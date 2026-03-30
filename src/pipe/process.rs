@@ -63,6 +63,9 @@ impl PipeProcess {
     }
 
     /// Spawn a headless CLI process with stdin/stdout pipes and custom options.
+    ///
+    /// The initial prompt is written to stdin (not as a CLI argument) to avoid
+    /// Windows `cmd /C` mangling of Unicode, spaces, and special characters.
     pub fn new_with_options(
         tool: CliTool,
         working_dir: &std::path::Path,
@@ -78,6 +81,18 @@ impl PipeProcess {
         let mut child = cmd.spawn()?;
 
         let stdin = child.stdin.take();
+
+        // Write prompt via stdin instead of CLI argument (avoids cmd.exe mangling).
+        // Claude `-p` reads stdin until EOF, so we must drop (close) stdin after writing.
+        if let Some(mut s) = stdin {
+            s.write_all(initial_prompt.as_bytes())?;
+            s.flush()?;
+            drop(s); // close stdin → Claude sees EOF → starts processing
+        }
+
+        // stdin is now closed; set to None
+        let stdin: Option<std::process::ChildStdin> = None;
+
         let stdout = child
             .stdout
             .take()
@@ -96,9 +111,13 @@ impl PipeProcess {
         })
     }
 
+    /// Build the CLI command **without** the prompt argument.
+    ///
+    /// The prompt is written to stdin after spawn (see `new_with_options`) to
+    /// avoid Windows `cmd /C` mangling of Unicode, spaces, and special chars.
     fn build_command_with_options(
         tool: CliTool,
-        prompt: &str,
+        _prompt: &str,
         options: &PipeProcessOptions,
     ) -> Command {
         if cfg!(windows) {
@@ -127,18 +146,18 @@ impl PipeProcess {
                         cmd_str.push_str(arg);
                     }
 
-                    cmd_str.push_str(" \"");
-                    cmd_str.push_str(&prompt.replace('"', "\\\""));
-                    cmd_str.push('"');
+                    // No prompt in CLI args — it goes via stdin
                     cmd_str
                 }
                 CliTool::Codex => {
-                    format!("codex exec --json \"{}\"", prompt.replace('"', "\\\""))
+                    // Codex doesn't support stdin prompt — keep as arg
+                    format!("codex exec --json \"{}\"", _prompt.replace('"', "\\\""))
                 }
                 CliTool::Gemini => {
+                    // Gemini doesn't support stdin prompt — keep as arg
                     format!(
                         "gemini --output-format stream-json -p \"{}\" --yolo",
-                        prompt.replace('"', "\\\"")
+                        _prompt.replace('"', "\\\"")
                     )
                 }
             };
@@ -172,17 +191,17 @@ impl PipeProcess {
                         cmd.arg(arg);
                     }
 
-                    cmd.arg(prompt);
+                    // No prompt in CLI args — it goes via stdin
                     cmd
                 }
                 CliTool::Codex => {
                     let mut cmd = Command::new("codex");
-                    cmd.args(["exec", "--json", prompt]);
+                    cmd.args(["exec", "--json", _prompt]);
                     cmd
                 }
                 CliTool::Gemini => {
                     let mut cmd = Command::new("gemini");
-                    cmd.args(["--output-format", "stream-json", "-p", prompt, "--yolo"]);
+                    cmd.args(["--output-format", "stream-json", "-p", _prompt, "--yolo"]);
                     cmd
                 }
             }

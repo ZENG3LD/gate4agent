@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::error::AgentError;
-use crate::ndjson::{create_ndjson_parser, CliEvent, NdjsonParser};
+use crate::ndjson::{create_ndjson_parser, CliEvent};
 use crate::types::{AgentEvent, CliTool, SessionConfig};
 
 use super::process::{PipeProcess, PipeProcessOptions};

@@ -1,0 +1,38 @@
+[package]
+name = "gate4agent"
+version = "0.1.0"
+edition = "2021"
+description = "Universal wrapper for CLI agents (Claude Code, Codex, Gemini). PTY mirror and pipe/NDJSON modes with tokio broadcast fan-out."
+
+[dependencies]
+# PTY creation and cross-platform ConPTY support
+portable-pty = "0.8"
+
+# ANSI escape sequence stripping (VteParser)
+vte = "0.13"
+
+# Full virtual terminal screen emulation (ScreenParser, PTY mirror mode)
+vt100 = "0.15"
+
+# Async runtime + broadcast channel (required for PtySession and PipeSession)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "process"] }
+
+# Serialization for AgentEvent, CliTool, etc.
+serde = { version = "1", features = ["derive"] }
+
+# NDJSON parsing
+serde_json = "1"
+
+# Timestamps in RateLimitInfo
+chrono = { version = "0.4", features = ["serde"] }
+
+# PtyError, AgentError
+thiserror = "2"
+
+# RateLimitDetector patterns, OutputParser regex matching
+regex = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[workspace]

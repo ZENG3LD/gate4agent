@@ -1,0 +1,129 @@
+//! Core shared types for cli2pty4agent.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Supported CLI tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CliTool {
+    #[serde(alias = "claude")]
+    #[default]
+    ClaudeCode,
+    Codex,
+    Gemini,
+}
+
+impl std::fmt::Display for CliTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliTool::ClaudeCode => write!(f, "Claude Code"),
+            CliTool::Codex => write!(f, "Codex"),
+            CliTool::Gemini => write!(f, "Gemini"),
+        }
+    }
+}
+
+/// Session configuration for spawning an agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// CLI tool to use.
+    pub tool: CliTool,
+    /// Working directory.
+    pub working_dir: PathBuf,
+    /// Environment variables to set.
+    pub env_vars: Vec<(String, String)>,
+    /// Session name/identifier.
+    pub name: Option<String>,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            tool: CliTool::ClaudeCode,
+            working_dir: std::env::current_dir().unwrap_or_default(),
+            env_vars: Vec::new(),
+            name: None,
+        }
+    }
+}
+
+/// Detected rate limit information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitInfo {
+    /// Type of rate limit.
+    pub limit_type: RateLimitType,
+    /// When the limit resets (if known).
+    pub resets_at: Option<DateTime<Utc>>,
+    /// Usage percentage (if known).
+    pub usage_percent: Option<f64>,
+    /// Raw message from CLI.
+    pub raw_message: String,
+    /// When detected.
+    pub detected_at: DateTime<Utc>,
+}
+
+/// Type of rate limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RateLimitType {
+    /// Session/hourly limit.
+    Session,
+    /// Daily limit.
+    Daily,
+    /// Weekly limit.
+    Weekly,
+    /// Unknown limit type.
+    Unknown,
+}
+
+/// Low-level PTY event (used internally before classification).
+#[derive(Debug, Clone)]
+pub struct PtyEvent {
+    /// Raw bytes from PTY.
+    pub raw: String,
+}
+
+/// Unified event type produced by both PTY and pipe transports.
+///
+/// Consumers subscribe to a `broadcast::Receiver<AgentEvent>` and
+/// never need to know which transport produced the event.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    // --- Lifecycle ---
+    /// Process spawned, session ID assigned.
+    Started { session_id: String },
+    /// Process exited with code.
+    Exited { code: i32 },
+    /// Error from transport or parsing.
+    Error { message: String },
+
+    // --- PTY mirror mode events ---
+    /// Raw byte chunk from PTY (pre-ANSI-strip). Use for vt100 screen emulation.
+    PtyRaw { data: String },
+    /// Classified PTY output (post-VTE-strip + OutputParser classification).
+    PtyParsed(crate::cli::traits::ParsedMessage),
+    /// PTY session ready for input (PromptReady detected).
+    PtyReady,
+    /// PTY tool approval needed.
+    PtyToolApproval { tool_name: String, description: Option<String> },
+
+    // --- Pipe / NDJSON mode events ---
+    /// Session initialized (from stream-json `system/init` event).
+    PipeSessionStart { session_id: String, model: String, tools: Vec<String> },
+    /// Streaming text delta from assistant (is_delta=true) or complete turn text.
+    PipeText { text: String, is_delta: bool },
+    /// Tool call started by assistant.
+    PipeToolStart { id: String, name: String, input: serde_json::Value },
+    /// Tool call completed.
+    PipeToolResult { id: String, output: String, is_error: bool, duration_ms: Option<u64> },
+    /// Assistant thinking/reasoning block.
+    PipeThinking { text: String },
+    /// Turn complete with token usage.
+    PipeTurnComplete { input_tokens: u64, output_tokens: u64 },
+    /// Session ended with final result.
+    PipeSessionEnd { result: String, cost_usd: Option<f64>, is_error: bool },
+
+    // --- Both modes ---
+    /// Rate limit detected (from text pattern matching).
+    RateLimit(RateLimitInfo),
+}

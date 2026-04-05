@@ -3,6 +3,11 @@ name = "gate4agent"
 version = "0.1.0"
 edition = "2021"
 description = "Universal wrapper for CLI agents (Claude Code, Codex, Gemini). PTY mirror and pipe/NDJSON modes with tokio broadcast fan-out."
+license = "MIT"
+repository = "https://github.com/ZENG3LD/gate4agent"
+readme = "README.md"
+keywords = ["claude", "agent", "cli", "pipe", "pty"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 # PTY creation and cross-platform ConPTY support
@@ -35,4 +40,5 @@ regex = "1"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 
+# Standalone crate — not part of the parent workspace
 [workspace]

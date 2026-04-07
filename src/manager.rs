@@ -198,6 +198,7 @@ impl MultiCliManager {
 
     /// Start a PTY session for the given CLI.
     pub async fn start_pty(&mut self, cli: AgentCli, config: SessionConfig) -> Result<(), String> {
+        eprintln!("[gate4agent] start_pty cli={:?} cwd={}", cli, config.working_dir.display());
         let rows = self.rows;
         let cols = self.cols;
         let st = self.state_mut(cli);
@@ -280,6 +281,7 @@ impl MultiCliManager {
         if need_spawn {
             let workdir = self.cli_workdir(cli);
             fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
+            eprintln!("[gate4agent] write_pty lazy-spawn cli={:?} cwd={}", cli, workdir.display());
             let tool = cli_to_tool(cli);
             let config = SessionConfig {
                 tool,
@@ -288,6 +290,7 @@ impl MultiCliManager {
             };
             self.start_pty(cli, config).await?;
         }
+        eprintln!("[gate4agent] write_pty cli={:?} bytes={}", cli, text.len());
         let st = self.state(cli);
         if let Some(ref session) = st.pty_session {
             session
@@ -304,9 +307,11 @@ impl MultiCliManager {
     /// Lazy-spawns a pipe session on the first call for this CLI.
     pub async fn send_chat(&mut self, cli: AgentCli, prompt: &str) -> Result<(), String> {
         let need_spawn = self.state(cli).pipe_session.is_none();
+        eprintln!("[gate4agent] send_chat cli={:?} need_spawn={} prompt_len={}", cli, need_spawn, prompt.len());
         if need_spawn {
             let workdir = self.cli_workdir(cli);
             fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
+            eprintln!("[gate4agent] send_chat lazy-spawn cli={:?} cwd={}", cli, workdir.display());
             let tool = cli_to_tool(cli);
             let config = SessionConfig {
                 tool,
@@ -661,7 +666,8 @@ impl MultiCliManager {
     /// Number of past sessions for this CLI (live disk read).
     pub fn past_session_count(&self, cli: AgentCli) -> usize {
         let workdir = self.cli_workdir(cli);
-        crate::history::reader_for(cli).list_sessions(&workdir).len()
+        let n = crate::history::reader_for(cli).list_sessions(&workdir).len();
+        n
     }
 
     /// List past sessions (newest first, live disk read).
@@ -676,11 +682,19 @@ impl MultiCliManager {
     pub fn load_latest_history(&mut self, cli: AgentCli) -> bool {
         let workdir = self.cli_workdir(cli);
         let reader = crate::history::reader_for(cli);
+        eprintln!("[gate4agent] load_latest_history cli={:?} workdir={}", cli, workdir.display());
         let latest = match reader.latest_session(&workdir) {
-            Some(id) => id,
-            None => return false,
+            Some(id) => {
+                eprintln!("[gate4agent]   latest session id={}", id);
+                id
+            }
+            None => {
+                eprintln!("[gate4agent]   no past sessions found");
+                return false;
+            }
         };
         let messages = reader.load_session(&workdir, &latest);
+        eprintln!("[gate4agent]   loaded {} messages", messages.len());
         if messages.is_empty() {
             return false;
         }

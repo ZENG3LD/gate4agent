@@ -86,11 +86,14 @@ fn find_projects_dir(workdir: &Path) -> Option<PathBuf> {
     let home = home_dir()?;
     let base = home.join(".claude").join("projects");
     if !base.exists() {
+        eprintln!("[gate4agent::history] base not found: {}", base.display());
         return None;
     }
     let mangled = mangle_cwd(workdir);
+    eprintln!("[gate4agent::history] looking for cwd={} mangled={}", workdir.display(), mangled);
     let exact = base.join(&mangled);
     if exact.is_dir() {
+        eprintln!("[gate4agent::history]   exact match: {}", exact.display());
         return Some(exact);
     }
     // Fallback: scan subdirs and pick the one whose name contains our mangled string
@@ -101,9 +104,9 @@ fn find_projects_dir(workdir: &Path) -> Option<PathBuf> {
     };
     // Best match: longest common prefix with mangled
     let mangled_lower = mangled.to_lowercase();
-    subdirs
+    let result = subdirs
         .into_iter()
-        .filter(|p| {
+        .find(|p| {
             p.file_name()
                 .and_then(|s| s.to_str())
                 .map(|n| {
@@ -111,8 +114,13 @@ fn find_projects_dir(workdir: &Path) -> Option<PathBuf> {
                     nl == mangled_lower || nl.contains(&mangled_lower) || mangled_lower.contains(&nl)
                 })
                 .unwrap_or(false)
-        })
-        .next()
+        });
+    if let Some(ref p) = result {
+        eprintln!("[gate4agent::history]   fuzzy match: {}", p.display());
+    } else {
+        eprintln!("[gate4agent::history]   no match in {} subdirs", base.display());
+    }
+    result
 }
 
 fn home_dir() -> Option<PathBuf> {

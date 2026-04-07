@@ -521,7 +521,80 @@ impl MultiCliManager {
     // Snapshot + query
     // =========================================================================
 
-    /// Build a render snapshot for the given CLI.
+    /// Build a render snapshot for the given CLI, honoring the UI's requested mode.
+    ///
+    /// `want_pty=true` → return PTY grid if a PTY parser/session exists (even if exited),
+    /// otherwise Idle. `want_pty=false` → return chat messages if any, otherwise Idle.
+    /// This decouples snapshot mode from session liveness so mode switches don't
+    /// destroy the other view.
+    pub fn snapshot_mode(&self, cli: AgentCli, want_pty: bool) -> AgentRenderSnapshot {
+        let st = self.state(cli);
+        if want_pty {
+            // Render PTY grid as long as we ever spawned one OR the parser has content.
+            if st.pty_session.is_some() || self.pty_has_content(cli) {
+                return self.build_pty_snapshot(st);
+            }
+            return AgentRenderSnapshot {
+                mode: AgentSnapshotMode::Idle,
+                session_active: st.session_active,
+            };
+        }
+        // Chat mode requested
+        if !st.chat_messages.is_empty() {
+            return AgentRenderSnapshot {
+                mode: AgentSnapshotMode::Chat(st.chat_messages.clone()),
+                session_active: st.session_active,
+            };
+        }
+        AgentRenderSnapshot {
+            mode: AgentSnapshotMode::Idle,
+            session_active: st.session_active,
+        }
+    }
+
+    fn pty_has_content(&self, cli: AgentCli) -> bool {
+        let st = self.state(cli);
+        let screen = st.pty_parser.screen();
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                if let Some(cell) = screen.cell(row, col) {
+                    if !cell.contents().is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn build_pty_snapshot(&self, st: &PerCliState) -> AgentRenderSnapshot {
+        let screen = st.pty_parser.screen();
+        let mut grid = TermGrid::empty(self.cols, self.rows);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                if let Some(cell) = screen.cell(row, col) {
+                    let fg = vt100_color_to_rgb(cell.fgcolor(), [204, 204, 204]);
+                    let bg = vt100_color_to_rgb(cell.bgcolor(), [0, 0, 0]);
+                    let contents = cell.contents();
+                    grid.cells[row as usize][col as usize] = TermCell {
+                        ch: if contents.is_empty() { " ".to_string() } else { contents },
+                        fg,
+                        bg,
+                        bold: cell.bold(),
+                    };
+                }
+            }
+        }
+        let (cur_row, cur_col) = screen.cursor_position();
+        grid.cursor_row = cur_row;
+        grid.cursor_col = cur_col;
+        AgentRenderSnapshot {
+            mode: AgentSnapshotMode::Pty(grid),
+            session_active: st.session_active,
+        }
+    }
+
+    /// Legacy snapshot — inferred from state. Prefer `snapshot_mode`.
     pub fn snapshot(&self, cli: AgentCli) -> AgentRenderSnapshot {
         let st = self.state(cli);
 

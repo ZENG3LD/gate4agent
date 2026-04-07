@@ -81,36 +81,62 @@ impl HistoryReader for ClaudeHistoryReader {
 }
 
 fn find_projects_dir(workdir: &Path) -> Option<PathBuf> {
-    let base = workdir.join(".claude").join("projects");
+    // Claude Code stores sessions at ~/.claude/projects/{mangled-cwd}/, NOT inside the cwd.
+    // The mangling replaces each non-alphanumeric char with '-' and prefixes with '-'.
+    let home = home_dir()?;
+    let base = home.join(".claude").join("projects");
     if !base.exists() {
         return None;
     }
-    // Claude mangles the cwd path. The exact mangling is: replace each non-alphanumeric
-    // character with `-`, prefix with `-`. We don't try to predict the exact name —
-    // instead we list subdirs of `.claude/projects` and pick the one with our mangled cwd.
-    // Easiest: if there's only one subdir, use it. Otherwise pick by best match.
-    let mut subdirs: Vec<PathBuf> = match fs::read_dir(&base) {
+    let mangled = mangle_cwd(workdir);
+    let exact = base.join(&mangled);
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    // Fallback: scan subdirs and pick the one whose name contains our mangled string
+    // (Claude may add or strip a trailing dash, etc).
+    let subdirs: Vec<PathBuf> = match fs::read_dir(&base) {
         Ok(rd) => rd.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect(),
         Err(_) => return None,
     };
-    if subdirs.is_empty() {
-        return None;
-    }
-    if subdirs.len() == 1 {
-        return Some(subdirs.remove(0));
-    }
-    // Multiple — pick the one whose name contains the workdir basename
-    let basename = workdir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    // Best match: longest common prefix with mangled
+    let mangled_lower = mangled.to_lowercase();
     subdirs
-        .iter()
-        .find(|p| {
+        .into_iter()
+        .filter(|p| {
             p.file_name()
                 .and_then(|s| s.to_str())
-                .map(|n| n.contains(basename))
+                .map(|n| {
+                    let nl = n.to_lowercase();
+                    nl == mangled_lower || nl.contains(&mangled_lower) || mangled_lower.contains(&nl)
+                })
                 .unwrap_or(false)
         })
-        .cloned()
-        .or_else(|| subdirs.into_iter().next())
+        .next()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(p) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(p));
+        }
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn mangle_cwd(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 1);
+    out.push('-');
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    out
 }
 
 fn first_user_text(path: &Path) -> Option<String> {

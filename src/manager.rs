@@ -593,7 +593,9 @@ impl MultiCliManager {
         let (cur_row, cur_col) = screen.cursor_position();
         grid.cursor_row = cur_row;
         grid.cursor_col = cur_col;
-        grid.detect_and_extract_buddy();
+        // Buddy extraction disabled — heuristic doesn't reliably catch the
+        // companion ASCII art yet. Kept in snapshot.rs for future experiments.
+        // grid.detect_and_extract_buddy();
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Pty(grid),
             session_active: st.session_active,
@@ -642,7 +644,9 @@ impl MultiCliManager {
             let (cur_row, cur_col) = screen.cursor_position();
             grid.cursor_row = cur_row;
             grid.cursor_col = cur_col;
-            grid.detect_and_extract_buddy();
+            // Buddy extraction disabled — heuristic doesn't reliably catch the
+        // companion ASCII art yet. Kept in snapshot.rs for future experiments.
+        // grid.detect_and_extract_buddy();
             AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Pty(grid),
                 session_active: true,

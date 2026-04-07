@@ -118,6 +118,10 @@ pub struct PerCliState {
     pub chat_messages: Vec<ChatMessage>,
     pub session_active: bool,
     pub pipe_session_id: Option<String>,
+    /// Number of tool invocations completed in the current turn (transient).
+    /// Reset on PipeTurnComplete. Used to render a single collapsed
+    /// "⟳ tool · N done" progress bubble instead of one bubble per call.
+    pub tool_done_count: u32,
 }
 
 impl PerCliState {
@@ -132,6 +136,7 @@ impl PerCliState {
             chat_messages: Vec::new(),
             session_active: false,
             pipe_session_id: None,
+            tool_done_count: 0,
         }
     }
 }
@@ -324,7 +329,18 @@ impl MultiCliManager {
                 content: prompt.to_string(),
                 tool_name: None,
             });
-            match PipeSession::spawn(config, prompt, PipeProcessOptions::default()).await {
+            // Resume the previous Claude session if we have its id captured.
+            // This makes a sequence of `send_chat` calls feel like a continuous
+            // chat thread instead of independent one-shots.
+            let resume_id = self.state(cli).pipe_session_id.clone();
+            let opts = PipeProcessOptions {
+                claude: crate::pipe::process::ClaudeOptions {
+                    resume_session_id: resume_id,
+                    ..Default::default()
+                },
+                ..PipeProcessOptions::default()
+            };
+            match PipeSession::spawn(config, prompt, opts).await {
                 Ok(session) => {
                     let st = self.state_mut(cli);
                     st.pipe_rx = Some(session.subscribe());
@@ -421,62 +437,68 @@ impl MultiCliManager {
                     Ok(event) => {
                         had_events = true;
                         match event {
-                            AgentEvent::PipeSessionStart { session_id, model, .. } => {
-                                st.pipe_session_id = Some(session_id.clone());
-                                let msg = ChatMessage {
-                                    role: ChatRole::Tool,
-                                    content: format!(
-                                        "{} · session {}",
-                                        model,
-                                        &session_id[..session_id.len().min(8)]
-                                    ),
-                                    tool_name: None,
-                                };
-                                st.chat_messages.push(msg);
+                            AgentEvent::PipeSessionStart { session_id, .. } => {
+                                // Capture id for --resume on the next prompt.
+                                // Do NOT push a ChatMessage — that was the source
+                                // of "[tool] unknown · session XXXX" spam.
+                                st.pipe_session_id = Some(session_id);
                             }
-                            AgentEvent::PipeText { text, is_delta } => {
-                                if is_delta {
-                                    if let Some(last) = st.chat_messages.last_mut() {
-                                        if last.role == ChatRole::Assistant {
-                                            last.content.push_str(&text);
-                                            continue;
-                                        }
+                            AgentEvent::PipeText { text, is_delta: _ } => {
+                                // Drop any in-flight progress bubble before
+                                // appending real assistant text.
+                                if let Some(last) = st.chat_messages.last() {
+                                    if last.tool_name.as_deref() == Some("__progress__") {
+                                        st.chat_messages.pop();
                                     }
-                                    st.chat_messages.push(ChatMessage {
-                                        role: ChatRole::Assistant,
-                                        content: text,
-                                        tool_name: None,
-                                    });
-                                } else {
-                                    st.chat_messages.push(ChatMessage {
-                                        role: ChatRole::Assistant,
-                                        content: text,
-                                        tool_name: None,
-                                    });
                                 }
-                            }
-                            AgentEvent::PipeToolStart { name, .. } => {
-                                st.chat_messages.push(ChatMessage {
-                                    role: ChatRole::Tool,
-                                    content: format!("Running {}...", name),
-                                    tool_name: Some(name),
-                                });
-                            }
-                            AgentEvent::PipeToolResult { id: _, output: _, is_error: _, .. } => {
                                 if let Some(last) = st.chat_messages.last_mut() {
-                                    if last.role == ChatRole::Tool {
-                                        if let Some(ref name) = last.tool_name.clone() {
-                                            last.content = format!("{}: done", name);
-                                        }
+                                    if last.role == ChatRole::Assistant {
+                                        last.content.push_str(&text);
+                                        continue;
                                     }
                                 }
-                            }
-                            AgentEvent::PipeThinking { text } => {
                                 st.chat_messages.push(ChatMessage {
-                                    role: ChatRole::Thinking,
+                                    role: ChatRole::Assistant,
                                     content: text,
                                     tool_name: None,
                                 });
+                            }
+                            AgentEvent::PipeToolStart { name, .. } => {
+                                // Collapse all tool activity into a SINGLE
+                                // transient progress bubble at the tail of the
+                                // chat. Updated in place as more tools fire.
+                                let progress_existing = st.chat_messages.last_mut()
+                                    .filter(|m| m.tool_name.as_deref() == Some("__progress__"));
+                                if let Some(p) = progress_existing {
+                                    // Bump tool count, switch label.
+                                    let done = st.tool_done_count;
+                                    p.content = format!("⟳ {} · {} done", name, done);
+                                } else {
+                                    st.tool_done_count = 0;
+                                    st.chat_messages.push(ChatMessage {
+                                        role: ChatRole::Tool,
+                                        content: format!("⟳ {} · 0 done", name),
+                                        tool_name: Some("__progress__".to_string()),
+                                    });
+                                }
+                            }
+                            AgentEvent::PipeToolResult { id: _, output: _, is_error: _, .. } => {
+                                st.tool_done_count = st.tool_done_count.saturating_add(1);
+                                let done = st.tool_done_count;
+                                if let Some(last) = st.chat_messages.last_mut() {
+                                    if last.tool_name.as_deref() == Some("__progress__") {
+                                        // Keep current tool label, just refresh counter.
+                                        let head = last.content
+                                            .split(" · ")
+                                            .next()
+                                            .unwrap_or("⟳ tool")
+                                            .to_string();
+                                        last.content = format!("{} · {} done", head, done);
+                                    }
+                                }
+                            }
+                            AgentEvent::PipeThinking { text: _ } => {
+                                // Suppress — was creating noise bubbles.
                             }
                             AgentEvent::Error { message } => {
                                 st.chat_messages.push(ChatMessage {
@@ -485,23 +507,31 @@ impl MultiCliManager {
                                     tool_name: None,
                                 });
                             }
-                            AgentEvent::PipeTurnComplete { input_tokens, output_tokens } => {
-                                st.chat_messages.push(ChatMessage {
-                                    role: ChatRole::Tool,
-                                    content: format!(
-                                        "in {} / out {} tokens",
-                                        input_tokens, output_tokens
-                                    ),
-                                    tool_name: None,
-                                });
+                            AgentEvent::PipeTurnComplete { .. } => {
+                                // Drop the transient progress bubble — the turn
+                                // is over and the assistant message (if any) is
+                                // already in the chat.
+                                if let Some(last) = st.chat_messages.last() {
+                                    if last.tool_name.as_deref() == Some("__progress__") {
+                                        st.chat_messages.pop();
+                                    }
+                                }
+                                st.tool_done_count = 0;
                             }
                             AgentEvent::PipeSessionEnd { result, is_error, .. } => {
-                                let status = if is_error { "error" } else { "done" };
-                                st.chat_messages.push(ChatMessage {
-                                    role: ChatRole::Tool,
-                                    content: format!("Session {} · {}", status, result),
-                                    tool_name: None,
-                                });
+                                if is_error {
+                                    st.chat_messages.push(ChatMessage {
+                                        role: ChatRole::Error,
+                                        content: format!("Session error · {}", result),
+                                        tool_name: None,
+                                    });
+                                }
+                                // Successful session-end: silent.
+                                if let Some(last) = st.chat_messages.last() {
+                                    if last.tool_name.as_deref() == Some("__progress__") {
+                                        st.chat_messages.pop();
+                                    }
+                                }
                             }
                             AgentEvent::Exited { .. } => {
                                 st.session_active = false;

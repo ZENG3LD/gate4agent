@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Universal wrapper for CLI agents (Claude Code, Codex, Gemini). PTY mirror and pipe/NDJSON modes with tokio broadcast fan-out."
 license = "MIT"

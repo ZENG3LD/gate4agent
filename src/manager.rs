@@ -738,6 +738,9 @@ impl MultiCliManager {
         }
         let st = self.state_mut(cli);
         st.chat_messages = messages;
+        st.pipe_session_id = Some(latest.clone());
+        st.pipe_session = None;
+        st.pipe_rx = None;
         true
     }
 

@@ -99,7 +99,9 @@ pub enum AgentEvent {
 
     // --- PTY mirror mode events ---
     /// Raw byte chunk from PTY (pre-ANSI-strip). Use for vt100 screen emulation.
-    PtyRaw { data: String },
+    /// Uses `Vec<u8>` (not String) so multi-byte UTF-8 sequences split across
+    /// reads are not corrupted by `from_utf8_lossy` replacement characters.
+    PtyRaw { data: Vec<u8> },
     /// Classified PTY output (post-VTE-strip + OutputParser classification).
     PtyParsed(crate::cli::traits::ParsedMessage),
     /// PTY session ready for input (PromptReady detected).

@@ -30,7 +30,7 @@ pub struct PtyWrapper {
     /// Writer for sending input.
     writer: Box<dyn Write + Send>,
     /// Receiver for output.
-    output_rx: Receiver<String>,
+    output_rx: Receiver<Vec<u8>>,
     /// CLI tool being wrapped.
     tool: CliTool,
 }
@@ -141,7 +141,7 @@ impl PtyWrapper {
         cmd
     }
 
-    fn reader_thread(reader: Box<dyn std::io::Read + Send>, tx: Sender<String>) {
+    fn reader_thread(reader: Box<dyn std::io::Read + Send>, tx: Sender<Vec<u8>>) {
         use std::io::Read;
 
         let mut reader = reader;
@@ -151,8 +151,10 @@ impl PtyWrapper {
             match reader.read(&mut buffer) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
-                    if tx.send(chunk).is_err() {
+                    // Send raw bytes — never lose UTF-8 to from_utf8_lossy.
+                    // vt100::Parser accepts &[u8] and handles multi-byte UTF-8
+                    // correctly even if a sequence is split across read() calls.
+                    if tx.send(buffer[..n].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -183,8 +185,8 @@ impl PtyWrapper {
         self.write(&format!("{}\n", data))
     }
 
-    /// Try to receive output (non-blocking).
-    pub fn try_recv(&self) -> Option<String> {
+    /// Try to receive output bytes (non-blocking).
+    pub fn try_recv(&self) -> Option<Vec<u8>> {
         self.output_rx.try_recv().ok()
     }
 

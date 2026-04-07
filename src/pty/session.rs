@@ -99,7 +99,7 @@ impl PtySession {
         )?;
         let pty = Arc::new(Mutex::new(pty));
 
-        let (tx, _) = broadcast::channel::<AgentEvent>(256);
+        let (tx, _) = broadcast::channel::<AgentEvent>(4096);
 
         // Broadcast Started event
         let _ = tx.send(AgentEvent::Started {
@@ -244,11 +244,18 @@ fn reader_loop(
             }
         };
 
-        // Broadcast raw PTY bytes (for vt100 screen emulation by consumers)
+        // Broadcast raw PTY bytes (for vt100 screen emulation by consumers).
+        // Keep as Vec<u8> — never round-trip through String::from_utf8_lossy
+        // because that destroys multi-byte UTF-8 sequences split across reads.
         let _ = tx.send(AgentEvent::PtyRaw { data: raw.clone() });
 
+        // For text analysis (rate limit detection, classification) we need a
+        // String. Lossy conversion is acceptable here because this branch only
+        // feeds the heuristic ANSI/text parsers, not the vt100 grid.
+        let raw_str = String::from_utf8_lossy(&raw).to_string();
+
         // Strip ANSI for text analysis
-        let cleaned = vte_parser.parse(&raw);
+        let cleaned = vte_parser.parse(&raw_str);
 
         // Rate limit detection
         if let Some(rl_info) = rate_limit_detector.detect(&cleaned) {
@@ -256,7 +263,7 @@ fn reader_loop(
         }
 
         // Classification pipeline
-        let messages = pipeline.process(&raw);
+        let messages = pipeline.process(&raw_str);
         for msg in messages {
             match msg.class {
                 MessageClass::PromptReady => {

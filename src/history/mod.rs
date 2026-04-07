@@ -8,6 +8,8 @@ use crate::snapshot::{AgentCli, ChatMessage};
 
 pub mod claude;
 
+pub use claude::invalidate_projects_dir_cache;
+
 /// Lightweight metadata for a session listing.
 #[derive(Debug, Clone)]
 pub struct SessionMeta {

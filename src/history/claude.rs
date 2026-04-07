@@ -10,11 +10,15 @@
 //! User messages contain `message.content` (string or array of {type:"text", text}).
 //! Assistant messages contain `message.content` (array of {type:"text", text} or {type:"tool_use", ...}).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::Deserialize;
+
+static PROJECTS_DIR_CACHE: Mutex<Option<HashMap<PathBuf, Option<PathBuf>>>> = Mutex::new(None);
 
 use crate::snapshot::{ChatMessage, ChatRole};
 use super::{HistoryReader, SessionMeta};
@@ -81,8 +85,26 @@ impl HistoryReader for ClaudeHistoryReader {
 }
 
 fn find_projects_dir(workdir: &Path) -> Option<PathBuf> {
+    // Cached lookup — avoid disk + log spam on per-frame calls.
+    {
+        let mut guard = PROJECTS_DIR_CACHE.lock().ok()?;
+        let map = guard.get_or_insert_with(HashMap::new);
+        if let Some(cached) = map.get(workdir) {
+            return cached.clone();
+        }
+    }
+    let result = find_projects_dir_uncached(workdir);
+    if let Ok(mut guard) = PROJECTS_DIR_CACHE.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.insert(workdir.to_path_buf(), result.clone());
+        }
+    }
+    result
+}
+
+fn find_projects_dir_uncached(workdir: &Path) -> Option<PathBuf> {
     // Claude Code stores sessions at ~/.claude/projects/{mangled-cwd}/, NOT inside the cwd.
-    // The mangling replaces each non-alphanumeric char with '-' and prefixes with '-'.
+    // Claude's mangling: replace each non-alphanumeric char with '-'. NO leading dash.
     let home = home_dir()?;
     let base = home.join(".claude").join("projects");
     if !base.exists() {
@@ -96,31 +118,32 @@ fn find_projects_dir(workdir: &Path) -> Option<PathBuf> {
         eprintln!("[gate4agent::history]   exact match: {}", exact.display());
         return Some(exact);
     }
-    // Fallback: scan subdirs and pick the one whose name contains our mangled string
-    // (Claude may add or strip a trailing dash, etc).
+    // Strict fallback: only accept exact name match (case-insensitive). No substring matching —
+    // a shorter cwd's directory must NOT match a longer cwd.
     let subdirs: Vec<PathBuf> = match fs::read_dir(&base) {
         Ok(rd) => rd.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect(),
         Err(_) => return None,
     };
-    // Best match: longest common prefix with mangled
     let mangled_lower = mangled.to_lowercase();
-    let result = subdirs
-        .into_iter()
-        .find(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(|n| {
-                    let nl = n.to_lowercase();
-                    nl == mangled_lower || nl.contains(&mangled_lower) || mangled_lower.contains(&nl)
-                })
-                .unwrap_or(false)
-        });
+    let result = subdirs.into_iter().find(|p| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.to_lowercase() == mangled_lower)
+            .unwrap_or(false)
+    });
     if let Some(ref p) = result {
-        eprintln!("[gate4agent::history]   fuzzy match: {}", p.display());
+        eprintln!("[gate4agent::history]   exact (ci) match: {}", p.display());
     } else {
-        eprintln!("[gate4agent::history]   no match in {} subdirs", base.display());
+        eprintln!("[gate4agent::history]   no match in {}", base.display());
     }
     result
+}
+
+/// Clear the projects-dir cache. Call after a new session is created so we re-scan.
+pub fn invalidate_projects_dir_cache() {
+    if let Ok(mut guard) = PROJECTS_DIR_CACHE.lock() {
+        *guard = None;
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -134,9 +157,9 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn mangle_cwd(path: &Path) -> String {
+    // Claude's scheme: replace each non-alphanumeric char with '-'. No leading dash.
     let s = path.to_string_lossy();
-    let mut out = String::with_capacity(s.len() + 1);
-    out.push('-');
+    let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch);

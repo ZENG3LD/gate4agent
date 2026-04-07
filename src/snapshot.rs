@@ -222,9 +222,30 @@ pub enum AgentSnapshotMode {
     Idle,
 }
 
+/// Live in-progress status of the current agent turn.
+///
+/// Rendered as a single animated line at the bottom of the chat view.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum LiveStatus {
+    /// No turn in progress.
+    #[default]
+    Idle,
+    /// Agent is reasoning / waiting for first output.
+    Thinking,
+    /// Agent is executing a tool.
+    RunningTool {
+        /// Name of the tool currently executing.
+        name: String,
+        /// Number of tool calls completed so far in this turn.
+        done: u32,
+    },
+}
+
 /// Snapshot of agent state for rendering — no OS handles.
 #[derive(Clone, Debug)]
 pub struct AgentRenderSnapshot {
     pub mode: AgentSnapshotMode,
     pub session_active: bool,
+    /// Live in-progress status (spinner text at bottom of chat).
+    pub live_status: LiveStatus,
 }

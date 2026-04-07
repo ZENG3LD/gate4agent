@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use crate::pipe::{PipeSession, PipeProcessOptions};
 use crate::pty::PtySession;
 use crate::snapshot::{
-    AgentCli, AgentRenderSnapshot, AgentSnapshotMode, ChatMessage, ChatRole, TermCell, TermGrid,
+    AgentCli, AgentRenderSnapshot, AgentSnapshotMode, ChatMessage, ChatRole, LiveStatus, TermCell, TermGrid,
 };
 use crate::types::{AgentEvent, CliTool, SessionConfig};
 
@@ -118,10 +118,8 @@ pub struct PerCliState {
     pub chat_messages: Vec<ChatMessage>,
     pub session_active: bool,
     pub pipe_session_id: Option<String>,
-    /// Number of tool invocations completed in the current turn (transient).
-    /// Reset on PipeTurnComplete. Used to render a single collapsed
-    /// "⟳ tool · N done" progress bubble instead of one bubble per call.
-    pub tool_done_count: u32,
+    /// Live status of the current turn — drives the animated spinner line in the chat view.
+    pub live_status: LiveStatus,
 }
 
 impl PerCliState {
@@ -136,7 +134,7 @@ impl PerCliState {
             chat_messages: Vec::new(),
             session_active: false,
             pipe_session_id: None,
-            tool_done_count: 0,
+            live_status: LiveStatus::Idle,
         }
     }
 }
@@ -329,15 +327,8 @@ impl MultiCliManager {
                 content: prompt.to_string(),
                 tool_name: None,
             });
-            // Show a transient "thinking" bubble immediately so the user
-            // sees feedback before the first NDJSON event arrives. It will
-            // be replaced/updated by drain_one as tool / text events flow.
-            self.state_mut(cli).tool_done_count = 0;
-            self.state_mut(cli).chat_messages.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: "... thinking".to_string(),
-                tool_name: Some("__progress__".to_string()),
-            });
+            // Switch to Thinking state so the animated spinner shows immediately.
+            self.state_mut(cli).live_status = LiveStatus::Thinking;
             // Resume the previous Claude session if we have its id captured.
             // This makes a sequence of `send_chat` calls feel like a continuous
             // chat thread instead of independent one-shots.
@@ -366,12 +357,7 @@ impl MultiCliManager {
                 content: prompt.to_string(),
                 tool_name: None,
             });
-            self.state_mut(cli).tool_done_count = 0;
-            self.state_mut(cli).chat_messages.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: "... thinking".to_string(),
-                tool_name: Some("__progress__".to_string()),
-            });
+            self.state_mut(cli).live_status = LiveStatus::Thinking;
             let st = self.state(cli);
             if let Some(ref session) = st.pipe_session {
                 session
@@ -459,13 +445,16 @@ impl MultiCliManager {
                                 st.pipe_session_id = Some(session_id);
                             }
                             AgentEvent::PipeText { text, is_delta: _ } => {
-                                // Drop any in-flight progress bubble before
-                                // appending real assistant text.
-                                if let Some(last) = st.chat_messages.last() {
-                                    if last.tool_name.as_deref() == Some("__progress__") {
-                                        st.chat_messages.pop();
-                                    }
+                                // Finalize any RunningTool status: push a "done" history entry.
+                                if let LiveStatus::RunningTool { ref name, done } = st.live_status.clone() {
+                                    st.chat_messages.push(ChatMessage {
+                                        role: ChatRole::Tool,
+                                        content: format!("✓ {} · {} done", name, done),
+                                        tool_name: Some(name.clone()),
+                                    });
                                 }
+                                st.live_status = LiveStatus::Idle;
+
                                 if let Some(last) = st.chat_messages.last_mut() {
                                     if last.role == ChatRole::Assistant {
                                         last.content.push_str(&text);
@@ -479,43 +468,27 @@ impl MultiCliManager {
                                 });
                             }
                             AgentEvent::PipeToolStart { name, .. } => {
-                                // Collapse all tool activity into a SINGLE
-                                // transient progress bubble at the tail of the
-                                // chat. Updated in place as more tools fire.
-                                let progress_existing = st.chat_messages.last_mut()
-                                    .filter(|m| m.tool_name.as_deref() == Some("__progress__"));
-                                if let Some(p) = progress_existing {
-                                    // Bump tool count, switch label.
-                                    let done = st.tool_done_count;
-                                    p.content = format!("⟳ {} · {} done", name, done);
-                                } else {
-                                    st.tool_done_count = 0;
+                                // Finalize previous tool if any.
+                                if let LiveStatus::RunningTool { name: ref prev, done } = st.live_status.clone() {
                                     st.chat_messages.push(ChatMessage {
                                         role: ChatRole::Tool,
-                                        content: format!("⟳ {} · 0 done", name),
-                                        tool_name: Some("__progress__".to_string()),
+                                        content: format!("✓ {} · {} done", prev, done),
+                                        tool_name: Some(prev.clone()),
                                     });
                                 }
+                                // Start tracking the new tool.
+                                st.live_status = LiveStatus::RunningTool { name, done: 0 };
                             }
                             AgentEvent::PipeToolResult { id: _, output: _, is_error: _, .. } => {
-                                st.tool_done_count = st.tool_done_count.saturating_add(1);
-                                let done = st.tool_done_count;
-                                if let Some(last) = st.chat_messages.last_mut() {
-                                    if last.tool_name.as_deref() == Some("__progress__") {
-                                        // Keep current tool label, just refresh counter.
-                                        let head = last.content
-                                            .split(" · ")
-                                            .next()
-                                            .unwrap_or("⟳ tool")
-                                            .to_string();
-                                        last.content = format!("{} · {} done", head, done);
-                                    }
+                                if let LiveStatus::RunningTool { done, .. } = &mut st.live_status {
+                                    *done = done.saturating_add(1);
                                 }
                             }
                             AgentEvent::PipeThinking { text: _ } => {
-                                // Suppress — was creating noise bubbles.
+                                // Keep Thinking status as-is; suppress bubble noise.
                             }
                             AgentEvent::Error { message } => {
+                                st.live_status = LiveStatus::Idle;
                                 st.chat_messages.push(ChatMessage {
                                     role: ChatRole::Error,
                                     content: message,
@@ -523,15 +496,15 @@ impl MultiCliManager {
                                 });
                             }
                             AgentEvent::PipeTurnComplete { .. } => {
-                                // Drop the transient progress bubble — the turn
-                                // is over and the assistant message (if any) is
-                                // already in the chat.
-                                if let Some(last) = st.chat_messages.last() {
-                                    if last.tool_name.as_deref() == Some("__progress__") {
-                                        st.chat_messages.pop();
-                                    }
+                                // Finalize any in-flight tool and clear live status.
+                                if let LiveStatus::RunningTool { ref name, done } = st.live_status.clone() {
+                                    st.chat_messages.push(ChatMessage {
+                                        role: ChatRole::Tool,
+                                        content: format!("✓ {} · {} done", name, done),
+                                        tool_name: Some(name.clone()),
+                                    });
                                 }
-                                st.tool_done_count = 0;
+                                st.live_status = LiveStatus::Idle;
                             }
                             AgentEvent::PipeSessionEnd { result, is_error, .. } => {
                                 if is_error {
@@ -541,15 +514,19 @@ impl MultiCliManager {
                                         tool_name: None,
                                     });
                                 }
-                                // Successful session-end: silent.
-                                if let Some(last) = st.chat_messages.last() {
-                                    if last.tool_name.as_deref() == Some("__progress__") {
-                                        st.chat_messages.pop();
-                                    }
+                                // Finalize any in-flight tool.
+                                if let LiveStatus::RunningTool { ref name, done } = st.live_status.clone() {
+                                    st.chat_messages.push(ChatMessage {
+                                        role: ChatRole::Tool,
+                                        content: format!("✓ {} · {} done", name, done),
+                                        tool_name: Some(name.clone()),
+                                    });
                                 }
+                                st.live_status = LiveStatus::Idle;
                             }
                             AgentEvent::Exited { .. } => {
                                 st.session_active = false;
+                                st.live_status = LiveStatus::Idle;
                             }
                             _ => {}
                         }
@@ -587,6 +564,7 @@ impl MultiCliManager {
             return AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Idle,
                 session_active: st.session_active,
+                live_status: st.live_status.clone(),
             };
         }
         // Chat mode requested
@@ -594,11 +572,13 @@ impl MultiCliManager {
             return AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Chat(st.chat_messages.clone()),
                 session_active: st.session_active,
+                live_status: st.live_status.clone(),
             };
         }
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Idle,
             session_active: st.session_active,
+            live_status: st.live_status.clone(),
         }
     }
 
@@ -645,6 +625,7 @@ impl MultiCliManager {
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Pty(grid),
             session_active: st.session_active,
+            live_status: st.live_status.clone(),
         }
     }
 
@@ -657,11 +638,13 @@ impl MultiCliManager {
                 return AgentRenderSnapshot {
                     mode: AgentSnapshotMode::Chat(st.chat_messages.clone()),
                     session_active: false,
+                    live_status: st.live_status.clone(),
                 };
             }
             return AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Idle,
                 session_active: false,
+                live_status: st.live_status.clone(),
             };
         }
 
@@ -697,11 +680,13 @@ impl MultiCliManager {
             AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Pty(grid),
                 session_active: true,
+                live_status: st.live_status.clone(),
             }
         } else {
             AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Chat(st.chat_messages.clone()),
                 session_active: true,
+                live_status: st.live_status.clone(),
             }
         }
     }

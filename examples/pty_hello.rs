@@ -32,12 +32,12 @@ async fn main() {
                         match &event {
                             AgentEvent::PtyRaw { data } => {
                                 // Print raw data (may contain ANSI sequences)
-                                print!("{}", data);
+                                print!("{}", String::from_utf8_lossy(data));
                             }
                             AgentEvent::PtyReady => {
                                 println!("\n[PTY READY - prompt detected]");
                             }
-                            AgentEvent::PtyParsed(msg) => {
+                            AgentEvent::PtyParsed(_msg) => {
                                 // Just count, don't spam
                             }
                             AgentEvent::Started { session_id } => {

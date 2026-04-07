@@ -21,10 +21,11 @@ use crate::types::{AgentEvent, CliTool, SessionConfig};
 // =============================================================================
 
 /// Configuration passed to `MultiCliManager::new`.
+///
+/// Each CLI runs in `{sessions_dir}/{cli_name}/` as cwd, so its dotfolder ends
+/// up there (e.g. `.claude/` for Claude Code).
 pub struct ManagerConfig {
-    /// Root directory for session NDJSON files.
-    ///
-    /// Layout: `{sessions_dir}/{cli}/{session_id}/messages.ndjson`
+    /// Root directory. Each CLI gets a subdirectory: `{sessions_dir}/{cli_name}/`.
     pub sessions_dir: PathBuf,
     /// Initial PTY width in columns.
     pub default_cols: u16,
@@ -112,13 +113,11 @@ pub struct PerCliState {
     pty_rx: Option<broadcast::Receiver<AgentEvent>>,
     pipe_rx: Option<broadcast::Receiver<AgentEvent>>,
     pty_parser: vt100::Parser,
+    /// Transient live-stream buffer for the currently running session.
+    /// Cleared when a past session is loaded for display.
     pub chat_messages: Vec<ChatMessage>,
     pub session_active: bool,
     pub pipe_session_id: Option<String>,
-    /// Past session IDs found on disk at startup (newest first).
-    pub past_sessions: Vec<String>,
-    /// Index into `past_sessions` for the debug picker (cycles on button click).
-    pub past_session_view_idx: usize,
 }
 
 impl PerCliState {
@@ -133,8 +132,6 @@ impl PerCliState {
             chat_messages: Vec::new(),
             session_active: false,
             pipe_session_id: None,
-            past_sessions: Vec::new(),
-            past_session_view_idx: 0,
         }
     }
 }
@@ -156,13 +153,10 @@ pub struct MultiCliManager {
 
 impl MultiCliManager {
     /// Create a new manager with the given configuration.
-    ///
-    /// Scans disk for past sessions at construction time.
     pub fn new(config: ManagerConfig) -> Self {
         let cols = config.default_cols;
         let rows = config.default_rows;
-        let sessions_dir = config.sessions_dir.clone();
-        let mut mgr = Self {
+        Self {
             config,
             states: [
                 PerCliState::new(AgentCli::Claude, rows, cols),
@@ -171,12 +165,7 @@ impl MultiCliManager {
             ],
             cols,
             rows,
-        };
-        for state in &mut mgr.states {
-            state.past_sessions =
-                crate::persist::scan_past_sessions(&sessions_dir, state.cli);
         }
-        mgr
     }
 
     fn idx(cli: AgentCli) -> usize {
@@ -195,26 +184,12 @@ impl MultiCliManager {
         &mut self.states[Self::idx(cli)]
     }
 
-    // =========================================================================
-    // Autostart
-    // =========================================================================
-
-    /// Spawn a PTY session for each of the 3 CLIs at app launch.
+    /// Returns the working directory for a given CLI.
     ///
-    /// Failures are logged but do not abort — the app starts normally without
-    /// the affected CLI.
-    pub async fn autostart_all(&mut self) {
-        for cli in [AgentCli::Claude, AgentCli::Codex, AgentCli::Gemini] {
-            let tool = match cli {
-                AgentCli::Claude => CliTool::ClaudeCode,
-                AgentCli::Codex => CliTool::Codex,
-                AgentCli::Gemini => CliTool::Gemini,
-            };
-            let config = SessionConfig { tool, ..SessionConfig::default() };
-            if let Err(e) = self.start_pty(cli, config).await {
-                eprintln!("[MultiCliManager] autostart PTY {:?} failed: {}", cli, e);
-            }
-        }
+    /// Each CLI runs isolated in `{sessions_dir}/{cli_name}/` so its dotfolder
+    /// (`.claude/`, `.codex/`, `.gemini/`) lives there.
+    pub fn cli_workdir(&self, cli: AgentCli) -> PathBuf {
+        self.config.sessions_dir.join(cli.as_str())
     }
 
     // =========================================================================
@@ -242,6 +217,8 @@ impl MultiCliManager {
     }
 
     /// Start a Pipe/Chat session for the given CLI.
+    ///
+    /// Deprecated: prefer `send_chat` which lazy-spawns on the first message.
     pub async fn start_pipe(
         &mut self,
         cli: AgentCli,
@@ -257,12 +234,7 @@ impl MultiCliManager {
             content: prompt.to_string(),
             tool_name: None,
         };
-        st.chat_messages.push(msg.clone());
-        let sessions_dir = self.config.sessions_dir.clone();
-        let pending_id = "pending";
-        if let Err(e) = crate::persist::persist_message(&sessions_dir, cli, pending_id, &msg) {
-            eprintln!("[MultiCliManager] persist error: {}", e);
-        }
+        st.chat_messages.push(msg);
         match PipeSession::spawn(config, prompt, PipeProcessOptions::default()).await {
             Ok(session) => {
                 let st = self.state_mut(cli);
@@ -301,7 +273,21 @@ impl MultiCliManager {
     // =========================================================================
 
     /// Write a string to the active PTY for the given CLI.
-    pub async fn write_pty(&self, cli: AgentCli, text: &str) -> Result<(), String> {
+    ///
+    /// Lazy-spawns a PTY session on the first call for this CLI.
+    pub async fn write_pty(&mut self, cli: AgentCli, text: &str) -> Result<(), String> {
+        let need_spawn = self.state(cli).pty_session.is_none();
+        if need_spawn {
+            let workdir = self.cli_workdir(cli);
+            fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
+            let tool = cli_to_tool(cli);
+            let config = SessionConfig {
+                tool,
+                working_dir: workdir,
+                ..SessionConfig::default()
+            };
+            self.start_pty(cli, config).await?;
+        }
         let st = self.state(cli);
         if let Some(ref session) = st.pty_session {
             session
@@ -313,30 +299,52 @@ impl MultiCliManager {
         }
     }
 
-    /// Send a chat prompt to the active pipe session for the given CLI.
+    /// Send a chat prompt to the pipe session for the given CLI.
+    ///
+    /// Lazy-spawns a pipe session on the first call for this CLI.
     pub async fn send_chat(&mut self, cli: AgentCli, prompt: &str) -> Result<(), String> {
-        let msg = ChatMessage {
-            role: ChatRole::User,
-            content: prompt.to_string(),
-            tool_name: None,
-        };
-        let sessions_dir = self.config.sessions_dir.clone();
-        {
-            let st = self.state_mut(cli);
-            st.chat_messages.push(msg.clone());
-            let sid = st.pipe_session_id.as_deref().unwrap_or("pending").to_string();
-            if let Err(e) = crate::persist::persist_message(&sessions_dir, cli, &sid, &msg) {
-                eprintln!("[MultiCliManager] persist error: {}", e);
+        let need_spawn = self.state(cli).pipe_session.is_none();
+        if need_spawn {
+            let workdir = self.cli_workdir(cli);
+            fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
+            let tool = cli_to_tool(cli);
+            let config = SessionConfig {
+                tool,
+                working_dir: workdir,
+                ..SessionConfig::default()
+            };
+            // Push the user message into the transient buffer immediately so UI shows it.
+            self.state_mut(cli).chat_messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: prompt.to_string(),
+                tool_name: None,
+            });
+            match PipeSession::spawn(config, prompt, PipeProcessOptions::default()).await {
+                Ok(session) => {
+                    let st = self.state_mut(cli);
+                    st.pipe_rx = Some(session.subscribe());
+                    st.pipe_session = Some(session);
+                    st.session_active = true;
+                    Ok(())
+                }
+                Err(e) => Err(format!("Failed to spawn pipe for {:?}: {}", cli, e)),
             }
-        }
-        let st = self.state(cli);
-        if let Some(ref session) = st.pipe_session {
-            session
-                .send_prompt(prompt)
-                .await
-                .map_err(|e| format!("Pipe send error ({:?}): {}", cli, e))
         } else {
-            Err(format!("No active pipe session for {:?}", cli))
+            // Existing session — push message and forward.
+            self.state_mut(cli).chat_messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: prompt.to_string(),
+                tool_name: None,
+            });
+            let st = self.state(cli);
+            if let Some(ref session) = st.pipe_session {
+                session
+                    .send_prompt(prompt)
+                    .await
+                    .map_err(|e| format!("Pipe send error ({:?}): {}", cli, e))
+            } else {
+                Err(format!("No active pipe session for {:?}", cli))
+            }
         }
     }
 
@@ -365,17 +373,15 @@ impl MultiCliManager {
 
     /// Drain events for all 3 CLIs. Returns `true` if any events were processed.
     pub fn drain_events(&mut self) -> bool {
-        let sessions_dir = self.config.sessions_dir.clone();
         let mut had_events = false;
         for i in 0..3 {
-            had_events |= Self::drain_one(&mut self.states[i], &sessions_dir);
+            had_events |= Self::drain_one(&mut self.states[i]);
         }
         had_events
     }
 
-    fn drain_one(st: &mut PerCliState, sessions_dir: &std::path::Path) -> bool {
+    fn drain_one(st: &mut PerCliState) -> bool {
         let mut had_events = false;
-        let cli = st.cli;
 
         // Drain PTY events
         if let Some(ref mut rx) = st.pty_rx {
@@ -411,19 +417,7 @@ impl MultiCliManager {
                         had_events = true;
                         match event {
                             AgentEvent::PipeSessionStart { session_id, model, .. } => {
-                                // Rename "pending" session dir to real session id
-                                let pending_dir =
-                                    sessions_dir.join(cli.as_str()).join("pending");
-                                let real_dir =
-                                    sessions_dir.join(cli.as_str()).join(&session_id);
-                                if pending_dir.exists() && !real_dir.exists() {
-                                    let _ = fs::rename(&pending_dir, &real_dir);
-                                }
                                 st.pipe_session_id = Some(session_id.clone());
-                                // Re-scan past sessions so picker stays current
-                                st.past_sessions =
-                                    crate::persist::scan_past_sessions(sessions_dir, cli);
-
                                 let msg = ChatMessage {
                                     role: ChatRole::Tool,
                                     content: format!(
@@ -433,22 +427,9 @@ impl MultiCliManager {
                                     ),
                                     tool_name: None,
                                 };
-                                if let Err(e) = crate::persist::persist_message(
-                                    sessions_dir,
-                                    cli,
-                                    &session_id,
-                                    &msg,
-                                ) {
-                                    eprintln!("[MultiCliManager] persist error: {}", e);
-                                }
                                 st.chat_messages.push(msg);
                             }
                             AgentEvent::PipeText { text, is_delta } => {
-                                let sid = st
-                                    .pipe_session_id
-                                    .as_deref()
-                                    .unwrap_or("pending")
-                                    .to_string();
                                 if is_delta {
                                     if let Some(last) = st.chat_messages.last_mut() {
                                         if last.role == ChatRole::Assistant {
@@ -456,146 +437,66 @@ impl MultiCliManager {
                                             continue;
                                         }
                                     }
-                                    let msg = ChatMessage {
+                                    st.chat_messages.push(ChatMessage {
                                         role: ChatRole::Assistant,
                                         content: text,
                                         tool_name: None,
-                                    };
-                                    if let Err(e) = crate::persist::persist_message(
-                                        sessions_dir, cli, &sid, &msg,
-                                    ) {
-                                        eprintln!("[MultiCliManager] persist error: {}", e);
-                                    }
-                                    st.chat_messages.push(msg);
+                                    });
                                 } else {
-                                    let msg = ChatMessage {
+                                    st.chat_messages.push(ChatMessage {
                                         role: ChatRole::Assistant,
                                         content: text,
                                         tool_name: None,
-                                    };
-                                    if let Err(e) = crate::persist::persist_message(
-                                        sessions_dir, cli, &sid, &msg,
-                                    ) {
-                                        eprintln!("[MultiCliManager] persist error: {}", e);
-                                    }
-                                    st.chat_messages.push(msg);
+                                    });
                                 }
                             }
                             AgentEvent::PipeToolStart { name, .. } => {
-                                let sid = st
-                                    .pipe_session_id
-                                    .as_deref()
-                                    .unwrap_or("pending")
-                                    .to_string();
-                                let msg = ChatMessage {
+                                st.chat_messages.push(ChatMessage {
                                     role: ChatRole::Tool,
                                     content: format!("Running {}...", name),
                                     tool_name: Some(name),
-                                };
-                                if let Err(e) = crate::persist::persist_message(
-                                    sessions_dir, cli, &sid, &msg,
-                                ) {
-                                    eprintln!("[MultiCliManager] persist error: {}", e);
-                                }
-                                st.chat_messages.push(msg);
+                                });
                             }
                             AgentEvent::PipeToolResult { id: _, output: _, is_error: _, .. } => {
-                                let sid = st
-                                    .pipe_session_id
-                                    .as_deref()
-                                    .unwrap_or("pending")
-                                    .to_string();
                                 if let Some(last) = st.chat_messages.last_mut() {
                                     if last.role == ChatRole::Tool {
                                         if let Some(ref name) = last.tool_name.clone() {
                                             last.content = format!("{}: done", name);
-                                            if let Err(e) = crate::persist::persist_message(
-                                                sessions_dir, cli, &sid, last,
-                                            ) {
-                                                eprintln!(
-                                                    "[MultiCliManager] persist error: {}",
-                                                    e
-                                                );
-                                            }
                                         }
                                     }
                                 }
                             }
                             AgentEvent::PipeThinking { text } => {
-                                let sid = st
-                                    .pipe_session_id
-                                    .as_deref()
-                                    .unwrap_or("pending")
-                                    .to_string();
-                                let msg = ChatMessage {
+                                st.chat_messages.push(ChatMessage {
                                     role: ChatRole::Thinking,
                                     content: text,
                                     tool_name: None,
-                                };
-                                if let Err(e) = crate::persist::persist_message(
-                                    sessions_dir, cli, &sid, &msg,
-                                ) {
-                                    eprintln!("[MultiCliManager] persist error: {}", e);
-                                }
-                                st.chat_messages.push(msg);
+                                });
                             }
                             AgentEvent::Error { message } => {
-                                let sid = st
-                                    .pipe_session_id
-                                    .as_deref()
-                                    .unwrap_or("pending")
-                                    .to_string();
-                                let msg = ChatMessage {
+                                st.chat_messages.push(ChatMessage {
                                     role: ChatRole::Error,
                                     content: message,
                                     tool_name: None,
-                                };
-                                if let Err(e) = crate::persist::persist_message(
-                                    sessions_dir, cli, &sid, &msg,
-                                ) {
-                                    eprintln!("[MultiCliManager] persist error: {}", e);
-                                }
-                                st.chat_messages.push(msg);
+                                });
                             }
                             AgentEvent::PipeTurnComplete { input_tokens, output_tokens } => {
-                                let sid = st
-                                    .pipe_session_id
-                                    .as_deref()
-                                    .unwrap_or("pending")
-                                    .to_string();
-                                let msg = ChatMessage {
+                                st.chat_messages.push(ChatMessage {
                                     role: ChatRole::Tool,
                                     content: format!(
                                         "in {} / out {} tokens",
                                         input_tokens, output_tokens
                                     ),
                                     tool_name: None,
-                                };
-                                if let Err(e) = crate::persist::persist_message(
-                                    sessions_dir, cli, &sid, &msg,
-                                ) {
-                                    eprintln!("[MultiCliManager] persist error: {}", e);
-                                }
-                                st.chat_messages.push(msg);
+                                });
                             }
                             AgentEvent::PipeSessionEnd { result, is_error, .. } => {
-                                let sid = st
-                                    .pipe_session_id
-                                    .as_deref()
-                                    .unwrap_or("pending")
-                                    .to_string();
                                 let status = if is_error { "error" } else { "done" };
-                                let msg = ChatMessage {
+                                st.chat_messages.push(ChatMessage {
                                     role: ChatRole::Tool,
                                     content: format!("Session {} · {}", status, result),
                                     tool_name: None,
-                                };
-                                if let Err(e) = crate::persist::persist_message(
-                                    sessions_dir, cli, &sid, &msg,
-                                ) {
-                                    eprintln!("[MultiCliManager] persist error: {}", e);
-                                }
-                                st.chat_messages.push(msg);
+                                });
                             }
                             AgentEvent::Exited { .. } => {
                                 st.session_active = false;
@@ -684,33 +585,71 @@ impl MultiCliManager {
         self.states.iter().any(|s| s.session_active)
     }
 
-    /// Returns the count of past sessions for the given CLI.
+    /// Number of past sessions for this CLI (live disk read).
     pub fn past_session_count(&self, cli: AgentCli) -> usize {
-        self.state(cli).past_sessions.len()
+        let workdir = self.cli_workdir(cli);
+        crate::history::reader_for(cli).list_sessions(&workdir).len()
     }
 
-    /// Cycle to the next past session for `cli` and load its messages.
-    /// Returns `true` if a session was loaded.
-    pub fn load_next_past_session(&mut self, cli: AgentCli) -> bool {
-        let sessions_dir = self.config.sessions_dir.clone();
-        let st = self.state_mut(cli);
-        if st.past_sessions.is_empty() {
+    /// List past sessions (newest first, live disk read).
+    pub fn list_past_sessions(&self, cli: AgentCli) -> Vec<crate::history::SessionMeta> {
+        let workdir = self.cli_workdir(cli);
+        crate::history::reader_for(cli).list_sessions(&workdir)
+    }
+
+    /// Load the latest past session into the chat view (display only — does NOT resume the CLI process).
+    ///
+    /// Returns `true` if anything was loaded.
+    pub fn load_latest_history(&mut self, cli: AgentCli) -> bool {
+        let workdir = self.cli_workdir(cli);
+        let reader = crate::history::reader_for(cli);
+        let latest = match reader.latest_session(&workdir) {
+            Some(id) => id,
+            None => return false,
+        };
+        let messages = reader.load_session(&workdir, &latest);
+        if messages.is_empty() {
             return false;
         }
-        let idx = st.past_session_view_idx % st.past_sessions.len();
-        let session_id = st.past_sessions[idx].clone();
-        let messages =
-            crate::persist::load_session(&sessions_dir, cli, &session_id).unwrap_or_default();
-        if !messages.is_empty() {
-            st.chat_messages = messages;
-        }
-        st.past_session_view_idx = (idx + 1) % st.past_sessions.len();
+        let st = self.state_mut(cli);
+        st.chat_messages = messages;
         true
+    }
+
+    /// Load a specific past session into the chat view (display only).
+    pub fn load_history(&mut self, cli: AgentCli, session_id: &str) -> bool {
+        let workdir = self.cli_workdir(cli);
+        let reader = crate::history::reader_for(cli);
+        let messages = reader.load_session(&workdir, session_id);
+        if messages.is_empty() {
+            return false;
+        }
+        self.state_mut(cli).chat_messages = messages;
+        true
+    }
+
+    /// Backwards-compatible wrapper — loads the latest past session.
+    ///
+    /// Chart-app callers using `load_next_past_session` continue to work unchanged.
+    pub fn load_next_past_session(&mut self, cli: AgentCli) -> bool {
+        self.load_latest_history(cli)
     }
 }
 
 impl Default for MultiCliManager {
     fn default() -> Self {
         Self::new(ManagerConfig::default())
+    }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+fn cli_to_tool(cli: AgentCli) -> CliTool {
+    match cli {
+        AgentCli::Claude => CliTool::ClaudeCode,
+        AgentCli::Codex => CliTool::Codex,
+        AgentCli::Gemini => CliTool::Gemini,
     }
 }

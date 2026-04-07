@@ -15,6 +15,14 @@ pub mod parser;
 pub mod ndjson;
 pub mod detection;
 pub mod cli;
+pub mod snapshot;
+pub mod persist;
+pub mod manager;
+
+pub use manager::{MultiCliManager, ManagerConfig};
+pub use snapshot::{
+    AgentCli, AgentRenderSnapshot, AgentSnapshotMode, ChatMessage, ChatRole, TermCell, TermGrid,
+};
 
 pub(crate) mod error;
 pub(crate) mod types;

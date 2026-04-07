@@ -335,7 +335,7 @@ impl MultiCliManager {
             self.state_mut(cli).tool_done_count = 0;
             self.state_mut(cli).chat_messages.push(ChatMessage {
                 role: ChatRole::Tool,
-                content: "⟳ thinking…".to_string(),
+                content: "... thinking".to_string(),
                 tool_name: Some("__progress__".to_string()),
             });
             // Resume the previous Claude session if we have its id captured.
@@ -369,7 +369,7 @@ impl MultiCliManager {
             self.state_mut(cli).tool_done_count = 0;
             self.state_mut(cli).chat_messages.push(ChatMessage {
                 role: ChatRole::Tool,
-                content: "⟳ thinking…".to_string(),
+                content: "... thinking".to_string(),
                 tool_name: Some("__progress__".to_string()),
             });
             let st = self.state(cli);

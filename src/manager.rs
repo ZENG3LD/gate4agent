@@ -618,10 +618,9 @@ impl MultiCliManager {
         let (cur_row, cur_col) = screen.cursor_position();
         grid.cursor_row = cur_row;
         grid.cursor_col = cur_col;
-        grid.cursor_visible = !screen.hide_cursor();
-        // Buddy extraction disabled — heuristic doesn't reliably catch the
-        // companion ASCII art yet. Kept in snapshot.rs for future experiments.
-        // grid.detect_and_extract_buddy();
+        // Always show cursor — TUIs like Claude Code/Ink hide it via DECTCEM,
+        // but users need to see where input goes. Override the hide flag.
+        grid.cursor_visible = true;
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Pty(grid),
             session_active: st.session_active,

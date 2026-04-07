@@ -329,6 +329,15 @@ impl MultiCliManager {
                 content: prompt.to_string(),
                 tool_name: None,
             });
+            // Show a transient "thinking" bubble immediately so the user
+            // sees feedback before the first NDJSON event arrives. It will
+            // be replaced/updated by drain_one as tool / text events flow.
+            self.state_mut(cli).tool_done_count = 0;
+            self.state_mut(cli).chat_messages.push(ChatMessage {
+                role: ChatRole::Tool,
+                content: "⟳ thinking…".to_string(),
+                tool_name: Some("__progress__".to_string()),
+            });
             // Resume the previous Claude session if we have its id captured.
             // This makes a sequence of `send_chat` calls feel like a continuous
             // chat thread instead of independent one-shots.
@@ -356,6 +365,12 @@ impl MultiCliManager {
                 role: ChatRole::User,
                 content: prompt.to_string(),
                 tool_name: None,
+            });
+            self.state_mut(cli).tool_done_count = 0;
+            self.state_mut(cli).chat_messages.push(ChatMessage {
+                role: ChatRole::Tool,
+                content: "⟳ thinking…".to_string(),
+                tool_name: Some("__progress__".to_string()),
             });
             let st = self.state(cli);
             if let Some(ref session) = st.pipe_session {
@@ -623,6 +638,7 @@ impl MultiCliManager {
         let (cur_row, cur_col) = screen.cursor_position();
         grid.cursor_row = cur_row;
         grid.cursor_col = cur_col;
+        grid.cursor_visible = !screen.hide_cursor();
         // Buddy extraction disabled — heuristic doesn't reliably catch the
         // companion ASCII art yet. Kept in snapshot.rs for future experiments.
         // grid.detect_and_extract_buddy();
@@ -674,6 +690,7 @@ impl MultiCliManager {
             let (cur_row, cur_col) = screen.cursor_position();
             grid.cursor_row = cur_row;
             grid.cursor_col = cur_col;
+            grid.cursor_visible = !screen.hide_cursor();
             // Buddy extraction disabled — heuristic doesn't reliably catch the
         // companion ASCII art yet. Kept in snapshot.rs for future experiments.
         // grid.detect_and_extract_buddy();
@@ -739,7 +756,10 @@ impl MultiCliManager {
         true
     }
 
-    /// Load a specific past session into the chat view (display only).
+    /// Load a specific past session into the chat view AND mark it as the
+    /// resume target — the next `send_chat` will respawn the pipe with
+    /// `--resume <session_id>`, so the user keeps writing into the chosen
+    /// thread instead of accidentally starting a fresh session.
     pub fn load_history(&mut self, cli: AgentCli, session_id: &str) -> bool {
         let workdir = self.cli_workdir(cli);
         let reader = crate::history::reader_for(cli);
@@ -747,7 +767,13 @@ impl MultiCliManager {
         if messages.is_empty() {
             return false;
         }
-        self.state_mut(cli).chat_messages = messages;
+        let st = self.state_mut(cli);
+        st.chat_messages = messages;
+        st.pipe_session_id = Some(session_id.to_string());
+        // Drop any stale live pipe handle so the next send_chat goes through
+        // the spawn branch and picks up the resume id.
+        st.pipe_session = None;
+        st.pipe_rx = None;
         true
     }
 

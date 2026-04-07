@@ -67,6 +67,9 @@ pub struct TermGrid {
     pub rows: u16,
     pub cursor_row: u16,
     pub cursor_col: u16,
+    /// Whether the terminal cursor should be visible (mirrors vt100's
+    /// `hide_cursor()` flag — TUIs toggle this off while drawing custom UI).
+    pub cursor_visible: bool,
     /// Optional ASCII-art "buddy" extracted from the right side of the grid.
     /// When `Some`, the cells covered by the buddy have already been blanked
     /// inside `cells`, so the main grid renders cleanly across the full width.
@@ -96,6 +99,7 @@ impl TermGrid {
             rows,
             cursor_row: 0,
             cursor_col: 0,
+            cursor_visible: true,
             buddy: None,
         }
     }

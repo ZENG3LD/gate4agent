@@ -618,9 +618,10 @@ impl MultiCliManager {
         let (cur_row, cur_col) = screen.cursor_position();
         grid.cursor_row = cur_row;
         grid.cursor_col = cur_col;
-        // Always show cursor — TUIs like Claude Code/Ink hide it via DECTCEM,
-        // but users need to see where input goes. Override the hide flag.
-        grid.cursor_visible = true;
+        // Respect DECTCEM: Ink-based TUIs (Claude Code) hide the terminal
+        // cursor during their render cycle and only show it at input prompts,
+        // so mirroring `!hide_cursor()` gives the correct input location.
+        grid.cursor_visible = !screen.hide_cursor();
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Pty(grid),
             session_active: st.session_active,

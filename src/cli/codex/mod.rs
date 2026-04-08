@@ -7,6 +7,9 @@
 //! - Response parsing (rate limits, token usage, status info)
 //! - ANSI escape code stripping
 
+pub mod parser;
+pub use parser::CodexNdjsonParser;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io;

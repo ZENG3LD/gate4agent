@@ -29,6 +29,9 @@
 //! If real output differs from the assumed shape, reconcile in a future patch
 //! (see Phase 3 risk note in transport-expansion.md).
 
+pub mod parser;
+pub use parser::CursorNdjsonParser;
+
 use crate::cli::traits::CliCommandBuilder;
 use crate::transport::SpawnOptions;
 

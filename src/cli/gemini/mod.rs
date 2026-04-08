@@ -9,6 +9,9 @@
 //! - Extension, MCP, and Skills management
 //! - Session and checkpoint management
 
+pub mod parser;
+pub use parser::GeminiNdjsonParser;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -3,6 +3,9 @@
 //! This module provides comprehensive bindings for Claude Code CLI,
 //! including all slash commands, keyboard shortcuts, and response parsing.
 
+pub mod parser;
+pub use parser::ClaudeNdjsonParser;
+
 use regex::Regex;
 use std::collections::HashMap;
 use std::io;

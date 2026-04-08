@@ -1,5 +1,5 @@
 pub mod traits;
-pub mod parsers;
+pub mod factory;
 
 pub use traits::{CliEvent, NdjsonParser};
-pub use parsers::{ClaudeNdjsonParser, CodexNdjsonParser, GeminiNdjsonParser, create_ndjson_parser};
+pub use factory::create_ndjson_parser;

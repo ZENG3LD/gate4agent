@@ -27,6 +27,9 @@
 //!
 //! If real output differs from the assumed shape, reconcile in a future patch.
 
+pub mod parser;
+pub use parser::OpenCodeNdjsonParser;
+
 use crate::cli::traits::CliCommandBuilder;
 use crate::transport::SpawnOptions;
 

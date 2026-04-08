@@ -266,22 +266,155 @@ fn gemini_prompt_is_last_arg() {
 }
 
 // ─────────────────────────────────────────────
-// Stubs — just verify they don't panic
+// Cursor Agent
 // ─────────────────────────────────────────────
+//
+// Source: https://cursor.com/docs/cli/headless
+// Argv shape: cursor-agent -p --output-format stream-json [--model <m>] [--resume <id>] [<extra>...] "<prompt>"
+// The prompt is a positional arg (unlike Claude which uses stdin).
 
 #[test]
-fn cursor_stub_does_not_panic() {
+fn cursor_fresh_session_argv() {
     let builder = cli_builder(CliTool::Cursor);
-    let opts = make_opts("test");
-    let _cmd = builder.build_command(&opts); // must not panic
+    let opts = make_opts("explain rust lifetimes");
+    let cmd = builder.build_command(&opts);
+
+    assert_eq!(get_program(&cmd), "cursor-agent");
+    let got = get_args(&cmd);
+    // Must contain -p and --output-format stream-json
+    assert!(got.contains(&"-p"), "Cursor argv must include -p");
+    assert!(
+        got.windows(2).any(|w| w == ["--output-format", "stream-json"]),
+        "Cursor argv must include --output-format stream-json"
+    );
+    // Prompt must be the last arg (positional, not stdin)
+    assert_eq!(
+        got.last().copied(),
+        Some("explain rust lifetimes"),
+        "Cursor: prompt must be the last positional argv token"
+    );
 }
 
 #[test]
-fn opencode_stub_does_not_panic() {
-    let builder = cli_builder(CliTool::OpenCode);
-    let opts = make_opts("test");
-    let _cmd = builder.build_command(&opts);
+fn cursor_with_resume_argv() {
+    let builder = cli_builder(CliTool::Cursor);
+    let opts = SpawnOptions {
+        prompt: "continue the task".to_string(),
+        resume_session_id: Some("cursor_ses_abc123".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    assert_eq!(get_program(&cmd), "cursor-agent");
+    let got = get_args(&cmd);
+    // --resume <id> must appear
+    assert!(
+        got.windows(2).any(|w| w == ["--resume", "cursor_ses_abc123"]),
+        "--resume <id> must appear in Cursor resume argv"
+    );
+    // Prompt must still be last
+    assert_eq!(
+        got.last().copied(),
+        Some("continue the task"),
+        "Cursor resume: prompt must be the last positional argv token"
+    );
 }
+
+#[test]
+fn cursor_prompt_is_last_arg() {
+    let builder = cli_builder(CliTool::Cursor);
+    let opts = make_opts("my cursor prompt");
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert_eq!(
+        got.last().copied(),
+        Some("my cursor prompt"),
+        "Cursor: prompt must be the last argv token"
+    );
+}
+
+// ─────────────────────────────────────────────
+// OpenCode
+// ─────────────────────────────────────────────
+//
+// Source: https://opencode.ai/docs/cli/
+// Argv shape: opencode run --format json [--session <ses_XXXX>] [<extra>...] "<prompt>"
+
+#[test]
+fn opencode_fresh_session_argv() {
+    let builder = cli_builder(CliTool::OpenCode);
+    let opts = make_opts("write a function");
+    let cmd = builder.build_command(&opts);
+
+    assert_eq!(get_program(&cmd), "opencode");
+    let got = get_args(&cmd);
+    // Must start with "run"
+    assert_eq!(got.first().copied(), Some("run"), "OpenCode argv must start with 'run'");
+    // Must contain --format json
+    assert!(
+        got.windows(2).any(|w| w == ["--format", "json"]),
+        "OpenCode argv must include --format json"
+    );
+    // Prompt must be last
+    assert_eq!(
+        got.last().copied(),
+        Some("write a function"),
+        "OpenCode: prompt must be the last positional argv token"
+    );
+    // Must NOT contain --session when no resume
+    assert!(
+        !got.contains(&"--session"),
+        "OpenCode fresh session must not contain --session"
+    );
+}
+
+#[test]
+fn opencode_with_session_argv() {
+    let builder = cli_builder(CliTool::OpenCode);
+    let opts = SpawnOptions {
+        prompt: "continue".to_string(),
+        resume_session_id: Some("ses_abc".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    assert_eq!(get_program(&cmd), "opencode");
+    let got = get_args(&cmd);
+    // --session ses_abc must appear before the prompt
+    let session_pos = got.iter().position(|a| *a == "--session");
+    let prompt_pos = got.iter().position(|a| *a == "continue");
+    assert!(session_pos.is_some(), "--session flag must appear in argv");
+    // The value after --session must be the session ID
+    assert_eq!(
+        got.get(session_pos.unwrap() + 1).copied(),
+        Some("ses_abc"),
+        "--session value must be the session ID"
+    );
+    // --session must appear before the prompt
+    assert!(
+        session_pos.unwrap() < prompt_pos.unwrap(),
+        "--session must appear before the prompt in argv"
+    );
+}
+
+#[test]
+fn opencode_prompt_is_last_arg() {
+    let builder = cli_builder(CliTool::OpenCode);
+    let opts = make_opts("my opencode prompt");
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert_eq!(
+        got.last().copied(),
+        Some("my opencode prompt"),
+        "OpenCode: prompt must be the last argv token"
+    );
+}
+
+// ─────────────────────────────────────────────
+// OpenClaw stub — verify no panic (Phase 4)
+// ─────────────────────────────────────────────
 
 #[test]
 fn openclaw_stub_does_not_panic() {

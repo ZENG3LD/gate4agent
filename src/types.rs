@@ -12,6 +12,12 @@ pub enum CliTool {
     ClaudeCode,
     Codex,
     Gemini,
+    /// Cursor Agent — PIPE transport, stream-json output (~Claude-compatible).
+    Cursor,
+    /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
+    OpenCode,
+    /// OpenClaw — DaemonHarness transport, requires pre-running daemon.
+    OpenClaw,
 }
 
 impl std::fmt::Display for CliTool {
@@ -20,6 +26,9 @@ impl std::fmt::Display for CliTool {
             CliTool::ClaudeCode => write!(f, "Claude Code"),
             CliTool::Codex => write!(f, "Codex"),
             CliTool::Gemini => write!(f, "Gemini"),
+            CliTool::Cursor => write!(f, "Cursor"),
+            CliTool::OpenCode => write!(f, "OpenCode"),
+            CliTool::OpenClaw => write!(f, "OpenClaw"),
         }
     }
 }
@@ -109,21 +118,21 @@ pub enum AgentEvent {
     /// PTY tool approval needed.
     PtyToolApproval { tool_name: String, description: Option<String> },
 
-    // --- Pipe / NDJSON mode events ---
-    /// Session initialized (from stream-json `system/init` event).
-    PipeSessionStart { session_id: String, model: String, tools: Vec<String> },
+    // --- Stream events (transport-neutral; formerly Pipe-prefixed) ---
+    /// Session initialized. Produced by all PIPE and DaemonHarness transports.
+    SessionStart { session_id: String, model: String, tools: Vec<String> },
     /// Streaming text delta from assistant (is_delta=true) or complete turn text.
-    PipeText { text: String, is_delta: bool },
+    Text { text: String, is_delta: bool },
     /// Tool call started by assistant.
-    PipeToolStart { id: String, name: String, input: serde_json::Value },
+    ToolStart { id: String, name: String, input: serde_json::Value },
     /// Tool call completed.
-    PipeToolResult { id: String, output: String, is_error: bool, duration_ms: Option<u64> },
+    ToolResult { id: String, output: String, is_error: bool, duration_ms: Option<u64> },
     /// Assistant thinking/reasoning block.
-    PipeThinking { text: String },
+    Thinking { text: String },
     /// Turn complete with token usage.
-    PipeTurnComplete { input_tokens: u64, output_tokens: u64 },
+    TurnComplete { input_tokens: u64, output_tokens: u64 },
     /// Session ended with final result.
-    PipeSessionEnd { result: String, cost_usd: Option<f64>, is_error: bool },
+    SessionEnd { result: String, cost_usd: Option<f64>, is_error: bool },
 
     // --- Both modes ---
     /// Rate limit detected (from text pattern matching).

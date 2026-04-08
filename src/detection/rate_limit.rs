@@ -31,6 +31,10 @@ impl RateLimitDetector {
             CliTool::ClaudeCode => Self::build_claude_patterns(),
             CliTool::Codex => Self::build_codex_patterns(),
             CliTool::Gemini => Self::build_gemini_patterns(),
+            // Phase 3: Cursor, OpenCode, OpenClaw will get their own pattern builders
+            // once real CLI output has been captured and rate-limit message formats confirmed.
+            // For now use empty pattern sets — no false positives, no detections.
+            CliTool::Cursor | CliTool::OpenCode | CliTool::OpenClaw => vec![],
         };
         Self { patterns }
     }

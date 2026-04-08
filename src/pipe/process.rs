@@ -150,15 +150,29 @@ impl PipeProcess {
                     cmd_str
                 }
                 CliTool::Codex => {
-                    // Codex doesn't support stdin prompt — keep as arg
-                    format!("codex exec --json \"{}\"", _prompt.replace('"', "\\\""))
-                }
-                CliTool::Gemini => {
-                    // Gemini doesn't support stdin prompt — keep as arg
+                    // Codex doesn't support stdin prompt — keep as arg.
+                    // --ask-for-approval never: without this, Codex blocks on interactive
+                    //   tool approval prompts when piped, causing the reader loop to hang forever.
+                    // --skip-git-repo-check: allows spawning Codex in non-git directories
+                    //   (chart app sessions, daemon contexts).
                     format!(
-                        "gemini --output-format stream-json -p \"{}\" --yolo",
+                        "codex exec --json --ask-for-approval never --skip-git-repo-check \"{}\"",
                         _prompt.replace('"', "\\\"")
                     )
+                }
+                CliTool::Gemini => {
+                    // Gemini doesn't support stdin prompt — keep as arg.
+                    // Note: --verbose is intentionally omitted. It is not required for
+                    // --output-format stream-json and only adds stderr noise (Gemini CLI v0.36.0).
+                    format!(
+                        "gemini --output-format stream-json -p \"{}\"",
+                        _prompt.replace('"', "\\\"")
+                    )
+                }
+                // Phase 3/4: Cursor, OpenCode, OpenClaw command building will be
+                // implemented when their spawn specifications are finalized.
+                CliTool::Cursor | CliTool::OpenCode | CliTool::OpenClaw => {
+                    String::from("echo \"unsupported tool\"")
                 }
             };
             let mut cmd = Command::new("cmd");
@@ -196,12 +210,25 @@ impl PipeProcess {
                 }
                 CliTool::Codex => {
                     let mut cmd = Command::new("codex");
-                    cmd.args(["exec", "--json", _prompt]);
+                    // --ask-for-approval never: without this, Codex blocks on interactive
+                    //   tool approval prompts when piped, causing the reader loop to hang forever.
+                    // --skip-git-repo-check: allows spawning Codex in non-git directories
+                    //   (chart app sessions, daemon contexts).
+                    cmd.args(["exec", "--json", "--ask-for-approval", "never", "--skip-git-repo-check", _prompt]);
                     cmd
                 }
                 CliTool::Gemini => {
                     let mut cmd = Command::new("gemini");
-                    cmd.args(["--output-format", "stream-json", "-p", _prompt, "--yolo"]);
+                    // Note: --verbose is intentionally omitted. It is not required for
+                    // --output-format stream-json and only adds stderr noise (Gemini CLI v0.36.0).
+                    cmd.args(["--output-format", "stream-json", "-p", _prompt]);
+                    cmd
+                }
+                // Phase 3/4: Cursor, OpenCode, OpenClaw command building will be
+                // implemented when their spawn specifications are finalized.
+                CliTool::Cursor | CliTool::OpenCode | CliTool::OpenClaw => {
+                    let mut cmd = Command::new("echo");
+                    cmd.arg("unsupported tool");
                     cmd
                 }
             }

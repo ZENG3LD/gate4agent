@@ -32,4 +32,10 @@ pub enum AgentError {
         #[from]
         source: serde_json::Error,
     },
+
+    #[error("required daemon is not running at {host}:{port}: {detail}")]
+    DaemonNotRunning { host: String, port: u16, detail: String },
+
+    #[error("daemon probe timed out after {timeout_ms}ms at {host}:{port}")]
+    DaemonProbeTimeout { host: String, port: u16, timeout_ms: u64 },
 }

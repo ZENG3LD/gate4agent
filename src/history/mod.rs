@@ -32,12 +32,18 @@ pub trait HistoryReader {
     }
 }
 
-/// Get a reader for the given CLI. Codex/Gemini are stub readers (return empty).
+/// Get a reader for the given CLI. All except Claude are stub readers (return empty).
+///
+/// Cursor, OpenCode, OpenClaw history reading will be implemented in Phase 3/4
+/// once their on-disk session storage layouts are confirmed.
 pub fn reader_for(cli: AgentCli) -> Box<dyn HistoryReader> {
     match cli {
         AgentCli::Claude => Box::new(claude::ClaudeHistoryReader),
-        AgentCli::Codex => Box::new(StubReader),
-        AgentCli::Gemini => Box::new(StubReader),
+        AgentCli::Codex
+        | AgentCli::Gemini
+        | AgentCli::Cursor
+        | AgentCli::OpenCode
+        | AgentCli::OpenClaw => Box::new(StubReader),
     }
 }
 

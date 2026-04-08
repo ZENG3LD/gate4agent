@@ -245,6 +245,10 @@ impl MultiCliManager {
             AgentCli::Claude => 0,
             AgentCli::Codex => 1,
             AgentCli::Gemini => 2,
+            // Cursor, OpenCode, OpenClaw do not have legacy slots — they are
+            // managed through the per-instance API. Map to slot 0 as a safe
+            // fallback; callers must not pass these to legacy methods.
+            AgentCli::Cursor | AgentCli::OpenCode | AgentCli::OpenClaw => 0,
         }
     }
 
@@ -928,13 +932,13 @@ impl MultiCliManager {
                     Ok(event) => {
                         had_events = true;
                         match event {
-                            AgentEvent::PipeSessionStart { session_id, .. } => {
+                            AgentEvent::SessionStart { session_id, .. } => {
                                 // Capture id for --resume on the next prompt.
                                 // Do NOT push a ChatMessage — that was the source
                                 // of "[tool] unknown · session XXXX" spam.
                                 inst.pipe_session_id = Some(session_id);
                             }
-                            AgentEvent::PipeText { text, is_delta: _ } => {
+                            AgentEvent::Text { text, is_delta: _ } => {
                                 // Finalize any RunningTool status: push a "done" history entry.
                                 if let LiveStatus::RunningTool { ref name, done } =
                                     inst.live_status.clone()
@@ -959,7 +963,7 @@ impl MultiCliManager {
                                     tool_name: None,
                                 });
                             }
-                            AgentEvent::PipeToolStart { name, .. } => {
+                            AgentEvent::ToolStart { name, .. } => {
                                 // Finalize previous tool if any.
                                 if let LiveStatus::RunningTool {
                                     name: ref prev,
@@ -975,7 +979,7 @@ impl MultiCliManager {
                                 // Start tracking the new tool.
                                 inst.live_status = LiveStatus::RunningTool { name, done: 0 };
                             }
-                            AgentEvent::PipeToolResult {
+                            AgentEvent::ToolResult {
                                 id: _,
                                 output: _,
                                 is_error: _,
@@ -986,7 +990,7 @@ impl MultiCliManager {
                                     *done = done.saturating_add(1);
                                 }
                             }
-                            AgentEvent::PipeThinking { text: _ } => {
+                            AgentEvent::Thinking { text: _ } => {
                                 // Keep Thinking status as-is; suppress bubble noise.
                             }
                             AgentEvent::Error { message } => {
@@ -997,7 +1001,7 @@ impl MultiCliManager {
                                     tool_name: None,
                                 });
                             }
-                            AgentEvent::PipeTurnComplete { .. } => {
+                            AgentEvent::TurnComplete { .. } => {
                                 // Finalize any in-flight tool and clear live status.
                                 if let LiveStatus::RunningTool { ref name, done } =
                                     inst.live_status.clone()
@@ -1010,7 +1014,7 @@ impl MultiCliManager {
                                 }
                                 inst.live_status = LiveStatus::Idle;
                             }
-                            AgentEvent::PipeSessionEnd {
+                            AgentEvent::SessionEnd {
                                 result, is_error, ..
                             } => {
                                 if is_error {
@@ -1347,5 +1351,8 @@ fn cli_to_tool(cli: AgentCli) -> CliTool {
         AgentCli::Claude => CliTool::ClaudeCode,
         AgentCli::Codex => CliTool::Codex,
         AgentCli::Gemini => CliTool::Gemini,
+        AgentCli::Cursor => CliTool::Cursor,
+        AgentCli::OpenCode => CliTool::OpenCode,
+        AgentCli::OpenClaw => CliTool::OpenClaw,
     }
 }

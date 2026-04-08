@@ -309,7 +309,9 @@ impl NdjsonParser for CodexNdjsonParser {
                                 input: serde_json::json!({"command": cmd}),
                             });
                         }
-                        Some("agent_message") => {
+                        // Both "agent_message" and "assistant_message" are valid names
+                        // depending on the Codex version. Treat them as aliases.
+                        Some("agent_message") | Some("assistant_message") => {
                             // Message starting — will get content in item.completed
                         }
                         Some("file_change") => {
@@ -346,8 +348,11 @@ impl NdjsonParser for CodexNdjsonParser {
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            // [BUGFIX] Codex emits "aggregated_output", not "output".
+                            // Reading "output" always returned an empty string for all
+                            // shell command results in pipe mode.
                             let output = item
-                                .get("output")
+                                .get("aggregated_output")
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("")
                                 .to_string();
@@ -360,7 +365,9 @@ impl NdjsonParser for CodexNdjsonParser {
                                 duration_ms: None,
                             });
                         }
-                        Some("agent_message") => {
+                        // Both "agent_message" and "assistant_message" are valid names
+                        // depending on the Codex version. Treat them as aliases.
+                        Some("agent_message") | Some("assistant_message") => {
                             let text = item
                                 .get("text")
                                 .and_then(|s| s.as_str())
@@ -570,11 +577,21 @@ impl NdjsonParser for GeminiNdjsonParser {
 }
 
 /// Create NDJSON parser for the given tool.
+///
+/// Cursor, OpenCode, and OpenClaw parsers are not yet implemented (Phase 3/4).
+/// For now they fall back to the Claude parser as a stub — they will be replaced
+/// with proper parsers when their CLI output has been captured and confirmed.
 pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
     match tool {
         CliTool::ClaudeCode => Box::new(ClaudeNdjsonParser::new()),
         CliTool::Codex => Box::new(CodexNdjsonParser::new()),
         CliTool::Gemini => Box::new(GeminiNdjsonParser::new()),
+        // Phase 3/4: these parsers will be implemented once real CLI output has
+        // been captured and confirmed. Claude parser is used as a structural stub
+        // so the factory compiles and dispatch works end-to-end.
+        CliTool::Cursor | CliTool::OpenCode | CliTool::OpenClaw => {
+            Box::new(ClaudeNdjsonParser::new())
+        }
     }
 }
 
@@ -639,6 +656,73 @@ mod tests {
                 assert_eq!(session_id, "thread_xyz");
             }
             _ => panic!("expected SessionStart"),
+        }
+    }
+
+    /// Regression test: Codex emits "aggregated_output" for command_execution results,
+    /// NOT "output". Reading the wrong field returns an empty string — this test guards
+    /// against regressing to that behavior.
+    #[test]
+    fn codex_aggregated_output_regression() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc 'ls -la'","aggregated_output":"total 48\ndrwxr-xr-x 12 user user 4096 Apr  9 12:00 .","exit_code":0,"status":"completed"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1, "expected exactly one ToolCallResult event");
+        match &events[0] {
+            CliEvent::ToolCallResult { output, is_error, .. } => {
+                assert!(
+                    !output.is_empty(),
+                    "aggregated_output must not be empty — parser may be reading the wrong field"
+                );
+                assert!(output.contains("total 48"), "expected ls output in aggregated_output");
+                assert!(!is_error, "status=completed should not be an error");
+            }
+            other => panic!("expected ToolCallResult, got {:?}", other),
+        }
+    }
+
+    /// Test that "assistant_message" is accepted as an alias for "agent_message"
+    /// in item.completed. Some Codex versions use one or the other.
+    #[test]
+    fn codex_assistant_message_alias_completed() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"assistant_message","text":"Here is what I found: some result"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1, "expected exactly one AssistantText event");
+        match &events[0] {
+            CliEvent::AssistantText { text, is_delta } => {
+                assert_eq!(text, "Here is what I found: some result");
+                assert!(!is_delta, "completed message should not be a delta");
+            }
+            other => panic!("expected AssistantText, got {:?}", other),
+        }
+    }
+
+    /// Test that "assistant_message" in item.started is silently consumed (no events),
+    /// same as "agent_message" — the content arrives in item.completed.
+    #[test]
+    fn codex_assistant_message_alias_started() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.started","item":{"id":"item_3","type":"assistant_message","status":"in_progress"}}"#;
+        let events = parser.parse_line(line);
+        assert!(
+            events.is_empty(),
+            "item.started for assistant_message should produce no events (content comes in item.completed)"
+        );
+    }
+
+    /// Test that "agent_message" still works (alias must not break the original).
+    #[test]
+    fn codex_agent_message_original_still_works() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Original agent_message format still works"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::AssistantText { text, .. } => {
+                assert_eq!(text, "Original agent_message format still works");
+            }
+            other => panic!("expected AssistantText, got {:?}", other),
         }
     }
 }

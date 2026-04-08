@@ -169,31 +169,31 @@ fn map_cli_event(event: CliEvent) -> AgentEvent {
             session_id,
             model,
             tools,
-        } => AgentEvent::PipeSessionStart {
+        } => AgentEvent::SessionStart {
             session_id,
             model,
             tools,
         },
-        CliEvent::AssistantText { text, is_delta } => AgentEvent::PipeText { text, is_delta },
+        CliEvent::AssistantText { text, is_delta } => AgentEvent::Text { text, is_delta },
         CliEvent::ToolCallStart { id, name, input } => {
-            AgentEvent::PipeToolStart { id, name, input }
+            AgentEvent::ToolStart { id, name, input }
         }
         CliEvent::ToolCallResult {
             id,
             output,
             is_error,
             duration_ms,
-        } => AgentEvent::PipeToolResult {
+        } => AgentEvent::ToolResult {
             id,
             output,
             is_error,
             duration_ms,
         },
-        CliEvent::Thinking { text } => AgentEvent::PipeThinking { text },
+        CliEvent::Thinking { text } => AgentEvent::Thinking { text },
         CliEvent::TurnComplete {
             input_tokens,
             output_tokens,
-        } => AgentEvent::PipeTurnComplete {
+        } => AgentEvent::TurnComplete {
             input_tokens,
             output_tokens,
         },
@@ -201,7 +201,7 @@ fn map_cli_event(event: CliEvent) -> AgentEvent {
             result,
             cost_usd,
             is_error,
-        } => AgentEvent::PipeSessionEnd {
+        } => AgentEvent::SessionEnd {
             result,
             cost_usd,
             is_error,

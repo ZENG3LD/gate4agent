@@ -8,9 +8,10 @@
 
 pub use error::AgentError;
 pub use types::{AgentEvent, CliTool, PtyEvent, SessionConfig};
-pub use transport::SpawnOptions;
+pub use transport::{SpawnOptions, DaemonProbe, DaemonSpec, ensure_daemon_running};
 
 pub mod transport;
+pub mod daemon;
 pub mod pty;
 pub mod pipe;
 pub mod parser;

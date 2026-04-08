@@ -959,11 +959,201 @@ impl NdjsonParser for OpenCodeNdjsonParser {
     }
 }
 
-/// Create NDJSON parser for the given tool.
+/// OpenClaw NDJSON parser.
 ///
-/// OpenClaw parser is not yet implemented (Phase 4).
-/// It falls back to the Claude parser as a structural stub — will be replaced
-/// with a proper parser in Phase 4 after daemon output capture.
+/// Parses output from: `acpx openclaw --format json "<prompt>"`
+///
+/// OpenClaw output is assumed ACP stream-json-compatible, meaning the NDJSON
+/// shape is similar to Claude Code `--output-format stream-json`.
+///
+/// # Source
+/// - docs/research/cli-agents-headless-modes-2026.md — OpenClaw / acpx section
+///
+/// # Field name assumptions
+/// All field names below are assumed per ACP protocol documentation and the
+/// research doc. They have NOT been confirmed against a live capture. A future
+/// patch must reconcile these against real output once a live openclaw install
+/// is available. Fields are annotated inline where assumed.
+///
+/// # Event schema (assumed)
+///
+/// | `type` value      | gate4agent event  | Key fields (assumed) |
+/// |-------------------|-------------------|----------------------|
+/// | `"system"` + `subtype:"init"` | `SessionStart` | `session_id` |
+/// | `"session/start"` | `SessionStart`    | `session_id`         |
+/// | `"assistant"`     | `AssistantText`   | `text`               |
+/// | `"text"`          | `AssistantText`   | `text`               |
+/// | `"tool_use"`      | `ToolCallStart`   | `id`, `name`, `input`|
+/// | `"tool_result"`   | `ToolCallResult`  | `id`, `output`, `is_error` |
+/// | `"result"`        | silent (SessionEnd synthesized by pipe_runner in Phase 5) | |
+/// | `"session/end"`   | silent            | |
+pub struct OpenClawNdjsonParser {
+    session_id: Option<String>,
+}
+
+impl OpenClawNdjsonParser {
+    pub fn new() -> Self {
+        Self { session_id: None }
+    }
+}
+
+impl Default for OpenClawNdjsonParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NdjsonParser for OpenClawNdjsonParser {
+    fn parse_line(&mut self, line: &str) -> Vec<CliEvent> {
+        let line = line.trim();
+        if line.is_empty() {
+            return vec![];
+        }
+
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                return vec![CliEvent::Error {
+                    message: format!("invalid JSON: {}", truncate_str(line, 100)),
+                }]
+            }
+        };
+
+        let mut events = Vec::new();
+
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match ty {
+            // Session start — two assumed shapes:
+            //   {"type":"system","subtype":"init","session_id":"..."}
+            //   {"type":"session/start","session_id":"..."}
+            // Field "subtype" assumed per ACP init convention (research doc).
+            // Field "session_id" assumed per ACP protocol, not confirmed via live capture.
+            "system" | "session/start" => {
+                let is_init = ty == "session/start"
+                    || v.get("subtype").and_then(|s| s.as_str()) == Some("init");
+
+                if is_init {
+                    // session_id field: assumed per ACP protocol, not confirmed via live capture.
+                    let sid = v
+                        .get("session_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.session_id = Some(sid.clone());
+                    events.push(CliEvent::SessionStart {
+                        session_id: sid,
+                        // model field: not documented for OpenClaw/acpx; default to "openclaw".
+                        // Assumed per research doc, not confirmed via live capture.
+                        model: v
+                            .get("model")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("openclaw")
+                            .to_string(),
+                        tools: vec![],
+                    });
+                }
+            }
+
+            // Assistant text — two assumed shapes:
+            //   {"type":"assistant","text":"..."}
+            //   {"type":"text","text":"..."}
+            // Field "text" assumed per ACP stream-json convention, not confirmed via live capture.
+            "assistant" | "text" => {
+                // Check for flat "text" field first (assumed primary shape for OpenClaw).
+                // Assumed per research doc, not confirmed via live capture.
+                let text_val = v
+                    .get("text")
+                    .and_then(|s| s.as_str())
+                    // Fallback: check nested message/content array (Claude-compatible shape).
+                    // Assumed per ACP stream-json-compatible docs, not confirmed via live capture.
+                    .map(|t| t.to_string())
+                    .or_else(|| {
+                        v.pointer("/message/content")
+                            .and_then(|c| c.as_array())
+                            .and_then(|arr| {
+                                arr.iter()
+                                    .find(|b| {
+                                        b.get("type").and_then(|t| t.as_str()) == Some("text")
+                                    })
+                                    .and_then(|b| b.get("text").and_then(|t| t.as_str()))
+                                    .map(|t| t.to_string())
+                            })
+                    });
+
+                if let Some(text) = text_val {
+                    if !text.is_empty() {
+                        events.push(CliEvent::AssistantText {
+                            text,
+                            is_delta: false,
+                        });
+                    }
+                }
+            }
+
+            // Tool call start.
+            // Field names "id", "name", "input" assumed per ACP tool_use convention.
+            // Assumed per research doc, not confirmed via live capture.
+            "tool_use" => {
+                let id = v
+                    .get("id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = v
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // "input" field: assumed per ACP tool_use convention, not confirmed.
+                let input = v.get("input").cloned().unwrap_or(Value::Null);
+                events.push(CliEvent::ToolCallStart { id, name, input });
+            }
+
+            // Tool call result.
+            // Field names "id", "output", "is_error" assumed per ACP convention.
+            // Assumed per research doc, not confirmed via live capture.
+            "tool_result" => {
+                let id = v
+                    .get("id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = v
+                    .get("output")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let is_error = v
+                    .get("is_error")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                events.push(CliEvent::ToolCallResult {
+                    id,
+                    output,
+                    is_error,
+                    duration_ms: None,
+                });
+            }
+
+            // "result" and "session/end": session termination signals.
+            // SessionEnd will be synthesized by the pipe_runner in Phase 5.
+            // These are consumed silently here to avoid spurious unknown-type noise.
+            "result" | "session/end" => {}
+
+            // Unknown event types are silently skipped.
+            _ => {}
+        }
+
+        events
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+}
+
+/// Create NDJSON parser for the given tool.
 pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
     match tool {
         CliTool::ClaudeCode => Box::new(ClaudeNdjsonParser::new()),
@@ -971,9 +1161,7 @@ pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
         CliTool::Gemini => Box::new(GeminiNdjsonParser::new()),
         CliTool::Cursor => Box::new(CursorNdjsonParser::new()),
         CliTool::OpenCode => Box::new(OpenCodeNdjsonParser::new()),
-        // Phase 4: OpenClaw parser will be implemented after daemon output capture.
-        // Claude parser used as a structural stub until then.
-        CliTool::OpenClaw => Box::new(ClaudeNdjsonParser::new()),
+        CliTool::OpenClaw => Box::new(OpenClawNdjsonParser::new()),
     }
 }
 
@@ -1272,6 +1460,145 @@ mod tests {
                 assert!(text.contains("model not available"));
             }
             other => panic!("expected AssistantText with error prefix, got {:?}", other),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // OpenClaw fixture tests
+    //
+    // Hand-authored NDJSON based on assumed ACP stream-json-compatible shape.
+    // Source: docs/research/cli-agents-headless-modes-2026.md, OpenClaw section.
+    // Field names are ASSUMED per ACP protocol convention and have NOT been
+    // confirmed against a live openclaw/acpx capture.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Feed a "system" + subtype:"init" line — should produce SessionStart.
+    ///
+    /// Shape: `{"type":"system","subtype":"init","session_id":"claw_test_1"}`
+    /// Assumed per ACP protocol (research doc); not confirmed against live capture.
+    #[test]
+    fn openclaw_parses_session_start() {
+        let mut parser = OpenClawNdjsonParser::new();
+
+        let line = r#"{"type":"system","subtype":"init","session_id":"claw_test_1"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1, "system/init must produce exactly one SessionStart event");
+        match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "claw_test_1");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+    }
+
+    /// Feed an "assistant" type line with flat "text" field — should produce AssistantText.
+    ///
+    /// Shape: `{"type":"assistant","text":"hello"}`
+    /// Assumed per ACP convention (research doc); not confirmed against live capture.
+    #[test]
+    fn openclaw_parses_assistant_text() {
+        let mut parser = OpenClawNdjsonParser::new();
+
+        let line = r#"{"type":"assistant","text":"hello"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1, "assistant text line must produce exactly one AssistantText event");
+        match &events[0] {
+            CliEvent::AssistantText { text, is_delta } => {
+                assert_eq!(text, "hello");
+                assert!(!is_delta, "flat text events are not deltas");
+            }
+            other => panic!("expected AssistantText, got {:?}", other),
+        }
+    }
+
+    /// After feeding a session/init line, `parser.session_id()` must return the id.
+    #[test]
+    fn openclaw_tracks_session_id() {
+        let mut parser = OpenClawNdjsonParser::new();
+
+        assert!(parser.session_id().is_none(), "no session_id before any input");
+
+        let line = r#"{"type":"system","subtype":"init","session_id":"claw_test_1"}"#;
+        parser.parse_line(line);
+
+        assert_eq!(
+            parser.session_id(),
+            Some("claw_test_1"),
+            "session_id must be tracked after session/init line"
+        );
+    }
+
+    /// "session/start" type also produces SessionStart (alias shape).
+    #[test]
+    fn openclaw_parses_session_slash_start() {
+        let mut parser = OpenClawNdjsonParser::new();
+
+        let line = r#"{"type":"session/start","session_id":"claw_sess_2"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "claw_sess_2");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+    }
+
+    /// "result" and "session/end" types are silently consumed (no events).
+    #[test]
+    fn openclaw_result_and_session_end_are_silent() {
+        let mut parser = OpenClawNdjsonParser::new();
+
+        let result_line = r#"{"type":"result","status":"ok"}"#;
+        let end_line = r#"{"type":"session/end"}"#;
+
+        assert!(
+            parser.parse_line(result_line).is_empty(),
+            "\"result\" type must produce no events (SessionEnd synthesized by pipe_runner)"
+        );
+        assert!(
+            parser.parse_line(end_line).is_empty(),
+            "\"session/end\" type must produce no events"
+        );
+    }
+
+    /// tool_use type produces ToolCallStart.
+    #[test]
+    fn openclaw_parses_tool_use() {
+        let mut parser = OpenClawNdjsonParser::new();
+
+        let line = r#"{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallStart { id, name, .. } => {
+                assert_eq!(id, "tu_1");
+                assert_eq!(name, "Bash");
+            }
+            other => panic!("expected ToolCallStart, got {:?}", other),
+        }
+    }
+
+    /// tool_result type produces ToolCallResult.
+    #[test]
+    fn openclaw_parses_tool_result() {
+        let mut parser = OpenClawNdjsonParser::new();
+
+        let line = r#"{"type":"tool_result","id":"tu_1","output":"file contents","is_error":false}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, output, is_error, .. } => {
+                assert_eq!(id, "tu_1");
+                assert_eq!(output, "file contents");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolCallResult, got {:?}", other),
         }
     }
 }

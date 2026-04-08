@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Universal transport library for 5 CLI AI agents (Claude Code, Codex, Gemini, Cursor, OpenCode). Pipe and PTY transports. TransportSession is a thin router over PipeSession."
 license = "MIT"

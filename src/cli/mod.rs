@@ -3,7 +3,6 @@ pub mod codex;
 pub mod gemini;
 pub mod cursor;
 pub mod opencode;
-pub mod openclaw;
 pub mod traits;
 pub mod pipeline;
 pub mod factory;

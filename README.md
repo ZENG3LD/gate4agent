@@ -1,6 +1,6 @@
 # gate4agent
 
-Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for six different CLI agents through one unified API.
+Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for five different CLI agents through one unified API.
 
 **Not a harness. Not a sandbox.** gate4agent is the thin wiring layer between your Rust app and the CLI agent's subprocess: spawn the binary, write the prompt, read structured events, resume by session id. That's it.
 
@@ -13,12 +13,10 @@ Universal Rust transport library for CLI AI agents. Spawn, stream, resume — fo
 | **Gemini** | Pipe + PTY | ✓ stream-json | ✗ (not in CLI) | — |
 | **Cursor Agent** | Pipe | ✓ stream-json | ✓ `--resume <id>` | Claude-compatible schema |
 | **OpenCode** (`sst/opencode`) | Pipe | ✓ `--format json` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
-| **OpenClaw** | DaemonHarness | ✓ via `acpx` | ✓ (assumed) | Requires running openclaw daemon + `npm i -g acpx` |
 
 Transport classes:
 - **Pipe**: spawn the CLI directly, read NDJSON over stdout
 - **PTY**: spawn inside a pseudo-terminal, scrape the screen with vt100 (for agents without structured output)
-- **DaemonHarness**: pre-probe a running daemon via raw TCP, then spawn the client binary over pipe
 
 ## Quick start
 
@@ -38,15 +36,15 @@ async fn main() -> anyhow::Result<()> {
         env_vars: vec![],
     };
 
-    let mut session = TransportSession::spawn(
+    let session = TransportSession::spawn(
         CliTool::ClaudeCode,
         &opts.working_dir.clone(),
         &opts.prompt.clone(),
         opts,
-    )?;
+    ).await?;
 
-    let rx = session.subscribe();
-    while let Ok(event) = rx.recv() {
+    let mut rx = session.subscribe();
+    while let Ok(event) = rx.recv().await {
         match event {
             AgentEvent::Text { text, .. } => print!("{text}"),
             AgentEvent::SessionEnd { .. } => break,
@@ -68,23 +66,33 @@ let opts = SpawnOptions {
 
 Each CLI handles resume in its own way — Codex swaps `exec` → `exec resume <id>`, Claude/Cursor use `--resume <id>`, OpenCode uses `--session <ses_XXX>`. gate4agent hides the difference behind `SpawnOptions::resume_session_id`.
 
-### DaemonHarness (OpenClaw)
-
-OpenClaw requires a running daemon. gate4agent probes it via raw TCP (no HTTP client) before spawning the `acpx` client. If the daemon is down, `TransportSession::spawn` returns `AgentError::DaemonNotRunning` or `DaemonProbeTimeout`.
+### Using PipeSession directly (backwards-compatible API)
 
 ```rust
-let session = TransportSession::spawn(CliTool::OpenClaw, &cwd, &prompt, opts)?;
+use gate4agent::{PipeSession, PipeProcessOptions, ClaudeOptions, SessionConfig, CliTool};
+
+let config = SessionConfig {
+    tool: CliTool::ClaudeCode,
+    working_dir: std::env::current_dir()?,
+    env_vars: vec![],
+    name: None,
+};
+let opts = PipeProcessOptions {
+    claude: ClaudeOptions { model: Some("claude-opus-4".into()), ..Default::default() },
+    ..Default::default()
+};
+let session = PipeSession::spawn(config, "hello", opts).await?;
 ```
 
 ## Features
 
-- **Single API for 6 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)`
+- **Single API for 5 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)`
+- **Backwards-compatible `PipeSession`** — 0.1.x consumers that used `PipeSession::spawn(config, prompt, options)` compile unchanged
 - **SessionEnd synthesis** — Codex has no terminal event; gate4agent synthesizes `SessionEnd { result: "exit_code=N", is_error: N != 0 }` on child exit
-- **Raw TCP daemon probe** — no `reqwest`, no HTTP client, `std::net` only
 - **Transport-neutral events** — `AgentEvent::{Text, ToolStart, ToolResult, Thinking, TurnComplete, SessionStart, SessionEnd}`
 - **Cross-platform** — Windows (ConPTY + `cmd /C` argv wrapping) and Unix (POSIX PTY + bare exec)
 - **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
-- **Zero new dependencies** — gate4agent 0.2.0 added 3 CLIs, a daemon transport, and a unified session API without pulling in any new crate
+- **Zero new dependencies** — gate4agent 0.2.1 removes dead fantasy transports without adding anything new
 
 ## Architecture
 
@@ -93,14 +101,13 @@ gate4agent/
 ├── src/
 │   ├── lib.rs           — Library root, re-exports
 │   ├── types.rs         — AgentEvent, CliTool, SessionConfig
-│   ├── error.rs         — AgentError (DaemonNotRunning, DaemonProbeTimeout, ...)
-│   ├── transport/       — ★ TransportSession, SpawnOptions, pipe_runner, daemon_runner
-│   ├── cli/             — Per-tool spawn builders + parsers (claude, codex, gemini, cursor, opencode, openclaw)
+│   ├── error.rs         — AgentError
+│   ├── transport/       — TransportSession (thin router over PipeSession), SpawnOptions
+│   ├── cli/             — Per-tool spawn builders + parsers (claude, codex, gemini, cursor, opencode)
 │   ├── ndjson/          — NDJSON parsers per CLI
 │   ├── parser/          — VTE + screen parser for PTY mode
 │   ├── pty/             — PTY session (PtyWrapper, PtySession)
-│   ├── pipe/            — Low-level PipeProcess (used internally by pipe_runner)
-│   ├── daemon/          — TCP liveness probe (std::net only)
+│   ├── pipe/            — PipeSession + PipeProcess (primary pipe entry point)
 │   └── detection/       — Rate limit detection
 ```
 
@@ -115,16 +122,25 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 | Gemini | `npm install -g @google/gemini-cli` |
 | Cursor Agent | See https://cursor.com/docs/cli |
 | OpenCode | `npm install -g opencode-ai` (or see https://opencode.ai) |
-| OpenClaw (via acpx) | `npm install -g acpx` + running openclaw daemon |
 
 ## Versioning
 
 - **0.1.x** — original 3-CLI library (Claude, Codex, Gemini)
-- **0.2.0** — breaking: 6 CLIs, `TransportSession`, `AgentEvent` renamed, `PipeSession` removed
+- **0.2.0** — breaking: 6 CLIs, `TransportSession`, `AgentEvent` renamed, `PipeSession` removed, OpenClaw fantasy transport
+- **0.2.1** — cleanup: OpenClaw removed (was never functional), `PipeSession` restored for 0.1.x compatibility, `TransportSession` is now a thin router over `PipeSession`
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 
-## Migration from 0.1.x to 0.2.0
+## Migration guide
+
+### 0.2.0 → 0.2.1
+
+- **OpenClaw removed** — `CliTool::OpenClaw` no longer exists. If you matched on it, delete that arm. OpenClaw was never functional (unverified daemon protocol, fictional acpx API surface).
+- **`PipeSession` restored** — 0.1.x callers that used `PipeSession::spawn(config, prompt, options)` compile again. The `PipeSession` now includes SessionEnd synthesis (previously only in the 0.2.0 `pipe_runner`).
+- **`TransportSession`** is now a thin wrapper over `PipeSession`. Its public API (`spawn`, `subscribe`, `session_id`, `send_prompt`, `kill`) is unchanged. Internal: no more `TransportHandle` enum, no dead `Pty` variant.
+- **`DaemonNotRunning` / `DaemonProbeTimeout` error variants removed** — they were only reachable via OpenClaw. Remove any match arms for these.
+
+### 0.1.x → 0.2.1
 
 1. **Events**: `AgentEvent::Pipe*` → neutral names. Rename all match arms:
    - `PipeText` → `Text`
@@ -135,13 +151,11 @@ See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) fo
    - `PipeSessionStart` → `SessionStart`
    - `PipeSessionEnd` → `SessionEnd`
 
-2. **Entry point**: `PipeSession::spawn(config, prompt, options)` → `TransportSession::spawn(tool, cwd, prompt, SpawnOptions)`. `PipeSession` no longer exists.
+2. **`PipeSession::spawn`** — signature unchanged: `PipeSession::spawn(config, prompt, options)`. Compiles directly.
 
-3. **SpawnOptions**: replaces `PipeProcessOptions` / `ClaudeOptions`. Fields: `working_dir`, `prompt`, `resume_session_id`, `model`, `append_system_prompt`, `extra_args`, `env_vars`.
+3. **`SpawnOptions`**: new unified struct. Fields: `working_dir`, `prompt`, `resume_session_id`, `model`, `append_system_prompt`, `extra_args`, `env_vars`.
 
-4. **CliTool** is now non-exhaustive in effect (3 new variants: `Cursor`, `OpenCode`, `OpenClaw`). Add arms or a `_ =>` fallback.
-
-5. **AgentError**: new variants `DaemonNotRunning { host, port, detail }` and `DaemonProbeTimeout { host, port, timeout_ms }` — handle them when calling OpenClaw.
+4. **`CliTool`** is now non-exhaustive in effect (2 new variants: `Cursor`, `OpenCode`). Add arms or a `_ =>` fallback.
 
 ## Support the Project
 

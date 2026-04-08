@@ -16,8 +16,6 @@ pub enum CliTool {
     Cursor,
     /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
     OpenCode,
-    /// OpenClaw — DaemonHarness transport, requires pre-running daemon.
-    OpenClaw,
 }
 
 impl std::fmt::Display for CliTool {
@@ -28,7 +26,6 @@ impl std::fmt::Display for CliTool {
             CliTool::Gemini => write!(f, "Gemini"),
             CliTool::Cursor => write!(f, "Cursor"),
             CliTool::OpenCode => write!(f, "OpenCode"),
-            CliTool::OpenClaw => write!(f, "OpenClaw"),
         }
     }
 }
@@ -83,13 +80,6 @@ pub enum RateLimitType {
     Weekly,
     /// Unknown limit type.
     Unknown,
-}
-
-/// Low-level PTY event (used internally before classification).
-#[derive(Debug, Clone)]
-pub struct PtyEvent {
-    /// Raw bytes from PTY.
-    pub raw: String,
 }
 
 /// Unified event type produced by both PTY and pipe transports.

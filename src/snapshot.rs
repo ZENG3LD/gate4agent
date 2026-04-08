@@ -12,8 +12,6 @@ pub enum AgentCli {
     Cursor,
     /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
     OpenCode,
-    /// OpenClaw — DaemonHarness transport, requires pre-running daemon.
-    OpenClaw,
 }
 
 impl AgentCli {
@@ -25,7 +23,6 @@ impl AgentCli {
             AgentCli::Gemini => "gemini",
             AgentCli::Cursor => "cursor",
             AgentCli::OpenCode => "opencode",
-            AgentCli::OpenClaw => "openclaw",
         }
     }
 
@@ -37,19 +34,17 @@ impl AgentCli {
             AgentCli::Gemini => "Gemini",
             AgentCli::Cursor => "Cursor",
             AgentCli::OpenCode => "OpenCode",
-            AgentCli::OpenClaw => "OpenClaw",
         }
     }
 
-    /// Returns the next CLI in cycle order: ClaudeCode → Codex → Gemini → Cursor → OpenCode → OpenClaw → ClaudeCode.
+    /// Returns the next CLI in cycle order: Claude → Codex → Gemini → Cursor → OpenCode → Claude.
     pub fn cycle(self) -> Self {
         match self {
             AgentCli::Claude => AgentCli::Codex,
             AgentCli::Codex => AgentCli::Gemini,
             AgentCli::Gemini => AgentCli::Cursor,
             AgentCli::Cursor => AgentCli::OpenCode,
-            AgentCli::OpenCode => AgentCli::OpenClaw,
-            AgentCli::OpenClaw => AgentCli::Claude,
+            AgentCli::OpenCode => AgentCli::Claude,
         }
     }
 }

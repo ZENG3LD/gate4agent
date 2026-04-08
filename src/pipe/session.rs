@@ -1,62 +1,99 @@
-//! Pipe runner — spawns a CLI process and drives the NDJSON reader loop.
+//! Async pipe session with tokio broadcast fan-out.
 //!
-//! Phase 5 deliverable. This module lifts the reader-loop logic out of
-//! `pipe/session.rs` and adds **SessionEnd synthesis**: when a child process
-//! exits and the parser has not emitted a `SessionEnd` event (e.g. Codex, which
-//! has no terminal event by design), the runner synthesizes one automatically:
+//! `PipeSession` spawns a CLI tool in headless pipe mode and broadcasts
+//! NDJSON events as `AgentEvent` to all subscribers via a tokio broadcast channel.
+//!
+//! # SessionEnd synthesis
+//!
+//! When a child process exits without having emitted a `SessionEnd` event
+//! (e.g. Codex, which exits with code 0 but never emits a terminal event),
+//! the reader loop synthesizes one automatically:
 //!
 //! ```text
 //! AgentEvent::SessionEnd { result: "exit_code=N", cost_usd: None, is_error: N != 0 }
 //! ```
 //!
-//! This ensures all PIPE and DaemonHarness consumers see exactly one
-//! `SessionEnd` per session, regardless of which CLI produced it.
+//! This guarantees exactly one `SessionEnd` per session regardless of CLI.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use crate::error::AgentError;
 use crate::ndjson::{create_ndjson_parser, CliEvent};
 use crate::pipe::process::{PipeProcess, PipeProcessOptions};
-use crate::transport::SpawnOptions;
-use crate::types::{AgentEvent, CliTool};
+use crate::types::{AgentEvent, CliTool, SessionConfig};
 
-// ---------------------------------------------------------------------------
-// PipeRunnerHandle — public handle returned to callers
-// ---------------------------------------------------------------------------
-
-/// Handle to a running pipe-based CLI session.
+/// Async pipe session. Spawns a CLI tool in headless pipe mode and broadcasts
+/// NDJSON events as `AgentEvent` to all subscribers via a tokio broadcast channel.
 ///
-/// Returned by [`run_pipe`]. Provides event subscription, prompt sending,
-/// and process termination. The reader loop and SessionEnd synthesis run
-/// in a background blocking thread managed by this handle.
-pub struct PipeRunnerHandle {
-    pub(crate) tx: broadcast::Sender<AgentEvent>,
-    /// Guard held for as long as the child process is alive.
-    /// Wrapped in `Option` so we can move it out on `kill()`.
-    pub(crate) process: Arc<Mutex<Option<PipeProcess>>>,
-    pub(crate) session_id: String,
+/// This is the machine-readable counterpart to `PtySession`. Use this for
+/// Telegram bots, web UIs, HTTP SSE, Discord bots, etc.
+pub struct PipeSession {
+    session_id: String,
+    tx: broadcast::Sender<AgentEvent>,
+    stdin: Arc<Mutex<Option<PipeProcess>>>,
+    reader_task: JoinHandle<()>,
 }
 
-impl PipeRunnerHandle {
-    /// Subscribe to all future `AgentEvent` values from this session.
+impl PipeSession {
+    /// Spawn an agent in headless pipe mode and start broadcasting NDJSON events.
+    ///
+    /// # Errors
+    ///
+    /// - `AgentError::Spawn` — the child process failed to start
+    pub async fn spawn(
+        config: SessionConfig,
+        initial_prompt: &str,
+        options: PipeProcessOptions,
+    ) -> Result<Self, AgentError> {
+        let tool = config.tool;
+        let session_id = uuid_v4();
+
+        let pipe = PipeProcess::new_with_options(
+            tool,
+            &config.working_dir,
+            initial_prompt,
+            options,
+        )
+        .map_err(|e| AgentError::Spawn { source: e })?;
+
+        let (tx, _) = broadcast::channel::<AgentEvent>(256);
+
+        let _ = tx.send(AgentEvent::Started {
+            session_id: session_id.clone(),
+        });
+
+        let pipe = Arc::new(Mutex::new(Some(pipe)));
+        let pipe_clone = pipe.clone();
+        let tx_clone = tx.clone();
+        let sid_clone = session_id.clone();
+
+        let reader_task = tokio::task::spawn_blocking(move || {
+            reader_loop(pipe_clone, tx_clone, tool, sid_clone);
+        });
+
+        Ok(Self {
+            session_id,
+            tx,
+            stdin: pipe,
+            reader_task,
+        })
+    }
+
+    /// Subscribe to receive all future `AgentEvent` values from this session.
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.tx.subscribe()
     }
 
-    /// The session ID assigned at spawn time.
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    /// Send a follow-up prompt via stdin (for CLIs that support multi-turn pipe mode).
+    /// Send a follow-up prompt via stdin (for persistent session mode).
     pub async fn send_prompt(&self, prompt: &str) -> Result<(), AgentError> {
         let prompt = prompt.to_owned();
-        let process = self.process.clone();
+        let pipe = self.stdin.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = process
+            let mut guard = pipe
                 .lock()
                 .map_err(|_| AgentError::Pty("pipe mutex poisoned".into()))?;
             if let Some(ref mut p) = *guard {
@@ -69,11 +106,17 @@ impl PipeRunnerHandle {
         .map_err(|_| AgentError::Pty("spawn_blocking panicked".into()))?
     }
 
-    /// Kill the underlying process.
+    /// Session ID assigned at spawn time.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Kill the pipe process.
     pub async fn kill(&self) -> Result<(), AgentError> {
-        let process = self.process.clone();
+        self.reader_task.abort();
+        let pipe = self.stdin.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = process
+            let mut guard = pipe
                 .lock()
                 .map_err(|_| AgentError::Pty("pipe mutex poisoned".into()))?;
             if let Some(ref mut p) = *guard {
@@ -87,76 +130,21 @@ impl PipeRunnerHandle {
 }
 
 // ---------------------------------------------------------------------------
-// run_pipe — spawn + reader thread entry point
-// ---------------------------------------------------------------------------
-
-/// Spawn a pipe-based CLI process and return a [`PipeRunnerHandle`].
-///
-/// The initial prompt is embedded in `opts` (via `SpawnOptions::prompt`).
-/// The reader loop starts immediately in a blocking background thread.
-///
-/// # SessionEnd synthesis
-///
-/// When the child process exits, if the parser has not already emitted a
-/// `AgentEvent::SessionEnd`, the runner synthesizes one:
-/// ```text
-/// AgentEvent::SessionEnd { result: "exit_code=N", cost_usd: None, is_error: N != 0 }
-/// ```
-/// This covers Codex, which exits with code 0 but never emits a terminal event.
-pub fn run_pipe(
-    tool: CliTool,
-    opts: SpawnOptions,
-) -> Result<PipeRunnerHandle, AgentError> {
-    let session_id = uuid_v4();
-
-    // Convert SpawnOptions → PipeProcessOptions for the legacy PipeProcess.
-    let pipe_opts = spawn_opts_to_pipe_opts(&opts);
-
-    let pipe = PipeProcess::new_with_options(tool, &opts.working_dir, &opts.prompt, pipe_opts)
-        .map_err(|e| AgentError::Spawn { source: e })?;
-
-    let (tx, _) = broadcast::channel::<AgentEvent>(256);
-
-    // Broadcast the Started lifecycle event immediately.
-    let _ = tx.send(AgentEvent::Started {
-        session_id: session_id.clone(),
-    });
-
-    let process = Arc::new(Mutex::new(Some(pipe)));
-    let process_clone = process.clone();
-    let tx_clone = tx.clone();
-    let sid_clone = session_id.clone();
-
-    // Spawn the reader loop on a dedicated blocking thread.
-    tokio::task::spawn_blocking(move || {
-        reader_loop(process_clone, tx_clone, tool, sid_clone);
-    });
-
-    Ok(PipeRunnerHandle {
-        tx,
-        process,
-        session_id,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Reader loop (blocking thread)
+// Reader loop (runs on blocking thread)
 // ---------------------------------------------------------------------------
 
 fn reader_loop(
-    process: Arc<Mutex<Option<PipeProcess>>>,
+    pipe: Arc<Mutex<Option<PipeProcess>>>,
     tx: broadcast::Sender<AgentEvent>,
     tool: CliTool,
     _session_id: String,
 ) {
     let mut parser = create_ndjson_parser(tool);
-    // Tracks whether the parser has ever emitted SessionEnd.
-    // If false when the child exits, we synthesize one.
     let mut parser_emitted_session_end = false;
 
     loop {
         let line = {
-            match process.lock() {
+            match pipe.lock() {
                 Ok(guard) => {
                     if let Some(ref p) = *guard {
                         p.try_recv()
@@ -171,15 +159,13 @@ fn reader_loop(
         let line = match line {
             Some(l) => l,
             None => {
-                // No data available; check if the child is still running.
-                let still_running = process
+                let still_running = pipe
                     .lock()
                     .ok()
                     .and_then(|mut g| g.as_mut().map(|p| p.is_running()))
                     .unwrap_or(false);
                 if !still_running {
-                    // Child exited — get exit code and synthesize SessionEnd if needed.
-                    let exit_code = get_exit_code(&process);
+                    let exit_code = get_exit_code(&pipe);
                     if !parser_emitted_session_end {
                         let _ = tx.send(AgentEvent::SessionEnd {
                             result: format!("exit_code={}", exit_code),
@@ -197,7 +183,6 @@ fn reader_loop(
 
         let events = parser.parse_line(&line);
         for event in events {
-            // Track whether the parser produced a SessionEnd.
             if matches!(event, CliEvent::SessionEnd { .. }) {
                 parser_emitted_session_end = true;
             }
@@ -224,7 +209,7 @@ fn get_exit_code(process: &Arc<Mutex<Option<PipeProcess>>>) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// CliEvent → AgentEvent mapping (shared with pipe/session.rs)
+// CliEvent → AgentEvent mapping
 // ---------------------------------------------------------------------------
 
 pub(crate) fn map_cli_event(event: CliEvent) -> AgentEvent {
@@ -276,24 +261,13 @@ pub(crate) fn map_cli_event(event: CliEvent) -> AgentEvent {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn spawn_opts_to_pipe_opts(opts: &SpawnOptions) -> PipeProcessOptions {
-    PipeProcessOptions {
-        extra_args: opts.extra_args.clone(),
-        claude: crate::pipe::process::ClaudeOptions {
-            resume_session_id: opts.resume_session_id.clone(),
-            model: opts.model.clone(),
-            append_system_prompt: opts.append_system_prompt.clone(),
-        },
-    }
-}
-
 fn uuid_v4() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("runner-{:x}", t)
+    format!("pipe-{:x}", t)
 }
 
 // ---------------------------------------------------------------------------
@@ -344,9 +318,6 @@ mod tests {
     }
 
     /// Helper: drive the synthesis logic directly without spawning a real process.
-    ///
-    /// Simulates a reader loop with the given parser and lines, then returns
-    /// all AgentEvent values that would be emitted (excluding broadcast overhead).
     fn simulate_reader(
         parser: &mut dyn NdjsonParser,
         lines: &[&str],
@@ -365,7 +336,6 @@ mod tests {
             }
         }
 
-        // Simulate process exit.
         if !parser_emitted_session_end {
             events.push(AgentEvent::SessionEnd {
                 result: format!("exit_code={}", exit_code),
@@ -391,7 +361,6 @@ mod tests {
             "expected exactly one SessionEnd when parser never emits one"
         );
 
-        // Verify the synthetic event has the right shape.
         let session_end = events
             .iter()
             .find(|e| matches!(e, AgentEvent::SessionEnd { .. }))
@@ -421,7 +390,6 @@ mod tests {
     #[test]
     fn parser_emitted_session_end_not_duplicated() {
         let mut parser = AlwaysEndsParser::new();
-        // Feed one line so the parser emits its SessionEnd.
         let events = simulate_reader(&mut parser, &["anything"], 0);
 
         let session_end_count = events
@@ -433,7 +401,6 @@ mod tests {
             "expected exactly one SessionEnd when parser already emitted one"
         );
 
-        // The emitted one should be the parser's, not the synthetic one.
         let session_end = events
             .iter()
             .find(|e| matches!(e, AgentEvent::SessionEnd { .. }))
@@ -448,7 +415,6 @@ mod tests {
         let mut parser = NeverEndsParser;
         let events = simulate_reader(&mut parser, &[], 0);
 
-        // SessionEnd must come before Exited.
         let session_end_pos = events
             .iter()
             .position(|e| matches!(e, AgentEvent::SessionEnd { .. }))

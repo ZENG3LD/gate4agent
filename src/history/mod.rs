@@ -42,8 +42,7 @@ pub fn reader_for(cli: AgentCli) -> Box<dyn HistoryReader> {
         AgentCli::Codex
         | AgentCli::Gemini
         | AgentCli::Cursor
-        | AgentCli::OpenCode
-        | AgentCli::OpenClaw => Box::new(StubReader),
+        | AgentCli::OpenCode => Box::new(StubReader),
     }
 }
 

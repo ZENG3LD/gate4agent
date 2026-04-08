@@ -1,4 +1,4 @@
-//! Integration tests for `TransportSession` — public API surface and SessionEnd synthesis.
+//! Integration tests for `TransportSession` — public API surface and dispatch.
 //!
 //! These tests verify:
 //! 1. `TransportSession` is accessible from the public API (re-export works).
@@ -8,15 +8,12 @@
 //! Note: Live process spawning is NOT tested here — no real CLI binaries
 //! (claude, codex, cursor, etc.) are required. The synthesis logic is covered
 //! by unit tests inside `src/transport/pipe_runner.rs`.
-//!
-//! The integration-level concern here is that the public exports are wired
-//! correctly and the dispatch match in `TransportSession::spawn` is exhaustive.
 
 use gate4agent::{CliTool, SpawnOptions, TransportSession};
 
-/// Verify that all 6 `CliTool` variants are accessible and that `SpawnOptions`
+/// Verify that all 5 `CliTool` variants are accessible and that `SpawnOptions`
 /// can be default-constructed. This is a compile-time test — if the match in
-/// `TransportSession::spawn` is not exhaustive, this test won't compile.
+/// `TransportSession::spawn_pipe` is not exhaustive, this test won't compile.
 #[test]
 fn all_cli_tool_variants_are_accessible() {
     let tools = [
@@ -25,9 +22,8 @@ fn all_cli_tool_variants_are_accessible() {
         CliTool::Gemini,
         CliTool::Cursor,
         CliTool::OpenCode,
-        CliTool::OpenClaw,
     ];
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 5);
 }
 
 /// Verify `SpawnOptions` can be constructed with resume_session_id.
@@ -46,7 +42,6 @@ fn spawn_options_with_resume_id() {
 /// This is a compile-time test — if the re-export is missing, this won't compile.
 #[test]
 fn transport_session_is_public_type() {
-    // Use the type in a way that would fail to compile if it's not pub.
     let _: fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = _>>> = || {
         Box::pin(async {
             let dir = std::path::Path::new(".");
@@ -68,7 +63,6 @@ fn transport_session_is_public_type() {
 /// (Compile-time verification that the public API is complete.)
 #[test]
 fn transport_session_public_methods_exist() {
-    // This closure captures the trait bounds — if any method is missing, compile fails.
     fn _assert_api_exists() {
         async fn _check(session: TransportSession) -> &'static str {
             let _rx = session.subscribe();
@@ -78,29 +72,4 @@ fn transport_session_public_methods_exist() {
             "ok"
         }
     }
-}
-
-/// Verify OpenClaw dispatch returns DaemonNotRunning when no daemon is listening.
-///
-/// This test attempts to spawn an OpenClaw session — since no openclaw daemon
-/// is running in CI, it must return an error (not panic or hang).
-#[tokio::test]
-async fn openclaw_spawn_returns_daemon_error_when_no_daemon() {
-    let dir = std::env::temp_dir();
-    let result = TransportSession::spawn(
-        CliTool::OpenClaw,
-        &dir,
-        "test",
-        SpawnOptions::default(),
-    )
-    .await;
-
-    let err = result.err().expect("OpenClaw spawn must fail when no daemon is running");
-    let err_str = format!("{}", err);
-    // Error must be DaemonNotRunning or DaemonProbeTimeout — NOT a panic or Spawn error.
-    assert!(
-        err_str.contains("not running") || err_str.contains("timed out"),
-        "Expected daemon not running or timed out error, got: {}",
-        err_str
-    );
 }

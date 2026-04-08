@@ -1,16 +1,14 @@
-//! Transport layer — unified entry point for spawning CLI agent processes.
+//! Transport layer — thin dispatch router for spawning CLI agent processes.
 //!
-//! Phase 2: `SpawnOptions` struct used by per-CLI `build_command` functions.
-//! Phase 4: `DaemonProbe`, `DaemonSpec`, `ensure_daemon_running` for daemon-backed tools.
-//! Phase 5: `TransportSession` unified entry point + `pipe_runner` with SessionEnd synthesis.
+//! Two transport modes exist:
+//! - **Pipe**: NDJSON-streaming subprocesses (Claude, Codex, Gemini, Cursor, OpenCode)
+//!   Entry point: `PipeSession::spawn` or `TransportSession::spawn` (routes to PipeSession)
+//! - **PTY**: pseudo-terminal screen-scraping — use `pty::PtySession` directly
+//!
+//! `TransportSession` is a thin wrapper over `PipeSession` providing the same API.
 
 mod options;
-pub mod daemon_spec;
-pub mod daemon_runner;
-pub(crate) mod pipe_runner;
 pub mod session;
 
 pub use options::SpawnOptions;
-pub use daemon_spec::{DaemonProbe, DaemonSpec};
-pub use daemon_runner::ensure_daemon_running;
 pub use session::TransportSession;

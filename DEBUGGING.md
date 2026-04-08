@@ -23,8 +23,8 @@ If a session produces no events:
 
 ### Codex
 
-- **Production bug fixed in 0.2.0**: `CodexNdjsonParser` was reading `item.get("output")` for command results but Codex actually emits `aggregated_output`. Any 0.1.x consumer would see empty shell output. Upgrade to 0.2.0 if you care about tool results.
-- **Interactive hangs without `--ask-for-approval never`**: fixed in 0.2.0. If you still see hangs, check you're on 0.2.0.
+- **Production bug fixed in 0.2.0**: `CodexNdjsonParser` was reading `item.get("output")` for command results but Codex actually emits `aggregated_output`. Any 0.1.x consumer would see empty shell output. Upgrade to 0.2.0+ if you care about tool results.
+- **Interactive hangs without `--ask-for-approval never`**: fixed in 0.2.0. If you still see hangs, check you're on 0.2.0+.
 - **`--skip-git-repo-check`**: fixed in 0.2.0. Without it, Codex refuses to run in non-git directories.
 - **Resume shape**: `codex exec resume <session_id> --json ...`. Note the sub-sub-command — this is why gate4agent uses function-per-CLI builders instead of a declarative spec.
 - **No terminal event**: Codex doesn't emit any `session_end`-equivalent. gate4agent synthesizes `SessionEnd` when the child process exits. If you see two `SessionEnd` events per session, the parser is double-counting — please file an issue with the raw NDJSON.
@@ -51,30 +51,21 @@ If a session produces no events:
 - **Don't confuse with `charmbracelet/crush`** or `opencode-ai/opencode`. gate4agent targets `sst/opencode` v1.4.0+.
 - Source docs: https://opencode.ai/docs/cli/
 
-### OpenClaw (via acpx)
-
-- **Daemon must be running** before spawn. gate4agent probes `127.0.0.1:8787` (assumed default) via raw TCP with a 2-second timeout. If the probe fails, you get `AgentError::DaemonNotRunning` or `DaemonProbeTimeout` without ever spawning `acpx`.
-- **Port 8787 is an assumption**. If your install uses a different port, build a custom `DaemonProbe` and pass it via a future extension point (patch release will expose this).
-- **`acpx` must be on `PATH`** — install with `npm install -g acpx`.
-- **Resume flag (`--session <id>`) is a guess**. If you need real OpenClaw resume and it's broken, please report.
-- **Parser dispatches** on `type: "system" + subtype: "init"`, `"assistant"`, `"tool_use"`, `"tool_result"`, `"session/end"`. All field names are marked `// Assumed per research doc, not confirmed against live capture` in the source — patches welcome.
-
 ## Transport-level issues
 
 ### SessionEnd synthesis
 
-- Exactly one `SessionEnd` is guaranteed per session: either the parser emitted one, or the runner synthesizes one on child exit. If you see zero or two, that's a bug — please file it.
+- Exactly one `SessionEnd` is guaranteed per session: either the parser emitted one, or the reader loop synthesizes one on child exit. If you see zero or two, that's a bug — please file it.
 - Synthetic SessionEnd format: `{ result: "exit_code=N", cost_usd: None, is_error: N != 0 }`.
 
 ### Windows-specific
 
 - **Spawn uses `cmd /C <shell_string>`** on Windows. The shell string is built by `argv_to_windows_shell_string` which wraps each token in `"..."` with `\"` escaping. If you pass a prompt containing backticks, `%var%`, or `^` escapes, `cmd.exe` may interpret them — use `extra_args` cautiously.
-- **TCP probe on Windows** can behave erratically with unroutable addresses. The `probe_returns_error_on_blackhole` unit test is `#[cfg(not(target_os = "windows"))]` for this reason. On Windows, closed ports sometimes RST immediately (→ `DaemonNotRunning`) and sometimes hang past timeout (→ `DaemonProbeTimeout`). Both are acceptable.
 - **PTY path uses ConPTY**. If you see corrupt output in PTY mode, verify your Windows version supports ConPTY (Windows 10 1809+).
 
 ### Reader thread deadlocks
 
-- Reader thread blocks on `child.stdout.read_line()`. If the CLI never closes stdout and never exits, the thread hangs forever. Kill the session via `TransportSession::kill()` to force cleanup.
+- Reader thread blocks on `child.stdout.read_line()`. If the CLI never closes stdout and never exits, the thread hangs forever. Kill the session via `TransportSession::kill()` or `PipeSession::kill()` to force cleanup.
 - On kill, gate4agent drops the stdin handle first (which usually causes the CLI to exit cleanly), then waits up to 2s, then `child.kill()` if needed.
 
 ## Test runner
@@ -92,8 +83,8 @@ cargo test --test spawn_argv_parity
 # Just transport session integration
 cargo test --test transport_session
 
-# Daemon probe
-cargo test --test daemon_probe
+# SessionEnd synthesis unit tests
+cargo test --lib pipe::session::tests
 ```
 
 If any test fails on a clean checkout with a released version, file an issue with:

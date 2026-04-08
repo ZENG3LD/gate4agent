@@ -246,10 +246,10 @@ impl MultiCliManager {
             AgentCli::Claude => 0,
             AgentCli::Codex => 1,
             AgentCli::Gemini => 2,
-            // Cursor, OpenCode, OpenClaw do not have legacy slots — they are
+            // Cursor and OpenCode do not have legacy slots — they are
             // managed through the per-instance API. Map to slot 0 as a safe
             // fallback; callers must not pass these to legacy methods.
-            AgentCli::Cursor | AgentCli::OpenCode | AgentCli::OpenClaw => 0,
+            AgentCli::Cursor | AgentCli::OpenCode => 0,
         }
     }
 
@@ -1327,6 +1327,5 @@ fn cli_to_tool(cli: AgentCli) -> CliTool {
         AgentCli::Gemini => CliTool::Gemini,
         AgentCli::Cursor => CliTool::Cursor,
         AgentCli::OpenCode => CliTool::OpenCode,
-        AgentCli::OpenClaw => CliTool::OpenClaw,
     }
 }

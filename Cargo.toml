@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 description = "Universal wrapper for CLI agents (Claude Code, Codex, Gemini). PTY mirror and pipe/NDJSON modes with tokio broadcast fan-out."
 license = "MIT"
@@ -24,6 +24,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "p
 
 # Serialization for AgentEvent, CliTool, etc.
 serde = { version = "1", features = ["derive"] }
+
+# UUID for InstanceId
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # NDJSON parsing
 serde_json = "1"

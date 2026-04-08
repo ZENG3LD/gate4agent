@@ -2,12 +2,20 @@
 //!
 //! `MultiCliManager` owns PTY and pipe sessions for Claude, Codex, and Gemini
 //! simultaneously. Call `drain_events` every frame; call `snapshot(cli)` to
-//! get a render-safe snapshot for the UI.
+//! get a render-safe snapshot for the active CLI.
+//!
+//! ## Architecture
+//!
+//! Internally the manager stores instances in a `HashMap<InstanceId, AgentInstance>`.
+//! Three "legacy" instances (one per `AgentCli`) are pre-created in `new()` so that
+//! all existing callers using the `cli: AgentCli` API continue to work unchanged.
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::pipe::{PipeSession, PipeProcessOptions};
 use crate::pty::PtySession;
@@ -15,6 +23,41 @@ use crate::snapshot::{
     AgentCli, AgentRenderSnapshot, AgentSnapshotMode, ChatMessage, ChatRole, LiveStatus, TermCell, TermGrid,
 };
 use crate::types::{AgentEvent, CliTool, SessionConfig};
+
+// =============================================================================
+// InstanceId
+// =============================================================================
+
+/// Opaque identifier for a per-instance agent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct InstanceId(pub Uuid);
+
+impl InstanceId {
+    /// Create a new random instance ID.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for InstanceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// InstanceMode
+// =============================================================================
+
+/// Operating mode for an agent instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InstanceMode {
+    /// PTY mirror mode — spawns agent in a real pseudo-terminal.
+    Pty,
+    /// Chat/pipe mode — communicates via stdin/stdout with NDJSON events.
+    /// Only supported for `AgentCli::Claude`.
+    Chat,
+}
 
 // =============================================================================
 // ManagerConfig
@@ -89,7 +132,7 @@ fn ansi_idx_to_rgb(idx: u8) -> [u8; 3] {
     if (idx as usize) < STANDARD_16.len() {
         return STANDARD_16[idx as usize];
     }
-    if idx >= 16 && idx <= 231 {
+    if (16..=231).contains(&idx) {
         let v = idx - 16;
         let b = v % 6;
         let g = (v / 6) % 6;
@@ -102,12 +145,16 @@ fn ansi_idx_to_rgb(idx: u8) -> [u8; 3] {
 }
 
 // =============================================================================
-// Per-CLI state
+// AgentInstance (internal)
 // =============================================================================
 
-/// State for a single CLI (Claude, Codex, or Gemini).
-pub struct PerCliState {
-    pub cli: AgentCli,
+/// Internal state for a single agent instance. Not public.
+struct AgentInstance {
+    /// Stored for diagnostic / future introspection — the canonical id lives as the map key.
+    _id: InstanceId,
+    cli: AgentCli,
+    mode: InstanceMode,
+    workdir: PathBuf,
     pty_session: Option<PtySession>,
     pipe_session: Option<PipeSession>,
     pty_rx: Option<broadcast::Receiver<AgentEvent>>,
@@ -115,17 +162,20 @@ pub struct PerCliState {
     pty_parser: vt100::Parser,
     /// Transient live-stream buffer for the currently running session.
     /// Cleared when a past session is loaded for display.
-    pub chat_messages: Vec<ChatMessage>,
-    pub session_active: bool,
-    pub pipe_session_id: Option<String>,
+    chat_messages: Vec<ChatMessage>,
+    session_active: bool,
+    pipe_session_id: Option<String>,
     /// Live status of the current turn — drives the animated spinner line in the chat view.
-    pub live_status: LiveStatus,
+    live_status: LiveStatus,
 }
 
-impl PerCliState {
-    fn new(cli: AgentCli, rows: u16, cols: u16) -> Self {
+impl AgentInstance {
+    fn new(id: InstanceId, cli: AgentCli, mode: InstanceMode, workdir: PathBuf, rows: u16, cols: u16) -> Self {
         Self {
+            _id: id,
             cli,
+            mode,
+            workdir,
             pty_session: None,
             pipe_session: None,
             pty_rx: None,
@@ -143,13 +193,16 @@ impl PerCliState {
 // MultiCliManager
 // =============================================================================
 
-/// Manages agent sessions for all 3 CLIs simultaneously.
+/// Manages agent sessions for all CLIs simultaneously.
 ///
-/// Each CLI has independent PTY and pipe sessions. Call `drain_events` every
-/// frame. Call `snapshot(cli)` to get rendering state for the active CLI.
+/// Internally uses a `HashMap<InstanceId, AgentInstance>`. Three legacy
+/// instances (one per `AgentCli`) are pre-created in `new()` so that all
+/// existing callers using the `cli: AgentCli` API continue to work unchanged.
 pub struct MultiCliManager {
     config: ManagerConfig,
-    states: [PerCliState; 3],
+    instances: HashMap<InstanceId, AgentInstance>,
+    /// Pre-created legacy slots: index 0 = Claude, 1 = Codex, 2 = Gemini.
+    legacy_instances: [InstanceId; 3],
     cols: u16,
     rows: u16,
 }
@@ -159,19 +212,35 @@ impl MultiCliManager {
     pub fn new(config: ManagerConfig) -> Self {
         let cols = config.default_cols;
         let rows = config.default_rows;
+
+        let mut instances = HashMap::new();
+
+        let claude_id = InstanceId::new();
+        let codex_id = InstanceId::new();
+        let gemini_id = InstanceId::new();
+
+        let claude_workdir = config.sessions_dir.join(AgentCli::Claude.as_str());
+        let codex_workdir = config.sessions_dir.join(AgentCli::Codex.as_str());
+        let gemini_workdir = config.sessions_dir.join(AgentCli::Gemini.as_str());
+
+        instances.insert(claude_id, AgentInstance::new(claude_id, AgentCli::Claude, InstanceMode::Pty, claude_workdir, rows, cols));
+        instances.insert(codex_id, AgentInstance::new(codex_id, AgentCli::Codex, InstanceMode::Pty, codex_workdir, rows, cols));
+        instances.insert(gemini_id, AgentInstance::new(gemini_id, AgentCli::Gemini, InstanceMode::Pty, gemini_workdir, rows, cols));
+
         Self {
             config,
-            states: [
-                PerCliState::new(AgentCli::Claude, rows, cols),
-                PerCliState::new(AgentCli::Codex, rows, cols),
-                PerCliState::new(AgentCli::Gemini, rows, cols),
-            ],
+            instances,
+            legacy_instances: [claude_id, codex_id, gemini_id],
             cols,
             rows,
         }
     }
 
-    fn idx(cli: AgentCli) -> usize {
+    // =========================================================================
+    // Legacy index helpers
+    // =========================================================================
+
+    fn legacy_idx(cli: AgentCli) -> usize {
         match cli {
             AgentCli::Claude => 0,
             AgentCli::Codex => 1,
@@ -179,13 +248,371 @@ impl MultiCliManager {
         }
     }
 
-    fn state(&self, cli: AgentCli) -> &PerCliState {
-        &self.states[Self::idx(cli)]
+    fn legacy_id(&self, cli: AgentCli) -> InstanceId {
+        self.legacy_instances[Self::legacy_idx(cli)]
     }
 
-    fn state_mut(&mut self, cli: AgentCli) -> &mut PerCliState {
-        &mut self.states[Self::idx(cli)]
+    // =========================================================================
+    // New per-instance API
+    // =========================================================================
+
+    /// Register a new agent instance. Does NOT spawn any process.
+    ///
+    /// Returns an error if `mode == Chat && cli != Claude`.
+    pub fn create_instance(
+        &mut self,
+        cli: AgentCli,
+        mode: InstanceMode,
+        workdir: PathBuf,
+    ) -> Result<InstanceId, String> {
+        if mode == InstanceMode::Chat && cli != AgentCli::Claude {
+            return Err(format!(
+                "Chat mode is only supported for Claude, not {:?}",
+                cli
+            ));
+        }
+        let id = InstanceId::new();
+        let inst = AgentInstance::new(id, cli, mode, workdir, self.rows, self.cols);
+        self.instances.insert(id, inst);
+        Ok(id)
     }
+
+    /// Stop and remove an instance from the manager.
+    pub async fn remove_instance(&mut self, id: InstanceId) {
+        self.stop_instance(id).await;
+        self.instances.remove(&id);
+    }
+
+    /// Start a PTY session for the given instance.
+    pub async fn start_pty_instance(
+        &mut self,
+        id: InstanceId,
+        config: SessionConfig,
+    ) -> Result<(), String> {
+        let rows = self.rows;
+        let cols = self.cols;
+        let inst = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("Instance {:?} not found", id))?;
+        if inst.session_active {
+            return Err(format!("Instance {:?} session already active", id));
+        }
+        match PtySession::spawn_with_size(config, rows, cols).await {
+            Ok(session) => {
+                inst.pty_rx = Some(session.subscribe());
+                inst.pty_parser = vt100::Parser::new(rows, cols, 0);
+                inst.pty_session = Some(session);
+                inst.session_active = true;
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to spawn PTY for instance {:?}: {}", id, e)),
+        }
+    }
+
+    /// Write a string to the active PTY for the given instance.
+    ///
+    /// Lazy-spawns a PTY session on the first call.
+    pub async fn write_pty_instance(&mut self, id: InstanceId, text: &str) -> Result<(), String> {
+        let need_spawn = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| format!("Instance {:?} not found", id))?
+            .pty_session
+            .is_none();
+
+        if need_spawn {
+            let (cli, workdir) = {
+                let inst = self
+                    .instances
+                    .get(&id)
+                    .ok_or_else(|| format!("Instance {:?} not found", id))?;
+                (inst.cli, inst.workdir.clone())
+            };
+            fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
+            eprintln!(
+                "[gate4agent] write_pty_instance lazy-spawn id={:?} cwd={}",
+                id,
+                workdir.display()
+            );
+            let tool = cli_to_tool(cli);
+            let config = SessionConfig {
+                tool,
+                working_dir: workdir,
+                ..SessionConfig::default()
+            };
+            self.start_pty_instance(id, config).await?;
+        }
+
+        let inst = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| format!("Instance {:?} not found", id))?;
+        eprintln!(
+            "[gate4agent] write_pty_instance id={:?} bytes={}",
+            id,
+            text.len()
+        );
+        if let Some(ref session) = inst.pty_session {
+            session
+                .write(text)
+                .await
+                .map_err(|e| format!("PTY write error (instance {:?}): {}", id, e))
+        } else {
+            Err(format!("No active PTY session for instance {:?}", id))
+        }
+    }
+
+    /// Send a chat prompt to the pipe session for the given instance.
+    ///
+    /// Only valid if the instance mode is `Chat`. Lazy-spawns on first call.
+    pub async fn send_chat_instance(&mut self, id: InstanceId, prompt: &str) -> Result<(), String> {
+        {
+            let inst = self
+                .instances
+                .get(&id)
+                .ok_or_else(|| format!("Instance {:?} not found", id))?;
+            if inst.mode != InstanceMode::Chat {
+                return Err(format!(
+                    "Instance {:?} is in {:?} mode, not Chat",
+                    id, inst.mode
+                ));
+            }
+        }
+
+        let need_spawn = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| format!("Instance {:?} not found", id))?
+            .pipe_session
+            .is_none();
+
+        eprintln!(
+            "[gate4agent] send_chat_instance id={:?} need_spawn={} prompt_len={}",
+            id,
+            need_spawn,
+            prompt.len()
+        );
+
+        if need_spawn {
+            let (cli, workdir, resume_id) = {
+                let inst = self
+                    .instances
+                    .get(&id)
+                    .ok_or_else(|| format!("Instance {:?} not found", id))?;
+                (inst.cli, inst.workdir.clone(), inst.pipe_session_id.clone())
+            };
+            fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
+            eprintln!(
+                "[gate4agent] send_chat_instance lazy-spawn id={:?} cwd={}",
+                id,
+                workdir.display()
+            );
+            let tool = cli_to_tool(cli);
+            let config = SessionConfig {
+                tool,
+                working_dir: workdir,
+                ..SessionConfig::default()
+            };
+            {
+                let inst = self
+                    .instances
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("Instance {:?} not found", id))?;
+                inst.chat_messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: prompt.to_string(),
+                    tool_name: None,
+                });
+                inst.live_status = LiveStatus::Thinking;
+            }
+            let opts = PipeProcessOptions {
+                claude: crate::pipe::process::ClaudeOptions {
+                    resume_session_id: resume_id,
+                    ..Default::default()
+                },
+                ..PipeProcessOptions::default()
+            };
+            match PipeSession::spawn(config, prompt, opts).await {
+                Ok(session) => {
+                    let inst = self
+                        .instances
+                        .get_mut(&id)
+                        .ok_or_else(|| format!("Instance {:?} not found", id))?;
+                    inst.pipe_rx = Some(session.subscribe());
+                    inst.pipe_session = Some(session);
+                    inst.session_active = true;
+                    Ok(())
+                }
+                Err(e) => Err(format!("Failed to spawn pipe for instance {:?}: {}", id, e)),
+            }
+        } else {
+            let inst = self
+                .instances
+                .get_mut(&id)
+                .ok_or_else(|| format!("Instance {:?} not found", id))?;
+            inst.chat_messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: prompt.to_string(),
+                tool_name: None,
+            });
+            inst.live_status = LiveStatus::Thinking;
+            if let Some(ref session) = inst.pipe_session {
+                session
+                    .send_prompt(prompt)
+                    .await
+                    .map_err(|e| format!("Pipe send error (instance {:?}): {}", id, e))
+            } else {
+                Err(format!("No active pipe session for instance {:?}", id))
+            }
+        }
+    }
+
+    /// Stop the session for a single instance.
+    pub async fn stop_instance(&mut self, id: InstanceId) {
+        if let Some(inst) = self.instances.get_mut(&id) {
+            if let Some(session) = inst.pty_session.take() {
+                let _ = session.kill().await;
+            }
+            if let Some(session) = inst.pipe_session.take() {
+                let _ = session.kill().await;
+            }
+            inst.pty_rx = None;
+            inst.pipe_rx = None;
+            inst.session_active = false;
+        }
+    }
+
+    /// Build a render snapshot for the given instance.
+    ///
+    /// Returns `None` if the instance doesn't exist. Otherwise builds a PTY or
+    /// Chat snapshot based on the instance's mode.
+    pub fn snapshot_instance(&self, id: InstanceId) -> Option<AgentRenderSnapshot> {
+        let inst = self.instances.get(&id)?;
+        let snap = match inst.mode {
+            InstanceMode::Pty => {
+                if inst.pty_session.is_some() || self.instance_pty_has_content(inst) {
+                    self.build_pty_snapshot_from_instance(inst)
+                } else {
+                    AgentRenderSnapshot {
+                        mode: AgentSnapshotMode::Idle,
+                        session_active: inst.session_active,
+                        live_status: inst.live_status.clone(),
+                    }
+                }
+            }
+            InstanceMode::Chat => {
+                if !inst.chat_messages.is_empty() {
+                    AgentRenderSnapshot {
+                        mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
+                        session_active: inst.session_active,
+                        live_status: inst.live_status.clone(),
+                    }
+                } else {
+                    AgentRenderSnapshot {
+                        mode: AgentSnapshotMode::Idle,
+                        session_active: inst.session_active,
+                        live_status: inst.live_status.clone(),
+                    }
+                }
+            }
+        };
+        Some(snap)
+    }
+
+    /// Returns `true` if the instance is active.
+    pub fn is_instance_active(&self, id: InstanceId) -> bool {
+        self.instances
+            .get(&id)
+            .map(|i| i.session_active)
+            .unwrap_or(false)
+    }
+
+    /// Returns all registered instance IDs.
+    pub fn list_instances(&self) -> Vec<InstanceId> {
+        self.instances.keys().copied().collect()
+    }
+
+    /// Returns the `AgentCli` for an instance.
+    pub fn instance_cli(&self, id: InstanceId) -> Option<AgentCli> {
+        self.instances.get(&id).map(|i| i.cli)
+    }
+
+    /// Returns the `InstanceMode` for an instance.
+    pub fn instance_mode(&self, id: InstanceId) -> Option<InstanceMode> {
+        self.instances.get(&id).map(|i| i.mode)
+    }
+
+    /// Returns the working directory for an instance.
+    pub fn instance_workdir(&self, id: InstanceId) -> Option<&Path> {
+        self.instances.get(&id).map(|i| i.workdir.as_path())
+    }
+
+    /// Resize the PTY for a single instance.
+    pub async fn resize_instance(&mut self, id: InstanceId, cols: u16, rows: u16) {
+        if let Some(inst) = self.instances.get_mut(&id) {
+            inst.pty_parser.set_size(rows, cols);
+            if let Some(ref session) = inst.pty_session {
+                let _ = session.resize(rows, cols).await;
+            }
+        }
+    }
+
+    /// Load the latest history for an instance. Chat-mode only.
+    pub fn load_latest_history_instance(&mut self, id: InstanceId) -> bool {
+        let workdir = match self.instances.get(&id).map(|i| i.workdir.clone()) {
+            Some(w) => w,
+            None => return false,
+        };
+        let cli = match self.instances.get(&id).map(|i| i.cli) {
+            Some(c) => c,
+            None => return false,
+        };
+        let reader = crate::history::reader_for(cli);
+        let latest = match reader.latest_session(&workdir) {
+            Some(id_str) => id_str,
+            None => return false,
+        };
+        let messages = reader.load_session(&workdir, &latest);
+        if messages.is_empty() {
+            return false;
+        }
+        if let Some(inst) = self.instances.get_mut(&id) {
+            inst.chat_messages = messages;
+            inst.pipe_session_id = Some(latest);
+            inst.pipe_session = None;
+            inst.pipe_rx = None;
+        }
+        true
+    }
+
+    /// Load a specific history session for an instance. Chat-mode only.
+    pub fn load_history_instance(&mut self, id: InstanceId, session_id: &str) -> bool {
+        let workdir = match self.instances.get(&id).map(|i| i.workdir.clone()) {
+            Some(w) => w,
+            None => return false,
+        };
+        let cli = match self.instances.get(&id).map(|i| i.cli) {
+            Some(c) => c,
+            None => return false,
+        };
+        let reader = crate::history::reader_for(cli);
+        let messages = reader.load_session(&workdir, session_id);
+        if messages.is_empty() {
+            return false;
+        }
+        if let Some(inst) = self.instances.get_mut(&id) {
+            inst.chat_messages = messages;
+            inst.pipe_session_id = Some(session_id.to_string());
+            inst.pipe_session = None;
+            inst.pipe_rx = None;
+        }
+        true
+    }
+
+    // =========================================================================
+    // Legacy 3-CLI public API (shims onto per-instance API)
+    // =========================================================================
 
     /// Returns the working directory for a given CLI.
     ///
@@ -195,25 +622,29 @@ impl MultiCliManager {
         self.config.sessions_dir.join(cli.as_str())
     }
 
-    // =========================================================================
-    // Session lifecycle
-    // =========================================================================
-
     /// Start a PTY session for the given CLI.
     pub async fn start_pty(&mut self, cli: AgentCli, config: SessionConfig) -> Result<(), String> {
-        eprintln!("[gate4agent] start_pty cli={:?} cwd={}", cli, config.working_dir.display());
+        eprintln!(
+            "[gate4agent] start_pty cli={:?} cwd={}",
+            cli,
+            config.working_dir.display()
+        );
+        let id = self.legacy_id(cli);
         let rows = self.rows;
         let cols = self.cols;
-        let st = self.state_mut(cli);
-        if st.session_active {
+        let inst = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+        if inst.session_active {
             return Err(format!("{:?} session already active", cli));
         }
         match PtySession::spawn_with_size(config, rows, cols).await {
             Ok(session) => {
-                st.pty_rx = Some(session.subscribe());
-                st.pty_parser = vt100::Parser::new(rows, cols, 0);
-                st.pty_session = Some(session);
-                st.session_active = true;
+                inst.pty_rx = Some(session.subscribe());
+                inst.pty_parser = vt100::Parser::new(rows, cols, 0);
+                inst.pty_session = Some(session);
+                inst.session_active = true;
                 Ok(())
             }
             Err(e) => Err(format!("Failed to spawn PTY for {:?}: {}", cli, e)),
@@ -229,8 +660,12 @@ impl MultiCliManager {
         config: SessionConfig,
         prompt: &str,
     ) -> Result<(), String> {
-        let st = self.state_mut(cli);
-        if st.session_active {
+        let id = self.legacy_id(cli);
+        let inst = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+        if inst.session_active {
             return Err(format!("{:?} session already active", cli));
         }
         let msg = ChatMessage {
@@ -238,13 +673,16 @@ impl MultiCliManager {
             content: prompt.to_string(),
             tool_name: None,
         };
-        st.chat_messages.push(msg);
+        inst.chat_messages.push(msg);
         match PipeSession::spawn(config, prompt, PipeProcessOptions::default()).await {
             Ok(session) => {
-                let st = self.state_mut(cli);
-                st.pipe_rx = Some(session.subscribe());
-                st.pipe_session = Some(session);
-                st.session_active = true;
+                let inst = self
+                    .instances
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+                inst.pipe_rx = Some(session.subscribe());
+                inst.pipe_session = Some(session);
+                inst.session_active = true;
                 Ok(())
             }
             Err(e) => Err(format!("Failed to spawn pipe for {:?}: {}", cli, e)),
@@ -253,38 +691,37 @@ impl MultiCliManager {
 
     /// Stop the session for a single CLI.
     pub async fn stop(&mut self, cli: AgentCli) {
-        let st = self.state_mut(cli);
-        if let Some(session) = st.pty_session.take() {
-            let _ = session.kill().await;
-        }
-        if let Some(session) = st.pipe_session.take() {
-            let _ = session.kill().await;
-        }
-        st.pty_rx = None;
-        st.pipe_rx = None;
-        st.session_active = false;
+        let id = self.legacy_id(cli);
+        self.stop_instance(id).await;
     }
 
     /// Stop all active sessions (called on app shutdown).
     pub async fn stop_all(&mut self) {
-        for cli in [AgentCli::Claude, AgentCli::Codex, AgentCli::Gemini] {
-            self.stop(cli).await;
+        let all_ids: Vec<InstanceId> = self.instances.keys().copied().collect();
+        for id in all_ids {
+            self.stop_instance(id).await;
         }
     }
-
-    // =========================================================================
-    // I/O
-    // =========================================================================
 
     /// Write a string to the active PTY for the given CLI.
     ///
     /// Lazy-spawns a PTY session on the first call for this CLI.
     pub async fn write_pty(&mut self, cli: AgentCli, text: &str) -> Result<(), String> {
-        let need_spawn = self.state(cli).pty_session.is_none();
+        let need_spawn = {
+            let id = self.legacy_id(cli);
+            self.instances
+                .get(&id)
+                .map(|i| i.pty_session.is_none())
+                .unwrap_or(false)
+        };
         if need_spawn {
             let workdir = self.cli_workdir(cli);
             fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
-            eprintln!("[gate4agent] write_pty lazy-spawn cli={:?} cwd={}", cli, workdir.display());
+            eprintln!(
+                "[gate4agent] write_pty lazy-spawn cli={:?} cwd={}",
+                cli,
+                workdir.display()
+            );
             let tool = cli_to_tool(cli);
             let config = SessionConfig {
                 tool,
@@ -293,9 +730,17 @@ impl MultiCliManager {
             };
             self.start_pty(cli, config).await?;
         }
-        eprintln!("[gate4agent] write_pty cli={:?} bytes={}", cli, text.len());
-        let st = self.state(cli);
-        if let Some(ref session) = st.pty_session {
+        eprintln!(
+            "[gate4agent] write_pty cli={:?} bytes={}",
+            cli,
+            text.len()
+        );
+        let id = self.legacy_id(cli);
+        let inst = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+        if let Some(ref session) = inst.pty_session {
             session
                 .write(text)
                 .await
@@ -308,13 +753,39 @@ impl MultiCliManager {
     /// Send a chat prompt to the pipe session for the given CLI.
     ///
     /// Lazy-spawns a pipe session on the first call for this CLI.
+    ///
+    /// Note: For `Codex` and `Gemini` this always returns an error because
+    /// Chat mode is only supported for `Claude`.
     pub async fn send_chat(&mut self, cli: AgentCli, prompt: &str) -> Result<(), String> {
-        let need_spawn = self.state(cli).pipe_session.is_none();
-        eprintln!("[gate4agent] send_chat cli={:?} need_spawn={} prompt_len={}", cli, need_spawn, prompt.len());
+        if cli != AgentCli::Claude {
+            return Err(format!(
+                "Chat mode only supported for Claude, not {:?}",
+                cli
+            ));
+        }
+
+        let id = self.legacy_id(cli);
+        let need_spawn = self
+            .instances
+            .get(&id)
+            .map(|i| i.pipe_session.is_none())
+            .unwrap_or(false);
+
+        eprintln!(
+            "[gate4agent] send_chat cli={:?} need_spawn={} prompt_len={}",
+            cli,
+            need_spawn,
+            prompt.len()
+        );
+
         if need_spawn {
             let workdir = self.cli_workdir(cli);
             fs::create_dir_all(&workdir).map_err(|e| format!("mkdir error: {}", e))?;
-            eprintln!("[gate4agent] send_chat lazy-spawn cli={:?} cwd={}", cli, workdir.display());
+            eprintln!(
+                "[gate4agent] send_chat lazy-spawn cli={:?} cwd={}",
+                cli,
+                workdir.display()
+            );
             let tool = cli_to_tool(cli);
             let config = SessionConfig {
                 tool,
@@ -322,17 +793,24 @@ impl MultiCliManager {
                 ..SessionConfig::default()
             };
             // Push the user message into the transient buffer immediately so UI shows it.
-            self.state_mut(cli).chat_messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: prompt.to_string(),
-                tool_name: None,
-            });
-            // Switch to Thinking state so the animated spinner shows immediately.
-            self.state_mut(cli).live_status = LiveStatus::Thinking;
+            {
+                let inst = self
+                    .instances
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+                inst.chat_messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: prompt.to_string(),
+                    tool_name: None,
+                });
+                // Switch to Thinking state so the animated spinner shows immediately.
+                inst.live_status = LiveStatus::Thinking;
+            }
             // Resume the previous Claude session if we have its id captured.
-            // This makes a sequence of `send_chat` calls feel like a continuous
-            // chat thread instead of independent one-shots.
-            let resume_id = self.state(cli).pipe_session_id.clone();
+            let resume_id = self
+                .instances
+                .get(&id)
+                .and_then(|i| i.pipe_session_id.clone());
             let opts = PipeProcessOptions {
                 claude: crate::pipe::process::ClaudeOptions {
                     resume_session_id: resume_id,
@@ -342,24 +820,36 @@ impl MultiCliManager {
             };
             match PipeSession::spawn(config, prompt, opts).await {
                 Ok(session) => {
-                    let st = self.state_mut(cli);
-                    st.pipe_rx = Some(session.subscribe());
-                    st.pipe_session = Some(session);
-                    st.session_active = true;
+                    let inst = self
+                        .instances
+                        .get_mut(&id)
+                        .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+                    inst.pipe_rx = Some(session.subscribe());
+                    inst.pipe_session = Some(session);
+                    inst.session_active = true;
                     Ok(())
                 }
                 Err(e) => Err(format!("Failed to spawn pipe for {:?}: {}", cli, e)),
             }
         } else {
             // Existing session — push message and forward.
-            self.state_mut(cli).chat_messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: prompt.to_string(),
-                tool_name: None,
-            });
-            self.state_mut(cli).live_status = LiveStatus::Thinking;
-            let st = self.state(cli);
-            if let Some(ref session) = st.pipe_session {
+            {
+                let inst = self
+                    .instances
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+                inst.chat_messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: prompt.to_string(),
+                    tool_name: None,
+                });
+                inst.live_status = LiveStatus::Thinking;
+            }
+            let inst = self
+                .instances
+                .get(&id)
+                .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
+            if let Some(ref session) = inst.pipe_session {
                 session
                     .send_prompt(prompt)
                     .await
@@ -381,9 +871,9 @@ impl MultiCliManager {
         }
         self.cols = cols;
         self.rows = rows;
-        for st in &mut self.states {
-            st.pty_parser.set_size(rows, cols);
-            if let Some(ref session) = st.pty_session {
+        for inst in self.instances.values_mut() {
+            inst.pty_parser.set_size(rows, cols);
+            if let Some(ref session) = inst.pty_session {
                 let _ = session.resize(rows, cols).await;
             }
         }
@@ -393,37 +883,37 @@ impl MultiCliManager {
     // Drain events (call every frame)
     // =========================================================================
 
-    /// Drain events for all 3 CLIs. Returns `true` if any events were processed.
+    /// Drain events for all instances. Returns `true` if any events were processed.
     pub fn drain_events(&mut self) -> bool {
         let mut had_events = false;
-        for i in 0..3 {
-            had_events |= Self::drain_one(&mut self.states[i]);
+        for inst in self.instances.values_mut() {
+            had_events |= Self::drain_one(inst);
         }
         had_events
     }
 
-    fn drain_one(st: &mut PerCliState) -> bool {
+    fn drain_one(inst: &mut AgentInstance) -> bool {
         let mut had_events = false;
 
         // Drain PTY events
-        if let Some(ref mut rx) = st.pty_rx {
+        if let Some(ref mut rx) = inst.pty_rx {
             loop {
                 match rx.try_recv() {
                     Ok(event) => {
                         had_events = true;
                         match event {
                             AgentEvent::PtyRaw { data } => {
-                                st.pty_parser.process(&data);
+                                inst.pty_parser.process(&data);
                             }
                             AgentEvent::Exited { .. } => {
-                                st.session_active = false;
+                                inst.session_active = false;
                             }
                             _ => {}
                         }
                     }
                     Err(broadcast::error::TryRecvError::Empty) => break,
                     Err(broadcast::error::TryRecvError::Closed) => {
-                        st.session_active = false;
+                        inst.session_active = false;
                         break;
                     }
                     Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -432,7 +922,7 @@ impl MultiCliManager {
         }
 
         // Drain Pipe events
-        if let Some(ref mut rx) = st.pipe_rx {
+        if let Some(ref mut rx) = inst.pipe_rx {
             loop {
                 match rx.try_recv() {
                     Ok(event) => {
@@ -442,26 +932,28 @@ impl MultiCliManager {
                                 // Capture id for --resume on the next prompt.
                                 // Do NOT push a ChatMessage — that was the source
                                 // of "[tool] unknown · session XXXX" spam.
-                                st.pipe_session_id = Some(session_id);
+                                inst.pipe_session_id = Some(session_id);
                             }
                             AgentEvent::PipeText { text, is_delta: _ } => {
                                 // Finalize any RunningTool status: push a "done" history entry.
-                                if let LiveStatus::RunningTool { ref name, done } = st.live_status.clone() {
-                                    st.chat_messages.push(ChatMessage {
+                                if let LiveStatus::RunningTool { ref name, done } =
+                                    inst.live_status.clone()
+                                {
+                                    inst.chat_messages.push(ChatMessage {
                                         role: ChatRole::Tool,
                                         content: format!("✓ {} · {} done", name, done),
                                         tool_name: Some(name.clone()),
                                     });
                                 }
-                                st.live_status = LiveStatus::Idle;
+                                inst.live_status = LiveStatus::Idle;
 
-                                if let Some(last) = st.chat_messages.last_mut() {
+                                if let Some(last) = inst.chat_messages.last_mut() {
                                     if last.role == ChatRole::Assistant {
                                         last.content.push_str(&text);
                                         continue;
                                     }
                                 }
-                                st.chat_messages.push(ChatMessage {
+                                inst.chat_messages.push(ChatMessage {
                                     role: ChatRole::Assistant,
                                     content: text,
                                     tool_name: None,
@@ -469,18 +961,28 @@ impl MultiCliManager {
                             }
                             AgentEvent::PipeToolStart { name, .. } => {
                                 // Finalize previous tool if any.
-                                if let LiveStatus::RunningTool { name: ref prev, done } = st.live_status.clone() {
-                                    st.chat_messages.push(ChatMessage {
+                                if let LiveStatus::RunningTool {
+                                    name: ref prev,
+                                    done,
+                                } = inst.live_status.clone()
+                                {
+                                    inst.chat_messages.push(ChatMessage {
                                         role: ChatRole::Tool,
                                         content: format!("✓ {} · {} done", prev, done),
                                         tool_name: Some(prev.clone()),
                                     });
                                 }
                                 // Start tracking the new tool.
-                                st.live_status = LiveStatus::RunningTool { name, done: 0 };
+                                inst.live_status = LiveStatus::RunningTool { name, done: 0 };
                             }
-                            AgentEvent::PipeToolResult { id: _, output: _, is_error: _, .. } => {
-                                if let LiveStatus::RunningTool { done, .. } = &mut st.live_status {
+                            AgentEvent::PipeToolResult {
+                                id: _,
+                                output: _,
+                                is_error: _,
+                                ..
+                            } => {
+                                if let LiveStatus::RunningTool { done, .. } = &mut inst.live_status
+                                {
                                     *done = done.saturating_add(1);
                                 }
                             }
@@ -488,8 +990,8 @@ impl MultiCliManager {
                                 // Keep Thinking status as-is; suppress bubble noise.
                             }
                             AgentEvent::Error { message } => {
-                                st.live_status = LiveStatus::Idle;
-                                st.chat_messages.push(ChatMessage {
+                                inst.live_status = LiveStatus::Idle;
+                                inst.chat_messages.push(ChatMessage {
                                     role: ChatRole::Error,
                                     content: message,
                                     tool_name: None,
@@ -497,43 +999,49 @@ impl MultiCliManager {
                             }
                             AgentEvent::PipeTurnComplete { .. } => {
                                 // Finalize any in-flight tool and clear live status.
-                                if let LiveStatus::RunningTool { ref name, done } = st.live_status.clone() {
-                                    st.chat_messages.push(ChatMessage {
+                                if let LiveStatus::RunningTool { ref name, done } =
+                                    inst.live_status.clone()
+                                {
+                                    inst.chat_messages.push(ChatMessage {
                                         role: ChatRole::Tool,
                                         content: format!("✓ {} · {} done", name, done),
                                         tool_name: Some(name.clone()),
                                     });
                                 }
-                                st.live_status = LiveStatus::Idle;
+                                inst.live_status = LiveStatus::Idle;
                             }
-                            AgentEvent::PipeSessionEnd { result, is_error, .. } => {
+                            AgentEvent::PipeSessionEnd {
+                                result, is_error, ..
+                            } => {
                                 if is_error {
-                                    st.chat_messages.push(ChatMessage {
+                                    inst.chat_messages.push(ChatMessage {
                                         role: ChatRole::Error,
                                         content: format!("Session error · {}", result),
                                         tool_name: None,
                                     });
                                 }
                                 // Finalize any in-flight tool.
-                                if let LiveStatus::RunningTool { ref name, done } = st.live_status.clone() {
-                                    st.chat_messages.push(ChatMessage {
+                                if let LiveStatus::RunningTool { ref name, done } =
+                                    inst.live_status.clone()
+                                {
+                                    inst.chat_messages.push(ChatMessage {
                                         role: ChatRole::Tool,
                                         content: format!("✓ {} · {} done", name, done),
                                         tool_name: Some(name.clone()),
                                     });
                                 }
-                                st.live_status = LiveStatus::Idle;
+                                inst.live_status = LiveStatus::Idle;
                             }
                             AgentEvent::Exited { .. } => {
-                                st.session_active = false;
-                                st.live_status = LiveStatus::Idle;
+                                inst.session_active = false;
+                                inst.live_status = LiveStatus::Idle;
                             }
                             _ => {}
                         }
                     }
                     Err(broadcast::error::TryRecvError::Empty) => break,
                     Err(broadcast::error::TryRecvError::Closed) => {
-                        st.session_active = false;
+                        inst.session_active = false;
                         break;
                     }
                     Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -545,7 +1053,7 @@ impl MultiCliManager {
     }
 
     // =========================================================================
-    // Snapshot + query
+    // Snapshot + query (legacy CLI-based)
     // =========================================================================
 
     /// Build a render snapshot for the given CLI, honoring the UI's requested mode.
@@ -555,36 +1063,45 @@ impl MultiCliManager {
     /// This decouples snapshot mode from session liveness so mode switches don't
     /// destroy the other view.
     pub fn snapshot_mode(&self, cli: AgentCli, want_pty: bool) -> AgentRenderSnapshot {
-        let st = self.state(cli);
+        let id = self.legacy_id(cli);
+        let inst = match self.instances.get(&id) {
+            Some(i) => i,
+            None => {
+                return AgentRenderSnapshot {
+                    mode: AgentSnapshotMode::Idle,
+                    session_active: false,
+                    live_status: LiveStatus::Idle,
+                }
+            }
+        };
         if want_pty {
             // Render PTY grid as long as we ever spawned one OR the parser has content.
-            if st.pty_session.is_some() || self.pty_has_content(cli) {
-                return self.build_pty_snapshot(st);
+            if inst.pty_session.is_some() || self.instance_pty_has_content(inst) {
+                return self.build_pty_snapshot_from_instance(inst);
             }
             return AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Idle,
-                session_active: st.session_active,
-                live_status: st.live_status.clone(),
+                session_active: inst.session_active,
+                live_status: inst.live_status.clone(),
             };
         }
         // Chat mode requested
-        if !st.chat_messages.is_empty() {
+        if !inst.chat_messages.is_empty() {
             return AgentRenderSnapshot {
-                mode: AgentSnapshotMode::Chat(st.chat_messages.clone()),
-                session_active: st.session_active,
-                live_status: st.live_status.clone(),
+                mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
+                session_active: inst.session_active,
+                live_status: inst.live_status.clone(),
             };
         }
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Idle,
-            session_active: st.session_active,
-            live_status: st.live_status.clone(),
+            session_active: inst.session_active,
+            live_status: inst.live_status.clone(),
         }
     }
 
-    fn pty_has_content(&self, cli: AgentCli) -> bool {
-        let st = self.state(cli);
-        let screen = st.pty_parser.screen();
+    fn instance_pty_has_content(&self, inst: &AgentInstance) -> bool {
+        let screen = inst.pty_parser.screen();
         for row in 0..self.rows {
             for col in 0..self.cols {
                 if let Some(cell) = screen.cell(row, col) {
@@ -597,8 +1114,8 @@ impl MultiCliManager {
         false
     }
 
-    fn build_pty_snapshot(&self, st: &PerCliState) -> AgentRenderSnapshot {
-        let screen = st.pty_parser.screen();
+    fn build_pty_snapshot_from_instance(&self, inst: &AgentInstance) -> AgentRenderSnapshot {
+        let screen = inst.pty_parser.screen();
         let mut grid = TermGrid::empty(self.cols, self.rows);
         for row in 0..self.rows {
             for col in 0..self.cols {
@@ -607,7 +1124,11 @@ impl MultiCliManager {
                     let bg = vt100_color_to_rgb(cell.bgcolor(), [0, 0, 0]);
                     let contents = cell.contents();
                     grid.cells[row as usize][col as usize] = TermCell {
-                        ch: if contents.is_empty() { " ".to_string() } else { contents },
+                        ch: if contents.is_empty() {
+                            " ".to_string()
+                        } else {
+                            contents
+                        },
                         fg,
                         bg,
                         bold: cell.bold(),
@@ -637,32 +1158,42 @@ impl MultiCliManager {
         grid.cursor_visible = !screen.hide_cursor();
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Pty(grid),
-            session_active: st.session_active,
-            live_status: st.live_status.clone(),
+            session_active: inst.session_active,
+            live_status: inst.live_status.clone(),
         }
     }
 
     /// Legacy snapshot — inferred from state. Prefer `snapshot_mode`.
     pub fn snapshot(&self, cli: AgentCli) -> AgentRenderSnapshot {
-        let st = self.state(cli);
-
-        if !st.session_active {
-            if !st.chat_messages.is_empty() {
+        let id = self.legacy_id(cli);
+        let inst = match self.instances.get(&id) {
+            Some(i) => i,
+            None => {
                 return AgentRenderSnapshot {
-                    mode: AgentSnapshotMode::Chat(st.chat_messages.clone()),
+                    mode: AgentSnapshotMode::Idle,
                     session_active: false,
-                    live_status: st.live_status.clone(),
+                    live_status: LiveStatus::Idle,
+                }
+            }
+        };
+
+        if !inst.session_active {
+            if !inst.chat_messages.is_empty() {
+                return AgentRenderSnapshot {
+                    mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
+                    session_active: false,
+                    live_status: inst.live_status.clone(),
                 };
             }
             return AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Idle,
                 session_active: false,
-                live_status: st.live_status.clone(),
+                live_status: inst.live_status.clone(),
             };
         }
 
-        if st.pty_session.is_some() {
-            let screen = st.pty_parser.screen();
+        if inst.pty_session.is_some() {
+            let screen = inst.pty_parser.screen();
             let mut grid = TermGrid::empty(self.cols, self.rows);
             for row in 0..self.rows {
                 for col in 0..self.cols {
@@ -686,43 +1217,46 @@ impl MultiCliManager {
             let (cur_row, cur_col) = screen.cursor_position();
             grid.cursor_row = cur_row;
             grid.cursor_col = cur_col;
-            // See build_pty_snapshot() for the rationale: Ink-based TUIs
+            // See build_pty_snapshot_from_instance() for the rationale: Ink-based TUIs
             // draw their own fake caret in the framebuffer and park the
             // real vt100 cursor on animation cells, so we must respect
             // DECTCEM to avoid a drifting ghost caret.
             grid.cursor_visible = !screen.hide_cursor();
             // Buddy extraction disabled — heuristic doesn't reliably catch the
-        // companion ASCII art yet. Kept in snapshot.rs for future experiments.
-        // grid.detect_and_extract_buddy();
+            // companion ASCII art yet. Kept in snapshot.rs for future experiments.
+            // grid.detect_and_extract_buddy();
             AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Pty(grid),
                 session_active: true,
-                live_status: st.live_status.clone(),
+                live_status: inst.live_status.clone(),
             }
         } else {
             AgentRenderSnapshot {
-                mode: AgentSnapshotMode::Chat(st.chat_messages.clone()),
+                mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
                 session_active: true,
-                live_status: st.live_status.clone(),
+                live_status: inst.live_status.clone(),
             }
         }
     }
 
     /// Returns `true` if either PTY or pipe session is alive for this CLI.
     pub fn is_active(&self, cli: AgentCli) -> bool {
-        self.state(cli).session_active
+        let id = self.legacy_id(cli);
+        self.instances
+            .get(&id)
+            .map(|i| i.session_active)
+            .unwrap_or(false)
     }
 
-    /// Returns `true` if any CLI has an active session.
+    /// Returns `true` if any instance has an active session.
     pub fn any_active(&self) -> bool {
-        self.states.iter().any(|s| s.session_active)
+        self.instances.values().any(|i| i.session_active)
     }
 
     /// Number of past sessions for this CLI (live disk read).
     pub fn past_session_count(&self, cli: AgentCli) -> usize {
         let workdir = self.cli_workdir(cli);
-        let n = crate::history::reader_for(cli).list_sessions(&workdir).len();
-        n
+        crate::history::reader_for(cli).list_sessions(&workdir).len()
     }
 
     /// List past sessions (newest first, live disk read).
@@ -737,7 +1271,11 @@ impl MultiCliManager {
     pub fn load_latest_history(&mut self, cli: AgentCli) -> bool {
         let workdir = self.cli_workdir(cli);
         let reader = crate::history::reader_for(cli);
-        eprintln!("[gate4agent] load_latest_history cli={:?} workdir={}", cli, workdir.display());
+        eprintln!(
+            "[gate4agent] load_latest_history cli={:?} workdir={}",
+            cli,
+            workdir.display()
+        );
         let latest = match reader.latest_session(&workdir) {
             Some(id) => {
                 eprintln!("[gate4agent]   latest session id={}", id);
@@ -753,11 +1291,13 @@ impl MultiCliManager {
         if messages.is_empty() {
             return false;
         }
-        let st = self.state_mut(cli);
-        st.chat_messages = messages;
-        st.pipe_session_id = Some(latest.clone());
-        st.pipe_session = None;
-        st.pipe_rx = None;
+        let id = self.legacy_id(cli);
+        if let Some(inst) = self.instances.get_mut(&id) {
+            inst.chat_messages = messages;
+            inst.pipe_session_id = Some(latest.clone());
+            inst.pipe_session = None;
+            inst.pipe_rx = None;
+        }
         true
     }
 
@@ -772,13 +1312,15 @@ impl MultiCliManager {
         if messages.is_empty() {
             return false;
         }
-        let st = self.state_mut(cli);
-        st.chat_messages = messages;
-        st.pipe_session_id = Some(session_id.to_string());
-        // Drop any stale live pipe handle so the next send_chat goes through
-        // the spawn branch and picks up the resume id.
-        st.pipe_session = None;
-        st.pipe_rx = None;
+        let id = self.legacy_id(cli);
+        if let Some(inst) = self.instances.get_mut(&id) {
+            inst.chat_messages = messages;
+            inst.pipe_session_id = Some(session_id.to_string());
+            // Drop any stale live pipe handle so the next send_chat goes through
+            // the spawn branch and picks up the resume id.
+            inst.pipe_session = None;
+            inst.pipe_rx = None;
+        }
         true
     }
 

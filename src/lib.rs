@@ -19,7 +19,7 @@ pub mod snapshot;
 pub mod history;
 pub mod manager;
 
-pub use manager::{MultiCliManager, ManagerConfig};
+pub use manager::{MultiCliManager, ManagerConfig, InstanceId, InstanceMode};
 pub use snapshot::{
     AgentCli, AgentRenderSnapshot, AgentSnapshotMode, BuddyArt, ChatMessage, ChatRole, TermCell, TermGrid,
 };

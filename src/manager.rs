@@ -621,7 +621,13 @@ impl MultiCliManager {
         // Respect DECTCEM: Ink-based TUIs (Claude Code) hide the terminal
         // cursor during their render cycle and only show it at input prompts,
         // so mirroring `!hide_cursor()` gives the correct input location.
-        grid.cursor_visible = !screen.hide_cursor();
+        // Always draw the cursor at vt100's reported position. Ink-based
+        // TUIs (Claude Code) flip DECTCEM on/off constantly during their
+        // render cycle, so mirroring `hide_cursor()` just makes the cursor
+        // disappear most of the time. The raw cursor_position() from vt100
+        // tracks the real edit caret (keyboard left/right arrow operate on
+        // it), so drawing it unconditionally matches user expectation.
+        grid.cursor_visible = true;
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Pty(grid),
             session_active: st.session_active,
@@ -673,7 +679,13 @@ impl MultiCliManager {
             let (cur_row, cur_col) = screen.cursor_position();
             grid.cursor_row = cur_row;
             grid.cursor_col = cur_col;
-            grid.cursor_visible = !screen.hide_cursor();
+            // Always draw the cursor at vt100's reported position. Ink-based
+        // TUIs (Claude Code) flip DECTCEM on/off constantly during their
+        // render cycle, so mirroring `hide_cursor()` just makes the cursor
+        // disappear most of the time. The raw cursor_position() from vt100
+        // tracks the real edit caret (keyboard left/right arrow operate on
+        // it), so drawing it unconditionally matches user expectation.
+        grid.cursor_visible = true;
             // Buddy extraction disabled — heuristic doesn't reliably catch the
         // companion ASCII art yet. Kept in snapshot.rs for future experiments.
         // grid.detect_and_extract_buddy();

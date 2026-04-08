@@ -240,6 +240,14 @@ impl PipeProcess {
         self.child.kill()
     }
 
+    /// Wait for the process to exit and return its exit status.
+    ///
+    /// Called by `pipe_runner` after `is_running()` returns false to collect
+    /// the exit code for `SessionEnd` synthesis.
+    pub fn wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
+        self.child.try_wait()
+    }
+
     /// Get the CLI tool type.
     pub fn tool(&self) -> CliTool {
         self.tool

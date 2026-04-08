@@ -1,14 +1,21 @@
-//! gate4agent — Universal wrapper for CLI agents (Claude Code, Codex, Gemini).
+//! gate4agent — Universal wrapper for CLI agents (Claude Code, Codex, Gemini, Cursor, OpenCode, OpenClaw).
 //!
-//! Two transport modes:
+//! Three transport modes:
 //! - PTY mirror: spawns agent in real PTY, captures raw output, vt100 parsing
-//! - Pipe mode: `claude -p --output-format stream-json`, plain OS pipes, NDJSON events
+//! - Pipe mode: NDJSON-streaming pipe sessions (Claude, Codex, Gemini, Cursor, OpenCode)
+//! - Daemon harness: pipe client over a pre-running daemon (OpenClaw via acpx)
 //!
-//! Both modes produce `AgentEvent` values on a `tokio::sync::broadcast` channel.
+//! All modes produce `AgentEvent` values on a `tokio::sync::broadcast` channel.
+//!
+//! # Entry points
+//!
+//! - [`TransportSession::spawn`] — unified entry for all 6 pipe/daemon CLIs
+//! - [`pty::PtySession::spawn`] — PTY mirror mode (unchanged)
+//! - [`MultiCliManager`] — high-level session manager for the chart app
 
 pub use error::AgentError;
 pub use types::{AgentEvent, CliTool, PtyEvent, SessionConfig};
-pub use transport::{SpawnOptions, DaemonProbe, DaemonSpec, ensure_daemon_running};
+pub use transport::{SpawnOptions, DaemonProbe, DaemonSpec, ensure_daemon_running, TransportSession};
 
 pub mod transport;
 pub mod daemon;

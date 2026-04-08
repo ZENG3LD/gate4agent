@@ -17,11 +17,11 @@ use std::path::{Path, PathBuf};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::pipe::{PipeSession, PipeProcessOptions};
 use crate::pty::PtySession;
 use crate::snapshot::{
     AgentCli, AgentRenderSnapshot, AgentSnapshotMode, ChatMessage, ChatRole, LiveStatus, TermCell, TermGrid,
 };
+use crate::transport::{SpawnOptions, TransportSession};
 use crate::types::{AgentEvent, CliTool, SessionConfig};
 
 // =============================================================================
@@ -55,7 +55,7 @@ pub enum InstanceMode {
     /// PTY mirror mode — spawns agent in a real pseudo-terminal.
     Pty,
     /// Chat/pipe mode — communicates via stdin/stdout with NDJSON events.
-    /// Only supported for `AgentCli::Claude`.
+    /// Supported for all 6 CLIs via `TransportSession`.
     Chat,
 }
 
@@ -156,7 +156,8 @@ struct AgentInstance {
     mode: InstanceMode,
     workdir: PathBuf,
     pty_session: Option<PtySession>,
-    pipe_session: Option<PipeSession>,
+    /// Phase 5: unified pipe/daemon session via `TransportSession`.
+    transport_session: Option<TransportSession>,
     pty_rx: Option<broadcast::Receiver<AgentEvent>>,
     pipe_rx: Option<broadcast::Receiver<AgentEvent>>,
     pty_parser: vt100::Parser,
@@ -177,7 +178,7 @@ impl AgentInstance {
             mode,
             workdir,
             pty_session: None,
-            pipe_session: None,
+            transport_session: None,
             pty_rx: None,
             pipe_rx: None,
             pty_parser: vt100::Parser::new(rows, cols, 0),
@@ -262,19 +263,13 @@ impl MultiCliManager {
 
     /// Register a new agent instance. Does NOT spawn any process.
     ///
-    /// Returns an error if `mode == Chat && cli != Claude`.
+    /// All 6 CLIs support Chat mode via `TransportSession` (pipe/daemon).
     pub fn create_instance(
         &mut self,
         cli: AgentCli,
         mode: InstanceMode,
         workdir: PathBuf,
     ) -> Result<InstanceId, String> {
-        if mode == InstanceMode::Chat && cli != AgentCli::Claude {
-            return Err(format!(
-                "Chat mode is only supported for Claude, not {:?}",
-                cli
-            ));
-        }
         let id = InstanceId::new();
         let inst = AgentInstance::new(id, cli, mode, workdir, self.rows, self.cols);
         self.instances.insert(id, inst);
@@ -388,7 +383,7 @@ impl MultiCliManager {
             .instances
             .get(&id)
             .ok_or_else(|| format!("Instance {:?} not found", id))?
-            .pipe_session
+            .transport_session
             .is_none();
 
         eprintln!(
@@ -413,11 +408,6 @@ impl MultiCliManager {
                 workdir.display()
             );
             let tool = cli_to_tool(cli);
-            let config = SessionConfig {
-                tool,
-                working_dir: workdir,
-                ..SessionConfig::default()
-            };
             {
                 let inst = self
                     .instances
@@ -430,21 +420,18 @@ impl MultiCliManager {
                 });
                 inst.live_status = LiveStatus::Thinking;
             }
-            let opts = PipeProcessOptions {
-                claude: crate::pipe::process::ClaudeOptions {
-                    resume_session_id: resume_id,
-                    ..Default::default()
-                },
-                ..PipeProcessOptions::default()
+            let opts = SpawnOptions {
+                resume_session_id: resume_id,
+                ..SpawnOptions::default()
             };
-            match PipeSession::spawn(config, prompt, opts).await {
+            match TransportSession::spawn(tool, &workdir, prompt, opts).await {
                 Ok(session) => {
                     let inst = self
                         .instances
                         .get_mut(&id)
                         .ok_or_else(|| format!("Instance {:?} not found", id))?;
                     inst.pipe_rx = Some(session.subscribe());
-                    inst.pipe_session = Some(session);
+                    inst.transport_session = Some(session);
                     inst.session_active = true;
                     Ok(())
                 }
@@ -461,7 +448,7 @@ impl MultiCliManager {
                 tool_name: None,
             });
             inst.live_status = LiveStatus::Thinking;
-            if let Some(ref session) = inst.pipe_session {
+            if let Some(ref session) = inst.transport_session {
                 session
                     .send_prompt(prompt)
                     .await
@@ -478,7 +465,7 @@ impl MultiCliManager {
             if let Some(session) = inst.pty_session.take() {
                 let _ = session.kill().await;
             }
-            if let Some(session) = inst.pipe_session.take() {
+            if let Some(session) = inst.transport_session.take() {
                 let _ = session.kill().await;
             }
             inst.pty_rx = None;
@@ -584,7 +571,7 @@ impl MultiCliManager {
         if let Some(inst) = self.instances.get_mut(&id) {
             inst.chat_messages = messages;
             inst.pipe_session_id = Some(latest);
-            inst.pipe_session = None;
+            inst.transport_session = None;
             inst.pipe_rx = None;
         }
         true
@@ -608,7 +595,7 @@ impl MultiCliManager {
         if let Some(inst) = self.instances.get_mut(&id) {
             inst.chat_messages = messages;
             inst.pipe_session_id = Some(session_id.to_string());
-            inst.pipe_session = None;
+            inst.transport_session = None;
             inst.pipe_rx = None;
         }
         true
@@ -678,14 +665,16 @@ impl MultiCliManager {
             tool_name: None,
         };
         inst.chat_messages.push(msg);
-        match PipeSession::spawn(config, prompt, PipeProcessOptions::default()).await {
+        let workdir = config.working_dir.clone();
+        let tool = config.tool;
+        match TransportSession::spawn(tool, &workdir, prompt, SpawnOptions::default()).await {
             Ok(session) => {
                 let inst = self
                     .instances
                     .get_mut(&id)
                     .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
                 inst.pipe_rx = Some(session.subscribe());
-                inst.pipe_session = Some(session);
+                inst.transport_session = Some(session);
                 inst.session_active = true;
                 Ok(())
             }
@@ -758,21 +747,14 @@ impl MultiCliManager {
     ///
     /// Lazy-spawns a pipe session on the first call for this CLI.
     ///
-    /// Note: For `Codex` and `Gemini` this always returns an error because
-    /// Chat mode is only supported for `Claude`.
+    /// Routes all 6 CLIs through `TransportSession`. Legacy Claude-only restriction
+    /// is lifted: all CLIs with a legacy slot can now use Chat/pipe mode.
     pub async fn send_chat(&mut self, cli: AgentCli, prompt: &str) -> Result<(), String> {
-        if cli != AgentCli::Claude {
-            return Err(format!(
-                "Chat mode only supported for Claude, not {:?}",
-                cli
-            ));
-        }
-
         let id = self.legacy_id(cli);
         let need_spawn = self
             .instances
             .get(&id)
-            .map(|i| i.pipe_session.is_none())
+            .map(|i| i.transport_session.is_none())
             .unwrap_or(false);
 
         eprintln!(
@@ -791,11 +773,6 @@ impl MultiCliManager {
                 workdir.display()
             );
             let tool = cli_to_tool(cli);
-            let config = SessionConfig {
-                tool,
-                working_dir: workdir,
-                ..SessionConfig::default()
-            };
             // Push the user message into the transient buffer immediately so UI shows it.
             {
                 let inst = self
@@ -810,26 +787,23 @@ impl MultiCliManager {
                 // Switch to Thinking state so the animated spinner shows immediately.
                 inst.live_status = LiveStatus::Thinking;
             }
-            // Resume the previous Claude session if we have its id captured.
+            // Resume the previous session if we have its id captured.
             let resume_id = self
                 .instances
                 .get(&id)
                 .and_then(|i| i.pipe_session_id.clone());
-            let opts = PipeProcessOptions {
-                claude: crate::pipe::process::ClaudeOptions {
-                    resume_session_id: resume_id,
-                    ..Default::default()
-                },
-                ..PipeProcessOptions::default()
+            let opts = SpawnOptions {
+                resume_session_id: resume_id,
+                ..SpawnOptions::default()
             };
-            match PipeSession::spawn(config, prompt, opts).await {
+            match TransportSession::spawn(tool, &workdir, prompt, opts).await {
                 Ok(session) => {
                     let inst = self
                         .instances
                         .get_mut(&id)
                         .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
                     inst.pipe_rx = Some(session.subscribe());
-                    inst.pipe_session = Some(session);
+                    inst.transport_session = Some(session);
                     inst.session_active = true;
                     Ok(())
                 }
@@ -853,7 +827,7 @@ impl MultiCliManager {
                 .instances
                 .get(&id)
                 .ok_or_else(|| format!("Legacy instance for {:?} not found", cli))?;
-            if let Some(ref session) = inst.pipe_session {
+            if let Some(ref session) = inst.transport_session {
                 session
                     .send_prompt(prompt)
                     .await
@@ -1299,7 +1273,7 @@ impl MultiCliManager {
         if let Some(inst) = self.instances.get_mut(&id) {
             inst.chat_messages = messages;
             inst.pipe_session_id = Some(latest.clone());
-            inst.pipe_session = None;
+            inst.transport_session = None;
             inst.pipe_rx = None;
         }
         true
@@ -1320,9 +1294,9 @@ impl MultiCliManager {
         if let Some(inst) = self.instances.get_mut(&id) {
             inst.chat_messages = messages;
             inst.pipe_session_id = Some(session_id.to_string());
-            // Drop any stale live pipe handle so the next send_chat goes through
+            // Drop any stale live transport handle so the next send_chat goes through
             // the spawn branch and picks up the resume id.
-            inst.pipe_session = None;
+            inst.transport_session = None;
             inst.pipe_rx = None;
         }
         true

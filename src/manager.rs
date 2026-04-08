@@ -618,16 +618,23 @@ impl MultiCliManager {
         let (cur_row, cur_col) = screen.cursor_position();
         grid.cursor_row = cur_row;
         grid.cursor_col = cur_col;
-        // Respect DECTCEM: Ink-based TUIs (Claude Code) hide the terminal
-        // cursor during their render cycle and only show it at input prompts,
-        // so mirroring `!hide_cursor()` gives the correct input location.
-        // Always draw the cursor at vt100's reported position. Ink-based
-        // TUIs (Claude Code) flip DECTCEM on/off constantly during their
-        // render cycle, so mirroring `hide_cursor()` just makes the cursor
-        // disappear most of the time. The raw cursor_position() from vt100
-        // tracks the real edit caret (keyboard left/right arrow operate on
-        // it), so drawing it unconditionally matches user expectation.
-        grid.cursor_visible = true;
+        // Respect DECTCEM. Empirically verified with
+        // `cargo run --example pty_cursor_probe -p gate4agent`: Ink-based
+        // TUIs like Claude Code
+        //   - hide the terminal cursor in steady state and only unhide it
+        //     briefly while echoing raw input;
+        //   - park the vt100 cursor on whichever cell they are currently
+        //     repainting — for Claude that is typically the top-right
+        //     buddy ASCII-art animation, NOT the edit caret;
+        //   - draw their own fake caret in the framebuffer at the real
+        //     input position (reverse video / block glyph).
+        // Drawing our own white block at the raw vt100 position therefore
+        // causes two visible bugs: (1) the caret drifts into the buddy
+        // area when idle, and (2) it sits one cell past the real input
+        // caret while typing. Respecting `hide_cursor()` means the visible
+        // caret comes entirely from the framebuffer (what Ink drew), and
+        // both symptoms disappear.
+        grid.cursor_visible = !screen.hide_cursor();
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Pty(grid),
             session_active: st.session_active,
@@ -679,13 +686,11 @@ impl MultiCliManager {
             let (cur_row, cur_col) = screen.cursor_position();
             grid.cursor_row = cur_row;
             grid.cursor_col = cur_col;
-            // Always draw the cursor at vt100's reported position. Ink-based
-        // TUIs (Claude Code) flip DECTCEM on/off constantly during their
-        // render cycle, so mirroring `hide_cursor()` just makes the cursor
-        // disappear most of the time. The raw cursor_position() from vt100
-        // tracks the real edit caret (keyboard left/right arrow operate on
-        // it), so drawing it unconditionally matches user expectation.
-        grid.cursor_visible = true;
+            // See build_pty_snapshot() for the rationale: Ink-based TUIs
+            // draw their own fake caret in the framebuffer and park the
+            // real vt100 cursor on animation cells, so we must respect
+            // DECTCEM to avoid a drifting ghost caret.
+            grid.cursor_visible = !screen.hide_cursor();
             // Buddy extraction disabled — heuristic doesn't reliably catch the
         // companion ASCII art yet. Kept in snapshot.rs for future experiments.
         // grid.detect_and_extract_buddy();

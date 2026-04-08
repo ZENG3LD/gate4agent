@@ -8,6 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use crate::cli::factory::cli_builder;
+use crate::transport::SpawnOptions;
 use crate::types::CliTool;
 
 /// Claude Code-specific options for pipe mode spawning.
@@ -66,13 +68,17 @@ impl PipeProcess {
     ///
     /// The initial prompt is written to stdin (not as a CLI argument) to avoid
     /// Windows `cmd /C` mangling of Unicode, spaces, and special characters.
+    /// Note: Codex and Gemini receive the prompt as a CLI argument because they
+    /// do not read stdin; for those tools the `cmd /C` shell string includes the
+    /// properly-escaped prompt.
     pub fn new_with_options(
         tool: CliTool,
         working_dir: &std::path::Path,
         initial_prompt: &str,
         options: PipeProcessOptions,
     ) -> Result<Self, std::io::Error> {
-        let mut cmd = Self::build_command_with_options(tool, initial_prompt, &options);
+        let spawn_opts = Self::pipe_options_to_spawn_opts(tool, initial_prompt, &options, working_dir);
+        let mut cmd = Self::build_command_with_options(tool, &spawn_opts);
         cmd.current_dir(working_dir);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -84,9 +90,12 @@ impl PipeProcess {
 
         // Write prompt via stdin instead of CLI argument (avoids cmd.exe mangling).
         // Claude `-p` reads stdin until EOF, so we must drop (close) stdin after writing.
+        // For Codex and Gemini the prompt is already in the argv; stdin is closed immediately.
         if let Some(mut s) = stdin {
-            s.write_all(initial_prompt.as_bytes())?;
-            s.flush()?;
+            if tool == CliTool::ClaudeCode {
+                s.write_all(initial_prompt.as_bytes())?;
+                s.flush()?;
+            }
             drop(s); // close stdin → Claude sees EOF → starts processing
         }
 
@@ -111,127 +120,83 @@ impl PipeProcess {
         })
     }
 
-    /// Build the CLI command **without** the prompt argument.
-    ///
-    /// The prompt is written to stdin after spawn (see `new_with_options`) to
-    /// avoid Windows `cmd /C` mangling of Unicode, spaces, and special chars.
-    fn build_command_with_options(
-        tool: CliTool,
-        _prompt: &str,
+    /// Convert legacy `PipeProcessOptions` to the new `SpawnOptions`.
+    fn pipe_options_to_spawn_opts(
+        _tool: CliTool,
+        prompt: &str,
         options: &PipeProcessOptions,
-    ) -> Command {
+        working_dir: &std::path::Path,
+    ) -> SpawnOptions {
+        SpawnOptions {
+            working_dir: working_dir.to_path_buf(),
+            prompt: prompt.to_string(),
+            resume_session_id: options.claude.resume_session_id.clone(),
+            model: options.claude.model.clone(),
+            append_system_prompt: options.claude.append_system_prompt.clone(),
+            extra_args: options.extra_args.clone(),
+            env_vars: Vec::new(),
+        }
+    }
+
+    /// Build the spawn `Command` by delegating to the per-CLI builder.
+    ///
+    /// On Unix: returns the `Command` from the per-CLI builder directly.
+    ///
+    /// On Windows: the per-CLI builder returns a bare argv `Command`; this
+    /// function converts it to a `cmd /C <shell_string>` command. The shell
+    /// string is built by quoting each argument with Windows `"..."` quoting,
+    /// which handles spaces and special characters correctly for `cmd.exe`.
+    ///
+    /// Note: the prompt is included in argv for Codex and Gemini even on
+    /// Windows — the shell-quoting in `argv_to_windows_shell_string` handles
+    /// escaping. Claude's prompt is NOT in argv (delivered via stdin instead).
+    fn build_command_with_options(tool: CliTool, opts: &SpawnOptions) -> Command {
+        let builder = cli_builder(tool);
+        let inner_cmd = builder.build_command(opts);
+
         if cfg!(windows) {
-            let tool_cmd = match tool {
-                CliTool::ClaudeCode => {
-                    let mut cmd_str = String::from(
-                        "claude -p --output-format stream-json --verbose --dangerously-skip-permissions",
-                    );
-
-                    if let Some(ref system_prompt) = options.claude.append_system_prompt {
-                        cmd_str.push_str(" --append-system-prompt \"");
-                        cmd_str.push_str(&system_prompt.replace('"', "\\\""));
-                        cmd_str.push('"');
-                    }
-                    if let Some(ref session_id) = options.claude.resume_session_id {
-                        cmd_str.push_str(" --resume ");
-                        cmd_str.push_str(session_id);
-                    }
-                    if let Some(ref model) = options.claude.model {
-                        cmd_str.push_str(" --model ");
-                        cmd_str.push_str(model);
-                    }
-
-                    for arg in &options.extra_args {
-                        cmd_str.push(' ');
-                        cmd_str.push_str(arg);
-                    }
-
-                    // No prompt in CLI args — it goes via stdin
-                    cmd_str
-                }
-                CliTool::Codex => {
-                    // Codex doesn't support stdin prompt — keep as arg.
-                    // --ask-for-approval never: without this, Codex blocks on interactive
-                    //   tool approval prompts when piped, causing the reader loop to hang forever.
-                    // --skip-git-repo-check: allows spawning Codex in non-git directories
-                    //   (chart app sessions, daemon contexts).
-                    format!(
-                        "codex exec --json --ask-for-approval never --skip-git-repo-check \"{}\"",
-                        _prompt.replace('"', "\\\"")
-                    )
-                }
-                CliTool::Gemini => {
-                    // Gemini doesn't support stdin prompt — keep as arg.
-                    // Note: --verbose is intentionally omitted. It is not required for
-                    // --output-format stream-json and only adds stderr noise (Gemini CLI v0.36.0).
-                    format!(
-                        "gemini --output-format stream-json -p \"{}\"",
-                        _prompt.replace('"', "\\\"")
-                    )
-                }
-                // Phase 3/4: Cursor, OpenCode, OpenClaw command building will be
-                // implemented when their spawn specifications are finalized.
-                CliTool::Cursor | CliTool::OpenCode | CliTool::OpenClaw => {
-                    String::from("echo \"unsupported tool\"")
-                }
-            };
+            let shell_str = Self::argv_to_windows_shell_string(&inner_cmd);
             let mut cmd = Command::new("cmd");
-            cmd.args(["/C", &tool_cmd]);
+            cmd.args(["/C", &shell_str]);
             cmd
         } else {
-            match tool {
-                CliTool::ClaudeCode => {
-                    let mut cmd = Command::new("claude");
-                    cmd.arg("-p");
-                    cmd.arg("--output-format");
-                    cmd.arg("stream-json");
-                    cmd.arg("--verbose");
-                    cmd.arg("--dangerously-skip-permissions");
+            inner_cmd
+        }
+    }
 
-                    if let Some(ref system_prompt) = options.claude.append_system_prompt {
-                        cmd.arg("--append-system-prompt");
-                        cmd.arg(system_prompt);
-                    }
-                    if let Some(ref session_id) = options.claude.resume_session_id {
-                        cmd.arg("--resume");
-                        cmd.arg(session_id);
-                    }
-                    if let Some(ref model) = options.claude.model {
-                        cmd.arg("--model");
-                        cmd.arg(model);
-                    }
+    /// Convert a `Command`'s program + args into a Windows shell string for `cmd /C`.
+    ///
+    /// Each token is wrapped in double quotes with internal double-quotes escaped
+    /// as `\"`. This matches the quoting the old `format!("... \"{}\"", ...)` code
+    /// used for Codex and Gemini prompts, and is safe for `cmd.exe` argument passing.
+    fn argv_to_windows_shell_string(cmd: &Command) -> String {
+        let program = cmd.get_program().to_string_lossy();
+        let mut parts = vec![Self::win_quote(&program)];
+        for arg in cmd.get_args() {
+            let s = arg.to_string_lossy();
+            parts.push(Self::win_quote(&s));
+        }
+        parts.join(" ")
+    }
 
-                    for arg in &options.extra_args {
-                        cmd.arg(arg);
-                    }
-
-                    // No prompt in CLI args — it goes via stdin
-                    cmd
-                }
-                CliTool::Codex => {
-                    let mut cmd = Command::new("codex");
-                    // --ask-for-approval never: without this, Codex blocks on interactive
-                    //   tool approval prompts when piped, causing the reader loop to hang forever.
-                    // --skip-git-repo-check: allows spawning Codex in non-git directories
-                    //   (chart app sessions, daemon contexts).
-                    cmd.args(["exec", "--json", "--ask-for-approval", "never", "--skip-git-repo-check", _prompt]);
-                    cmd
-                }
-                CliTool::Gemini => {
-                    let mut cmd = Command::new("gemini");
-                    // Note: --verbose is intentionally omitted. It is not required for
-                    // --output-format stream-json and only adds stderr noise (Gemini CLI v0.36.0).
-                    cmd.args(["--output-format", "stream-json", "-p", _prompt]);
-                    cmd
-                }
-                // Phase 3/4: Cursor, OpenCode, OpenClaw command building will be
-                // implemented when their spawn specifications are finalized.
-                CliTool::Cursor | CliTool::OpenCode | CliTool::OpenClaw => {
-                    let mut cmd = Command::new("echo");
-                    cmd.arg("unsupported tool");
-                    cmd
-                }
-            }
+    /// Wrap a single token in Windows double-quote quoting.
+    ///
+    /// If the token contains no spaces, quotes, or shell-special characters,
+    /// the raw token is returned unchanged (avoids spurious quoting noise in
+    /// simple cases like flag names). Otherwise the token is wrapped in `"..."`
+    /// with internal `"` escaped as `\"`.
+    fn win_quote(s: &str) -> String {
+        let needs_quoting = s.is_empty()
+            || s.contains(' ')
+            || s.contains('"')
+            || s.contains('&')
+            || s.contains('|')
+            || s.contains('<')
+            || s.contains('>');
+        if needs_quoting {
+            format!("\"{}\"", s.replace('"', "\\\""))
+        } else {
+            s.to_string()
         }
     }
 

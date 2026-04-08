@@ -16,9 +16,11 @@ use std::io;
 use std::sync::OnceLock;
 
 use crate::cli::traits::{
-    MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter, StartupAction,
+    CliCommandBuilder, MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter,
+    StartupAction,
 };
 use crate::parser::VteParser;
+use crate::transport::SpawnOptions;
 use crate::types::CliTool;
 
 /// Gemini interactive slash commands.
@@ -2233,5 +2235,38 @@ mod tests {
             .to_pty_input(),
             "/restore 2025-06-22T10-00-00_000Z-file.txt-write_file\n"
         );
+    }
+}
+
+/// Pipe-mode spawn builder for Gemini CLI.
+///
+/// Implements `CliCommandBuilder` for use in `pipe/process.rs` dispatch.
+///
+/// Argv produced:
+///   `gemini --output-format stream-json -p <prompt>`
+///
+/// Note: `--verbose` is intentionally omitted — it is not required for
+/// `--output-format stream-json` and only adds stderr noise (Gemini CLI v0.36.0).
+///
+/// Resume: Gemini CLI does not support a `--resume` flag in pipe (`-p`) mode.
+/// `resume_session_id` is ignored. If Gemini adds resume support in a future
+/// version, this builder will need updating (Phase 3 live capture will confirm).
+pub struct GeminiPipeBuilder;
+
+impl CliCommandBuilder for GeminiPipeBuilder {
+    fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
+        let mut cmd = std::process::Command::new("gemini");
+        // Note: --verbose intentionally omitted (see doc comment above).
+        cmd.arg("--output-format");
+        cmd.arg("stream-json");
+        cmd.arg("-p");
+
+        for arg in &opts.extra_args {
+            cmd.arg(arg);
+        }
+
+        // Prompt follows -p as the final positional argument.
+        cmd.arg(&opts.prompt);
+        cmd
     }
 }

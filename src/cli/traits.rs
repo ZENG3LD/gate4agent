@@ -1,5 +1,6 @@
 //! Unified traits and types for CLI output parsing and prompt submission.
 
+use crate::transport::SpawnOptions;
 use crate::types::CliTool;
 use std::io;
 
@@ -92,4 +93,26 @@ pub enum StartupAction {
     Ready,
     SendInput(String),
     Waiting,
+}
+
+/// Trait for building the `std::process::Command` that spawns a CLI agent.
+///
+/// Each CLI module implements this trait. The returned `Command` is a bare
+/// command without `current_dir`, `stdin`, `stdout`, or `stderr` set — those
+/// are configured by the caller (`pipe/process.rs`) after dispatch.
+///
+/// On Windows the caller wraps the command in `cmd /C` to handle PATH lookup
+/// for node-based CLI tools installed via npm. The per-CLI impl returns the
+/// logical (non-shell) argv; the Windows wrapper is applied by the caller.
+pub trait CliCommandBuilder {
+    /// Build the spawn command for the given options.
+    ///
+    /// `prompt` delivery differs per CLI:
+    /// - Claude: prompt goes via stdin (not in argv) — builder omits it
+    /// - Codex: prompt is the final positional arg
+    /// - Gemini: prompt follows `-p`
+    ///
+    /// This is encoded per-CLI in the implementation — the trait does not
+    /// prescribe how the prompt appears in argv.
+    fn build_command(&self, opts: &SpawnOptions) -> std::process::Command;
 }

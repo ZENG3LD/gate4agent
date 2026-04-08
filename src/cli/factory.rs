@@ -2,11 +2,14 @@
 
 use crate::types::CliTool;
 
-use super::claude::{ClaudeOutputParser, ClaudePromptSubmitter};
-use super::codex::{CodexOutputParser, CodexPromptSubmitter};
-use super::gemini::{GeminiOutputParser, GeminiPromptSubmitter};
+use super::claude::{ClaudePipeBuilder, ClaudeOutputParser, ClaudePromptSubmitter};
+use super::codex::{CodexPipeBuilder, CodexOutputParser, CodexPromptSubmitter};
+use super::cursor::CursorPipeBuilder;
+use super::gemini::{GeminiPipeBuilder, GeminiOutputParser, GeminiPromptSubmitter};
+use super::openclaw::OpenClawPipeBuilder;
+use super::opencode::OpenCodePipeBuilder;
 use super::pipeline::ClassificationPipeline;
-use super::traits::{OutputParser, PromptSubmitter};
+use super::traits::{CliCommandBuilder, OutputParser, PromptSubmitter};
 
 /// Create an `OutputParser` for the given CLI tool.
 ///
@@ -43,4 +46,20 @@ pub fn create_submitter(tool: CliTool) -> Box<dyn PromptSubmitter> {
 /// Create a full `ClassificationPipeline` for the given CLI tool.
 pub fn create_pipeline(tool: CliTool) -> ClassificationPipeline {
     ClassificationPipeline::new(create_parser(tool))
+}
+
+/// Return a boxed `CliCommandBuilder` for the given CLI tool.
+///
+/// This is the single dispatch point used by `pipe/process.rs` to delegate
+/// command construction to the per-CLI builder, eliminating the giant match
+/// block in `build_command_with_options`.
+pub fn cli_builder(tool: CliTool) -> Box<dyn CliCommandBuilder> {
+    match tool {
+        CliTool::ClaudeCode => Box::new(ClaudePipeBuilder),
+        CliTool::Codex => Box::new(CodexPipeBuilder),
+        CliTool::Gemini => Box::new(GeminiPipeBuilder),
+        CliTool::Cursor => Box::new(CursorPipeBuilder),
+        CliTool::OpenCode => Box::new(OpenCodePipeBuilder),
+        CliTool::OpenClaw => Box::new(OpenClawPipeBuilder),
+    }
 }

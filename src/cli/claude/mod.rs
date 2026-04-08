@@ -9,8 +9,10 @@ use std::io;
 use std::sync::OnceLock;
 
 use crate::cli::traits::{
-    MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter, StartupAction,
+    CliCommandBuilder, MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter,
+    StartupAction,
 };
+use crate::transport::SpawnOptions;
 use crate::types::CliTool;
 
 /// Claude Code slash commands.
@@ -1153,6 +1155,47 @@ impl ClaudeCommandBuilder {
         }
 
         cmd.join(" ")
+    }
+}
+
+/// Pipe-mode spawn builder for Claude Code.
+///
+/// Implements `CliCommandBuilder` for use in `pipe/process.rs` dispatch.
+///
+/// Argv produced (all platforms):
+///   `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
+///   `[--append-system-prompt "<text>"] [--resume <id>] [--model <m>] [<extra>...]`
+///
+/// The initial prompt is **not** included in argv — it is written to stdin by
+/// the caller (`pipe/process.rs`) after spawn. Claude `-p` reads stdin until EOF.
+pub struct ClaudePipeBuilder;
+
+impl CliCommandBuilder for ClaudePipeBuilder {
+    fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
+        let mut cmd = std::process::Command::new("claude");
+        cmd.arg("-p");
+        cmd.arg("--output-format");
+        cmd.arg("stream-json");
+        cmd.arg("--verbose");
+        cmd.arg("--dangerously-skip-permissions");
+
+        if let Some(ref system_prompt) = opts.append_system_prompt {
+            cmd.arg("--append-system-prompt");
+            cmd.arg(system_prompt);
+        }
+        if let Some(ref session_id) = opts.resume_session_id {
+            cmd.arg("--resume");
+            cmd.arg(session_id);
+        }
+        if let Some(ref model) = opts.model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
+        for arg in &opts.extra_args {
+            cmd.arg(arg);
+        }
+        // No prompt in argv — delivered via stdin after spawn.
+        cmd
     }
 }
 

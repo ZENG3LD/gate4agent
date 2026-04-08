@@ -8,7 +8,9 @@
 
 pub use error::AgentError;
 pub use types::{AgentEvent, CliTool, PtyEvent, SessionConfig};
+pub use transport::SpawnOptions;
 
+pub mod transport;
 pub mod pty;
 pub mod pipe;
 pub mod parser;

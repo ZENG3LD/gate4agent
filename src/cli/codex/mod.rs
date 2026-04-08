@@ -13,8 +13,10 @@ use std::io;
 use std::sync::OnceLock;
 
 use crate::cli::traits::{
-    MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter, StartupAction,
+    CliCommandBuilder, MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter,
+    StartupAction,
 };
+use crate::transport::SpawnOptions;
 use crate::types::CliTool;
 
 /// Codex slash commands that can be sent via PTY.
@@ -1343,5 +1345,53 @@ Context window: 100% left (7.49K used / 272K)"#;
         // Should contain WelcomeScreen, but not duplicate ContextLeft
         assert!(responses.iter().any(|r| matches!(r, CodexResponse::WelcomeScreen { .. })));
         assert!(!responses.iter().any(|r| matches!(r, CodexResponse::ContextLeft { .. })));
+    }
+}
+
+/// Pipe-mode spawn builder for Codex.
+///
+/// Implements `CliCommandBuilder` for use in `pipe/process.rs` dispatch.
+///
+/// Argv produced (fresh session):
+///   `codex exec --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///
+/// Argv produced (resumed session):
+///   `codex exec resume <session_id> --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///
+/// Note the `exec resume <id>` sub-sub-command shape — this is why per-CLI
+/// function builders are used instead of a declarative `ResumeMode` enum.
+///
+/// `--ask-for-approval never`: without this, Codex blocks on interactive tool
+///   approval prompts when piped, causing the reader loop to hang forever.
+/// `--skip-git-repo-check`: allows spawning Codex in non-git directories
+///   (chart app sessions, daemon contexts).
+pub struct CodexPipeBuilder;
+
+impl CliCommandBuilder for CodexPipeBuilder {
+    fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
+        let mut cmd = std::process::Command::new("codex");
+
+        if let Some(ref session_id) = opts.resume_session_id {
+            // Resume shape: `codex exec resume <id> --json --ask-for-approval never ...`
+            cmd.arg("exec");
+            cmd.arg("resume");
+            cmd.arg(session_id);
+        } else {
+            // Fresh shape: `codex exec --json --ask-for-approval never ...`
+            cmd.arg("exec");
+        }
+
+        cmd.arg("--json");
+        cmd.arg("--ask-for-approval");
+        cmd.arg("never");
+        cmd.arg("--skip-git-repo-check");
+
+        for arg in &opts.extra_args {
+            cmd.arg(arg);
+        }
+
+        // Prompt is the final positional argument.
+        cmd.arg(&opts.prompt);
+        cmd
     }
 }

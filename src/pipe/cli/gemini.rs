@@ -193,13 +193,13 @@ impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
             cmd.arg(session_id);
         }
 
-        cmd.arg("-p");
-
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }
 
-        // Prompt follows -p as the final positional argument.
+        // -p takes the prompt as its value (not as a separate positional arg).
+        // `gemini -p "prompt text"` — confirmed from `gemini --help`.
+        cmd.arg("-p");
         cmd.arg(&opts.prompt);
         cmd
     }

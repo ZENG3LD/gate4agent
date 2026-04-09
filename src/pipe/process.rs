@@ -142,62 +142,88 @@ impl PipeProcess {
     ///
     /// On Unix: returns the `Command` from the per-CLI builder directly.
     ///
-    /// On Windows: the per-CLI builder returns a bare argv `Command`; this
-    /// function converts it to a `cmd /C <shell_string>` command. The shell
-    /// string is built by quoting each argument with Windows `"..."` quoting,
-    /// which handles spaces and special characters correctly for `cmd.exe`.
-    ///
-    /// Note: the prompt is included in argv for Codex and Gemini even on
-    /// Windows — the shell-quoting in `argv_to_windows_shell_string` handles
-    /// escaping. Claude's prompt is NOT in argv (delivered via stdin instead).
+    /// On Windows: npm-installed CLIs get `cmd /C <program>.cmd <args...>`.
+    /// Non-npm tools (bash scripts, native binaries) get `bash -c '...'`.
+    /// Each arg is passed individually (not joined into a shell string)
+    /// so Windows CreateProcess handles quoting correctly for prompts
+    /// that contain spaces and special characters.
     fn build_command_with_options(tool: CliTool, opts: &SpawnOptions) -> Command {
         let builder = cli_builder(tool);
         let inner_cmd = builder.build_command(opts);
 
         if cfg!(windows) {
-            let shell_str = Self::argv_to_windows_shell_string(&inner_cmd);
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", &shell_str]);
-            cmd
+            // On Windows, npm-installed CLIs have `.cmd` batch wrappers that
+            // cmd.exe can invoke. Non-npm tools (e.g. cursor-agent) may be
+            // bash scripts or native binaries with no `.cmd` wrapper.
+            //
+            // Strategy: check if `<program>.cmd` exists on PATH. If yes,
+            // use `cmd /C <program>.cmd <args...>`. If not, invoke the
+            // program directly (works for .exe binaries and bash scripts
+            // when running under MSYS2/Git Bash).
+            //
+            // Each arg is passed as a separate element (NOT joined into a
+            // shell string) so Windows CreateProcess handles quoting correctly.
+            let program = inner_cmd.get_program().to_string_lossy().to_string();
+
+            if program.ends_with(".cmd") || program.ends_with(".exe") {
+                // Already has extension — use cmd /C directly.
+                let mut cmd = Command::new("cmd");
+                cmd.arg("/C");
+                cmd.arg(&program);
+                for arg in inner_cmd.get_args() {
+                    cmd.arg(arg);
+                }
+                cmd
+            } else {
+                // Check if a .cmd wrapper exists on PATH.
+                let cmd_name = format!("{}.cmd", program);
+                let has_cmd = std::env::var_os("PATH")
+                    .map(|path| {
+                        std::env::split_paths(&path)
+                            .any(|dir| dir.join(&cmd_name).is_file())
+                    })
+                    .unwrap_or(false);
+
+                if has_cmd {
+                    let mut cmd = Command::new("cmd");
+                    cmd.arg("/C");
+                    cmd.arg(&cmd_name);
+                    for arg in inner_cmd.get_args() {
+                        cmd.arg(arg);
+                    }
+                    cmd
+                } else {
+                    // No .cmd wrapper — may be a bash script or native .exe.
+                    // Windows CreateProcess can't run extensionless scripts,
+                    // so we invoke via `bash -c "program arg1 arg2 ..."`.
+                    let mut cmd = Command::new("bash");
+                    cmd.arg("-c");
+                    let mut shell_str = Self::shell_quote(&program);
+                    for arg in inner_cmd.get_args() {
+                        let s = arg.to_string_lossy();
+                        shell_str.push(' ');
+                        shell_str.push_str(&Self::shell_quote(&s));
+                    }
+                    cmd.arg(&shell_str);
+                    cmd
+                }
+            }
         } else {
             inner_cmd
         }
     }
 
-    /// Convert a `Command`'s program + args into a Windows shell string for `cmd /C`.
-    ///
-    /// Each token is wrapped in double quotes with internal double-quotes escaped
-    /// as `\"`. This matches the quoting the old `format!("... \"{}\"", ...)` code
-    /// used for Codex and Gemini prompts, and is safe for `cmd.exe` argument passing.
-    fn argv_to_windows_shell_string(cmd: &Command) -> String {
-        let program = cmd.get_program().to_string_lossy();
-        let mut parts = vec![Self::win_quote(&program)];
-        for arg in cmd.get_args() {
-            let s = arg.to_string_lossy();
-            parts.push(Self::win_quote(&s));
+    /// Single-quote a token for POSIX shell (`bash -c`).
+    fn shell_quote(s: &str) -> String {
+        if s.is_empty() {
+            return "''".to_string();
         }
-        parts.join(" ")
-    }
-
-    /// Wrap a single token in Windows double-quote quoting.
-    ///
-    /// If the token contains no spaces, quotes, or shell-special characters,
-    /// the raw token is returned unchanged (avoids spurious quoting noise in
-    /// simple cases like flag names). Otherwise the token is wrapped in `"..."`
-    /// with internal `"` escaped as `\"`.
-    fn win_quote(s: &str) -> String {
-        let needs_quoting = s.is_empty()
-            || s.contains(' ')
-            || s.contains('"')
-            || s.contains('&')
-            || s.contains('|')
-            || s.contains('<')
-            || s.contains('>');
-        if needs_quoting {
-            format!("\"{}\"", s.replace('"', "\\\""))
-        } else {
-            s.to_string()
+        // If it contains no special chars, return as-is.
+        if s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/') {
+            return s.to_string();
         }
+        // Wrap in single quotes, escaping embedded single quotes.
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 
     fn reader_thread(stdout: std::process::ChildStdout, tx: Sender<String>) {

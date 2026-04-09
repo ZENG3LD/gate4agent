@@ -9,7 +9,7 @@ Universal Rust transport library for CLI AI agents. Spawn, stream, resume — fo
 | Tool | Transport | Pipe mode | Resume | Notes |
 |---|---|---|---|---|
 | **Claude Code** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via stdin |
-| **Codex** | Pipe + PTY | ✓ `--json` | ✓ `exec resume <id>` | Requires `--ask-for-approval never --skip-git-repo-check` |
+| **Codex** | Pipe + PTY | ✓ `--json` | ✓ `exec resume <id>` | Uses `--full-auto` for non-interactive execution |
 | **Gemini** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via `-p` flag |
 | **Cursor Agent** | Pipe | ✓ stream-json | ✓ `--resume <id>` | Claude-compatible schema |
 | **OpenCode** (`sst/opencode`) | Pipe | ✓ `--format json` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
@@ -114,14 +114,24 @@ gate4agent/
 
 | Tool | Pipe tested? | PTY tested? | Notes |
 |---|---|---|---|
-| **Claude Code** | ✓ verified in 0.1.x | ✗ untested | Primary consumer, production-proven pipe |
-| **Codex** | ✗ research-based | ✗ untested | Parser from OpenAI docs, not live-verified |
-| **Gemini** | ✗ research-based | ✗ untested | Parser from Google docs, not live-verified |
-| **Cursor Agent** | ✗ research-based | N/A (no PTY) | Closed-source CLI, community-sourced field names |
-| **OpenCode** | ✗ research-based | ✗ untested | Parser from sst/opencode source, not live-verified |
+| **Claude Code** | ✓ live-verified (0.2.5) | ✗ untested | Full session: init → text → tokens → result |
+| **Codex** | ✓ live-verified (0.2.5) | ✗ untested | Full session: thread.started → item.completed → turn.completed |
+| **Gemini** | ✓ parser verified (0.2.5) | ✗ untested | Init event parsed; API returned 429 (rate limit) |
+| **OpenCode** | ✓ parser verified (0.2.5) | ✗ untested | Error event parsed, session ID tracked; API key misconfigured |
+| **Cursor Agent** | ✗ CLI broken on test machine | N/A (no PTY) | `node_sqlite3.node` incompatible (Linux binary on Windows) |
 
 PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
-New pipe parsers (0.2.3) are backed by unit tests with fixture JSON but have NOT been tested against actual CLI subprocess output.
+Pipe parsers for Claude and Codex are fully live-verified. Gemini and OpenCode parsers correctly handle real CLI output but need valid API credentials for full end-to-end testing. Cursor parser is structurally correct but the CLI itself is broken on the test machine.
+
+## Windows spawn strategy
+
+On Windows, CLI tools are invoked through the appropriate shell:
+
+- **npm-installed CLIs** (claude, codex, gemini, opencode): `cmd /C program.cmd arg1 arg2` — the `.cmd` batch wrapper is detected via PATH lookup
+- **Bash scripts** (cursor-agent): `bash -c 'program arg1 arg2'` — fallback when no `.cmd` wrapper exists
+- **Unix**: direct `Command::new("program")` — no shell wrapping needed
+
+Arguments are passed individually (not joined into a shell string) to avoid cmd.exe quote-mangling issues.
 
 ## Prerequisites
 
@@ -142,6 +152,8 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.1** — cleanup: OpenClaw removed (was never functional), `PipeSession` restored for 0.1.x compatibility, `TransportSession` is now a thin router over `PipeSession`
 - **0.2.2** — parser isolation: NdjsonParser trait extracted, per-CLI parser modules split out
 - **0.2.3** — source tree restructure into core/pty/pipe layout; proper pipe builders+parsers for Codex, Gemini, Cursor, OpenCode (research-based, NOT yet tested against live CLI output)
+- **0.2.4** — docs update, Codex flags fixed (`--full-auto` replaces removed `--ask-for-approval`)
+- **0.2.5** — live integration tests: fixed Codex flags, OpenCode `run` subcommand, Gemini `-p` flag, Windows `cmd /C` quoting; all parsers verified against real CLI output
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

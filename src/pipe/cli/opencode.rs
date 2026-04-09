@@ -142,27 +142,29 @@ impl NdjsonParser for OpenCodeNdjsonParser {
 
 /// Pipe-mode spawn builder for OpenCode.
 ///
-/// There is NO `run` subcommand — the default command takes a message directly.
+/// The `run` subcommand is required for headless pipe mode.
+/// Without it, `opencode` launches the TUI.
 ///
 /// Argv produced (fresh session):
 /// ```text
-/// opencode --format json [<extra>...] "<prompt>"
+/// opencode run --format json [<extra>...] "<prompt>"
 /// ```
 ///
 /// Argv produced (resumed session — specific ID):
 /// ```text
-/// opencode --format json --session <ses_XXXX> [<extra>...] "<prompt>"
+/// opencode run --format json --session <ses_XXXX> [<extra>...] "<prompt>"
 /// ```
 ///
 /// Argv produced (resumed session — last session):
 /// ```text
-/// opencode --format json --continue [<extra>...] "<prompt>"
+/// opencode run --format json --continue [<extra>...] "<prompt>"
 /// ```
 pub struct OpenCodePipeBuilder;
 
 impl super::traits::CliCommandBuilder for OpenCodePipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut cmd = std::process::Command::new("opencode");
+        cmd.arg("run");
         cmd.arg("--format");
         cmd.arg("json");
 

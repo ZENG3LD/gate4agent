@@ -9,7 +9,7 @@ If a session produces no events:
 1. **Is the CLI binary on `PATH`?** Run it manually first (`claude --version`, `codex --version`, etc.).
 2. **Is the CLI logged in?** gate4agent doesn't handle auth. Each CLI manages its own credentials.
 3. **Capture raw stdout** — before blaming the parser, spawn the exact argv gate4agent uses and pipe to a file. Compare against the fixture NDJSON in `tests/` for that CLI.
-4. **Check for interactive prompts** — headless mode must not prompt. Codex needs `--ask-for-approval never --skip-git-repo-check` (gate4agent adds these automatically).
+4. **Check for interactive prompts** — headless mode must not prompt. Codex needs `--full-auto --skip-git-repo-check` (gate4agent adds these automatically).
 5. **Check exit code** — `SessionEnd { result: "exit_code=N", is_error: ... }` tells you if the child crashed. `exit_code=0` without real events usually means the CLI wrote something we don't parse.
 
 ## Per-CLI issues
@@ -24,7 +24,7 @@ If a session produces no events:
 ### Codex
 
 - **Production bug fixed in 0.2.0**: `CodexNdjsonParser` was reading `item.get("output")` for command results but Codex actually emits `aggregated_output`. Any 0.1.x consumer would see empty shell output. Upgrade to 0.2.0+ if you care about tool results.
-- **Interactive hangs without `--ask-for-approval never`**: fixed in 0.2.0. If you still see hangs, check you're on 0.2.0+.
+- **Interactive hangs without `--full-auto`**: fixed in 0.2.0. If you still see hangs, check you're on 0.2.0+.
 - **`--skip-git-repo-check`**: fixed in 0.2.0. Without it, Codex refuses to run in non-git directories.
 - **Resume shape**: `codex exec resume <session_id> --json ...`. Note the sub-sub-command — this is why gate4agent uses function-per-CLI builders instead of a declarative spec.
 - **No terminal event**: Codex doesn't emit any `session_end`-equivalent. gate4agent synthesizes `SessionEnd` when the child process exits. If you see two `SessionEnd` events per session, the parser is double-counting — please file an issue with the raw NDJSON.
@@ -98,3 +98,13 @@ If any test fails on a clean checkout with a released version, file an issue wit
 1. Reproduce with `RUST_LOG=gate4agent=trace`
 2. Capture the raw NDJSON (or PTY screen) from the CLI directly
 3. File an issue on GitHub with: CLI name + version, gate4agent version, OS, raw output, expected vs actual event sequence
+
+## Windows spawn: cmd /C vs bash fallback
+
+gate4agent detects whether a CLI has a `.cmd` wrapper on PATH:
+- If `.cmd` exists: `cmd /C program.cmd arg1 arg2` (npm-installed tools)
+- If no `.cmd`: `bash -c 'program arg1 ...'` (bash scripts, native binaries)
+
+**Why not join args into a shell string?** `cmd.exe /C` has bizarre quote-stripping rules: if the first char after `/C` is `"`, cmd may strip enclosing quotes and break the inner command. Passing args individually via `.arg()` lets Windows `CreateProcess` handle quoting correctly.
+
+**Why `/S /C "..."` doesn't work?** Tested — cmd.exe still misinterprets nested quotes in certain edge cases (e.g., prompts with periods and colons). The individual-args approach is more reliable.

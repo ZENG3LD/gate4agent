@@ -144,12 +144,10 @@ fn codex_fresh_session_argv() {
         &[
             "exec",
             "--json",
-            "--ask-for-approval",
-            "never",
-            "--skip-git-repo-check",
+            "--full-auto",
             "write a hello world in rust",
         ],
-        "Codex fresh: exec subcommand, --json, approval flags, then prompt as final arg"
+        "Codex fresh: exec subcommand, --json, --full-auto, then prompt as final arg"
     );
 }
 
@@ -165,7 +163,7 @@ fn codex_with_resume_argv() {
 
     assert_eq!(get_program(&cmd), "codex");
     let got = get_args(&cmd);
-    // Resumed shape: codex exec resume <id> --json --ask-for-approval never --skip-git-repo-check <prompt>
+    // Resumed shape: codex exec resume <id> --json --full-auto <prompt>
     assert_eq!(
         got,
         &[
@@ -173,9 +171,7 @@ fn codex_with_resume_argv() {
             "resume",
             "rollout-20260409-abc",
             "--json",
-            "--ask-for-approval",
-            "never",
-            "--skip-git-repo-check",
+            "--full-auto",
             "continue",
         ],
         "Codex resume: exec resume <id> sub-sub-command, then flags, then prompt"
@@ -351,8 +347,8 @@ fn opencode_fresh_session_argv() {
 
     assert_eq!(get_program(&cmd), "opencode");
     let got = get_args(&cmd);
-    // Must NOT start with "run" — there is no "run" subcommand per OpenCode source.
-    assert_ne!(got.first().copied(), Some("run"), "OpenCode argv must NOT contain a 'run' subcommand");
+    // Must start with "run" — the `run` subcommand is required for headless pipe mode.
+    assert_eq!(got.first().copied(), Some("run"), "OpenCode argv must start with 'run' subcommand");
     // Must contain --format json
     assert!(
         got.windows(2).any(|w| w == ["--format", "json"]),

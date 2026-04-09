@@ -1356,16 +1356,17 @@ Context window: 100% left (7.49K used / 272K)"#;
 /// Implements `CliCommandBuilder` for use in `pipe/process.rs` dispatch.
 ///
 /// Argv produced (fresh session):
-///   `codex exec --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///   `codex exec --json --full-auto --skip-git-repo-check <prompt>`
 ///
 /// Argv produced (resumed session):
-///   `codex exec resume <session_id> --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///   `codex exec resume <session_id> --json --full-auto --skip-git-repo-check <prompt>`
 ///
 /// Note the `exec resume <id>` sub-sub-command shape — this is why per-CLI
 /// function builders are used instead of a declarative `ResumeMode` enum.
 ///
-/// `--ask-for-approval never`: without this, Codex blocks on interactive tool
-///   approval prompts when piped, causing the reader loop to hang forever.
+/// `--full-auto`: non-interactive execution mode; without this, Codex blocks
+///   on interactive tool approval prompts when piped, causing the reader loop
+///   to hang forever.
 /// `--skip-git-repo-check`: allows spawning Codex in non-git directories
 ///   (chart app sessions, daemon contexts).
 pub struct CodexPipeBuilder;
@@ -1375,18 +1376,17 @@ impl CliCommandBuilder for CodexPipeBuilder {
         let mut cmd = std::process::Command::new("codex");
 
         if let Some(ref session_id) = opts.resume_session_id {
-            // Resume shape: `codex exec resume <id> --json --ask-for-approval never ...`
+            // Resume shape: `codex exec resume <id> --json --full-auto ...`
             cmd.arg("exec");
             cmd.arg("resume");
             cmd.arg(session_id);
         } else {
-            // Fresh shape: `codex exec --json --ask-for-approval never ...`
+            // Fresh shape: `codex exec --json --full-auto ...`
             cmd.arg("exec");
         }
 
         cmd.arg("--json");
-        cmd.arg("--ask-for-approval");
-        cmd.arg("never");
+        cmd.arg("--full-auto");
         cmd.arg("--skip-git-repo-check");
 
         for arg in &opts.extra_args {

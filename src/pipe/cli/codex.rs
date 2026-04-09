@@ -280,10 +280,10 @@ impl NdjsonParser for CodexNdjsonParser {
 /// Pipe-mode spawn builder for Codex.
 ///
 /// Argv produced (fresh session):
-///   `codex exec --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///   `codex exec --json --full-auto <prompt>`
 ///
 /// Argv produced (resumed session):
-///   `codex exec resume <session_id> --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///   `codex exec resume <session_id> --json --full-auto <prompt>`
 ///
 /// Available `--sandbox` policies (not added here — callers can pass via `extra_args`):
 ///   - `read-only` (default) — no file writes, no network
@@ -296,19 +296,17 @@ impl super::traits::CliCommandBuilder for CodexPipeBuilder {
         let mut cmd = std::process::Command::new("codex");
 
         if let Some(ref session_id) = opts.resume_session_id {
-            // Resume shape: `codex exec resume <id> --json --ask-for-approval never ...`
+            // Resume shape: `codex exec resume <id> --json --full-auto ...`
             cmd.arg("exec");
             cmd.arg("resume");
             cmd.arg(session_id);
         } else {
-            // Fresh shape: `codex exec --json --ask-for-approval never ...`
+            // Fresh shape: `codex exec --json --full-auto ...`
             cmd.arg("exec");
         }
 
         cmd.arg("--json");
-        cmd.arg("--ask-for-approval");
-        cmd.arg("never");
-        cmd.arg("--skip-git-repo-check");
+        cmd.arg("--full-auto");
 
         for arg in &opts.extra_args {
             cmd.arg(arg);

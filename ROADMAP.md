@@ -25,8 +25,11 @@ What changed from 0.2.1 → 0.2.3:
 
 ### Testing status
 
-- **Claude pipe**: verified in production since 0.1.x. NOT modified in 0.2.2–0.2.3.
-- **Codex/Gemini/Cursor/OpenCode pipes**: research-based parsers backed by unit tests with fixture JSON. NOT tested against live CLI subprocess output yet.
+- **Claude pipe**: live-verified (0.2.5). Full session lifecycle: SessionStart → AssistantText → TurnComplete → SessionEnd.
+- **Codex pipe**: live-verified (0.2.5). Full session: SessionStart → AssistantText → TurnComplete.
+- **Gemini pipe**: parser verified (0.2.5). Init event parsed correctly, API returned 429 rate limit.
+- **OpenCode pipe**: parser verified (0.2.5). Error event parsed, session ID (`ses_XXX`) tracked correctly. Needs valid API key for full test.
+- **Cursor pipe**: CLI broken on test machine (`node_sqlite3.node` incompatibility). Parser structure correct per unit tests.
 - **PTY**: structurally unchanged, low risk. Not formally tested.
 
 ### Known limitations
@@ -40,7 +43,7 @@ Small, additive, non-breaking:
 
 - [x] **Research actual OpenCode session storage** — done (0.2.3), session persistence via `--session ses_XXX`
 - [x] **Research Gemini resume** — done (0.2.3), `--resume <id>` supported
-- [ ] **Live integration tests** — run each CLI's pipe against the real subprocess, capture output, validate parser correctness
+- [x] **Live integration tests** — done (0.2.5): Claude+Codex fully verified, Gemini+OpenCode parser-verified, Cursor CLI broken
 - [ ] **Live-verify Cursor parser** — run `cursor-agent -p --output-format stream-json` and diff against fixture tests
 - [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
 - [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for Cursor / OpenCode

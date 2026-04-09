@@ -25,16 +25,16 @@ What changed from 0.2.1 → 0.2.3:
 
 ### Testing status
 
-- **Claude pipe**: live-verified (0.2.5). Full session lifecycle: SessionStart → AssistantText → TurnComplete → SessionEnd.
-- **Codex pipe**: live-verified (0.2.5). Full session: SessionStart → AssistantText → TurnComplete.
-- **Gemini pipe**: parser verified (0.2.5). Init event parsed correctly, API returned 429 rate limit.
-- **OpenCode pipe**: parser verified (0.2.5). Error event parsed, session ID (`ses_XXX`) tracked correctly. Needs valid API key for full test.
-- **Cursor pipe**: CLI broken on test machine (`node_sqlite3.node` incompatibility). Parser structure correct per unit tests.
+- **Claude pipe**: live-verified (0.2.5). Full session lifecycle.
+- **Codex pipe**: live-verified (0.2.5). Full session.
+- **Gemini pipe**: **live-verified (0.2.6)**. Full session: SessionStart → AssistantText → TurnComplete → SessionEnd. Previously 429 rate-limited.
+- **OpenCode pipe**: **live-verified (0.2.6)**. Full session: AssistantText → TurnComplete. Parser rewritten from real CLI output. Free model (`opencode/nemotron-3-super-free`) used for testing.
+- **Cursor pipe**: CLI broken on test machine.
 - **PTY**: structurally unchanged, low risk. Not formally tested.
 
 ### Known limitations
 
-1. **Non-Claude pipe parsers are research-based**, not verified against live CLI output. Field names may drift if upstream CLIs change their output format.
+1. **Cursor pipe parser is research-based**, not verified against live CLI output. Claude, Codex, Gemini, and OpenCode parsers are all live-verified. Cursor field names may drift if the upstream CLI changes its output format.
 2. **Cursor CLI is closed-source** — parser fields marked UNVERIFIED come from community analysis and may change without notice.
 
 ## Next — 0.2.x patch line

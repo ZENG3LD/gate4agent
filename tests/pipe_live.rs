@@ -10,23 +10,23 @@ use std::time::{Duration, Instant};
 
 use gate4agent::pipe::cli::traits::CliEvent;
 use gate4agent::pipe::cli::create_ndjson_parser;
-use gate4agent::pipe::{PipeProcess, PipeProcessOptions};
+use gate4agent::pipe::{PipeProcess, PipeProcessOptions, ClaudeOptions};
 use gate4agent::CliTool;
 
 /// Spawn the given CLI tool via PipeProcess and validate NDJSON output.
-fn run_pipe_test(tool: CliTool) {
+fn run_pipe_test(tool: CliTool, extra_args: Vec<String>) {
     let cwd = std::env::current_dir().unwrap();
     let prompt = "Say exactly: hello from gate4agent. Nothing else.";
 
     println!("[{:?}] Spawning...", tool);
 
-    let mut pipe = PipeProcess::new_with_options(
-        tool,
-        &cwd,
-        prompt,
-        PipeProcessOptions::default(),
-    )
-    .unwrap_or_else(|e| panic!("{:?} failed to spawn: {}", tool, e));
+    let opts = PipeProcessOptions {
+        extra_args,
+        claude: ClaudeOptions::default(),
+    };
+
+    let mut pipe = PipeProcess::new_with_options(tool, &cwd, prompt, opts)
+        .unwrap_or_else(|e| panic!("{:?} failed to spawn: {}", tool, e));
 
     println!("[{:?}] Spawned, reading NDJSON events...", tool);
 
@@ -56,7 +56,6 @@ fn run_pipe_test(tool: CliTool) {
         }
 
         if !pipe.is_running() {
-            // Drain remaining lines
             while let Some(line) = pipe.try_recv() {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -103,29 +102,33 @@ fn run_pipe_test(tool: CliTool) {
 #[test]
 #[ignore]
 fn pipe_live_claude() {
-    run_pipe_test(CliTool::ClaudeCode);
+    run_pipe_test(CliTool::ClaudeCode, vec![]);
 }
 
 #[test]
 #[ignore]
 fn pipe_live_codex() {
-    run_pipe_test(CliTool::Codex);
+    run_pipe_test(CliTool::Codex, vec![]);
 }
 
 #[test]
 #[ignore]
 fn pipe_live_gemini() {
-    run_pipe_test(CliTool::Gemini);
+    run_pipe_test(CliTool::Gemini, vec![]);
 }
 
 #[test]
 #[ignore]
 fn pipe_live_cursor() {
-    run_pipe_test(CliTool::Cursor);
+    run_pipe_test(CliTool::Cursor, vec![]);
 }
 
 #[test]
 #[ignore]
 fn pipe_live_opencode() {
-    run_pipe_test(CliTool::OpenCode);
+    // Use free built-in model to avoid API key requirements.
+    run_pipe_test(
+        CliTool::OpenCode,
+        vec!["-m".into(), "opencode/nemotron-3-super-free".into()],
+    );
 }

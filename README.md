@@ -116,12 +116,12 @@ gate4agent/
 |---|---|---|---|
 | **Claude Code** | ✓ live-verified (0.2.5) | ✗ untested | Full session: init → text → tokens → result |
 | **Codex** | ✓ live-verified (0.2.5) | ✗ untested | Full session: thread.started → item.completed → turn.completed |
-| **Gemini** | ✓ parser verified (0.2.5) | ✗ untested | Init event parsed; API returned 429 (rate limit) |
-| **OpenCode** | ✓ parser verified (0.2.5) | ✗ untested | Error event parsed, session ID tracked; API key misconfigured |
+| **Gemini** | ✓ live-verified (0.2.6) | ✗ untested | Full session: init → text → result |
+| **OpenCode** | ✓ live-verified (0.2.6) | ✗ untested | Full session: text → step_finish. Parser rewritten from real output. |
 | **Cursor Agent** | ✗ CLI broken on test machine | N/A (no PTY) | `node_sqlite3.node` incompatible (Linux binary on Windows) |
 
 PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
-Pipe parsers for Claude and Codex are fully live-verified. Gemini and OpenCode parsers correctly handle real CLI output but need valid API credentials for full end-to-end testing. Cursor parser is structurally correct but the CLI itself is broken on the test machine.
+Pipe parsers for Claude, Codex, Gemini, and OpenCode are fully live-verified. Cursor parser is structurally correct but the CLI itself is broken on the test machine.
 
 ## Windows spawn strategy
 
@@ -154,6 +154,7 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.3** — source tree restructure into core/pty/pipe layout; proper pipe builders+parsers for Codex, Gemini, Cursor, OpenCode (research-based, NOT yet tested against live CLI output)
 - **0.2.4** — docs update, Codex flags fixed (`--full-auto` replaces removed `--ask-for-approval`)
 - **0.2.5** — live integration tests: fixed Codex flags, OpenCode `run` subcommand, Gemini `-p` flag, Windows `cmd /C` quoting; all parsers verified against real CLI output
+- **0.2.6** — Gemini + OpenCode live-verified; OpenCode parser rewritten from real CLI output
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

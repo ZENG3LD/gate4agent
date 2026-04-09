@@ -16,10 +16,10 @@ use std::path::Path;
 
 use tokio::sync::broadcast;
 
-use crate::error::AgentError;
+use crate::core::error::AgentError;
 use crate::pipe::PipeSession;
 use crate::transport::SpawnOptions;
-use crate::types::{AgentEvent, CliTool};
+use crate::core::types::{AgentEvent, CliTool};
 
 /// Thin dispatch router for spawning any of the 5 supported PIPE-mode CLI agents.
 ///
@@ -49,7 +49,7 @@ impl TransportSession {
         prompt: &str,
         options: SpawnOptions,
     ) -> Result<Self, AgentError> {
-        use crate::types::SessionConfig;
+        use crate::core::types::SessionConfig;
 
         let config = SessionConfig {
             tool,

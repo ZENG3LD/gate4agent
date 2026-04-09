@@ -1,7 +1,7 @@
 //! Unified traits and types for CLI output parsing and prompt submission.
 
 use crate::transport::SpawnOptions;
-use crate::types::CliTool;
+use crate::core::types::CliTool;
 use std::io;
 
 /// Classification of a message received from a CLI tool.

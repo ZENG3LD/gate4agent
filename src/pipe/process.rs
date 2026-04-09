@@ -8,9 +8,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use crate::cli::factory::cli_builder;
+use crate::pipe::cli::cli_builder;
 use crate::transport::SpawnOptions;
-use crate::types::CliTool;
+use crate::core::types::CliTool;
 
 /// Claude Code-specific options for pipe mode spawning.
 #[derive(Debug, Clone, Default)]

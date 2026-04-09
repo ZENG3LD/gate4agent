@@ -1,4 +1,4 @@
-//! NDJSON parser trait and unified CliEvent type.
+//! Pipe-mode CLI traits: NDJSON parser and command builder.
 
 use serde_json::Value;
 
@@ -66,4 +66,18 @@ pub trait NdjsonParser: Send {
     fn detected_session_id(&self) -> Option<&str> {
         self.session_id()
     }
+}
+
+/// Trait for building the `std::process::Command` that spawns a CLI agent.
+///
+/// Each CLI module implements this trait. The returned `Command` is a bare
+/// command without `current_dir`, `stdin`, `stdout`, or `stderr` set — those
+/// are configured by the caller (`pipe/process.rs`) after dispatch.
+///
+/// On Windows the caller wraps the command in `cmd /C` to handle PATH lookup
+/// for node-based CLI tools installed via npm. The per-CLI impl returns the
+/// logical (non-shell) argv; the Windows wrapper is applied by the caller.
+pub trait CliCommandBuilder {
+    /// Build the spawn command for the given options.
+    fn build_command(&self, opts: &crate::transport::SpawnOptions) -> std::process::Command;
 }

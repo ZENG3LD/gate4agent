@@ -18,11 +18,11 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::pty::PtySession;
-use crate::snapshot::{
+use crate::pty::snapshot::{
     AgentCli, AgentRenderSnapshot, AgentSnapshotMode, ChatMessage, ChatRole, LiveStatus, TermCell, TermGrid,
 };
 use crate::transport::{SpawnOptions, TransportSession};
-use crate::types::{AgentEvent, CliTool, SessionConfig};
+use crate::core::types::{AgentEvent, CliTool, SessionConfig};
 
 // =============================================================================
 // InstanceId

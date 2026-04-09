@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 static PROJECTS_DIR_CACHE: Mutex<Option<HashMap<PathBuf, Option<PathBuf>>>> = Mutex::new(None);
 
-use crate::snapshot::{ChatMessage, ChatRole};
+use crate::pty::snapshot::{ChatMessage, ChatRole};
 use super::{HistoryReader, SessionMeta};
 
 pub struct ClaudeHistoryReader;

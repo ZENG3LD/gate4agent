@@ -1,19 +1,14 @@
-//! NDJSON stream parser for Google Gemini CLI.
-//!
-//! Expects output from: `gemini --output-format stream-json --prompt "prompt"`
-//!
-//! Event types: "init", "message", "tool_use", "tool_result", "error", "result"
+//! Pipe-mode Gemini bindings: NDJSON parser + spawn builder.
 
-use serde_json::Value;
-
-use crate::ndjson::traits::{CliEvent, NdjsonParser};
+use super::traits::{CliEvent, NdjsonParser};
 use crate::utils::truncate_str;
+use crate::transport::SpawnOptions;
 
 /// Gemini CLI stream-json parser.
 ///
 /// Expects output from: `gemini --output-format stream-json --prompt "prompt"`
 ///
-/// Event types: "init", "message", "tool_use", "tool_result", "result"
+/// Event types: "init", "message", "tool_use", "tool_result", "error", "result"
 pub struct GeminiNdjsonParser {
     session_id: Option<String>,
 }
@@ -37,7 +32,7 @@ impl NdjsonParser for GeminiNdjsonParser {
             return vec![];
         }
 
-        let v: Value = match serde_json::from_str(line) {
+        let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
                 return vec![CliEvent::Error {
@@ -96,7 +91,7 @@ impl NdjsonParser for GeminiNdjsonParser {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string();
-                let params = v.get("parameters").cloned().unwrap_or(Value::Null);
+                let params = v.get("parameters").cloned().unwrap_or(serde_json::Value::Null);
                 events.push(CliEvent::ToolCallStart { id, name, input: params });
             }
             Some("tool_result") => {
@@ -165,5 +160,34 @@ impl NdjsonParser for GeminiNdjsonParser {
 
     fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+}
+
+/// Pipe-mode spawn builder for Gemini CLI.
+///
+/// Argv produced:
+///   `gemini --output-format stream-json -p <prompt>`
+///
+/// Note: `--verbose` is intentionally omitted — it is not required for
+/// `--output-format stream-json` and only adds stderr noise.
+///
+/// Resume: Gemini CLI does not support a `--resume` flag in pipe (`-p`) mode.
+/// `resume_session_id` is ignored.
+pub struct GeminiPipeBuilder;
+
+impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
+    fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
+        let mut cmd = std::process::Command::new("gemini");
+        cmd.arg("--output-format");
+        cmd.arg("stream-json");
+        cmd.arg("-p");
+
+        for arg in &opts.extra_args {
+            cmd.arg(arg);
+        }
+
+        // Prompt follows -p as the final positional argument.
+        cmd.arg(&opts.prompt);
+        cmd
     }
 }

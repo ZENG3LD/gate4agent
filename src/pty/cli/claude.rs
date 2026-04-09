@@ -3,20 +3,20 @@
 //! This module provides comprehensive bindings for Claude Code CLI,
 //! including all slash commands, keyboard shortcuts, and response parsing.
 
-pub mod parser;
-pub use parser::ClaudeNdjsonParser;
+
+
 
 use regex::Regex;
 use std::collections::HashMap;
 use std::io;
 use std::sync::OnceLock;
 
-use crate::cli::traits::{
+use super::traits::{
     CliCommandBuilder, MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter,
     StartupAction,
 };
 use crate::transport::SpawnOptions;
-use crate::types::CliTool;
+use crate::core::types::CliTool;
 
 /// Claude Code slash commands.
 ///

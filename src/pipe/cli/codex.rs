@@ -1,14 +1,8 @@
-//! NDJSON stream parser for OpenAI Codex CLI.
-//!
-//! Expects output from: `codex exec --json "prompt"`
-//!
-//! Event types: "thread.started", "turn.started", "turn.completed", "item.started",
-//! "item.completed", "turn.failed", "error"
+//! Pipe-mode Codex bindings: NDJSON parser + spawn builder.
 
-use serde_json::Value;
-
-use crate::ndjson::traits::{CliEvent, NdjsonParser};
+use super::traits::{CliEvent, NdjsonParser};
 use crate::utils::truncate_str;
+use crate::transport::SpawnOptions;
 
 /// Codex CLI JSONL parser.
 ///
@@ -38,7 +32,7 @@ impl NdjsonParser for CodexNdjsonParser {
             return vec![];
         }
 
-        let v: Value = match serde_json::from_str(line) {
+        let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
                 return vec![CliEvent::Error {
@@ -215,6 +209,44 @@ impl NdjsonParser for CodexNdjsonParser {
     }
 }
 
+/// Pipe-mode spawn builder for Codex.
+///
+/// Argv produced (fresh session):
+///   `codex exec --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///
+/// Argv produced (resumed session):
+///   `codex exec resume <session_id> --json --ask-for-approval never --skip-git-repo-check <prompt>`
+pub struct CodexPipeBuilder;
+
+impl super::traits::CliCommandBuilder for CodexPipeBuilder {
+    fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
+        let mut cmd = std::process::Command::new("codex");
+
+        if let Some(ref session_id) = opts.resume_session_id {
+            // Resume shape: `codex exec resume <id> --json --ask-for-approval never ...`
+            cmd.arg("exec");
+            cmd.arg("resume");
+            cmd.arg(session_id);
+        } else {
+            // Fresh shape: `codex exec --json --ask-for-approval never ...`
+            cmd.arg("exec");
+        }
+
+        cmd.arg("--json");
+        cmd.arg("--ask-for-approval");
+        cmd.arg("never");
+        cmd.arg("--skip-git-repo-check");
+
+        for arg in &opts.extra_args {
+            cmd.arg(arg);
+        }
+
+        // Prompt is the final positional argument.
+        cmd.arg(&opts.prompt);
+        cmd
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,8 +304,7 @@ mod tests {
         }
     }
 
-    /// Test that "assistant_message" in item.started is silently consumed (no events),
-    /// same as "agent_message" — the content arrives in item.completed.
+    /// Test that "assistant_message" in item.started is silently consumed (no events).
     #[test]
     fn codex_assistant_message_alias_started() {
         let mut parser = CodexNdjsonParser::new();
@@ -281,11 +312,11 @@ mod tests {
         let events = parser.parse_line(line);
         assert!(
             events.is_empty(),
-            "item.started for assistant_message should produce no events (content comes in item.completed)"
+            "item.started for assistant_message should produce no events"
         );
     }
 
-    /// Test that "agent_message" still works (alias must not break the original).
+    /// Test that "agent_message" still works.
     #[test]
     fn codex_agent_message_original_still_works() {
         let mut parser = CodexNdjsonParser::new();

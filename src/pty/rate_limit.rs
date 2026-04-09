@@ -3,7 +3,7 @@
 use chrono::Utc;
 use regex::Regex;
 
-use crate::types::{CliTool, RateLimitInfo, RateLimitType};
+use crate::core::types::{CliTool, RateLimitInfo, RateLimitType};
 
 /// Detects rate limits from CLI output.
 pub struct RateLimitDetector {

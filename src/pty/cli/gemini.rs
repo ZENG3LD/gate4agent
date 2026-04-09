@@ -9,8 +9,8 @@
 //! - Extension, MCP, and Skills management
 //! - Session and checkpoint management
 
-pub mod parser;
-pub use parser::GeminiNdjsonParser;
+
+
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -18,13 +18,13 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::OnceLock;
 
-use crate::cli::traits::{
+use super::traits::{
     CliCommandBuilder, MessageClass, MessageMetadata, OutputParser, ParsedMessage, PromptSubmitter,
     StartupAction,
 };
-use crate::parser::VteParser;
+use crate::pty::vte::VteParser;
 use crate::transport::SpawnOptions;
-use crate::types::CliTool;
+use crate::core::types::CliTool;
 
 /// Gemini interactive slash commands.
 ///

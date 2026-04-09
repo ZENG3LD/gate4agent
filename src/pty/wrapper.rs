@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use thiserror::Error;
 
-use crate::types::CliTool;
+use crate::core::types::CliTool;
 
 /// Module-internal PTY errors. Converted to `AgentError` at the `PtySession` boundary.
 #[derive(Error, Debug)]

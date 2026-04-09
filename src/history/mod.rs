@@ -4,7 +4,7 @@
 //! inside its own dotfolder under our workdir. This module just reads them.
 
 use std::path::Path;
-use crate::snapshot::{AgentCli, ChatMessage};
+use crate::pty::snapshot::{AgentCli, ChatMessage};
 
 pub mod claude;
 

@@ -1,4 +1,4 @@
-//! Unified error enum for the cli2pty4agent crate.
+//! Unified error enum for gate4agent.
 
 /// Unified error type for all operations in this crate.
 #[derive(Debug, thiserror::Error)]

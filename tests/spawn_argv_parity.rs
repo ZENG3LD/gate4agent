@@ -8,7 +8,7 @@
 //! `cmd /C` wrapping is applied by `pipe/process.rs` and is tested separately
 //! via the shell-quoting helpers in that module.
 
-use gate4agent::cli::cli_builder;
+use gate4agent::pipe::cli_builder;
 use gate4agent::{CliTool, SpawnOptions};
 
 fn get_program(cmd: &std::process::Command) -> &str {

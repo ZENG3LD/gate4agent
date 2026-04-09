@@ -1,14 +1,8 @@
-//! NDJSON stream parser for Claude Code CLI.
-//!
-//! Expects output from: `claude -p "prompt" --output-format stream-json --verbose`
-//!
-//! Event types: "system" (init), "assistant" (text/tool_use), "user" (tool_result),
-//! "result" (final), "stream_event" (streaming delta)
+//! Pipe-mode Claude Code bindings: NDJSON parser + spawn builder.
 
-use serde_json::Value;
-
-use crate::ndjson::traits::{CliEvent, NdjsonParser};
+use super::traits::{CliEvent, NdjsonParser};
 use crate::utils::truncate_str;
+use crate::transport::SpawnOptions;
 
 /// Claude Code stream-json parser.
 ///
@@ -38,7 +32,7 @@ impl NdjsonParser for ClaudeNdjsonParser {
             return vec![];
         }
 
-        let v: Value = match serde_json::from_str(line) {
+        let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
                 return vec![CliEvent::Error {
@@ -107,7 +101,7 @@ impl NdjsonParser for ClaudeNdjsonParser {
                                 let input = block
                                     .get("input")
                                     .cloned()
-                                    .unwrap_or(Value::Null);
+                                    .unwrap_or(serde_json::Value::Null);
                                 events.push(CliEvent::ToolCallStart { id, name, input });
                             }
                             Some("thinking") => {
@@ -210,6 +204,45 @@ impl NdjsonParser for ClaudeNdjsonParser {
 
     fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+}
+
+/// Pipe-mode spawn builder for Claude Code.
+///
+/// Argv produced (all platforms):
+///   `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
+///   `[--append-system-prompt "<text>"] [--resume <id>] [--model <m>] [<extra>...]`
+///
+/// The initial prompt is **not** included in argv — it is written to stdin by
+/// the caller (`pipe/process.rs`) after spawn.
+pub struct ClaudePipeBuilder;
+
+impl super::traits::CliCommandBuilder for ClaudePipeBuilder {
+    fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
+        let mut cmd = std::process::Command::new("claude");
+        cmd.arg("-p");
+        cmd.arg("--output-format");
+        cmd.arg("stream-json");
+        cmd.arg("--verbose");
+        cmd.arg("--dangerously-skip-permissions");
+
+        if let Some(ref system_prompt) = opts.append_system_prompt {
+            cmd.arg("--append-system-prompt");
+            cmd.arg(system_prompt);
+        }
+        if let Some(ref session_id) = opts.resume_session_id {
+            cmd.arg("--resume");
+            cmd.arg(session_id);
+        }
+        if let Some(ref model) = opts.model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
+        for arg in &opts.extra_args {
+            cmd.arg(arg);
+        }
+        // No prompt in argv — delivered via stdin after spawn.
+        cmd
     }
 }
 

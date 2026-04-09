@@ -21,10 +21,10 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::error::AgentError;
-use crate::ndjson::{create_ndjson_parser, CliEvent};
+use crate::core::error::AgentError;
+use crate::pipe::cli::{create_ndjson_parser, CliEvent};
 use crate::pipe::process::{PipeProcess, PipeProcessOptions};
-use crate::types::{AgentEvent, CliTool, SessionConfig};
+use crate::core::types::{AgentEvent, CliTool, SessionConfig};
 
 /// Async pipe session. Spawns a CLI tool in headless pipe mode and broadcasts
 /// NDJSON events as `AgentEvent` to all subscribers via a tokio broadcast channel.
@@ -277,7 +277,7 @@ fn uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ndjson::traits::NdjsonParser;
+    use crate::pipe::cli::NdjsonParser;
 
     /// A fake parser that never emits SessionEnd.
     struct NeverEndsParser;

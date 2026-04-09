@@ -1,4 +1,4 @@
-//! Core shared types for cli2pty4agent.
+//! Core shared types for gate4agent.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ pub enum AgentEvent {
     /// reads are not corrupted by `from_utf8_lossy` replacement characters.
     PtyRaw { data: Vec<u8> },
     /// Classified PTY output (post-VTE-strip + OutputParser classification).
-    PtyParsed(crate::cli::traits::ParsedMessage),
+    PtyParsed(crate::pty::cli::traits::ParsedMessage),
     /// PTY session ready for input (PromptReady detected).
     PtyReady,
     /// PTY tool approval needed.

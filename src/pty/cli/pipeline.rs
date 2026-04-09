@@ -1,7 +1,7 @@
 //! Classification pipeline that combines VTE stripping with CLI-specific parsing.
 
-use crate::parser::VteParser;
-use crate::types::CliTool;
+use crate::pty::vte::VteParser;
+use crate::core::types::CliTool;
 
 use super::traits::{MessageClass, OutputParser, ParsedMessage};
 

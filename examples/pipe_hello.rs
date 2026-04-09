@@ -1,7 +1,7 @@
 //! Quick smoke test: spawn Claude in pipe mode, send a prompt, print events.
 
 use gate4agent::pipe::{PipeProcess, PipeProcessOptions};
-use gate4agent::ndjson::{create_ndjson_parser, CliEvent};
+use gate4agent::pipe::{create_ndjson_parser, CliEvent};
 use gate4agent::CliTool;
 use std::time::{Duration, Instant};
 

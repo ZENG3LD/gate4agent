@@ -6,12 +6,12 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::cli::factory::{create_pipeline, create_submitter};
-use crate::cli::traits::{MessageClass, StartupAction};
-use crate::detection::RateLimitDetector;
-use crate::error::AgentError;
-use crate::parser::VteParser;
-use crate::types::{AgentEvent, CliTool, SessionConfig};
+use crate::pty::cli::{create_pipeline, create_submitter};
+use crate::pty::cli::traits::{MessageClass, StartupAction};
+use crate::pty::rate_limit::RateLimitDetector;
+use crate::core::error::AgentError;
+use crate::pty::vte::VteParser;
+use crate::core::types::{AgentEvent, CliTool, SessionConfig};
 
 use super::wrapper::{PtyError, PtyWrapper};
 

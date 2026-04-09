@@ -252,7 +252,15 @@ impl super::traits::CliCommandBuilder for OpenCodePipeBuilder {
         if let Some(ref session_id) = opts.resume_session_id {
             cmd.arg("--session");
             cmd.arg(session_id);
+        } else if opts.continue_last {
+            cmd.arg("--continue");
         }
+
+        if let Some(ref model) = opts.model {
+            cmd.arg("-m");
+            cmd.arg(model);
+        }
+
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }

@@ -135,6 +135,7 @@ impl PipeProcess {
             append_system_prompt: options.claude.append_system_prompt.clone(),
             extra_args: options.extra_args.clone(),
             env_vars: Vec::new(),
+            ..Default::default()
         }
     }
 

@@ -209,9 +209,14 @@ impl NdjsonParser for ClaudeNdjsonParser {
 
 /// Pipe-mode spawn builder for Claude Code.
 ///
-/// Argv produced (all platforms):
+/// Argv produced (default, no permission_mode):
 ///   `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
-///   `[--append-system-prompt "<text>"] [--resume <id>] [--model <m>] [<extra>...]`
+///   `[--append-system-prompt "<text>"] [--resume <id> | --continue] [--model <m>]`
+///   `[--allowedTools <tools>] [--permission-mode <mode>] [--mcp-config <path>]`
+///   `[--max-turns <N>] [<extra>...]`
+///
+/// When `permission_mode` is set, `--dangerously-skip-permissions` is omitted and
+/// `--permission-mode <value>` is added instead.
 ///
 /// The initial prompt is **not** included in argv — it is written to stdin by
 /// the caller (`pipe/process.rs`) after spawn.
@@ -224,20 +229,50 @@ impl super::traits::CliCommandBuilder for ClaudePipeBuilder {
         cmd.arg("--output-format");
         cmd.arg("stream-json");
         cmd.arg("--verbose");
-        cmd.arg("--dangerously-skip-permissions");
+
+        // --dangerously-skip-permissions is the default, but omitted when the
+        // caller explicitly sets permission_mode (they conflict).
+        if opts.permission_mode.is_none() {
+            cmd.arg("--dangerously-skip-permissions");
+        }
 
         if let Some(ref system_prompt) = opts.append_system_prompt {
             cmd.arg("--append-system-prompt");
             cmd.arg(system_prompt);
         }
+
         if let Some(ref session_id) = opts.resume_session_id {
             cmd.arg("--resume");
             cmd.arg(session_id);
+        } else if opts.continue_last {
+            cmd.arg("--continue");
         }
+
         if let Some(ref model) = opts.model {
             cmd.arg("--model");
             cmd.arg(model);
         }
+
+        if !opts.allowed_tools.is_empty() {
+            cmd.arg("--allowedTools");
+            cmd.arg(opts.allowed_tools.join(","));
+        }
+
+        if let Some(ref mode) = opts.permission_mode {
+            cmd.arg("--permission-mode");
+            cmd.arg(mode);
+        }
+
+        if let Some(ref mcp_config) = opts.mcp_config {
+            cmd.arg("--mcp-config");
+            cmd.arg(mcp_config);
+        }
+
+        if let Some(max_turns) = opts.max_turns {
+            cmd.arg("--max-turns");
+            cmd.arg(max_turns.to_string());
+        }
+
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }

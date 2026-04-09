@@ -280,10 +280,13 @@ impl NdjsonParser for CodexNdjsonParser {
 /// Pipe-mode spawn builder for Codex.
 ///
 /// Argv produced (fresh session):
-///   `codex exec --json --full-auto <prompt>`
+///   `codex exec --json --full-auto [--model <m>] <prompt>`
 ///
-/// Argv produced (resumed session):
-///   `codex exec resume <session_id> --json --full-auto <prompt>`
+/// Argv produced (resumed session by ID):
+///   `codex exec resume <session_id> --json --full-auto [--model <m>] <prompt>`
+///
+/// Argv produced (resume last session via `continue_last`):
+///   `codex exec resume --last --json --full-auto [--model <m>] <prompt>`
 ///
 /// Available `--sandbox` policies (not added here — callers can pass via `extra_args`):
 ///   - `read-only` (default) — no file writes, no network
@@ -296,17 +299,27 @@ impl super::traits::CliCommandBuilder for CodexPipeBuilder {
         let mut cmd = std::process::Command::new("codex");
 
         if let Some(ref session_id) = opts.resume_session_id {
-            // Resume shape: `codex exec resume <id> --json --full-auto ...`
+            // Resume by ID: `codex exec resume <id> --json --full-auto ...`
             cmd.arg("exec");
             cmd.arg("resume");
             cmd.arg(session_id);
+        } else if opts.continue_last {
+            // Resume last: `codex exec resume --last --json --full-auto ...`
+            cmd.arg("exec");
+            cmd.arg("resume");
+            cmd.arg("--last");
         } else {
-            // Fresh shape: `codex exec --json --full-auto ...`
+            // Fresh: `codex exec --json --full-auto ...`
             cmd.arg("exec");
         }
 
         cmd.arg("--json");
         cmd.arg("--full-auto");
+
+        if let Some(ref model) = opts.model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
 
         for arg in &opts.extra_args {
             cmd.arg(arg);

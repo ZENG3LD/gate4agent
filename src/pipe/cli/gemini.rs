@@ -167,12 +167,12 @@ impl NdjsonParser for GeminiNdjsonParser {
 ///
 /// Argv produced (fresh session):
 /// ```text
-/// gemini --output-format stream-json -p [<extra>...] "<prompt>"
+/// gemini --output-format stream-json [--sandbox] -p [<extra>...] "<prompt>"
 /// ```
 ///
 /// Argv produced (resumed session):
 /// ```text
-/// gemini --output-format stream-json --resume <id> -p [<extra>...] "<prompt>"
+/// gemini --output-format stream-json --resume <id> [--sandbox] -p [<extra>...] "<prompt>"
 /// ```
 ///
 /// Note: `--verbose` is intentionally omitted — it is not required for
@@ -180,6 +180,9 @@ impl NdjsonParser for GeminiNdjsonParser {
 ///
 /// Resume: `--resume latest` or `--resume <index>` (from `--list-sessions`).
 /// Source: `packages/cli/src/config/config.ts` — `--resume` / `-r` flag.
+///
+/// `continue_last` is NOT supported by Gemini — it has no `--continue` flag.
+/// Use `resume_session_id = Some("latest".to_string())` instead.
 pub struct GeminiPipeBuilder;
 
 impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
@@ -191,6 +194,10 @@ impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
         if let Some(ref session_id) = opts.resume_session_id {
             cmd.arg("--resume");
             cmd.arg(session_id);
+        }
+
+        if opts.sandbox {
+            cmd.arg("--sandbox");
         }
 
         for arg in &opts.extra_args {

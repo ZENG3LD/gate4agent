@@ -128,6 +128,174 @@ fn claude_extra_args_appear_in_argv() {
 }
 
 // ─────────────────────────────────────────────
+// Claude — new SpawnOptions fields
+// ─────────────────────────────────────────────
+
+#[test]
+fn claude_continue_last_argv() {
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        continue_last: true,
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"--continue"),
+        "continue_last=true must add --continue to Claude argv"
+    );
+    assert!(
+        !got.contains(&"--resume"),
+        "--resume must NOT appear when continue_last is used without resume_session_id"
+    );
+}
+
+#[test]
+fn claude_continue_last_ignored_when_resume_session_id_set() {
+    // resume_session_id takes priority over continue_last.
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        continue_last: true,
+        resume_session_id: Some("ses_explicit".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"--resume"),
+        "--resume must appear when resume_session_id is set"
+    );
+    assert!(
+        !got.contains(&"--continue"),
+        "--continue must NOT appear when resume_session_id is also set"
+    );
+}
+
+#[test]
+fn claude_allowed_tools_argv() {
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        allowed_tools: vec!["Edit".to_string(), "Read".to_string(), "Bash".to_string()],
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    let tools_pos = got.iter().position(|a| *a == "--allowedTools");
+    assert!(tools_pos.is_some(), "--allowedTools flag must appear in argv");
+    assert_eq!(
+        got.get(tools_pos.unwrap() + 1).copied(),
+        Some("Edit,Read,Bash"),
+        "--allowedTools value must be comma-joined tool names"
+    );
+}
+
+#[test]
+fn claude_permission_mode_replaces_dangerously_skip() {
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        permission_mode: Some("default".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"--permission-mode"),
+        "--permission-mode flag must appear when permission_mode is set"
+    );
+    assert_eq!(
+        got.iter().position(|a| *a == "--permission-mode")
+            .and_then(|i| got.get(i + 1).copied()),
+        Some("default"),
+        "--permission-mode value must be 'default'"
+    );
+    assert!(
+        !got.contains(&"--dangerously-skip-permissions"),
+        "--dangerously-skip-permissions must NOT appear when permission_mode is set"
+    );
+}
+
+#[test]
+fn claude_permission_mode_accept_all() {
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        permission_mode: Some("accept-all".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.windows(2).any(|w| w == ["--permission-mode", "accept-all"]),
+        "--permission-mode accept-all must appear in argv"
+    );
+    assert!(
+        !got.contains(&"--dangerously-skip-permissions"),
+        "--dangerously-skip-permissions must NOT appear when permission_mode is explicitly set"
+    );
+}
+
+#[test]
+fn claude_mcp_config_argv() {
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        mcp_config: Some(std::path::PathBuf::from("/tmp/mcp.json")),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    let mcp_pos = got.iter().position(|a| *a == "--mcp-config");
+    assert!(mcp_pos.is_some(), "--mcp-config flag must appear in argv");
+    assert!(
+        got.get(mcp_pos.unwrap() + 1)
+            .map(|v| v.contains("mcp.json"))
+            .unwrap_or(false),
+        "--mcp-config value must contain the path"
+    );
+}
+
+#[test]
+fn claude_max_turns_argv() {
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        max_turns: Some(10),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.windows(2).any(|w| w == ["--max-turns", "10"]),
+        "--max-turns 10 must appear in Claude argv"
+    );
+}
+
+#[test]
+fn claude_no_permission_mode_keeps_dangerously_skip() {
+    // Default behavior: no permission_mode set → --dangerously-skip-permissions stays.
+    let builder = cli_builder(CliTool::ClaudeCode);
+    let opts = make_opts("hello");
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"--dangerously-skip-permissions"),
+        "--dangerously-skip-permissions must appear when permission_mode is None"
+    );
+}
+
+// ─────────────────────────────────────────────
 // Codex
 // ─────────────────────────────────────────────
 
@@ -189,6 +357,55 @@ fn codex_prompt_is_last_arg() {
         got.last().copied(),
         Some("my prompt"),
         "Codex: prompt must be the last argv token"
+    );
+}
+
+#[test]
+fn codex_continue_last_argv() {
+    let builder = cli_builder(CliTool::Codex);
+    let opts = SpawnOptions {
+        prompt: "continue".to_string(),
+        continue_last: true,
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    assert_eq!(get_program(&cmd), "codex");
+    let got = get_args(&cmd);
+    // Shape: codex exec resume --last --json --full-auto <prompt>
+    assert_eq!(
+        &got[..3],
+        &["exec", "resume", "--last"],
+        "Codex continue_last must produce: exec resume --last ..."
+    );
+    assert!(got.contains(&"--json"), "--json must appear in Codex continue_last argv");
+    assert!(got.contains(&"--full-auto"), "--full-auto must appear in Codex continue_last argv");
+    assert_eq!(
+        got.last().copied(),
+        Some("continue"),
+        "Codex: prompt must still be the last argv token"
+    );
+}
+
+#[test]
+fn codex_continue_last_ignored_when_resume_session_id_set() {
+    let builder = cli_builder(CliTool::Codex);
+    let opts = SpawnOptions {
+        prompt: "go".to_string(),
+        continue_last: true,
+        resume_session_id: Some("rollout-explicit".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"rollout-explicit"),
+        "explicit session ID must appear in argv"
+    );
+    assert!(
+        !got.contains(&"--last"),
+        "--last must NOT appear when resume_session_id is also set"
     );
 }
 
@@ -258,6 +475,36 @@ fn gemini_prompt_is_last_arg() {
         got.last().copied(),
         Some("my gemini prompt"),
         "Gemini: prompt must be the last argv token (follows -p)"
+    );
+}
+
+#[test]
+fn gemini_sandbox_argv() {
+    let builder = cli_builder(CliTool::Gemini);
+    let opts = SpawnOptions {
+        prompt: "test".to_string(),
+        sandbox: true,
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"--sandbox"),
+        "--sandbox must appear in Gemini argv when sandbox=true"
+    );
+}
+
+#[test]
+fn gemini_no_sandbox_by_default() {
+    let builder = cli_builder(CliTool::Gemini);
+    let opts = make_opts("test");
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        !got.contains(&"--sandbox"),
+        "--sandbox must NOT appear in Gemini argv when sandbox=false"
     );
 }
 
@@ -338,6 +585,72 @@ fn opencode_prompt_is_last_arg() {
         got.last().copied(),
         Some("my opencode prompt"),
         "OpenCode: prompt must be the last argv token"
+    );
+}
+
+#[test]
+fn opencode_continue_last_argv() {
+    let builder = cli_builder(CliTool::OpenCode);
+    let opts = SpawnOptions {
+        prompt: "continue".to_string(),
+        continue_last: true,
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    assert_eq!(get_program(&cmd), "opencode");
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"--continue"),
+        "--continue must appear in OpenCode argv when continue_last=true"
+    );
+    assert!(
+        !got.contains(&"--session"),
+        "--session must NOT appear when continue_last is used without resume_session_id"
+    );
+    assert_eq!(
+        got.last().copied(),
+        Some("continue"),
+        "OpenCode: prompt must still be the last argv token"
+    );
+}
+
+#[test]
+fn opencode_continue_last_ignored_when_resume_session_id_set() {
+    let builder = cli_builder(CliTool::OpenCode);
+    let opts = SpawnOptions {
+        prompt: "go".to_string(),
+        continue_last: true,
+        resume_session_id: Some("ses_explicit".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.contains(&"--session"),
+        "--session must appear when resume_session_id is set"
+    );
+    assert!(
+        !got.contains(&"--continue"),
+        "--continue must NOT appear when resume_session_id is also set"
+    );
+}
+
+#[test]
+fn opencode_model_argv() {
+    let builder = cli_builder(CliTool::OpenCode);
+    let opts = SpawnOptions {
+        prompt: "hello".to_string(),
+        model: Some("anthropic/claude-opus-4".to_string()),
+        ..Default::default()
+    };
+    let cmd = builder.build_command(&opts);
+
+    let got = get_args(&cmd);
+    assert!(
+        got.windows(2).any(|w| w == ["-m", "anthropic/claude-opus-4"]),
+        "-m <model> must appear in OpenCode argv when model is set"
     );
 }
 

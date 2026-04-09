@@ -2,41 +2,48 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.1 (April 2026)
+## Current — 0.2.3 (April 2026)
 
-Shipped in 0.2.1 (cleanup release):
+Shipped in 0.2.3:
 
 - **5 CLI tools**: Claude Code, Codex, Gemini, Cursor Agent, OpenCode (`sst/opencode`)
 - **Two transport classes**: Pipe, PTY
-- **Honest dispatch**: `TransportSession` is a thin router over `PipeSession` — no dead code, no fantasy enum variants
-- **`PipeSession` restored**: 0.1.x-compatible `PipeSession::spawn(config, prompt, options)` entry point is back
-- **`SpawnOptions`**: single options struct, unchanged from 0.2.0
+- **core/pty/pipe source layout**: clean separation — `core/` for types+errors, `pty/` for PTY transport + per-CLI screen parsers, `pipe/` for Pipe transport + per-CLI NDJSON parsers
+- **Research-based pipe parsers**: Codex, Gemini, Cursor, OpenCode parsers rewritten from actual docs/source (not Claude-copy-paste)
+- **Gemini resume support**: `--resume <id>` flag added to GeminiPipeBuilder
+- **NdjsonParser trait**: `parse_line(&mut self, line: &str) -> Vec<CliEvent>` + `session_id() -> Option<&str>`
+- **CliCommandBuilder trait**: per-tool command builder handles each CLI's quirks
+- **`PipeSession` restored**: 0.1.x-compatible entry point
+- **`SpawnOptions`**: single options struct
 - **SessionEnd synthesis**: guaranteed one `SessionEnd` per session regardless of CLI
-- **Per-CLI `CliCommandBuilder`**: per-tool command builder handles each CLI's quirks
 - **Transport-neutral `AgentEvent`**: `Text`, `ToolStart`, `ToolResult`, `Thinking`, `TurnComplete`, `SessionStart`, `SessionEnd`
 
-What changed from 0.2.0:
+What changed from 0.2.1 → 0.2.3:
 
-- **OpenClaw removed entirely** — `CliTool::OpenClaw`, `AgentCli::OpenClaw`, `DaemonSpec`, `DaemonProbe`, `ensure_daemon_running`, `DaemonNotRunning`, `DaemonProbeTimeout` all deleted. OpenClaw was never functional: the acpx API surface was fiction from unread docs, and no live capture was ever performed.
-- **`TransportHandle` enum deleted** — replaced by `TransportSession` holding a `PipeSession` directly. No dead `Pty` variant.
-- **`pipe_runner.rs` deleted** — its reader-loop logic is now in `pipe/session.rs` where it belongs.
-- **`daemon_runner.rs` / `daemon_spec.rs` / `daemon/` deleted** — no daemon transport exists.
+- **0.2.2**: Parser isolation — `NdjsonParser` trait extracted, per-CLI parser modules split out from monolithic file
+- **0.2.3**: Full source tree restructure (core/pty/pipe), proper pipe builders+parsers for all 4 non-Claude CLIs based on research
+
+### Testing status
+
+- **Claude pipe**: verified in production since 0.1.x. NOT modified in 0.2.2–0.2.3.
+- **Codex/Gemini/Cursor/OpenCode pipes**: research-based parsers backed by unit tests with fixture JSON. NOT tested against live CLI subprocess output yet.
+- **PTY**: structurally unchanged, low risk. Not formally tested.
 
 ### Known limitations
 
-1. **Cursor / OpenCode parsers are doc-based**, not verified against live CLI output. If upstream field names differ, a patch release will reconcile.
-2. **Gemini resume is not supported** — the Gemini CLI does not expose a `--resume` flag in pipe mode. `SpawnOptions::resume_session_id` is silently ignored for Gemini.
+1. **Non-Claude pipe parsers are research-based**, not verified against live CLI output. Field names may drift if upstream CLIs change their output format.
+2. **Cursor CLI is closed-source** — parser fields marked UNVERIFIED come from community analysis and may change without notice.
 
 ## Next — 0.2.x patch line
 
 Small, additive, non-breaking:
 
-- [ ] **Live-capture verification** of Cursor / OpenCode parsers. Reconcile any field-name drift against real `cursor-agent` and `opencode` output.
-- [ ] **Research actual OpenCode session storage** — read `sst/opencode` source to understand session persistence, resume semantics, and `ses_XXX` ID format.
-- [ ] **Live-verify Cursor parser** — run `cursor-agent -p --output-format stream-json` and diff against fixture tests.
-- [ ] **Live-verify Gemini resume limitation** — confirm `--resume` is truly absent in pipe mode; track `gemini-cli` releases for future support.
-- [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics.
-- [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for Cursor / OpenCode.
+- [x] **Research actual OpenCode session storage** — done (0.2.3), session persistence via `--session ses_XXX`
+- [x] **Research Gemini resume** — done (0.2.3), `--resume <id>` supported
+- [ ] **Live integration tests** — run each CLI's pipe against the real subprocess, capture output, validate parser correctness
+- [ ] **Live-verify Cursor parser** — run `cursor-agent -p --output-format stream-json` and diff against fixture tests
+- [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
+- [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for Cursor / OpenCode
 
 ## 0.3.0 — capability queries + session listing
 

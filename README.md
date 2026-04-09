@@ -10,7 +10,7 @@ Universal Rust transport library for CLI AI agents. Spawn, stream, resume — fo
 |---|---|---|---|---|
 | **Claude Code** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via stdin |
 | **Codex** | Pipe + PTY | ✓ `--json` | ✓ `exec resume <id>` | Requires `--ask-for-approval never --skip-git-repo-check` |
-| **Gemini** | Pipe + PTY | ✓ stream-json | ✗ (not in CLI) | — |
+| **Gemini** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via `-p` flag |
 | **Cursor Agent** | Pipe | ✓ stream-json | ✓ `--resume <id>` | Claude-compatible schema |
 | **OpenCode** (`sst/opencode`) | Pipe | ✓ `--format json` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
 
@@ -100,16 +100,28 @@ let session = PipeSession::spawn(config, "hello", opts).await?;
 gate4agent/
 ├── src/
 │   ├── lib.rs           — Library root, re-exports
-│   ├── types.rs         — AgentEvent, CliTool, SessionConfig
-│   ├── error.rs         — AgentError
+│   ├── core/            — AgentEvent, CliTool, SessionConfig, AgentError
 │   ├── transport/       — TransportSession (thin router over PipeSession), SpawnOptions
-│   ├── cli/             — Per-tool spawn builders + parsers (claude, codex, gemini, cursor, opencode)
-│   ├── ndjson/          — NDJSON parsers per CLI
-│   ├── parser/          — VTE + screen parser for PTY mode
-│   ├── pty/             — PTY session (PtyWrapper, PtySession)
-│   ├── pipe/            — PipeSession + PipeProcess (primary pipe entry point)
-│   └── detection/       — Rate limit detection
+│   ├── pipe/            — PipeSession, PipeProcess, per-CLI NDJSON parsers + command builders
+│   │   └── cli/         — claude.rs, codex.rs, gemini.rs, cursor.rs, opencode.rs
+│   ├── pty/             — PtyWrapper, PtySession, VTE/screen parsers, per-CLI PTY parsers
+│   │   └── cli/         — Per-CLI PTY output parsers
+│   ├── history/         — Session history reader
+│   └── utils.rs         — String utilities
 ```
+
+## Testing status
+
+| Tool | Pipe tested? | PTY tested? | Notes |
+|---|---|---|---|
+| **Claude Code** | ✓ verified in 0.1.x | ✗ untested | Primary consumer, production-proven pipe |
+| **Codex** | ✗ research-based | ✗ untested | Parser from OpenAI docs, not live-verified |
+| **Gemini** | ✗ research-based | ✗ untested | Parser from Google docs, not live-verified |
+| **Cursor Agent** | ✗ research-based | N/A (no PTY) | Closed-source CLI, community-sourced field names |
+| **OpenCode** | ✗ research-based | ✗ untested | Parser from sst/opencode source, not live-verified |
+
+PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
+New pipe parsers (0.2.3) are backed by unit tests with fixture JSON but have NOT been tested against actual CLI subprocess output.
 
 ## Prerequisites
 
@@ -128,6 +140,8 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.1.x** — original 3-CLI library (Claude, Codex, Gemini)
 - **0.2.0** — breaking: 6 CLIs, `TransportSession`, `AgentEvent` renamed, `PipeSession` removed, OpenClaw fantasy transport
 - **0.2.1** — cleanup: OpenClaw removed (was never functional), `PipeSession` restored for 0.1.x compatibility, `TransportSession` is now a thin router over `PipeSession`
+- **0.2.2** — parser isolation: NdjsonParser trait extracted, per-CLI parser modules split out
+- **0.2.3** — source tree restructure into core/pty/pipe layout; proper pipe builders+parsers for Codex, Gemini, Cursor, OpenCode (research-based, NOT yet tested against live CLI output)
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

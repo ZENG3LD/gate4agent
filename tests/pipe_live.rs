@@ -119,12 +119,6 @@ fn pipe_live_gemini() {
 
 #[test]
 #[ignore]
-fn pipe_live_cursor() {
-    run_pipe_test(CliTool::Cursor, vec![]);
-}
-
-#[test]
-#[ignore]
 fn pipe_live_opencode() {
     // Use free built-in model to avoid API key requirements.
     run_pipe_test(

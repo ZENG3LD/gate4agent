@@ -6,12 +6,12 @@
 //! 3. The `CliTool` variants all dispatch through the right path in `spawn()`.
 //!
 //! Note: Live process spawning is NOT tested here — no real CLI binaries
-//! (claude, codex, cursor, etc.) are required. The synthesis logic is covered
+//! (claude, codex, gemini, etc.) are required. The synthesis logic is covered
 //! by unit tests inside `src/transport/pipe_runner.rs`.
 
 use gate4agent::{CliTool, SpawnOptions, TransportSession};
 
-/// Verify that all 5 `CliTool` variants are accessible and that `SpawnOptions`
+/// Verify that all 4 `CliTool` variants are accessible and that `SpawnOptions`
 /// can be default-constructed. This is a compile-time test — if the match in
 /// `TransportSession::spawn_pipe` is not exhaustive, this test won't compile.
 #[test]
@@ -20,10 +20,9 @@ fn all_cli_tool_variants_are_accessible() {
         CliTool::ClaudeCode,
         CliTool::Codex,
         CliTool::Gemini,
-        CliTool::Cursor,
         CliTool::OpenCode,
     ];
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 4);
 }
 
 /// Verify `SpawnOptions` can be constructed with resume_session_id.

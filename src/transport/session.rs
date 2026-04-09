@@ -9,8 +9,8 @@
 //! directly for PTY-based screen-scraping sessions.
 //!
 //! The only transport currently is **Pipe**: NDJSON-streaming subprocesses for
-//! Claude Code, Codex, Gemini, Cursor, and OpenCode. There is no Daemon
-//! transport — that was a fiction (OpenClaw/acpx were never functional).
+//! Claude Code, Codex, Gemini, and OpenCode. There is no Daemon transport —
+//! that was a fiction (OpenClaw/acpx were never functional).
 
 use std::path::Path;
 
@@ -21,9 +21,9 @@ use crate::pipe::PipeSession;
 use crate::transport::SpawnOptions;
 use crate::core::types::{AgentEvent, CliTool};
 
-/// Thin dispatch router for spawning any of the 5 supported PIPE-mode CLI agents.
+/// Thin dispatch router for spawning any of the 4 supported PIPE-mode CLI agents.
 ///
-/// All five CLIs (Claude Code, Codex, Gemini, Cursor, OpenCode) use the Pipe
+/// All four CLIs (Claude Code, Codex, Gemini, OpenCode) use the Pipe
 /// transport. PTY-mode sessions use `PtySession` directly — there is no PTY
 /// routing through `TransportSession`.
 pub struct TransportSession {
@@ -37,7 +37,7 @@ pub struct TransportSession {
 impl TransportSession {
     /// Spawn a new pipe session for the given tool and deliver the initial prompt.
     ///
-    /// All five `CliTool` variants use the Pipe transport. PTY mode is not
+    /// All four `CliTool` variants use the Pipe transport. PTY mode is not
     /// dispatched here — use `PtySession::spawn` directly.
     ///
     /// # Errors

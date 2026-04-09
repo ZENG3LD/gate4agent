@@ -114,9 +114,8 @@ impl PtyWrapper {
                 CliTool::ClaudeCode => "claude",
                 CliTool::Codex => "codex",
                 CliTool::Gemini => "gemini",
-                // Cursor and OpenCode PTY integration will be added once
-                // their invocation shapes are confirmed via live capture.
-                CliTool::Cursor => "cursor-agent",
+                // OpenCode PTY integration will be added once
+                // its invocation shape is confirmed via live capture.
                 CliTool::OpenCode => "opencode",
             };
             let mut c = CommandBuilder::new("cmd");
@@ -128,9 +127,8 @@ impl PtyWrapper {
                 CliTool::ClaudeCode => CommandBuilder::new("claude"),
                 CliTool::Codex => CommandBuilder::new("codex"),
                 CliTool::Gemini => CommandBuilder::new("gemini"),
-                // Cursor and OpenCode PTY integration will be added once
-                // their invocation shapes are confirmed via live capture.
-                CliTool::Cursor => CommandBuilder::new("cursor-agent"),
+                // OpenCode PTY integration will be added once
+                // its invocation shape is confirmed via live capture.
                 CliTool::OpenCode => CommandBuilder::new("opencode"),
             }
         };

@@ -37,17 +37,11 @@ If a session produces no events:
 - **`--yolo` was removed** in 0.2.0 spawn args — not needed for `--output-format stream-json` and only adds stderr noise.
 - **Session storage**: `~/.gemini/tmp/<hash>/chats/` — reference for debugging.
 
-### Cursor Agent
-
-- **Parser is doc-based, not live-verified**. If you see unexpected empty events, diff your live output against `tests/` fixtures and file an issue with the raw NDJSON — we'll patch and release.
-- **Prompt is positional**, not stdin. Differs from Claude.
-- Source docs: https://cursor.com/docs/cli/headless
-
 ### OpenCode (sst/opencode)
 
 - **5-event schema**: `step_start`, `tool_use`, `text`, `step_finish`, `error`. Some versions use `tool_use` as an alias for `step_start` — parser accepts both.
 - **Session id prefix**: `ses_XXXX`. Parser tracks this automatically; use with `SpawnOptions::resume_session_id` to resume.
-- **Parser is doc-based**. Same caveat as Cursor — if real output differs, file an issue with raw stdout.
+- **Parser is doc-based**. If real output differs, file an issue with raw stdout.
 - **Don't confuse with `charmbracelet/crush`** or `opencode-ai/opencode`. gate4agent targets `sst/opencode` v1.4.0+.
 - Source docs: https://opencode.ai/docs/cli/
 

@@ -246,10 +246,10 @@ impl MultiCliManager {
             AgentCli::Claude => 0,
             AgentCli::Codex => 1,
             AgentCli::Gemini => 2,
-            // Cursor and OpenCode do not have legacy slots — they are
-            // managed through the per-instance API. Map to slot 0 as a safe
-            // fallback; callers must not pass these to legacy methods.
-            AgentCli::Cursor | AgentCli::OpenCode => 0,
+            // OpenCode does not have a legacy slot — it is managed through
+            // the per-instance API. Map to slot 0 as a safe fallback;
+            // callers must not pass it to legacy methods.
+            AgentCli::OpenCode => 0,
         }
     }
 
@@ -575,6 +575,29 @@ impl MultiCliManager {
             inst.pipe_rx = None;
         }
         true
+    }
+
+    /// Clear chat messages for an instance, starting a fresh session (display only).
+    ///
+    /// Stops the running transport session (if any) and wipes the message list.
+    /// The next `send_chat_instance` will begin a brand-new CLI session.
+    pub fn clear_chat_instance(&mut self, id: InstanceId) {
+        if let Some(inst) = self.instances.get_mut(&id) {
+            inst.chat_messages.clear();
+            inst.pipe_session_id = None;
+            inst.transport_session = None;
+            inst.pipe_rx = None;
+            inst.session_active = false;
+        }
+    }
+
+    /// List past sessions for an instance by its workdir (newest-first, live disk read).
+    pub fn list_past_sessions_instance(&self, id: InstanceId) -> Vec<crate::history::SessionMeta> {
+        let inst = match self.instances.get(&id) {
+            Some(i) => i,
+            None => return Vec::new(),
+        };
+        crate::history::reader_for(inst.cli).list_sessions(&inst.workdir)
     }
 
     /// Load a specific history session for an instance. Chat-mode only.
@@ -1325,7 +1348,6 @@ fn cli_to_tool(cli: AgentCli) -> CliTool {
         AgentCli::Claude => CliTool::ClaudeCode,
         AgentCli::Codex => CliTool::Codex,
         AgentCli::Gemini => CliTool::Gemini,
-        AgentCli::Cursor => CliTool::Cursor,
         AgentCli::OpenCode => CliTool::OpenCode,
     }
 }

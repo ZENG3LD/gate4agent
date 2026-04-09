@@ -1,7 +1,7 @@
-//! gate4agent — Universal wrapper for CLI agents (Claude Code, Codex, Gemini, Cursor, OpenCode).
+//! gate4agent — Universal wrapper for CLI agents (Claude Code, Codex, Gemini, OpenCode).
 //!
 //! Two transport modes:
-//! - Pipe mode: NDJSON-streaming pipe sessions (Claude, Codex, Gemini, Cursor, OpenCode)
+//! - Pipe mode: NDJSON-streaming pipe sessions (Claude, Codex, Gemini, OpenCode)
 //! - PTY mirror: spawns agent in real PTY, captures raw output, vt100 parsing
 //!
 //! All modes produce `AgentEvent` values on a `tokio::sync::broadcast` channel.

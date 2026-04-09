@@ -8,8 +8,6 @@ pub enum AgentCli {
     Claude,
     Codex,
     Gemini,
-    /// Cursor Agent — PIPE transport, stream-json output.
-    Cursor,
     /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
     OpenCode,
 }
@@ -21,7 +19,6 @@ impl AgentCli {
             AgentCli::Claude => "claude",
             AgentCli::Codex => "codex",
             AgentCli::Gemini => "gemini",
-            AgentCli::Cursor => "cursor",
             AgentCli::OpenCode => "opencode",
         }
     }
@@ -32,18 +29,16 @@ impl AgentCli {
             AgentCli::Claude => "Claude",
             AgentCli::Codex => "Codex",
             AgentCli::Gemini => "Gemini",
-            AgentCli::Cursor => "Cursor",
             AgentCli::OpenCode => "OpenCode",
         }
     }
 
-    /// Returns the next CLI in cycle order: Claude → Codex → Gemini → Cursor → OpenCode → Claude.
+    /// Returns the next CLI in cycle order: Claude → Codex → Gemini → OpenCode → Claude.
     pub fn cycle(self) -> Self {
         match self {
             AgentCli::Claude => AgentCli::Codex,
             AgentCli::Codex => AgentCli::Gemini,
-            AgentCli::Gemini => AgentCli::Cursor,
-            AgentCli::Cursor => AgentCli::OpenCode,
+            AgentCli::Gemini => AgentCli::OpenCode,
             AgentCli::OpenCode => AgentCli::Claude,
         }
     }

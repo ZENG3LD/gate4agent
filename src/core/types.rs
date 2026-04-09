@@ -12,8 +12,6 @@ pub enum CliTool {
     ClaudeCode,
     Codex,
     Gemini,
-    /// Cursor Agent — PIPE transport, stream-json output (~Claude-compatible).
-    Cursor,
     /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
     OpenCode,
 }
@@ -24,7 +22,6 @@ impl std::fmt::Display for CliTool {
             CliTool::ClaudeCode => write!(f, "Claude Code"),
             CliTool::Codex => write!(f, "Codex"),
             CliTool::Gemini => write!(f, "Gemini"),
-            CliTool::Cursor => write!(f, "Cursor"),
             CliTool::OpenCode => write!(f, "OpenCode"),
         }
     }

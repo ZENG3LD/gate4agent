@@ -16,13 +16,12 @@ pub struct SpawnOptions {
     /// - Claude: `--resume <id>`
     /// - Codex: `exec resume <id>` sub-sub-command
     /// - Gemini: `--resume <id>` (pass `"latest"` for most recent session)
-    /// - Cursor: `--resume <id>`
+    /// - Others: ignored.
     pub resume_session_id: Option<String>,
 
     /// Model override passed to the CLI.
     ///
     /// - Claude: `--model <model>`
-    /// - Cursor: `--model <model>`
     /// - Others: ignored.
     pub model: Option<String>,
 

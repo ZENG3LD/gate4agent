@@ -6,10 +6,10 @@ Living document. Current state + what's next. Updated per release.
 
 Shipped in 0.2.3:
 
-- **5 CLI tools**: Claude Code, Codex, Gemini, Cursor Agent, OpenCode (`sst/opencode`)
+- **4 CLI tools**: Claude Code, Codex, Gemini, OpenCode (`sst/opencode`)
 - **Two transport classes**: Pipe, PTY
 - **core/pty/pipe source layout**: clean separation — `core/` for types+errors, `pty/` for PTY transport + per-CLI screen parsers, `pipe/` for Pipe transport + per-CLI NDJSON parsers
-- **Research-based pipe parsers**: Codex, Gemini, Cursor, OpenCode parsers rewritten from actual docs/source (not Claude-copy-paste)
+- **Research-based pipe parsers**: Codex, Gemini, OpenCode parsers rewritten from actual docs/source (not Claude-copy-paste)
 - **Gemini resume support**: `--resume <id>` flag added to GeminiPipeBuilder
 - **NdjsonParser trait**: `parse_line(&mut self, line: &str) -> Vec<CliEvent>` + `session_id() -> Option<&str>`
 - **CliCommandBuilder trait**: per-tool command builder handles each CLI's quirks
@@ -21,7 +21,7 @@ Shipped in 0.2.3:
 What changed from 0.2.1 → 0.2.3:
 
 - **0.2.2**: Parser isolation — `NdjsonParser` trait extracted, per-CLI parser modules split out from monolithic file
-- **0.2.3**: Full source tree restructure (core/pty/pipe), proper pipe builders+parsers for all 4 non-Claude CLIs based on research
+- **0.2.3**: Full source tree restructure (core/pty/pipe), proper pipe builders+parsers for all 3 non-Claude CLIs based on research
 
 ### Testing status
 
@@ -29,13 +29,7 @@ What changed from 0.2.1 → 0.2.3:
 - **Codex pipe**: live-verified (0.2.5). Full session.
 - **Gemini pipe**: **live-verified (0.2.6)**. Full session: SessionStart → AssistantText → TurnComplete → SessionEnd. Previously 429 rate-limited.
 - **OpenCode pipe**: **live-verified (0.2.6)**. Full session: AssistantText → TurnComplete. Parser rewritten from real CLI output. Free model (`opencode/nemotron-3-super-free`) used for testing.
-- **Cursor pipe**: CLI broken on test machine.
 - **PTY**: structurally unchanged, low risk. Not formally tested.
-
-### Known limitations
-
-1. **Cursor pipe parser is research-based**, not verified against live CLI output. Claude, Codex, Gemini, and OpenCode parsers are all live-verified. Cursor field names may drift if the upstream CLI changes its output format.
-2. **Cursor CLI is closed-source** — parser fields marked UNVERIFIED come from community analysis and may change without notice.
 
 ## Next — 0.2.x patch line
 
@@ -43,10 +37,9 @@ Small, additive, non-breaking:
 
 - [x] **Research actual OpenCode session storage** — done (0.2.3), session persistence via `--session ses_XXX`
 - [x] **Research Gemini resume** — done (0.2.3), `--resume <id>` supported
-- [x] **Live integration tests** — done (0.2.5): Claude+Codex fully verified, Gemini+OpenCode parser-verified, Cursor CLI broken
-- [ ] **Live-verify Cursor parser** — run `cursor-agent -p --output-format stream-json` and diff against fixture tests
+- [x] **Live integration tests** — done (0.2.5): Claude+Codex fully verified, Gemini+OpenCode parser-verified
 - [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
-- [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for Cursor / OpenCode
+- [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for OpenCode
 
 ## 0.3.0 — capability queries + session listing
 
@@ -80,6 +73,7 @@ If a real HTTP-based agent daemon API becomes available (e.g. an agent SDK that 
 - **Aider / Cline / Continue / Amp / Goose integration** — scope excluded by upstream user decision.
 - **Crush (`charmbracelet/crush`)** — no structured headless output, PTY-only, not worth the integration cost until it ships a structured mode. Track `charmbracelet/crush` issue #1030.
 - **Config-based auth / API keys** — out of scope. Each CLI handles its own auth; gate4agent just spawns.
+- **Cursor Agent CLI** — no native Windows binary (`node_sqlite3.node` is Linux-only ELF), headless mode hangs (SIGTERM on spawn), closed-source. Removed in 0.2.7.
 
 ## Out-of-band projects that may feed back into gate4agent
 

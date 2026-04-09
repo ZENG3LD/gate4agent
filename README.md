@@ -1,6 +1,6 @@
 # gate4agent
 
-Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for five different CLI agents through one unified API.
+Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for four different CLI agents through one unified API.
 
 **Not a harness. Not a sandbox.** gate4agent is the thin wiring layer between your Rust app and the CLI agent's subprocess: spawn the binary, write the prompt, read structured events, resume by session id. That's it.
 
@@ -11,7 +11,6 @@ Universal Rust transport library for CLI AI agents. Spawn, stream, resume — fo
 | **Claude Code** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via stdin |
 | **Codex** | Pipe + PTY | ✓ `--json` | ✓ `exec resume <id>` | Uses `--full-auto` for non-interactive execution |
 | **Gemini** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via `-p` flag |
-| **Cursor Agent** | Pipe | ✓ stream-json | ✓ `--resume <id>` | Claude-compatible schema |
 | **OpenCode** (`sst/opencode`) | Pipe | ✓ `--format json` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
 
 Transport classes:
@@ -64,7 +63,7 @@ let opts = SpawnOptions {
 };
 ```
 
-Each CLI handles resume in its own way — Codex swaps `exec` → `exec resume <id>`, Claude/Cursor use `--resume <id>`, OpenCode uses `--session <ses_XXX>`. gate4agent hides the difference behind `SpawnOptions::resume_session_id`.
+Each CLI handles resume in its own way — Codex swaps `exec` → `exec resume <id>`, Claude uses `--resume <id>`, OpenCode uses `--session <ses_XXX>`. gate4agent hides the difference behind `SpawnOptions::resume_session_id`.
 
 ### Using PipeSession directly (backwards-compatible API)
 
@@ -86,7 +85,7 @@ let session = PipeSession::spawn(config, "hello", opts).await?;
 
 ## Features
 
-- **Single API for 5 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)`
+- **Single API for 4 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)`
 - **Backwards-compatible `PipeSession`** — 0.1.x consumers that used `PipeSession::spawn(config, prompt, options)` compile unchanged
 - **SessionEnd synthesis** — Codex has no terminal event; gate4agent synthesizes `SessionEnd { result: "exit_code=N", is_error: N != 0 }` on child exit
 - **Transport-neutral events** — `AgentEvent::{Text, ToolStart, ToolResult, Thinking, TurnComplete, SessionStart, SessionEnd}`
@@ -103,7 +102,7 @@ gate4agent/
 │   ├── core/            — AgentEvent, CliTool, SessionConfig, AgentError
 │   ├── transport/       — TransportSession (thin router over PipeSession), SpawnOptions
 │   ├── pipe/            — PipeSession, PipeProcess, per-CLI NDJSON parsers + command builders
-│   │   └── cli/         — claude.rs, codex.rs, gemini.rs, cursor.rs, opencode.rs
+│   │   └── cli/         — claude.rs, codex.rs, gemini.rs, opencode.rs
 │   ├── pty/             — PtyWrapper, PtySession, VTE/screen parsers, per-CLI PTY parsers
 │   │   └── cli/         — Per-CLI PTY output parsers
 │   ├── history/         — Session history reader
@@ -118,17 +117,16 @@ gate4agent/
 | **Codex** | ✓ live-verified (0.2.5) | ✗ untested | Full session: thread.started → item.completed → turn.completed |
 | **Gemini** | ✓ live-verified (0.2.6) | ✗ untested | Full session: init → text → result |
 | **OpenCode** | ✓ live-verified (0.2.6) | ✗ untested | Full session: text → step_finish. Parser rewritten from real output. |
-| **Cursor Agent** | ✗ CLI broken on test machine | N/A (no PTY) | `node_sqlite3.node` incompatible (Linux binary on Windows) |
 
 PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
-Pipe parsers for Claude, Codex, Gemini, and OpenCode are fully live-verified. Cursor parser is structurally correct but the CLI itself is broken on the test machine.
+Pipe parsers for Claude, Codex, Gemini, and OpenCode are fully live-verified.
 
 ## Windows spawn strategy
 
 On Windows, CLI tools are invoked through the appropriate shell:
 
 - **npm-installed CLIs** (claude, codex, gemini, opencode): `cmd /C program.cmd arg1 arg2` — the `.cmd` batch wrapper is detected via PATH lookup
-- **Bash scripts** (cursor-agent): `bash -c 'program arg1 arg2'` — fallback when no `.cmd` wrapper exists
+- **Bash scripts** (native binaries without `.cmd` wrapper): `bash -c 'program arg1 arg2'` — fallback when no `.cmd` wrapper exists
 - **Unix**: direct `Command::new("program")` — no shell wrapping needed
 
 Arguments are passed individually (not joined into a shell string) to avoid cmd.exe quote-mangling issues.
@@ -142,7 +140,6 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 | Claude Code | `npm install -g @anthropic-ai/claude-code` |
 | Codex | `npm install -g @openai/codex` |
 | Gemini | `npm install -g @google/gemini-cli` |
-| Cursor Agent | See https://cursor.com/docs/cli |
 | OpenCode | `npm install -g opencode-ai` (or see https://opencode.ai) |
 
 ## Versioning
@@ -155,6 +152,7 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.4** — docs update, Codex flags fixed (`--full-auto` replaces removed `--ask-for-approval`)
 - **0.2.5** — live integration tests: fixed Codex flags, OpenCode `run` subcommand, Gemini `-p` flag, Windows `cmd /C` quoting; all parsers verified against real CLI output
 - **0.2.6** — Gemini + OpenCode live-verified; OpenCode parser rewritten from real CLI output
+- **0.2.7** — Cursor removed (no native Windows support, broken headless mode, closed-source CLI). 4 CLI tools remain: Claude Code, Codex, Gemini, OpenCode.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 
@@ -182,7 +180,7 @@ See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) fo
 
 3. **`SpawnOptions`**: new unified struct. Fields: `working_dir`, `prompt`, `resume_session_id`, `model`, `append_system_prompt`, `extra_args`, `env_vars`.
 
-4. **`CliTool`** is now non-exhaustive in effect (2 new variants: `Cursor`, `OpenCode`). Add arms or a `_ =>` fallback.
+4. **`CliTool`** is now non-exhaustive in effect (new variant: `OpenCode`). Add arms or a `_ =>` fallback.
 
 ## Support the Project
 

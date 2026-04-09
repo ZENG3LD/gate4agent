@@ -229,9 +229,9 @@ fn gemini_no_verbose_flag() {
 }
 
 #[test]
-fn gemini_resume_is_ignored() {
-    // Gemini does not support resume in -p mode.
-    // The builder silently ignores resume_session_id.
+fn gemini_resume_passes_flag() {
+    // Gemini supports --resume <id> in -p mode.
+    // Source: packages/cli/src/config/config.ts — --resume / -r flag.
     let builder = cli_builder(CliTool::Gemini);
     let opts = SpawnOptions {
         prompt: "test".to_string(),
@@ -242,12 +242,12 @@ fn gemini_resume_is_ignored() {
 
     let got = get_args(&cmd);
     assert!(
-        !got.contains(&"--resume"),
-        "Gemini does not support --resume; field must be silently ignored"
+        got.contains(&"--resume"),
+        "Gemini must pass --resume when resume_session_id is set"
     );
     assert!(
-        !got.contains(&"some-id"),
-        "Gemini resume ID must not appear in argv"
+        got.contains(&"some-id"),
+        "Gemini resume ID must appear in argv after --resume"
     );
 }
 
@@ -338,8 +338,10 @@ fn cursor_prompt_is_last_arg() {
 // OpenCode
 // ─────────────────────────────────────────────
 //
-// Source: https://opencode.ai/docs/cli/
-// Argv shape: opencode run --format json [--session <ses_XXXX>] [<extra>...] "<prompt>"
+// Source: https://opencode.ai/docs/cli/ — packages/opencode/src/cli/cmd/run.ts
+// Argv shape: opencode --format json [--session <ses_XXXX>] [<extra>...] "<prompt>"
+//
+// There is NO "run" subcommand — the default command takes the message directly.
 
 #[test]
 fn opencode_fresh_session_argv() {
@@ -349,8 +351,8 @@ fn opencode_fresh_session_argv() {
 
     assert_eq!(get_program(&cmd), "opencode");
     let got = get_args(&cmd);
-    // Must start with "run"
-    assert_eq!(got.first().copied(), Some("run"), "OpenCode argv must start with 'run'");
+    // Must NOT start with "run" — there is no "run" subcommand per OpenCode source.
+    assert_ne!(got.first().copied(), Some("run"), "OpenCode argv must NOT contain a 'run' subcommand");
     // Must contain --format json
     assert!(
         got.windows(2).any(|w| w == ["--format", "json"]),

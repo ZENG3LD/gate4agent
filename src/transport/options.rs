@@ -15,7 +15,7 @@ pub struct SpawnOptions {
     ///
     /// - Claude: `--resume <id>`
     /// - Codex: `exec resume <id>` sub-sub-command
-    /// - Gemini: not supported (field is ignored)
+    /// - Gemini: `--resume <id>` (pass `"latest"` for most recent session)
     /// - Cursor: `--resume <id>`
     pub resume_session_id: Option<String>,
 

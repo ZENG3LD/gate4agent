@@ -6,9 +6,12 @@ use crate::transport::SpawnOptions;
 
 /// OpenCode NDJSON parser.
 ///
-/// Parses output from: `opencode run --format json "<prompt>"`
+/// Parses output from: `opencode --format json "<prompt>"`
 ///
-/// OpenCode v1.4.0+ emits NDJSON with a 5-event schema distinct from Claude/Cursor.
+/// Event types: "text", "tool_use", "step_start", "step_finish", "reasoning", "error"
+///
+/// OpenCode has NO init/session_start event — `session_id` is tracked from any
+/// line that contains a `sessionID` field.
 pub struct OpenCodeNdjsonParser {
     session_id: Option<String>,
 }
@@ -41,9 +44,14 @@ impl NdjsonParser for OpenCodeNdjsonParser {
             }
         };
 
-        // Track session_id whenever it appears in any line.
+        // Track session ID whenever it appears in any line.
+        // OpenCode emits "sessionID" (camelCase) per source; accept both forms.
         if self.session_id.is_none() {
-            if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+            let sid = v
+                .get("sessionID")
+                .or_else(|| v.get("session_id"))
+                .and_then(|s| s.as_str());
+            if let Some(sid) = sid {
                 self.session_id = Some(sid.to_string());
             }
         }
@@ -101,16 +109,25 @@ impl NdjsonParser for OpenCodeNdjsonParser {
                     duration_ms: None,
                 });
             }
+            Some("reasoning") => {
+                // Emitted only when `--thinking` flag is passed to opencode.
+                let text = v
+                    .get("text")
+                    .and_then(|s| s.as_str())
+                    .or_else(|| v.get("content").and_then(|s| s.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                if !text.is_empty() {
+                    events.push(CliEvent::Thinking { text });
+                }
+            }
             Some("error") => {
                 let message = v
                     .get("message")
                     .and_then(|s| s.as_str())
                     .unwrap_or("unknown error")
                     .to_string();
-                events.push(CliEvent::AssistantText {
-                    text: format!("[error] {}", message),
-                    is_delta: false,
-                });
+                events.push(CliEvent::Error { message });
             }
             _ => {}
         }
@@ -125,21 +142,27 @@ impl NdjsonParser for OpenCodeNdjsonParser {
 
 /// Pipe-mode spawn builder for OpenCode.
 ///
+/// There is NO `run` subcommand — the default command takes a message directly.
+///
 /// Argv produced (fresh session):
 /// ```text
-/// opencode run --format json [<extra>...] "<prompt>"
+/// opencode --format json [<extra>...] "<prompt>"
 /// ```
 ///
-/// Argv produced (resumed session):
+/// Argv produced (resumed session — specific ID):
 /// ```text
-/// opencode run --format json --session <ses_XXXX> [<extra>...] "<prompt>"
+/// opencode --format json --session <ses_XXXX> [<extra>...] "<prompt>"
+/// ```
+///
+/// Argv produced (resumed session — last session):
+/// ```text
+/// opencode --format json --continue [<extra>...] "<prompt>"
 /// ```
 pub struct OpenCodePipeBuilder;
 
 impl super::traits::CliCommandBuilder for OpenCodePipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut cmd = std::process::Command::new("opencode");
-        cmd.arg("run");
         cmd.arg("--format");
         cmd.arg("json");
 
@@ -206,12 +229,23 @@ mod tests {
     }
 
     #[test]
-    fn opencode_session_id_tracked() {
+    fn opencode_session_id_tracked_camel_case() {
+        // OpenCode emits "sessionID" (camelCase) per source code.
         let mut parser = OpenCodeNdjsonParser::new();
         assert!(parser.session_id().is_none());
-        let line = r#"{"session_id":"ses_test123","type":"text","text":"hi"}"#;
+        let line = r#"{"sessionID":"ses_test123","type":"text","text":"hi"}"#;
         parser.parse_line(line);
         assert_eq!(parser.session_id(), Some("ses_test123"));
+    }
+
+    #[test]
+    fn opencode_session_id_tracked_snake_case_fallback() {
+        // Accept legacy snake_case form as well.
+        let mut parser = OpenCodeNdjsonParser::new();
+        assert!(parser.session_id().is_none());
+        let line = r#"{"session_id":"ses_test456","type":"text","text":"hi"}"#;
+        parser.parse_line(line);
+        assert_eq!(parser.session_id(), Some("ses_test456"));
     }
 
     #[test]
@@ -230,17 +264,52 @@ mod tests {
     }
 
     #[test]
-    fn opencode_error_surfaced_as_text() {
+    fn opencode_error_emits_cli_error() {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"error","message":"model not available"}"#;
         let events = parser.parse_line(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            CliEvent::AssistantText { text, .. } => {
-                assert!(text.starts_with("[error] "));
-                assert!(text.contains("model not available"));
+            CliEvent::Error { message } => {
+                assert_eq!(message, "model not available");
             }
-            other => panic!("expected AssistantText with error prefix, got {:?}", other),
+            other => panic!("expected CliEvent::Error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn opencode_reasoning_emits_thinking() {
+        let mut parser = OpenCodeNdjsonParser::new();
+        let line = r#"{"type":"reasoning","text":"Let me think about this carefully..."}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::Thinking { text } => {
+                assert_eq!(text, "Let me think about this carefully...");
+            }
+            other => panic!("expected CliEvent::Thinking, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn opencode_reasoning_via_content_field() {
+        let mut parser = OpenCodeNdjsonParser::new();
+        let line = r#"{"type":"reasoning","content":"Alternative content field for reasoning"}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::Thinking { text } => {
+                assert_eq!(text, "Alternative content field for reasoning");
+            }
+            other => panic!("expected CliEvent::Thinking, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn opencode_reasoning_empty_text_ignored() {
+        let mut parser = OpenCodeNdjsonParser::new();
+        let line = r#"{"type":"reasoning","text":""}"#;
+        let events = parser.parse_line(line);
+        assert!(events.is_empty(), "empty reasoning text should produce no events");
     }
 }

@@ -165,14 +165,21 @@ impl NdjsonParser for GeminiNdjsonParser {
 
 /// Pipe-mode spawn builder for Gemini CLI.
 ///
-/// Argv produced:
-///   `gemini --output-format stream-json -p <prompt>`
+/// Argv produced (fresh session):
+/// ```text
+/// gemini --output-format stream-json -p [<extra>...] "<prompt>"
+/// ```
+///
+/// Argv produced (resumed session):
+/// ```text
+/// gemini --output-format stream-json --resume <id> -p [<extra>...] "<prompt>"
+/// ```
 ///
 /// Note: `--verbose` is intentionally omitted — it is not required for
 /// `--output-format stream-json` and only adds stderr noise.
 ///
-/// Resume: Gemini CLI does not support a `--resume` flag in pipe (`-p`) mode.
-/// `resume_session_id` is ignored.
+/// Resume: `--resume latest` or `--resume <index>` (from `--list-sessions`).
+/// Source: `packages/cli/src/config/config.ts` — `--resume` / `-r` flag.
 pub struct GeminiPipeBuilder;
 
 impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
@@ -180,6 +187,12 @@ impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
         let mut cmd = std::process::Command::new("gemini");
         cmd.arg("--output-format");
         cmd.arg("stream-json");
+
+        if let Some(ref session_id) = opts.resume_session_id {
+            cmd.arg("--resume");
+            cmd.arg(session_id);
+        }
+
         cmd.arg("-p");
 
         for arg in &opts.extra_args {

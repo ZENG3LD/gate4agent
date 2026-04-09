@@ -127,6 +127,54 @@ impl NdjsonParser for CodexNdjsonParser {
                                 });
                             }
                         }
+                        // MCP tool, web search, and plan update items — surface as
+                        // ToolCallStart so callers can log/display them.
+                        Some("mcp_tool_call") => {
+                            let id = item
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = item
+                                .get("tool_name")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("mcp_tool_call")
+                                .to_string();
+                            events.push(CliEvent::ToolCallStart {
+                                id,
+                                name,
+                                input: item.clone(),
+                            });
+                        }
+                        Some("web_search") => {
+                            let id = item
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let query = item
+                                .get("query")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            events.push(CliEvent::ToolCallStart {
+                                id,
+                                name: "web_search".to_string(),
+                                input: serde_json::json!({"query": query}),
+                            });
+                        }
+                        Some("plan_update") => {
+                            let id = item
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            events.push(CliEvent::ToolCallStart {
+                                id,
+                                name: "plan_update".to_string(),
+                                input: item.clone(),
+                            });
+                        }
                         _ => {}
                     }
                 }
@@ -185,6 +233,26 @@ impl NdjsonParser for CodexNdjsonParser {
                                 duration_ms: None,
                             });
                         }
+                        Some("mcp_tool_call") | Some("web_search") | Some("plan_update") => {
+                            let id = item
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let output = item
+                                .get("output")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let status =
+                                item.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                            events.push(CliEvent::ToolCallResult {
+                                id,
+                                output,
+                                is_error: status == "failed",
+                                duration_ms: None,
+                            });
+                        }
                         _ => {}
                     }
                 }
@@ -216,6 +284,11 @@ impl NdjsonParser for CodexNdjsonParser {
 ///
 /// Argv produced (resumed session):
 ///   `codex exec resume <session_id> --json --ask-for-approval never --skip-git-repo-check <prompt>`
+///
+/// Available `--sandbox` policies (not added here — callers can pass via `extra_args`):
+///   - `read-only` (default) — no file writes, no network
+///   - `workspace-write` — files writable, network blocked
+///   - `danger-full-access` — arbitrary shell + network (use only in isolated envs)
 pub struct CodexPipeBuilder;
 
 impl super::traits::CliCommandBuilder for CodexPipeBuilder {
@@ -314,6 +387,99 @@ mod tests {
             events.is_empty(),
             "item.started for assistant_message should produce no events"
         );
+    }
+
+    #[test]
+    fn codex_mcp_tool_call_started() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.started","item":{"id":"mcp_1","type":"mcp_tool_call","tool_name":"get_file_info","status":"in_progress"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallStart { id, name, .. } => {
+                assert_eq!(id, "mcp_1");
+                assert_eq!(name, "get_file_info");
+            }
+            other => panic!("expected ToolCallStart for mcp_tool_call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_web_search_started() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.started","item":{"id":"ws_1","type":"web_search","query":"rust async patterns","status":"in_progress"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallStart { id, name, input } => {
+                assert_eq!(id, "ws_1");
+                assert_eq!(name, "web_search");
+                assert_eq!(input.get("query").and_then(|q| q.as_str()), Some("rust async patterns"));
+            }
+            other => panic!("expected ToolCallStart for web_search, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_plan_update_started() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.started","item":{"id":"plan_1","type":"plan_update","summary":"Step 1: analyze","status":"in_progress"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallStart { id, name, .. } => {
+                assert_eq!(id, "plan_1");
+                assert_eq!(name, "plan_update");
+            }
+            other => panic!("expected ToolCallStart for plan_update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_mcp_tool_call_completed() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.completed","item":{"id":"mcp_1","type":"mcp_tool_call","output":"file info: 4096 bytes","status":"completed"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, output, is_error, .. } => {
+                assert_eq!(id, "mcp_1");
+                assert_eq!(output, "file info: 4096 bytes");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolCallResult for mcp_tool_call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_web_search_completed() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.completed","item":{"id":"ws_1","type":"web_search","output":"Found 10 results","status":"completed"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, output, is_error, .. } => {
+                assert_eq!(id, "ws_1");
+                assert_eq!(output, "Found 10 results");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolCallResult for web_search, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_plan_update_failed() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.completed","item":{"id":"plan_1","type":"plan_update","output":"","status":"failed"}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, is_error, .. } => {
+                assert_eq!(id, "plan_1");
+                assert!(*is_error, "status=failed should be an error");
+            }
+            other => panic!("expected ToolCallResult for plan_update, got {:?}", other),
+        }
     }
 
     /// Test that "agent_message" still works.

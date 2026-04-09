@@ -1,7 +1,15 @@
 //! Pipe-mode Cursor Agent bindings: NDJSON parser + spawn builder.
 //!
-//! Cursor Agent's `--output-format stream-json` is documented as Claude-compatible.
-//! This parser is a copy of `ClaudeNdjsonParser` with Cursor-specific naming.
+//! NOTE: Cursor CLI is closed-source and proprietary. All stream-json field
+//! names and event shapes below are sourced from:
+//!   - Official docs: https://cursor.com/docs/cli/reference/output-format
+//!   - Community stream analysis: https://tarq.net/posts/cursor-agent-stream-format/
+//!   - Windows port reverse-engineering: https://github.com/gitcnd/cursor-agent-cli-windows
+//!
+//! Fields marked `// UNVERIFIED` come from community analysis only and may
+//! change in future Cursor releases without notice.
+
+// NOTE: closed-source, flags from community docs
 
 use super::traits::{CliEvent, NdjsonParser};
 use crate::utils::truncate_str;
@@ -9,10 +17,13 @@ use crate::transport::SpawnOptions;
 
 /// Cursor Agent stream-json parser.
 ///
-/// Cursor Agent's `--output-format stream-json` is documented as Claude-compatible:
-/// it emits the same 5 event types (system/init, assistant, user, tool_use, result).
-///
-/// Source: https://cursor.com/docs/cli/headless — "stream-json format mirrors Claude Code"
+/// Handles the NDJSON event types emitted by `cursor-agent --output-format stream-json`:
+///   - `system`    → [`CliEvent::SessionStart`]
+///   - `assistant` → [`CliEvent::AssistantText`]
+///   - `tool_call` (subtype `started`) → [`CliEvent::ToolCallStart`]
+///   - `tool_call` (subtype `completed`) → [`CliEvent::ToolCallResult`]
+///   - `user`      → ignored (echoes the prompt, no actionable data)
+///   - `result`    → [`CliEvent::SessionEnd`]
 pub struct CursorNdjsonParser {
     session_id: Option<String>,
 }
@@ -47,8 +58,11 @@ impl NdjsonParser for CursorNdjsonParser {
 
         let mut events = Vec::new();
 
-        // Field names assumed identical to Claude stream-json per Cursor docs.
         match v.get("type").and_then(|t| t.as_str()) {
+            // Session initialisation — emitted once at stream start.
+            // Schema per official docs + community analysis:
+            //   { "type": "system", "subtype": "init", "session_id": "...",
+            //     "cwd": "/path", "model": "claude-3-5-sonnet" }
             Some("system") => {
                 let sid = v
                     .get("session_id")
@@ -60,147 +74,118 @@ impl NdjsonParser for CursorNdjsonParser {
                     .and_then(|s| s.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let tools = v
-                    .get("tools")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // Cursor does not list available tools in the system event.
+                // UNVERIFIED: tool list might be added in future versions.
                 self.session_id = Some(sid.clone());
                 events.push(CliEvent::SessionStart {
                     session_id: sid,
                     model,
-                    tools,
+                    tools: vec![],
                 });
             }
+
+            // Assistant text response.
+            // Schema per official docs:
+            //   { "type": "assistant",
+            //     "message": { "role": "assistant",
+            //                  "content": [{"type": "text", "text": "..."}] },
+            //     "session_id": "..." }
             Some("assistant") => {
                 if let Some(content) =
                     v.pointer("/message/content").and_then(|c| c.as_array())
                 {
                     for block in content {
-                        match block.get("type").and_then(|t| t.as_str()) {
-                            Some("text") => {
-                                if let Some(text) =
-                                    block.get("text").and_then(|t| t.as_str())
-                                {
-                                    events.push(CliEvent::AssistantText {
-                                        text: text.to_string(),
-                                        is_delta: false,
-                                    });
-                                }
+                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                // Cursor delivers complete messages, not streaming deltas.
+                                events.push(CliEvent::AssistantText {
+                                    text: text.to_string(),
+                                    is_delta: false,
+                                });
                             }
-                            Some("tool_use") => {
-                                let id = block
-                                    .get("id")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let name = block
-                                    .get("name")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let input = block
-                                    .get("input")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                events.push(CliEvent::ToolCallStart { id, name, input });
-                            }
-                            Some("thinking") => {
-                                if let Some(text) =
-                                    block.get("thinking").and_then(|t| t.as_str())
-                                {
-                                    events.push(CliEvent::Thinking {
-                                        text: text.to_string(),
-                                    });
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                if let Some(usage) = v.pointer("/message/usage") {
-                    let input = usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let output = usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    if input > 0 || output > 0 {
-                        events.push(CliEvent::TurnComplete {
-                            input_tokens: input,
-                            output_tokens: output,
-                        });
-                    }
-                }
-            }
-            Some("user") => {
-                if let Some(content) =
-                    v.pointer("/message/content").and_then(|c| c.as_array())
-                {
-                    for block in content {
-                        if block.get("type").and_then(|t| t.as_str())
-                            == Some("tool_result")
-                        {
-                            let id = block
-                                .get("tool_use_id")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let output = block
-                                .get("content")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let is_error = block
-                                .get("is_error")
-                                .and_then(|b| b.as_bool())
-                                .unwrap_or(false);
-                            let duration_ms = v
-                                .pointer("/tool_use_result/durationMs")
-                                .and_then(|d| d.as_u64());
-                            events.push(CliEvent::ToolCallResult {
-                                id,
-                                output,
-                                is_error,
-                                duration_ms,
-                            });
                         }
                     }
                 }
             }
-            Some("result") => {
-                let result_text = v
-                    .get("result")
+
+            // Tool invocation event — two subtypes: "started" and "completed".
+            // Schema per community analysis (UNVERIFIED — closed-source CLI):
+            //   started:   { "type": "tool_call", "subtype": "started",
+            //                "tool": "shellToolCall", "session_id": "..." }
+            //   completed: { "type": "tool_call", "subtype": "completed",
+            //                "tool": "shellToolCall", "session_id": "...",
+            //                "duration_ms": 1234 }    // UNVERIFIED
+            //
+            // Known tool type strings (from community stream captures):
+            //   shellToolCall, readToolCall, editToolCall, writeToolCall,
+            //   deleteToolCall, grepToolCall, lsToolCall, globToolCall,
+            //   todoToolCall, updateTodosToolCall
+            Some("tool_call") => {
+                let subtype = v
+                    .get("subtype")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                // UNVERIFIED: Cursor does not expose a stable tool call ID in the stream.
+                // We synthesise one from the tool name to allow ToolCallResult to
+                // reference the same logical call.
+                let tool_name = v
+                    .get("tool")
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string();
-                let cost = v.get("total_cost_usd").and_then(|c| c.as_f64());
-                let is_error = v
-                    .get("is_error")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false);
+
+                match subtype {
+                    "started" => {
+                        events.push(CliEvent::ToolCallStart {
+                            // UNVERIFIED: no stable id field in community docs;
+                            // use tool name as synthetic id for pairing.
+                            id: tool_name.clone(),
+                            name: tool_name,
+                            input: serde_json::Value::Null, // UNVERIFIED: parameters not in spec
+                        });
+                    }
+                    "completed" => {
+                        let duration_ms = v
+                            .get("duration_ms") // UNVERIFIED field name
+                            .and_then(|d| d.as_u64());
+                        events.push(CliEvent::ToolCallResult {
+                            id: tool_name,
+                            output: String::new(), // UNVERIFIED: output not in spec
+                            is_error: false,       // UNVERIFIED: no error field in spec
+                            duration_ms,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            // User event — echoes the prompt back to the consumer.
+            // Schema per official docs:
+            //   { "type": "user",
+            //     "message": { "role": "user",
+            //                  "content": [{"type": "text", "text": "..."}] },
+            //     "session_id": "..." }
+            // No actionable data — ignored.
+            Some("user") => {}
+
+            // Terminal event — stream ends after this line.
+            // Schema per official docs + community analysis:
+            //   { "type": "result", "subtype": "success" | "error" | "cancelled",
+            //     "duration_ms": 12453, "session_id": "..." }
+            // UNVERIFIED: "cancelled" subtype inferred from parallel CLI behaviour.
+            Some("result") => {
+                let subtype = v
+                    .get("subtype")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("success");
+                let is_error = subtype == "error";
                 events.push(CliEvent::SessionEnd {
-                    result: result_text,
-                    cost_usd: cost,
+                    result: subtype.to_string(),
+                    cost_usd: None, // Cursor does not expose cost in stream events.
                     is_error,
                 });
             }
-            Some("stream_event") => {
-                if let Some(delta_text) = v.pointer("/event/delta/text") {
-                    if let Some(text) = delta_text.as_str() {
-                        events.push(CliEvent::AssistantText {
-                            text: text.to_string(),
-                            is_delta: true,
-                        });
-                    }
-                }
-            }
+
             _ => {}
         }
 
@@ -214,6 +199,9 @@ impl NdjsonParser for CursorNdjsonParser {
 
 /// Pipe-mode spawn builder for Cursor Agent.
 ///
+/// NOTE: closed-source, flags from community docs and official reference at
+/// https://cursor.com/docs/cli/reference/output-format
+///
 /// Argv produced (fresh session):
 /// ```text
 /// cursor-agent -p --output-format stream-json [--model <m>] [<extra>...] "<prompt>"
@@ -223,6 +211,9 @@ impl NdjsonParser for CursorNdjsonParser {
 /// ```text
 /// cursor-agent -p --output-format stream-json [--model <m>] --resume <id> [<extra>...] "<prompt>"
 /// ```
+///
+/// No stdin support: Cursor CLI reads the prompt from argv only. Large prompts
+/// via shell substitution may cause parsing issues with special characters.
 pub struct CursorPipeBuilder;
 
 impl super::traits::CliCommandBuilder for CursorPipeBuilder {
@@ -254,44 +245,144 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cursor_parses_hello_session() {
+    fn cursor_parses_system_init() {
         let mut parser = CursorNdjsonParser::new();
 
-        let line1 = r#"{"type":"system","session_id":"cursor_ses_abc","model":"cursor-small","tools":[]}"#;
-        let line2 = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello from Cursor!"}],"usage":{"input_tokens":0,"output_tokens":0}}}"#;
-        let line3 = r#"{"type":"result","result":"success","is_error":false,"total_cost_usd":0.001}"#;
+        let line = r#"{"type":"system","subtype":"init","session_id":"cursor_ses_abc","cwd":"/home/user/project","model":"claude-3-5-sonnet"}"#;
+        let events = parser.parse_line(line);
 
-        let ev1 = parser.parse_line(line1);
-        let ev2 = parser.parse_line(line2);
-        let ev3 = parser.parse_line(line3);
-
-        assert_eq!(ev1.len(), 1);
-        match &ev1[0] {
-            CliEvent::SessionStart { session_id, model, .. } => {
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::SessionStart { session_id, model, tools } => {
                 assert_eq!(session_id, "cursor_ses_abc");
-                assert_eq!(model, "cursor-small");
+                assert_eq!(model, "claude-3-5-sonnet");
+                assert!(tools.is_empty());
             }
             other => panic!("expected SessionStart, got {:?}", other),
         }
+        assert_eq!(parser.session_id(), Some("cursor_ses_abc"));
+    }
 
-        assert_eq!(ev2.len(), 1);
-        match &ev2[0] {
+    #[test]
+    fn cursor_parses_assistant_text() {
+        let mut parser = CursorNdjsonParser::new();
+
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello from Cursor!"}]},"session_id":"cursor_ses_abc"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             CliEvent::AssistantText { text, is_delta } => {
                 assert_eq!(text, "Hello from Cursor!");
                 assert!(!is_delta);
             }
             other => panic!("expected AssistantText, got {:?}", other),
         }
+    }
 
-        assert_eq!(ev3.len(), 1);
-        match &ev3[0] {
-            CliEvent::SessionEnd { is_error, cost_usd, .. } => {
+    #[test]
+    fn cursor_parses_tool_call_started() {
+        let mut parser = CursorNdjsonParser::new();
+
+        let line = r#"{"type":"tool_call","subtype":"started","tool":"shellToolCall","session_id":"cursor_ses_abc"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallStart { id, name, .. } => {
+                assert_eq!(id, "shellToolCall");
+                assert_eq!(name, "shellToolCall");
+            }
+            other => panic!("expected ToolCallStart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cursor_parses_tool_call_completed() {
+        let mut parser = CursorNdjsonParser::new();
+
+        let line = r#"{"type":"tool_call","subtype":"completed","tool":"shellToolCall","duration_ms":1234,"session_id":"cursor_ses_abc"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, duration_ms, is_error, .. } => {
+                assert_eq!(id, "shellToolCall");
+                assert_eq!(*duration_ms, Some(1234));
                 assert!(!is_error);
-                assert!(cost_usd.is_some());
+            }
+            other => panic!("expected ToolCallResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cursor_parses_user_event_as_no_events() {
+        let mut parser = CursorNdjsonParser::new();
+
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"find and fix the memory leak"}]},"session_id":"cursor_ses_abc"}"#;
+        let events = parser.parse_line(line);
+
+        // user event is ignored — it just echoes the prompt back
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn cursor_parses_result_success() {
+        let mut parser = CursorNdjsonParser::new();
+
+        let line = r#"{"type":"result","subtype":"success","duration_ms":12453,"session_id":"cursor_ses_abc"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::SessionEnd { is_error, cost_usd, result } => {
+                assert!(!is_error);
+                assert!(cost_usd.is_none());
+                assert_eq!(result, "success");
             }
             other => panic!("expected SessionEnd, got {:?}", other),
         }
+    }
 
-        assert_eq!(parser.session_id(), Some("cursor_ses_abc"));
+    #[test]
+    fn cursor_parses_result_error() {
+        let mut parser = CursorNdjsonParser::new();
+
+        let line = r#"{"type":"result","subtype":"error","duration_ms":500,"session_id":"cursor_ses_abc"}"#;
+        let events = parser.parse_line(line);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::SessionEnd { is_error, .. } => {
+                assert!(is_error);
+            }
+            other => panic!("expected SessionEnd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cursor_parses_full_session() {
+        let mut parser = CursorNdjsonParser::new();
+
+        let lines = [
+            r#"{"type":"system","subtype":"init","session_id":"ses_xyz","cwd":"/repo","model":"gpt-4o"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"analyze this CI failure"}]},"session_id":"ses_xyz"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I found the issue in..."}]},"session_id":"ses_xyz"}"#,
+            r#"{"type":"tool_call","subtype":"started","tool":"shellToolCall","session_id":"ses_xyz"}"#,
+            r#"{"type":"tool_call","subtype":"completed","tool":"shellToolCall","duration_ms":300,"session_id":"ses_xyz"}"#,
+            r#"{"type":"result","subtype":"success","duration_ms":5000,"session_id":"ses_xyz"}"#,
+        ];
+
+        let all_events: Vec<_> = lines.iter().flat_map(|l| parser.parse_line(l)).collect();
+
+        // system(1) + user(0) + assistant(1) + started(1) + completed(1) + result(1) = 5
+        assert_eq!(all_events.len(), 5);
+        assert!(matches!(all_events[0], CliEvent::SessionStart { .. }));
+        assert!(matches!(all_events[1], CliEvent::AssistantText { .. }));
+        assert!(matches!(all_events[2], CliEvent::ToolCallStart { .. }));
+        assert!(matches!(all_events[3], CliEvent::ToolCallResult { .. }));
+        assert!(matches!(all_events[4], CliEvent::SessionEnd { .. }));
+
+        assert_eq!(parser.session_id(), Some("ses_xyz"));
     }
 }

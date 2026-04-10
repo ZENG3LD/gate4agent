@@ -38,6 +38,7 @@ Small, additive, non-breaking:
 - [x] **Research actual OpenCode session storage** — done (0.2.3), session persistence via `--session ses_XXX`
 - [x] **Research Gemini resume** — done (0.2.3), `--resume <id>` supported
 - [x] **Live integration tests** — done (0.2.5): Claude+Codex fully verified, Gemini+OpenCode parser-verified
+- [x] **Daemon transport skeleton** — done (0.2.9): DaemonSession, DaemonConfig for OpenCode serve + OpenClaw. API surface documented, not yet functional. Needs live testing against `opencode serve` and OpenClaw instances.
 - [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
 - [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for OpenCode
 

@@ -105,6 +105,7 @@ gate4agent/
 │   │   └── cli/         — claude.rs, codex.rs, gemini.rs, opencode.rs
 │   ├── pty/             — PtyWrapper, PtySession, VTE/screen parsers, per-CLI PTY parsers
 │   │   └── cli/         — Per-CLI PTY output parsers
+│   ├── daemon/         — DaemonSession, per-daemon adapters (OpenCode, OpenClaw) [skeleton]
 │   ├── history/         — Session history reader
 │   └── utils.rs         — String utilities
 ```
@@ -154,6 +155,7 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.6** — Gemini + OpenCode live-verified; OpenCode parser rewritten from real CLI output
 - **0.2.7** — Cursor removed (no native Windows support, broken headless mode, closed-source CLI). 4 CLI tools remain: Claude Code, Codex, Gemini, OpenCode.
 - **0.2.8** — SpawnOptions extended: continue_last, allowed_tools, permission_mode, mcp_config, max_turns, sandbox. Per-CLI builders updated.
+- **0.2.9** — Daemon transport skeleton: DaemonSession, DaemonConfig, DaemonType (OpenCode, OpenClaw). Not yet functional — API surface documented for future implementation.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

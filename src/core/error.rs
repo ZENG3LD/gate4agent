@@ -32,4 +32,7 @@ pub enum AgentError {
         #[from]
         source: serde_json::Error,
     },
+
+    #[error("Spawn failed: {0}")]
+    SpawnFailed(String),
 }

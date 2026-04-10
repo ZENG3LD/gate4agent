@@ -24,6 +24,7 @@ pub mod pty;
 pub mod pipe;
 pub mod history;
 pub mod manager;
+pub mod daemon;
 
 pub use manager::{MultiCliManager, ManagerConfig, InstanceId, InstanceMode};
 pub use pty::snapshot::{
@@ -32,3 +33,5 @@ pub use pty::snapshot::{
 pub use history::{HistoryReader, SessionMeta, reader_for};
 
 pub(crate) mod utils;
+
+pub use daemon::{DaemonSession, DaemonConfig, DaemonType, DaemonAuth};

@@ -65,17 +65,14 @@ If a session produces no events:
 ## Test runner
 
 ```bash
-# All tests
-cd gate4agent && cargo test --lib --tests
+# All unit tests
+cd gate4agent && cargo test --lib
 
-# Just parser fixtures
-cargo test --lib ndjson::parsers::tests
+# Builder argv parity tests
+cargo test --test builder_argv
 
-# Just argv parity
-cargo test --test spawn_argv_parity
-
-# Just transport session integration
-cargo test --test transport_session
+# Live integration tests (require a CLI installed and logged in)
+cargo test --test pipe_live -- --ignored --nocapture
 
 # SessionEnd synthesis unit tests
 cargo test --lib pipe::session::tests

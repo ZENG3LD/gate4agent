@@ -330,4 +330,128 @@ mod tests {
         assert!(parser.parse_line("").is_empty());
         assert!(parser.parse_line("   ").is_empty());
     }
+
+    #[test]
+    fn claude_assistant_text_block() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::AssistantText { text, is_delta } => {
+                assert_eq!(text, "hello");
+                assert!(!*is_delta, "assistant message blocks are not deltas");
+            }
+            other => panic!("expected AssistantText, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_assistant_tool_use() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool_1","name":"Read","input":{"path":"foo.rs"}}]}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallStart { id, name, input } => {
+                assert_eq!(id, "tool_1");
+                assert_eq!(name, "Read");
+                assert_eq!(input.get("path").and_then(|v| v.as_str()), Some("foo.rs"));
+            }
+            other => panic!("expected ToolCallStart, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_assistant_thinking() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"let me think..."}]}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::Thinking { text } => {
+                assert_eq!(text, "let me think...");
+            }
+            other => panic!("expected Thinking, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_assistant_usage() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::TurnComplete { input_tokens, output_tokens } => {
+                assert_eq!(*input_tokens, 100);
+                assert_eq!(*output_tokens, 50);
+            }
+            other => panic!("expected TurnComplete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_user_tool_result() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool_1","content":"file contents here"}]}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, output, is_error, duration_ms } => {
+                assert_eq!(id, "tool_1");
+                assert_eq!(output, "file contents here");
+                assert!(!*is_error, "tool_result without is_error field defaults to false");
+                assert!(duration_ms.is_none());
+            }
+            other => panic!("expected ToolCallResult, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_result_event() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"result","result":"session complete","total_cost_usd":0.05,"duration_ms":5000,"session_id":"abc-123"}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::SessionEnd { result, cost_usd, is_error } => {
+                assert_eq!(result, "session complete");
+                assert_eq!(*cost_usd, Some(0.05));
+                assert!(!*is_error, "result without is_error defaults to false");
+            }
+            other => panic!("expected SessionEnd, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_session_id_persists() {
+        let mut parser = ClaudeNdjsonParser::new();
+        assert!(parser.session_id().is_none(), "session_id must be None before system event");
+        let line = r#"{"type":"system","session_id":"ses-persist-42","model":"claude-sonnet-4","tools":[]}"#;
+        parser.parse_line(line);
+        assert_eq!(parser.session_id(), Some("ses-persist-42"));
+    }
+
+    #[test]
+    fn claude_assistant_mixed_content_blocks() {
+        // Multiple content blocks in one message → multiple events
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Here is the result:"},{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], CliEvent::AssistantText { text, .. } if text == "Here is the result:"));
+        assert!(matches!(&events[1], CliEvent::ToolCallStart { name, .. } if name == "Bash"));
+    }
+
+    #[test]
+    fn claude_assistant_usage_with_content_both_emitted() {
+        // Message with both content blocks AND usage → content events + TurnComplete
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], CliEvent::AssistantText { text, .. } if text == "done"));
+        assert!(matches!(&events[1], CliEvent::TurnComplete { input_tokens: 10, output_tokens: 5 }));
+    }
 }

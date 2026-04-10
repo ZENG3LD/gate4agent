@@ -21,18 +21,13 @@ Transport classes:
 
 ```rust
 use gate4agent::{TransportSession, SpawnOptions, CliTool, AgentEvent};
-use std::path::PathBuf;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = SpawnOptions {
-        working_dir: PathBuf::from("."),
+        working_dir: std::env::current_dir()?,
         prompt: "Say hello in 3 words".into(),
-        resume_session_id: None,
-        model: None,
-        append_system_prompt: None,
-        extra_args: vec![],
-        env_vars: vec![],
+        ..Default::default()
     };
 
     let session = TransportSession::spawn(
@@ -82,6 +77,30 @@ let opts = PipeProcessOptions {
 };
 let session = PipeSession::spawn(config, "hello", opts).await?;
 ```
+
+### Bidirectional JSON-RPC 2.0 (RpcSession)
+
+```rust
+use gate4agent::rpc::{RpcSession, RpcSessionOptions, MethodRouter};
+use gate4agent::{CliTool, PipeProcessOptions};
+
+let session = RpcSession::spawn(
+    CliTool::ClaudeCode,
+    PipeProcessOptions::default(),
+    RpcSessionOptions {
+        host_handler: Some(Box::new(
+            MethodRouter::new().on("ping", |_| Ok(serde_json::json!({"pong": true})))
+        )),
+        ..Default::default()
+    },
+    &std::env::current_dir()?,
+    "hello",
+).await?;
+```
+
+### Daemon Transport (skeleton)
+
+`DaemonSession` connects to long-running HTTP/WebSocket agent daemons (OpenCode `serve`, OpenClaw). Not yet functional — API surface documented for future implementation.
 
 ## Features
 
@@ -159,6 +178,7 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.9** — Daemon transport skeleton: DaemonSession, DaemonConfig, DaemonType (OpenCode, OpenClaw). Not yet functional — API surface documented for future implementation.
 - **0.2.10** — Bidirectional JSON-RPC 2.0: RpcSession, HostHandler, MethodRouter. Agent→host requests, host→agent calls, fallback to legacy NDJSON parsing.
 - **0.2.11** — Critical bugfixes: stale transport_session cleared on exit, send_prompt() returns BrokenPipe instead of silent no-op, OpenCode emits SessionStart, Gemini skips non-JSON banners silently, history readers for Codex/Gemini/OpenCode
+- **0.2.12** — Test coverage: Gemini parser (14 tests), Claude parser (+8), builder argv parity (22 tests), PipeSession live test, RpcSession tests. README/DEBUGGING.md fixed. Examples added.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

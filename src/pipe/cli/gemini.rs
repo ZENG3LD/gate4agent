@@ -259,4 +259,206 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], CliEvent::AssistantText { text, .. } if text == "Hello"));
     }
+
+    #[test]
+    fn gemini_init_event() {
+        let mut p = parser();
+        let line = r#"{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"ses-abc123","model":"gemini-3-flash-preview"}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::SessionStart { session_id, model, tools } => {
+                assert_eq!(session_id, "ses-abc123");
+                assert_eq!(model, "gemini-3-flash-preview");
+                assert!(tools.is_empty());
+            }
+            other => panic!("expected SessionStart, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_assistant_message_delta() {
+        let mut p = parser();
+        let line = r#"{"type":"message","timestamp":"2026-01-01T00:00:00Z","role":"assistant","content":"hello","delta":true}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::AssistantText { text, is_delta } => {
+                assert_eq!(text, "hello");
+                assert!(*is_delta, "expected is_delta=true");
+            }
+            other => panic!("expected AssistantText, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_assistant_message_full() {
+        let mut p = parser();
+        // delta field absent → is_delta defaults to false
+        let line = r#"{"type":"message","timestamp":"2026-01-01T00:00:00Z","role":"assistant","content":"full response"}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::AssistantText { text, is_delta } => {
+                assert_eq!(text, "full response");
+                assert!(!*is_delta, "expected is_delta=false when delta field is absent");
+            }
+            other => panic!("expected AssistantText, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_assistant_message_delta_false() {
+        let mut p = parser();
+        let line = r#"{"type":"message","timestamp":"2026-01-01T00:00:00Z","role":"assistant","content":"complete","delta":false}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::AssistantText { text, is_delta } => {
+                assert_eq!(text, "complete");
+                assert!(!*is_delta, "expected is_delta=false when delta=false");
+            }
+            other => panic!("expected AssistantText, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_user_message_ignored() {
+        let mut p = parser();
+        let line = r#"{"type":"message","timestamp":"2026-01-01T00:00:00Z","role":"user","content":"prompt text"}"#;
+        let events = p.parse_line(line);
+        assert!(events.is_empty(), "user messages must not generate events, got: {events:?}");
+    }
+
+    #[test]
+    fn gemini_tool_use() {
+        let mut p = parser();
+        // Parser reads: tool_id, tool_name, parameters
+        let line = r#"{"type":"tool_use","timestamp":"2026-01-01T00:00:00Z","tool_id":"call-1","tool_name":"edit_file","parameters":{"path":"foo.rs"}}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallStart { id, name, input } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "edit_file");
+                assert!(input.get("path").is_some(), "input must contain path field");
+            }
+            other => panic!("expected ToolCallStart, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_tool_result_success() {
+        let mut p = parser();
+        let line = r#"{"type":"tool_result","timestamp":"2026-01-01T00:00:00Z","tool_id":"call-1","tool_name":"edit_file","output":"done","status":"success"}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, output, is_error, .. } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(output, "done");
+                assert!(!*is_error, "expected is_error=false for status=success");
+            }
+            other => panic!("expected ToolCallResult, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_tool_result_failed() {
+        let mut p = parser();
+        let line = r#"{"type":"tool_result","timestamp":"2026-01-01T00:00:00Z","tool_id":"call-2","tool_name":"bad_tool","output":"failed","status":"failed"}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::ToolCallResult { id, output, is_error, .. } => {
+                assert_eq!(id, "call-2");
+                assert_eq!(output, "failed");
+                assert!(*is_error, "expected is_error=true for status=failed");
+            }
+            other => panic!("expected ToolCallResult, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_error_event() {
+        let mut p = parser();
+        let line = r#"{"type":"error","timestamp":"2026-01-01T00:00:00Z","message":"something went wrong"}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::Error { message } => {
+                assert_eq!(message, "something went wrong");
+            }
+            other => panic!("expected Error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_result_success() {
+        let mut p = parser();
+        let line = r#"{"type":"result","timestamp":"2026-01-01T00:00:00Z","status":"success","stats":{"total_tokens":100,"input_tokens":80,"output_tokens":20}}"#;
+        let events = p.parse_line(line);
+        // Expect TurnComplete + SessionEnd
+        assert_eq!(events.len(), 2, "result with stats must emit TurnComplete + SessionEnd");
+        match &events[0] {
+            CliEvent::TurnComplete { input_tokens, output_tokens } => {
+                assert_eq!(*input_tokens, 80);
+                assert_eq!(*output_tokens, 20);
+            }
+            other => panic!("expected TurnComplete first, got: {other:?}"),
+        }
+        match &events[1] {
+            CliEvent::SessionEnd { is_error, .. } => {
+                assert!(!*is_error, "expected is_error=false for status=success");
+            }
+            other => panic!("expected SessionEnd second, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_result_error() {
+        let mut p = parser();
+        let line = r#"{"type":"result","timestamp":"2026-01-01T00:00:00Z","status":"error","error":"API failure"}"#;
+        let events = p.parse_line(line);
+        // No stats → only SessionEnd
+        assert_eq!(events.len(), 1, "result without stats must emit only SessionEnd");
+        match &events[0] {
+            CliEvent::SessionEnd { is_error, .. } => {
+                assert!(*is_error, "expected is_error=true for status=error");
+            }
+            other => panic!("expected SessionEnd, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_session_id_tracked() {
+        let mut p = parser();
+        assert!(p.session_id().is_none(), "session_id must be None before init");
+        let line = r#"{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"ses-xyz789","model":"gemini-3-flash-preview"}"#;
+        p.parse_line(line);
+        assert_eq!(p.session_id(), Some("ses-xyz789"));
+    }
+
+    #[test]
+    fn gemini_malformed_json() {
+        let mut p = parser();
+        let events = p.parse_line("{not valid json{{");
+        assert!(events.is_empty(), "malformed JSON must be silently skipped, got: {events:?}");
+    }
+
+    #[test]
+    fn gemini_non_json_banner() {
+        let mut p = parser();
+        let events = p.parse_line("Welcome to Gemini CLI! Type your prompt below.");
+        assert!(events.is_empty(), "banner lines must be silently skipped, got: {events:?}");
+    }
+
+    #[test]
+    fn gemini_empty_content_assistant_message_ignored() {
+        let mut p = parser();
+        // Empty content string should not produce AssistantText
+        let line = r#"{"type":"message","role":"assistant","content":"","delta":true}"#;
+        let events = p.parse_line(line);
+        assert!(events.is_empty(), "empty content must not produce events, got: {events:?}");
+    }
 }

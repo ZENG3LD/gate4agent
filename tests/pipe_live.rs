@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use gate4agent::pipe::cli::traits::CliEvent;
 use gate4agent::pipe::cli::create_ndjson_parser;
-use gate4agent::pipe::{PipeProcess, PipeProcessOptions, ClaudeOptions};
-use gate4agent::CliTool;
+use gate4agent::pipe::{PipeProcess, PipeProcessOptions, ClaudeOptions, PipeSession};
+use gate4agent::{AgentEvent, CliTool};
+use gate4agent::core::types::SessionConfig;
 
 /// Spawn the given CLI tool via PipeProcess and validate NDJSON output.
 fn run_pipe_test(tool: CliTool, extra_args: Vec<String>) {
@@ -125,4 +126,89 @@ fn pipe_live_opencode() {
         CliTool::OpenCode,
         vec!["-m".into(), "opencode/nemotron-3-super-free".into()],
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PipeSession integration test (higher-level API over PipeProcess)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Full PipeSession lifecycle: spawn → subscribe → receive events → session ends.
+///
+/// Verifies:
+/// 1. `PipeSession::spawn` succeeds (Claude CLI must be installed).
+/// 2. `session.session_id()` is non-empty immediately after spawn.
+/// 3. At least one `AgentEvent::Text` event with non-empty text arrives.
+/// 4. The session eventually sends `AgentEvent::SessionEnd`.
+#[test]
+#[ignore] // Requires real `claude` CLI installed and authenticated
+fn pipe_session_full_lifecycle() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let config = SessionConfig {
+            tool: CliTool::ClaudeCode,
+            working_dir: std::env::current_dir().unwrap(),
+            env_vars: Vec::new(),
+            name: None,
+        };
+
+        let session = PipeSession::spawn(
+            config,
+            "Say exactly: hello from gate4agent pipe session. Nothing else.",
+            PipeProcessOptions::default(),
+        )
+        .await
+        .expect("PipeSession::spawn must succeed — is claude CLI installed?");
+
+        // session_id is set immediately (it is a UUID assigned at spawn time,
+        // not the CLI-native session ID from the NDJSON stream).
+        assert!(
+            !session.session_id().is_empty(),
+            "session_id must be non-empty immediately after spawn"
+        );
+
+        let mut rx = session.subscribe();
+
+        let mut got_text = false;
+        let mut got_session_end = false;
+
+        let deadline = std::time::Duration::from_secs(120);
+
+        loop {
+            match tokio::time::timeout(deadline, rx.recv()).await {
+                Ok(Ok(AgentEvent::Text { ref text, .. })) if !text.is_empty() => {
+                    println!("[pipe_session] Text: {}", text);
+                    got_text = true;
+                }
+                Ok(Ok(AgentEvent::SessionEnd { ref result, .. })) => {
+                    println!("[pipe_session] SessionEnd: {}", result);
+                    got_session_end = true;
+                    break;
+                }
+                Ok(Ok(AgentEvent::Exited { code })) => {
+                    println!("[pipe_session] Exited with code {}", code);
+                    break;
+                }
+                Ok(Ok(ev)) => {
+                    println!("[pipe_session] event: {:?}", ev);
+                }
+                Ok(Err(e)) => {
+                    println!("[pipe_session] recv error (channel closed): {}", e);
+                    break;
+                }
+                Err(_) => {
+                    println!("[pipe_session] TIMEOUT after 120s");
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            got_text,
+            "must receive at least one AgentEvent::Text with non-empty text"
+        );
+        assert!(
+            got_session_end,
+            "must receive AgentEvent::SessionEnd before channel closes"
+        );
+    });
 }

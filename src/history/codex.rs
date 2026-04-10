@@ -108,8 +108,13 @@ fn collect_sessions(dir: &Path, workdir: &Path, out: &mut Vec<SessionMeta>) {
     }
 }
 
-/// Read the first line of a `.jsonl` file and extract session id, cwd, and first message
-/// preview from the `session_meta` record.
+/// Read a `.jsonl` file and extract session id, cwd, and the first real user
+/// message preview.
+///
+/// Reads the `session_meta` first line for `id` and `cwd`, then scans forward
+/// to find the first genuine user message (skipping Codex-injected system
+/// context).  Falls back to `first_message` in the metadata if present and no
+/// real user message is found.
 ///
 /// Returns `None` if the file cannot be opened or the first line is not a valid
 /// `session_meta` record.
@@ -125,14 +130,61 @@ fn read_jsonl_meta(path: &Path) -> Option<(String, String, String)> {
     let payload = v.get("payload")?;
     let session_id = payload.get("id").and_then(|i| i.as_str())?.to_string();
     let cwd = payload.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string();
-    // `first_message` is an optional field in newer Codex versions.
-    let preview = payload
+    // Try `first_message` from meta as a fallback (often absent in real sessions).
+    let meta_preview: String = payload
         .get("first_message")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .chars()
         .take(80)
         .collect();
+
+    // Scan the remaining lines to find the first genuine user message.
+    let mut preview = String::new();
+    let mut scan_line = String::new();
+    loop {
+        scan_line.clear();
+        match reader.read_line(&mut scan_line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let trimmed = scan_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lv: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if lv.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+            continue;
+        }
+        let lp = match lv.get("payload") {
+            Some(p) => p,
+            None => continue,
+        };
+        if lp.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        if lp.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let text = extract_content(lp.get("content").unwrap_or(&serde_json::Value::Null));
+        if is_injected_system_content(&text) {
+            continue;
+        }
+        if !text.is_empty() {
+            preview = text.chars().take(80).collect();
+            break;
+        }
+    }
+
+    // Fall back to first_message from meta when no real user message was found.
+    if preview.is_empty() {
+        preview = meta_preview;
+    }
+
     Some((session_id, cwd, preview))
 }
 
@@ -217,7 +269,41 @@ fn extract_codex_item(v: &serde_json::Value) -> Option<ChatMessage> {
     if content.is_empty() {
         return None;
     }
+    // Skip Codex-injected system context that appears as "user" role messages.
+    if role == ChatRole::User && is_injected_system_content(&content) {
+        return None;
+    }
     Some(ChatMessage { role, content, tool_name: None })
+}
+
+/// Detect whether a "user" role message is actually system context injected by
+/// Codex (environment info, AGENTS.md, IDE context) rather than a real user
+/// message.
+///
+/// Heuristics:
+/// - Starts with `<` and is longer than 500 chars → XML environment block.
+/// - Starts with `# ` → markdown section header (AGENTS.md, IDE open tabs, etc.).
+/// - Starts with `## ` → same as above.
+/// - Contains `<environment_context>` or `<INSTRUCTIONS>` → XML injected blocks.
+fn is_injected_system_content(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // XML blocks injected by Codex are long and start with `<`.
+    if trimmed.starts_with('<') && text.len() > 500 {
+        return true;
+    }
+    // Shorter XML that is clearly a system tag.
+    if trimmed.contains("<environment_context>") || trimmed.contains("<INSTRUCTIONS>") {
+        return true;
+    }
+    // Markdown headers used for AGENTS.md, IDE context, open tabs, etc.
+    // Real short user messages rarely start with `# ` or `## `.
+    if (trimmed.starts_with("# ") || trimmed.starts_with("## ")) && text.len() > 200 {
+        return true;
+    }
+    false
 }
 
 fn extract_content(v: &serde_json::Value) -> String {
@@ -391,5 +477,65 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello");
         assert_eq!(msgs[1].role, ChatRole::Assistant);
         assert_eq!(msgs[1].content, "World");
+    }
+
+    #[test]
+    fn injected_xml_context_is_filtered() {
+        // The environment_context block (>500 chars, starts with `<`) should be dropped.
+        let env_block = format!(
+            "<environment_context><cwd>c:\\\\users\\\\me</cwd>{}</environment_context>",
+            "x".repeat(600),
+        );
+        assert!(is_injected_system_content(&env_block));
+        // A short XML snippet is NOT filtered (could be user pasting XML).
+        assert!(!is_injected_system_content("<tag>short</tag>"));
+        // Markdown header with body > 200 chars should be filtered.
+        let md_header = format!("# AGENTS.md instructions\n\n{}", "y".repeat(300));
+        assert!(is_injected_system_content(&md_header));
+        // A short markdown heading is NOT filtered.
+        assert!(!is_injected_system_content("# Short heading"));
+        // Normal user text is NOT filtered.
+        assert!(!is_injected_system_content("Fix the bug in auth.rs"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_skips_injected_context() {
+        let env_block = format!(
+            "<environment_context><cwd>/home/user</cwd>{}</environment_context>",
+            "x".repeat(600),
+        );
+        let raw = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/p"}}"#,
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text": env_block}]}}).to_string(),
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Real user message"}]}}"#,
+        );
+        let msgs = parse_codex_jsonl(&raw);
+        // Only the real user message should appear; the injected block must be dropped.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Real user message");
+    }
+
+    #[test]
+    fn read_jsonl_meta_falls_back_to_scanning_when_no_first_message() {
+        let env_block = format!(
+            "<environment_context><cwd>/home/user</cwd>{}</environment_context>",
+            "x".repeat(600),
+        );
+        let jsonl = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"session_meta","payload":{"id":"scan-test","cwd":"/home/user/project"}}"#,
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text": env_block}]}}).to_string(),
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Actual question from the user"}]}}"#,
+        );
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_codex_scan_preview.jsonl");
+        std::fs::write(&path, &jsonl).unwrap();
+        let result = read_jsonl_meta(&path);
+        assert!(result.is_some());
+        let (id, _cwd, preview) = result.unwrap();
+        assert_eq!(id, "scan-test");
+        assert_eq!(preview, "Actual question from the user");
+        std::fs::remove_file(&path).ok();
     }
 }

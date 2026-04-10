@@ -204,6 +204,10 @@ fn list_json_files_in(dir: &Path) -> Vec<SessionMeta> {
 }
 
 /// Read the first user message from a Gemini session file for use as a preview.
+///
+/// Handles both content formats:
+/// - `"content": "plain string"` — used in some legacy and assistant messages.
+/// - `"content": [{"text": "..."}]` — used in real Gemini CLI sessions for user messages.
 fn read_session_preview(path: &Path) -> String {
     let raw = match fs::read_to_string(path) {
         Ok(r) => r,
@@ -213,12 +217,13 @@ fn read_session_preview(path: &Path) -> String {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
-    // New format: {"messages":[{"type":"user","content":"..."},...]}
+    // New format: {"messages":[{"type":"user","content":"..." or [{"text":"..."}]},...]}
     if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
         for msg in arr {
             let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if msg_type == "user" {
-                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                let text = extract_gemini_content_text(msg.get("content"));
+                if !text.is_empty() {
                     return text.chars().take(80).collect();
                 }
             }
@@ -228,11 +233,35 @@ fn read_session_preview(path: &Path) -> String {
     if let Some(arr) = v.as_array() {
         for msg in arr {
             if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                let text = extract_gemini_content_text(msg.get("content"));
+                if !text.is_empty() {
                     return text.chars().take(80).collect();
                 }
             }
         }
+    }
+    String::new()
+}
+
+/// Extract text from a Gemini `content` value which may be either a plain
+/// string or an array of `{"text": "..."}` parts.
+fn extract_gemini_content_text(content: Option<&serde_json::Value>) -> String {
+    let c = match content {
+        Some(c) => c,
+        None => return String::new(),
+    };
+    // Plain string variant.
+    if let Some(s) = c.as_str() {
+        return s.to_string();
+    }
+    // Array of parts variant: [{"text": "..."}].
+    if let Some(arr) = c.as_array() {
+        let joined: String = arr
+            .iter()
+            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return joined;
     }
     String::new()
 }
@@ -481,5 +510,59 @@ mod tests {
         assert_eq!(slug.as_deref(), Some("myproject"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_new_format_content_as_array() {
+        // Real Gemini CLI format: user content is an array of parts.
+        let raw = r#"{
+            "sessionId": "14d02c74-4b93-4d88-9851-e0979f90ce3a",
+            "startTime": "2026-04-10T16:13:02.964Z",
+            "messages": [
+                {"id":"1","type":"user","content":[{"text":"Say exactly: hello from gate4agent RPC."}]},
+                {"id":"2","type":"gemini","content":"hello from gate4agent RPC."}
+            ]
+        }"#;
+        let msgs = parse_gemini_json(raw);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, ChatRole::User);
+        assert_eq!(msgs[0].content, "Say exactly: hello from gate4agent RPC.");
+        assert_eq!(msgs[1].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn read_session_preview_handles_content_array() {
+        // Verify the preview function handles array content (the bug that was fixed).
+        let json = r#"{
+            "sessionId": "test",
+            "messages": [
+                {"type":"user","content":[{"text":"Hello from content array"}]},
+                {"type":"gemini","content":"Response here"}
+            ]
+        }"#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("gemini_preview_test.json");
+        std::fs::write(&path, json).unwrap();
+        let preview = read_session_preview(&path);
+        assert_eq!(preview, "Hello from content array");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_session_preview_handles_content_string() {
+        // Verify string content still works (legacy format).
+        let json = r#"{
+            "sessionId": "test",
+            "messages": [
+                {"type":"user","content":"Hello plain string"},
+                {"type":"gemini","content":"Response here"}
+            ]
+        }"#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("gemini_preview_string_test.json");
+        std::fs::write(&path, json).unwrap();
+        let preview = read_session_preview(&path);
+        assert_eq!(preview, "Hello plain string");
+        std::fs::remove_file(&path).ok();
     }
 }

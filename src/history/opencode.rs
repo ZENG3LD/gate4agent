@@ -67,7 +67,9 @@ impl HistoryReader for OpenCodeHistoryReader {
                     .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                metas.push(SessionMeta { id, timestamp: ts, preview: String::new() });
+                // Read the first user message for a preview.
+                let preview = read_session_preview(&path);
+                metas.push(SessionMeta { id, timestamp: ts, preview });
             }
             if !metas.is_empty() {
                 metas.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -169,11 +171,91 @@ fn load_from_session_dir(dir: &Path) -> Vec<ChatMessage> {
     out
 }
 
+/// Read the first user message from an OpenCode session file for use as a
+/// preview. Supports both JSON and JSONL formats.
+fn read_session_preview(path: &Path) -> String {
+    let raw = match fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if ext == "jsonl" {
+        // Scan JSONL for the first user event.
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(text) = extract_opencode_user_text_from_event(&v) {
+                if !text.is_empty() {
+                    return text.chars().take(80).collect();
+                }
+            }
+        }
+        return String::new();
+    }
+    // JSON format: parse and find the first user message.
+    let msgs = parse_opencode_json(&raw);
+    for msg in msgs {
+        if msg.role == ChatRole::User && !msg.content.is_empty() {
+            return msg.content.chars().take(80).collect();
+        }
+    }
+    String::new()
+}
+
+/// Extract the user text from a single OpenCode JSONL event line, if it
+/// represents a user-authored message.
+///
+/// OpenCode event types for user messages are not formally documented; the
+/// following variants are handled:
+/// - `{"type":"user","content":"..."}` or `{"type":"user_message","content":"..."}`
+/// - `{"type":"input","text":"..."}` or `{"type":"input","content":"..."}`
+/// - `{"role":"user","content":"..."}` (JSON-style records in JSONL)
+fn extract_opencode_user_text_from_event(v: &serde_json::Value) -> Option<String> {
+    let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let is_user_event = matches!(event_type, "user" | "user_message" | "input");
+    let has_user_role = v.get("role").and_then(|r| r.as_str()) == Some("user");
+
+    if !is_user_event && !has_user_role {
+        return None;
+    }
+
+    // Try "content" field first, then "text".
+    for field in &["content", "text"] {
+        let field_val = v.get(field)?;
+        if let Some(s) = field_val.as_str() {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        if let Some(arr) = field_val.as_array() {
+            let joined: String = arr
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !joined.is_empty() {
+                return Some(joined);
+            }
+        }
+    }
+    None
+}
+
 /// Parse an OpenCode NDJSON session file.
 ///
 /// OpenCode streams events with `type` field: "text", "step_start",
 /// "step_finish", "tool_use", "reasoning".  Each line also has a `sessionID`
 /// field.  We only care about content-bearing events.
+///
+/// User messages arrive as events with `type: "user"`, `"user_message"`, or
+/// `"input"`, or with a `role: "user"` field.  Assistant text is accumulated
+/// from `type: "text"` events and flushed on `type: "step_finish"`.
 fn parse_opencode_jsonl(raw: &str) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     // Accumulate assistant text deltas into a single message.
@@ -188,6 +270,26 @@ fn parse_opencode_jsonl(raw: &str) -> Vec<ChatMessage> {
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Check for user message event first.
+        if let Some(user_text) = extract_opencode_user_text_from_event(&v) {
+            // Flush any pending assistant content before emitting a user turn.
+            if !assistant_buf.is_empty() {
+                out.push(ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: assistant_buf.clone(),
+                    tool_name: None,
+                });
+                assistant_buf.clear();
+            }
+            out.push(ChatMessage {
+                role: ChatRole::User,
+                content: user_text,
+                tool_name: None,
+            });
+            continue;
+        }
+
         match v.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 // Accumulate into assistant buffer.
@@ -321,6 +423,83 @@ mod tests {
         let msgs = parse_opencode_jsonl(raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "ok");
+    }
+
+    #[test]
+    fn parse_jsonl_emits_user_messages() {
+        // User messages with type "user" should appear in output.
+        let raw = concat!(
+            "{\"type\":\"user\",\"content\":\"What is Rust?\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"text\",\"text\":\"Rust is a systems language.\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"step_finish\",\"sessionID\":\"s\"}\n",
+        );
+        let msgs = parse_opencode_jsonl(raw);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, ChatRole::User);
+        assert_eq!(msgs[0].content, "What is Rust?");
+        assert_eq!(msgs[1].role, ChatRole::Assistant);
+        assert_eq!(msgs[1].content, "Rust is a systems language.");
+    }
+
+    #[test]
+    fn parse_jsonl_emits_user_message_type_variants() {
+        // Verify "user_message" and "input" variants are also handled.
+        let raw = concat!(
+            "{\"type\":\"user_message\",\"content\":\"First question\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"step_finish\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"input\",\"content\":\"Second question\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"step_finish\",\"sessionID\":\"s\"}\n",
+        );
+        let msgs = parse_opencode_jsonl(raw);
+        // Two user messages and no assistant (step_finish with empty buffer).
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| m.role == ChatRole::User).collect();
+        assert_eq!(user_msgs.len(), 2);
+        assert_eq!(user_msgs[0].content, "First question");
+        assert_eq!(user_msgs[1].content, "Second question");
+    }
+
+    #[test]
+    fn parse_jsonl_role_field_user_message() {
+        // JSONL records with role:"user" field (JSON-style within JSONL stream).
+        let raw = concat!(
+            "{\"role\":\"user\",\"content\":\"Question via role field\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"text\",\"text\":\"Answer\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"step_finish\",\"sessionID\":\"s\"}\n",
+        );
+        let msgs = parse_opencode_jsonl(raw);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, ChatRole::User);
+        assert_eq!(msgs[0].content, "Question via role field");
+        assert_eq!(msgs[1].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn read_session_preview_from_json_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oc_preview_test.json");
+        let json = r#"[
+            {"role":"user","content":"What is gate4agent?"},
+            {"role":"assistant","content":"It is a transport library."}
+        ]"#;
+        std::fs::write(&path, json).unwrap();
+        let preview = read_session_preview(&path);
+        assert_eq!(preview, "What is gate4agent?");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_session_preview_from_jsonl_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oc_preview_test.jsonl");
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"content\":\"JSONL user question here\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"text\",\"text\":\"Answer\",\"sessionID\":\"s\"}\n",
+            "{\"type\":\"step_finish\",\"sessionID\":\"s\"}\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+        let preview = read_session_preview(&path);
+        assert_eq!(preview, "JSONL user question here");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

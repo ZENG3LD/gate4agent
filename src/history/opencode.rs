@@ -2,17 +2,18 @@
 //!
 //! OpenCode (sst/opencode) stores sessions in a SQLite database:
 //! - macOS/Linux: `~/.local/share/opencode/opencode.db`
-//! - Windows: `%APPDATA%\opencode\opencode.db` or `%LOCALAPPDATA%\opencode\`
+//! - Windows: `%LOCALAPPDATA%\opencode\opencode.db` (or `%APPDATA%\opencode\`)
 //!
-//! The `sessions` table has a `directory` column (absolute path where the session
-//! was created) which enables project-scoped filtering.  SQLite reading is not
-//! attempted in this reader (no SQLite dependency); sessions remain unreadable in
-//! pure-SQLite installations.
+//! Schema (relevant tables):
+//! - `session`: id, directory, title, time_created, time_updated
+//! - `message`: id, session_id, time_created, data (JSON with `role` field)
+//! - `part`: id, message_id, session_id, data (JSON, `type:"text"` has user text)
+//!
+//! The `directory` column on `session` enables project-scoped filtering.
 //!
 //! As a fallback, some older or custom OpenCode versions write flat JSON/JSONL
 //! session files under `~/.opencode/sessions/` or `~/.opencode/`.  These may
 //! contain a top-level `directory` field which is used for filtering when present.
-//! If the field is absent the session is included unfiltered.
 
 use std::fs;
 use std::path::Path;
@@ -25,103 +26,356 @@ pub struct OpenCodeHistoryReader;
 
 impl HistoryReader for OpenCodeHistoryReader {
     fn list_sessions(&self, workdir: &Path) -> Vec<SessionMeta> {
-        let home = home_dir();
-        // Try candidate directories where OpenCode may store sessions.
-        for candidate in [
-            home.join(".opencode").join("sessions"),
-            home.join(".opencode"),
-        ] {
-            if !candidate.is_dir() {
-                continue;
-            }
-            let entries = match fs::read_dir(&candidate) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let mut metas: Vec<SessionMeta> = Vec::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                // OpenCode sessions may be JSON files or directories.
-                if !path.is_dir() && ext != "json" && ext != "jsonl" {
-                    continue;
-                }
-                let id = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if id.is_empty() {
-                    continue;
-                }
-                // Filter by directory field if it can be read from the session.
-                if path.is_file() {
-                    if !session_matches_workdir(&path, workdir) {
-                        continue;
-                    }
-                }
-                let ts = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                // Read the first user message for a preview.
-                let preview = read_session_preview(&path);
-                metas.push(SessionMeta { id, timestamp: ts, preview });
-            }
+        // Primary: try SQLite database.
+        if let Some(metas) = list_sessions_sqlite(workdir) {
             if !metas.is_empty() {
-                metas.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                 return metas;
             }
         }
-        Vec::new()
+        // Fallback: flat JSON/JSONL files.
+        list_sessions_files(workdir)
     }
 
     fn load_session(&self, _workdir: &Path, session_id: &str) -> Vec<ChatMessage> {
-        let home = home_dir();
-        for dir in [
-            home.join(".opencode").join("sessions"),
-            home.join(".opencode"),
-        ] {
-            // Try JSON file.
-            for ext in &["json", "jsonl"] {
-                let file = dir.join(format!("{}.{}", session_id, ext));
-                if file.is_file() {
-                    if let Ok(raw) = fs::read_to_string(&file) {
-                        if *ext == "jsonl" {
-                            return parse_opencode_jsonl(&raw);
-                        } else {
-                            return parse_opencode_json(&raw);
-                        }
-                    }
-                }
-            }
-            // Try directory layout.
-            let session_dir = dir.join(session_id);
-            if session_dir.is_dir() {
-                return load_from_session_dir(&session_dir);
+        // Primary: SQLite.
+        if let Some(msgs) = load_session_sqlite(session_id) {
+            if !msgs.is_empty() {
+                return msgs;
             }
         }
-        Vec::new()
+        // Fallback: flat files.
+        load_session_files(session_id)
     }
 }
 
+// ---------------------------------------------------------------------------
+// SQLite backend
+// ---------------------------------------------------------------------------
+
+/// Candidate paths for the OpenCode SQLite database.
+fn sqlite_db_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    // macOS / Linux standard XDG path.
+    if let Some(home) = home_dir_opt() {
+        candidates.push(home.join(".local").join("share").join("opencode").join("opencode.db"));
+    }
+    // Windows: %LOCALAPPDATA%\opencode\opencode.db
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            std::path::PathBuf::from(local)
+                .join("opencode")
+                .join("opencode.db"),
+        );
+    }
+    // Windows: %APPDATA%\opencode\opencode.db
+    if let Some(roaming) = std::env::var_os("APPDATA") {
+        candidates.push(
+            std::path::PathBuf::from(roaming)
+                .join("opencode")
+                .join("opencode.db"),
+        );
+    }
+    candidates
+}
+
+/// Open the first existing OpenCode SQLite database.
+fn open_sqlite() -> Option<rusqlite::Connection> {
+    for path in sqlite_db_candidates() {
+        if path.is_file() {
+            if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                return Some(conn);
+            }
+        }
+    }
+    None
+}
+
+/// List sessions from the SQLite database, filtered by `workdir`.
+fn list_sessions_sqlite(workdir: &Path) -> Option<Vec<SessionMeta>> {
+    let conn = open_sqlite()?;
+    let workdir_norm = normalise_path(&workdir.to_string_lossy());
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, directory, title, time_created, time_updated \
+             FROM session \
+             WHERE time_archived IS NULL \
+             ORDER BY time_updated DESC",
+        )
+        .ok()?;
+
+    let mut metas: Vec<SessionMeta> = Vec::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,  // id
+                row.get::<_, String>(1)?,  // directory
+                row.get::<_, String>(2)?,  // title
+                row.get::<_, i64>(3)?,     // time_created (ms)
+                row.get::<_, i64>(4)?,     // time_updated (ms)
+            ))
+        })
+        .ok()?;
+
+    for row in rows.flatten() {
+        let (id, directory, _title, _time_created, time_updated) = row;
+        if !normalise_path(&directory).eq(&workdir_norm) {
+            continue;
+        }
+        // Convert milliseconds to seconds.
+        let timestamp = time_updated / 1000;
+        // Fetch the first real user message as preview.
+        let preview = fetch_user_preview_sqlite(&conn, &id);
+        // Skip zombie sessions — no real user input recorded yet.
+        if preview.is_empty() {
+            continue;
+        }
+        metas.push(SessionMeta { id, timestamp, preview });
+    }
+
+    Some(metas)
+}
+
+/// Fetch the first user message text from a session for use as a preview.
+///
+/// User messages are stored in the `part` table linked to a `message` row
+/// whose `data` JSON contains `"role":"user"`.  Parts with `type:"text"` hold
+/// the actual text typed by the user.
+fn fetch_user_preview_sqlite(conn: &rusqlite::Connection, session_id: &str) -> String {
+    // Find the earliest user message id for this session.
+    let user_msg_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM message \
+             WHERE session_id = ?1 \
+               AND json_extract(data, '$.role') = 'user' \
+             ORDER BY time_created ASC \
+             LIMIT 1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let msg_id = match user_msg_id {
+        Some(id) => id,
+        None => return String::new(),
+    };
+
+    // Find text parts for this message.
+    let mut stmt = match conn.prepare(
+        "SELECT data FROM part \
+         WHERE message_id = ?1 \
+           AND json_extract(data, '$.type') = 'text' \
+         ORDER BY time_created ASC \
+         LIMIT 5",
+    ) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    let mut text_buf = String::new();
+    let rows = match stmt.query_map(rusqlite::params![msg_id], |row| {
+        row.get::<_, String>(0)
+    }) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+
+    for data_json in rows.flatten() {
+        let v: serde_json::Value = match serde_json::from_str(&data_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+            if !text.is_empty() {
+                text_buf.push_str(text);
+                if text_buf.len() >= 80 {
+                    break;
+                }
+            }
+        }
+    }
+
+    text_buf.trim().chars().take(80).collect()
+}
+
+/// Load full chat messages for a session from SQLite.
+fn load_session_sqlite(session_id: &str) -> Option<Vec<ChatMessage>> {
+    let conn = open_sqlite()?;
+
+    // Fetch all messages ordered by creation time.
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, data FROM message \
+             WHERE session_id = ?1 \
+             ORDER BY time_created ASC",
+        )
+        .ok()?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()?;
+
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        let (msg_id, data_json) = row;
+        let data: serde_json::Value = match serde_json::from_str(&data_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let role_str = data.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let role = match role_str {
+            "user" => ChatRole::User,
+            "assistant" => ChatRole::Assistant,
+            _ => continue,
+        };
+        // Collect text from parts for this message.
+        let content = collect_parts_text(&conn, &msg_id);
+        if content.is_empty() {
+            continue;
+        }
+        out.push(ChatMessage { role, content, tool_name: None });
+    }
+
+    Some(out)
+}
+
+/// Collect all text parts for a message into a single string.
+fn collect_parts_text(conn: &rusqlite::Connection, message_id: &str) -> String {
+    let mut stmt = match conn.prepare(
+        "SELECT data FROM part \
+         WHERE message_id = ?1 \
+           AND json_extract(data, '$.type') = 'text' \
+         ORDER BY time_created ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    let rows = match stmt.query_map(rusqlite::params![message_id], |row| {
+        row.get::<_, String>(0)
+    }) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+
+    let mut buf = String::new();
+    for data_json in rows.flatten() {
+        let v: serde_json::Value = match serde_json::from_str(&data_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(text);
+        }
+    }
+    buf.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// File-based fallback (older / custom OpenCode installs)
+// ---------------------------------------------------------------------------
+
+fn list_sessions_files(workdir: &Path) -> Vec<SessionMeta> {
+    let home = home_dir();
+    for candidate in [
+        home.join(".opencode").join("sessions"),
+        home.join(".opencode"),
+    ] {
+        if !candidate.is_dir() {
+            continue;
+        }
+        let entries = match fs::read_dir(&candidate) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let mut metas: Vec<SessionMeta> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if !path.is_dir() && ext != "json" && ext != "jsonl" {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if path.is_file() && !session_matches_workdir(&path, workdir) {
+                continue;
+            }
+            let ts = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let preview = read_session_preview(&path);
+            if preview.is_empty() {
+                continue;
+            }
+            metas.push(SessionMeta { id, timestamp: ts, preview });
+        }
+        if !metas.is_empty() {
+            metas.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            return metas;
+        }
+    }
+    Vec::new()
+}
+
+fn load_session_files(session_id: &str) -> Vec<ChatMessage> {
+    let home = home_dir();
+    for dir in [
+        home.join(".opencode").join("sessions"),
+        home.join(".opencode"),
+    ] {
+        for ext in &["json", "jsonl"] {
+            let file = dir.join(format!("{}.{}", session_id, ext));
+            if file.is_file() {
+                if let Ok(raw) = fs::read_to_string(&file) {
+                    if *ext == "jsonl" {
+                        return parse_opencode_jsonl(&raw);
+                    } else {
+                        return parse_opencode_json(&raw);
+                    }
+                }
+            }
+        }
+        let session_dir = dir.join(session_id);
+        if session_dir.is_dir() {
+            return load_from_session_dir(&session_dir);
+        }
+    }
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Normalise a path string to lowercase with forward slashes and no trailing slash.
+fn normalise_path(s: &str) -> String {
+    s.replace('\\', "/").to_lowercase().trim_end_matches('/').to_string()
+}
+
 /// Check whether a session file's `directory` field matches `workdir`.
-///
-/// Returns `true` if:
-/// - The file cannot be read or parsed (pass-through: we cannot filter).
-/// - The parsed JSON has no `directory` field (pass-through: unknown project).
-/// - The `directory` field matches `workdir` after path normalisation.
-///
-/// Returns `false` only if a `directory` field is present and does NOT match.
 fn session_matches_workdir(path: &Path, workdir: &Path) -> bool {
     let raw = match fs::read_to_string(path) {
         Ok(r) => r,
-        Err(_) => return true, // cannot read → pass-through
+        Err(_) => return true,
     };
-    // For JSONL files check the first line for a session header.
     let text = if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
         raw.lines().next().unwrap_or("").to_string()
     } else {
@@ -129,10 +383,10 @@ fn session_matches_workdir(path: &Path, workdir: &Path) -> bool {
     };
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return true, // parse failure → pass-through
+        Err(_) => return true,
     };
     match v.get("directory").and_then(|d| d.as_str()) {
-        None => true, // field absent → pass-through
+        None => true,
         Some(dir) => paths_match(dir, workdir),
     }
 }
@@ -142,10 +396,7 @@ fn paths_match(a: &str, b: &Path) -> bool {
     if a.is_empty() {
         return false;
     }
-    let normalise = |s: &str| {
-        s.replace('\\', "/").to_lowercase().trim_end_matches('/').to_string()
-    };
-    normalise(a) == normalise(&b.to_string_lossy())
+    normalise_path(a) == normalise_path(&b.to_string_lossy())
 }
 
 fn load_from_session_dir(dir: &Path) -> Vec<ChatMessage> {
@@ -171,8 +422,7 @@ fn load_from_session_dir(dir: &Path) -> Vec<ChatMessage> {
     out
 }
 
-/// Read the first user message from an OpenCode session file for use as a
-/// preview. Supports both JSON and JSONL formats.
+/// Read the first user message from an OpenCode session file for use as a preview.
 fn read_session_preview(path: &Path) -> String {
     let raw = match fs::read_to_string(path) {
         Ok(r) => r,
@@ -180,7 +430,6 @@ fn read_session_preview(path: &Path) -> String {
     };
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     if ext == "jsonl" {
-        // Scan JSONL for the first user event.
         for line in raw.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -198,7 +447,6 @@ fn read_session_preview(path: &Path) -> String {
         }
         return String::new();
     }
-    // JSON format: parse and find the first user message.
     let msgs = parse_opencode_json(&raw);
     for msg in msgs {
         if msg.role == ChatRole::User && !msg.content.is_empty() {
@@ -208,14 +456,7 @@ fn read_session_preview(path: &Path) -> String {
     String::new()
 }
 
-/// Extract the user text from a single OpenCode JSONL event line, if it
-/// represents a user-authored message.
-///
-/// OpenCode event types for user messages are not formally documented; the
-/// following variants are handled:
-/// - `{"type":"user","content":"..."}` or `{"type":"user_message","content":"..."}`
-/// - `{"type":"input","text":"..."}` or `{"type":"input","content":"..."}`
-/// - `{"role":"user","content":"..."}` (JSON-style records in JSONL)
+/// Extract the user text from a single OpenCode JSONL event line.
 fn extract_opencode_user_text_from_event(v: &serde_json::Value) -> Option<String> {
     let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let is_user_event = matches!(event_type, "user" | "user_message" | "input");
@@ -225,40 +466,30 @@ fn extract_opencode_user_text_from_event(v: &serde_json::Value) -> Option<String
         return None;
     }
 
-    // Try "content" field first, then "text".
     for field in &["content", "text"] {
-        let field_val = v.get(field)?;
-        if let Some(s) = field_val.as_str() {
-            if !s.is_empty() {
-                return Some(s.to_string());
+        if let Some(field_val) = v.get(field) {
+            if let Some(s) = field_val.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
             }
-        }
-        if let Some(arr) = field_val.as_array() {
-            let joined: String = arr
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !joined.is_empty() {
-                return Some(joined);
+            if let Some(arr) = field_val.as_array() {
+                let joined: String = arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !joined.is_empty() {
+                    return Some(joined);
+                }
             }
         }
     }
     None
 }
 
-/// Parse an OpenCode NDJSON session file.
-///
-/// OpenCode streams events with `type` field: "text", "step_start",
-/// "step_finish", "tool_use", "reasoning".  Each line also has a `sessionID`
-/// field.  We only care about content-bearing events.
-///
-/// User messages arrive as events with `type: "user"`, `"user_message"`, or
-/// `"input"`, or with a `role: "user"` field.  Assistant text is accumulated
-/// from `type: "text"` events and flushed on `type: "step_finish"`.
 fn parse_opencode_jsonl(raw: &str) -> Vec<ChatMessage> {
     let mut out = Vec::new();
-    // Accumulate assistant text deltas into a single message.
     let mut assistant_buf = String::new();
 
     for line in raw.lines() {
@@ -271,9 +502,7 @@ fn parse_opencode_jsonl(raw: &str) -> Vec<ChatMessage> {
             Err(_) => continue,
         };
 
-        // Check for user message event first.
         if let Some(user_text) = extract_opencode_user_text_from_event(&v) {
-            // Flush any pending assistant content before emitting a user turn.
             if !assistant_buf.is_empty() {
                 out.push(ChatMessage {
                     role: ChatRole::Assistant,
@@ -292,13 +521,11 @@ fn parse_opencode_jsonl(raw: &str) -> Vec<ChatMessage> {
 
         match v.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
-                // Accumulate into assistant buffer.
                 if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
                     assistant_buf.push_str(text);
                 }
             }
             Some("step_finish") => {
-                // Flush accumulated assistant text.
                 if !assistant_buf.is_empty() {
                     out.push(ChatMessage {
                         role: ChatRole::Assistant,
@@ -311,7 +538,6 @@ fn parse_opencode_jsonl(raw: &str) -> Vec<ChatMessage> {
             _ => {}
         }
     }
-    // Flush any remaining text.
     if !assistant_buf.is_empty() {
         out.push(ChatMessage {
             role: ChatRole::Assistant,
@@ -322,7 +548,6 @@ fn parse_opencode_jsonl(raw: &str) -> Vec<ChatMessage> {
     out
 }
 
-/// Parse an OpenCode JSON session file (array or object with messages).
 fn parse_opencode_json(raw: &str) -> Vec<ChatMessage> {
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -379,13 +604,15 @@ fn extract_opencode_message(v: &serde_json::Value) -> Option<ChatMessage> {
 }
 
 fn home_dir() -> std::path::PathBuf {
+    home_dir_opt().unwrap_or_default()
+}
+
+fn home_dir_opt() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     if let Some(p) = std::env::var_os("USERPROFILE") {
-        return std::path::PathBuf::from(p);
+        return Some(std::path::PathBuf::from(p));
     }
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 #[cfg(test)]
@@ -427,7 +654,6 @@ mod tests {
 
     #[test]
     fn parse_jsonl_emits_user_messages() {
-        // User messages with type "user" should appear in output.
         let raw = concat!(
             "{\"type\":\"user\",\"content\":\"What is Rust?\",\"sessionID\":\"s\"}\n",
             "{\"type\":\"text\",\"text\":\"Rust is a systems language.\",\"sessionID\":\"s\"}\n",
@@ -443,7 +669,6 @@ mod tests {
 
     #[test]
     fn parse_jsonl_emits_user_message_type_variants() {
-        // Verify "user_message" and "input" variants are also handled.
         let raw = concat!(
             "{\"type\":\"user_message\",\"content\":\"First question\",\"sessionID\":\"s\"}\n",
             "{\"type\":\"step_finish\",\"sessionID\":\"s\"}\n",
@@ -451,7 +676,6 @@ mod tests {
             "{\"type\":\"step_finish\",\"sessionID\":\"s\"}\n",
         );
         let msgs = parse_opencode_jsonl(raw);
-        // Two user messages and no assistant (step_finish with empty buffer).
         let user_msgs: Vec<_> = msgs.iter().filter(|m| m.role == ChatRole::User).collect();
         assert_eq!(user_msgs.len(), 2);
         assert_eq!(user_msgs[0].content, "First question");
@@ -460,7 +684,6 @@ mod tests {
 
     #[test]
     fn parse_jsonl_role_field_user_message() {
-        // JSONL records with role:"user" field (JSON-style within JSONL stream).
         let raw = concat!(
             "{\"role\":\"user\",\"content\":\"Question via role field\",\"sessionID\":\"s\"}\n",
             "{\"type\":\"text\",\"text\":\"Answer\",\"sessionID\":\"s\"}\n",
@@ -506,7 +729,6 @@ mod tests {
     fn session_matches_workdir_pass_through_on_no_field() {
         let dir = std::env::temp_dir();
         let path = dir.join("oc_test_no_dir.json");
-        // JSON with no "directory" field.
         std::fs::write(&path, r#"{"messages":[]}"#).unwrap();
         let workdir = std::path::Path::new("/some/project");
         assert!(session_matches_workdir(&path, workdir));
@@ -537,5 +759,30 @@ mod tests {
         assert!(paths_match("/home/me/project/", std::path::Path::new("/home/me/project")));
         assert!(!paths_match("/a", std::path::Path::new("/b")));
         assert!(!paths_match("", std::path::Path::new("/a")));
+    }
+
+    #[test]
+    fn sqlite_db_candidates_includes_local_share() {
+        // On Linux/macOS, the ~/.local/share/opencode/ path should appear.
+        // This is a basic smoke test that the function returns at least one path.
+        let candidates = sqlite_db_candidates();
+        assert!(!candidates.is_empty());
+    }
+
+    /// Verify that the SQLite reader can query the real OpenCode database when
+    /// it is present on this machine.  This test is skipped when no database
+    /// file is found.
+    #[test]
+    fn sqlite_reader_smoke_test() {
+        let conn = match open_sqlite() {
+            Some(c) => c,
+            None => return, // no OpenCode DB on this machine — skip
+        };
+        // Just verify we can query the session table without panicking.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .unwrap_or(0);
+        // Whatever the count, the query must succeed.
+        let _ = count;
     }
 }

@@ -86,7 +86,9 @@ fn collect_sessions(dir: &Path, workdir: &Path, out: &mut Vec<SessionMeta>) {
         if ext == "jsonl" {
             // New layout: read first line to get session_meta with cwd + preview.
             if let Some((session_id, cwd, preview)) = read_jsonl_meta(&path) {
-                if paths_match(&cwd, workdir) {
+                // Exclude zombie sessions — Codex created the file but no real
+                // user interaction happened (preview would be empty).
+                if paths_match(&cwd, workdir) && !preview.is_empty() {
                     out.push(SessionMeta {
                         id: session_id,
                         timestamp: ts,
@@ -96,13 +98,18 @@ fn collect_sessions(dir: &Path, workdir: &Path, out: &mut Vec<SessionMeta>) {
             }
         } else if ext == "json" {
             // Old layout: no cwd available, include unfiltered.
+            // Read the file to extract the first real user message as preview.
             let id = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
             if !id.is_empty() {
-                out.push(SessionMeta { id, timestamp: ts, preview: String::new() });
+                let preview = read_json_preview(&path);
+                // Exclude sessions with no real user messages (zombie / aborted).
+                if !preview.is_empty() {
+                    out.push(SessionMeta { id, timestamp: ts, preview });
+                }
             }
         }
     }
@@ -140,6 +147,12 @@ fn read_jsonl_meta(path: &Path) -> Option<(String, String, String)> {
         .collect();
 
     // Scan the remaining lines to find the first genuine user message.
+    //
+    // Two formats exist:
+    // - New (Codex v0.118+): `event_msg` with `payload.type == "user_message"` and
+    //   `payload.message` holding the raw text typed by the user.
+    // - Old (Codex <v0.118): `response_item` with `payload.type == "message"` and
+    //   `payload.role == "user"`, filtered via `is_injected_system_content`.
     let mut preview = String::new();
     let mut scan_line = String::new();
     loop {
@@ -157,7 +170,32 @@ fn read_jsonl_meta(path: &Path) -> Option<(String, String, String)> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if lv.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        let record_type = lv.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        // New format: event_msg with payload.type == "user_message".
+        if record_type == "event_msg" {
+            let lp = match lv.get("payload") {
+                Some(p) => p,
+                None => continue,
+            };
+            if lp.get("type").and_then(|t| t.as_str()) != Some("user_message") {
+                continue;
+            }
+            let text = lp
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !text.is_empty() {
+                preview = text.chars().take(80).collect();
+                break;
+            }
+            continue;
+        }
+
+        // Old format: response_item with payload.role == "user".
+        if record_type != "response_item" {
             continue;
         }
         let lp = match lv.get("payload") {
@@ -186,6 +224,25 @@ fn read_jsonl_meta(path: &Path) -> Option<(String, String, String)> {
     }
 
     Some((session_id, cwd, preview))
+}
+
+/// Extract the first real user message preview from an old-layout `.json` file.
+///
+/// Parses the file with `parse_codex_session`, then walks the resulting messages
+/// to find the first `ChatRole::User` entry that is not injected system content.
+/// Returns an empty string when no real user message is found.
+fn read_json_preview(path: &Path) -> String {
+    let raw = match fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    let messages = parse_codex_session(&raw);
+    for msg in messages {
+        if msg.role == ChatRole::User && !is_injected_system_content(&msg.content) {
+            return msg.content.chars().take(80).collect();
+        }
+    }
+    String::new()
 }
 
 /// Find a session file by its id (UUID) anywhere under `root`.
@@ -226,8 +283,11 @@ fn paths_match(a: &str, b: &Path) -> bool {
 
 /// Parse a new-layout Codex JSONL session file into chat messages.
 ///
-/// Each line is a JSON record with `type` and `payload`. We look for
-/// `response_item` records that contain user/assistant messages.
+/// Two record types carry message content:
+/// - `event_msg` with `payload.type == "user_message"`: real user input (new format,
+///   Codex v0.118+). The text is in `payload.message`.
+/// - `response_item` with `payload.type == "message"`: assistant or legacy user
+///   messages (old format). Injected system context is filtered out.
 fn parse_codex_jsonl(raw: &str) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     for line in raw.lines() {
@@ -240,6 +300,29 @@ fn parse_codex_jsonl(raw: &str) -> Vec<ChatMessage> {
             Err(_) => continue,
         };
         let record_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        // New format: real user message via event_msg.
+        if record_type == "event_msg" {
+            let payload = match v.get("payload") {
+                Some(p) => p,
+                None => continue,
+            };
+            if payload.get("type").and_then(|t| t.as_str()) != Some("user_message") {
+                continue;
+            }
+            let text = payload
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !text.is_empty() {
+                out.push(ChatMessage { role: ChatRole::User, content: text, tool_name: None });
+            }
+            continue;
+        }
+
+        // Old format: response_item.
         if record_type != "response_item" {
             continue;
         }
@@ -514,6 +597,54 @@ mod tests {
         // Only the real user message should appear; the injected block must be dropped.
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Real user message");
+    }
+
+    #[test]
+    fn read_jsonl_meta_extracts_event_msg_user_message() {
+        // New Codex format (v0.118+): real user input comes via event_msg.
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-04-10T10:00:00Z","type":"session_meta","payload":{"id":"evt-test","cwd":"/home/user/project"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>..."}]}}"#,
+            "\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions\\n\\n<INSTRUCTIONS>...</INSTRUCTIONS>\"}]}}",
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"abc"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"Fix the memory leak in allocator.rs","images":[]}}"#,
+            "\n",
+        );
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_codex_event_msg.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        let result = read_jsonl_meta(&path);
+        assert!(result.is_some());
+        let (id, cwd, preview) = result.unwrap();
+        assert_eq!(id, "evt-test");
+        assert_eq!(cwd, "/home/user/project");
+        assert_eq!(preview, "Fix the memory leak in allocator.rs");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parse_codex_jsonl_extracts_event_msg_user_messages() {
+        // New format: event_msg carries real user input; response_item carries assistant.
+        let raw = concat!(
+            r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/p"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"Hello from event_msg","images":[]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":"Hi there!"}}"#,
+            "\n",
+        );
+        let msgs = parse_codex_jsonl(raw);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, ChatRole::User);
+        assert_eq!(msgs[0].content, "Hello from event_msg");
+        assert_eq!(msgs[1].role, ChatRole::Assistant);
+        assert_eq!(msgs[1].content, "Hi there!");
     }
 
     #[test]

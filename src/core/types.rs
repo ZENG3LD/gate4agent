@@ -14,6 +14,8 @@ pub enum CliTool {
     Gemini,
     /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
     OpenCode,
+    /// Cursor AI editor agent (cursor-agent CLI) — ACP transport only.
+    Cursor,
 }
 
 impl std::fmt::Display for CliTool {
@@ -23,6 +25,7 @@ impl std::fmt::Display for CliTool {
             CliTool::Codex => write!(f, "Codex"),
             CliTool::Gemini => write!(f, "Gemini"),
             CliTool::OpenCode => write!(f, "OpenCode"),
+            CliTool::Cursor => write!(f, "Cursor"),
         }
     }
 }

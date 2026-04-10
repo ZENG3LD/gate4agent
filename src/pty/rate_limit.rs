@@ -35,6 +35,8 @@ impl RateLimitDetector {
             // output has been captured and rate-limit message formats confirmed.
             // For now use an empty pattern set — no false positives, no detections.
             CliTool::OpenCode => vec![],
+            // Cursor uses ACP transport; PTY rate-limit detection does not apply.
+            CliTool::Cursor => vec![],
         };
         Self { patterns }
     }

@@ -1,8 +1,9 @@
-//! gate4agent — Universal wrapper for CLI agents (Claude Code, Codex, Gemini, OpenCode).
+//! gate4agent — Universal wrapper for CLI agents (Claude Code, Codex, Gemini, OpenCode, Cursor).
 //!
-//! Two transport modes:
+//! Three transport modes:
 //! - Pipe mode: NDJSON-streaming pipe sessions (Claude, Codex, Gemini, OpenCode)
 //! - PTY mirror: spawns agent in real PTY, captures raw output, vt100 parsing
+//! - ACP mode: bidirectional JSON-RPC 2.0 over stdio (Gemini, OpenCode, Cursor, Claude ACP adapter)
 //!
 //! All modes produce `AgentEvent` values on a `tokio::sync::broadcast` channel.
 //!
@@ -11,6 +12,7 @@
 //! - [`TransportSession`] — thin dispatch router: pipe or PTY
 //! - [`PipeSession`] — direct pipe session entry point (restored for 0.1.x compatibility)
 //! - [`pty::PtySession::spawn`] — PTY mirror mode (unchanged)
+//! - [`AcpSession`] — ACP transport (multi-turn JSON-RPC 2.0, Cursor/Gemini/OpenCode)
 //! - [`MultiCliManager`] — high-level session manager for the chart app
 
 pub use core::error::AgentError;
@@ -18,6 +20,7 @@ pub use core::types::{AgentEvent, CliTool, SessionConfig};
 pub use transport::{SpawnOptions, TransportSession};
 pub use pipe::{PipeSession, PipeProcessOptions, ClaudeOptions};
 
+pub mod acp;
 pub mod core;
 pub mod transport;
 pub mod pty;
@@ -27,6 +30,7 @@ pub mod history;
 pub mod manager;
 pub mod daemon;
 
+pub use acp::{AcpSession, AcpSessionOptions, AcpError, AcpHostHandler, DefaultAcpHandler};
 pub use rpc::{
     RpcSession, RpcSessionOptions, RpcSessionError,
     HostHandler, RejectAllHandler, MethodRouter,

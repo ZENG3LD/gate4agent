@@ -22,6 +22,7 @@ pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
         CliTool::Codex => Box::new(CodexNdjsonParser::new()),
         CliTool::Gemini => Box::new(GeminiNdjsonParser::new()),
         CliTool::OpenCode => Box::new(OpenCodeNdjsonParser::new()),
+        CliTool::Cursor => panic!("Cursor uses ACP transport — use AcpSession::spawn, not pipe mode"),
     }
 }
 
@@ -35,5 +36,6 @@ pub fn cli_builder(tool: CliTool) -> Box<dyn CliCommandBuilder> {
         CliTool::Codex => Box::new(CodexPipeBuilder),
         CliTool::Gemini => Box::new(GeminiPipeBuilder),
         CliTool::OpenCode => Box::new(OpenCodePipeBuilder),
+        CliTool::Cursor => panic!("Cursor uses ACP transport — use AcpSession::spawn, not pipe mode"),
     }
 }

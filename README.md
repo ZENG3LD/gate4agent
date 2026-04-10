@@ -1,21 +1,23 @@
 # gate4agent
 
-Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for four different CLI agents through one unified API.
+Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for five different CLI agents through one unified API.
 
 **Not a harness. Not a sandbox.** gate4agent is the thin wiring layer between your Rust app and the CLI agent's subprocess: spawn the binary, write the prompt, read structured events, resume by session id. That's it.
 
 ## Supported CLI tools
 
-| Tool | Transport | Pipe mode | Resume | Notes |
-|---|---|---|---|---|
-| **Claude Code** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via stdin |
-| **Codex** | Pipe + PTY | ✓ `--json` | ✓ `exec resume <id>` | Uses `--full-auto` for non-interactive execution |
-| **Gemini** | Pipe + PTY | ✓ stream-json | ✓ `--resume <id>` | Prompt via `-p` flag |
-| **OpenCode** (`sst/opencode`) | Pipe | ✓ `--format json` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
+| Tool | Transport | Pipe mode | ACP | Resume | Notes |
+|---|---|---|---|---|---|
+| **Claude Code** | Pipe + PTY + ACP | ✓ stream-json | ✓ via `claude-agent-acp` | ✓ `--resume <id>` | Prompt via stdin |
+| **Codex** | Pipe + PTY + ACP | ✓ `--json` | ✓ via `codex-acp` | ✓ `exec resume <id>` | Uses `--full-auto` for non-interactive |
+| **Gemini** | Pipe + PTY + ACP | ✓ stream-json | ✓ native `--experimental-acp` | ✓ `--resume <id>` | Prompt via `-p` flag |
+| **OpenCode** (`sst/opencode`) | Pipe + ACP | ✓ `--format json` | ✓ native `opencode acp` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
+| **Cursor** | ACP | — | ✓ native `cursor-agent agent acp` | — | ACP-only, no pipe/PTY |
 
 Transport classes:
 - **Pipe**: spawn the CLI directly, read NDJSON over stdout
 - **PTY**: spawn inside a pseudo-terminal, scrape the screen with vt100 (for agents without structured output)
+- **ACP** (Agent Client Protocol): spawn the CLI in ACP mode, communicate via bidirectional JSON-RPC 2.0 over stdio. Multi-turn sessions, structured events, agent→host callbacks (fs, terminal, permissions).
 
 ## Quick start
 
@@ -98,19 +100,53 @@ let session = RpcSession::spawn(
 ).await?;
 ```
 
+### ACP Transport (Agent Client Protocol)
+
+```rust
+use gate4agent::acp::{AcpSession, AcpSessionOptions};
+use gate4agent::{CliTool, AgentEvent};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let session = AcpSession::spawn(
+        CliTool::Gemini,
+        &std::env::current_dir()?,
+        AcpSessionOptions::default(),
+    ).await?;
+
+    let mut rx = session.subscribe();
+
+    session.prompt("Say hello in 3 words").await?;
+
+    while let Ok(event) = rx.recv().await {
+        match event {
+            AgentEvent::Text { text, .. } => print!("{text}"),
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+
+    session.kill().await?;
+    Ok(())
+}
+```
+
+ACP provides multi-turn sessions — call `prompt()` repeatedly without respawning the agent process. The agent can also call back to the host for file access, terminal execution, and permission requests.
+
 ### Daemon Transport (skeleton)
 
 `DaemonSession` connects to long-running HTTP/WebSocket agent daemons (OpenCode `serve`, OpenClaw). Not yet functional — API surface documented for future implementation.
 
 ## Features
 
-- **Single API for 4 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)`
+- **Single API for 5 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)` (Pipe) or `AcpSession::spawn(tool, cwd, options)` (ACP)
 - **Backwards-compatible `PipeSession`** — 0.1.x consumers that used `PipeSession::spawn(config, prompt, options)` compile unchanged
 - **SessionEnd synthesis** — Codex has no terminal event; gate4agent synthesizes `SessionEnd { result: "exit_code=N", is_error: N != 0 }` on child exit
 - **Transport-neutral events** — `AgentEvent::{Text, ToolStart, ToolResult, Thinking, TurnComplete, SessionStart, SessionEnd}`
 - **Cross-platform** — Windows (ConPTY + `cmd /C` argv wrapping) and Unix (POSIX PTY + bare exec)
 - **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
-- **Zero new dependencies** — gate4agent 0.2.1 removes dead fantasy transports without adding anything new
+- **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks
+- **5 CLI agents** — Claude Code, Codex, Gemini, OpenCode, Cursor
 
 ## Architecture
 
@@ -124,23 +160,30 @@ gate4agent/
 │   │   └── cli/         — claude.rs, codex.rs, gemini.rs, opencode.rs
 │   ├── pty/             — PtyWrapper, PtySession, VTE/screen parsers, per-CLI PTY parsers
 │   │   └── cli/         — Per-CLI PTY output parsers
-│   ├── rpc/             — Bidirectional JSON-RPC 2.0 protocol layer
-│   ├── daemon/         — DaemonSession, per-daemon adapters (OpenCode, OpenClaw) [skeleton]
+│   ├── acp/             — ACP transport: AcpSession, protocol types, reader loop, host handler
+│   │   ├── session.rs   — AcpSession::spawn(), prompt(), cancel(), kill()
+│   │   ├── protocol.rs  — ACP wire types (InitializeParams, SessionUpdate, ContentBlock)
+│   │   ├── reader.rs    — Blocking JSON-RPC reader loop
+│   │   ├── host.rs      — AcpHostHandler trait + DefaultAcpHandler
+│   │   └── spawn.rs     — AcpProcess + per-CLI spawn specs
+│   ├── rpc/             — Shared JSON-RPC 2.0 primitives (message, pending, handler, id)
+│   ├── daemon/         — DaemonSession, per-daemon adapters [skeleton]
 │   ├── history/         — Session history reader
 │   └── utils.rs         — String utilities
 ```
 
 ## Testing status
 
-| Tool | Pipe tested? | PTY tested? | Notes |
-|---|---|---|---|
-| **Claude Code** | ✓ live-verified (0.2.5) | ✗ untested | Full session: init → text → tokens → result |
-| **Codex** | ✓ live-verified (0.2.5) | ✗ untested | Full session: thread.started → item.completed → turn.completed |
-| **Gemini** | ✓ live-verified (0.2.6) | ✗ untested | Full session: init → text → result |
-| **OpenCode** | ✓ live-verified (0.2.6) | ✗ untested | Full session: text → step_finish. Parser rewritten from real output. |
+| Tool | Pipe | PTY | ACP | Notes |
+|---|---|---|---|---|
+| **Claude Code** | ✓ live (0.2.5) | ✗ | ✓ live (0.2.16) | Pipe: stream-json. ACP: via claude-agent-acp adapter |
+| **Codex** | ✓ live (0.2.5) | ✗ | ✓ live (0.2.16) | Pipe: --json. ACP: via codex-acp adapter |
+| **Gemini** | ✓ live (0.2.6) | ✗ | ✓ live (0.2.16) | Pipe: stream-json. ACP: native --experimental-acp |
+| **OpenCode** | ✓ live (0.2.6) | ✗ | ✓ live (0.2.16) | Pipe: --format json. ACP: native `opencode acp` |
+| **Cursor** | — | — | ✗ untested | ACP: native `cursor-agent agent acp`. Not installed on test machine. |
 
+All Pipe and ACP transports are live-verified against real CLI output.
 PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
-Pipe parsers for Claude, Codex, Gemini, and OpenCode are fully live-verified.
 
 ## Windows spawn strategy
 
@@ -156,12 +199,13 @@ Arguments are passed individually (not joined into a shell string) to avoid cmd.
 
 At least one CLI agent must be installed on the host. gate4agent does not install them.
 
-| CLI | Install |
-|---|---|
-| Claude Code | `npm install -g @anthropic-ai/claude-code` |
-| Codex | `npm install -g @openai/codex` |
-| Gemini | `npm install -g @google/gemini-cli` |
-| OpenCode | `npm install -g opencode-ai` (or see https://opencode.ai) |
+| CLI | Install | ACP mode |
+|---|---|---|
+| Claude Code | `npm install -g @anthropic-ai/claude-code` | via `npx @agentclientprotocol/claude-agent-acp` |
+| Codex | `npm install -g @openai/codex` | via `npx @zed-industries/codex-acp` |
+| Gemini | `npm install -g @google/gemini-cli` | native: `gemini --experimental-acp` |
+| OpenCode | `npm install -g opencode-ai` | native: `opencode acp` |
+| Cursor | Install Cursor IDE | native: `cursor-agent agent acp` |
 
 ## Versioning
 
@@ -179,6 +223,8 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.10** — Bidirectional JSON-RPC 2.0: RpcSession, HostHandler, MethodRouter. Agent→host requests, host→agent calls, fallback to legacy NDJSON parsing.
 - **0.2.11** — Critical bugfixes: stale transport_session cleared on exit, send_prompt() returns BrokenPipe instead of silent no-op, OpenCode emits SessionStart, Gemini skips non-JSON banners silently, history readers for Codex/Gemini/OpenCode
 - **0.2.12** — Test coverage: Gemini parser (14 tests), Claude parser (+8), builder argv parity (22 tests), PipeSession live test, RpcSession tests. README/DEBUGGING.md fixed. Examples added.
+- **0.2.13–0.2.15** — OpenCode default model, env sanitization, test cleanup, TermCell improvements
+- **0.2.16** — **ACP transport**: full Agent Client Protocol (JSON-RPC 2.0 over stdio) implementation. AcpSession with initialize + session/new handshake, multi-turn prompt(), session/update streaming, agent→host callbacks (fs, terminal, permissions). 5th CLI added: Cursor (via `cursor-agent agent acp`). Live-verified with Gemini, OpenCode, Claude, Codex. 199 unit tests.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

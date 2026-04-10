@@ -9,12 +9,9 @@
 //! ```
 //! Subsequent lines are `response_item` or other records.
 //!
-//! **Old layout**: flat `rollout-<timestamp>-<uuid>.json` files with a top-level
-//! `{"session":{...},"items":[...]}` structure (no `cwd` field).
-//!
-//! Project scoping: the new layout includes `cwd` in the `session_meta` header,
-//! so we filter by comparing `cwd` with `workdir`. Old-layout files have no `cwd`
-//! and are included unfiltered.
+//! **Old layout**: flat `rollout-<timestamp>-<uuid>.json` files (pre-v0.8, from 2025).
+//! These have no `cwd` field and cannot be scoped to a project, so they are skipped
+//! entirely when a workdir filter is active.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -60,8 +57,10 @@ impl HistoryReader for CodexHistoryReader {
 }
 
 /// Recursively collect sessions from `dir`, filtering new-layout `.jsonl` files
-/// by `workdir` via the `session_meta` header, and including all old-layout `.json`
-/// files unfiltered (they have no cwd).
+/// by `workdir` via the `session_meta` header.
+///
+/// Old-layout `.json` files (pre-v0.8, from 2025) contain no `cwd` field and
+/// cannot be scoped to a project, so they are skipped entirely.
 fn collect_sessions(dir: &Path, workdir: &Path, out: &mut Vec<SessionMeta>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -96,22 +95,9 @@ fn collect_sessions(dir: &Path, workdir: &Path, out: &mut Vec<SessionMeta>) {
                     });
                 }
             }
-        } else if ext == "json" {
-            // Old layout: no cwd available, include unfiltered.
-            // Read the file to extract the first real user message as preview.
-            let id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            if !id.is_empty() {
-                let preview = read_json_preview(&path);
-                // Exclude sessions with no real user messages (zombie / aborted).
-                if !preview.is_empty() {
-                    out.push(SessionMeta { id, timestamp: ts, preview });
-                }
-            }
         }
+        // Old-layout `.json` files (pre-v0.8) have no `cwd` field and cannot be
+        // scoped to a project — skip them entirely.
     }
 }
 
@@ -226,25 +212,6 @@ fn read_jsonl_meta(path: &Path) -> Option<(String, String, String)> {
     Some((session_id, cwd, preview))
 }
 
-/// Extract the first real user message preview from an old-layout `.json` file.
-///
-/// Parses the file with `parse_codex_session`, then walks the resulting messages
-/// to find the first `ChatRole::User` entry that is not injected system content.
-/// Returns an empty string when no real user message is found.
-fn read_json_preview(path: &Path) -> String {
-    let raw = match fs::read_to_string(path) {
-        Ok(r) => r,
-        Err(_) => return String::new(),
-    };
-    let messages = parse_codex_session(&raw);
-    for msg in messages {
-        if msg.role == ChatRole::User && !is_injected_system_content(&msg.content) {
-            return msg.content.chars().take(80).collect();
-        }
-    }
-    String::new()
-}
-
 /// Find a session file by its id (UUID) anywhere under `root`.
 fn find_session_file(root: &Path, session_id: &str) -> Option<std::path::PathBuf> {
     let entries = fs::read_dir(root).ok()?;
@@ -284,10 +251,13 @@ fn paths_match(a: &str, b: &Path) -> bool {
 /// Parse a new-layout Codex JSONL session file into chat messages.
 ///
 /// Two record types carry message content:
-/// - `event_msg` with `payload.type == "user_message"`: real user input (new format,
-///   Codex v0.118+). The text is in `payload.message`.
-/// - `response_item` with `payload.type == "message"`: assistant or legacy user
-///   messages (old format). Injected system context is filtered out.
+/// - `event_msg` with `payload.type == "user_message"`: canonical user input
+///   (Codex v0.93+). The text is in `payload.message`.
+/// - `response_item` with `payload.role == "assistant"`: agent responses.
+///
+/// `response_item` entries with `role == "user"` are skipped entirely — Codex
+/// v0.93+ echoes every user message as a `response_item` in addition to the
+/// `event_msg`, causing duplicates. The `event_msg` is the canonical source.
 fn parse_codex_jsonl(raw: &str) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     for line in raw.lines() {
@@ -322,7 +292,8 @@ fn parse_codex_jsonl(raw: &str) -> Vec<ChatMessage> {
             continue;
         }
 
-        // Old format: response_item.
+        // response_item: only emit assistant messages.
+        // User entries are skipped — Codex v0.93+ duplicates them from event_msg.
         if record_type != "response_item" {
             continue;
         }
@@ -330,6 +301,10 @@ fn parse_codex_jsonl(raw: &str) -> Vec<ChatMessage> {
             Some(p) => p,
             None => continue,
         };
+        // Skip user role — canonical source is event_msg (avoids duplicates).
+        if payload.get("role").and_then(|r| r.as_str()) == Some("user") {
+            continue;
+        }
         if let Some(msg) = extract_codex_item(payload) {
             out.push(msg);
         }
@@ -546,8 +521,12 @@ mod tests {
 
     #[test]
     fn parse_codex_jsonl_extracts_messages() {
+        // User message comes via event_msg (canonical since v0.93+).
+        // The response_item with role=user is the duplicate echo — it must be dropped.
         let raw = concat!(
             r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/p","first_message":"Hi"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"Hello","images":[]}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}}"#,
             "\n",
@@ -583,6 +562,8 @@ mod tests {
 
     #[test]
     fn parse_codex_jsonl_skips_injected_context() {
+        // Injected system context arrives as response_item with role=user — dropped
+        // by the user-role skip rule. Real user input arrives via event_msg only.
         let env_block = format!(
             "<environment_context><cwd>/home/user</cwd>{}</environment_context>",
             "x".repeat(600),
@@ -591,10 +572,10 @@ mod tests {
             "{}\n{}\n{}\n",
             r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/p"}}"#,
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text": env_block}]}}).to_string(),
-            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Real user message"}]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"Real user message","images":[]}}"#,
         );
         let msgs = parse_codex_jsonl(&raw);
-        // Only the real user message should appear; the injected block must be dropped.
+        // Only the real user message from event_msg should appear.
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Real user message");
     }

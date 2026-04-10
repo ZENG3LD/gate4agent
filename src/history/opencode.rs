@@ -1,11 +1,18 @@
 //! OpenCode session history reader.
 //!
-//! OpenCode (sst/opencode) stores sessions in `~/.opencode/` — either as a
-//! SQLite database or as JSON files depending on the version.  This reader
-//! attempts a best-effort scan of the directory and parses any JSON/JSONL
-//! session files it finds.  SQLite reading is not attempted (no SQLite
-//! dependency available); if the format is pure SQLite, sessions will remain
-//! unreadable until a SQLite reader is added.
+//! OpenCode (sst/opencode) stores sessions in a SQLite database:
+//! - macOS/Linux: `~/.local/share/opencode/opencode.db`
+//! - Windows: `%APPDATA%\opencode\opencode.db` or `%LOCALAPPDATA%\opencode\`
+//!
+//! The `sessions` table has a `directory` column (absolute path where the session
+//! was created) which enables project-scoped filtering.  SQLite reading is not
+//! attempted in this reader (no SQLite dependency); sessions remain unreadable in
+//! pure-SQLite installations.
+//!
+//! As a fallback, some older or custom OpenCode versions write flat JSON/JSONL
+//! session files under `~/.opencode/sessions/` or `~/.opencode/`.  These may
+//! contain a top-level `directory` field which is used for filtering when present.
+//! If the field is absent the session is included unfiltered.
 
 use std::fs;
 use std::path::Path;
@@ -17,7 +24,7 @@ use super::{HistoryReader, SessionMeta};
 pub struct OpenCodeHistoryReader;
 
 impl HistoryReader for OpenCodeHistoryReader {
-    fn list_sessions(&self, _workdir: &Path) -> Vec<SessionMeta> {
+    fn list_sessions(&self, workdir: &Path) -> Vec<SessionMeta> {
         let home = home_dir();
         // Try candidate directories where OpenCode may store sessions.
         for candidate in [
@@ -46,6 +53,12 @@ impl HistoryReader for OpenCodeHistoryReader {
                     .to_string();
                 if id.is_empty() {
                     continue;
+                }
+                // Filter by directory field if it can be read from the session.
+                if path.is_file() {
+                    if !session_matches_workdir(&path, workdir) {
+                        continue;
+                    }
                 }
                 let ts = entry
                     .metadata()
@@ -91,6 +104,46 @@ impl HistoryReader for OpenCodeHistoryReader {
         }
         Vec::new()
     }
+}
+
+/// Check whether a session file's `directory` field matches `workdir`.
+///
+/// Returns `true` if:
+/// - The file cannot be read or parsed (pass-through: we cannot filter).
+/// - The parsed JSON has no `directory` field (pass-through: unknown project).
+/// - The `directory` field matches `workdir` after path normalisation.
+///
+/// Returns `false` only if a `directory` field is present and does NOT match.
+fn session_matches_workdir(path: &Path, workdir: &Path) -> bool {
+    let raw = match fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return true, // cannot read → pass-through
+    };
+    // For JSONL files check the first line for a session header.
+    let text = if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+        raw.lines().next().unwrap_or("").to_string()
+    } else {
+        raw
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return true, // parse failure → pass-through
+    };
+    match v.get("directory").and_then(|d| d.as_str()) {
+        None => true, // field absent → pass-through
+        Some(dir) => paths_match(dir, workdir),
+    }
+}
+
+/// Compare a path string with a `Path`, normalising case and separators.
+fn paths_match(a: &str, b: &Path) -> bool {
+    if a.is_empty() {
+        return false;
+    }
+    let normalise = |s: &str| {
+        s.replace('\\', "/").to_lowercase().trim_end_matches('/').to_string()
+    };
+    normalise(a) == normalise(&b.to_string_lossy())
 }
 
 fn load_from_session_dir(dir: &Path) -> Vec<ChatMessage> {
@@ -268,5 +321,42 @@ mod tests {
         let msgs = parse_opencode_jsonl(raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "ok");
+    }
+
+    #[test]
+    fn session_matches_workdir_pass_through_on_no_field() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oc_test_no_dir.json");
+        // JSON with no "directory" field.
+        std::fs::write(&path, r#"{"messages":[]}"#).unwrap();
+        let workdir = std::path::Path::new("/some/project");
+        assert!(session_matches_workdir(&path, workdir));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn session_matches_workdir_filters_correctly() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oc_test_with_dir.json");
+        let json = r#"{"directory":"/home/user/myproject","messages":[]}"#;
+        std::fs::write(&path, json).unwrap();
+
+        let matching = std::path::Path::new("/home/user/myproject");
+        let other = std::path::Path::new("/home/user/other");
+
+        assert!(session_matches_workdir(&path, matching));
+        assert!(!session_matches_workdir(&path, other));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn paths_match_normalisation() {
+        assert!(paths_match(
+            r"C:\Users\Me\Project",
+            std::path::Path::new(r"c:\users\me\project"),
+        ));
+        assert!(paths_match("/home/me/project/", std::path::Path::new("/home/me/project")));
+        assert!(!paths_match("/a", std::path::Path::new("/b")));
+        assert!(!paths_match("", std::path::Path::new("/a")));
     }
 }

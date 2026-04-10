@@ -264,10 +264,12 @@ impl super::traits::CliCommandBuilder for OpenCodePipeBuilder {
             cmd.arg("--continue");
         }
 
-        if let Some(ref model) = opts.model {
-            cmd.arg("-m");
-            cmd.arg(model);
-        }
+        // Default to free opencode.ai model. The opencode/ prefix routes through
+        // OpenCode Zen which has its own auth — avoids picking up stray OPENAI_API_KEY
+        // from the system environment.
+        let model = opts.model.as_deref().unwrap_or("opencode/gpt-5-nano");
+        cmd.arg("-m");
+        cmd.arg(model);
 
         for arg in &opts.extra_args {
             cmd.arg(arg);

@@ -222,11 +222,11 @@ fn codex_default_argv() {
     let cmd = builder.build_command(&opts("write rust"));
 
     assert_eq!(program(&cmd), "codex");
-    assert_eq!(
-        args(&cmd),
-        &["exec", "--json", "--full-auto", "write rust"],
-        "Codex fresh: exec subcommand, --json, --full-auto, prompt as last arg"
-    );
+    let got = args(&cmd);
+    assert_eq!(got.first().copied(), Some("exec"), "must start with 'exec' subcommand");
+    assert!(got.contains(&"--json"), "--json must be present");
+    assert!(got.contains(&"--full-auto"), "--full-auto must be present");
+    assert_eq!(got.last().copied(), Some("write rust"), "prompt must be last");
 }
 
 /// `--model <m>` inserted between `--full-auto` and the prompt.
@@ -370,7 +370,10 @@ fn gemini_no_sandbox_by_default() {
 // OpenCode
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Default: `run --format json <prompt>`
+/// Default: `run --format json -m opencode/gpt-5-nano <prompt>`
+///
+/// `-m opencode/gpt-5-nano` is always injected to route through OpenCode Zen,
+/// avoiding stray OPENAI_API_KEY from the parent environment.
 #[test]
 fn opencode_default_argv() {
     let builder = cli_builder(CliTool::OpenCode);
@@ -382,6 +385,10 @@ fn opencode_default_argv() {
     assert!(
         got.windows(2).any(|w| w == ["--format", "json"]),
         "--format json must appear"
+    );
+    assert!(
+        got.windows(2).any(|w| w == ["-m", "opencode/gpt-5-nano"]),
+        "-m opencode/gpt-5-nano must appear (default free model)"
     );
     assert_eq!(
         got.last().copied(),

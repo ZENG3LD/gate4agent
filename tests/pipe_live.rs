@@ -158,11 +158,8 @@ fn pipe_live_opencode() {
         println!("[OpenCode] SKIPPED — opencode not found on PATH");
         return;
     }
-    // Use free built-in model to avoid API key requirements.
-    run_pipe_test(
-        CliTool::OpenCode,
-        vec!["-m".into(), "opencode/nemotron-3-super-free".into()],
-    );
+    // Default model is opencode/gpt-5-nano (free, via OpenCode Zen).
+    run_pipe_test(CliTool::OpenCode, vec![]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

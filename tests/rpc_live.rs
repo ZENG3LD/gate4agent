@@ -120,9 +120,6 @@ async fn rpc_live_gemini() {
 
 #[tokio::test]
 async fn rpc_live_opencode() {
-    // OpenCode with free built-in model — no API key needed.
-    run_rpc_test(CliTool::OpenCode, "opencode", PipeProcessOptions {
-        extra_args: vec!["-m".into(), "opencode/nemotron-3-super-free".into()],
-        ..Default::default()
-    }).await;
+    // Default model is opencode/gpt-5-nano (free, via OpenCode Zen).
+    run_rpc_test(CliTool::OpenCode, "opencode", PipeProcessOptions::default()).await;
 }

@@ -82,6 +82,7 @@ impl PipeProcess {
         for (key, value) in &spawn_opts.env_vars {
             cmd.env(key, value);
         }
+
         cmd.current_dir(working_dir);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());

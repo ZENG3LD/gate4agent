@@ -30,7 +30,6 @@ pub fn create_parser(tool: CliTool) -> Box<dyn OutputParser> {
         CliTool::Gemini => Box::new(GeminiOutputParser::new()),
         // Dedicated parser will be added after real CLI output capture.
         CliTool::OpenCode => Box::new(ClaudeOutputParser::new()),
-        CliTool::Cursor => panic!("Cursor uses ACP transport — use AcpSession::spawn, not PTY mode"),
     }
 }
 
@@ -45,7 +44,6 @@ pub fn create_submitter(tool: CliTool) -> Box<dyn PromptSubmitter> {
         CliTool::Gemini => Box::new(GeminiPromptSubmitter::new()),
         // Dedicated submitter will be added after real CLI output capture.
         CliTool::OpenCode => Box::new(ClaudePromptSubmitter::new()),
-        CliTool::Cursor => panic!("Cursor uses ACP transport — use AcpSession::spawn, not PTY mode"),
     }
 }
 

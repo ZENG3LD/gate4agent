@@ -45,11 +45,6 @@ pub(crate) fn acp_command(tool: CliTool) -> AcpSpawnSpec {
             args: &["acp"],
             npm_tool: false,
         },
-        CliTool::Cursor => AcpSpawnSpec {
-            program: "cursor-agent",
-            args: &["agent", "acp"],
-            npm_tool: false,
-        },
         CliTool::ClaudeCode => AcpSpawnSpec {
             program: "npx",
             args: &["-y", "@agentclientprotocol/claude-agent-acp"],
@@ -279,14 +274,6 @@ mod tests {
         let spec = acp_command(CliTool::OpenCode);
         assert_eq!(spec.program, "opencode");
         assert_eq!(spec.args, &["acp"]);
-        assert!(!spec.npm_tool);
-    }
-
-    #[test]
-    fn acp_command_cursor() {
-        let spec = acp_command(CliTool::Cursor);
-        assert_eq!(spec.program, "cursor-agent");
-        assert_eq!(spec.args, &["agent", "acp"]);
         assert!(!spec.npm_tool);
     }
 

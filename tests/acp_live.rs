@@ -129,8 +129,3 @@ async fn acp_live_codex() {
     run_acp_test(CliTool::Codex, "npx").await;
 }
 
-#[tokio::test]
-async fn acp_live_cursor() {
-    // Cursor has native ACP via `cursor-agent agent acp`.
-    run_acp_test(CliTool::Cursor, "cursor-agent").await;
-}

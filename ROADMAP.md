@@ -6,7 +6,7 @@ Living document. Current state + what's next. Updated per release.
 
 Shipped in 0.2.16:
 
-- **5 CLI tools**: Claude Code, Codex, Gemini, OpenCode, Cursor
+- **4 CLI tools**: Claude Code, Codex, Gemini, OpenCode
 - **Three transport classes**: Pipe, PTY, ACP (Agent Client Protocol)
 - **core/pty/pipe source layout**: clean separation — `core/` for types+errors, `pty/` for PTY transport + per-CLI screen parsers, `pipe/` for Pipe transport + per-CLI NDJSON parsers
 - **Research-based pipe parsers**: Codex, Gemini, OpenCode parsers rewritten from actual docs/source (not Claude-copy-paste)
@@ -18,7 +18,6 @@ Shipped in 0.2.16:
 - **SessionEnd synthesis**: guaranteed one `SessionEnd` per session regardless of CLI
 - **Transport-neutral `AgentEvent`**: `Text`, `ToolStart`, `ToolResult`, `Thinking`, `TurnComplete`, `SessionStart`, `SessionEnd`
 - **ACP transport** (0.2.16): `AcpSession` — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks (fs, terminal, permissions). Live-verified with all 4 native/adapter CLIs.
-- **Cursor** (0.2.16): 5th CLI tool, ACP-only via `cursor-agent agent acp`.
 
 What changed from 0.2.1 → 0.2.16:
 
@@ -31,7 +30,6 @@ What changed from 0.2.1 → 0.2.16:
 - **Codex pipe**: live-verified (0.2.5). **Codex ACP**: live-verified (0.2.16) via codex-acp adapter.
 - **Gemini pipe**: live-verified (0.2.6). **Gemini ACP**: live-verified (0.2.16) native `--experimental-acp`.
 - **OpenCode pipe**: live-verified (0.2.6). **OpenCode ACP**: live-verified (0.2.16) native `opencode acp`.
-- **Cursor ACP**: untested (not installed on test machine). Native `cursor-agent agent acp`.
 - **PTY**: structurally unchanged, low risk. Not formally tested.
 
 ## Next — 0.2.x patch line
@@ -45,8 +43,7 @@ Small, additive, non-breaking:
 - [x] **Bidirectional JSON-RPC 2.0** — done (0.2.10): RpcSession with HostHandler trait, MethodRouter, pending request tracking. ACP-compatible protocol layer.
 - [x] **Critical bugfixes** — done (0.2.11): stale session cleanup, stdin error visibility, OpenCode SessionStart synthesis, Gemini banner suppression, per-CLI history readers
 - [x] **ACP transport** — done (0.2.16): AcpSession with initialize + session/new handshake, multi-turn prompt(), session/update streaming, agent→host callbacks. Live-verified: Gemini, OpenCode, Claude, Codex.
-- [x] **Cursor support** — done (0.2.16): 5th CLI tool via `cursor-agent agent acp`. ACP-only.
-- [ ] **Cursor ACP live test** — needs cursor-agent installed to verify
+- [x] **Cursor support** — done (0.2.16), removed in 0.2.17: `cursor-agent` ships Linux/macOS only — `node_sqlite3.node` is a Linux ELF binary, crashes on Windows. No official Windows build.
 - [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
 - [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for OpenCode
 
@@ -82,7 +79,7 @@ If a real HTTP-based agent daemon API becomes available (e.g. an agent SDK that 
 - **Aider / Cline / Continue / Amp / Goose integration** — scope excluded by upstream user decision.
 - **Crush (`charmbracelet/crush`)** — no structured headless output, PTY-only, not worth the integration cost until it ships a structured mode. Track `charmbracelet/crush` issue #1030.
 - **Config-based auth / API keys** — out of scope. Each CLI handles its own auth; gate4agent just spawns.
-- **Cursor Pipe/PTY** — Cursor has no structured Pipe output. ACP-only via `cursor-agent agent acp` (added in 0.2.16).
+- **Cursor** — `cursor-agent` ships Linux/macOS only — `node_sqlite3.node` is a Linux ELF binary, crashes on Windows with "is not a valid Win32 application". No official Windows build. Community patch (gitcnd/cursor-agent-cli-windows) exists but is unofficial. Re-added in 0.2.16 for ACP, removed again in 0.2.17.
 
 ## Out-of-band projects that may feed back into gate4agent
 

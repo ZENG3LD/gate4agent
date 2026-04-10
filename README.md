@@ -1,6 +1,6 @@
 # gate4agent
 
-Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for five different CLI agents through one unified API.
+Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for four different CLI agents through one unified API.
 
 **Not a harness. Not a sandbox.** gate4agent is the thin wiring layer between your Rust app and the CLI agent's subprocess: spawn the binary, write the prompt, read structured events, resume by session id. That's it.
 
@@ -12,7 +12,6 @@ Universal Rust transport library for CLI AI agents. Spawn, stream, resume — fo
 | **Codex** | Pipe + PTY + ACP | ✓ `--json` | ✓ via `codex-acp` | ✓ `exec resume <id>` | Uses `--full-auto` for non-interactive |
 | **Gemini** | Pipe + PTY + ACP | ✓ stream-json | ✓ native `--experimental-acp` | ✓ `--resume <id>` | Prompt via `-p` flag |
 | **OpenCode** (`sst/opencode`) | Pipe + ACP | ✓ `--format json` | ✓ native `opencode acp` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
-| **Cursor** | ACP | — | ✓ native `cursor-agent agent acp` | — | ACP-only, no pipe/PTY |
 
 Transport classes:
 - **Pipe**: spawn the CLI directly, read NDJSON over stdout
@@ -139,14 +138,14 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 
 ## Features
 
-- **Single API for 5 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)` (Pipe) or `AcpSession::spawn(tool, cwd, options)` (ACP)
+- **Single API for 4 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)` (Pipe) or `AcpSession::spawn(tool, cwd, options)` (ACP)
 - **Backwards-compatible `PipeSession`** — 0.1.x consumers that used `PipeSession::spawn(config, prompt, options)` compile unchanged
 - **SessionEnd synthesis** — Codex has no terminal event; gate4agent synthesizes `SessionEnd { result: "exit_code=N", is_error: N != 0 }` on child exit
 - **Transport-neutral events** — `AgentEvent::{Text, ToolStart, ToolResult, Thinking, TurnComplete, SessionStart, SessionEnd}`
 - **Cross-platform** — Windows (ConPTY + `cmd /C` argv wrapping) and Unix (POSIX PTY + bare exec)
 - **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
 - **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks
-- **5 CLI agents** — Claude Code, Codex, Gemini, OpenCode, Cursor
+- **4 CLI agents** — Claude Code, Codex, Gemini, OpenCode
 
 ## Architecture
 
@@ -180,7 +179,6 @@ gate4agent/
 | **Codex** | ✓ live (0.2.5) | ✗ | ✓ live (0.2.16) | Pipe: --json. ACP: via codex-acp adapter |
 | **Gemini** | ✓ live (0.2.6) | ✗ | ✓ live (0.2.16) | Pipe: stream-json. ACP: native --experimental-acp |
 | **OpenCode** | ✓ live (0.2.6) | ✗ | ✓ live (0.2.16) | Pipe: --format json. ACP: native `opencode acp` |
-| **Cursor** | — | — | ✗ untested | ACP: native `cursor-agent agent acp`. Not installed on test machine. |
 
 All Pipe and ACP transports are live-verified against real CLI output.
 PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
@@ -205,7 +203,6 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 | Codex | `npm install -g @openai/codex` | via `npx @zed-industries/codex-acp` |
 | Gemini | `npm install -g @google/gemini-cli` | native: `gemini --experimental-acp` |
 | OpenCode | `npm install -g opencode-ai` | native: `opencode acp` |
-| Cursor | Install Cursor IDE | native: `cursor-agent agent acp` |
 
 ## Versioning
 
@@ -225,6 +222,7 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.12** — Test coverage: Gemini parser (14 tests), Claude parser (+8), builder argv parity (22 tests), PipeSession live test, RpcSession tests. README/DEBUGGING.md fixed. Examples added.
 - **0.2.13–0.2.15** — OpenCode default model, env sanitization, test cleanup, TermCell improvements
 - **0.2.16** — **ACP transport**: full Agent Client Protocol (JSON-RPC 2.0 over stdio) implementation. AcpSession with initialize + session/new handshake, multi-turn prompt(), session/update streaming, agent→host callbacks (fs, terminal, permissions). 5th CLI added: Cursor (via `cursor-agent agent acp`). Live-verified with Gemini, OpenCode, Claude, Codex. 199 unit tests.
+- **0.2.17** — Cursor removed again (no Windows binary: `node_sqlite3.node` is a Linux ELF, crashes on Windows with "is not a valid Win32 application"; no official Windows build exists). 4 CLI tools remain: Claude Code, Codex, Gemini, OpenCode.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

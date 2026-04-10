@@ -117,8 +117,6 @@ impl PtyWrapper {
                 // OpenCode PTY integration will be added once
                 // its invocation shape is confirmed via live capture.
                 CliTool::OpenCode => "opencode",
-                // Cursor uses ACP transport — PTY mode is not supported.
-                CliTool::Cursor => panic!("Cursor uses ACP transport — use AcpSession::spawn, not PTY mode"),
             };
             let mut c = CommandBuilder::new("cmd");
             c.args(["/Q", "/K", tool_name]);
@@ -132,8 +130,6 @@ impl PtyWrapper {
                 // OpenCode PTY integration will be added once
                 // its invocation shape is confirmed via live capture.
                 CliTool::OpenCode => CommandBuilder::new("opencode"),
-                // Cursor uses ACP transport — PTY mode is not supported.
-                CliTool::Cursor => panic!("Cursor uses ACP transport — use AcpSession::spawn, not PTY mode"),
             }
         };
 

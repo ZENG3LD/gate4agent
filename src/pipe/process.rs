@@ -79,6 +79,9 @@ impl PipeProcess {
     ) -> Result<Self, std::io::Error> {
         let spawn_opts = Self::pipe_options_to_spawn_opts(tool, initial_prompt, &options, working_dir);
         let mut cmd = Self::build_command_with_options(tool, &spawn_opts);
+        for (key, value) in &spawn_opts.env_vars {
+            cmd.env(key, value);
+        }
         cmd.current_dir(working_dir);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());

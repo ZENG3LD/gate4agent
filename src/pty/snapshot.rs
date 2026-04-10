@@ -51,6 +51,14 @@ pub struct TermCell {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub bold: bool,
+    /// `true` when the cell's background is the terminal's default color
+    /// (vt100::Color::Default), not an explicit ANSI color.
+    /// Consumers should treat `bg_is_default == true` as transparent
+    /// (use the panel's themed background instead of `self.bg`).
+    pub bg_is_default: bool,
+    /// Display width of the character (1 for normal, 2 for wide CJK/emoji).
+    /// Continuation cells (right half of a wide char) have `width: 0`.
+    pub width: u8,
 }
 
 impl Default for TermCell {
@@ -60,6 +68,8 @@ impl Default for TermCell {
             fg: [204, 204, 204],
             bg: [0, 0, 0],
             bold: false,
+            bg_is_default: true,
+            width: 1,
         }
     }
 }

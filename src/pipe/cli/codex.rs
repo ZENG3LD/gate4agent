@@ -315,6 +315,7 @@ impl super::traits::CliCommandBuilder for CodexPipeBuilder {
 
         cmd.arg("--json");
         cmd.arg("--full-auto");
+        cmd.arg("--skip-git-repo-check");
 
         if let Some(ref model) = opts.model {
             cmd.arg("--model");

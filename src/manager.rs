@@ -110,6 +110,28 @@ fn vt100_color_to_rgb(color: vt100::Color, default_rgb: [u8; 3]) -> [u8; 3] {
     }
 }
 
+/// Heuristic: is the character a wide (fullwidth) display char?
+fn is_wide_char(c: char) -> bool {
+    let cp = c as u32;
+    // CJK Unified Ideographs
+    (0x4E00..=0x9FFF).contains(&cp)
+    // CJK Extension A
+    || (0x3400..=0x4DBF).contains(&cp)
+    // CJK Compatibility Ideographs
+    || (0xF900..=0xFAFF).contains(&cp)
+    // Fullwidth Forms
+    || (0xFF01..=0xFF60).contains(&cp)
+    || (0xFFE0..=0xFFE6).contains(&cp)
+    // CJK Extension B+
+    || (0x20000..=0x2FA1F).contains(&cp)
+    // Hangul Syllables
+    || (0xAC00..=0xD7AF).contains(&cp)
+    // Emoji (common ranges)
+    || (0x1F300..=0x1F9FF).contains(&cp)
+    || (0x1FA00..=0x1FA6F).contains(&cp)
+    || (0x1FA70..=0x1FAFF).contains(&cp)
+}
+
 fn ansi_idx_to_rgb(idx: u8) -> [u8; 3] {
     const STANDARD_16: [[u8; 3]; 16] = [
         [0, 0, 0],
@@ -1140,6 +1162,13 @@ impl MultiCliManager {
                     let fg = vt100_color_to_rgb(cell.fgcolor(), [204, 204, 204]);
                     let bg = vt100_color_to_rgb(cell.bgcolor(), [0, 0, 0]);
                     let contents = cell.contents();
+                    let bg_is_default = cell.bgcolor() == vt100::Color::Default;
+                    let width = if contents.is_empty() {
+                        0 // continuation cell (right half of wide char) or truly empty
+                    } else {
+                        let first = contents.chars().next().unwrap_or(' ');
+                        if is_wide_char(first) { 2 } else { 1 }
+                    };
                     grid.cells[row as usize][col as usize] = TermCell {
                         ch: if contents.is_empty() {
                             " ".to_string()
@@ -1149,6 +1178,8 @@ impl MultiCliManager {
                         fg,
                         bg,
                         bold: cell.bold(),
+                        bg_is_default,
+                        width,
                     };
                 }
             }
@@ -1218,6 +1249,13 @@ impl MultiCliManager {
                         let fg = vt100_color_to_rgb(cell.fgcolor(), [204, 204, 204]);
                         let bg = vt100_color_to_rgb(cell.bgcolor(), [0, 0, 0]);
                         let contents = cell.contents();
+                        let bg_is_default = cell.bgcolor() == vt100::Color::Default;
+                        let width = if contents.is_empty() {
+                            0 // continuation cell (right half of wide char) or truly empty
+                        } else {
+                            let first = contents.chars().next().unwrap_or(' ');
+                            if is_wide_char(first) { 2 } else { 1 }
+                        };
                         grid.cells[row as usize][col as usize] = TermCell {
                             ch: if contents.is_empty() {
                                 " ".to_string()
@@ -1227,6 +1265,8 @@ impl MultiCliManager {
                             fg,
                             bg,
                             bold: cell.bold(),
+                            bg_is_default,
+                            width,
                         };
                     }
                 }

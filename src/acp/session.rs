@@ -25,10 +25,11 @@ use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcNotification, RpcRequest};
 use crate::rpc::pending::PendingRequests;
 
-use super::host::{AcpHostAdapter, AcpHostHandler, DefaultAcpHandler};
+use super::host::{AcpHostAdapter, AcpHostHandler, FilesystemAcpHandler};
 use super::protocol::{
-    AgentCapabilities, ClientCapabilities, ClientInfo, ContentBlock, FsCapabilities,
-    InitializeParams, SessionCancelParams, SessionNewParams, SessionPromptParams,
+    extract_token_usage, AgentCapabilities, ClientCapabilities, ClientInfo, ContentBlock,
+    FsCapabilities, InitializeParams, McpServerConfig, SessionCancelParams, SessionLoadParams,
+    SessionLoadResult, SessionNewParams, SessionPromptParams,
 };
 use super::reader::acp_reader_loop;
 use super::spawn::AcpProcess;
@@ -83,7 +84,7 @@ pub enum AcpError {
 
 /// Options for constructing an [`AcpSession`].
 pub struct AcpSessionOptions {
-    /// Handler for agent → host requests. Default: [`DefaultAcpHandler`].
+    /// Handler for agent → host requests. Default: [`FilesystemAcpHandler`] with no root restrictions.
     pub host_handler: Option<Box<dyn AcpHostHandler>>,
 
     /// Broadcast channel capacity. Default: 256.
@@ -94,6 +95,9 @@ pub struct AcpSessionOptions {
 
     /// Timeout for `session/prompt` calls. Default: 120 s.
     pub prompt_timeout: Duration,
+
+    /// MCP servers to pass to the agent on session creation. Default: empty.
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 impl Default for AcpSessionOptions {
@@ -103,6 +107,7 @@ impl Default for AcpSessionOptions {
             channel_capacity: 256,
             handshake_timeout: Duration::from_secs(30),
             prompt_timeout: Duration::from_secs(120),
+            mcp_servers: vec![],
         }
     }
 }
@@ -129,6 +134,8 @@ pub struct AcpSession {
     id_gen: Arc<IdGen>,
     reader_task: JoinHandle<()>,
     prompt_timeout: Duration,
+    /// Capabilities reported by the agent during `initialize`.
+    agent_caps: AgentCapabilities,
 }
 
 impl AcpSession {
@@ -146,6 +153,10 @@ impl AcpSession {
         working_dir: &std::path::Path,
         options: AcpSessionOptions,
     ) -> Result<Self, AcpError> {
+        // Extract mcp_servers before options fields are partially consumed below.
+        let mcp_servers = options.mcp_servers;
+        let options = AcpSessionOptions { mcp_servers: vec![], ..options };
+
         let proc = AcpProcess::spawn(tool, working_dir, &[])
             .map_err(|e| AcpError::Spawn { source: e })?;
 
@@ -162,7 +173,7 @@ impl AcpSession {
         // Build the HostHandler for the reader loop.
         let handler: Arc<dyn crate::rpc::handler::HostHandler> = match options.host_handler {
             Some(h) => Arc::new(AcpHostAdapter(Arc::from(h))),
-            None => Arc::new(AcpHostAdapter(Arc::new(DefaultAcpHandler))),
+            None => Arc::new(AcpHostAdapter(Arc::new(FilesystemAcpHandler { allowed_roots: None }))),
         };
 
         let pending = PendingRequests::new();
@@ -179,7 +190,7 @@ impl AcpSession {
 
         let acp_session_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
 
-        let session = Self {
+        let mut session = Self {
             local_session_id: local_session_id.clone(),
             acp_session_id: Arc::clone(&acp_session_id),
             tool,
@@ -189,6 +200,7 @@ impl AcpSession {
             id_gen,
             reader_task,
             prompt_timeout: options.prompt_timeout,
+            agent_caps: AgentCapabilities::default(),
         };
 
         // --- Handshake step 1: initialize (id=0 per ACP convention) ---
@@ -204,7 +216,7 @@ impl AcpSession {
                 version: env!("CARGO_PKG_VERSION"),
             },
         };
-        let _caps: AgentCapabilities = session
+        let caps: AgentCapabilities = session
             .rpc_call_typed("initialize", json!(init_params), options.handshake_timeout, true)
             .await
             .map_err(|e| match e {
@@ -214,11 +226,12 @@ impl AcpSession {
                 },
                 other => other,
             })?;
+        session.agent_caps = caps;
 
         // --- Handshake step 2: session/new ---
         let new_params = SessionNewParams {
             cwd: working_dir.to_str().unwrap_or(".").to_string(),
-            mcp_servers: vec![],
+            mcp_servers,
         };
         let new_result = session
             .rpc_call("session/new", Some(json!(new_params)), options.handshake_timeout)
@@ -285,10 +298,8 @@ impl AcpSession {
             .and_then(|v| v.as_str())
             .unwrap_or("end_turn")
             .to_owned();
-        let _ = self.tx.send(AgentEvent::TurnComplete {
-            input_tokens: 0,
-            output_tokens: 0,
-        });
+        let (input_tokens, output_tokens) = extract_token_usage(&result);
+        let _ = self.tx.send(AgentEvent::TurnComplete { input_tokens, output_tokens });
         let _ = self.tx.send(AgentEvent::SessionEnd {
             result: stop_reason,
             cost_usd: None,
@@ -347,6 +358,48 @@ impl AcpSession {
         })
         .await
         .map_err(|_| AgentError::Pty("spawn_blocking panicked".into()))?
+    }
+
+    /// Whether this agent supports session resumption via `session/load`.
+    pub fn supports_load_session(&self) -> bool {
+        self.agent_caps.agent_capabilities.load_session
+    }
+
+    /// Resume a prior ACP session by replaying its history.
+    ///
+    /// Sends `session/load` with `prior_session_id`. On success, updates the
+    /// stored `acp_session_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`AcpError::HandshakeFailed`] — agent does not advertise `loadSession` capability
+    /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
+    /// - [`AcpError::Agent`] — agent returned an RPC error
+    pub async fn load_session(&self, prior_session_id: &str) -> Result<(), AcpError> {
+        if !self.supports_load_session() {
+            return Err(AcpError::HandshakeFailed {
+                message: "agent does not support loadSession".to_string(),
+            });
+        }
+
+        let params = SessionLoadParams { session_id: prior_session_id.to_owned() };
+
+        let result: SessionLoadResult = self
+            .rpc_call_typed("session/load", json!(params), self.prompt_timeout, false)
+            .await?;
+
+        let new_sid = if result.session_id.is_empty() {
+            prior_session_id.to_owned()
+        } else {
+            result.session_id
+        };
+
+        {
+            let mut guard = self.acp_session_id.lock().await;
+            *guard = Some(new_sid);
+        }
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -460,5 +513,6 @@ mod tests {
         assert_eq!(opts.handshake_timeout, Duration::from_secs(30));
         assert_eq!(opts.prompt_timeout, Duration::from_secs(120));
         assert!(opts.host_handler.is_none());
+        assert!(opts.mcp_servers.is_empty(), "default mcp_servers must be empty");
     }
 }

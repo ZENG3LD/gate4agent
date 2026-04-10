@@ -313,6 +313,7 @@ fn codex_fresh_session_argv() {
             "exec",
             "--json",
             "--full-auto",
+            "--skip-git-repo-check",
             "write a hello world in rust",
         ],
         "Codex fresh: exec subcommand, --json, --full-auto, then prompt as final arg"
@@ -340,6 +341,7 @@ fn codex_with_resume_argv() {
             "rollout-20260409-abc",
             "--json",
             "--full-auto",
+            "--skip-git-repo-check",
             "continue",
         ],
         "Codex resume: exec resume <id> sub-sub-command, then flags, then prompt"

@@ -36,4 +36,5 @@ pub(crate) mod reader;
 pub(crate) mod spawn;
 
 pub use host::{AcpHostHandler, DefaultAcpHandler};
+pub use protocol::McpServerConfig;
 pub use session::{AcpError, AcpSession, AcpSessionOptions};

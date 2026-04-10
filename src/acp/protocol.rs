@@ -59,12 +59,32 @@ pub struct ClientInfo {
     pub version: &'static str,
 }
 
+/// A single MCP server entry for `session/new`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "lowercase")]
+pub enum McpServerConfig {
+    /// stdio-based MCP server launched as a subprocess.
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+    },
+    /// SSE-based MCP server at a URL.
+    Sse {
+        url: String,
+        #[serde(default)]
+        headers: std::collections::HashMap<String, String>,
+    },
+}
+
 /// `session/new` request params.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionNewParams {
     pub cwd: String,
     #[serde(rename = "mcpServers", default)]
-    pub mcp_servers: Vec<serde_json::Value>,
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 /// A content block in a `session/prompt` request.
@@ -87,6 +107,20 @@ pub struct SessionPromptParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionCancelParams {
     #[serde(rename = "sessionId")]
+    pub session_id: String,
+}
+
+/// `session/load` request params (host → agent).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionLoadParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+}
+
+/// `session/load` response result (agent → host).
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct SessionLoadResult {
+    #[serde(rename = "sessionId", default)]
     pub session_id: String,
 }
 
@@ -147,6 +181,12 @@ pub enum SessionUpdate {
     Stop {
         #[serde(rename = "stopReason", default)]
         stop_reason: String,
+        #[serde(rename = "inputTokens", default)]
+        input_tokens: u64,
+        #[serde(rename = "outputTokens", default)]
+        output_tokens: u64,
+        #[serde(default)]
+        usage: Option<Value>,
     },
     #[serde(other)]
     Unknown,
@@ -175,6 +215,14 @@ pub struct PermissionRequestParams {
     pub description: String,
     #[serde(rename = "sessionId")]
     pub session_id: String,
+}
+
+/// `terminal/write` request params (agent → host).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminalWriteParams {
+    #[serde(rename = "terminalId")]
+    pub terminal_id: String,
+    pub input: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +274,46 @@ pub struct AgentInfo {
 // ---------------------------------------------------------------------------
 // update_to_event
 // ---------------------------------------------------------------------------
+
+/// Extract token counts from a raw ACP response value.
+///
+/// Tries multiple known shapes:
+/// 1. ACP canonical camelCase: `{"inputTokens": N, "outputTokens": N}`
+/// 2. Claude-nested usage: `{"usage": {"input_tokens": N, "output_tokens": N}}`
+/// 3. Gemini-nested stats: `{"stats": {"input_tokens": N, "output_tokens": N}}`
+///
+/// Returns `(0, 0)` if nothing matches.
+pub(crate) fn extract_token_usage(v: &Value) -> (u64, u64) {
+    // 1. Top-level camelCase (ACP canonical)
+    if let (Some(i), Some(o)) = (
+        v.get("inputTokens").and_then(|x| x.as_u64()),
+        v.get("outputTokens").and_then(|x| x.as_u64()),
+    ) {
+        return (i, o);
+    }
+
+    // 2. Nested under "usage" (Claude ACP)
+    if let Some(usage) = v.get("usage") {
+        if let (Some(i), Some(o)) = (
+            usage.get("input_tokens").and_then(|x| x.as_u64()),
+            usage.get("output_tokens").and_then(|x| x.as_u64()),
+        ) {
+            return (i, o);
+        }
+    }
+
+    // 3. Nested under "stats" (Gemini ACP)
+    if let Some(stats) = v.get("stats") {
+        if let (Some(i), Some(o)) = (
+            stats.get("input_tokens").and_then(|x| x.as_u64()),
+            stats.get("output_tokens").and_then(|x| x.as_u64()),
+        ) {
+            return (i, o);
+        }
+    }
+
+    (0, 0)
+}
 
 /// Extract text from a content value that may be:
 /// - A single object `{"type": "text", "text": "..."}` (Gemini ACP)
@@ -301,9 +389,17 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
             }]
         }
 
-        SessionUpdate::Stop { stop_reason } => {
+        SessionUpdate::Stop { stop_reason, input_tokens, output_tokens, usage } => {
+            // Prefer direct fields; fall back to the usage sub-object.
+            let (tok_in, tok_out) = if *input_tokens > 0 || *output_tokens > 0 {
+                (*input_tokens, *output_tokens)
+            } else if let Some(u) = usage {
+                extract_token_usage(u)
+            } else {
+                (0, 0)
+            };
             vec![
-                AgentEvent::TurnComplete { input_tokens: 0, output_tokens: 0 },
+                AgentEvent::TurnComplete { input_tokens: tok_in, output_tokens: tok_out },
                 AgentEvent::SessionEnd {
                     result: stop_reason.clone(),
                     cost_usd: None,
@@ -426,11 +522,40 @@ mod tests {
 
     #[test]
     fn update_to_event_stop_emits_two_events() {
-        let p = make_update(SessionUpdate::Stop { stop_reason: "end_turn".to_string() });
+        let p = make_update(SessionUpdate::Stop {
+            stop_reason: "end_turn".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            usage: None,
+        });
         let events = update_to_event(&p);
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], AgentEvent::TurnComplete { .. }));
         assert!(matches!(&events[1], AgentEvent::SessionEnd { is_error: false, .. }));
+    }
+
+    #[test]
+    fn extract_token_usage_acp_canonical() {
+        let v = json!({"inputTokens": 10, "outputTokens": 5});
+        assert_eq!(extract_token_usage(&v), (10, 5));
+    }
+
+    #[test]
+    fn extract_token_usage_claude_nested() {
+        let v = json!({"usage": {"input_tokens": 10, "output_tokens": 5}});
+        assert_eq!(extract_token_usage(&v), (10, 5));
+    }
+
+    #[test]
+    fn extract_token_usage_gemini_nested() {
+        let v = json!({"stats": {"input_tokens": 10, "output_tokens": 5}});
+        assert_eq!(extract_token_usage(&v), (10, 5));
+    }
+
+    #[test]
+    fn extract_token_usage_missing() {
+        let v = json!({});
+        assert_eq!(extract_token_usage(&v), (0, 0));
     }
 
     #[test]
@@ -503,5 +628,78 @@ mod tests {
         assert!(s.contains("\"prompt\""), "must have prompt field");
         assert!(s.contains("\"type\":\"text\""), "content block must have type=text");
         assert!(s.contains("\"text\":\"hello\""), "must have text content");
+    }
+
+    #[test]
+    fn session_load_params_serialize() {
+        let p = SessionLoadParams { session_id: "prior-session-123".to_string() };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"sessionId\""), "must use sessionId");
+        assert!(s.contains("prior-session-123"), "must contain the session id value");
+
+        // Round-trip
+        let p2: SessionLoadParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(p2.session_id, "prior-session-123");
+    }
+
+    #[test]
+    fn session_load_result_deserialize_with_session_id() {
+        let raw = r#"{"sessionId":"new-session-456"}"#;
+        let r: SessionLoadResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.session_id, "new-session-456");
+    }
+
+    #[test]
+    fn session_load_result_deserialize_without_session_id() {
+        // Agent may omit sessionId — should default to empty string
+        let raw = r#"{}"#;
+        let r: SessionLoadResult = serde_json::from_str(raw).unwrap();
+        assert!(r.session_id.is_empty());
+    }
+
+    #[test]
+    fn mcp_server_config_stdio_serialize() {
+        let cfg = McpServerConfig::Stdio {
+            command: "my-mcp-server".to_string(),
+            args: vec!["--port".to_string(), "8080".to_string()],
+            env: std::collections::HashMap::new(),
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        assert!(s.contains(r#""transport":"stdio""#), "must tag as stdio");
+        assert!(s.contains("my-mcp-server"), "must contain command");
+    }
+
+    #[test]
+    fn mcp_server_config_sse_serialize() {
+        let cfg = McpServerConfig::Sse {
+            url: "https://example.com/mcp".to_string(),
+            headers: std::collections::HashMap::new(),
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        assert!(s.contains(r#""transport":"sse""#), "must tag as sse");
+        assert!(s.contains("https://example.com/mcp"), "must contain url");
+    }
+
+    #[test]
+    fn mcp_server_config_roundtrip() {
+        let original = McpServerConfig::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()],
+            env: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("HOME".to_string(), "/home/user".to_string());
+                m
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: McpServerConfig = serde_json::from_str(&json).unwrap();
+        match decoded {
+            McpServerConfig::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args, vec!["-y", "@modelcontextprotocol/server-filesystem"]);
+                assert_eq!(env.get("HOME").map(String::as_str), Some("/home/user"));
+            }
+            McpServerConfig::Sse { .. } => panic!("expected Stdio variant"),
+        }
     }
 }

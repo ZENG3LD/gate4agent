@@ -5,7 +5,7 @@
 //! - Host handler for agent → host requests (fs, terminal, permissions)
 //! - Structured session/update streaming
 //!
-//! Run: cargo run --example rpc_hello
+//! Run: cargo run --example acp_hello
 //!
 //! Requires `claude` CLI installed, authenticated, and the ACP adapter:
 //!   npx @agentclientprotocol/claude-agent-acp

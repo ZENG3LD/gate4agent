@@ -21,22 +21,17 @@ Transport classes:
 ## Quick start
 
 ```rust
-use gate4agent::{TransportSession, SpawnOptions, CliTool, AgentEvent};
+use gate4agent::{CliTool, SessionConfig, AgentEvent, PipeSession, PipeProcessOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opts = SpawnOptions {
+    let config = SessionConfig {
+        tool: CliTool::ClaudeCode,
         working_dir: std::env::current_dir()?,
-        prompt: "Say hello in 3 words".into(),
-        ..Default::default()
+        env_vars: vec![],
+        name: None,
     };
-
-    let session = TransportSession::spawn(
-        CliTool::ClaudeCode,
-        &opts.working_dir.clone(),
-        &opts.prompt.clone(),
-        opts,
-    ).await?;
+    let session = PipeSession::spawn(config, "Say hello in 3 words", PipeProcessOptions::default()).await?;
 
     let mut rx = session.subscribe();
     while let Ok(event) = rx.recv().await {
@@ -156,10 +151,10 @@ gate4agent/
 
 | Tool | Pipe | PTY | ACP | Notes |
 |---|---|---|---|---|
-| **Claude Code** | ✓ live (0.2.5) | ✗ | ✓ live (0.2.16) | Pipe: stream-json. ACP: via claude-agent-acp adapter |
-| **Codex** | ✓ live (0.2.5) | ✗ | ✓ live (0.2.16) | Pipe: --json. ACP: via codex-acp adapter |
-| **Gemini** | ✓ live (0.2.6) | ✗ | ✓ live (0.2.16) | Pipe: stream-json. ACP: native --experimental-acp |
-| **OpenCode** | ✓ live (0.2.6) | ✗ | ✓ live (0.2.16) | Pipe: --format json. ACP: native `opencode acp` |
+| **Claude Code** | ✓ live | ✗ | ✓ live | Pipe: stream-json. ACP: via claude-agent-acp adapter |
+| **Codex** | ✓ live | ✗ | ✓ live | Pipe: --json. ACP: via codex-acp adapter |
+| **Gemini** | ✓ live | ✗ | ✓ live | Pipe: stream-json. ACP: native --experimental-acp |
+| **OpenCode** | ✓ live | ✗ | ✓ live | Pipe: --format json. ACP: native `opencode acp` |
 
 All Pipe and ACP transports are live-verified against real CLI output.
 PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.

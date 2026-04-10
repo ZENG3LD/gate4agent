@@ -2,9 +2,13 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.19 (April 2026)
+## Current — 0.2.20 (April 2026)
 
-Shipped in 0.2.19:
+### Shipped in 0.2.20
+
+- **workdir scoping for Codex, Gemini, OpenCode history readers**: session history is now scoped to the working directory, preventing cross-project session pollution in multi-repo setups.
+
+### Shipped in 0.2.19
 
 - **RpcSession removed**: standalone RPC transport was a pre-ACP intermediate step. ACP does everything RpcSession did (bidirectional JSON-RPC 2.0, host handlers, multi-turn sessions) but follows the standard Agent Client Protocol. Shared `rpc/` primitives (message, pending, handler, id) retained for ACP internal use.
 

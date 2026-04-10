@@ -923,6 +923,7 @@ impl MultiCliManager {
         }
 
         // Drain Pipe events
+        let mut clear_pipe_rx = false;
         if let Some(ref mut rx) = inst.pipe_rx {
             loop {
                 match rx.try_recv() {
@@ -1032,10 +1033,21 @@ impl MultiCliManager {
                                     });
                                 }
                                 inst.live_status = LiveStatus::Idle;
+                                // Clear stale transport handle on session end so that the
+                                // next prompt correctly re-spawns instead of calling into a
+                                // finished process.  We can't assign inst.pipe_rx here
+                                // because it is borrowed by `rx` — set a flag instead.
+                                inst.transport_session = None;
+                                clear_pipe_rx = true;
                             }
                             AgentEvent::Exited { .. } => {
                                 inst.session_active = false;
                                 inst.live_status = LiveStatus::Idle;
+                                // Clear the transport handle so the next send_chat_instance
+                                // correctly goes through the spawn branch instead of calling
+                                // send_prompt() on a dead process (which silently discards).
+                                inst.transport_session = None;
+                                clear_pipe_rx = true;
                             }
                             _ => {}
                         }
@@ -1048,6 +1060,10 @@ impl MultiCliManager {
                     Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
                 }
             }
+        }
+        // Apply deferred pipe_rx clear now that the borrow of inst.pipe_rx is gone.
+        if clear_pipe_rx {
+            inst.pipe_rx = None;
         }
 
         had_events

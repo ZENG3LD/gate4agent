@@ -249,12 +249,22 @@ impl PipeProcess {
     }
 
     /// Write input to the process stdin.
+    ///
+    /// Returns `BrokenPipe` if stdin is closed (all supported CLIs are one-shot:
+    /// Claude reads prompt from stdin then closes; Codex/Gemini/OpenCode take the
+    /// prompt as argv and never open stdin at all). Callers should use
+    /// `resume_session_id` to continue a prior session rather than writing again.
     pub fn write(&mut self, data: &str) -> Result<(), std::io::Error> {
         if let Some(stdin) = &mut self.stdin {
             stdin.write_all(data.as_bytes())?;
             stdin.flush()?;
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdin is closed — process is one-shot, use resume_session_id to continue",
+            ))
         }
-        Ok(())
     }
 
     /// Check if the process is still running.

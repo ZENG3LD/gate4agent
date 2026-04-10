@@ -7,6 +7,9 @@ use std::path::Path;
 use crate::pty::snapshot::{AgentCli, ChatMessage};
 
 pub mod claude;
+pub mod codex;
+pub mod gemini;
+pub mod opencode;
 
 pub use claude::invalidate_projects_dir_cache;
 
@@ -32,21 +35,15 @@ pub trait HistoryReader {
     }
 }
 
-/// Get a reader for the given CLI. All except Claude are stub readers (return empty).
+/// Get a reader for the given CLI.
 ///
-/// OpenCode history reading will be implemented once its on-disk session
-/// storage layout is confirmed.
+/// Returns a best-effort reader for each CLI. Non-Claude readers attempt to
+/// locate session files on disk but return empty vecs if none are found.
 pub fn reader_for(cli: AgentCli) -> Box<dyn HistoryReader> {
     match cli {
         AgentCli::Claude => Box::new(claude::ClaudeHistoryReader),
-        AgentCli::Codex
-        | AgentCli::Gemini
-        | AgentCli::OpenCode => Box::new(StubReader),
+        AgentCli::Codex => Box::new(codex::CodexHistoryReader),
+        AgentCli::Gemini => Box::new(gemini::GeminiHistoryReader),
+        AgentCli::OpenCode => Box::new(opencode::OpenCodeHistoryReader),
     }
-}
-
-struct StubReader;
-impl HistoryReader for StubReader {
-    fn list_sessions(&self, _: &Path) -> Vec<SessionMeta> { Vec::new() }
-    fn load_session(&self, _: &Path, _: &str) -> Vec<ChatMessage> { Vec::new() }
 }

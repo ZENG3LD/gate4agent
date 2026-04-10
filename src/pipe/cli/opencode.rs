@@ -91,8 +91,12 @@ impl NdjsonParser for OpenCodeNdjsonParser {
             }
         };
 
+        let mut events = Vec::new();
+
         // Track session ID whenever it appears in any line.
         // OpenCode emits "sessionID" (camelCase); accept legacy "session_id" as fallback.
+        // On the FIRST line that carries a session ID, synthesize a SessionStart event so
+        // that pipe_session_id is populated in the manager and resume works correctly.
         if self.session_id.is_none() {
             let sid = v
                 .get("sessionID")
@@ -100,10 +104,14 @@ impl NdjsonParser for OpenCodeNdjsonParser {
                 .and_then(|s| s.as_str());
             if let Some(sid) = sid {
                 self.session_id = Some(sid.to_string());
+                events.push(CliEvent::SessionStart {
+                    session_id: sid.to_string(),
+                    // OpenCode doesn't report the model name in streaming events.
+                    model: String::new(),
+                    tools: vec![],
+                });
             }
         }
-
-        let mut events = Vec::new();
 
         match v.get("type").and_then(|t| t.as_str()) {
             Some("tool_use") => {
@@ -281,8 +289,15 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"text","timestamp":1775737274160,"sessionID":"ses_28dcfca7effeG4iMaRZrD8C8x6","part":{"id":"prt_d72307f22001","sessionID":"ses_28dcfca7effeG4iMaRZrD8C8x6","messageID":"msg_d7230374c001","type":"text","text":"Hello! 👋","time":{"start":1775737274149,"end":1775737274149}}}"#;
         let events = parser.parse_line(line);
-        assert_eq!(events.len(), 1);
+        // First event is synthesized SessionStart (first line with sessionID), second is AssistantText.
+        assert_eq!(events.len(), 2);
         match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_28dcfca7effeG4iMaRZrD8C8x6");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+        match &events[1] {
             CliEvent::AssistantText { text, is_delta } => {
                 assert_eq!(text, "Hello! 👋");
                 assert!(!is_delta);
@@ -297,9 +312,17 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"tool_use","timestamp":1775737305647,"sessionID":"ses_abc","part":{"id":"prt_xyz","type":"tool","callID":"chatcmpl-tool-bdc397ac90703079","tool":"read","state":{"status":"completed","input":{"filePath":"C:\\README.md"},"output":"<file>contents here</file>","title":"README.md","time":{"start":1775737305648,"end":1775737305700}}}}"#;
         let events = parser.parse_line(line);
-        assert_eq!(events.len(), 2, "completed tool_use must emit ToolCallStart + ToolCallResult");
+        // First event is synthesized SessionStart, then ToolCallStart + ToolCallResult.
+        assert_eq!(events.len(), 3, "completed tool_use must emit SessionStart + ToolCallStart + ToolCallResult");
 
         match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_abc");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+
+        match &events[1] {
             CliEvent::ToolCallStart { id, name, input } => {
                 assert_eq!(id, "chatcmpl-tool-bdc397ac90703079");
                 assert_eq!(name, "read");
@@ -311,7 +334,7 @@ mod tests {
             other => panic!("expected ToolCallStart, got {:?}", other),
         }
 
-        match &events[1] {
+        match &events[2] {
             CliEvent::ToolCallResult { id, output, is_error, .. } => {
                 assert_eq!(id, "chatcmpl-tool-bdc397ac90703079");
                 assert_eq!(output, "<file>contents here</file>");
@@ -326,8 +349,15 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"tool_use","sessionID":"ses_abc","part":{"type":"tool","callID":"call-123","tool":"bash","state":{"status":"pending","input":{"command":"ls"}}}}"#;
         let events = parser.parse_line(line);
-        assert_eq!(events.len(), 1, "pending tool_use emits only ToolCallStart");
+        // First event is synthesized SessionStart, then ToolCallStart (no result for pending).
+        assert_eq!(events.len(), 2, "pending tool_use emits SessionStart + ToolCallStart");
         match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_abc");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+        match &events[1] {
             CliEvent::ToolCallStart { id, name, .. } => {
                 assert_eq!(id, "call-123");
                 assert_eq!(name, "bash");
@@ -341,8 +371,15 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"step_finish","timestamp":1775737275618,"sessionID":"ses_abc","part":{"type":"step-finish","reason":"stop","snapshot":"abc","cost":0,"tokens":{"input":14290,"output":6,"reasoning":4,"cache":{"read":0,"write":0}}}}"#;
         let events = parser.parse_line(line);
-        assert_eq!(events.len(), 1);
+        // First event is synthesized SessionStart, then TurnComplete.
+        assert_eq!(events.len(), 2);
         match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_abc");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+        match &events[1] {
             CliEvent::TurnComplete { input_tokens, output_tokens } => {
                 assert_eq!(*input_tokens, 14290);
                 assert_eq!(*output_tokens, 6);
@@ -354,10 +391,14 @@ mod tests {
     #[test]
     fn opencode_step_finish_zero_tokens_emits_nothing() {
         let mut parser = OpenCodeNdjsonParser::new();
-        // When both token counts are 0 (or absent), no event is emitted.
+        // When both token counts are 0 (or absent), only the SessionStart is emitted (first line).
         let line = r#"{"type":"step_finish","sessionID":"ses_abc","part":{"type":"step-finish","reason":"tool-calls","cost":0,"tokens":{"input":0,"output":0}}}"#;
         let events = parser.parse_line(line);
-        assert!(events.is_empty(), "zero-token step_finish should produce no events");
+        assert_eq!(events.len(), 1, "zero-token step_finish should emit only SessionStart");
+        match &events[0] {
+            CliEvent::SessionStart { .. } => {}
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
     }
 
     #[test]
@@ -365,8 +406,15 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"error","timestamp":1775737195012,"sessionID":"ses_28dd0bb31ffe","error":{"name":"APIError","data":{"message":"Incorrect API key provided: sk-or-v1...d6a3.","statusCode":401,"isRetryable":false}}}"#;
         let events = parser.parse_line(line);
-        assert_eq!(events.len(), 1);
+        // First event is synthesized SessionStart, then the Error.
+        assert_eq!(events.len(), 2);
         match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_28dd0bb31ffe");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+        match &events[1] {
             CliEvent::Error { message } => {
                 assert_eq!(message, "Incorrect API key provided: sk-or-v1...d6a3.");
             }
@@ -399,22 +447,37 @@ mod tests {
     }
 
     #[test]
-    fn opencode_step_start_is_ignored() {
+    fn opencode_step_start_emits_only_session_start() {
+        // step_start itself produces no domain events, but the synthesized SessionStart
+        // IS emitted because this is the first line with a sessionID.
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"step_start","timestamp":1775737274135,"sessionID":"ses_28dcfca7effeG4iMaRZrD8C8x6","part":{"id":"prt_d72307f0a001","sessionID":"ses_28dcfca7effeG4iMaRZrD8C8x6","messageID":"msg_d7230374c001","type":"step-start","snapshot":"11f897c48dde50396cfdadda13159d56b138e9af"}}"#;
         let events = parser.parse_line(line);
-        assert!(events.is_empty(), "step_start should produce no events, got {:?}", events);
+        assert_eq!(events.len(), 1, "step_start should emit only SessionStart, got {:?}", events);
+        match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_28dcfca7effeG4iMaRZrD8C8x6");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
     }
 
     #[test]
     fn opencode_session_id_from_any_line() {
         // sessionID is tracked from whatever the first line is — step_start in practice.
+        // The synthesized SessionStart is emitted on that first line.
         let mut parser = OpenCodeNdjsonParser::new();
         assert!(parser.session_id().is_none());
 
         let step_start = r#"{"type":"step_start","timestamp":123,"sessionID":"ses_realworld123","part":{"type":"step-start","snapshot":"abc"}}"#;
         let events = parser.parse_line(step_start);
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1, "first line with sessionID emits SessionStart");
+        match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_realworld123");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
         assert_eq!(parser.session_id(), Some("ses_realworld123"));
     }
 
@@ -442,8 +505,15 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"reasoning","sessionID":"ses_abc","part":{"type":"reasoning","text":"Let me think about this carefully..."}}"#;
         let events = parser.parse_line(line);
-        assert_eq!(events.len(), 1);
+        // First event is synthesized SessionStart, then Thinking.
+        assert_eq!(events.len(), 2);
         match &events[0] {
+            CliEvent::SessionStart { session_id, .. } => {
+                assert_eq!(session_id, "ses_abc");
+            }
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
+        match &events[1] {
             CliEvent::Thinking { text } => {
                 assert_eq!(text, "Let me think about this carefully...");
             }
@@ -493,7 +563,13 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         let line = r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":""}}"#;
         let events = parser.parse_line(line);
-        assert!(events.is_empty(), "empty text event should produce no events");
+        // The empty text produces no AssistantText, but the synthesized SessionStart IS emitted
+        // because this is the first line with sessionID.
+        assert_eq!(events.len(), 1, "empty text on first line emits only SessionStart");
+        match &events[0] {
+            CliEvent::SessionStart { .. } => {}
+            other => panic!("expected SessionStart, got {:?}", other),
+        }
     }
 
     #[test]
@@ -512,5 +588,30 @@ mod tests {
         let mut parser = OpenCodeNdjsonParser::new();
         assert!(parser.parse_line("").is_empty());
         assert!(parser.parse_line("   ").is_empty());
+    }
+
+    #[test]
+    fn opencode_session_start_emitted_exactly_once() {
+        // SessionStart must be emitted on the FIRST line that carries a sessionID,
+        // and NEVER again on subsequent lines (even though every line has sessionID).
+        let mut parser = OpenCodeNdjsonParser::new();
+
+        let first_line = r#"{"type":"step_start","sessionID":"ses_once","part":{"type":"step-start","snapshot":"abc"}}"#;
+        let second_line = r#"{"type":"text","sessionID":"ses_once","part":{"type":"text","text":"hello"}}"#;
+        let third_line = r#"{"type":"step_finish","sessionID":"ses_once","part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"input":100,"output":10}}}"#;
+
+        let events1 = parser.parse_line(first_line);
+        assert_eq!(events1.len(), 1);
+        assert!(matches!(&events1[0], CliEvent::SessionStart { session_id, .. } if session_id == "ses_once"));
+
+        let events2 = parser.parse_line(second_line);
+        // Second line: no SessionStart, just AssistantText.
+        assert_eq!(events2.len(), 1);
+        assert!(matches!(&events2[0], CliEvent::AssistantText { .. }), "got {:?}", events2);
+
+        let events3 = parser.parse_line(third_line);
+        // Third line: no SessionStart, just TurnComplete.
+        assert_eq!(events3.len(), 1);
+        assert!(matches!(&events3[0], CliEvent::TurnComplete { .. }), "got {:?}", events3);
     }
 }

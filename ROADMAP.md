@@ -40,6 +40,7 @@ Small, additive, non-breaking:
 - [x] **Live integration tests** — done (0.2.5): Claude+Codex fully verified, Gemini+OpenCode parser-verified
 - [x] **Daemon transport skeleton** — done (0.2.9): DaemonSession, DaemonConfig for OpenCode serve + OpenClaw. API surface documented, not yet functional. Needs live testing against `opencode serve` and OpenClaw instances.
 - [x] **Bidirectional JSON-RPC 2.0** — done (0.2.10): RpcSession with HostHandler trait, MethodRouter, pending request tracking. ACP-compatible protocol layer.
+- [x] **Critical bugfixes** — done (0.2.11): stale session cleanup, stdin error visibility, OpenCode SessionStart synthesis, Gemini banner suppression, per-CLI history readers
 - [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
 - [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for OpenCode
 

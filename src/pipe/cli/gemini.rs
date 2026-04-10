@@ -1,7 +1,6 @@
 //! Pipe-mode Gemini bindings: NDJSON parser + spawn builder.
 
 use super::traits::{CliEvent, NdjsonParser};
-use crate::utils::truncate_str;
 use crate::transport::SpawnOptions;
 
 /// Gemini CLI stream-json parser.
@@ -35,9 +34,10 @@ impl NdjsonParser for GeminiNdjsonParser {
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
-                return vec![CliEvent::Error {
-                    message: format!("invalid JSON: {}", truncate_str(line, 100)),
-                }]
+                // Skip non-JSON lines silently (startup banners, auth notices).
+                // These are not real errors — just pre-NDJSON output from the CLI.
+                // Real Gemini errors arrive as JSON objects with `"type": "error"`.
+                return vec![];
             }
         };
 
@@ -209,5 +209,54 @@ impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
         cmd.arg("-p");
         cmd.arg(&opts.prompt);
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parser() -> GeminiNdjsonParser {
+        GeminiNdjsonParser::new()
+    }
+
+    #[test]
+    fn non_json_lines_are_silently_skipped() {
+        let mut p = parser();
+        // Startup banner — must return empty vec, NOT an error event.
+        let events = p.parse_line("Gemini CLI v1.2.3 — Initializing...");
+        assert!(events.is_empty(), "expected no events for banner line, got: {events:?}");
+    }
+
+    #[test]
+    fn auth_notice_is_silently_skipped() {
+        let mut p = parser();
+        let events = p.parse_line("Authenticating with Google... done.");
+        assert!(events.is_empty(), "expected no events for auth notice, got: {events:?}");
+    }
+
+    #[test]
+    fn empty_line_is_silently_skipped() {
+        let mut p = parser();
+        assert!(p.parse_line("").is_empty());
+        assert!(p.parse_line("   ").is_empty());
+    }
+
+    #[test]
+    fn real_json_error_is_preserved() {
+        let mut p = parser();
+        let line = r#"{"type":"error","message":"quota exceeded"}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], CliEvent::Error { message } if message == "quota exceeded"));
+    }
+
+    #[test]
+    fn valid_message_event_is_parsed() {
+        let mut p = parser();
+        let line = r#"{"type":"message","role":"assistant","content":"Hello","delta":false}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], CliEvent::AssistantText { text, .. } if text == "Hello"));
     }
 }

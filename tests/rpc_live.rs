@@ -16,18 +16,32 @@ use gate4agent::rpc::{RpcSession, RpcSessionOptions};
 use gate4agent::{AgentEvent, CliTool, PipeProcessOptions};
 
 /// Check if a CLI tool binary exists on PATH.
+/// On Windows, npm tools are .cmd files — must spawn via `cmd /C`.
 fn cli_available(name: &str) -> bool {
-    std::process::Command::new(name)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|mut c| { let _ = c.kill(); true })
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", name, "--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 /// Generic RPC session test for any CLI tool.
-async fn run_rpc_test(tool: CliTool, binary_name: &str, extra_prompt: &str) {
+async fn run_rpc_test(tool: CliTool, binary_name: &str, opts: PipeProcessOptions) {
     if !cli_available(binary_name) {
         println!("[{:?}] SKIPPED — {} not found on PATH", tool, binary_name);
         return;
@@ -35,14 +49,14 @@ async fn run_rpc_test(tool: CliTool, binary_name: &str, extra_prompt: &str) {
 
     println!("[{:?}] Spawning RPC session...", tool);
 
-    let prompt = format!("Say exactly: hello from gate4agent RPC. Nothing else. {}", extra_prompt);
+    let prompt = "Say exactly: hello from gate4agent RPC. Nothing else.";
 
     let session = RpcSession::spawn(
         tool,
-        PipeProcessOptions::default(),
+        opts,
         RpcSessionOptions::default(),
         &std::env::current_dir().unwrap(),
-        &prompt,
+        prompt,
     )
     .await
     .unwrap_or_else(|e| panic!("{:?} RPC spawn failed: {}", tool, e));
@@ -91,21 +105,24 @@ async fn run_rpc_test(tool: CliTool, binary_name: &str, extra_prompt: &str) {
 
 #[tokio::test]
 async fn rpc_live_claude() {
-    run_rpc_test(CliTool::ClaudeCode, "claude", "").await;
+    run_rpc_test(CliTool::ClaudeCode, "claude", PipeProcessOptions::default()).await;
 }
 
 #[tokio::test]
 async fn rpc_live_codex() {
-    run_rpc_test(CliTool::Codex, "codex", "").await;
+    run_rpc_test(CliTool::Codex, "codex", PipeProcessOptions::default()).await;
 }
 
 #[tokio::test]
 async fn rpc_live_gemini() {
-    run_rpc_test(CliTool::Gemini, "gemini", "").await;
+    run_rpc_test(CliTool::Gemini, "gemini", PipeProcessOptions::default()).await;
 }
 
 #[tokio::test]
 async fn rpc_live_opencode() {
     // OpenCode with free built-in model — no API key needed.
-    run_rpc_test(CliTool::OpenCode, "opencode", "").await;
+    run_rpc_test(CliTool::OpenCode, "opencode", PipeProcessOptions {
+        extra_args: vec!["-m".into(), "opencode/nemotron-3-super-free".into()],
+        ..Default::default()
+    }).await;
 }

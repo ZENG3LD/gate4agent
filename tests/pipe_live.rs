@@ -15,14 +15,28 @@ use gate4agent::{AgentEvent, CliTool};
 use gate4agent::core::types::SessionConfig;
 
 /// Check if a CLI tool binary exists on PATH.
+/// On Windows, npm tools are .cmd files — must spawn via `cmd /C`.
 fn cli_available(name: &str) -> bool {
-    std::process::Command::new(name)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|mut c| { let _ = c.kill(); true })
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", name, "--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 /// Spawn the given CLI tool via PipeProcess and validate NDJSON output.

@@ -2,7 +2,21 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.20 (April 2026)
+## Current — 0.2.23 (April 2026)
+
+### Shipped in 0.2.23
+
+- **Codex zombie session filter**: sessions with no user input are excluded from history listing (avoids polluting the list with incomplete/aborted sessions).
+- **OpenCode SQLite reader**: reads from `~/.local/share/opencode/opencode.db` instead of the nonexistent `~/.opencode/` path.
+
+### Shipped in 0.2.22
+
+- **Preview extraction for Codex, Gemini, OpenCode history readers**: the first real user message is extracted and surfaced as a session preview.
+- **System message filtering for Codex**: injected XML and AGENTS.md content is excluded from previews and event streams.
+
+### Shipped in 0.2.21
+
+- **Docs**: fixed README Quick Start example. Renamed `rpc_hello` example to `acp_hello` to reflect current transport.
 
 ### Shipped in 0.2.20
 

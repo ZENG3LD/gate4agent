@@ -121,6 +121,7 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 - **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
 - **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks
 - **4 CLI agents** — Claude Code, Codex, Gemini, OpenCode
+- **Session history** — per-CLI session listing with workdir scoping, preview extraction, and resume support (Claude JSONL, Codex JSONL, Gemini JSON, OpenCode SQLite)
 
 ## Architecture
 
@@ -138,12 +139,16 @@ gate4agent/
 │   │   ├── session.rs   — AcpSession::spawn(), prompt(), cancel(), kill()
 │   │   ├── protocol.rs  — ACP wire types (InitializeParams, SessionUpdate, ContentBlock)
 │   │   ├── reader.rs    — Blocking JSON-RPC reader loop
-│   │   ├── host.rs      — AcpHostHandler trait + DefaultAcpHandler
+│   │   ├── host.rs      — AcpHostHandler trait, FilesystemAcpHandler, TerminalAcpHandler
 │   │   └── spawn.rs     — AcpProcess + per-CLI spawn specs
 │   ├── rpc/             — Shared JSON-RPC 2.0 primitives (message, pending, handler, id)
 │   │                      Used internally by acp/. Not a standalone transport.
 │   ├── daemon/         — DaemonSession, per-daemon adapters [skeleton]
-│   ├── history/         — Session history reader
+│   ├── history/         — Session history readers (per-CLI format)
+│   │   ├── claude.rs    — JSONL from ~/.claude/projects/{cwd}/
+│   │   ├── codex.rs     — JSONL from ~/.codex/sessions/ (event_msg format)
+│   │   ├── gemini.rs    — JSON from ~/.gemini/tmp/{slug}/chats/
+│   │   └── opencode.rs  — SQLite from ~/.local/share/opencode/opencode.db
 │   └── utils.rs         — String utilities
 ```
 
@@ -201,6 +206,10 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.17** — Cursor removed again (no Windows binary: `node_sqlite3.node` is a Linux ELF, crashes on Windows with "is not a valid Win32 application"; no official Windows build exists). 4 CLI tools remain: Claude Code, Codex, Gemini, OpenCode.
 - **0.2.18** — ACP host handler extended: TerminalAcpHandler with real terminal execution, FilesystemAcpHandler root whitelisting.
 - **0.2.19** — RpcSession removed: standalone RPC transport was a pre-ACP intermediate step, now superseded by AcpSession. Shared JSON-RPC primitives (message, pending, handler, id) retained in `rpc/` for ACP internal use.
+- **0.2.20** — History readers: workdir scoping for Codex (cwd field), Gemini (projects.json slug), OpenCode (directory field). All readers now filter sessions by working directory.
+- **0.2.21** — Docs: fixed README Quick Start example, renamed rpc_hello → acp_hello example.
+- **0.2.22** — History readers: preview extraction for Codex/Gemini/OpenCode (first real user message), system message filtering (Codex injected XML/AGENTS.md content excluded).
+- **0.2.23** — History readers: Codex zombie session filter (sessions with no user input excluded), OpenCode SQLite reader (reads from ~/.local/share/opencode/opencode.db instead of nonexistent ~/.opencode/).
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

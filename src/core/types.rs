@@ -124,4 +124,20 @@ pub enum AgentEvent {
     // --- Both modes ---
     /// Rate limit detected (from text pattern matching).
     RateLimit(RateLimitInfo),
+
+    // --- JSON-RPC 2.0 (RpcSession) ---
+    /// Raw JSON-RPC notification from agent that did not map to a structured
+    /// event. Consumers can inspect `method` and parse `params` themselves.
+    RpcNotification { method: String, params: serde_json::Value },
+
+    /// Agent sent a JSON-RPC request to the host (for observer purposes).
+    ///
+    /// The `RpcSession` reader loop has already handled it via `HostHandler`
+    /// and sent the response. This variant lets subscribers audit what the
+    /// agent requested without needing their own handler.
+    RpcIncomingRequest {
+        id: crate::rpc::message::RpcId,
+        method: String,
+        params: Option<serde_json::Value>,
+    },
 }

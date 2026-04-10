@@ -22,10 +22,17 @@ pub mod core;
 pub mod transport;
 pub mod pty;
 pub mod pipe;
+pub mod rpc;
 pub mod history;
 pub mod manager;
 pub mod daemon;
 
+pub use rpc::{
+    RpcSession, RpcSessionOptions, RpcSessionError,
+    HostHandler, RejectAllHandler, MethodRouter,
+    RpcId, RpcRequest, RpcResponse, RpcError, RpcNotification,
+    classify_line,
+};
 pub use manager::{MultiCliManager, ManagerConfig, InstanceId, InstanceMode};
 pub use pty::snapshot::{
     AgentCli, AgentRenderSnapshot, AgentSnapshotMode, BuddyArt, ChatMessage, ChatRole, TermCell, TermGrid,

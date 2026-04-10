@@ -79,26 +79,6 @@ let opts = PipeProcessOptions {
 let session = PipeSession::spawn(config, "hello", opts).await?;
 ```
 
-### Bidirectional JSON-RPC 2.0 (RpcSession)
-
-```rust
-use gate4agent::rpc::{RpcSession, RpcSessionOptions, MethodRouter};
-use gate4agent::{CliTool, PipeProcessOptions};
-
-let session = RpcSession::spawn(
-    CliTool::ClaudeCode,
-    PipeProcessOptions::default(),
-    RpcSessionOptions {
-        host_handler: Some(Box::new(
-            MethodRouter::new().on("ping", |_| Ok(serde_json::json!({"pong": true})))
-        )),
-        ..Default::default()
-    },
-    &std::env::current_dir()?,
-    "hello",
-).await?;
-```
-
 ### ACP Transport (Agent Client Protocol)
 
 ```rust
@@ -166,6 +146,7 @@ gate4agent/
 │   │   ├── host.rs      — AcpHostHandler trait + DefaultAcpHandler
 │   │   └── spawn.rs     — AcpProcess + per-CLI spawn specs
 │   ├── rpc/             — Shared JSON-RPC 2.0 primitives (message, pending, handler, id)
+│   │                      Used internally by acp/. Not a standalone transport.
 │   ├── daemon/         — DaemonSession, per-daemon adapters [skeleton]
 │   ├── history/         — Session history reader
 │   └── utils.rs         — String utilities
@@ -217,12 +198,14 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.7** — Cursor removed (no native Windows support, broken headless mode, closed-source CLI). 4 CLI tools remain: Claude Code, Codex, Gemini, OpenCode.
 - **0.2.8** — SpawnOptions extended: continue_last, allowed_tools, permission_mode, mcp_config, max_turns, sandbox. Per-CLI builders updated.
 - **0.2.9** — Daemon transport skeleton: DaemonSession, DaemonConfig, DaemonType (OpenCode, OpenClaw). Not yet functional — API surface documented for future implementation.
-- **0.2.10** — Bidirectional JSON-RPC 2.0: RpcSession, HostHandler, MethodRouter. Agent→host requests, host→agent calls, fallback to legacy NDJSON parsing.
+- **0.2.10** — Bidirectional JSON-RPC 2.0 primitives: RpcRequest, RpcResponse, RpcNotification, PendingRequests, HostHandler, MethodRouter. Shared infrastructure for ACP transport.
 - **0.2.11** — Critical bugfixes: stale transport_session cleared on exit, send_prompt() returns BrokenPipe instead of silent no-op, OpenCode emits SessionStart, Gemini skips non-JSON banners silently, history readers for Codex/Gemini/OpenCode
-- **0.2.12** — Test coverage: Gemini parser (14 tests), Claude parser (+8), builder argv parity (22 tests), PipeSession live test, RpcSession tests. README/DEBUGGING.md fixed. Examples added.
+- **0.2.12** — Test coverage: Gemini parser (14 tests), Claude parser (+8), builder argv parity (22 tests), PipeSession live test. README/DEBUGGING.md fixed. Examples added.
 - **0.2.13–0.2.15** — OpenCode default model, env sanitization, test cleanup, TermCell improvements
-- **0.2.16** — **ACP transport**: full Agent Client Protocol (JSON-RPC 2.0 over stdio) implementation. AcpSession with initialize + session/new handshake, multi-turn prompt(), session/update streaming, agent→host callbacks (fs, terminal, permissions). 5th CLI added: Cursor (via `cursor-agent agent acp`). Live-verified with Gemini, OpenCode, Claude, Codex. 199 unit tests.
+- **0.2.16** — **ACP transport**: full Agent Client Protocol (JSON-RPC 2.0 over stdio) implementation. AcpSession with initialize + session/new handshake, multi-turn prompt(), session/update streaming, agent→host callbacks (fs, terminal, permissions). Live-verified with Gemini, OpenCode, Claude, Codex. 199 unit tests.
 - **0.2.17** — Cursor removed again (no Windows binary: `node_sqlite3.node` is a Linux ELF, crashes on Windows with "is not a valid Win32 application"; no official Windows build exists). 4 CLI tools remain: Claude Code, Codex, Gemini, OpenCode.
+- **0.2.18** — ACP host handler extended: TerminalAcpHandler with real terminal execution, FilesystemAcpHandler root whitelisting.
+- **0.2.19** — RpcSession removed: standalone RPC transport was a pre-ACP intermediate step, now superseded by AcpSession. Shared JSON-RPC primitives (message, pending, handler, id) retained in `rpc/` for ACP internal use.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 
@@ -234,6 +217,11 @@ See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) fo
 - **`PipeSession` restored** — 0.1.x callers that used `PipeSession::spawn(config, prompt, options)` compile again. The `PipeSession` now includes SessionEnd synthesis (previously only in the 0.2.0 `pipe_runner`).
 - **`TransportSession`** is now a thin wrapper over `PipeSession`. Its public API (`spawn`, `subscribe`, `session_id`, `send_prompt`, `kill`) is unchanged. Internal: no more `TransportHandle` enum, no dead `Pty` variant.
 - **`DaemonNotRunning` / `DaemonProbeTimeout` error variants removed** — they were only reachable via OpenClaw. Remove any match arms for these.
+
+### 0.2.18 → 0.2.19
+
+- **`RpcSession` removed** — if you were using `gate4agent::rpc::RpcSession` or the top-level `gate4agent::RpcSession` / `RpcSessionOptions` / `RpcSessionError` re-exports, migrate to [`AcpSession`] instead. ACP does everything RpcSession did (bidirectional JSON-RPC 2.0, host handlers, multi-turn) but follows the standard Agent Client Protocol.
+- **Shared `rpc` primitives unchanged** — `RpcRequest`, `RpcResponse`, `RpcError`, `RpcNotification`, `RpcId`, `HostHandler`, `MethodRouter`, `RejectAllHandler`, `PendingRequests`, `IdGen`, `classify_line` are all still exported. Only the `RpcSession` transport struct is gone.
 
 ### 0.1.x → 0.2.1
 

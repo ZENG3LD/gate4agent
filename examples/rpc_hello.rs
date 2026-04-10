@@ -1,40 +1,50 @@
-//! RPC session example — spawn Claude Code with bidirectional JSON-RPC 2.0.
+//! ACP session example — spawn Claude Code via Agent Client Protocol.
 //!
-//! The RpcSession wraps PipeProcess, adding:
-//! - Legacy NDJSON fallback (parses Claude's native output)
-//! - Bidirectional JSON-RPC 2.0 support (for ACP-compatible CLIs)
-//! - Host handler for agent → host requests
+//! AcpSession provides bidirectional JSON-RPC 2.0 over stdio with:
+//! - Multi-turn sessions (call prompt() repeatedly without respawning)
+//! - Host handler for agent → host requests (fs, terminal, permissions)
+//! - Structured session/update streaming
 //!
 //! Run: cargo run --example rpc_hello
 //!
-//! Requires `claude` CLI installed and authenticated.
+//! Requires `claude` CLI installed, authenticated, and the ACP adapter:
+//!   npx @agentclientprotocol/claude-agent-acp
 
-use gate4agent::rpc::{RpcSession, RpcSessionOptions, MethodRouter};
-use gate4agent::{CliTool, PipeProcessOptions, AgentEvent};
-use serde_json::json;
+use gate4agent::acp::{AcpSession, AcpSessionOptions};
+use gate4agent::{AcpHostHandler, CliTool, AgentEvent};
+
+/// Minimal host handler: auto-allows all permission requests, denies fs reads.
+struct ExampleHandler;
+
+impl AcpHostHandler for ExampleHandler {
+    fn request_permission(
+        &self,
+        tool_name: &str,
+        _description: &str,
+        _session_id: &str,
+    ) -> Result<bool, String> {
+        println!("[host] permission request for tool: {}", tool_name);
+        Ok(true)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up a host handler that responds to "ping" requests from the agent.
-    let handler = MethodRouter::new()
-        .on("ping", |_| Ok(json!({"pong": true})));
-
-    let session = RpcSession::spawn(
+    let session = AcpSession::spawn(
         CliTool::ClaudeCode,
-        PipeProcessOptions::default(),
-        RpcSessionOptions {
-            host_handler: Some(Box::new(handler)),
-            legacy_fallback: true,
-            channel_capacity: 256,
-        },
         &std::env::current_dir()?,
-        "Say exactly: hello from RPC session. Nothing else.",
+        AcpSessionOptions {
+            host_handler: Some(Box::new(ExampleHandler)),
+            ..Default::default()
+        },
     )
     .await?;
 
-    println!("RPC session started: {}", session.session_id());
+    println!("ACP session started: {}", session.session_id());
 
     let mut rx = session.subscribe();
+
+    session.prompt("Say exactly: hello from ACP session. Nothing else.").await?;
 
     loop {
         match tokio::time::timeout(
@@ -49,6 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("[tool result] err={is_error} {}", &output[..output.len().min(200)]);
                     }
                     AgentEvent::Thinking { text } => println!("[thinking] {text}"),
+                    AgentEvent::TurnComplete { .. } => {
+                        println!("\n[turn complete]");
+                        break;
+                    }
                     AgentEvent::SessionEnd { result, is_error, .. } => {
                         println!("\n[session end] err={is_error} {result}");
                         break;
@@ -74,5 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    session.kill().await.ok();
     Ok(())
 }

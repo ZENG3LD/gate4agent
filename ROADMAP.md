@@ -2,9 +2,13 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.16 (April 2026)
+## Current — 0.2.19 (April 2026)
 
-Shipped in 0.2.16:
+Shipped in 0.2.19:
+
+- **RpcSession removed**: standalone RPC transport was a pre-ACP intermediate step. ACP does everything RpcSession did (bidirectional JSON-RPC 2.0, host handlers, multi-turn sessions) but follows the standard Agent Client Protocol. Shared `rpc/` primitives (message, pending, handler, id) retained for ACP internal use.
+
+Shipped in 0.2.16–0.2.18:
 
 - **4 CLI tools**: Claude Code, Codex, Gemini, OpenCode
 - **Three transport classes**: Pipe, PTY, ACP (Agent Client Protocol)
@@ -18,11 +22,7 @@ Shipped in 0.2.16:
 - **SessionEnd synthesis**: guaranteed one `SessionEnd` per session regardless of CLI
 - **Transport-neutral `AgentEvent`**: `Text`, `ToolStart`, `ToolResult`, `Thinking`, `TurnComplete`, `SessionStart`, `SessionEnd`
 - **ACP transport** (0.2.16): `AcpSession` — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks (fs, terminal, permissions). Live-verified with all 4 native/adapter CLIs.
-
-What changed from 0.2.1 → 0.2.16:
-
-- **0.2.2**: Parser isolation — `NdjsonParser` trait extracted, per-CLI parser modules split out from monolithic file
-- **0.2.3**: Full source tree restructure (core/pty/pipe), proper pipe builders+parsers for all 3 non-Claude CLIs based on research
+- **TerminalAcpHandler** (0.2.18): real terminal execution via host handler.
 
 ### Testing status
 
@@ -40,10 +40,11 @@ Small, additive, non-breaking:
 - [x] **Research Gemini resume** — done (0.2.3), `--resume <id>` supported
 - [x] **Live integration tests** — done (0.2.5): Claude+Codex fully verified, Gemini+OpenCode parser-verified
 - [x] **Daemon transport skeleton** — done (0.2.9): DaemonSession, DaemonConfig for OpenCode serve + OpenClaw. API surface documented, not yet functional. Needs live testing against `opencode serve` and OpenClaw instances.
-- [x] **Bidirectional JSON-RPC 2.0** — done (0.2.10): RpcSession with HostHandler trait, MethodRouter, pending request tracking. ACP-compatible protocol layer.
+- [x] **JSON-RPC 2.0 primitives** — done (0.2.10): shared RPC building blocks (message, pending, handler, id) for ACP transport.
 - [x] **Critical bugfixes** — done (0.2.11): stale session cleanup, stdin error visibility, OpenCode SessionStart synthesis, Gemini banner suppression, per-CLI history readers
 - [x] **ACP transport** — done (0.2.16): AcpSession with initialize + session/new handshake, multi-turn prompt(), session/update streaming, agent→host callbacks. Live-verified: Gemini, OpenCode, Claude, Codex.
 - [x] **Cursor support** — done (0.2.16), removed in 0.2.17: `cursor-agent` ships Linux/macOS only — `node_sqlite3.node` is a Linux ELF binary, crashes on Windows. No official Windows build.
+- [x] **RpcSession removed** — done (0.2.19): pre-ACP intermediate transport removed. AcpSession supersedes it completely.
 - [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
 - [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for OpenCode
 

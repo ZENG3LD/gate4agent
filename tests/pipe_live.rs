@@ -4,7 +4,7 @@
 //! Uses PipeProcess directly — it handles cmd /C wrapping, stdin for Claude, etc.
 //!
 //! Run with:
-//!   cargo test --test pipe_live -- --ignored --nocapture
+//!   cargo test --test pipe_live -- --nocapture
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,17 @@ use gate4agent::pipe::cli::create_ndjson_parser;
 use gate4agent::pipe::{PipeProcess, PipeProcessOptions, ClaudeOptions, PipeSession};
 use gate4agent::{AgentEvent, CliTool};
 use gate4agent::core::types::SessionConfig;
+
+/// Check if a CLI tool binary exists on PATH.
+fn cli_available(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut c| { let _ = c.kill(); true })
+        .unwrap_or(false)
+}
 
 /// Spawn the given CLI tool via PipeProcess and validate NDJSON output.
 fn run_pipe_test(tool: CliTool, extra_args: Vec<String>) {
@@ -101,26 +112,38 @@ fn run_pipe_test(tool: CliTool, extra_args: Vec<String>) {
 }
 
 #[test]
-#[ignore]
 fn pipe_live_claude() {
+    if !cli_available("claude") {
+        println!("[ClaudeCode] SKIPPED — claude not found on PATH");
+        return;
+    }
     run_pipe_test(CliTool::ClaudeCode, vec![]);
 }
 
 #[test]
-#[ignore]
 fn pipe_live_codex() {
+    if !cli_available("codex") {
+        println!("[Codex] SKIPPED — codex not found on PATH");
+        return;
+    }
     run_pipe_test(CliTool::Codex, vec![]);
 }
 
 #[test]
-#[ignore]
 fn pipe_live_gemini() {
+    if !cli_available("gemini") {
+        println!("[Gemini] SKIPPED — gemini not found on PATH");
+        return;
+    }
     run_pipe_test(CliTool::Gemini, vec![]);
 }
 
 #[test]
-#[ignore]
 fn pipe_live_opencode() {
+    if !cli_available("opencode") {
+        println!("[OpenCode] SKIPPED — opencode not found on PATH");
+        return;
+    }
     // Use free built-in model to avoid API key requirements.
     run_pipe_test(
         CliTool::OpenCode,
@@ -140,8 +163,11 @@ fn pipe_live_opencode() {
 /// 3. At least one `AgentEvent::Text` event with non-empty text arrives.
 /// 4. The session eventually sends `AgentEvent::SessionEnd`.
 #[test]
-#[ignore] // Requires real `claude` CLI installed and authenticated
 fn pipe_session_full_lifecycle() {
+    if !cli_available("claude") {
+        println!("[pipe_session] SKIPPED — claude not found on PATH");
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let config = SessionConfig {

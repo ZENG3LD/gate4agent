@@ -511,6 +511,7 @@ impl MultiCliManager {
                         mode: AgentSnapshotMode::Idle,
                         session_active: inst.session_active,
                         live_status: inst.live_status.clone(),
+                        pipe_session_id: inst.pipe_session_id.clone(),
                     }
                 }
             }
@@ -520,12 +521,14 @@ impl MultiCliManager {
                         mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
                         session_active: inst.session_active,
                         live_status: inst.live_status.clone(),
+                        pipe_session_id: inst.pipe_session_id.clone(),
                     }
                 } else {
                     AgentRenderSnapshot {
                         mode: AgentSnapshotMode::Idle,
                         session_active: inst.session_active,
                         live_status: inst.live_status.clone(),
+                        pipe_session_id: inst.pipe_session_id.clone(),
                     }
                 }
             }
@@ -1110,6 +1113,7 @@ impl MultiCliManager {
                     mode: AgentSnapshotMode::Idle,
                     session_active: false,
                     live_status: LiveStatus::Idle,
+                    pipe_session_id: None,
                 }
             }
         };
@@ -1122,6 +1126,7 @@ impl MultiCliManager {
                 mode: AgentSnapshotMode::Idle,
                 session_active: inst.session_active,
                 live_status: inst.live_status.clone(),
+                pipe_session_id: inst.pipe_session_id.clone(),
             };
         }
         // Chat mode requested
@@ -1130,12 +1135,14 @@ impl MultiCliManager {
                 mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
                 session_active: inst.session_active,
                 live_status: inst.live_status.clone(),
+                pipe_session_id: inst.pipe_session_id.clone(),
             };
         }
         AgentRenderSnapshot {
             mode: AgentSnapshotMode::Idle,
             session_active: inst.session_active,
             live_status: inst.live_status.clone(),
+            pipe_session_id: inst.pipe_session_id.clone(),
         }
     }
 
@@ -1208,6 +1215,7 @@ impl MultiCliManager {
             mode: AgentSnapshotMode::Pty(grid),
             session_active: inst.session_active,
             live_status: inst.live_status.clone(),
+            pipe_session_id: inst.pipe_session_id.clone(),
         }
     }
 
@@ -1221,6 +1229,7 @@ impl MultiCliManager {
                     mode: AgentSnapshotMode::Idle,
                     session_active: false,
                     live_status: LiveStatus::Idle,
+                    pipe_session_id: None,
                 }
             }
         };
@@ -1231,12 +1240,14 @@ impl MultiCliManager {
                     mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
                     session_active: false,
                     live_status: inst.live_status.clone(),
+                    pipe_session_id: inst.pipe_session_id.clone(),
                 };
             }
             return AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Idle,
                 session_active: false,
                 live_status: inst.live_status.clone(),
+                pipe_session_id: inst.pipe_session_id.clone(),
             };
         }
 
@@ -1286,12 +1297,14 @@ impl MultiCliManager {
                 mode: AgentSnapshotMode::Pty(grid),
                 session_active: true,
                 live_status: inst.live_status.clone(),
+                pipe_session_id: inst.pipe_session_id.clone(),
             }
         } else {
             AgentRenderSnapshot {
                 mode: AgentSnapshotMode::Chat(inst.chat_messages.clone()),
                 session_active: true,
                 live_status: inst.live_status.clone(),
+                pipe_session_id: inst.pipe_session_id.clone(),
             }
         }
     }

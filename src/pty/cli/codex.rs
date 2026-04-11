@@ -1386,7 +1386,19 @@ impl CliCommandBuilder for CodexPipeBuilder {
         }
 
         cmd.arg("--json");
-        cmd.arg("--full-auto");
+        // Codex approval mode is a positional flag, not --permission-mode.
+        // Map SpawnOptions::permission_mode to the correct Codex CLI flag.
+        match opts.permission_mode.as_deref() {
+            Some("suggest") => {
+                cmd.arg("--suggest");
+            }
+            Some("auto-edit") => {
+                cmd.arg("--auto-edit");
+            }
+            _ => {
+                cmd.arg("--full-auto");
+            }
+        }
         cmd.arg("--skip-git-repo-check");
 
         for arg in &opts.extra_args {

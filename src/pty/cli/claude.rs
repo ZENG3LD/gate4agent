@@ -1180,7 +1180,12 @@ impl CliCommandBuilder for ClaudePipeBuilder {
         cmd.arg("--output-format");
         cmd.arg("stream-json");
         cmd.arg("--verbose");
-        cmd.arg("--dangerously-skip-permissions");
+
+        // --dangerously-skip-permissions is the default, but omitted when the
+        // caller explicitly sets permission_mode (they conflict).
+        if opts.permission_mode.is_none() {
+            cmd.arg("--dangerously-skip-permissions");
+        }
 
         if let Some(ref system_prompt) = opts.append_system_prompt {
             cmd.arg("--append-system-prompt");
@@ -1193,6 +1198,10 @@ impl CliCommandBuilder for ClaudePipeBuilder {
         if let Some(ref model) = opts.model {
             cmd.arg("--model");
             cmd.arg(model);
+        }
+        if let Some(ref mode) = opts.permission_mode {
+            cmd.arg("--permission-mode");
+            cmd.arg(mode);
         }
         for arg in &opts.extra_args {
             cmd.arg(arg);
@@ -1419,6 +1428,50 @@ mod tests {
             }
             .to_command_string(),
             "claude plugin install test@official"
+        );
+    }
+
+    // ── ClaudePipeBuilder tests ───────────────────────────────────────────────
+
+    fn pipe_args(permission_mode: Option<&str>) -> Vec<String> {
+        use super::super::traits::CliCommandBuilder;
+        let opts = SpawnOptions {
+            permission_mode: permission_mode.map(|s| s.to_string()),
+            prompt: "test".to_string(),
+            ..SpawnOptions::default()
+        };
+        ClaudePipeBuilder.build_command(&opts)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn claude_pty_builder_no_permission_mode_uses_dangerous_skip() {
+        let args = pipe_args(None);
+        assert!(
+            args.contains(&"--dangerously-skip-permissions".to_string()),
+            "--dangerously-skip-permissions must be present when permission_mode is None, args: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--permission-mode".to_string()),
+            "--permission-mode must be absent when permission_mode is None, args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_pty_builder_permission_mode_overrides_dangerous_skip() {
+        let args = pipe_args(Some("acceptEdits"));
+        assert!(
+            !args.contains(&"--dangerously-skip-permissions".to_string()),
+            "--dangerously-skip-permissions must be absent when permission_mode is set, args: {args:?}"
+        );
+        let idx = args.iter().position(|a| a == "--permission-mode");
+        assert!(idx.is_some(), "--permission-mode must be present, args: {args:?}");
+        assert_eq!(
+            args.get(idx.unwrap() + 1).map(|s| s.as_str()),
+            Some("acceptEdits"),
+            "--permission-mode value must be acceptEdits"
         );
     }
 }

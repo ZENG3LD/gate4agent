@@ -2239,6 +2239,42 @@ mod tests {
             "/restore 2025-06-22T10-00-00_000Z-file.txt-write_file\n"
         );
     }
+
+    // ── GeminiPipeBuilder tests ───────────────────────────────────────────────
+
+    fn pty_gemini_args(model: Option<&str>) -> Vec<String> {
+        use super::super::traits::CliCommandBuilder;
+        let opts = SpawnOptions {
+            model: model.map(|s| s.to_string()),
+            prompt: "test".to_string(),
+            ..SpawnOptions::default()
+        };
+        GeminiPipeBuilder.build_command(&opts)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn gemini_pty_pipe_builder_emits_model_flag() {
+        let args = pty_gemini_args(Some("gemini-2.5-pro"));
+        let idx = args.iter().position(|a| a == "--model");
+        assert!(idx.is_some(), "--model flag must be present, args: {args:?}");
+        assert_eq!(
+            args.get(idx.unwrap() + 1).map(|s| s.as_str()),
+            Some("gemini-2.5-pro"),
+            "--model value must be gemini-2.5-pro"
+        );
+    }
+
+    #[test]
+    fn gemini_pty_pipe_builder_no_model_flag_when_none() {
+        let args = pty_gemini_args(None);
+        assert!(
+            !args.contains(&"--model".to_string()),
+            "--model must not appear when model is None, args: {args:?}"
+        );
+    }
 }
 
 /// Pipe-mode spawn builder for Gemini CLI.
@@ -2262,6 +2298,12 @@ impl CliCommandBuilder for GeminiPipeBuilder {
         // Note: --verbose intentionally omitted (see doc comment above).
         cmd.arg("--output-format");
         cmd.arg("stream-json");
+
+        if let Some(ref model) = opts.model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
+
         cmd.arg("-p");
 
         for arg in &opts.extra_args {

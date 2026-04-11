@@ -27,6 +27,33 @@ impl std::fmt::Display for CliTool {
     }
 }
 
+impl CliTool {
+    /// Returns static capability metadata for this CLI tool.
+    ///
+    /// The returned reference points to a `'static` constant; no allocation occurs.
+    /// Consumers use this to populate model pickers, permission selectors, and
+    /// feature-flag-gated UI panels.
+    ///
+    /// # Example
+    /// ```rust
+    /// use gate4agent::CliTool;
+    /// let caps = CliTool::ClaudeCode.capabilities();
+    /// let default_model = caps.default_model().map(|m| m.id);
+    /// let models: Vec<&str> = caps.available_models.iter().map(|m| m.id).collect();
+    /// ```
+    pub fn capabilities(&self) -> &'static crate::core::capabilities::CliCapabilities {
+        use crate::core::capabilities::{
+            CLAUDE_CAPABILITIES, CODEX_CAPABILITIES, GEMINI_CAPABILITIES, OPENCODE_CAPABILITIES,
+        };
+        match self {
+            CliTool::ClaudeCode => &CLAUDE_CAPABILITIES,
+            CliTool::Codex => &CODEX_CAPABILITIES,
+            CliTool::Gemini => &GEMINI_CAPABILITIES,
+            CliTool::OpenCode => &OPENCODE_CAPABILITIES,
+        }
+    }
+}
+
 /// Session configuration for spawning an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {

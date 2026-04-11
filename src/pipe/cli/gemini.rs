@@ -196,6 +196,11 @@ impl super::traits::CliCommandBuilder for GeminiPipeBuilder {
             cmd.arg(session_id);
         }
 
+        if let Some(ref model) = opts.model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
+
         if opts.sandbox {
             cmd.arg("--sandbox");
         }
@@ -460,5 +465,48 @@ mod tests {
         let line = r#"{"type":"message","role":"assistant","content":"","delta":true}"#;
         let events = p.parse_line(line);
         assert!(events.is_empty(), "empty content must not produce events, got: {events:?}");
+    }
+
+    // ── Builder tests ─────────────────────────────────────────────────────────
+
+    fn make_opts(model: Option<&str>) -> SpawnOptions {
+        SpawnOptions {
+            model: model.map(|s| s.to_string()),
+            prompt: "test".to_string(),
+            ..SpawnOptions::default()
+        }
+    }
+
+    fn args_of(cmd: std::process::Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn gemini_pipe_builder_emits_model_flag() {
+        use super::super::traits::CliCommandBuilder;
+        let builder = GeminiPipeBuilder;
+        let opts = make_opts(Some("gemini-2.5-pro"));
+        let cmd = builder.build_command(&opts);
+        let args = args_of(cmd);
+        let idx = args.iter().position(|a| a == "--model");
+        assert!(idx.is_some(), "--model flag must be present, args: {args:?}");
+        assert_eq!(
+            args.get(idx.unwrap() + 1).map(|s| s.as_str()),
+            Some("gemini-2.5-pro"),
+            "--model value must be gemini-2.5-pro"
+        );
+    }
+
+    #[test]
+    fn gemini_pipe_builder_no_model_flag_when_none() {
+        use super::super::traits::CliCommandBuilder;
+        let builder = GeminiPipeBuilder;
+        let opts = make_opts(None);
+        let cmd = builder.build_command(&opts);
+        let args = args_of(cmd);
+        assert!(
+            !args.contains(&"--model".to_string()),
+            "--model must not appear when model is None, args: {args:?}"
+        );
     }
 }

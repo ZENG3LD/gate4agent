@@ -314,7 +314,19 @@ impl super::traits::CliCommandBuilder for CodexPipeBuilder {
         }
 
         cmd.arg("--json");
-        cmd.arg("--full-auto");
+        // Codex approval mode is a positional flag, not --permission-mode.
+        // Map SpawnOptions::permission_mode to the correct Codex CLI flag.
+        match opts.permission_mode.as_deref() {
+            Some("suggest") => {
+                cmd.arg("--suggest");
+            }
+            Some("auto-edit") => {
+                cmd.arg("--auto-edit");
+            }
+            _ => {
+                cmd.arg("--full-auto");
+            }
+        }
         cmd.arg("--skip-git-repo-check");
 
         if let Some(ref model) = opts.model {
@@ -507,5 +519,58 @@ mod tests {
             }
             other => panic!("expected AssistantText, got {:?}", other),
         }
+    }
+
+    // ── Builder tests ─────────────────────────────────────────────────────────
+
+    fn make_opts(permission_mode: Option<&str>) -> SpawnOptions {
+        SpawnOptions {
+            permission_mode: permission_mode.map(|s| s.to_string()),
+            prompt: "test".to_string(),
+            ..SpawnOptions::default()
+        }
+    }
+
+    fn args_of(cmd: std::process::Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn codex_pipe_builder_suggest_mode() {
+        use super::super::traits::CliCommandBuilder;
+        let builder = CodexPipeBuilder;
+        let opts = make_opts(Some("suggest"));
+        let args = args_of(builder.build_command(&opts));
+        assert!(args.contains(&"--suggest".to_string()), "--suggest must be present, args: {args:?}");
+        assert!(!args.contains(&"--full-auto".to_string()), "--full-auto must be absent, args: {args:?}");
+        assert!(!args.contains(&"--auto-edit".to_string()), "--auto-edit must be absent, args: {args:?}");
+    }
+
+    #[test]
+    fn codex_pipe_builder_auto_edit_mode() {
+        use super::super::traits::CliCommandBuilder;
+        let builder = CodexPipeBuilder;
+        let opts = make_opts(Some("auto-edit"));
+        let args = args_of(builder.build_command(&opts));
+        assert!(args.contains(&"--auto-edit".to_string()), "--auto-edit must be present, args: {args:?}");
+        assert!(!args.contains(&"--full-auto".to_string()), "--full-auto must be absent, args: {args:?}");
+    }
+
+    #[test]
+    fn codex_pipe_builder_default_is_full_auto() {
+        use super::super::traits::CliCommandBuilder;
+        let builder = CodexPipeBuilder;
+        let opts = make_opts(None);
+        let args = args_of(builder.build_command(&opts));
+        assert!(args.contains(&"--full-auto".to_string()), "--full-auto must be present by default, args: {args:?}");
+    }
+
+    #[test]
+    fn codex_pipe_builder_full_auto_explicit() {
+        use super::super::traits::CliCommandBuilder;
+        let builder = CodexPipeBuilder;
+        let opts = make_opts(Some("full-auto"));
+        let args = args_of(builder.build_command(&opts));
+        assert!(args.contains(&"--full-auto".to_string()), "--full-auto must be present for explicit 'full-auto', args: {args:?}");
     }
 }

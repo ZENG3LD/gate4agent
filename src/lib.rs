@@ -15,6 +15,7 @@
 //! - [`AcpSession`] — ACP transport (multi-turn JSON-RPC 2.0, Gemini/OpenCode/Claude)
 //! - [`MultiCliManager`] — high-level session manager for the chart app
 
+pub use core::capabilities::{CliCapabilities, CliFeatures, ModelInfo, PermissionModeInfo};
 pub use core::error::AgentError;
 pub use core::types::{AgentEvent, CliTool, SessionConfig};
 pub use transport::{SpawnOptions, TransportSession};

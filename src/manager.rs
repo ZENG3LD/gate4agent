@@ -459,6 +459,7 @@ impl MultiCliManager {
                     inst.pipe_rx = Some(session.subscribe());
                     inst.transport_session = Some(session);
                     inst.session_active = true;
+                    inst.context_tracker = ContextTracker::unknown();
                     Ok(())
                 }
                 Err(e) => Err(format!("Failed to spawn pipe for instance {:?}: {}", id, e)),
@@ -731,6 +732,7 @@ impl MultiCliManager {
                 inst.pipe_rx = Some(session.subscribe());
                 inst.transport_session = Some(session);
                 inst.session_active = true;
+                inst.context_tracker = ContextTracker::unknown();
                 Ok(())
             }
             Err(e) => Err(format!("Failed to spawn pipe for {:?}: {}", cli, e)),
@@ -860,6 +862,7 @@ impl MultiCliManager {
                     inst.pipe_rx = Some(session.subscribe());
                     inst.transport_session = Some(session);
                     inst.session_active = true;
+                    inst.context_tracker = ContextTracker::unknown();
                     Ok(())
                 }
                 Err(e) => Err(format!("Failed to spawn pipe for {:?}: {}", cli, e)),
@@ -962,11 +965,22 @@ impl MultiCliManager {
                     Ok(event) => {
                         had_events = true;
                         match event {
-                            AgentEvent::SessionStart { session_id, .. } => {
+                            AgentEvent::SessionStart { session_id, model, .. } => {
                                 // Capture id for --resume on the next prompt.
                                 // Do NOT push a ChatMessage — that was the source
                                 // of "[tool] unknown · session XXXX" spam.
                                 inst.pipe_session_id = Some(session_id);
+                                // Init context tracker from the model's known context window so
+                                // that context_percent is non-zero from the very first turn.
+                                let tool = cli_to_tool(inst.cli);
+                                let caps = tool.capabilities();
+                                if let Some(model_info) = caps.available_models.iter()
+                                    .find(|m| m.id == model || m.display_name == model)
+                                {
+                                    if let Some(window) = model_info.context_window {
+                                        inst.context_tracker = ContextTracker::with_window(window);
+                                    }
+                                }
                             }
                             AgentEvent::Text { text, is_delta: _ } => {
                                 // Finalize any RunningTool status.

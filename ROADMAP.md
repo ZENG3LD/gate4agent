@@ -2,7 +2,11 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.31 (April 2026)
+## Current — 0.2.32 (April 2026)
+
+### Shipped in 0.2.32
+
+- **Fix context_percent always 0%**: Initialize `ContextTracker` from model capabilities at `SessionStart` (matches model ID → `context_window`). Reset tracker on new session spawn so stale data doesn't persist across sessions.
 
 ### Shipped in 0.2.31
 

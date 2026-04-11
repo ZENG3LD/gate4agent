@@ -18,6 +18,7 @@
 pub use core::capabilities::{CliCapabilities, CliFeatures, ModelInfo, PermissionModeInfo};
 pub use core::error::AgentError;
 pub use core::types::{AgentEvent, CliTool, SessionConfig};
+pub use core::image::image_to_prompt_reference;
 pub use transport::{SpawnOptions, TransportSession};
 pub use pipe::{PipeSession, PipeProcessOptions, ClaudeOptions};
 

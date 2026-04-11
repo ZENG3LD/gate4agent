@@ -33,6 +33,10 @@ use crate::core::types::{AgentEvent, CliTool, SessionConfig};
 /// Telegram bots, web UIs, HTTP SSE, Discord bots, etc.
 pub struct PipeSession {
     session_id: String,
+    tool: CliTool,
+    /// Model override passed at spawn time (from `PipeProcessOptions::claude::model`).
+    /// `None` means the tool's built-in default was used.
+    model: Option<String>,
     tx: broadcast::Sender<AgentEvent>,
     stdin: Arc<Mutex<Option<PipeProcess>>>,
     reader_task: JoinHandle<()>,
@@ -50,6 +54,7 @@ impl PipeSession {
         options: PipeProcessOptions,
     ) -> Result<Self, AgentError> {
         let tool = config.tool;
+        let model = options.claude.model.clone();
         let session_id = uuid_v4();
 
         let pipe = PipeProcess::new_with_options(
@@ -77,6 +82,8 @@ impl PipeSession {
 
         Ok(Self {
             session_id,
+            tool,
+            model,
             tx,
             stdin: pipe,
             reader_task,
@@ -109,6 +116,19 @@ impl PipeSession {
     /// Session ID assigned at spawn time.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// CLI tool type this session was spawned with.
+    pub fn tool(&self) -> CliTool {
+        self.tool
+    }
+
+    /// Model override passed at spawn time, if any.
+    ///
+    /// Returns `None` when no explicit model was requested and the tool's
+    /// built-in default is in use.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     /// Kill the pipe process.

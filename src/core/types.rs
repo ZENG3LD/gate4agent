@@ -28,9 +28,12 @@ impl std::fmt::Display for CliTool {
 }
 
 impl CliTool {
-    /// Returns static capability metadata for this CLI tool.
+    /// Returns the default (compile-time) capability descriptor for this CLI tool.
     ///
-    /// The returned reference points to a `'static` constant; no allocation occurs.
+    /// Returns an owned [`CliCapabilities`] populated with hardcoded defaults.
+    /// Use [`discover_capabilities`](Self::discover_capabilities) if you want
+    /// the descriptor enriched by on-disk config files.
+    ///
     /// Consumers use this to populate model pickers, permission selectors, and
     /// feature-flag-gated UI panels.
     ///
@@ -38,19 +41,35 @@ impl CliTool {
     /// ```rust
     /// use gate4agent::CliTool;
     /// let caps = CliTool::ClaudeCode.capabilities();
-    /// let default_model = caps.default_model().map(|m| m.id);
-    /// let models: Vec<&str> = caps.available_models.iter().map(|m| m.id).collect();
+    /// let default_model = caps.default_model().map(|m| m.id.clone());
+    /// let models: Vec<String> = caps.available_models.iter().map(|m| m.id.clone()).collect();
     /// ```
-    pub fn capabilities(&self) -> &'static crate::core::capabilities::CliCapabilities {
+    pub fn capabilities(&self) -> crate::core::capabilities::CliCapabilities {
         use crate::core::capabilities::{
-            CLAUDE_CAPABILITIES, CODEX_CAPABILITIES, GEMINI_CAPABILITIES, OPENCODE_CAPABILITIES,
+            claude_capabilities, codex_capabilities, gemini_capabilities, opencode_capabilities,
         };
         match self {
-            CliTool::ClaudeCode => &CLAUDE_CAPABILITIES,
-            CliTool::Codex => &CODEX_CAPABILITIES,
-            CliTool::Gemini => &GEMINI_CAPABILITIES,
-            CliTool::OpenCode => &OPENCODE_CAPABILITIES,
+            CliTool::ClaudeCode => claude_capabilities(),
+            CliTool::Codex => codex_capabilities(),
+            CliTool::Gemini => gemini_capabilities(),
+            CliTool::OpenCode => opencode_capabilities(),
         }
+    }
+
+    /// Returns capability metadata enriched by reading on-disk CLI config files.
+    ///
+    /// Starts from the compiled-in defaults (same as [`capabilities()`](Self::capabilities)),
+    /// then overlays any model configured in tool-specific config files:
+    ///
+    /// - **Codex**: reads `~/.codex/config.toml` → `model = "…"`
+    /// - **OpenCode**: reads `./opencode.json` or `~/.config/opencode/opencode.json`
+    ///   → `{ "model": { "default": "…" } }`
+    /// - **Claude / Gemini**: returns defaults unchanged (no config-based model info).
+    ///
+    /// Falls back gracefully to defaults if any config file is absent or unreadable.
+    /// Performs only synchronous filesystem I/O; safe to call from any thread.
+    pub fn discover_capabilities(&self) -> crate::core::capabilities::CliCapabilities {
+        crate::core::capabilities::discover(*self)
     }
 }
 

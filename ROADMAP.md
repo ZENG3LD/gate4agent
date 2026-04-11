@@ -2,7 +2,12 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.33 (April 2026)
+## Current — 0.2.34 (April 2026)
+
+### Shipped in 0.2.34
+
+- **fix(context): correct usage_percent formula**: `used_tokens()` now = `input + output + cache_read + cache_write` (matches OpenCode's overflow.ts formula). Per-turn mode: input/cache REPLACE (last turn = current context snapshot), output ACCUMULATES (grows context). Codex `event_msg` normalizes input by subtracting cached to avoid double-counting.
+- **cure module**: runtime model discovery pipeline — reads OpenCode disk cache (`~/.cache/opencode/models.json`), optional OpenRouter fallback (`cure-network` feature), persists to `~/.gate4agent/models.json`. `discover_capabilities()` overlays cure data onto hardcoded defaults.
 
 ### Shipped in 0.2.33
 

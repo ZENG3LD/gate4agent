@@ -52,3 +52,9 @@ pub mod probe;
 pub use probe::{probe_all, probe_force, load_cached_probe, ProbeResult, CliProbe};
 
 pub use context::{ContextTracker, TurnCompleteData};
+
+pub mod cure;
+pub use cure::{cure, load_cure_cache, CureCache, CuredModel, CureError, CureSource};
+
+#[cfg(feature = "cure-network")]
+pub use cure::cure_async;

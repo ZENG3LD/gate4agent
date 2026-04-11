@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent"
-version = "0.2.33"
+version = "0.2.34"
 edition = "2021"
 description = "Universal transport library for CLI AI agents (Claude Code, Codex, Gemini, OpenCode). Pipe, PTY, ACP (Agent Client Protocol), and Daemon transports."
 license = "MIT"
@@ -42,6 +42,16 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # RateLimitDetector patterns, OutputParser regex matching
 regex = "1"
+
+# HTTP client for live OpenRouter model fetch (optional, behind cure-network feature)
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+[features]
+default = []
+# Enable live model discovery via https://openrouter.ai/api/v1/models.
+# Adds reqwest as a dependency. Consumers that only need disk-based cure
+# (OpenCode cache) do not need this feature.
+cure-network = ["dep:reqwest"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

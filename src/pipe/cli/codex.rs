@@ -102,8 +102,13 @@ impl NdjsonParser for CodexNdjsonParser {
                             let ctx_window = info
                                 .get("model_context_window")
                                 .and_then(|v| v.as_u64());
+                            // Codex `input_tokens` INCLUDES cached — subtract
+                            // to match the normalized convention where input =
+                            // uncached portion only (same as OpenCode/Claude).
+                            // Formula: used = input + output + cache_read + cache_write
+                            let net_input = input.saturating_sub(cached);
                             events.push(CliEvent::TurnComplete {
-                                input_tokens: input,
+                                input_tokens: net_input,
                                 output_tokens: output,
                                 cache_read_tokens: cached,
                                 cache_write_tokens: 0,
@@ -579,7 +584,8 @@ mod tests {
                 context_window,
                 is_cumulative,
             } => {
-                assert_eq!(*input_tokens, 5000);
+                // input = 5000 - 300 (cached) = 4700 net uncached
+                assert_eq!(*input_tokens, 4700);
                 assert_eq!(*output_tokens, 200);
                 assert_eq!(*cache_read_tokens, 300);
                 assert_eq!(*cache_write_tokens, 0);

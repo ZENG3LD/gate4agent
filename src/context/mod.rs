@@ -73,21 +73,39 @@ impl ContextTracker {
             self.cumulative_cache_write = ev.cache_write_tokens;
             self.cumulative_reasoning = ev.reasoning_tokens;
         } else {
-            // Per-turn delta: accumulate.
-            self.cumulative_input += ev.input_tokens;
+            // Per-turn delta: accumulate output (generated tokens grow the
+            // context), but REPLACE cache & input counters.
+            //
+            // Why replace?  Claude/Gemini report per-request cache stats:
+            //   cache_read  = tokens served from prompt cache THIS turn
+            //   cache_write = tokens written to cache THIS turn
+            //   input       = tokens NOT in cache THIS turn
+            // These are a snapshot of the current context composition, not
+            // cumulative deltas.  Summing them across 1 000+ turns would
+            // wildly overcount.  The last turn's values reflect the actual
+            // context window occupancy.
+            self.cumulative_input = ev.input_tokens;
             self.cumulative_output += ev.output_tokens;
-            self.cumulative_cache_read += ev.cache_read_tokens;
-            self.cumulative_cache_write += ev.cache_write_tokens;
-            self.cumulative_reasoning += ev.reasoning_tokens;
+            self.cumulative_cache_read = ev.cache_read_tokens;
+            self.cumulative_cache_write = ev.cache_write_tokens;
+            self.cumulative_reasoning = ev.reasoning_tokens;
         }
         if let Some(w) = ev.context_window_hint {
             self.set_window_from_pipe(w);
         }
     }
 
-    /// Total tokens consumed (input + output).
+    /// Total tokens occupying the context window.
+    ///
+    /// For providers with prompt caching (Claude, Gemini), the real context
+    /// size is `cache_read + cache_write + uncached_input + output`.
+    /// `input_tokens` from the API is only the uncached portion, so we must
+    /// add cache counters to get the true window occupancy.
     pub fn used_tokens(&self) -> u64 {
-        self.cumulative_input + self.cumulative_output
+        self.cumulative_input
+            + self.cumulative_output
+            + self.cumulative_cache_read
+            + self.cumulative_cache_write
     }
 
     /// Tokens remaining before context window is full.
@@ -119,22 +137,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_accumulates_per_turn() {
+    fn update_per_turn_replaces_input_accumulates_output() {
         let mut t = ContextTracker::with_window(200_000);
         t.update(&TurnCompleteData {
             input_tokens: 100,
             output_tokens: 50,
+            cache_read_tokens: 5000,
             ..Default::default()
         });
         t.update(&TurnCompleteData {
             input_tokens: 200,
             output_tokens: 80,
+            cache_read_tokens: 5200,
             ..Default::default()
         });
-        assert_eq!(t.cumulative_input, 300);
+        // input/cache REPLACED by last turn values.
+        assert_eq!(t.cumulative_input, 200);
+        assert_eq!(t.cumulative_cache_read, 5200);
+        // output ACCUMULATED across turns.
         assert_eq!(t.cumulative_output, 130);
-        assert_eq!(t.used_tokens(), 430);
-        assert_eq!(t.remaining_tokens(), Some(200_000 - 430));
+        // used = input + output + cache_read + cache_write
+        assert_eq!(t.used_tokens(), 200 + 130 + 5200);
+        assert_eq!(t.remaining_tokens(), Some(200_000 - (200 + 130 + 5200)));
     }
 
     #[test]
@@ -146,8 +170,8 @@ mod tests {
             output_tokens: 50,
             ..Default::default()
         });
-        assert_eq!(t.used_tokens(), 150);
-        // Then: cumulative replaces
+        assert_eq!(t.used_tokens(), 100 + 50); // input + output, no cache
+        // Then: cumulative replaces ALL counters
         t.update(&TurnCompleteData {
             input_tokens: 1240,
             output_tokens: 88,
@@ -160,7 +184,8 @@ mod tests {
         assert_eq!(t.cumulative_output, 88);
         assert_eq!(t.cumulative_cache_read, 900);
         assert_eq!(t.cumulative_reasoning, 12);
-        assert_eq!(t.used_tokens(), 1328);
+        // used = input + output + cache_read + cache_write
+        assert_eq!(t.used_tokens(), 1240 + 88 + 900);
     }
 
     #[test]
@@ -182,14 +207,18 @@ mod tests {
 
     #[test]
     fn usage_percent_correct() {
-        let mut t = ContextTracker::with_window(1000);
+        let mut t = ContextTracker::with_window(1_000_000);
+        // Simulate a Claude turn: 3 uncached input, 43K cached, 200 output.
         t.update(&TurnCompleteData {
-            input_tokens: 250,
-            output_tokens: 250,
+            input_tokens: 3,
+            output_tokens: 200,
+            cache_read_tokens: 43_000,
             ..Default::default()
         });
+        // used = 3 + 200 + 43_000 = 43_203
         let pct = t.usage_percent().unwrap();
-        assert!((pct - 50.0).abs() < 0.01);
+        let expected = 43_203.0 / 1_000_000.0 * 100.0;
+        assert!((pct - expected).abs() < 0.01, "got {pct}, expected {expected}");
     }
 
     #[test]
@@ -239,5 +268,54 @@ mod tests {
         };
         let t = ContextTracker::from_model_info(&info);
         assert!(t.context_window.is_none());
+    }
+
+    /// Realistic Claude session: 3 turns, cache grows, output accumulates.
+    /// Based on real session data: input_tokens=1-6, cache_read=27K→43K.
+    #[test]
+    fn realistic_claude_session() {
+        let mut t = ContextTracker::with_window(1_000_000);
+
+        // Turn 1: initial prompt
+        t.update(&TurnCompleteData {
+            input_tokens: 6,
+            output_tokens: 139,
+            cache_read_tokens: 27_385,
+            cache_write_tokens: 21_482,
+            ..Default::default()
+        });
+        // input=6, output=139, cache_read=27385, cache_write=21482
+        assert_eq!(t.used_tokens(), 6 + 139 + 27_385 + 21_482);
+
+        // Turn 2: context grows, most is cached
+        t.update(&TurnCompleteData {
+            input_tokens: 3,
+            output_tokens: 280,
+            cache_read_tokens: 35_000,
+            cache_write_tokens: 500,
+            ..Default::default()
+        });
+        // input REPLACED=3, output ACCUMULATED=139+280=419,
+        // cache_read REPLACED=35000, cache_write REPLACED=500
+        assert_eq!(t.cumulative_input, 3);
+        assert_eq!(t.cumulative_output, 419);
+        assert_eq!(t.cumulative_cache_read, 35_000);
+        assert_eq!(t.cumulative_cache_write, 500);
+        assert_eq!(t.used_tokens(), 3 + 419 + 35_000 + 500);
+
+        // Turn 3: near end of session
+        t.update(&TurnCompleteData {
+            input_tokens: 3,
+            output_tokens: 150,
+            cache_read_tokens: 43_429,
+            cache_write_tokens: 0,
+            ..Default::default()
+        });
+        assert_eq!(t.cumulative_output, 569); // 419 + 150
+        assert_eq!(t.used_tokens(), 3 + 569 + 43_429 + 0);
+        // ~4.4% of 1M window — matches real session data
+        let pct = t.usage_percent().unwrap();
+        assert!(pct < 5.0, "usage should be ~4.4%, got {pct}%");
+        assert!(pct > 3.0, "usage should be ~4.4%, got {pct}%");
     }
 }

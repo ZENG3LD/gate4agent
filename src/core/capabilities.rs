@@ -401,13 +401,9 @@ fn update_default_model(models: &mut Vec<ModelInfo>, discovered_id: &str) {
     }
 }
 
-/// Cross-platform home directory lookup without the `dirs` crate.
+/// Cross-platform home directory lookup — delegates to `crate::utils::home_dir`.
 fn home_dir() -> Option<PathBuf> {
-    // Try $HOME first (Unix), then $USERPROFILE (Windows).
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(PathBuf::from)
+    crate::utils::home_dir()
 }
 
 // ── Public discovery API (used by CliTool::discover_capabilities) ─────────────
@@ -417,6 +413,10 @@ fn home_dir() -> Option<PathBuf> {
 /// Falls back to the compiled-in defaults for any tool whose config is
 /// absent or unreadable. Safe to call from any thread; performs only
 /// synchronous filesystem I/O.
+///
+/// Also overlays `context_window` values from the cure cache
+/// (`~/.gate4agent/models.json`) if it exists. Run `gate4agent::cure()` at
+/// init time to populate it.
 pub(crate) fn discover(
     tool: crate::core::types::CliTool,
 ) -> CliCapabilities {
@@ -428,6 +428,13 @@ pub(crate) fn discover(
         CliTool::Gemini => gemini_capabilities(),
         CliTool::OpenCode => opencode_capabilities(),
     };
+
+    // Overlay context_window values from the cure cache (non-fatal if absent).
+    if let Some(cure_cache) = crate::cure::load_cure_cache() {
+        if let Some(cured_models) = cure_cache.tools.get(caps.tool_id.as_str()) {
+            apply_cure_context_windows(&mut caps.available_models, cured_models);
+        }
+    }
 
     match tool {
         CliTool::Codex => {
@@ -445,6 +452,31 @@ pub(crate) fn discover(
     }
 
     caps
+}
+
+/// Update `context_window` for models that appear in both lists.
+///
+/// Does **not** add new models — only enriches context-window data for models
+/// already present in the compiled-in defaults. Adding unknown models from the
+/// cure cache would bloat the picker with every provider model.
+fn apply_cure_context_windows(
+    models: &mut Vec<ModelInfo>,
+    cured: &[crate::cure::CuredModel],
+) {
+    use std::collections::HashMap;
+    // Build lookup: cured_id → context_window.
+    let lookup: HashMap<&str, Option<u64>> = cured
+        .iter()
+        .map(|c| (c.id.as_str(), c.context_window))
+        .collect();
+
+    for m in models.iter_mut() {
+        if let Some(&ctx) = lookup.get(m.id.as_str()) {
+            if ctx.is_some() {
+                m.context_window = ctx;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

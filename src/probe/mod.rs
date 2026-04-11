@@ -103,10 +103,7 @@ fn do_probe() -> ProbeResult {
 }
 
 fn cache_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(std::path::PathBuf::from)?;
+    let home = crate::utils::home_dir()?;
     Some(home.join(".gate4agent").join("probe-cache.json"))
 }
 

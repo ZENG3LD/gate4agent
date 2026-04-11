@@ -2,7 +2,11 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.32 (April 2026)
+## Current — 0.2.33 (April 2026)
+
+### Shipped in 0.2.33
+
+- **fix(capabilities)**: correct context windows and model IDs for all 4 CLIs — Claude Opus/Sonnet 4.6 → 1M tokens, Codex all → 272K, Gemini preview IDs fixed, OpenCode models updated to current.
 
 ### Shipped in 0.2.32
 

@@ -172,8 +172,8 @@ pub(crate) fn claude_capabilities() -> CliCapabilities {
         display_name: "Claude Code".to_string(),
         binary: "claude".to_string(),
         available_models: vec![
-            model("claude-opus-4-6", "Claude Opus 4.6", false, false, Some(200_000)),
-            model("claude-sonnet-4-6", "Claude Sonnet 4.6", true, false, Some(200_000)),
+            model("claude-opus-4-6", "Claude Opus 4.6", false, false, Some(1_048_576)),
+            model("claude-sonnet-4-6", "Claude Sonnet 4.6", true, false, Some(1_048_576)),
             model("claude-haiku-4-5", "Claude Haiku 4.5", false, false, Some(200_000)),
             model("opus", "Opus (alias)", false, false, None),
             model("sonnet", "Sonnet (alias)", false, false, None),
@@ -211,10 +211,10 @@ pub(crate) fn codex_capabilities() -> CliCapabilities {
         display_name: "Codex".to_string(),
         binary: "codex".to_string(),
         available_models: vec![
-            model("gpt-5.4", "GPT-5.4", true, false, Some(258_400)),
-            model("gpt-5.4-mini", "GPT-5.4 Mini", false, false, Some(128_000)),
-            model("gpt-5.3-codex", "GPT-5.3 Codex", false, false, Some(200_000)),
-            model("gpt-5.2", "GPT-5.2", false, false, Some(128_000)),
+            model("gpt-5.4", "GPT-5.4", true, false, Some(272_000)),
+            model("gpt-5.4-mini", "GPT-5.4 Mini", false, false, Some(272_000)),
+            model("gpt-5.3-codex", "GPT-5.3 Codex", false, false, Some(272_000)),
+            model("gpt-5.2", "GPT-5.2", false, false, Some(272_000)),
         ],
         // Codex uses --full-auto / --suggest / --auto-edit as approval mode flags (not a
         // --permission-mode string). We surface them as permission modes so the UI can offer
@@ -249,10 +249,10 @@ pub(crate) fn gemini_capabilities() -> CliCapabilities {
         display_name: "Gemini".to_string(),
         binary: "gemini".to_string(),
         available_models: vec![
-            model("gemini-2.5-pro", "Gemini 2.5 Pro", false, false, Some(1_000_000)),
-            model("gemini-2.5-flash", "Gemini 2.5 Flash", false, true, Some(1_000_000)),
-            model("gemini-3.1-pro", "Gemini 3.1 Pro", true, false, Some(2_000_000)),
-            model("gemini-3.0-flash", "Gemini 3.0 Flash", false, true, Some(1_000_000)),
+            model("gemini-2.5-pro", "Gemini 2.5 Pro", false, false, Some(1_048_576)),
+            model("gemini-2.5-flash", "Gemini 2.5 Flash", false, true, Some(1_048_576)),
+            model("gemini-3.1-pro-preview", "Gemini 3.1 Pro", true, false, Some(1_048_576)),
+            model("gemini-3-flash-preview", "Gemini 3.0 Flash", false, true, Some(1_048_576)),
         ],
         permission_modes: vec![
             perm("default", "Default", "Standard Gemini permissions.", true),
@@ -286,15 +286,15 @@ pub(crate) fn opencode_capabilities() -> CliCapabilities {
         binary: "opencode".to_string(),
         available_models: vec![
             // Free tier (no API key required)
-            model("opencode/gpt-5-nano", "OpenCode GPT-5 Nano (free)", true, true, None),
+            model("opencode/gpt-5-nano", "OpenCode GPT-5 Nano (free)", true, true, Some(128_000)),
             // Anthropic via API key
-            model("anthropic/claude-sonnet-4-5", "Claude Sonnet 4.5", false, false, None),
-            model("anthropic/claude-opus-4", "Claude Opus 4", false, false, None),
+            model("anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6", false, false, Some(1_048_576)),
+            model("anthropic/claude-opus-4-6", "Claude Opus 4.6", false, false, Some(1_048_576)),
             // OpenAI via API key
-            model("openai/gpt-4o", "GPT-4o", false, false, None),
-            model("openai/gpt-5", "GPT-5", false, false, None),
+            model("openai/gpt-5.4", "GPT-5.4", false, false, Some(272_000)),
+            model("openai/gpt-5", "GPT-5", false, false, Some(272_000)),
             // Google via API key
-            model("google/gemini-2.5-pro", "Gemini 2.5 Pro", false, false, None),
+            model("google/gemini-2.5-pro", "Gemini 2.5 Pro", false, false, Some(1_048_576)),
         ],
         // OpenCode has no permission modes concept.
         permission_modes: vec![],
@@ -660,7 +660,7 @@ mod tests {
         let config_path = dir.join("opencode.json");
         std::fs::write(
             &config_path,
-            r#"{"model":{"default":"anthropic/claude-opus-4"}}"#,
+            r#"{"model":{"default":"anthropic/claude-opus-4-6"}}"#,
         )
         .unwrap();
 
@@ -671,6 +671,6 @@ mod tests {
             .and_then(|m| m.get("default"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        assert_eq!(model_id.as_deref(), Some("anthropic/claude-opus-4"));
+        assert_eq!(model_id.as_deref(), Some("anthropic/claude-opus-4-6"));
     }
 }

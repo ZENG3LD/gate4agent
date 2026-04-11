@@ -962,16 +962,8 @@ impl MultiCliManager {
                                 inst.pipe_session_id = Some(session_id);
                             }
                             AgentEvent::Text { text, is_delta: _ } => {
-                                // Finalize any RunningTool status: push a "done" history entry.
-                                if let LiveStatus::RunningTool { ref name, done } =
-                                    inst.live_status.clone()
-                                {
-                                    inst.chat_messages.push(ChatMessage {
-                                        role: ChatRole::Tool,
-                                        content: format!("✓ {} · {} done", name, done),
-                                        tool_name: Some(name.clone()),
-                                    });
-                                }
+                                // Finalize any RunningTool status.
+                                // ToolStart already pushed a Tool bubble, so just clear status.
                                 inst.live_status = LiveStatus::Idle;
 
                                 if let Some(last) = inst.chat_messages.last_mut() {
@@ -999,22 +991,46 @@ impl MultiCliManager {
                                         tool_name: Some(prev.clone()),
                                     });
                                 }
+                                // Push an immediate tool-start bubble so the UI shows the tool name.
+                                inst.chat_messages.push(ChatMessage {
+                                    role: ChatRole::Tool,
+                                    content: String::new(),
+                                    tool_name: Some(name.clone()),
+                                });
                                 // Start tracking the new tool.
                                 inst.live_status = LiveStatus::RunningTool { name, done: 0 };
                             }
                             AgentEvent::ToolResult {
                                 id: _,
-                                output: _,
+                                output,
                                 is_error: _,
                                 ..
                             } => {
+                                // Update the last Tool message with output (if it exists and is empty).
+                                if let Some(last) = inst.chat_messages.last_mut() {
+                                    if last.role == ChatRole::Tool && last.content.is_empty() {
+                                        last.content = output;
+                                    }
+                                }
                                 if let LiveStatus::RunningTool { done, .. } = &mut inst.live_status
                                 {
                                     *done = done.saturating_add(1);
                                 }
                             }
-                            AgentEvent::Thinking { text: _ } => {
-                                // Keep Thinking status as-is; suppress bubble noise.
+                            AgentEvent::Thinking { text } => {
+                                // Push thinking content as a Thinking bubble.
+                                // Consecutive thinking events merge into a single message.
+                                if let Some(last) = inst.chat_messages.last_mut() {
+                                    if last.role == ChatRole::Thinking {
+                                        last.content.push_str(&text);
+                                        continue;
+                                    }
+                                }
+                                inst.chat_messages.push(ChatMessage {
+                                    role: ChatRole::Thinking,
+                                    content: text,
+                                    tool_name: None,
+                                });
                             }
                             AgentEvent::Error { message } => {
                                 inst.live_status = LiveStatus::Idle;
@@ -1025,16 +1041,7 @@ impl MultiCliManager {
                                 });
                             }
                             AgentEvent::TurnComplete { .. } => {
-                                // Finalize any in-flight tool and clear live status.
-                                if let LiveStatus::RunningTool { ref name, done } =
-                                    inst.live_status.clone()
-                                {
-                                    inst.chat_messages.push(ChatMessage {
-                                        role: ChatRole::Tool,
-                                        content: format!("✓ {} · {} done", name, done),
-                                        tool_name: Some(name.clone()),
-                                    });
-                                }
+                                // Clear live status. ToolStart already pushed bubbles.
                                 inst.live_status = LiveStatus::Idle;
                             }
                             AgentEvent::SessionEnd {
@@ -1045,16 +1052,6 @@ impl MultiCliManager {
                                         role: ChatRole::Error,
                                         content: format!("Session error · {}", result),
                                         tool_name: None,
-                                    });
-                                }
-                                // Finalize any in-flight tool.
-                                if let LiveStatus::RunningTool { ref name, done } =
-                                    inst.live_status.clone()
-                                {
-                                    inst.chat_messages.push(ChatMessage {
-                                        role: ChatRole::Tool,
-                                        content: format!("✓ {} · {} done", name, done),
-                                        tool_name: Some(name.clone()),
                                     });
                                 }
                                 inst.live_status = LiveStatus::Idle;

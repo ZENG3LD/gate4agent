@@ -58,7 +58,7 @@ fn main() {
                     CliEvent::ToolCallStart { name, .. } => {
                         println!("[TOOL] {}", name);
                     }
-                    CliEvent::TurnComplete { input_tokens, output_tokens } => {
+                    CliEvent::TurnComplete { input_tokens, output_tokens, .. } => {
                         println!("\n[TOKENS] in={} out={}", input_tokens, output_tokens);
                     }
                     CliEvent::SessionEnd { result, cost_usd, is_error } => {

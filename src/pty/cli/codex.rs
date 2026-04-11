@@ -674,7 +674,7 @@ impl CodexOutputParser {
 
     /// Parse model selection menu.
     /// Pattern:
-    /// ```
+    /// ```text
     /// Select Model and Effort
     /// › 1. gpt-5.2-codex (current)  Latest frontier agentic coding model.
     ///   2. gpt-5.1-codex-max        Codex-optimized flagship for deep and fast reasoning.

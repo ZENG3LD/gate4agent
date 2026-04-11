@@ -399,7 +399,15 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
                 (0, 0)
             };
             vec![
-                AgentEvent::TurnComplete { input_tokens: tok_in, output_tokens: tok_out },
+                AgentEvent::TurnComplete {
+                    input_tokens: tok_in,
+                    output_tokens: tok_out,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    context_window: None,
+                    is_cumulative: false,
+                },
                 AgentEvent::SessionEnd {
                     result: stop_reason.clone(),
                     cost_usd: None,

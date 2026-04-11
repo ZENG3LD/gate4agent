@@ -122,6 +122,7 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 - **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks
 - **4 CLI agents** — Claude Code, Codex, Gemini, OpenCode
 - **Session history** — per-CLI session listing with workdir scoping, preview extraction, and resume support (Claude JSONL, Codex JSONL, Gemini JSON, OpenCode SQLite)
+- **Probe + context tracking** — `probe_all()` discovers installed CLIs (sync, filesystem-only, cached 1h); `ContextTracker` accumulates token usage, computes remaining context window capacity
 
 ## Architecture
 
@@ -143,6 +144,8 @@ gate4agent/
 │   │   └── spawn.rs     — AcpProcess + per-CLI spawn specs
 │   ├── rpc/             — Shared JSON-RPC 2.0 primitives (message, pending, handler, id)
 │   │                      Used internally by acp/. Not a standalone transport.
+│   ├── probe/          — probe_all(), ProbeResult, CliProbe, cache logic
+│   ├── context/        — ContextTracker, TurnCompleteData
 │   ├── daemon/         — DaemonSession, per-daemon adapters [skeleton]
 │   ├── history/         — Session history readers (per-CLI format)
 │   │   ├── claude.rs    — JSONL from ~/.claude/projects/{cwd}/
@@ -210,6 +213,10 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.21** — Docs: fixed README Quick Start example, renamed rpc_hello → acp_hello example.
 - **0.2.22** — History readers: preview extraction for Codex/Gemini/OpenCode (first real user message), system message filtering (Codex injected XML/AGENTS.md content excluded).
 - **0.2.23** — History readers: Codex zombie session filter (sessions with no user input excluded), OpenCode SQLite reader (reads from ~/.local/share/opencode/opencode.db instead of nonexistent ~/.opencode/).
+- **0.2.24** — History readers: Codex duplicate message fix (skip `response_item` with role=user), old `.json` session format removed (no cwd field = leaked into all projects).
+- **0.2.25–0.2.28** — `CliCapabilities` API: `ModelInfo`, `PermissionModeInfo`, `CliFeatures` per CLI tool. Gemini `--model` flag support, Codex configurable permission modes, Claude conditional `--dangerously-skip-permissions`.
+- **0.2.29** — Dynamic model discovery: `discover_capabilities()` reads CLI configs (Codex `~/.codex/config.toml`, OpenCode `opencode.json`). Model picker enrichment at runtime.
+- **0.2.30** — **Probe + Context tracking**: `probe_all()` discovers installed CLIs with caching (`~/.gate4agent/probe-cache.json`). `ContextTracker` accumulates tokens per session, computes remaining context. Extended `TurnComplete` with `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `context_window`, `is_cumulative`. Codex `event_msg/token_count` parser (cumulative totals + `model_context_window`). Claude/Gemini/OpenCode parsers extract cache and reasoning tokens. Fixed Claude model IDs (4 → 4.6). Removed `image_to_prompt_reference()` and `PipeSession::tool()`.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

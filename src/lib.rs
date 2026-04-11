@@ -18,11 +18,11 @@
 pub use core::capabilities::{CliCapabilities, CliFeatures, ModelInfo, PermissionModeInfo};
 pub use core::error::AgentError;
 pub use core::types::{AgentEvent, CliTool, SessionConfig};
-pub use core::image::image_to_prompt_reference;
 pub use transport::{SpawnOptions, TransportSession};
 pub use pipe::{PipeSession, PipeProcessOptions, ClaudeOptions};
 
 pub mod acp;
+pub mod context;
 pub mod core;
 pub mod transport;
 pub mod pty;
@@ -47,3 +47,8 @@ pub use history::{HistoryReader, SessionMeta, reader_for};
 pub(crate) mod utils;
 
 pub use daemon::{DaemonSession, DaemonConfig, DaemonType, DaemonAuth};
+
+pub mod probe;
+pub use probe::{probe_all, probe_force, load_cached_probe, ProbeResult, CliProbe};
+
+pub use context::{ContextTracker, TurnCompleteData};

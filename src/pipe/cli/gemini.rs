@@ -139,10 +139,23 @@ impl NdjsonParser for GeminiNdjsonParser {
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    let cache_read = stats
+                        .get("cached_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let reasoning = stats
+                        .get("thoughts_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     if input > 0 || output > 0 {
                         events.push(CliEvent::TurnComplete {
                             input_tokens: input,
                             output_tokens: output,
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: 0,
+                            reasoning_tokens: reasoning,
+                            context_window: None,
+                            is_cumulative: false,
                         });
                     }
                 }
@@ -406,7 +419,7 @@ mod tests {
         // Expect TurnComplete + SessionEnd
         assert_eq!(events.len(), 2, "result with stats must emit TurnComplete + SessionEnd");
         match &events[0] {
-            CliEvent::TurnComplete { input_tokens, output_tokens } => {
+            CliEvent::TurnComplete { input_tokens, output_tokens, .. } => {
                 assert_eq!(*input_tokens, 80);
                 assert_eq!(*output_tokens, 20);
             }
@@ -417,6 +430,34 @@ mod tests {
                 assert!(!*is_error, "expected is_error=false for status=success");
             }
             other => panic!("expected SessionEnd second, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_result_with_cached_and_thoughts_tokens() {
+        let mut p = parser();
+        let line = r#"{"type":"result","timestamp":"2026-01-01T00:00:00Z","status":"success","stats":{"input_tokens":100,"output_tokens":40,"cached_tokens":20,"thoughts_tokens":10}}"#;
+        let events = p.parse_line(line);
+        assert_eq!(events.len(), 2, "result with stats must emit TurnComplete + SessionEnd");
+        match &events[0] {
+            CliEvent::TurnComplete {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                context_window,
+                is_cumulative,
+            } => {
+                assert_eq!(*input_tokens, 100);
+                assert_eq!(*output_tokens, 40);
+                assert_eq!(*cache_read_tokens, 20);
+                assert_eq!(*cache_write_tokens, 0);
+                assert_eq!(*reasoning_tokens, 10);
+                assert!(context_window.is_none());
+                assert!(!is_cumulative);
+            }
+            other => panic!("expected TurnComplete, got: {other:?}"),
         }
     }
 

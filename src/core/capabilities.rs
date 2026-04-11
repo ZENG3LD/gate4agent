@@ -27,7 +27,7 @@ pub struct ModelInfo {
     pub is_free_tier: bool,
 
     /// Optional context window size in tokens (for display in model picker).
-    pub context_window: Option<u32>,
+    pub context_window: Option<u64>,
 }
 
 /// Metadata about one permission mode offered by a CLI tool.
@@ -94,7 +94,7 @@ pub struct CliFeatures {
 ///
 /// Returned by [`crate::core::types::CliTool::capabilities()`] (static defaults) or
 /// [`crate::core::types::CliTool::discover_capabilities()`] (dynamic, config-enriched).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliCapabilities {
     /// Canonical identifier matching `CliTool` variant (snake_case, stable).
     pub tool_id: String,
@@ -143,7 +143,7 @@ fn model(
     display_name: &str,
     is_default: bool,
     is_free_tier: bool,
-    context_window: Option<u32>,
+    context_window: Option<u64>,
 ) -> ModelInfo {
     ModelInfo {
         id: id.to_string(),
@@ -172,11 +172,9 @@ pub(crate) fn claude_capabilities() -> CliCapabilities {
         display_name: "Claude Code".to_string(),
         binary: "claude".to_string(),
         available_models: vec![
-            model("claude-opus-4", "Claude Opus 4", false, false, Some(200_000)),
-            model("claude-opus-4-1m", "Claude Opus 4 (1M ctx)", false, false, Some(1_000_000)),
-            model("claude-sonnet-4", "Claude Sonnet 4", true, false, Some(200_000)),
-            model("claude-sonnet-4-1m", "Claude Sonnet 4 (1M ctx)", false, false, Some(1_000_000)),
-            model("claude-haiku-4", "Claude Haiku 4", false, false, Some(200_000)),
+            model("claude-opus-4-6", "Claude Opus 4.6", false, false, Some(200_000)),
+            model("claude-sonnet-4-6", "Claude Sonnet 4.6", true, false, Some(200_000)),
+            model("claude-haiku-4-5", "Claude Haiku 4.5", false, false, Some(200_000)),
             model("opus", "Opus (alias)", false, false, None),
             model("sonnet", "Sonnet (alias)", false, false, None),
             model("haiku", "Haiku (alias)", false, false, None),
@@ -213,10 +211,10 @@ pub(crate) fn codex_capabilities() -> CliCapabilities {
         display_name: "Codex".to_string(),
         binary: "codex".to_string(),
         available_models: vec![
-            model("gpt-5.4", "GPT-5.4", true, false, None),
-            model("gpt-5.4-mini", "GPT-5.4 Mini", false, false, None),
-            model("gpt-5.3-codex", "GPT-5.3 Codex", false, false, None),
-            model("gpt-5.2", "GPT-5.2", false, false, None),
+            model("gpt-5.4", "GPT-5.4", true, false, Some(258_400)),
+            model("gpt-5.4-mini", "GPT-5.4 Mini", false, false, Some(128_000)),
+            model("gpt-5.3-codex", "GPT-5.3 Codex", false, false, Some(200_000)),
+            model("gpt-5.2", "GPT-5.2", false, false, Some(128_000)),
         ],
         // Codex uses --full-auto / --suggest / --auto-edit as approval mode flags (not a
         // --permission-mode string). We surface them as permission modes so the UI can offer

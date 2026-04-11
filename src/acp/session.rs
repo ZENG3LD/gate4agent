@@ -299,7 +299,15 @@ impl AcpSession {
             .unwrap_or("end_turn")
             .to_owned();
         let (input_tokens, output_tokens) = extract_token_usage(&result);
-        let _ = self.tx.send(AgentEvent::TurnComplete { input_tokens, output_tokens });
+        let _ = self.tx.send(AgentEvent::TurnComplete {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            context_window: None,
+            is_cumulative: false,
+        });
         let _ = self.tx.send(AgentEvent::SessionEnd {
             result: stop_reason,
             cost_usd: None,

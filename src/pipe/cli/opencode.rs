@@ -186,10 +186,27 @@ impl NdjsonParser for OpenCodeNdjsonParser {
                     .pointer("/part/tokens/output")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                let reasoning_tokens = v
+                    .pointer("/part/tokens/reasoning")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cache_read_tokens = v
+                    .pointer("/part/tokens/cache/read")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cache_write_tokens = v
+                    .pointer("/part/tokens/cache/write")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if input_tokens > 0 || output_tokens > 0 {
                     events.push(CliEvent::TurnComplete {
                         input_tokens,
                         output_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                        reasoning_tokens,
+                        context_window: None,
+                        is_cumulative: false,
                     });
                 }
             }
@@ -382,9 +399,38 @@ mod tests {
             other => panic!("expected SessionStart, got {:?}", other),
         }
         match &events[1] {
-            CliEvent::TurnComplete { input_tokens, output_tokens } => {
+            CliEvent::TurnComplete { input_tokens, output_tokens, .. } => {
                 assert_eq!(*input_tokens, 14290);
                 assert_eq!(*output_tokens, 6);
+            }
+            other => panic!("expected TurnComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn opencode_step_finish_with_reasoning_and_cache() {
+        let mut parser = OpenCodeNdjsonParser::new();
+        let line = r#"{"type":"step_finish","sessionID":"ses_xyz","part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"input":5000,"output":200,"reasoning":150,"cache":{"read":100,"write":50}}}}"#;
+        let events = parser.parse_line(line);
+        // First event is synthesized SessionStart, then TurnComplete.
+        assert_eq!(events.len(), 2);
+        match &events[1] {
+            CliEvent::TurnComplete {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                context_window,
+                is_cumulative,
+            } => {
+                assert_eq!(*input_tokens, 5000);
+                assert_eq!(*output_tokens, 200);
+                assert_eq!(*cache_read_tokens, 100);
+                assert_eq!(*cache_write_tokens, 50);
+                assert_eq!(*reasoning_tokens, 150);
+                assert!(context_window.is_none());
+                assert!(!is_cumulative);
             }
             other => panic!("expected TurnComplete, got {:?}", other),
         }
@@ -614,6 +660,6 @@ mod tests {
         let events3 = parser.parse_line(third_line);
         // Third line: no SessionStart, just TurnComplete.
         assert_eq!(events3.len(), 1);
-        assert!(matches!(&events3[0], CliEvent::TurnComplete { .. }), "got {:?}", events3);
+        assert!(matches!(&events3[0], CliEvent::TurnComplete { .. }), "got {events3:?}");
     }
 }

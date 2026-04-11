@@ -163,7 +163,15 @@ pub enum AgentEvent {
     /// Assistant thinking/reasoning block.
     Thinking { text: String },
     /// Turn complete with token usage.
-    TurnComplete { input_tokens: u64, output_tokens: u64 },
+    TurnComplete {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+        context_window: Option<u64>,
+        is_cumulative: bool,
+    },
     /// Session ended with final result.
     SessionEnd { result: String, cost_usd: Option<f64>, is_error: bool },
 

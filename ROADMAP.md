@@ -2,7 +2,32 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.23 (April 2026)
+## Current — 0.2.30 (April 2026)
+
+### Shipped in 0.2.30
+
+- **Probe + context tracking**: `probe_all()` discovers installed CLIs with caching (`~/.gate4agent/probe-cache.json`, 1h TTL). `ContextTracker` accumulates tokens per session and computes remaining context window capacity.
+- **Extended `TurnComplete`**: new fields `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `context_window`, `is_cumulative`.
+- **Codex `event_msg/token_count` parser**: extracts cumulative token totals and `model_context_window` from Codex pipe output.
+- **Cache + reasoning tokens**: Claude, Gemini, and OpenCode parsers now extract cache read/write and reasoning token counts.
+- **Fixed Claude model IDs**: `claude-opus-4` → `claude-opus-4.6` and related corrections.
+- **Removed `image_to_prompt_reference()`** and **`PipeSession::tool()`**: both functions deleted (unused internal API surface).
+
+### Shipped in 0.2.29
+
+- **Dynamic model discovery**: `discover_capabilities()` reads CLI configs (Codex `~/.codex/config.toml`, OpenCode `opencode.json`) at runtime. Model picker enrichment without hardcoded lists.
+
+### Shipped in 0.2.25–0.2.28
+
+- **`CliCapabilities` API**: `ModelInfo`, `PermissionModeInfo`, `CliFeatures` per CLI tool — static capability matrix queryable before spawning.
+- **Gemini `--model` flag support**: model override via `--model` passed through to the Gemini CLI.
+- **Codex configurable permission modes**: `PermissionModeInfo` for `full-auto`, `auto-edit`, `suggest`.
+- **Claude conditional `--dangerously-skip-permissions`**: flag only appended when permission mode requires it.
+
+### Shipped in 0.2.24
+
+- **Codex duplicate message fix**: `response_item` events with `role=user` skipped to avoid double-rendering.
+- **Old `.json` session format removed**: Claude sessions without a `cwd` field are no longer loaded — they leaked across all projects.
 
 ### Shipped in 0.2.23
 
@@ -63,6 +88,9 @@ Small, additive, non-breaking:
 - [x] **ACP transport** — done (0.2.16): AcpSession with initialize + session/new handshake, multi-turn prompt(), session/update streaming, agent→host callbacks. Live-verified: Gemini, OpenCode, Claude, Codex.
 - [x] **Cursor support** — done (0.2.16), removed in 0.2.17: `cursor-agent` ships Linux/macOS only — `node_sqlite3.node` is a Linux ELF binary, crashes on Windows. No official Windows build.
 - [x] **RpcSession removed** — done (0.2.19): pre-ACP intermediate transport removed. AcpSession supersedes it completely.
+- [x] **`CliCapabilities` API** — done (0.2.25–0.2.28): static capability matrix, ModelInfo, PermissionModeInfo, CliFeatures per CLI.
+- [x] **Dynamic model discovery** — done (0.2.29): `discover_capabilities()` reads CLI config files at runtime.
+- [x] **Probe + context tracking** — done (0.2.30): `probe_all()` with 1h cache, `ContextTracker`, extended `TurnComplete` token fields.
 - [ ] **Parser fuzzing** — feed random NDJSON through each parser, assert no panics
 - [ ] **Rate-limit pattern expansion** — add known session/daily/weekly limit patterns for OpenCode
 

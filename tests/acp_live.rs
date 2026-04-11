@@ -77,7 +77,7 @@ async fn run_acp_test(tool: CliTool, binary_name: &str) {
                 println!("[{:?}] Text: {}", tool, &text[..text.len().min(200)]);
                 got_text = true;
             }
-            Ok(Ok(AgentEvent::TurnComplete { input_tokens, output_tokens })) => {
+            Ok(Ok(AgentEvent::TurnComplete { input_tokens, output_tokens, .. })) => {
                 println!("[{:?}] TurnComplete: in={} out={}", tool, input_tokens, output_tokens);
                 break;
             }

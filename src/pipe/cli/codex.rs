@@ -70,7 +70,49 @@ impl NdjsonParser for CodexNdjsonParser {
                     events.push(CliEvent::TurnComplete {
                         input_tokens: input,
                         output_tokens: output,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        context_window: None,
+                        is_cumulative: false,
                     });
+                }
+            }
+            Some("event_msg") => {
+                if let Some(payload) = v.get("payload") {
+                    if payload.get("type").and_then(|t| t.as_str()) == Some("token_count") {
+                        if let Some(info) = payload.get("info") {
+                            let usage = info.get("total_token_usage");
+                            let input = usage
+                                .and_then(|u| u.get("input_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let output = usage
+                                .and_then(|u| u.get("output_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let cached = usage
+                                .and_then(|u| u.get("cached_input_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let reasoning = usage
+                                .and_then(|u| u.get("reasoning_output_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let ctx_window = info
+                                .get("model_context_window")
+                                .and_then(|v| v.as_u64());
+                            events.push(CliEvent::TurnComplete {
+                                input_tokens: input,
+                                output_tokens: output,
+                                cache_read_tokens: cached,
+                                cache_write_tokens: 0,
+                                reasoning_tokens: reasoning,
+                                context_window: ctx_window,
+                                is_cumulative: true,
+                            });
+                        }
+                    }
                 }
             }
             Some("turn.failed") => {
@@ -519,6 +561,42 @@ mod tests {
             }
             other => panic!("expected AssistantText, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn codex_parses_event_msg_token_count() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"output_tokens":200,"cached_input_tokens":300,"reasoning_output_tokens":50},"model_context_window":128000}}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::TurnComplete {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                context_window,
+                is_cumulative,
+            } => {
+                assert_eq!(*input_tokens, 5000);
+                assert_eq!(*output_tokens, 200);
+                assert_eq!(*cache_read_tokens, 300);
+                assert_eq!(*cache_write_tokens, 0);
+                assert_eq!(*reasoning_tokens, 50);
+                assert_eq!(*context_window, Some(128_000));
+                assert!(*is_cumulative, "event_msg token_count must be cumulative");
+            }
+            other => panic!("expected TurnComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_event_msg_non_token_count_ignored() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"event_msg","payload":{"type":"some_other_type","info":{}}}"#;
+        let events = parser.parse_line(line);
+        assert!(events.is_empty(), "non-token_count event_msg must produce no events, got {:?}", events);
     }
 
     // ── Builder tests ─────────────────────────────────────────────────────────

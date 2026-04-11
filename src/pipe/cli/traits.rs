@@ -37,6 +37,14 @@ pub enum CliEvent {
     TurnComplete {
         input_tokens: u64,
         output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+        /// Only Codex provides this natively from pipe output.
+        context_window: Option<u64>,
+        /// When true, values are cumulative session totals (Codex event_msg).
+        /// Consumer should SET counters, not ADD to them.
+        is_cumulative: bool,
     },
     /// Session ended.
     SessionEnd {

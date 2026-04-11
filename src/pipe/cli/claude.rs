@@ -126,10 +126,23 @@ impl NdjsonParser for ClaudeNdjsonParser {
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    let cache_read = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_write = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     if input > 0 || output > 0 {
                         events.push(CliEvent::TurnComplete {
                             input_tokens: input,
                             output_tokens: output,
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: cache_write,
+                            reasoning_tokens: 0,
+                            context_window: None,
+                            is_cumulative: false,
                         });
                     }
                 }
@@ -383,7 +396,7 @@ mod tests {
         let events = parser.parse_line(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            CliEvent::TurnComplete { input_tokens, output_tokens } => {
+            CliEvent::TurnComplete { input_tokens, output_tokens, .. } => {
                 assert_eq!(*input_tokens, 100);
                 assert_eq!(*output_tokens, 50);
             }
@@ -445,6 +458,34 @@ mod tests {
     }
 
     #[test]
+    fn claude_assistant_usage_with_cache_fields() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":50,"cache_creation_input_tokens":30}}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CliEvent::TurnComplete {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                context_window,
+                is_cumulative,
+            } => {
+                assert_eq!(*input_tokens, 200);
+                assert_eq!(*output_tokens, 80);
+                assert_eq!(*cache_read_tokens, 50);
+                assert_eq!(*cache_write_tokens, 30);
+                assert_eq!(*reasoning_tokens, 0);
+                assert!(context_window.is_none());
+                assert!(!is_cumulative);
+            }
+            other => panic!("expected TurnComplete, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn claude_assistant_usage_with_content_both_emitted() {
         // Message with both content blocks AND usage → content events + TurnComplete
         let mut parser = ClaudeNdjsonParser::new();
@@ -452,6 +493,6 @@ mod tests {
         let events = parser.parse_line(line);
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], CliEvent::AssistantText { text, .. } if text == "done"));
-        assert!(matches!(&events[1], CliEvent::TurnComplete { input_tokens: 10, output_tokens: 5 }));
+        assert!(matches!(&events[1], CliEvent::TurnComplete { input_tokens: 10, output_tokens: 5, .. }));
     }
 }

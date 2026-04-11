@@ -23,6 +23,7 @@ use crate::pty::snapshot::{
 };
 use crate::transport::{SpawnOptions, TransportSession};
 use crate::core::types::{AgentEvent, CliTool, SessionConfig};
+use crate::context::{ContextTracker, TurnCompleteData};
 
 // =============================================================================
 // InstanceId
@@ -190,6 +191,8 @@ struct AgentInstance {
     pipe_session_id: Option<String>,
     /// Live status of the current turn — drives the animated spinner line in the chat view.
     live_status: LiveStatus,
+    /// Token usage tracker — updated on every TurnComplete event.
+    context_tracker: ContextTracker,
 }
 
 impl AgentInstance {
@@ -208,6 +211,7 @@ impl AgentInstance {
             session_active: false,
             pipe_session_id: None,
             live_status: LiveStatus::Idle,
+            context_tracker: ContextTracker::unknown(),
         }
     }
 }
@@ -512,6 +516,7 @@ impl MultiCliManager {
                         session_active: inst.session_active,
                         live_status: inst.live_status.clone(),
                         pipe_session_id: inst.pipe_session_id.clone(),
+                        context_percent: inst.context_tracker.usage_percent(),
                     }
                 }
             }
@@ -522,6 +527,7 @@ impl MultiCliManager {
                         session_active: inst.session_active,
                         live_status: inst.live_status.clone(),
                         pipe_session_id: inst.pipe_session_id.clone(),
+                        context_percent: inst.context_tracker.usage_percent(),
                     }
                 } else {
                     AgentRenderSnapshot {
@@ -529,6 +535,7 @@ impl MultiCliManager {
                         session_active: inst.session_active,
                         live_status: inst.live_status.clone(),
                         pipe_session_id: inst.pipe_session_id.clone(),
+                        context_percent: inst.context_tracker.usage_percent(),
                     }
                 }
             }
@@ -1040,8 +1047,24 @@ impl MultiCliManager {
                                     tool_name: None,
                                 });
                             }
-                            AgentEvent::TurnComplete { .. } => {
-                                // Clear live status. ToolStart already pushed bubbles.
+                            AgentEvent::TurnComplete {
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_write_tokens,
+                                reasoning_tokens,
+                                context_window,
+                                is_cumulative,
+                            } => {
+                                inst.context_tracker.update(&TurnCompleteData {
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_tokens,
+                                    cache_write_tokens,
+                                    reasoning_tokens,
+                                    context_window_hint: context_window,
+                                    is_cumulative,
+                                });
                                 inst.live_status = LiveStatus::Idle;
                             }
                             AgentEvent::SessionEnd {
@@ -1111,6 +1134,7 @@ impl MultiCliManager {
                     session_active: false,
                     live_status: LiveStatus::Idle,
                     pipe_session_id: None,
+                    context_percent: None,
                 }
             }
         };
@@ -1124,6 +1148,7 @@ impl MultiCliManager {
                 session_active: inst.session_active,
                 live_status: inst.live_status.clone(),
                 pipe_session_id: inst.pipe_session_id.clone(),
+                context_percent: inst.context_tracker.usage_percent(),
             };
         }
         // Chat mode requested
@@ -1133,6 +1158,7 @@ impl MultiCliManager {
                 session_active: inst.session_active,
                 live_status: inst.live_status.clone(),
                 pipe_session_id: inst.pipe_session_id.clone(),
+                context_percent: inst.context_tracker.usage_percent(),
             };
         }
         AgentRenderSnapshot {
@@ -1140,6 +1166,7 @@ impl MultiCliManager {
             session_active: inst.session_active,
             live_status: inst.live_status.clone(),
             pipe_session_id: inst.pipe_session_id.clone(),
+            context_percent: inst.context_tracker.usage_percent(),
         }
     }
 
@@ -1213,6 +1240,7 @@ impl MultiCliManager {
             session_active: inst.session_active,
             live_status: inst.live_status.clone(),
             pipe_session_id: inst.pipe_session_id.clone(),
+            context_percent: inst.context_tracker.usage_percent(),
         }
     }
 
@@ -1227,6 +1255,7 @@ impl MultiCliManager {
                     session_active: false,
                     live_status: LiveStatus::Idle,
                     pipe_session_id: None,
+                    context_percent: None,
                 }
             }
         };
@@ -1238,6 +1267,7 @@ impl MultiCliManager {
                     session_active: false,
                     live_status: inst.live_status.clone(),
                     pipe_session_id: inst.pipe_session_id.clone(),
+                    context_percent: inst.context_tracker.usage_percent(),
                 };
             }
             return AgentRenderSnapshot {
@@ -1245,6 +1275,7 @@ impl MultiCliManager {
                 session_active: false,
                 live_status: inst.live_status.clone(),
                 pipe_session_id: inst.pipe_session_id.clone(),
+                context_percent: inst.context_tracker.usage_percent(),
             };
         }
 
@@ -1295,6 +1326,7 @@ impl MultiCliManager {
                 session_active: true,
                 live_status: inst.live_status.clone(),
                 pipe_session_id: inst.pipe_session_id.clone(),
+                context_percent: inst.context_tracker.usage_percent(),
             }
         } else {
             AgentRenderSnapshot {
@@ -1302,6 +1334,7 @@ impl MultiCliManager {
                 session_active: true,
                 live_status: inst.live_status.clone(),
                 pipe_session_id: inst.pipe_session_id.clone(),
+                context_percent: inst.context_tracker.usage_percent(),
             }
         }
     }

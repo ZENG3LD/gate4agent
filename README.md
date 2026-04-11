@@ -217,6 +217,7 @@ At least one CLI agent must be installed on the host. gate4agent does not instal
 - **0.2.25–0.2.28** — `CliCapabilities` API: `ModelInfo`, `PermissionModeInfo`, `CliFeatures` per CLI tool. Gemini `--model` flag support, Codex configurable permission modes, Claude conditional `--dangerously-skip-permissions`.
 - **0.2.29** — Dynamic model discovery: `discover_capabilities()` reads CLI configs (Codex `~/.codex/config.toml`, OpenCode `opencode.json`). Model picker enrichment at runtime.
 - **0.2.30** — **Probe + Context tracking**: `probe_all()` discovers installed CLIs with caching (`~/.gate4agent/probe-cache.json`). `ContextTracker` accumulates tokens per session, computes remaining context. Extended `TurnComplete` with `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `context_window`, `is_cumulative`. Codex `event_msg/token_count` parser (cumulative totals + `model_context_window`). Claude/Gemini/OpenCode parsers extract cache and reasoning tokens. Fixed Claude model IDs (4 → 4.6). Removed `image_to_prompt_reference()` and `PipeSession::tool()`.
+- **0.2.31** — **ContextTracker wired into runtime**: `AgentInstance` now holds a `ContextTracker`, updated on every `TurnComplete` event. `AgentRenderSnapshot` gains `context_percent: Option<f64>` — consumers get live context window usage without any extra work.
 
 See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
 

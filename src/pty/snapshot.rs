@@ -266,4 +266,6 @@ pub struct AgentRenderSnapshot {
     /// Active pipe session ID (OpenCode resume token). `None` when no session
     /// has been established yet or the instance is in PTY mode.
     pub pipe_session_id: Option<String>,
+    /// Context window usage percentage (0.0–100.0), or `None` if unknown.
+    pub context_percent: Option<f64>,
 }

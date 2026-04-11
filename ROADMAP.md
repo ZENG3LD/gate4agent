@@ -2,7 +2,11 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.30 (April 2026)
+## Current — 0.2.31 (April 2026)
+
+### Shipped in 0.2.31
+
+- **ContextTracker wired into runtime**: `AgentInstance` holds a `ContextTracker`, fed on every `TurnComplete` event in `drain_one()`. `AgentRenderSnapshot` gains `context_percent: Option<f64>` — consumers get live context window usage percentage without any extra work.
 
 ### Shipped in 0.2.30
 

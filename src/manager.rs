@@ -597,7 +597,7 @@ impl MultiCliManager {
             Some(id_str) => id_str,
             None => return false,
         };
-        let messages = reader.load_session(&workdir, &latest);
+        let (messages, usage) = reader.load_session_with_usage(&workdir, &latest);
         if messages.is_empty() {
             return false;
         }
@@ -606,6 +606,24 @@ impl MultiCliManager {
             inst.pipe_session_id = Some(latest);
             inst.transport_session = None;
             inst.pipe_rx = None;
+            let tool = cli_to_tool(cli);
+            let caps = tool.capabilities();
+            let context_window = caps.available_models.iter()
+                .find(|m| m.is_default)
+                .and_then(|m| m.context_window)
+                .unwrap_or(200_000);
+            inst.context_tracker = ContextTracker::with_window(context_window);
+            if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cache_read_tokens > 0 {
+                inst.context_tracker.update(&TurnCompleteData {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                    reasoning_tokens: 0,
+                    context_window_hint: None,
+                    is_cumulative: true,
+                });
+            }
         }
         true
     }
@@ -644,7 +662,7 @@ impl MultiCliManager {
             None => return false,
         };
         let reader = crate::history::reader_for(cli);
-        let messages = reader.load_session(&workdir, session_id);
+        let (messages, usage) = reader.load_session_with_usage(&workdir, session_id);
         if messages.is_empty() {
             return false;
         }
@@ -653,6 +671,24 @@ impl MultiCliManager {
             inst.pipe_session_id = Some(session_id.to_string());
             inst.transport_session = None;
             inst.pipe_rx = None;
+            let tool = cli_to_tool(cli);
+            let caps = tool.capabilities();
+            let context_window = caps.available_models.iter()
+                .find(|m| m.is_default)
+                .and_then(|m| m.context_window)
+                .unwrap_or(200_000);
+            inst.context_tracker = ContextTracker::with_window(context_window);
+            if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cache_read_tokens > 0 {
+                inst.context_tracker.update(&TurnCompleteData {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                    reasoning_tokens: 0,
+                    context_window_hint: None,
+                    is_cumulative: true,
+                });
+            }
         }
         true
     }
@@ -1400,7 +1436,7 @@ impl MultiCliManager {
                 return false;
             }
         };
-        let messages = reader.load_session(&workdir, &latest);
+        let (messages, usage) = reader.load_session_with_usage(&workdir, &latest);
         eprintln!("[gate4agent]   loaded {} messages", messages.len());
         if messages.is_empty() {
             return false;
@@ -1411,6 +1447,24 @@ impl MultiCliManager {
             inst.pipe_session_id = Some(latest.clone());
             inst.transport_session = None;
             inst.pipe_rx = None;
+            let tool = cli_to_tool(cli);
+            let caps = tool.capabilities();
+            let context_window = caps.available_models.iter()
+                .find(|m| m.is_default)
+                .and_then(|m| m.context_window)
+                .unwrap_or(200_000);
+            inst.context_tracker = ContextTracker::with_window(context_window);
+            if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cache_read_tokens > 0 {
+                inst.context_tracker.update(&TurnCompleteData {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                    reasoning_tokens: 0,
+                    context_window_hint: None,
+                    is_cumulative: true,
+                });
+            }
         }
         true
     }
@@ -1422,7 +1476,7 @@ impl MultiCliManager {
     pub fn load_history(&mut self, cli: AgentCli, session_id: &str) -> bool {
         let workdir = self.cli_workdir(cli);
         let reader = crate::history::reader_for(cli);
-        let messages = reader.load_session(&workdir, session_id);
+        let (messages, usage) = reader.load_session_with_usage(&workdir, session_id);
         if messages.is_empty() {
             return false;
         }
@@ -1434,6 +1488,24 @@ impl MultiCliManager {
             // the spawn branch and picks up the resume id.
             inst.transport_session = None;
             inst.pipe_rx = None;
+            let tool = cli_to_tool(cli);
+            let caps = tool.capabilities();
+            let context_window = caps.available_models.iter()
+                .find(|m| m.is_default)
+                .and_then(|m| m.context_window)
+                .unwrap_or(200_000);
+            inst.context_tracker = ContextTracker::with_window(context_window);
+            if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cache_read_tokens > 0 {
+                inst.context_tracker.update(&TurnCompleteData {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                    reasoning_tokens: 0,
+                    context_window_hint: None,
+                    is_cumulative: true,
+                });
+            }
         }
         true
     }

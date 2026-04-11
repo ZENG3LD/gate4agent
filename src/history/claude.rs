@@ -21,7 +21,7 @@ use serde::Deserialize;
 static PROJECTS_DIR_CACHE: Mutex<Option<HashMap<PathBuf, Option<PathBuf>>>> = Mutex::new(None);
 
 use crate::pty::snapshot::{ChatMessage, ChatRole};
-use super::{HistoryReader, SessionMeta};
+use super::{HistoryReader, SessionMeta, SessionUsage};
 
 pub struct ClaudeHistoryReader;
 
@@ -81,6 +81,57 @@ impl HistoryReader for ClaudeHistoryReader {
             }
         }
         out
+    }
+
+    fn load_session_with_usage(
+        &self,
+        workdir: &Path,
+        session_id: &str,
+    ) -> (Vec<ChatMessage>, SessionUsage) {
+        let projects_dir = match find_projects_dir(workdir) {
+            Some(p) => p,
+            None => return (Vec::new(), SessionUsage::default()),
+        };
+        let path = projects_dir.join(format!("{}.jsonl", session_id));
+        let raw = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return (Vec::new(), SessionUsage::default()),
+        };
+        let mut messages = Vec::new();
+        let mut usage = SessionUsage::default();
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(evt) = serde_json::from_str::<JsonlEvent>(line) {
+                // Extract usage from assistant messages before consuming the event.
+                if let Some(ref msg) = evt.message {
+                    if msg.role.as_deref() == Some("assistant") {
+                        if let Some(ref u) = msg.usage {
+                            // input_tokens: replace (last turn's value reflects cumulative context)
+                            if let Some(v) = u.input_tokens {
+                                usage.input_tokens = v;
+                            }
+                            // output_tokens: accumulate across turns
+                            if let Some(v) = u.output_tokens {
+                                usage.output_tokens = usage.output_tokens.saturating_add(v);
+                            }
+                            // cache fields: replace (last turn is most recent)
+                            if let Some(v) = u.cache_read_input_tokens {
+                                usage.cache_read_tokens = v;
+                            }
+                            if let Some(v) = u.cache_creation_input_tokens {
+                                usage.cache_write_tokens = v;
+                            }
+                        }
+                    }
+                }
+                if let Some(msg) = evt.into_chat_message() {
+                    messages.push(msg);
+                }
+            }
+        }
+        (messages, usage)
     }
 }
 
@@ -193,10 +244,19 @@ struct JsonlEvent {
     message: Option<JsonlMessage>,
 }
 
+#[derive(Deserialize, Default)]
+struct JsonlUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+}
+
 #[derive(Deserialize)]
 struct JsonlMessage {
     role: Option<String>,
     content: Option<serde_json::Value>,
+    usage: Option<JsonlUsage>,
 }
 
 impl JsonlEvent {

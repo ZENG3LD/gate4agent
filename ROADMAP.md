@@ -2,7 +2,11 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.34 (April 2026)
+## Current — 0.2.35 (April 2026)
+
+### Shipped in 0.2.35
+
+- **feat(history): SessionUsage from loaded sessions**: `HistoryReader::load_session_with_usage()` returns aggregated token counts alongside chat messages. Claude JSONL reader extracts `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` from assistant messages. All 4 history-loading paths in `MultiCliManager` now initialize `ContextTracker` from loaded usage — `context_percent` shows real values when browsing past sessions.
 
 ### Shipped in 0.2.34
 

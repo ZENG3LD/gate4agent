@@ -21,6 +21,15 @@ pub struct SessionMeta {
     pub preview: String,       // first user message, max 80 chars
 }
 
+/// Token usage extracted from a loaded session file.
+#[derive(Debug, Clone, Default)]
+pub struct SessionUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
 /// Read-only history accessor for one CLI.
 pub trait HistoryReader {
     /// List sessions newest-first. Empty vec on errors or no sessions.
@@ -28,6 +37,20 @@ pub trait HistoryReader {
 
     /// Load full message list for one session. Empty vec on errors.
     fn load_session(&self, workdir: &Path, session_id: &str) -> Vec<ChatMessage>;
+
+    /// Load full message list plus token usage for one session.
+    ///
+    /// The default implementation delegates to `load_session` and returns
+    /// `SessionUsage::default()`. CLIs that embed token data in their session
+    /// files (e.g. Claude JSONL) should override this.
+    fn load_session_with_usage(
+        &self,
+        workdir: &Path,
+        session_id: &str,
+    ) -> (Vec<ChatMessage>, SessionUsage) {
+        let messages = self.load_session(workdir, session_id);
+        (messages, SessionUsage::default())
+    }
 
     /// Convenience: latest session id, if any.
     fn latest_session(&self, workdir: &Path) -> Option<String> {

@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent"
-version = "0.2.33"
+version = "0.2.37"
 dependencies = [
  "chrono",
  "portable-pty",

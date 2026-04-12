@@ -2,7 +2,12 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.36 (April 2026)
+## Current — 0.2.37 (April 2026)
+
+### Shipped in 0.2.37
+
+- **feat: full OpenCode model catalog**: All 49 OpenCode built-in models listed — 12 free-tier first (GPT-5 Nano, GLM, Kimi, Mimo, MiniMax, Nemotron, Qwen, Trinity), then 37 paid. Removed old cross-provider entries (`anthropic/`, `openai/`, `google/`); all use `opencode/` prefix. Own-key users configure `opencode.json` → `discover_capabilities()`.
+- **fix: remove Claude alias models**: Dropped `opus`/`sonnet`/`haiku` aliases — redundant with versioned IDs.
 
 ### Shipped in 0.2.36
 

@@ -25,6 +25,16 @@ use crate::transport::{SpawnOptions, TransportSession};
 use crate::core::types::{AgentEvent, CliTool, SessionConfig};
 use crate::context::{ContextTracker, TurnCompleteData};
 
+/// Run the cure discovery pipeline exactly once per process lifetime.
+/// Populates `~/.gate4agent/models.json` so that `tool.capabilities()` returns
+/// accurate context windows. Safe to call from any thread — no-ops after first run.
+fn ensure_cure_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = crate::cure::cure();
+    });
+}
+
 // =============================================================================
 // InstanceId
 // =============================================================================
@@ -606,6 +616,7 @@ impl MultiCliManager {
             inst.pipe_session_id = Some(latest);
             inst.transport_session = None;
             inst.pipe_rx = None;
+            ensure_cure_once();
             let tool = cli_to_tool(cli);
             let caps = tool.capabilities();
             let context_window = caps.available_models.iter()
@@ -671,6 +682,7 @@ impl MultiCliManager {
             inst.pipe_session_id = Some(session_id.to_string());
             inst.transport_session = None;
             inst.pipe_rx = None;
+            ensure_cure_once();
             let tool = cli_to_tool(cli);
             let caps = tool.capabilities();
             let context_window = caps.available_models.iter()
@@ -1008,6 +1020,7 @@ impl MultiCliManager {
                                 inst.pipe_session_id = Some(session_id);
                                 // Init context tracker from the model's known context window so
                                 // that context_percent is non-zero from the very first turn.
+                                ensure_cure_once();
                                 let tool = cli_to_tool(inst.cli);
                                 let caps = tool.capabilities();
                                 if let Some(model_info) = caps.available_models.iter()
@@ -1447,6 +1460,7 @@ impl MultiCliManager {
             inst.pipe_session_id = Some(latest.clone());
             inst.transport_session = None;
             inst.pipe_rx = None;
+            ensure_cure_once();
             let tool = cli_to_tool(cli);
             let caps = tool.capabilities();
             let context_window = caps.available_models.iter()
@@ -1488,6 +1502,7 @@ impl MultiCliManager {
             // the spawn branch and picks up the resume id.
             inst.transport_session = None;
             inst.pipe_rx = None;
+            ensure_cure_once();
             let tool = cli_to_tool(cli);
             let caps = tool.capabilities();
             let context_window = caps.available_models.iter()

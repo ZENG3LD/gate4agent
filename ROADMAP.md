@@ -2,7 +2,11 @@
 
 Living document. Current state + what's next. Updated per release.
 
-## Current — 0.2.35 (April 2026)
+## Current — 0.2.36 (April 2026)
+
+### Shipped in 0.2.36
+
+- **feat: lazy cure on first use**: `ensure_cure_once()` runs cure pipeline (OpenCode cache → hardcoded) on first history load or SessionStart. `tool.capabilities()` returns cure-enriched context windows from the first interaction. No explicit init call needed by consumers.
 
 ### Shipped in 0.2.35
 

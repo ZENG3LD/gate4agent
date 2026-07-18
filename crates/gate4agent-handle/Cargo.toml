@@ -1,0 +1,16 @@
+[package]
+name = "gate4agent-handle"
+version = "0.2.37"
+edition = "2021"
+description = "Bounded dispatch, snapshot, and event port for gate4agent"
+license = "MIT"
+
+[lib]
+name = "gate4agent_handle"
+
+[dependencies]
+gate4agent-types = { path = "../gate4agent-types" }
+thiserror = "2"
+
+[dev-dependencies]
+gate4agent-kernel = { path = "../gate4agent-kernel" }

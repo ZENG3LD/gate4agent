@@ -1,0 +1,15 @@
+[package]
+name = "gate4agent-kernel"
+version = "0.2.37"
+edition = "2021"
+description = "Deterministic host kernel for gate4agent engines"
+license = "MIT"
+
+[lib]
+name = "gate4agent_kernel"
+
+[dependencies]
+gate4agent-types = { path = "../gate4agent-types" }
+gate4agent-catalog = { path = "../gate4agent-catalog" }
+gate4agent-engine = { path = "../gate4agent-engine" }
+thiserror = "2"

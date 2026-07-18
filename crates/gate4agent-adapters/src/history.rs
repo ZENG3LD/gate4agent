@@ -645,4 +645,61 @@ mod tests {
             Err(HistoryAdapterError::TranscriptTooLarge)
         );
     }
+
+    #[test]
+    fn retained_history_is_utf8_safe_and_bounded_without_losing_total_count() {
+        let long_text = format!("привет{}", "界".repeat(HISTORY_MESSAGE_MAX_CHARS));
+        let transcript = (0..=HISTORY_STORED_MESSAGES_MAX)
+            .map(|index| {
+                serde_json::json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": long_text
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_history(
+            &id("cursor"),
+            &HistoryDocument {
+                session_id_hint: "c1".to_owned(),
+                metadata_json: None,
+                transcript,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            session.message_count,
+            u64::try_from(HISTORY_STORED_MESSAGES_MAX + 1).unwrap()
+        );
+        assert_eq!(session.messages.len(), HISTORY_STORED_MESSAGES_MAX);
+        assert_eq!(
+            session.messages[0].text.chars().count(),
+            HISTORY_MESSAGE_MAX_CHARS
+        );
+        assert!(session.messages[0].text.starts_with("привет"));
+    }
+
+    #[test]
+    fn split_metadata_contracts_reject_missing_or_invalid_json() {
+        let missing = HistoryDocument {
+            session_id_hint: "g1".to_owned(),
+            metadata_json: None,
+            transcript: String::new(),
+        };
+        assert_eq!(
+            parse_history(&id("grok"), &missing),
+            Err(HistoryAdapterError::MissingMetadata)
+        );
+
+        let invalid = HistoryDocument {
+            session_id_hint: "k1".to_owned(),
+            metadata_json: Some("[]".to_owned()),
+            transcript: String::new(),
+        };
+        assert_eq!(
+            parse_history(&id("kimi"), &invalid),
+            Err(HistoryAdapterError::InvalidMetadata)
+        );
+    }
 }

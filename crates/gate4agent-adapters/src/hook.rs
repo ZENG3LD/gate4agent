@@ -559,4 +559,30 @@ mod tests {
             Err(HookAdapterError::InvalidEventName)
         );
     }
+
+    #[test]
+    fn unknown_events_are_ignored_and_normalization_is_deterministic() {
+        let payload = json!({"future_field": {"nested": true}});
+        let first = normalize_hook_event(&id("grok"), "futureEvent", &payload).unwrap();
+        let second = normalize_hook_event(&id("grok"), "futureEvent", &payload).unwrap();
+        assert!(first.is_empty());
+        assert_eq!(first, second);
+        assert!(matches!(
+            normalize_hook_event(&id("future-provider"), "Stop", &json!({})),
+            Err(HookAdapterError::UnsupportedAdapter(_))
+        ));
+    }
+
+    #[test]
+    fn text_is_utf8_safe_and_bounded_by_characters() {
+        let text = format!("привет{}", "界".repeat(HOOK_TEXT_MAX_CHARS));
+        let events =
+            normalize_hook_event(&id("cursor"), "afterAgentResponse", &json!({"text": text}))
+                .unwrap();
+        let [ProviderEvent::Text { text, .. }] = events.as_slice() else {
+            panic!("expected one text event");
+        };
+        assert_eq!(text.chars().count(), HOOK_TEXT_MAX_CHARS);
+        assert!(text.starts_with("привет"));
+    }
 }

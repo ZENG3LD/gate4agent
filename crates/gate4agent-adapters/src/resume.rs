@@ -105,4 +105,13 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn unsupported_and_explicit_negative_capabilities_are_distinct() {
+        assert_eq!(build_resume_plan(&id("qwen-code"), "s1").unwrap(), None);
+        assert!(matches!(
+            build_resume_plan(&id("future-provider"), "s1"),
+            Err(ResumeAdapterError::UnsupportedAdapter(_))
+        ));
+    }
 }

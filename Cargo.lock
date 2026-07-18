@@ -323,6 +323,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-engine"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-types",
+]
+
+[[package]]
 name = "gate4agent-types"
 version = "0.2.37"
 dependencies = [

@@ -1,0 +1,320 @@
+use super::{AgentId, AgentSpec, InitialPromptMode, NativeDraftMode, RuntimePlatform};
+use std::ffi::OsString;
+use std::path::PathBuf;
+use thiserror::Error;
+
+pub const MAX_LAUNCH_PROMPT_BYTES: usize = 16 * 1024 * 1024;
+pub const WINDOWS_INLINE_LAUNCH_MAX_CHARS: usize = 24_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvMutation {
+    pub key: OsString,
+    /// `None` removes the variable from the child environment.
+    pub value: Option<OsString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchRequest {
+    pub working_dir: PathBuf,
+    pub prompt: Option<String>,
+    pub extra_args: Vec<OsString>,
+    pub env: Vec<EnvMutation>,
+    pub platform: RuntimePlatform,
+}
+
+impl Default for LaunchRequest {
+    fn default() -> Self {
+        Self {
+            working_dir: PathBuf::new(),
+            prompt: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            platform: RuntimePlatform::current(),
+        }
+    }
+}
+
+/// Shell-free executable plan for an interactive agent CLI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchPlan {
+    pub agent_id: AgentId,
+    pub program: OsString,
+    pub args: Vec<OsString>,
+    pub working_dir: PathBuf,
+    pub env: Vec<EnvMutation>,
+    /// Prompt that must be delivered only after the readiness policy succeeds.
+    pub followup_prompt: Option<String>,
+    /// Reviewable draft that must be inserted after draft readiness succeeds.
+    pub followup_draft: Option<String>,
+}
+
+pub fn plan_launch(
+    spec: &AgentSpec,
+    request: LaunchRequest,
+) -> Result<LaunchPlan, LaunchPlanError> {
+    if !spec.supports_platform(request.platform) {
+        return Err(LaunchPlanError::UnsupportedPlatform {
+            agent: spec.id.clone(),
+            platform: request.platform,
+        });
+    }
+
+    let prompt = request.prompt.filter(|prompt| !prompt.is_empty());
+    if let Some(prompt) = &prompt {
+        if prompt.len() > MAX_LAUNCH_PROMPT_BYTES {
+            return Err(LaunchPlanError::PromptTooLarge {
+                bytes: prompt.len(),
+                max: MAX_LAUNCH_PROMPT_BYTES,
+            });
+        }
+    }
+
+    let mut args: Vec<OsString> = spec.launch.fixed_args.iter().map(OsString::from).collect();
+    args.extend(request.extra_args);
+    let mut followup_prompt = None;
+
+    if let Some(prompt) = prompt {
+        match &spec.prompt.initial {
+            InitialPromptMode::None => {
+                return Err(LaunchPlanError::PromptUnsupported(spec.id.clone()));
+            }
+            InitialPromptMode::Positional { option_terminator } => {
+                if *option_terminator {
+                    args.push(OsString::from("--"));
+                }
+                args.push(OsString::from(prompt));
+            }
+            InitialPromptMode::Flag { flag } | InitialPromptMode::InteractiveFlag { flag } => {
+                args.push(OsString::from(flag));
+                args.push(OsString::from(prompt));
+            }
+            InitialPromptMode::AgentNativeQuery => {
+                return Err(LaunchPlanError::NativePlannerRequired(spec.id.clone()));
+            }
+            InitialPromptMode::AfterReady => {
+                followup_prompt = Some(prompt);
+            }
+        }
+    }
+
+    let plan = LaunchPlan {
+        agent_id: spec.id.clone(),
+        program: OsString::from(&spec.launch.program),
+        args,
+        working_dir: request.working_dir,
+        env: request.env,
+        followup_prompt,
+        followup_draft: None,
+    };
+    validate_platform_budget(&plan, request.platform)?;
+    Ok(plan)
+}
+
+/// Plan a reviewable initial draft without accidentally submitting it as a task.
+pub fn plan_draft_launch(
+    spec: &AgentSpec,
+    request: LaunchRequest,
+    draft: String,
+) -> Result<LaunchPlan, LaunchPlanError> {
+    if request
+        .prompt
+        .as_ref()
+        .is_some_and(|prompt| !prompt.is_empty())
+    {
+        return Err(LaunchPlanError::ConflictingPromptAndDraft);
+    }
+    if draft.len() > MAX_LAUNCH_PROMPT_BYTES {
+        return Err(LaunchPlanError::PromptTooLarge {
+            bytes: draft.len(),
+            max: MAX_LAUNCH_PROMPT_BYTES,
+        });
+    }
+
+    let platform = request.platform;
+    let mut plan = plan_launch(spec, request)?;
+    if draft.is_empty() {
+        return Ok(plan);
+    }
+
+    match &spec.prompt.native_draft {
+        Some(NativeDraftMode::Flag { flag }) => {
+            plan.args.push(OsString::from(flag));
+            plan.args.push(OsString::from(&draft));
+            if platform == RuntimePlatform::Windows
+                && (windows_wrapper_unsafe_text(&draft)
+                    || estimated_windows_launch_chars(&plan) > WINDOWS_INLINE_LAUNCH_MAX_CHARS)
+            {
+                plan.args.pop();
+                plan.args.pop();
+                plan.followup_draft = Some(draft);
+            }
+        }
+        None => plan.followup_draft = Some(draft),
+    }
+    validate_platform_budget(&plan, platform)?;
+    Ok(plan)
+}
+
+fn validate_platform_budget(
+    plan: &LaunchPlan,
+    platform: RuntimePlatform,
+) -> Result<(), LaunchPlanError> {
+    if platform != RuntimePlatform::Windows {
+        return Ok(());
+    }
+    let chars = estimated_windows_launch_chars(plan);
+    if chars > WINDOWS_INLINE_LAUNCH_MAX_CHARS {
+        return Err(LaunchPlanError::WindowsInlineLaunchTooLarge {
+            chars,
+            max: WINDOWS_INLINE_LAUNCH_MAX_CHARS,
+        });
+    }
+    Ok(())
+}
+
+fn estimated_windows_launch_chars(plan: &LaunchPlan) -> usize {
+    let argv_chars = std::iter::once(&plan.program)
+        .chain(plan.args.iter())
+        .map(|value| value.to_string_lossy().chars().count().saturating_add(1))
+        .sum::<usize>();
+    let env_chars = plan
+        .env
+        .iter()
+        .map(|mutation| {
+            mutation.key.to_string_lossy().chars().count()
+                + mutation
+                    .value
+                    .as_ref()
+                    .map(|value| value.to_string_lossy().chars().count())
+                    .unwrap_or_default()
+                + 2
+        })
+        .sum::<usize>();
+    argv_chars.saturating_add(env_chars)
+}
+
+fn windows_wrapper_unsafe_text(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character,
+            '\0' | '\r' | '\n' | '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>' | '(' | ')'
+        )
+    })
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum LaunchPlanError {
+    #[error("agent '{agent}' does not support runtime platform {platform:?}")]
+    UnsupportedPlatform {
+        agent: AgentId,
+        platform: RuntimePlatform,
+    },
+    #[error("agent '{0}' does not accept an initial prompt")]
+    PromptUnsupported(AgentId),
+    #[error("agent '{0}' requires a provider-native startup query planner")]
+    NativePlannerRequired(AgentId),
+    #[error("prompt is {bytes} bytes; the launch limit is {max} bytes")]
+    PromptTooLarge { bytes: usize, max: usize },
+    #[error("launch request cannot contain both an auto-submitted prompt and a reviewable draft")]
+    ConflictingPromptAndDraft,
+    #[error("Windows inline launch is {chars} characters; the safe limit is {max}")]
+    WindowsInlineLaunchTooLarge { chars: usize, max: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::builtin_registry;
+
+    fn request(prompt: &str) -> LaunchRequest {
+        LaunchRequest {
+            prompt: Some(prompt.to_owned()),
+            ..LaunchRequest::default()
+        }
+    }
+
+    fn args_as_strings(plan: &LaunchPlan) -> Vec<String> {
+        plan.args
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn grok_terminates_options_before_a_positional_prompt() {
+        let spec = builtin_registry().get_by_id("grok").unwrap();
+        let plan = plan_launch(spec, request("--version")).unwrap();
+        assert_eq!(args_as_strings(&plan), ["--", "--version"]);
+        assert!(plan.followup_prompt.is_none());
+    }
+
+    #[test]
+    fn opencode_uses_a_prompt_flag_without_shell_quoting() {
+        let spec = builtin_registry().get_by_id("opencode").unwrap();
+        let prompt = "fix 'quotes'\nand Unicode: Привет";
+        let plan = plan_launch(spec, request(prompt)).unwrap();
+        assert_eq!(args_as_strings(&plan), ["--prompt", prompt]);
+    }
+
+    #[test]
+    fn kimi_defers_prompt_until_readiness() {
+        let spec = builtin_registry().get_by_id("kimi").unwrap();
+        let plan = plan_launch(spec, request("inspect the repository")).unwrap();
+        assert!(plan.args.is_empty());
+        assert_eq!(
+            plan.followup_prompt.as_deref(),
+            Some("inspect the repository")
+        );
+    }
+
+    #[test]
+    fn claude_uses_native_prefill_for_a_reviewable_draft() {
+        let spec = builtin_registry().get_by_id("claude").unwrap();
+        let plan = plan_draft_launch(
+            spec,
+            LaunchRequest {
+                platform: RuntimePlatform::Linux,
+                ..LaunchRequest::default()
+            },
+            "review before submit".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            args_as_strings(&plan),
+            ["--prefill", "review before submit"]
+        );
+        assert!(plan.followup_draft.is_none());
+    }
+
+    #[test]
+    fn agents_without_native_prefill_defer_the_draft() {
+        let spec = builtin_registry().get_by_id("kimi").unwrap();
+        let plan = plan_draft_launch(
+            spec,
+            LaunchRequest {
+                platform: RuntimePlatform::Linux,
+                ..LaunchRequest::default()
+            },
+            "review before submit".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(plan.followup_draft.as_deref(), Some("review before submit"));
+        assert!(plan.followup_prompt.is_none());
+    }
+
+    #[test]
+    fn unsafe_windows_wrapper_draft_falls_back_to_post_ready_paste() {
+        let spec = builtin_registry().get_by_id("claude").unwrap();
+        let plan = plan_draft_launch(
+            spec,
+            LaunchRequest {
+                platform: RuntimePlatform::Windows,
+                ..LaunchRequest::default()
+            },
+            "inspect & explain".to_owned(),
+        )
+        .unwrap();
+        assert!(plan.args.is_empty());
+        assert_eq!(plan.followup_draft.as_deref(), Some("inspect & explain"));
+    }
+}

@@ -13,6 +13,90 @@ Universal Rust transport library for CLI AI agents. Spawn, stream, resume — fo
 | **Gemini** | Pipe + PTY + ACP | ✓ stream-json | ✓ native `--experimental-acp` | ✓ `--resume <id>` | Prompt via `-p` flag |
 | **OpenCode** (`sst/opencode`) | Pipe + ACP | ✓ `--format json` | ✓ native `opencode acp` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
 
+### Grounding registry (preview)
+
+The transport table above remains the deep, structured-support matrix. The
+separate `agent` module now provides 33 extensible CLI identity and interactive
+launch specifications, including first-class Grok, Kimi, Qwen Code, Copilot,
+Cursor, Kiro, Goose, Aider, and Mistral Vibe entries.
+
+The launch entries are marked `SpecVerification::Reference`: their interactive
+launch shape is pinned to a reviewed source snapshot but still requires
+provider/version verification before a product presents it as fully supported.
+
+```rust
+use gate4agent::{builtin_registry, plan_launch, LaunchRequest};
+
+let grok = builtin_registry().get_by_id("grok").unwrap();
+let plan = plan_launch(
+    grok,
+    LaunchRequest {
+        prompt: Some("--version".into()),
+        ..LaunchRequest::default()
+    },
+)?;
+
+assert_eq!(plan.program.to_string_lossy(), "grok");
+let args: Vec<_> = plan.args.iter().map(|arg| arg.to_string_lossy()).collect();
+assert_eq!(args, ["--", "--version"]);
+```
+
+`LaunchPlan` contains an executable plus argument vector; it never concatenates
+the prompt into a shell command. `PtySession::spawn_agent()` consumes the plan.
+Agents such as Kimi retain a one-shot `followup_prompt`, which can be submitted
+only with an opaque permit issued by `ReadinessTracker` after the expected
+foreground/readiness evidence succeeds.
+
+The same module separates prompt, draft, agent-command, shell-command, terminal
+text, and terminal-control actions. `prepare_input()` produces bounded,
+UTF-8-safe writes; bracketed paste neutralizes embedded terminal control
+sequences and keeps submission as a separate final write.
+
+`PtySession::spawn_agent_draft()` keeps reviewable drafts distinct from
+auto-submitted prompts. Claude and OpenClaude reference specs use native
+`--prefill`; other agents retain a one-shot post-readiness draft. On Windows,
+unsafe or oversized inline drafts automatically use the post-readiness path.
+
+Declared slash-command capability is target-bound to the readiness permit.
+Command bodies and prompt bodies use a separate Enter write after the pinned
+500 ms TUI settle delay; controls/newlines in inline command arguments are
+rejected. Specs without the capability fail explicitly.
+
+The sequenced PTY event stream (`subscribe_events` / `attach_events`) reports
+subscriber and replay gaps explicitly, keeps a bounded 64 KiB raw-output tail,
+and supports atomic replay plus future subscription. Terminal snapshots are
+pinned to the last incorporated sequence. PTY output is drained before the
+ordered exit event. The producer-side reader queue applies byte-based 256 KiB /
+32 KiB high/low watermarks, so backpressure is independent of read chunking.
+Event envelopes, replay cursors, and terminal snapshots pin the agent-spec plus
+PTY protocol revision; attach rejects a revision mismatch. Fresh foreground
+observations and snapshot availability are part of the same ordered sequence.
+
+`PtySession::observe_foreground()` performs a fresh, time- and size-bounded OS
+process-table observation using the real PTY root PID. On POSIX it also uses the
+kernel foreground process group; on Windows it prefers a hidden CIM probe and
+falls back to native Toolhelp/GetProcessTimes identity data when WMI is blocked.
+Expected agent wrappers outrank deeper tool children during readiness checks.
+
+`terminate_tree()` snapshots descendants before killing the root process handle.
+POSIX force escalation revalidates PID, process group, and start identity;
+Windows descendants are revalidated against CIM or native creation identity.
+Consuming `shutdown()` joins both the ordered Tokio consumer and the OS reader
+thread within a bounded deadline and returns an explicit root-only degradation
+report when process inspection was unavailable.
+Generic registry sessions remain raw-only; semantic adapters are not selected
+from an `AgentId` supplied by a custom specification. The legacy four-tool
+constructor retains its existing parser behavior.
+
+`PtyColdRestoreCheckpoint` is a bounded, serde-compatible terminal checkpoint.
+It reconstructs a checkpoint plus a contiguous event tail and rejects gaps,
+identity/revision changes, invalid resize data, and oversized payloads. Storage,
+current-CWD capture, and process restart policy remain owned by the embedding
+shell or daemon.
+
+The PTY transport never auto-accepts workspace trust/safety prompts or update
+menus. Those remain visible for operator input.
+
 Transport classes:
 - **Pipe**: spawn the CLI directly, read NDJSON over stdout
 - **PTY**: spawn inside a pseudo-terminal, scrape the screen with vt100 (for agents without structured output)
@@ -121,6 +205,11 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 - **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
 - **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks
 - **4 CLI agents** — Claude Code, Codex, Gemini, OpenCode
+- **Extensible grounding registry** — 33 portable agent IDs and shell-free interactive launch plans; deep transport support remains capability-specific
+- **Typed terminal input** — bounded prompt/draft framing with UTF-8-safe chunks and explicit command/control variants
+- **Reviewable draft launch** — native prefill where declared, readiness-gated fallback elsewhere, and conservative Windows inline limits
+- **Target-bound agent commands** — explicit slash-line capability, sanitized inline arguments, and delayed separate submit
+- **Observable PTY lifecycle** — generation/sequence envelopes, explicit data gaps, bounded replay, sequence-pinned snapshots, applied resize events, and output-before-exit ordering
 - **Session history** — per-CLI session listing with workdir scoping, preview extraction, and resume support (Claude JSONL, Codex JSONL, Gemini JSON, OpenCode SQLite)
 - **Probe + context tracking** — `probe_all()` discovers installed CLIs (sync, filesystem-only, cached 1h); `ContextTracker` accumulates token usage, computes remaining context window capacity
 - **Cure (model discovery)** — `cure()` populates `~/.gate4agent/models.json` with live model metadata from OpenCode cache or OpenRouter, so `discover_capabilities()` returns accurate context windows without hardcoding
@@ -131,6 +220,7 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 gate4agent/
 ├── src/
 │   ├── lib.rs           — Library root, re-exports
+│   ├── agent/           — AgentId, registry, built-in specs, argv planner, typed input preparation
 │   ├── core/            — AgentEvent, CliTool, SessionConfig, AgentError
 │   ├── transport/       — TransportSession (thin router over PipeSession), SpawnOptions
 │   ├── pipe/            — PipeSession, PipeProcess, per-CLI NDJSON parsers + command builders
@@ -168,6 +258,10 @@ gate4agent/
 
 All Pipe and ACP transports are live-verified against real CLI output.
 PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
+
+Vendor-live Pipe and ACP cases are opt-in because they require installed,
+authenticated CLIs and network access. Run them with `--ignored`; ordinary
+`cargo test` is hermetic and does not contact provider accounts.
 
 ## Windows spawn strategy
 

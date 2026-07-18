@@ -6,7 +6,7 @@
 //! - Events are broadcast correctly
 //! - Session lifecycle (Started → SessionStart → Text → SessionEnd → Exited)
 //!
-//! Run: cargo test --test acp_live -- --nocapture
+//! Run: cargo test --test acp_live -- --ignored --nocapture
 //!
 //! Each test checks if the CLI is installed before running.
 //! If not installed, the test is skipped (not failed).
@@ -108,22 +108,26 @@ async fn run_acp_test(tool: CliTool, binary_name: &str) {
 }
 
 #[tokio::test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 async fn acp_live_gemini() {
     run_acp_test(CliTool::Gemini, "gemini").await;
 }
 
 #[tokio::test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 async fn acp_live_opencode() {
     run_acp_test(CliTool::OpenCode, "opencode").await;
 }
 
 #[tokio::test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 async fn acp_live_claude() {
     // ClaudeCode ACP adapter is invoked via npx (claude-agent-acp package).
     run_acp_test(CliTool::ClaudeCode, "npx").await;
 }
 
 #[tokio::test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 async fn acp_live_codex() {
     // Codex ACP adapter is also invoked via npx.
     run_acp_test(CliTool::Codex, "npx").await;

@@ -1039,8 +1039,9 @@ impl PromptSubmitter for CodexPromptSubmitter {
     }
 
     fn handle_startup(&self, output: &str) -> StartupAction {
+        // Update menus are operator choices, not transport defaults.
         if output.contains("Update available") {
-            return StartupAction::SendInput("2\n".to_string());
+            return StartupAction::Waiting;
         }
         if output.contains('\u{203a}') {
             return StartupAction::Ready;

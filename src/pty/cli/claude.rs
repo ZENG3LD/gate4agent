@@ -965,9 +965,10 @@ impl PromptSubmitter for ClaudePromptSubmitter {
     }
 
     fn handle_startup(&self, output: &str) -> StartupAction {
-        // Handle "trust this folder" safety check dialog
+        // Trust and safety prompts belong to the user. Surface them through
+        // raw PTY output; never accept them from the transport layer.
         if output.contains("trust this folder") || output.contains("safety check") {
-            return StartupAction::SendInput("\r".to_string());
+            return StartupAction::Waiting;
         }
 
         if output.contains('❯') {

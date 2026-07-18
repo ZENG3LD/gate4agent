@@ -18,6 +18,53 @@ pub enum AgentError {
     #[error("PTY operation failed: {0}")]
     Pty(String),
 
+    #[error("PTY process observation failed: {source}")]
+    PtyProcessProbe {
+        #[from]
+        source: crate::pty::PtyProcessProbeError,
+    },
+
+    #[error("PTY process-tree termination failed: {source}")]
+    PtyTreeTermination {
+        #[from]
+        source: crate::pty::PtyTreeTerminationError,
+    },
+
+    #[error("PTY shutdown did not reach an ordered exit within {timeout_ms}ms")]
+    PtyShutdownTimedOut { timeout_ms: u64 },
+
+    #[error("agent launch plan failed: {source}")]
+    LaunchPlan {
+        #[from]
+        source: crate::agent::LaunchPlanError,
+    },
+
+    #[error("terminal input preparation failed: {source}")]
+    InputPrepare {
+        #[from]
+        source: crate::agent::InputPrepareError,
+    },
+
+    #[error(
+        "readiness permit belongs to agent '{permit_agent}', not session agent '{session_agent}'"
+    )]
+    PtyReadinessAgentMismatch {
+        session_agent: crate::agent::AgentId,
+        permit_agent: crate::agent::AgentId,
+    },
+
+    #[error("readiness permit intent {actual:?} cannot authorize {required:?}")]
+    PtyReadinessIntentMismatch {
+        required: crate::agent::ReadinessIntent,
+        actual: crate::agent::ReadinessIntent,
+    },
+
+    #[error("agent '{agent}' does not declare capability '{capability}'")]
+    AgentCapabilityUnsupported {
+        agent: crate::agent::AgentId,
+        capability: &'static str,
+    },
+
     #[error("Process spawn failed: {source}")]
     Spawn {
         #[source]

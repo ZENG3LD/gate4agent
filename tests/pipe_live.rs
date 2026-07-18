@@ -4,7 +4,7 @@
 //! Uses PipeProcess directly — it handles cmd /C wrapping, stdin for Claude, etc.
 //!
 //! Run with:
-//!   cargo test --test pipe_live -- --nocapture
+//!   cargo test --test pipe_live -- --ignored --nocapture
 
 use std::time::{Duration, Instant};
 
@@ -126,6 +126,7 @@ fn run_pipe_test(tool: CliTool, extra_args: Vec<String>) {
 }
 
 #[test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 fn pipe_live_claude() {
     if !cli_available("claude") {
         println!("[ClaudeCode] SKIPPED — claude not found on PATH");
@@ -135,6 +136,7 @@ fn pipe_live_claude() {
 }
 
 #[test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 fn pipe_live_codex() {
     if !cli_available("codex") {
         println!("[Codex] SKIPPED — codex not found on PATH");
@@ -144,6 +146,7 @@ fn pipe_live_codex() {
 }
 
 #[test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 fn pipe_live_gemini() {
     if !cli_available("gemini") {
         println!("[Gemini] SKIPPED — gemini not found on PATH");
@@ -153,6 +156,7 @@ fn pipe_live_gemini() {
 }
 
 #[test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 fn pipe_live_opencode() {
     if !cli_available("opencode") {
         println!("[OpenCode] SKIPPED — opencode not found on PATH");
@@ -174,6 +178,7 @@ fn pipe_live_opencode() {
 /// 3. At least one `AgentEvent::Text` event with non-empty text arrives.
 /// 4. The session eventually sends `AgentEvent::SessionEnd`.
 #[test]
+#[ignore = "requires an installed and authenticated vendor CLI"]
 fn pipe_session_full_lifecycle() {
     if !cli_available("claude") {
         println!("[pipe_session] SKIPPED — claude not found on PATH");

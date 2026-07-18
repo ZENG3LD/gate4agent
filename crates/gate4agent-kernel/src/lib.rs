@@ -66,7 +66,15 @@ impl Gate4AgentKernel {
         let mut command_outcomes = Vec::new();
         for command in commands {
             let command_id = command.id;
+            let instance_id = command.command.instance_id();
             let result = self.apply_validated_command(command);
+            if let Err(error) = &result {
+                self.engine.record_command_rejection(
+                    command_id,
+                    instance_id,
+                    error.to_string(),
+                );
+            }
             command_outcomes.push(CommandOutcome { command_id, result });
         }
 
@@ -178,7 +186,10 @@ mod tests {
         ));
         assert!(step.snapshot.sessions.is_empty());
         assert!(step.effects.is_empty());
-        assert!(step.events.is_empty());
+        assert!(matches!(
+            step.events[0].event,
+            gate4agent_types::ControlEventKind::CommandRejected { .. }
+        ));
     }
 
     #[test]
@@ -291,12 +302,15 @@ mod tests {
                 operation_id: None,
                 instance_id: instance(),
                 generation: spawn.generation,
-                observation: ControlObservation::ProcessExited { exit_code: Some(0) },
+                observation: ControlObservation::ProcessExited {
+                    exit_code: Some(0),
+                    final_terminal: None,
+                },
             }],
         );
 
         assert!(raced.command_outcomes[0].result.is_ok());
-        assert_eq!(raced.effects.len(), 1);
+        assert!(raced.effects.is_empty());
         assert_eq!(
             raced.snapshot.sessions[0].status,
             SessionStatus::Exited { exit_code: Some(0) }

@@ -8,7 +8,8 @@ use gate4agent::{
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
     AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope, ObservationEnvelope,
-    OperationId, PreparedInputKind, SessionGeneration, TransportKind, CONTROL_PROTOCOL_VERSION,
+    OperationId, PreparedInputKind, SessionGeneration, TerminalFrame, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ pub struct NativeSessionKey {
 struct OwnedPtySession {
     session: PtySession,
     spawn_operation_id: OperationId,
+    last_terminal_sequence: u64,
+    terminal_stale_published: bool,
 }
 
 /// Executes native effects and returns exactly one completion observation for
@@ -101,9 +104,16 @@ impl NativeEffectShell {
                                 "native session {instance_id:?}/{generation:?} already exists"
                             ),
                         }
-                    } else if request.working_directory.is_empty() {
+                    } else if !request.terminal_size.is_valid() {
                         ControlObservation::SpawnFailed {
-                            message: "working directory is empty".to_owned(),
+                            message: "terminal size is outside the supported range".to_owned(),
+                        }
+                    } else if request.working_directory.is_empty()
+                        || request.working_directory.len() > WORKING_DIRECTORY_MAX_BYTES
+                        || request.working_directory.contains('\0')
+                    {
+                        ControlObservation::SpawnFailed {
+                            message: "working directory is invalid".to_owned(),
                         }
                     } else if let Some(spec) = self.catalog.get(&agent_id) {
                         match PtySession::spawn_agent_with_size(
@@ -125,6 +135,8 @@ impl NativeEffectShell {
                                     OwnedPtySession {
                                         session,
                                         spawn_operation_id: operation_id,
+                                        last_terminal_sequence: 0,
+                                        terminal_stale_published: false,
                                     },
                                 );
                                 ControlObservation::Spawned { process_id }
@@ -141,9 +153,14 @@ impl NativeEffectShell {
                 }
                 ControlEffect::Stop { force } => match self.pty_sessions.remove(&key) {
                     Some(owned) => match owned.session.shutdown().await {
-                        Ok(outcome) => ControlObservation::StopCompleted {
-                            forced: force || outcome.termination.is_some(),
-                        },
+                        Ok(outcome) => {
+                            let forced = force || outcome.termination.is_some();
+                            ControlObservation::StopCompleted {
+                                forced,
+                                exit_code: outcome.exit_code,
+                                final_terminal: Some(terminal_frame(outcome.terminal)),
+                            }
+                        }
                         Err(error) => ControlObservation::StopFailed {
                             message: error.to_string(),
                         },
@@ -199,6 +216,11 @@ impl NativeEffectShell {
                         message: missing_session_message(key),
                     },
                 },
+                ControlEffect::Resize { size } if !size.is_valid() => {
+                    ControlObservation::ResizeFailed {
+                        message: "terminal size is outside the supported range".to_owned(),
+                    }
+                }
                 ControlEffect::Resize { size } => match self.pty_sessions.get(&key) {
                     Some(owned) => match owned.session.resize(size.rows, size.columns).await {
                         Ok(()) => ControlObservation::ResizeCompleted { size },
@@ -230,19 +252,61 @@ impl NativeEffectShell {
                 .pty_sessions
                 .remove(&key)
                 .expect("completed key came from the owned session map");
-            let exit_code = owned
-                .session
-                .shutdown()
-                .await
-                .ok()
-                .and_then(|outcome| outcome.exit_code);
+            let (exit_code, final_terminal) = match owned.session.shutdown().await {
+                Ok(outcome) => (
+                    outcome.exit_code,
+                    Some(terminal_frame(outcome.terminal)),
+                ),
+                Err(_) => (None, None),
+            };
             observations.push(ObservationEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: key.instance_id,
                 generation: key.generation,
-                observation: ControlObservation::ProcessExited { exit_code },
+                observation: ControlObservation::ProcessExited {
+                    exit_code,
+                    final_terminal,
+                },
             });
+        }
+        observations
+    }
+
+    /// Capture only changed terminal frames. Snapshot failures become an
+    /// explicit stale observation once, until a later successful frame heals it.
+    pub fn collect_terminal_frames(&mut self) -> Vec<ObservationEnvelope> {
+        let mut observations = Vec::new();
+        for (key, owned) in &mut self.pty_sessions {
+            match owned.session.terminal_state() {
+                Ok(snapshot) if snapshot.sequence > owned.last_terminal_sequence => {
+                    owned.last_terminal_sequence = snapshot.sequence;
+                    owned.terminal_stale_published = false;
+                    observations.push(ObservationEnvelope {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        operation_id: None,
+                        instance_id: key.instance_id,
+                        generation: key.generation,
+                        observation: ControlObservation::TerminalFrame {
+                            frame: terminal_frame(snapshot),
+                        },
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if !owned.terminal_stale_published => {
+                    owned.terminal_stale_published = true;
+                    observations.push(ObservationEnvelope {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        operation_id: None,
+                        instance_id: key.instance_id,
+                        generation: key.generation,
+                        observation: ControlObservation::TerminalStale {
+                            message: error.to_string(),
+                        },
+                    });
+                }
+                Err(_) => {}
+            }
         }
         observations
     }
@@ -253,6 +317,20 @@ fn missing_session_message(key: NativeSessionKey) -> String {
         "native session {:?}/{:?} does not exist",
         key.instance_id, key.generation
     )
+}
+
+fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
+    TerminalFrame {
+        sequence: snapshot.sequence,
+        size: TerminalSize {
+            rows: snapshot.size.rows,
+            columns: snapshot.size.cols,
+        },
+        cursor_row: snapshot.cursor.0,
+        cursor_column: snapshot.cursor.1,
+        contents: snapshot.contents,
+        formatted: snapshot.formatted,
+    }
 }
 
 fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation {

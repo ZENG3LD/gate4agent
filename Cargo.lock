@@ -349,14 +349,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-runtime-native"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-catalog",
+ "gate4agent-handle",
+ "gate4agent-kernel",
+ "gate4agent-shell-native",
+ "gate4agent-testkit",
+ "gate4agent-types",
+ "tokio",
+]
+
+[[package]]
 name = "gate4agent-shell-native"
 version = "0.2.37"
 dependencies = [
  "gate4agent",
  "gate4agent-catalog",
  "gate4agent-kernel",
+ "gate4agent-testkit",
  "gate4agent-types",
  "tokio",
+]
+
+[[package]]
+name = "gate4agent-testkit"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-types",
 ]
 
 [[package]]

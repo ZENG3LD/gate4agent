@@ -2,7 +2,10 @@ use crate::{AgentId, InputAction, InputPrepareError, PreparedInput, PreparedInpu
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 4;
+pub const TERMINAL_ROWS_MAX: u16 = 1_000;
+pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
+pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -32,9 +35,20 @@ pub struct TerminalSize {
     pub columns: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalFrame {
+    pub sequence: u64,
+    pub size: TerminalSize,
+    pub cursor_row: u16,
+    pub cursor_column: u16,
+    pub contents: String,
+    pub formatted: Vec<u8>,
+}
+
 impl TerminalSize {
     pub fn is_valid(self) -> bool {
-        self.rows > 0 && self.columns > 0
+        (1..=TERMINAL_ROWS_MAX).contains(&self.rows)
+            && (1..=TERMINAL_COLUMNS_MAX).contains(&self.columns)
     }
 }
 
@@ -143,9 +157,12 @@ pub enum ControlObservation {
     },
     ProcessExited {
         exit_code: Option<i32>,
+        final_terminal: Option<TerminalFrame>,
     },
     StopCompleted {
         forced: bool,
+        exit_code: Option<i32>,
+        final_terminal: Option<TerminalFrame>,
     },
     StopFailed {
         message: String,
@@ -160,11 +177,20 @@ pub enum ControlObservation {
     ResizeFailed {
         message: String,
     },
+    TerminalFrame {
+        frame: TerminalFrame,
+    },
+    TerminalStale {
+        message: String,
+    },
 }
 
 impl ControlObservation {
     pub fn requires_operation_id(&self) -> bool {
-        !matches!(self, Self::ProcessExited { .. })
+        !matches!(
+            self,
+            Self::ProcessExited { .. } | Self::TerminalFrame { .. } | Self::TerminalStale { .. }
+        )
     }
 }
 
@@ -190,6 +216,8 @@ pub struct SessionSnapshot {
     pub pending_input: Option<PreparedInputKind>,
     pub process_id: Option<u32>,
     pub terminal_size: Option<TerminalSize>,
+    pub terminal_frame: Option<TerminalFrame>,
+    pub terminal_stale: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -212,6 +240,7 @@ pub struct ControlEvent {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlEventKind {
+    CommandRejected { message: String },
     Registered,
     StartRequested { operation_id: OperationId },
     Running { process_id: Option<u32> },
@@ -235,6 +264,7 @@ pub enum ControlEventKind {
     ResizeFailed {
         message: String,
     },
+    TerminalStale { message: String },
     Exited { exit_code: Option<i32>, forced: bool },
     Failed { message: String },
     Removed,
@@ -250,6 +280,7 @@ pub enum ObservationIgnoredReason {
     MissingOperation,
     OperationMismatch,
     InvalidState,
+    StaleTerminalFrame,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
@@ -268,9 +299,9 @@ pub enum ControlError {
     },
     #[error("agent input was rejected: {error}")]
     InputRejected { error: InputPrepareError },
-    #[error("terminal size must have non-zero rows and columns")]
+    #[error("terminal size is outside the supported bounded range")]
     InvalidTerminalSize,
-    #[error("working directory must be non-empty and contain no NUL byte")]
+    #[error("working directory is empty, too large, or contains a NUL byte")]
     InvalidWorkingDirectory,
     #[error("agent instance {instance_id:?} cannot {action} while in state {status:?}")]
     InvalidTransition {

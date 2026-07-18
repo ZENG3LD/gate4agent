@@ -1,0 +1,8 @@
+[package]
+name = "gate4agent-testkit"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[dependencies]
+gate4agent-types = { path = "../gate4agent-types" }

@@ -111,6 +111,21 @@ fn output_bytes(events: &[PtyEventEnvelope]) -> Vec<u8> {
         .collect()
 }
 
+async fn next_resize(
+    receiver: &mut gate4agent::pty::PtyEventReceiver,
+) -> PtyEventEnvelope {
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            let event = receiver.recv().await.expect("event before PTY resize");
+            if matches!(event.event, PtyEvent::Resized(_)) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("resize event timeout")
+}
+
 #[cfg(windows)]
 const EXIT_SCRIPT: &str =
     "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write('fixture-output'); exit 7";
@@ -161,6 +176,7 @@ async fn output_exit_snapshot_and_post_exit_attach_are_ordered() {
     let outcome = session.shutdown().await.expect("join exited fixture");
     assert_eq!(outcome.exit_code, Some(7));
     assert!(outcome.termination.is_none());
+    assert!(outcome.terminal.contents.contains("fixture-output"));
 }
 
 #[cfg(windows)]
@@ -175,14 +191,8 @@ async fn resize_and_shutdown_have_observable_terminal_states() {
 
     session.resize(20, 70).await.expect("first resize");
     session.resize(21, 71).await.expect("second resize");
-    let first = tokio::time::timeout(FIXTURE_TIMEOUT, receiver.recv())
-        .await
-        .expect("first resize event timeout")
-        .expect("first resize event");
-    let second = tokio::time::timeout(FIXTURE_TIMEOUT, receiver.recv())
-        .await
-        .expect("second resize event timeout")
-        .expect("second resize event");
+    let first = next_resize(&mut receiver).await;
+    let second = next_resize(&mut receiver).await;
     assert!(matches!(
         first.event,
         PtyEvent::Resized(PtySize { rows: 20, cols: 70 })

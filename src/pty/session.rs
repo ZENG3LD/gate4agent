@@ -38,6 +38,7 @@ pub const PTY_SHUTDOWN_TIMEOUT_MS: u64 = 8_000;
 pub struct PtyShutdownOutcome {
     pub exit_code: Option<i32>,
     pub termination: Option<PtyTreeTerminationReport>,
+    pub terminal: PtyTerminalSnapshot,
 }
 
 /// Conversion from the internal PtyError to the public AgentError.
@@ -325,6 +326,12 @@ impl PtySession {
             snapshot_sequence: snapshot.sequence,
         });
         Ok(snapshot)
+    }
+
+    /// Capture terminal state without publishing a snapshot-available event.
+    /// Native runtimes use this to refresh replaceable control-plane state.
+    pub fn terminal_state(&self) -> Result<PtyTerminalSnapshot, PtyAttachError> {
+        self.events.snapshot()
     }
 
     /// Take a fresh, bounded OS process-table observation for readiness.
@@ -691,9 +698,14 @@ impl PtySession {
         })
         .await
         .map_err(|_| AgentError::Pty("spawn_blocking panicked".into()))??;
+        let terminal = self
+            .events
+            .snapshot()
+            .map_err(|error| AgentError::Pty(error.to_string()))?;
         Ok(PtyShutdownOutcome {
             exit_code,
             termination,
+            terminal,
         })
     }
 }

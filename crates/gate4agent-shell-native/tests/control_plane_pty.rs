@@ -3,80 +3,13 @@ use std::time::Duration;
 use gate4agent_catalog::AgentRegistry;
 use gate4agent_kernel::Gate4AgentKernel;
 use gate4agent_shell_native::{NativeEffectShell, NativeSessionKey};
+use gate4agent_testkit::{exiting_agent_spec, interactive_agent_spec, CONTROL_FIXTURE_ID};
 use gate4agent_types::{
-    AgentCapabilities, AgentCommand, AgentCommandMode, AgentId, AgentInstanceId,
-    AgentReadinessSpec, AgentSpec, CommandEnvelope, CommandId, ControlCommand, DetectionSpec,
-    DraftReadySignal, InitialPromptMode, InputAction, LaunchSpec, ProcessMatcher, PromptSpec,
-    SessionStatus, SpecVerification, StartRequest, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    AgentCommand, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
+    InputAction, SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[cfg(windows)]
-const INTERACTIVE_SCRIPT: &str = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write([char]27 + '[?2004h' + [char]27 + '[?25hfixture-ready>'); $line=[Console]::ReadLine(); [Console]::Write('fixture-echo:' + $line); Start-Sleep -Seconds 60";
-#[cfg(not(windows))]
-const INTERACTIVE_SCRIPT: &str =
-    "printf '\033[?2004h\033[?25hfixture-ready>'; IFS= read -r line; printf 'fixture-echo:%s' \"$line\"; sleep 60";
-
-#[cfg(windows)]
-const EXIT_SCRIPT: &str =
-    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write('fixture-exit'); exit 7";
-#[cfg(not(windows))]
-const EXIT_SCRIPT: &str = "printf 'fixture-exit'; exit 7";
-
-fn fixture_spec(script: &str) -> AgentSpec {
-    #[cfg(windows)]
-    let (program, fixed_args) = (
-        "powershell.exe",
-        vec![
-            "-NoLogo".to_owned(),
-            "-NoProfile".to_owned(),
-            "-NonInteractive".to_owned(),
-            "-ExecutionPolicy".to_owned(),
-            "Bypass".to_owned(),
-            "-Command".to_owned(),
-            script.to_owned(),
-        ],
-    );
-
-    #[cfg(not(windows))]
-    let (program, fixed_args) = (
-        "sh",
-        vec!["-c".to_owned(), script.to_owned()],
-    );
-
-    AgentSpec {
-        id: AgentId::new("control-fixture").expect("fixture agent ID"),
-        revision: "fixture-r1".to_owned(),
-        display_name: "Control-plane PTY fixture".to_owned(),
-        detection: DetectionSpec {
-            command: program.to_owned(),
-            aliases: Vec::new(),
-            required_commands: Vec::new(),
-            unsupported_platforms: Vec::new(),
-        },
-        launch: LaunchSpec {
-            program: program.to_owned(),
-            fixed_args,
-        },
-        expected_processes: vec![ProcessMatcher::Exact {
-            name: "control-fixture".to_owned(),
-        }],
-        prompt: PromptSpec {
-            initial: InitialPromptMode::None,
-            native_draft: None,
-        },
-        readiness: AgentReadinessSpec {
-            draft_signal: DraftReadySignal::CursorAfterBracketedPaste,
-            ..AgentReadinessSpec::default()
-        },
-        capabilities: AgentCapabilities {
-            agent_commands: Some(AgentCommandMode::SlashLine),
-        },
-        verification: SpecVerification::Gate4AgentVerified,
-    }
-}
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
@@ -123,7 +56,7 @@ async fn wait_for_contents(
 
 #[tokio::test]
 async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
-    let registry = AgentRegistry::new([fixture_spec(INTERACTIVE_SCRIPT)]).expect("fixture registry");
+    let registry = AgentRegistry::new([interactive_agent_spec()]).expect("fixture registry");
     let mut kernel = Gate4AgentKernel::new(registry.clone());
     let mut shell = NativeEffectShell::new(registry);
     let instance_id = AgentInstanceId(501);
@@ -137,7 +70,7 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
             1,
             ControlCommand::Register {
                 instance_id,
-                agent_id: AgentId::new("control-fixture").unwrap(),
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
                 transport: TransportKind::Pty,
             },
         )],
@@ -181,7 +114,7 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
             ControlCommand::SendInput {
                 instance_id,
                 action: InputAction::AgentCommand(AgentCommand {
-                    agent_id: AgentId::new("control-fixture").unwrap(),
+                    agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
                     name: "status".to_owned(),
                     arguments: vec!["detail".to_owned()],
                 }),
@@ -233,12 +166,16 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
         kernel.snapshot().sessions[0].status,
         SessionStatus::Exited { .. }
     ));
+    assert!(kernel.snapshot().sessions[0]
+        .terminal_frame
+        .as_ref()
+        .is_some_and(|frame| frame.contents.contains("fixture-echo:/status detail")));
     assert_eq!(shell.active_session_count(), 0);
 }
 
 #[tokio::test]
 async fn natural_exit_is_collected_as_generation_bound_observation() {
-    let registry = AgentRegistry::new([fixture_spec(EXIT_SCRIPT)]).expect("fixture registry");
+    let registry = AgentRegistry::new([exiting_agent_spec()]).expect("fixture registry");
     let mut kernel = Gate4AgentKernel::new(registry.clone());
     let mut shell = NativeEffectShell::new(registry);
     let instance_id = AgentInstanceId(502);
@@ -248,7 +185,7 @@ async fn natural_exit_is_collected_as_generation_bound_observation() {
                 1,
                 ControlCommand::Register {
                     instance_id,
-                    agent_id: AgentId::new("control-fixture").unwrap(),
+                    agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
                     transport: TransportKind::Pty,
                 },
             ),
@@ -291,5 +228,9 @@ async fn natural_exit_is_collected_as_generation_bound_observation() {
         kernel.snapshot().sessions[0].status,
         SessionStatus::Exited { exit_code: Some(7) }
     );
+    assert!(kernel.snapshot().sessions[0]
+        .terminal_frame
+        .as_ref()
+        .is_some_and(|frame| frame.contents.contains("fixture-exit")));
     assert_eq!(shell.active_session_count(), 0);
 }

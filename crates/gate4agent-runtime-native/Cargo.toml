@@ -1,16 +1,16 @@
 [package]
-name = "gate4agent-shell-native"
+name = "gate4agent-runtime-native"
 version = "0.2.37"
 edition = "2021"
 publish = false
 
 [dependencies]
-gate4agent = { path = "../.." }
 gate4agent-catalog = { path = "../gate4agent-catalog" }
-gate4agent-types = { path = "../gate4agent-types" }
-tokio = { version = "1", features = ["time"] }
+gate4agent-handle = { path = "../gate4agent-handle" }
+gate4agent-kernel = { path = "../gate4agent-kernel" }
+gate4agent-shell-native = { path = "../gate4agent-shell-native" }
 
 [dev-dependencies]
-gate4agent-kernel = { path = "../gate4agent-kernel" }
+gate4agent-types = { path = "../gate4agent-types" }
 gate4agent-testkit = { path = "../gate4agent-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

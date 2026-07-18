@@ -1,8 +1,9 @@
 use crate::{
-    AcpTransportSpec, AgentCapabilities, AgentCommandMode, AgentId, AgentReadinessSpec,
+    builtin_adapter_registry, AcpTransportSpec, AdapterBinding, AdapterFamily,
+    AgentAdapterCapabilities, AgentCapabilities, AgentCommandMode, AgentId, AgentReadinessSpec,
     AgentRegistry, AgentSpec, AgentTransportCapabilities, DetectionSpec, DraftReadySignal,
     InitialPromptMode, LaunchSpec, NativeDraftMode, PipePromptDelivery, PipeTransportSpec,
-    ProcessMatcher, PromptSpec, ProviderAdapter, SpecVerification,
+    ProcessMatcher, PromptSpec, SpecVerification,
 };
 use std::sync::OnceLock;
 
@@ -288,11 +289,11 @@ fn spec(
 }
 
 fn capabilities(id: &str) -> AgentCapabilities {
-    let adapter = match id {
-        "claude" => Some(ProviderAdapter::ClaudeCode),
-        "codex" => Some(ProviderAdapter::Codex),
-        "gemini" => Some(ProviderAdapter::Gemini),
-        "opencode" => Some(ProviderAdapter::OpenCode),
+    let adapter_id = match id {
+        "claude" => Some("claude-code"),
+        "codex" => Some("codex"),
+        "gemini" => Some("gemini"),
+        "opencode" => Some("opencode"),
         _ => None,
     };
     AgentCapabilities {
@@ -300,26 +301,31 @@ fn capabilities(id: &str) -> AgentCapabilities {
             .then_some(AgentCommandMode::SlashLine),
         transports: AgentTransportCapabilities {
             pty: true,
-            pty_adapter: adapter,
-            pipe: adapter.map(|adapter| PipeTransportSpec {
-                adapter,
-                launch_override: None,
-                prompt_delivery: PipePromptDelivery::None,
-            }),
+            pty_adapter: adapter_id
+                .and_then(|adapter| binding(AdapterFamily::PtySemantic, adapter)),
+            pipe: adapter_id
+                .and_then(|adapter| binding(AdapterFamily::Pipe, adapter))
+                .map(|adapter| PipeTransportSpec {
+                    adapter,
+                    launch_override: None,
+                    prompt_delivery: PipePromptDelivery::None,
+                }),
             // The legacy Claude/Codex ACP adapters use npm packages that may
             // be downloaded at launch. They are deliberately not enabled by
             // the catalog-backed control plane.
-            acp: match adapter {
-                Some(adapter @ (ProviderAdapter::Gemini | ProviderAdapter::OpenCode)) => {
-                    Some(AcpTransportSpec {
-                        adapter,
-                        launch_override: None,
-                    })
-                }
-                _ => None,
-            },
+            acp: adapter_id
+                .and_then(|adapter| binding(AdapterFamily::Acp, adapter))
+                .map(|adapter| AcpTransportSpec {
+                    adapter,
+                    launch_override: None,
+                }),
         },
+        adapters: AgentAdapterCapabilities::default(),
     }
+}
+
+fn binding(family: AdapterFamily, id: &str) -> Option<AdapterBinding> {
+    builtin_adapter_registry().binding(family, id).cloned()
 }
 
 fn readiness(id: &str) -> AgentReadinessSpec {

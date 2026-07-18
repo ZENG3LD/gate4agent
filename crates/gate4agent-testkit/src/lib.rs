@@ -1,10 +1,11 @@
 //! Controlled, authentication-free provider fixtures for integration tests.
 
+use gate4agent_adapters::builtin_adapter_registry;
 use gate4agent_types::{
-    AcpTransportSpec, AgentCapabilities, AgentCommandMode, AgentId, AgentReadinessSpec, AgentSpec,
-    AgentTransportCapabilities, DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec,
-    PipePromptDelivery, PipeTransportSpec, ProcessMatcher, PromptSpec, ProviderAdapter,
-    SpecVerification,
+    AcpTransportSpec, AdapterBinding, AdapterFamily, AgentAdapterCapabilities, AgentCapabilities,
+    AgentCommandMode, AgentId, AgentReadinessSpec, AgentSpec, AgentTransportCapabilities,
+    DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, PipePromptDelivery,
+    PipeTransportSpec, ProcessMatcher, PromptSpec, SpecVerification,
 };
 
 pub const CONTROL_FIXTURE_ID: &str = "control-fixture";
@@ -43,7 +44,7 @@ pub fn pipe_agent_spec() -> AgentSpec {
             pty: false,
             pty_adapter: None,
             pipe: Some(PipeTransportSpec {
-                adapter: ProviderAdapter::Codex,
+                adapter: adapter(AdapterFamily::Pipe, "codex"),
                 launch_override: Some(launch),
                 prompt_delivery: PipePromptDelivery::None,
             }),
@@ -82,7 +83,7 @@ for line in sys.stdin:
             pty_adapter: None,
             pipe: None,
             acp: Some(AcpTransportSpec {
-                adapter: ProviderAdapter::Gemini,
+                adapter: adapter(AdapterFamily::Acp, "gemini"),
                 launch_override: Some(launch),
             }),
         },
@@ -101,7 +102,7 @@ pub fn pty_provider_agent_spec() -> AgentSpec {
         launch,
         AgentTransportCapabilities {
             pty: true,
-            pty_adapter: Some(ProviderAdapter::Codex),
+            pty_adapter: Some(adapter(AdapterFamily::PtySemantic, "codex")),
             pipe: None,
             acp: None,
         },
@@ -156,9 +157,17 @@ fn provider_spec(
         capabilities: AgentCapabilities {
             agent_commands: None,
             transports,
+            adapters: AgentAdapterCapabilities::default(),
         },
         verification: SpecVerification::Gate4AgentVerified,
     }
+}
+
+fn adapter(family: AdapterFamily, id: &str) -> AdapterBinding {
+    builtin_adapter_registry()
+        .binding(family, id)
+        .unwrap_or_else(|| panic!("missing controlled {family:?} adapter {id}"))
+        .clone()
 }
 
 fn fixture_spec(script: &str) -> AgentSpec {

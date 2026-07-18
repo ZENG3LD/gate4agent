@@ -1,0 +1,14 @@
+[package]
+name = "gate4agent-adapters"
+version = "0.2.37"
+edition = "2021"
+description = "Pure revisioned provider adapter registry and implementations for gate4agent"
+license = "MIT"
+publish = false
+
+[lib]
+name = "gate4agent_adapters"
+
+[dependencies]
+gate4agent-types = { path = "../gate4agent-types" }
+thiserror = "2"

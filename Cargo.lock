@@ -315,9 +315,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-adapters"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "gate4agent-catalog"
 version = "0.2.37"
 dependencies = [
+ "gate4agent-adapters",
  "gate4agent-types",
  "thiserror 2.0.18",
 ]
@@ -377,6 +386,7 @@ dependencies = [
 name = "gate4agent-testkit"
 version = "0.2.37"
 dependencies = [
+ "gate4agent-adapters",
  "gate4agent-types",
 ]
 
@@ -385,6 +395,7 @@ name = "gate4agent-types"
 version = "0.2.37"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

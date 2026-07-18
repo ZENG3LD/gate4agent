@@ -5,11 +5,17 @@ mod launch;
 mod registry;
 
 pub use builtin::{builtin_registry, builtin_specs, ORCA_REFERENCE_REVISION};
+pub use gate4agent_adapters::{
+    builtin_adapter_registry, AdapterDescriptor, AdapterRegistry, AdapterRegistryError,
+    BUILTIN_ADAPTER_REVISION,
+};
 pub use gate4agent_types::{
-    AcpTransportSpec, AgentCapabilities, AgentCommandMode, AgentId, AgentIdError,
-    AgentReadinessSpec, AgentSpec, AgentTransportCapabilities, DetectionSpec, DraftReadySignal,
-    InitialPromptMode, LaunchSpec, NativeDraftMode, PipePromptDelivery, PipeTransportSpec,
-    ProcessMatcher, PromptSpec, ProviderAdapter, RuntimePlatform, SpecVerification,
+    AcpTransportSpec, AdapterBinding, AdapterBindingError, AdapterFamily, AdapterId,
+    AdapterIdError, AdapterVerification, AgentAdapterCapabilities, AgentCapabilities,
+    AgentCommandMode, AgentId, AgentIdError, AgentReadinessSpec, AgentSpec,
+    AgentTransportCapabilities, DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec,
+    NativeDraftMode, PipePromptDelivery, PipeTransportSpec, ProcessMatcher, PromptSpec,
+    RuntimePlatform, SpecVerification,
 };
 pub use launch::{
     plan_draft_launch, plan_launch, EnvMutation, LaunchPlan, LaunchPlanError, LaunchRequest,

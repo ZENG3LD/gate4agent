@@ -10,4 +10,5 @@ name = "gate4agent_catalog"
 
 [dependencies]
 gate4agent-types = { path = "../gate4agent-types" }
+gate4agent-adapters = { path = "../gate4agent-adapters" }
 thiserror = "2"

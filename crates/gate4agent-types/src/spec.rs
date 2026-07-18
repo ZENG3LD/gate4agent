@@ -1,4 +1,4 @@
-use crate::{normalize_executable_name, AgentId, AgentReadinessSpec};
+use crate::{normalize_executable_name, AdapterBinding, AgentId, AgentReadinessSpec};
 use serde::{Deserialize, Serialize};
 
 /// Runtime in which an executable is detected or launched.
@@ -105,20 +105,20 @@ pub struct AgentCapabilities {
     pub agent_commands: Option<AgentCommandMode>,
     #[serde(default)]
     pub transports: AgentTransportCapabilities,
+    #[serde(default)]
+    pub adapters: AgentAdapterCapabilities,
 }
 
-/// Parser/protocol adapter implemented by the native shell for a provider.
-///
-/// This is deliberately distinct from [`AgentId`]: a catalog entry may use a
-/// compatible wire protocol without being silently re-identified as another
-/// provider.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderAdapter {
-    ClaudeCode,
-    Codex,
-    Gemini,
-    OpenCode,
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentAdapterCapabilities {
+    #[serde(default)]
+    pub hook: Option<AdapterBinding>,
+    #[serde(default)]
+    pub history: Option<AdapterBinding>,
+    #[serde(default)]
+    pub resume: Option<AdapterBinding>,
+    #[serde(default)]
+    pub capability_probe: Option<AdapterBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -133,7 +133,7 @@ pub enum PipePromptDelivery {
 /// headless executable differs from their interactive PTY executable.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PipeTransportSpec {
-    pub adapter: ProviderAdapter,
+    pub adapter: AdapterBinding,
     #[serde(default)]
     pub launch_override: Option<LaunchSpec>,
     #[serde(default = "default_pipe_prompt_delivery")]
@@ -146,7 +146,7 @@ fn default_pipe_prompt_delivery() -> PipePromptDelivery {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AcpTransportSpec {
-    pub adapter: ProviderAdapter,
+    pub adapter: AdapterBinding,
     #[serde(default)]
     pub launch_override: Option<LaunchSpec>,
 }
@@ -156,7 +156,7 @@ pub struct AgentTransportCapabilities {
     #[serde(default = "default_true")]
     pub pty: bool,
     #[serde(default)]
-    pub pty_adapter: Option<ProviderAdapter>,
+    pub pty_adapter: Option<AdapterBinding>,
     #[serde(default)]
     pub pipe: Option<PipeTransportSpec>,
     #[serde(default)]

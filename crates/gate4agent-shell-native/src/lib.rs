@@ -13,10 +13,10 @@ use gate4agent::{
 };
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
-    AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-    ObservationEnvelope, OperationId, PreparedInputKind, ProviderAdapter, ProviderEvent,
-    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    AdapterBinding, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
+    ObservationEnvelope, OperationId, PreparedInputKind, ProviderEvent, SessionGeneration,
+    StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
+    WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -276,27 +276,38 @@ impl NativeEffectShell {
                 Ok(session) => {
                     let process_id = session.root_pid();
                     let session_id = session.session_id().to_owned();
-                    let provider = match spec.capabilities.transports.pty_adapter.map(cli_tool) {
-                        Some(tool) => match session.attach_events(session.beginning_cursor()) {
-                            Ok(attachment) => Some(OwnedPtyProvider {
-                                receiver: attachment.receiver,
-                                replay: attachment.replay.into(),
-                                pending_events: VecDeque::from([ProviderEvent::SessionStarted {
-                                    session_id,
-                                    model: String::new(),
-                                    tools: Vec::new(),
-                                }]),
-                                pipeline: Mutex::new(create_pipeline(tool)),
-                                rate_limits: RateLimitDetector::new_for_tool(tool),
-                                next_provider_sequence: 1,
-                            }),
-                            Err(error) => {
-                                let _ = session.shutdown().await;
-                                return ControlObservation::SpawnFailed {
-                                    message: error.to_string(),
-                                };
+                    let provider = match spec.capabilities.transports.pty_adapter.as_ref() {
+                        Some(adapter) => {
+                            let tool = match cli_tool(adapter) {
+                                Ok(tool) => tool,
+                                Err(message) => {
+                                    let _ = session.shutdown().await;
+                                    return ControlObservation::SpawnFailed { message };
+                                }
+                            };
+                            match session.attach_events(session.beginning_cursor()) {
+                                Ok(attachment) => Some(OwnedPtyProvider {
+                                    receiver: attachment.receiver,
+                                    replay: attachment.replay.into(),
+                                    pending_events: VecDeque::from([
+                                        ProviderEvent::SessionStarted {
+                                            session_id,
+                                            model: String::new(),
+                                            tools: Vec::new(),
+                                        },
+                                    ]),
+                                    pipeline: Mutex::new(create_pipeline(tool)),
+                                    rate_limits: RateLimitDetector::new_for_tool(tool),
+                                    next_provider_sequence: 1,
+                                }),
+                                Err(error) => {
+                                    let _ = session.shutdown().await;
+                                    return ControlObservation::SpawnFailed {
+                                        message: error.to_string(),
+                                    };
+                                }
                             }
-                        },
+                        }
                         None => None,
                     };
                     self.pty_sessions.insert(
@@ -321,7 +332,10 @@ impl NativeEffectShell {
                         message: format!("agent '{agent_id}' does not support Pipe transport"),
                     };
                 };
-                let tool = cli_tool(pipe_spec.adapter);
+                let tool = match cli_tool(&pipe_spec.adapter) {
+                    Ok(tool) => tool,
+                    Err(message) => return ControlObservation::SpawnFailed { message },
+                };
                 let prompt = request.initial_prompt.unwrap_or_default();
                 let config = SessionConfig {
                     tool,
@@ -375,7 +389,10 @@ impl NativeEffectShell {
                         message: format!("agent '{agent_id}' does not support ACP transport"),
                     };
                 };
-                let tool = cli_tool(acp_spec.adapter);
+                let tool = match cli_tool(&acp_spec.adapter) {
+                    Ok(tool) => tool,
+                    Err(message) => return ControlObservation::SpawnFailed { message },
+                };
                 let spawned = match acp_spec.launch_override.as_ref() {
                     Some(launch) => {
                         AcpSession::spawn_with_launch(
@@ -886,12 +903,16 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
     }
 }
 
-fn cli_tool(adapter: ProviderAdapter) -> CliTool {
-    match adapter {
-        ProviderAdapter::ClaudeCode => CliTool::ClaudeCode,
-        ProviderAdapter::Codex => CliTool::Codex,
-        ProviderAdapter::Gemini => CliTool::Gemini,
-        ProviderAdapter::OpenCode => CliTool::OpenCode,
+fn cli_tool(adapter: &AdapterBinding) -> Result<CliTool, String> {
+    match adapter.id.as_str() {
+        "claude-code" => Ok(CliTool::ClaudeCode),
+        "codex" => Ok(CliTool::Codex),
+        "gemini" => Ok(CliTool::Gemini),
+        "opencode" => Ok(CliTool::OpenCode),
+        id => Err(format!(
+            "adapter '{id}' at revision '{}' has no legacy CLI bridge",
+            adapter.revision
+        )),
     }
 }
 

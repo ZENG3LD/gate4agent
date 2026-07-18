@@ -1,4 +1,7 @@
-use crate::{AgentId, AgentSpec, InitialPromptMode, ProcessMatcher, RuntimePlatform};
+use crate::{
+    builtin_adapter_registry, AdapterBinding, AdapterFamily, AdapterRegistry, AgentId, AgentSpec,
+    InitialPromptMode, ProcessMatcher, RuntimePlatform,
+};
 use gate4agent_types::normalize_executable_name;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -14,15 +17,32 @@ pub struct AgentRegistry {
 
 impl AgentRegistry {
     pub fn new(specs: impl IntoIterator<Item = AgentSpec>) -> Result<Self, RegistryError> {
+        Self::new_with_adapters(specs, builtin_adapter_registry())
+    }
+
+    /// Builds a catalog against a consumer-extended adapter registry.
+    pub fn new_with_adapters(
+        specs: impl IntoIterator<Item = AgentSpec>,
+        adapters: &AdapterRegistry,
+    ) -> Result<Self, RegistryError> {
         let mut registry = Self::default();
         for spec in specs {
-            registry.insert(spec)?;
+            registry.insert_with_adapters(spec, adapters)?;
         }
         Ok(registry)
     }
 
     pub fn insert(&mut self, spec: AgentSpec) -> Result<(), RegistryError> {
-        validate_spec(&spec)?;
+        self.insert_with_adapters(spec, builtin_adapter_registry())
+    }
+
+    /// Inserts a specification validated against a consumer adapter registry.
+    pub fn insert_with_adapters(
+        &mut self,
+        spec: AgentSpec,
+        adapters: &AdapterRegistry,
+    ) -> Result<(), RegistryError> {
+        validate_spec(&spec, adapters)?;
         if self.id_index.contains_key(&spec.id) {
             return Err(RegistryError::DuplicateAgentId(spec.id));
         }
@@ -95,7 +115,7 @@ impl AgentRegistry {
     }
 }
 
-fn validate_spec(spec: &AgentSpec) -> Result<(), RegistryError> {
+fn validate_spec(spec: &AgentSpec, adapters: &AdapterRegistry) -> Result<(), RegistryError> {
     if spec.revision.trim().is_empty()
         || spec.revision.len() > 256
         || spec.revision.chars().any(char::is_control)
@@ -116,6 +136,7 @@ fn validate_spec(spec: &AgentSpec) -> Result<(), RegistryError> {
         validate_executable_name(&spec.id, "required command", required)?;
     }
     validate_launch(&spec.id, &spec.launch)?;
+    validate_adapter_bindings(spec, adapters)?;
     if let Some(launch) = spec
         .capabilities
         .transports
@@ -165,6 +186,70 @@ fn validate_spec(spec: &AgentSpec) -> Result<(), RegistryError> {
         }
         _ => Ok(()),
     }
+}
+
+fn validate_adapter_bindings(
+    spec: &AgentSpec,
+    adapters: &AdapterRegistry,
+) -> Result<(), RegistryError> {
+    let transports = &spec.capabilities.transports;
+    for (family, binding) in [
+        (AdapterFamily::PtySemantic, transports.pty_adapter.as_ref()),
+        (
+            AdapterFamily::Pipe,
+            transports.pipe.as_ref().map(|value| &value.adapter),
+        ),
+        (
+            AdapterFamily::Acp,
+            transports.acp.as_ref().map(|value| &value.adapter),
+        ),
+        (
+            AdapterFamily::Hook,
+            spec.capabilities.adapters.hook.as_ref(),
+        ),
+        (
+            AdapterFamily::History,
+            spec.capabilities.adapters.history.as_ref(),
+        ),
+        (
+            AdapterFamily::Resume,
+            spec.capabilities.adapters.resume.as_ref(),
+        ),
+        (
+            AdapterFamily::CapabilityProbe,
+            spec.capabilities.adapters.capability_probe.as_ref(),
+        ),
+    ] {
+        if let Some(binding) = binding {
+            validate_adapter_binding(&spec.id, family, binding, adapters)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_adapter_binding(
+    agent: &AgentId,
+    family: AdapterFamily,
+    binding: &AdapterBinding,
+    adapters: &AdapterRegistry,
+) -> Result<(), RegistryError> {
+    binding
+        .validate()
+        .map_err(|error| RegistryError::InvalidAdapterBinding {
+            agent: agent.clone(),
+            family,
+            adapter_id: binding.id.to_string(),
+            message: error.to_string(),
+        })?;
+    if !adapters.supports(family, binding) {
+        return Err(RegistryError::UnsupportedAdapterBinding {
+            agent: agent.clone(),
+            family,
+            adapter_id: binding.id.to_string(),
+            revision: binding.revision.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_executable_name(
@@ -240,12 +325,31 @@ pub enum RegistryError {
     InvalidPromptFlag { agent: AgentId, flag: String },
     #[error("agent '{agent}' contains a NUL byte in {field}")]
     NulByte { agent: AgentId, field: &'static str },
+    #[error("agent '{agent}' has invalid {family:?} adapter '{adapter_id}': {message}")]
+    InvalidAdapterBinding {
+        agent: AgentId,
+        family: AdapterFamily,
+        adapter_id: String,
+        message: String,
+    },
+    #[error(
+        "agent '{agent}' requires unavailable {family:?} adapter '{adapter_id}' at revision '{revision}'"
+    )]
+    UnsupportedAdapterBinding {
+        agent: AgentId,
+        family: AdapterFamily,
+        adapter_id: String,
+        revision: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DetectionSpec, LaunchSpec, ProcessMatcher, PromptSpec, SpecVerification};
+    use crate::{
+        AdapterDescriptor, AdapterId, AdapterVerification, DetectionSpec, LaunchSpec,
+        ProcessMatcher, PromptSpec, SpecVerification,
+    };
 
     fn spec(id: &str, command: &str) -> AgentSpec {
         AgentSpec {
@@ -301,5 +405,29 @@ mod tests {
         second.detection.aliases.push("first.cmd".to_owned());
         let error = AgentRegistry::new([spec("first", "first"), second]).unwrap_err();
         assert!(matches!(error, RegistryError::AmbiguousCommand { .. }));
+    }
+
+    #[test]
+    fn consumer_specs_can_use_an_extended_adapter_registry() {
+        let binding = AdapterBinding::new(
+            AdapterId::new("custom-hook").unwrap(),
+            "custom-hook/v1",
+            AdapterVerification::SyntheticFixture,
+        )
+        .unwrap();
+        let adapters = AdapterRegistry::new([AdapterDescriptor {
+            family: AdapterFamily::Hook,
+            binding: binding.clone(),
+            agents: vec![AgentId::new("custom").unwrap()],
+        }])
+        .unwrap();
+        let mut custom = spec("custom", "custom");
+        custom.capabilities.adapters.hook = Some(binding);
+
+        assert!(matches!(
+            AgentRegistry::new([custom.clone()]),
+            Err(RegistryError::UnsupportedAdapterBinding { .. })
+        ));
+        AgentRegistry::new_with_adapters([custom], &adapters).unwrap();
     }
 }

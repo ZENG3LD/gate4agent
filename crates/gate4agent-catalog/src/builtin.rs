@@ -289,11 +289,9 @@ fn spec(
 }
 
 fn capabilities(id: &str) -> AgentCapabilities {
-    let adapter_id = match id {
-        "claude" => Some("claude-code"),
-        "codex" => Some("codex"),
-        "gemini" => Some("gemini"),
-        "opencode" => Some("opencode"),
+    let adapter_id = if id == "claude" { "claude-code" } else { id };
+    let transport_adapter_id = match id {
+        "claude" | "codex" | "gemini" | "opencode" => Some(adapter_id),
         _ => None,
     };
     AgentCapabilities {
@@ -301,9 +299,9 @@ fn capabilities(id: &str) -> AgentCapabilities {
             .then_some(AgentCommandMode::SlashLine),
         transports: AgentTransportCapabilities {
             pty: true,
-            pty_adapter: adapter_id
+            pty_adapter: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::PtySemantic, adapter)),
-            pipe: adapter_id
+            pipe: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::Pipe, adapter))
                 .map(|adapter| PipeTransportSpec {
                     adapter,
@@ -313,14 +311,19 @@ fn capabilities(id: &str) -> AgentCapabilities {
             // The legacy Claude/Codex ACP adapters use npm packages that may
             // be downloaded at launch. They are deliberately not enabled by
             // the catalog-backed control plane.
-            acp: adapter_id
+            acp: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::Acp, adapter))
                 .map(|adapter| AcpTransportSpec {
                     adapter,
                     launch_override: None,
                 }),
         },
-        adapters: AgentAdapterCapabilities::default(),
+        adapters: AgentAdapterCapabilities {
+            hook: binding(AdapterFamily::Hook, adapter_id),
+            history: binding(AdapterFamily::History, adapter_id),
+            resume: binding(AdapterFamily::Resume, adapter_id),
+            capability_probe: binding(AdapterFamily::CapabilityProbe, adapter_id),
+        },
     }
 }
 
@@ -395,5 +398,44 @@ mod tests {
             .transports
             .pty_adapter
             .is_none());
+
+        for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
+            let adapters = &registry.get_by_id(id).unwrap().capabilities.adapters;
+            assert!(adapters.hook.is_some(), "missing hook adapter for {id}");
+            assert!(
+                adapters.history.is_some(),
+                "missing history adapter for {id}"
+            );
+        }
+        for id in ["claude", "codex", "gemini", "opencode", "grok", "droid"] {
+            assert!(
+                registry
+                    .get_by_id(id)
+                    .unwrap()
+                    .capabilities
+                    .adapters
+                    .resume
+                    .is_some(),
+                "missing resume adapter for {id}"
+            );
+        }
+        for id in ["kimi", "copilot", "cursor", "qwen-code"] {
+            assert!(
+                registry
+                    .get_by_id(id)
+                    .unwrap()
+                    .capabilities
+                    .adapters
+                    .resume
+                    .is_none(),
+                "unexpected live resume adapter for {id}"
+            );
+        }
+
+        let qwen = registry.get_by_id("qwen-code").unwrap();
+        assert_eq!(qwen.prompt.initial, InitialPromptMode::AfterReady);
+        assert!(qwen.capabilities.adapters.hook.is_none());
+        assert!(qwen.capabilities.adapters.history.is_none());
+        assert!(qwen.capabilities.transports.pty_adapter.is_none());
     }
 }

@@ -6,10 +6,25 @@
 //! Forbidden: async, locks, channels, process, filesystem, database, network,
 //! credentials, and product presentation policy.
 
+mod history;
+mod hook;
+mod resume;
+
 use gate4agent_types::{AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use thiserror::Error;
+
+pub use history::{
+    parse_history, HistoryAdapterError, HistoryDocument, HistoryMessage, HistoryRole,
+    HistorySession, HISTORY_DOCUMENT_MAX_BYTES, HISTORY_MESSAGE_MAX_CHARS,
+    HISTORY_METADATA_MAX_BYTES, HISTORY_STORED_MESSAGES_MAX,
+};
+pub use hook::{
+    normalize_hook_event, HookAdapterError, HOOK_EVENT_NAME_MAX_BYTES, HOOK_PAYLOAD_MAX_BYTES,
+    HOOK_TEXT_MAX_CHARS,
+};
+pub use resume::{build_resume_plan, ResumeAdapterError, ResumePlan, RESUME_SESSION_ID_MAX_BYTES};
 
 pub const BUILTIN_ADAPTER_REVISION: &str = "gate4agent-adapter/v1";
 
@@ -233,6 +248,20 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     }
     for id in ["gemini", "opencode"] {
         descriptors.push(descriptor(AdapterFamily::Acp, id));
+    }
+    for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
+        descriptors.push(descriptor(AdapterFamily::Hook, id));
+        descriptors.push(descriptor(AdapterFamily::History, id));
+    }
+    for id in [
+        "claude-code",
+        "codex",
+        "gemini",
+        "opencode",
+        "grok",
+        "droid",
+    ] {
+        descriptors.push(descriptor(AdapterFamily::Resume, id));
     }
     descriptors
 }

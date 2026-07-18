@@ -2,7 +2,7 @@ use crate::{AgentId, InputAction, InputPrepareError, PreparedInput, PreparedInpu
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -19,6 +19,24 @@ pub struct OperationId(pub u64);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionGeneration(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartRequest {
+    pub working_directory: String,
+    pub terminal_size: TerminalSize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub columns: u16,
+}
+
+impl TerminalSize {
+    pub fn is_valid(self) -> bool {
+        self.rows > 0 && self.columns > 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -45,6 +63,7 @@ pub enum ControlCommand {
     },
     Start {
         instance_id: AgentInstanceId,
+        request: StartRequest,
     },
     Stop {
         instance_id: AgentInstanceId,
@@ -53,6 +72,10 @@ pub enum ControlCommand {
     SendInput {
         instance_id: AgentInstanceId,
         action: InputAction,
+    },
+    Resize {
+        instance_id: AgentInstanceId,
+        size: TerminalSize,
     },
     Remove {
         instance_id: AgentInstanceId,
@@ -63,9 +86,10 @@ impl ControlCommand {
     pub fn instance_id(&self) -> AgentInstanceId {
         match self {
             Self::Register { instance_id, .. }
-            | Self::Start { instance_id }
+            | Self::Start { instance_id, .. }
             | Self::Stop { instance_id, .. }
             | Self::SendInput { instance_id, .. }
+            | Self::Resize { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
     }
@@ -86,12 +110,16 @@ pub enum ControlEffect {
     Spawn {
         agent_id: AgentId,
         transport: TransportKind,
+        request: StartRequest,
     },
     Stop {
         force: bool,
     },
     WriteInput {
         input: PreparedInput,
+    },
+    Resize {
+        size: TerminalSize,
     },
 }
 
@@ -119,8 +147,17 @@ pub enum ControlObservation {
     StopCompleted {
         forced: bool,
     },
+    StopFailed {
+        message: String,
+    },
     InputCompleted,
     InputFailed {
+        message: String,
+    },
+    ResizeCompleted {
+        size: TerminalSize,
+    },
+    ResizeFailed {
         message: String,
     },
 }
@@ -152,6 +189,7 @@ pub struct SessionSnapshot {
     pub pending_operation: Option<OperationId>,
     pub pending_input: Option<PreparedInputKind>,
     pub process_id: Option<u32>,
+    pub terminal_size: Option<TerminalSize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -187,6 +225,16 @@ pub enum ControlEventKind {
         input_kind: PreparedInputKind,
         message: String,
     },
+    ResizeRequested {
+        operation_id: OperationId,
+        size: TerminalSize,
+    },
+    Resized {
+        size: TerminalSize,
+    },
+    ResizeFailed {
+        message: String,
+    },
     Exited { exit_code: Option<i32>, forced: bool },
     Failed { message: String },
     Removed,
@@ -220,6 +268,10 @@ pub enum ControlError {
     },
     #[error("agent input was rejected: {error}")]
     InputRejected { error: InputPrepareError },
+    #[error("terminal size must have non-zero rows and columns")]
+    InvalidTerminalSize,
+    #[error("working directory must be non-empty and contain no NUL byte")]
+    InvalidWorkingDirectory,
     #[error("agent instance {instance_id:?} cannot {action} while in state {status:?}")]
     InvalidTransition {
         instance_id: AgentInstanceId,

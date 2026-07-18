@@ -67,5 +67,6 @@ members = [
     "crates/gate4agent-engine",
     "crates/gate4agent-kernel",
     "crates/gate4agent-handle",
+    "crates/gate4agent-shell-native",
 ]
 resolver = "2"

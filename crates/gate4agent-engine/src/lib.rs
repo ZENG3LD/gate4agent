@@ -5,13 +5,14 @@ use gate4agent_types::{
     ControlCommand, ControlEffect, ControlError, ControlEvent, ControlEventKind,
     ControlObservation, ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope,
     ObservationIgnoredReason, OperationId, SessionGeneration, SessionSnapshot, SessionStatus,
-    CONTROL_PROTOCOL_VERSION,
+    StartRequest, TerminalSize, CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionState {
     snapshot: SessionSnapshot,
+    pending_terminal_size: Option<TerminalSize>,
 }
 
 /// Owns logical session lifecycle state. External work is emitted as effects
@@ -68,7 +69,9 @@ impl Gate4AgentEngine {
                             pending_operation: None,
                             pending_input: None,
                             process_id: None,
+                            terminal_size: None,
                         },
+                        pending_terminal_size: None,
                     },
                 );
                 self.bump_revision();
@@ -80,7 +83,10 @@ impl Gate4AgentEngine {
                 );
                 Ok(())
             }
-            ControlCommand::Start { instance_id } => self.start(command_id, instance_id),
+            ControlCommand::Start {
+                instance_id,
+                request,
+            } => self.start(command_id, instance_id, request),
             ControlCommand::Stop { instance_id, force } => {
                 self.stop(command_id, instance_id, force)
             }
@@ -89,6 +95,9 @@ impl Gate4AgentEngine {
                 action,
             } => {
                 self.send_input(command_id, instance_id, action)
+            }
+            ControlCommand::Resize { instance_id, size } => {
+                self.resize(command_id, instance_id, size)
             }
             ControlCommand::Remove { instance_id } => self.remove(command_id, instance_id),
         }
@@ -138,8 +147,11 @@ impl Gate4AgentEngine {
             (SessionStatus::Starting, ControlObservation::Spawned { .. })
             | (SessionStatus::Starting, ControlObservation::SpawnFailed { .. })
             | (SessionStatus::Stopping, ControlObservation::StopCompleted { .. })
+            | (SessionStatus::Stopping, ControlObservation::StopFailed { .. })
             | (SessionStatus::Running, ControlObservation::InputCompleted)
-            | (SessionStatus::Running, ControlObservation::InputFailed { .. }) => true,
+            | (SessionStatus::Running, ControlObservation::InputFailed { .. })
+            | (SessionStatus::Running, ControlObservation::ResizeCompleted { .. })
+            | (SessionStatus::Running, ControlObservation::ResizeFailed { .. }) => true,
             (
                 SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping,
                 ControlObservation::ProcessExited { .. },
@@ -154,15 +166,26 @@ impl Gate4AgentEngine {
         let pending_input = current.pending_input;
         let event = match envelope.observation {
             ControlObservation::Spawned { process_id } => {
-                let session = self.session_mut(instance_id);
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                let terminal_size = state.pending_terminal_size.take();
+                let session = &mut state.snapshot;
                 session.status = SessionStatus::Running;
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = process_id;
+                session.terminal_size = terminal_size;
                 ControlEventKind::Running { process_id }
             }
             ControlObservation::SpawnFailed { message } => {
-                let session = self.session_mut(instance_id);
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_terminal_size = None;
+                let session = &mut state.snapshot;
                 session.status = SessionStatus::Failed {
                     message: message.clone(),
                 };
@@ -172,7 +195,12 @@ impl Gate4AgentEngine {
                 ControlEventKind::Failed { message }
             }
             ControlObservation::ProcessExited { exit_code } => {
-                let session = self.session_mut(instance_id);
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_terminal_size = None;
+                let session = &mut state.snapshot;
                 session.status = SessionStatus::Exited { exit_code };
                 session.pending_operation = None;
                 session.pending_input = None;
@@ -183,7 +211,12 @@ impl Gate4AgentEngine {
                 }
             }
             ControlObservation::StopCompleted { forced } => {
-                let session = self.session_mut(instance_id);
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_terminal_size = None;
+                let session = &mut state.snapshot;
                 session.status = SessionStatus::Exited { exit_code: None };
                 session.pending_operation = None;
                 session.pending_input = None;
@@ -192,6 +225,21 @@ impl Gate4AgentEngine {
                     exit_code: None,
                     forced,
                 }
+            }
+            ControlObservation::StopFailed { message } => {
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_terminal_size = None;
+                let session = &mut state.snapshot;
+                session.status = SessionStatus::Failed {
+                    message: message.clone(),
+                };
+                session.pending_operation = None;
+                session.pending_input = None;
+                session.process_id = None;
+                ControlEventKind::Failed { message }
             }
             ControlObservation::InputCompleted => {
                 let input_kind = pending_input
@@ -212,6 +260,27 @@ impl Gate4AgentEngine {
                     message,
                 }
             }
+            ControlObservation::ResizeCompleted { size } => {
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_terminal_size = None;
+                let session = &mut state.snapshot;
+                session.pending_operation = None;
+                session.terminal_size = Some(size);
+                ControlEventKind::Resized { size }
+            }
+            ControlObservation::ResizeFailed { message } => {
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_terminal_size = None;
+                let session = &mut state.snapshot;
+                session.pending_operation = None;
+                ControlEventKind::ResizeFailed { message }
+            }
         };
         self.bump_revision();
         self.emit_event(None, instance_id, generation, event);
@@ -229,6 +298,10 @@ impl Gate4AgentEngine {
         }
     }
 
+    pub fn session_snapshot(&self, instance_id: AgentInstanceId) -> Option<&SessionSnapshot> {
+        self.sessions.get(&instance_id).map(|state| &state.snapshot)
+    }
+
     pub fn drain_effects(&mut self) -> Vec<EffectEnvelope> {
         std::mem::take(&mut self.effects)
     }
@@ -241,7 +314,14 @@ impl Gate4AgentEngine {
         &mut self,
         command_id: CommandId,
         instance_id: AgentInstanceId,
+        request: StartRequest,
     ) -> Result<(), ControlError> {
+        if !request.terminal_size.is_valid() {
+            return Err(ControlError::InvalidTerminalSize);
+        }
+        if request.working_directory.is_empty() || request.working_directory.contains('\0') {
+            return Err(ControlError::InvalidWorkingDirectory);
+        }
         let status = self
             .sessions
             .get(&instance_id)
@@ -262,12 +342,18 @@ impl Gate4AgentEngine {
 
         let operation_id = self.allocate_operation();
         let (generation, agent_id, transport) = {
-            let session = self.session_mut(instance_id);
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.pending_terminal_size = Some(request.terminal_size);
+            let session = &mut state.snapshot;
             session.generation = SessionGeneration(session.generation.0.saturating_add(1));
             session.status = SessionStatus::Starting;
             session.pending_operation = Some(operation_id);
             session.pending_input = None;
             session.process_id = None;
+            session.terminal_size = None;
             (
                 session.generation,
                 session.agent_id.clone(),
@@ -282,6 +368,7 @@ impl Gate4AgentEngine {
             effect: ControlEffect::Spawn {
                 agent_id,
                 transport,
+                request,
             },
         });
         self.bump_revision();
@@ -398,6 +485,60 @@ impl Gate4AgentEngine {
                 operation_id,
                 input_kind,
             },
+        );
+        Ok(())
+    }
+
+    fn resize(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        size: TerminalSize,
+    ) -> Result<(), ControlError> {
+        if !size.is_valid() {
+            return Err(ControlError::InvalidTerminalSize);
+        }
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.status != SessionStatus::Running {
+            return Err(ControlError::InvalidTransition {
+                instance_id,
+                action: "resize".to_owned(),
+                status: state.snapshot.status.clone(),
+            });
+        }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
+
+        let operation_id = self.allocate_operation();
+        let generation = {
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.snapshot.pending_operation = Some(operation_id);
+            state.pending_terminal_size = Some(size);
+            state.snapshot.generation
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::Resize { size },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::ResizeRequested { operation_id, size },
         );
         Ok(())
     }
@@ -520,6 +661,13 @@ mod tests {
             id: CommandId(command_id),
             command: ControlCommand::Start {
                 instance_id: instance(),
+                request: StartRequest {
+                    working_directory: ".".to_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                },
             },
         }
     }
@@ -576,6 +724,49 @@ mod tests {
         assert_eq!(session.status, SessionStatus::Running);
         assert_eq!(session.process_id, Some(42));
         assert_eq!(session.pending_operation, None);
+        assert_eq!(
+            session.terminal_size,
+            Some(TerminalSize {
+                rows: 24,
+                columns: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn resize_is_pending_until_observed() {
+        let (mut engine, _) = running_engine();
+        let size = TerminalSize {
+            rows: 40,
+            columns: 120,
+        };
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(9),
+                command: ControlCommand::Resize {
+                    instance_id: instance(),
+                    size,
+                },
+            })
+            .unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        assert_eq!(
+            engine.snapshot().sessions[0].terminal_size,
+            Some(TerminalSize {
+                rows: 24,
+                columns: 80,
+            })
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(effect.operation_id),
+            instance_id: effect.instance_id,
+            generation: effect.generation,
+            observation: ControlObservation::ResizeCompleted { size },
+        });
+        assert_eq!(engine.snapshot().sessions[0].terminal_size, Some(size));
     }
 
     #[test]

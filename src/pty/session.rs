@@ -406,6 +406,24 @@ impl PtySession {
             PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl => None,
         };
         self.validate_permit(&permit, required_intent)?;
+        self.write_prepared_input(input).await
+    }
+
+    /// Write explicit terminal text or control without an agent readiness
+    /// permit. Semantic prompt, draft, and agent-command inputs remain gated.
+    pub async fn send_terminal_input(&self, input: PreparedInput) -> Result<(), AgentError> {
+        if !matches!(
+            input.kind(),
+            PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl
+        ) {
+            return Err(AgentError::Pty(
+                "semantic input requires a readiness permit".to_owned(),
+            ));
+        }
+        self.write_prepared_input(input).await
+    }
+
+    async fn write_prepared_input(&self, input: PreparedInput) -> Result<(), AgentError> {
         let _serialized = self.typed_input_lock.lock().await;
         for write in input.into_writes() {
             if write.delay_before_ms > TERMINAL_WRITE_DELAY_MAX_MS {
@@ -598,6 +616,11 @@ impl PtySession {
     /// Stable agent identity associated with the session.
     pub fn agent_id(&self) -> &AgentId {
         &self.agent_id
+    }
+
+    /// Root process ID observed from the owned PTY child handle.
+    pub fn root_pid(&self) -> Option<u32> {
+        self.root_pid
     }
 
     /// Whether the output reader has reached a terminal state.

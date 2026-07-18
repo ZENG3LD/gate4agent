@@ -11,7 +11,8 @@ pub use control::{
     AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
     ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
     ObservationEnvelope, ObservationIgnoredReason, OperationId, SessionGeneration,
-    SessionSnapshot, SessionStatus, TransportKind, CONTROL_PROTOCOL_VERSION,
+    SessionSnapshot, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 pub use executable::normalize_executable_name;
 pub use id::{AgentId, AgentIdError};

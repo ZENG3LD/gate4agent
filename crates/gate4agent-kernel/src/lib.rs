@@ -4,7 +4,7 @@ use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_engine::Gate4AgentEngine;
 use gate4agent_types::{
     AgentId, CommandEnvelope, CommandId, ControlCommand, ControlError, ControlEvent,
-    ControlSnapshot, EffectEnvelope, ObservationEnvelope, CONTROL_PROTOCOL_VERSION,
+    ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope, CONTROL_PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -18,6 +18,11 @@ pub struct CommandOutcome {
 pub enum KernelCommandError {
     #[error("agent '{agent_id}' is not present in the kernel catalog")]
     UnknownAgent { agent_id: AgentId },
+    #[error("agent '{agent_id}' does not declare capability '{capability}'")]
+    UnsupportedCapability {
+        agent_id: AgentId,
+        capability: &'static str,
+    },
     #[error(transparent)]
     Control(#[from] ControlError),
 }
@@ -103,6 +108,24 @@ impl Gate4AgentKernel {
                 });
             }
         }
+        if let ControlCommand::SendInput {
+            instance_id,
+            action: InputAction::AgentCommand(_),
+        } = &command.command
+        {
+            if let Some(session) = self.engine.session_snapshot(*instance_id) {
+                let supports_agent_commands = self
+                    .catalog
+                    .get(&session.agent_id)
+                    .is_some_and(|spec| spec.capabilities.agent_commands.is_some());
+                if !supports_agent_commands {
+                    return Err(KernelCommandError::UnsupportedCapability {
+                        agent_id: session.agent_id.clone(),
+                        capability: "agent-commands",
+                    });
+                }
+            }
+        }
         self.engine.apply_command(command).map_err(Into::into)
     }
 }
@@ -118,7 +141,7 @@ mod tests {
     use super::*;
     use gate4agent_types::{
         AgentInstanceId, ControlObservation, ObservationEnvelope, SessionStatus,
-        TransportKind, CONTROL_PROTOCOL_VERSION,
+        StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
@@ -159,6 +182,66 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_agent_commands_are_rejected_before_effect_creation() {
+        let mut kernel = Gate4AgentKernel::default();
+        let started = kernel.step(
+            [
+                register(1, "grok"),
+                command(
+                    2,
+                    ControlCommand::Start {
+                        instance_id: instance(),
+                        request: StartRequest {
+                            working_directory: ".".to_owned(),
+                            terminal_size: TerminalSize {
+                                rows: 24,
+                                columns: 80,
+                            },
+                        },
+                    },
+                ),
+            ],
+            [],
+        );
+        let spawn = started.effects[0].clone();
+        kernel.step(
+            [],
+            [ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: Some(spawn.operation_id),
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::Spawned {
+                    process_id: Some(123),
+                },
+            }],
+        );
+
+        let rejected = kernel.step(
+            [command(
+                3,
+                ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::AgentCommand(gate4agent_types::AgentCommand {
+                        agent_id: AgentId::new("grok").unwrap(),
+                        name: "help".to_owned(),
+                        arguments: Vec::new(),
+                    }),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedCapability {
+                capability: "agent-commands",
+                ..
+            })
+        ));
+        assert!(rejected.effects.is_empty());
+    }
+
+    #[test]
     fn command_phase_precedes_observation_phase() {
         let mut kernel = Gate4AgentKernel::default();
         let first = kernel.step(
@@ -168,6 +251,13 @@ mod tests {
                     2,
                     ControlCommand::Start {
                         instance_id: instance(),
+                        request: StartRequest {
+                            working_directory: ".".to_owned(),
+                            terminal_size: TerminalSize {
+                                rows: 24,
+                                columns: 80,
+                            },
+                        },
                     },
                 ),
             ],
@@ -224,6 +314,13 @@ mod tests {
                         2,
                         ControlCommand::Start {
                             instance_id: instance(),
+                            request: StartRequest {
+                                working_directory: ".".to_owned(),
+                                terminal_size: TerminalSize {
+                                    rows: 24,
+                                    columns: 80,
+                                },
+                            },
                         },
                     ),
                 ],

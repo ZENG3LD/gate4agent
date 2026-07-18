@@ -40,6 +40,7 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
         NativeRuntimeConfig {
             command_capacity: 16,
             max_commands_per_tick: 16,
+            ..NativeRuntimeConfig::default()
         },
     );
     let subscription = handle.subscribe(64);
@@ -74,13 +75,27 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
         ))
         .unwrap();
 
-    let started = runtime.tick().await;
+    let started = tokio::time::timeout(Duration::from_millis(500), runtime.tick())
+        .await
+        .expect("start dispatch must not await PTY spawn");
     assert!(started
         .command_outcomes
         .iter()
         .all(|outcome| outcome.result.is_ok()));
-    assert_eq!(started.effects_executed, 1);
-    assert_eq!(handle.snapshot().sessions[0].status, SessionStatus::Running);
+    assert_eq!(started.effects_dispatched, 1);
+    assert_eq!(handle.snapshot().sessions[0].status, SessionStatus::Starting);
+
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            if handle.snapshot().sessions[0].status == SessionStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PTY spawn completion timeout");
     assert_eq!(runtime.active_native_sessions(), 1);
 
     tokio::time::timeout(FIXTURE_TIMEOUT, async {
@@ -112,7 +127,9 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
             },
         ))
         .unwrap();
-    runtime.tick().await;
+    tokio::time::timeout(Duration::from_millis(500), runtime.tick())
+        .await
+        .expect("input dispatch must not await readiness");
     tokio::time::timeout(FIXTURE_TIMEOUT, async {
         loop {
             if handle.snapshot().sessions[0]
@@ -143,7 +160,17 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
         ))
         .unwrap();
     runtime.tick().await;
-    assert_eq!(handle.snapshot().sessions[0].terminal_size, Some(resized));
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            if handle.snapshot().sessions[0].terminal_size == Some(resized) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resize completion timeout");
 
     handle
         .dispatch(command(
@@ -155,6 +182,20 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
         ))
         .unwrap();
     runtime.tick().await;
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            if matches!(
+                handle.snapshot().sessions[0].status,
+                SessionStatus::Exited { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stop completion timeout");
     assert!(matches!(
         handle.snapshot().sessions[0].status,
         SessionStatus::Exited { .. }
@@ -205,4 +246,130 @@ async fn rejected_commands_are_visible_on_the_ordered_event_port() {
         event.event,
         gate4agent_types::ControlEventKind::CommandRejected { .. }
     ));
+}
+
+#[tokio::test]
+async fn two_agent_instances_progress_on_independent_effect_workers() {
+    let registry = AgentRegistry::new([interactive_agent_spec()]).expect("fixture registry");
+    let (handle, mut runtime) = NativeRuntime::new(registry, NativeRuntimeConfig::default());
+    let instances = [AgentInstanceId(801), AgentInstanceId(802)];
+    for (index, instance_id) in instances.into_iter().enumerate() {
+        handle
+            .dispatch(command(
+                100 + (index as u64 * 2),
+                ControlCommand::Register {
+                    instance_id,
+                    agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                    transport: TransportKind::Pty,
+                },
+            ))
+            .unwrap();
+        handle
+            .dispatch(command(
+                101 + (index as u64 * 2),
+                ControlCommand::Start {
+                    instance_id,
+                    request: StartRequest {
+                        working_directory: std::env::current_dir()
+                            .expect("current directory")
+                            .to_string_lossy()
+                            .into_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 12,
+                            columns: 48,
+                        },
+                    },
+                },
+            ))
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_millis(500), runtime.tick())
+        .await
+        .expect("multi-agent spawn dispatch must not await workers");
+
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            let snapshot = handle.snapshot();
+            if snapshot
+                .sessions
+                .iter()
+                .all(|session| session.status == SessionStatus::Running)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("multi-agent spawn completion timeout");
+    assert_eq!(runtime.active_native_sessions(), 2);
+
+    for (index, instance_id) in instances.into_iter().enumerate() {
+        handle
+            .dispatch(command(
+                110 + index as u64,
+                ControlCommand::SendInput {
+                    instance_id,
+                    action: InputAction::AgentCommand(AgentCommand {
+                        agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                        name: "status".to_owned(),
+                        arguments: vec![format!("worker-{index}")],
+                    }),
+                },
+            ))
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_millis(500), runtime.tick())
+        .await
+        .expect("multi-agent input dispatch must not await readiness workers");
+
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            let snapshot = handle.snapshot();
+            if snapshot.sessions.iter().enumerate().all(|(index, session)| {
+                session.terminal_frame.as_ref().is_some_and(|frame| {
+                    frame
+                        .contents
+                        .contains(&format!("fixture-echo:/status worker-{index}"))
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("independent agent-command completion timeout");
+
+    for (index, instance_id) in instances.into_iter().enumerate() {
+        handle
+            .dispatch(command(
+                120 + index as u64,
+                ControlCommand::Stop {
+                    instance_id,
+                    force: false,
+                },
+            ))
+            .unwrap();
+    }
+    runtime.tick().await;
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            if handle
+                .snapshot()
+                .sessions
+                .iter()
+                .all(|session| matches!(session.status, SessionStatus::Exited { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("multi-agent stop timeout");
+    assert_eq!(runtime.active_native_sessions(), 0);
 }

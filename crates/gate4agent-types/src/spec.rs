@@ -103,6 +103,76 @@ pub enum AgentCommandMode {
 pub struct AgentCapabilities {
     #[serde(default)]
     pub agent_commands: Option<AgentCommandMode>,
+    #[serde(default)]
+    pub transports: AgentTransportCapabilities,
+}
+
+/// Parser/protocol adapter implemented by the native shell for a provider.
+///
+/// This is deliberately distinct from [`AgentId`]: a catalog entry may use a
+/// compatible wire protocol without being silently re-identified as another
+/// provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAdapter {
+    ClaudeCode,
+    Codex,
+    Gemini,
+    OpenCode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PipePromptDelivery {
+    None,
+    StdinClose,
+    Positional,
+}
+
+/// Optional catalog override used by controlled fixtures and providers whose
+/// headless executable differs from their interactive PTY executable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PipeTransportSpec {
+    pub adapter: ProviderAdapter,
+    #[serde(default)]
+    pub launch_override: Option<LaunchSpec>,
+    #[serde(default = "default_pipe_prompt_delivery")]
+    pub prompt_delivery: PipePromptDelivery,
+}
+
+fn default_pipe_prompt_delivery() -> PipePromptDelivery {
+    PipePromptDelivery::None
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcpTransportSpec {
+    pub adapter: ProviderAdapter,
+    #[serde(default)]
+    pub launch_override: Option<LaunchSpec>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentTransportCapabilities {
+    #[serde(default = "default_true")]
+    pub pty: bool,
+    #[serde(default)]
+    pub pipe: Option<PipeTransportSpec>,
+    #[serde(default)]
+    pub acp: Option<AcpTransportSpec>,
+}
+
+impl Default for AgentTransportCapabilities {
+    fn default() -> Self {
+        Self {
+            pty: true,
+            pipe: None,
+            acp: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Provenance state for a built-in launch specification.

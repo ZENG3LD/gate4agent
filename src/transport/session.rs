@@ -90,10 +90,8 @@ impl TransportSession {
         &self.session_id
     }
 
-    /// Send a follow-up prompt via stdin (for CLIs that support multi-turn pipe mode).
-    ///
-    /// Currently only Claude Code supports multi-turn pipe sessions. For other CLIs
-    /// this will write to stdin but may have no effect.
+    /// Attempt to send a follow-up prompt. Current Pipe adapters are one-shot
+    /// and return `BrokenPipe`; resume by spawning a new provider process.
     pub async fn send_prompt(&self, prompt: &str) -> Result<(), AgentError> {
         self.inner.send_prompt(prompt).await
     }

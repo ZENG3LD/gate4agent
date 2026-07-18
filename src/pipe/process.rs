@@ -11,6 +11,7 @@ use std::thread;
 use crate::pipe::cli::cli_builder;
 use crate::transport::SpawnOptions;
 use crate::core::types::CliTool;
+use gate4agent_types::{LaunchSpec, PipePromptDelivery};
 
 /// Claude Code-specific options for pipe mode spawning.
 #[derive(Debug, Clone, Default)]
@@ -83,6 +84,43 @@ impl PipeProcess {
             cmd.env(key, value);
         }
 
+        Self::spawn_command(
+            tool,
+            working_dir,
+            cmd,
+            (tool == CliTool::ClaudeCode).then_some(initial_prompt),
+        )
+    }
+
+    /// Spawn a catalog-declared headless command while retaining the selected
+    /// provider's NDJSON parser.
+    pub fn new_with_launch(
+        tool: CliTool,
+        working_dir: &std::path::Path,
+        initial_prompt: &str,
+        launch: &LaunchSpec,
+        prompt_delivery: PipePromptDelivery,
+    ) -> Result<Self, std::io::Error> {
+        let mut cmd = Command::new(&launch.program);
+        cmd.args(&launch.fixed_args);
+        if prompt_delivery == PipePromptDelivery::Positional {
+            cmd.arg(initial_prompt);
+        }
+        Self::spawn_command(
+            tool,
+            working_dir,
+            cmd,
+            (prompt_delivery == PipePromptDelivery::StdinClose).then_some(initial_prompt),
+        )
+    }
+
+    fn spawn_command(
+        tool: CliTool,
+        working_dir: &std::path::Path,
+        mut cmd: Command,
+        stdin_prompt: Option<&str>,
+    ) -> Result<Self, std::io::Error> {
+
         cmd.current_dir(working_dir);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -96,8 +134,8 @@ impl PipeProcess {
         // Claude `-p` reads stdin until EOF, so we must drop (close) stdin after writing.
         // For Codex and Gemini the prompt is already in the argv; stdin is closed immediately.
         if let Some(mut s) = stdin {
-            if tool == CliTool::ClaudeCode {
-                s.write_all(initial_prompt.as_bytes())?;
+            if let Some(prompt) = stdin_prompt {
+                s.write_all(prompt.as_bytes())?;
                 s.flush()?;
             }
             drop(s); // close stdin → Claude sees EOF → starts processing
@@ -298,6 +336,10 @@ impl PipeProcess {
     /// Get the CLI tool type.
     pub fn tool(&self) -> CliTool {
         self.tool
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
     }
 }
 

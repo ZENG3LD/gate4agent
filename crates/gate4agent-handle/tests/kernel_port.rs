@@ -33,6 +33,7 @@ fn handle_drives_kernel_and_publishes_one_authoritative_snapshot() {
                         rows: 24,
                         columns: 80,
                     },
+                    initial_prompt: None,
                 },
             },
         })

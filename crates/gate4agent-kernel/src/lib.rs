@@ -4,7 +4,8 @@ use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_engine::Gate4AgentEngine;
 use gate4agent_types::{
     AgentId, CommandEnvelope, CommandId, ControlCommand, ControlError, ControlEvent,
-    ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope, CONTROL_PROTOCOL_VERSION,
+    ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -22,6 +23,11 @@ pub enum KernelCommandError {
     UnsupportedCapability {
         agent_id: AgentId,
         capability: &'static str,
+    },
+    #[error("agent '{agent_id}' does not support transport {transport:?}")]
+    UnsupportedTransport {
+        agent_id: AgentId,
+        transport: TransportKind,
     },
     #[error(transparent)]
     Control(#[from] ControlError),
@@ -109,10 +115,26 @@ impl Gate4AgentKernel {
             }
             .into());
         }
-        if let ControlCommand::Register { agent_id, .. } = &command.command {
-            if self.catalog.get(agent_id).is_none() {
+        if let ControlCommand::Register {
+            agent_id,
+            transport,
+            ..
+        } = &command.command
+        {
+            let Some(spec) = self.catalog.get(agent_id) else {
                 return Err(KernelCommandError::UnknownAgent {
                     agent_id: agent_id.clone(),
+                });
+            };
+            let supported = match transport {
+                TransportKind::Pty => spec.capabilities.transports.pty,
+                TransportKind::Pipe => spec.capabilities.transports.pipe.is_some(),
+                TransportKind::Acp => spec.capabilities.transports.acp.is_some(),
+            };
+            if !supported {
+                return Err(KernelCommandError::UnsupportedTransport {
+                    agent_id: agent_id.clone(),
+                    transport: *transport,
                 });
             }
         }
@@ -193,6 +215,30 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_provider_transport_is_rejected_before_registration() {
+        let mut kernel = Gate4AgentKernel::default();
+        let outcome = kernel.step(
+            [command(
+                1,
+                ControlCommand::Register {
+                    instance_id: instance(),
+                    agent_id: AgentId::new("grok").unwrap(),
+                    transport: TransportKind::Pipe,
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &outcome.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedTransport {
+                transport: TransportKind::Pipe,
+                ..
+            })
+        ));
+        assert!(outcome.snapshot.sessions.is_empty());
+    }
+
+    #[test]
     fn undeclared_agent_commands_are_rejected_before_effect_creation() {
         let mut kernel = Gate4AgentKernel::default();
         let started = kernel.step(
@@ -208,6 +254,7 @@ mod tests {
                                 rows: 24,
                                 columns: 80,
                             },
+                            initial_prompt: None,
                         },
                     },
                 ),
@@ -268,6 +315,7 @@ mod tests {
                                 rows: 24,
                                 columns: 80,
                             },
+                            initial_prompt: None,
                         },
                     },
                 ),
@@ -334,6 +382,7 @@ mod tests {
                                     rows: 24,
                                     columns: 80,
                                 },
+                                initial_prompt: None,
                             },
                         },
                     ),

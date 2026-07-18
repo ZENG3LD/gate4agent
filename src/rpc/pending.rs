@@ -58,6 +58,15 @@ impl PendingRequests {
         }
     }
 
+    /// Remove a request whose serialized write failed before the agent could
+    /// ever produce a response.
+    pub fn remove(&self, id: &RpcId) -> bool {
+        self.inner
+            .lock()
+            .map(|mut guard| guard.remove(id).is_some())
+            .unwrap_or(false)
+    }
+
     /// Cancel all pending requests with an internal error.
     ///
     /// Called on session shutdown to wake all waiting `rpc_call` futures.
@@ -137,5 +146,14 @@ mod tests {
         let r2 = rx2.await.unwrap().unwrap();
         assert_eq!(r1["which"], "one");
         assert_eq!(r2["which"], "two");
+    }
+
+    #[test]
+    fn failed_write_can_remove_pending_request() {
+        let pending = PendingRequests::new();
+        let id = RpcId::Number(7);
+        let _receiver = pending.register(id.clone());
+        assert!(pending.remove(&id));
+        assert!(pending.is_empty());
     }
 }

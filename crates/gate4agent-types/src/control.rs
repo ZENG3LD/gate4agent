@@ -2,7 +2,7 @@ use crate::{AgentId, InputAction, InputPrepareError, PreparedInput, PreparedInpu
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 4;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 5;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -27,6 +27,8 @@ pub struct SessionGeneration(pub u64);
 pub struct StartRequest {
     pub working_directory: String,
     pub terminal_size: TerminalSize,
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,6 +134,10 @@ pub enum ControlEffect {
     WriteInput {
         input: PreparedInput,
     },
+    SubmitPrompt {
+        prompt: String,
+    },
+    Interrupt,
     Resize {
         size: TerminalSize,
     },
@@ -183,13 +189,24 @@ pub enum ControlObservation {
     TerminalStale {
         message: String,
     },
+    ProviderEvent {
+        sequence: u64,
+        event: ProviderEvent,
+    },
+    ProviderGap {
+        missed: u64,
+    },
 }
 
 impl ControlObservation {
     pub fn requires_operation_id(&self) -> bool {
         !matches!(
             self,
-            Self::ProcessExited { .. } | Self::TerminalFrame { .. } | Self::TerminalStale { .. }
+            Self::ProcessExited { .. }
+                | Self::TerminalFrame { .. }
+                | Self::TerminalStale { .. }
+                | Self::ProviderEvent { .. }
+                | Self::ProviderGap { .. }
         )
     }
 }
@@ -218,6 +235,70 @@ pub struct SessionSnapshot {
     pub terminal_size: Option<TerminalSize>,
     pub terminal_frame: Option<TerminalFrame>,
     pub terminal_stale: Option<String>,
+    pub provider: ProviderSnapshot,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub context_window: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ProviderEvent {
+    SessionStarted {
+        session_id: String,
+        model: String,
+        tools: Vec<String>,
+    },
+    Text {
+        text: String,
+        is_delta: bool,
+    },
+    Thinking {
+        text: String,
+    },
+    ToolStarted {
+        id: String,
+        name: String,
+        input_json: String,
+    },
+    ToolCompleted {
+        id: String,
+        output: String,
+        is_error: bool,
+        duration_ms: Option<u64>,
+    },
+    TurnCompleted {
+        usage: TokenUsage,
+        is_cumulative: bool,
+    },
+    SessionEnded {
+        result: String,
+        cost_usd: Option<String>,
+        is_error: bool,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSnapshot {
+    pub sequence: u64,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub tools: Vec<String>,
+    pub completed_turns: u64,
+    pub usage: TokenUsage,
+    pub last_event: Option<ProviderEvent>,
+    pub gap_count: u64,
+    pub stale: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,6 +346,8 @@ pub enum ControlEventKind {
         message: String,
     },
     TerminalStale { message: String },
+    ProviderEvent { sequence: u64, event: ProviderEvent },
+    ProviderGap { missed: u64 },
     Exited { exit_code: Option<i32>, forced: bool },
     Failed { message: String },
     Removed,
@@ -281,6 +364,7 @@ pub enum ObservationIgnoredReason {
     OperationMismatch,
     InvalidState,
     StaleTerminalFrame,
+    StaleProviderEvent,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
@@ -303,6 +387,13 @@ pub enum ControlError {
     InvalidTerminalSize,
     #[error("working directory is empty, too large, or contains a NUL byte")]
     InvalidWorkingDirectory,
+    #[error("pipe transport requires a non-empty initial prompt")]
+    MissingInitialPrompt,
+    #[error("transport {transport:?} does not support {action}")]
+    UnsupportedTransportOperation {
+        transport: TransportKind,
+        action: String,
+    },
     #[error("agent instance {instance_id:?} cannot {action} while in state {status:?}")]
     InvalidTransition {
         instance_id: AgentInstanceId,

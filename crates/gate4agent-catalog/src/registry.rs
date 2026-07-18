@@ -115,14 +115,24 @@ fn validate_spec(spec: &AgentSpec) -> Result<(), RegistryError> {
     for required in &spec.detection.required_commands {
         validate_executable_name(&spec.id, "required command", required)?;
     }
-    validate_program(&spec.id, &spec.launch.program)?;
-    for arg in &spec.launch.fixed_args {
-        if arg.contains('\0') {
-            return Err(RegistryError::NulByte {
-                agent: spec.id.clone(),
-                field: "fixed argument",
-            });
-        }
+    validate_launch(&spec.id, &spec.launch)?;
+    if let Some(launch) = spec
+        .capabilities
+        .transports
+        .pipe
+        .as_ref()
+        .and_then(|transport| transport.launch_override.as_ref())
+    {
+        validate_launch(&spec.id, launch)?;
+    }
+    if let Some(launch) = spec
+        .capabilities
+        .transports
+        .acp
+        .as_ref()
+        .and_then(|transport| transport.launch_override.as_ref())
+    {
+        validate_launch(&spec.id, launch)?;
     }
     if spec.expected_processes.is_empty() {
         return Err(RegistryError::MissingExpectedProcess(spec.id.clone()));
@@ -183,6 +193,19 @@ fn validate_program(agent: &AgentId, value: &str) -> Result<(), RegistryError> {
             agent: agent.clone(),
             value: value.to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn validate_launch(agent: &AgentId, launch: &crate::LaunchSpec) -> Result<(), RegistryError> {
+    validate_program(agent, &launch.program)?;
+    for argument in &launch.fixed_args {
+        if argument.contains('\0') {
+            return Err(RegistryError::NulByte {
+                agent: agent.clone(),
+                field: "fixed argument",
+            });
+        }
     }
     Ok(())
 }

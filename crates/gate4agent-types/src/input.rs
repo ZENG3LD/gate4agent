@@ -6,6 +6,7 @@ pub const TERMINAL_INPUT_CHUNK_MAX_BYTES: usize = 16 * 1024;
 pub const TERMINAL_INPUT_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TERMINAL_SUBMIT_DELAY_MS: u64 = 500;
 pub const TERMINAL_WRITE_DELAY_MAX_MS: u64 = 5_000;
+pub const SEMANTIC_PROMPT_MAX_BYTES: usize = TERMINAL_INPUT_MAX_BYTES;
 pub const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 pub const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -130,6 +131,19 @@ pub fn prepare_input(action: InputAction) -> Result<PreparedInput, InputPrepareE
         TERMINAL_INPUT_CHUNK_MAX_BYTES,
         TERMINAL_INPUT_MAX_BYTES,
     )
+}
+
+/// Validate and normalize a semantic prompt before it crosses a process or
+/// protocol boundary. Terminal controls are rendered inert consistently with
+/// PTY prompt preparation, but no terminal framing bytes are added.
+pub fn normalize_semantic_prompt(text: &str) -> Result<String, InputPrepareError> {
+    if text.len() > SEMANTIC_PROMPT_MAX_BYTES {
+        return Err(InputPrepareError::InputTooLarge {
+            bytes: text.len(),
+            max: SEMANTIC_PROMPT_MAX_BYTES,
+        });
+    }
+    Ok(sanitize_prompt_text(text))
 }
 
 pub fn prepare_input_with_limits(

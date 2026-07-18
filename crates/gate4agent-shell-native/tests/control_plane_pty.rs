@@ -91,6 +91,7 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
                         .to_string_lossy()
                         .into_owned(),
                     terminal_size: initial_size,
+                    initial_prompt: None,
                 },
             },
         ),
@@ -202,6 +203,7 @@ async fn natural_exit_is_collected_as_generation_bound_observation() {
                             rows: 10,
                             columns: 40,
                         },
+                        initial_prompt: None,
                     },
                 },
             ),

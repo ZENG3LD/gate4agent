@@ -1,7 +1,8 @@
 use crate::{
-    AgentCapabilities, AgentCommandMode, AgentId, AgentReadinessSpec, AgentRegistry, AgentSpec,
-    DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, NativeDraftMode,
-    ProcessMatcher, PromptSpec, SpecVerification,
+    AcpTransportSpec, AgentCapabilities, AgentCommandMode, AgentId, AgentReadinessSpec,
+    AgentRegistry, AgentSpec, AgentTransportCapabilities, DetectionSpec, DraftReadySignal,
+    InitialPromptMode, LaunchSpec, NativeDraftMode, PipePromptDelivery, PipeTransportSpec,
+    ProcessMatcher, PromptSpec, ProviderAdapter, SpecVerification,
 };
 use std::sync::OnceLock;
 
@@ -287,9 +288,36 @@ fn spec(
 }
 
 fn capabilities(id: &str) -> AgentCapabilities {
+    let adapter = match id {
+        "claude" => Some(ProviderAdapter::ClaudeCode),
+        "codex" => Some(ProviderAdapter::Codex),
+        "gemini" => Some(ProviderAdapter::Gemini),
+        "opencode" => Some(ProviderAdapter::OpenCode),
+        _ => None,
+    };
     AgentCapabilities {
         agent_commands: matches!(id, "claude" | "codex" | "gemini")
             .then_some(AgentCommandMode::SlashLine),
+        transports: AgentTransportCapabilities {
+            pty: true,
+            pipe: adapter.map(|adapter| PipeTransportSpec {
+                adapter,
+                launch_override: None,
+                prompt_delivery: PipePromptDelivery::None,
+            }),
+            // The legacy Claude/Codex ACP adapters use npm packages that may
+            // be downloaded at launch. They are deliberately not enabled by
+            // the catalog-backed control plane.
+            acp: match adapter {
+                Some(adapter @ (ProviderAdapter::Gemini | ProviderAdapter::OpenCode)) => {
+                    Some(AcpTransportSpec {
+                        adapter,
+                        launch_override: None,
+                    })
+                }
+                _ => None,
+            },
+        },
     }
 }
 
@@ -329,5 +357,15 @@ mod tests {
             assert!(ids.contains(&required), "missing built-in agent {required}");
         }
         assert!(!ids.contains(&"claude-agent-teams"));
+
+        for id in ["claude", "codex", "gemini", "opencode"] {
+            assert!(registry.get_by_id(id).unwrap().capabilities.transports.pipe.is_some());
+        }
+        for id in ["gemini", "opencode"] {
+            assert!(registry.get_by_id(id).unwrap().capabilities.transports.acp.is_some());
+        }
+        for id in ["claude", "codex", "grok"] {
+            assert!(registry.get_by_id(id).unwrap().capabilities.transports.acp.is_none());
+        }
     }
 }

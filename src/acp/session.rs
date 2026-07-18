@@ -25,7 +25,7 @@ use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcNotification, RpcRequest};
 use crate::rpc::pending::PendingRequests;
 
-use super::host::{AcpHostAdapter, AcpHostHandler, FilesystemAcpHandler};
+use super::host::{AcpHostAdapter, AcpHostHandler, DefaultAcpHandler};
 use super::protocol::{
     extract_token_usage, AgentCapabilities, ClientCapabilities, ClientInfo, ContentBlock,
     FsCapabilities, InitializeParams, McpServerConfig, SessionCancelParams, SessionLoadParams,
@@ -33,6 +33,7 @@ use super::protocol::{
 };
 use super::reader::acp_reader_loop;
 use super::spawn::AcpProcess;
+use gate4agent_types::LaunchSpec;
 
 // ---------------------------------------------------------------------------
 // AcpError
@@ -84,7 +85,8 @@ pub enum AcpError {
 
 /// Options for constructing an [`AcpSession`].
 pub struct AcpSessionOptions {
-    /// Handler for agent → host requests. Default: [`FilesystemAcpHandler`] with no root restrictions.
+    /// Handler for agent-to-host requests. Default: [`DefaultAcpHandler`],
+    /// which denies filesystem, terminal, and permission requests.
     pub host_handler: Option<Box<dyn AcpHostHandler>>,
 
     /// Broadcast channel capacity. Default: 256.
@@ -153,12 +155,35 @@ impl AcpSession {
         working_dir: &std::path::Path,
         options: AcpSessionOptions,
     ) -> Result<Self, AcpError> {
+        let process = AcpProcess::spawn(tool, working_dir, &[])
+            .map_err(|source| AcpError::Spawn { source })?;
+        Self::spawn_process(tool, working_dir, options, process).await
+    }
+
+    /// Spawn a catalog-declared ACP command. The command must implement the
+    /// standard ACP stdio protocol; provider identity still selects the
+    /// canonical adapter and capability policy.
+    pub async fn spawn_with_launch(
+        tool: CliTool,
+        working_dir: &std::path::Path,
+        options: AcpSessionOptions,
+        launch: &LaunchSpec,
+    ) -> Result<Self, AcpError> {
+        let process = AcpProcess::spawn_with_launch(working_dir, &[], launch)
+            .map_err(|source| AcpError::Spawn { source })?;
+        Self::spawn_process(tool, working_dir, options, process).await
+    }
+
+    async fn spawn_process(
+        tool: CliTool,
+        working_dir: &std::path::Path,
+        options: AcpSessionOptions,
+        proc: AcpProcess,
+    ) -> Result<Self, AcpError> {
+        let host_capabilities_enabled = options.host_handler.is_some();
         // Extract mcp_servers before options fields are partially consumed below.
         let mcp_servers = options.mcp_servers;
         let options = AcpSessionOptions { mcp_servers: vec![], ..options };
-
-        let proc = AcpProcess::spawn(tool, working_dir, &[])
-            .map_err(|e| AcpError::Spawn { source: e })?;
 
         let local_session_id = generate_session_id();
         let (tx, _) = broadcast::channel::<AgentEvent>(options.channel_capacity);
@@ -173,7 +198,7 @@ impl AcpSession {
         // Build the HostHandler for the reader loop.
         let handler: Arc<dyn crate::rpc::handler::HostHandler> = match options.host_handler {
             Some(h) => Arc::new(AcpHostAdapter(Arc::from(h))),
-            None => Arc::new(AcpHostAdapter(Arc::new(FilesystemAcpHandler { allowed_roots: None }))),
+            None => Arc::new(AcpHostAdapter(Arc::new(DefaultAcpHandler))),
         };
 
         let pending = PendingRequests::new();
@@ -207,8 +232,11 @@ impl AcpSession {
         let init_params = InitializeParams {
             protocol_version: 1,
             client_capabilities: ClientCapabilities {
-                fs: FsCapabilities { read_text_file: true, write_text_file: true },
-                terminal: true,
+                fs: FsCapabilities {
+                    read_text_file: host_capabilities_enabled,
+                    write_text_file: false,
+                },
+                terminal: host_capabilities_enabled,
             },
             client_info: ClientInfo {
                 name: "gate4agent",
@@ -290,30 +318,54 @@ impl AcpSession {
             .rpc_call("session/prompt", Some(json!(params)), self.prompt_timeout)
             .await?;
 
-        // The session/prompt response arrives only after the full turn completes.
-        // Emit TurnComplete so broadcast subscribers see the turn boundary even
-        // if the agent didn't send a separate `stop` session/update notification.
-        let stop_reason = result
-            .get("stopReason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("end_turn")
-            .to_owned();
-        let (input_tokens, output_tokens) = extract_token_usage(&result);
-        let _ = self.tx.send(AgentEvent::TurnComplete {
-            input_tokens,
-            output_tokens,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
-            context_window: None,
-            is_cumulative: false,
-        });
-        let _ = self.tx.send(AgentEvent::SessionEnd {
-            result: stop_reason,
-            cost_usd: None,
-            is_error: false,
-        });
+        emit_prompt_result(&self.tx, &result);
 
+        Ok(())
+    }
+
+    /// Write a prompt request and complete immediately after the request is on
+    /// stdin. The ACP response is awaited in a background task so streaming
+    /// provider notifications remain observable while the turn runs.
+    pub async fn start_prompt(&self, text: &str) -> Result<(), AcpError> {
+        let session_id = {
+            let guard = self.acp_session_id.lock().await;
+            guard.clone().ok_or(AcpError::NoSession)?
+        };
+        let params = SessionPromptParams {
+            session_id,
+            prompt: vec![ContentBlock::Text { text: text.to_owned() }],
+        };
+        let id = self.id_gen.next();
+        let request = RpcRequest::new(id.clone(), "session/prompt", Some(json!(params)));
+        let line = serde_json::to_string(&request).map_err(|source| AcpError::Json { source })?;
+        let receiver = self.pending.register(id.clone());
+        if let Err(error) = self.write_line(line).await {
+            self.pending.remove(&id);
+            return Err(error);
+        }
+
+        let tx = self.tx.clone();
+        let timeout = self.prompt_timeout;
+        tokio::spawn(async move {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(Ok(Ok(result))) => emit_prompt_result(&tx, &result),
+                Ok(Ok(Err(error))) => {
+                    let _ = tx.send(AgentEvent::Error {
+                        message: error.to_string(),
+                    });
+                }
+                Ok(Err(_)) => {
+                    let _ = tx.send(AgentEvent::Error {
+                        message: "ACP session closed while awaiting prompt response".to_owned(),
+                    });
+                }
+                Err(_) => {
+                    let _ = tx.send(AgentEvent::Error {
+                        message: "ACP session/prompt timed out".to_owned(),
+                    });
+                }
+            }
+        });
         Ok(())
     }
 
@@ -343,6 +395,14 @@ impl AcpSession {
     /// CLI tool type.
     pub fn tool(&self) -> CliTool {
         self.tool
+    }
+
+    pub fn process_id(&self) -> Option<u32> {
+        self.process.lock().ok().map(|guard| guard.process_id())
+    }
+
+    pub fn reader_finished(&self) -> bool {
+        self.reader_task.is_finished()
     }
 
     /// ACP `sessionId` returned during the handshake.
@@ -434,11 +494,13 @@ impl AcpSession {
         timeout: Duration,
     ) -> Result<Value, AcpError> {
         let id = self.id_gen.next();
-        let rx = self.pending.register(id.clone());
-
         let request = RpcRequest::new(id.clone(), method, params);
         let line = serde_json::to_string(&request).map_err(|e| AcpError::Json { source: e })?;
-        self.write_line(line).await?;
+        let rx = self.pending.register(id.clone());
+        if let Err(error) = self.write_line(line).await {
+            self.pending.remove(&id);
+            return Err(error);
+        }
 
         tokio::time::timeout(timeout, rx)
             .await
@@ -489,6 +551,29 @@ fn generate_session_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("acp-{:x}", t)
+}
+
+fn emit_prompt_result(tx: &broadcast::Sender<AgentEvent>, result: &Value) {
+    let stop_reason = result
+        .get("stopReason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("end_turn")
+        .to_owned();
+    let (input_tokens, output_tokens) = extract_token_usage(result);
+    let _ = tx.send(AgentEvent::TurnComplete {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        context_window: None,
+        is_cumulative: false,
+    });
+    let _ = tx.send(AgentEvent::SessionEnd {
+        result: stop_reason,
+        cost_usd: None,
+        is_error: false,
+    });
 }
 
 // ---------------------------------------------------------------------------

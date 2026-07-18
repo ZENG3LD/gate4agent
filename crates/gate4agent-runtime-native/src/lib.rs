@@ -297,6 +297,12 @@ async fn publish_shell_observations(
     terminal_frames: &Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
     active_sessions: &Arc<AtomicUsize>,
 ) -> bool {
+    for observation in shell.collect_provider_events() {
+        if control_tx.send(observation).await.is_err() {
+            return false;
+        }
+    }
+
     for observation in shell.collect_terminal_frames() {
         if matches!(
             &observation.observation,
@@ -348,6 +354,9 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
         ControlEffect::Spawn { .. } => ControlObservation::SpawnFailed { message },
         ControlEffect::Stop { .. } => ControlObservation::StopFailed { message },
         ControlEffect::WriteInput { .. } => ControlObservation::InputFailed { message },
+        ControlEffect::SubmitPrompt { .. } | ControlEffect::Interrupt => {
+            ControlObservation::InputFailed { message }
+        }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
     };
     ObservationEnvelope {

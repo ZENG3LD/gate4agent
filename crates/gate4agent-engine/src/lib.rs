@@ -1,11 +1,13 @@
 //! Deterministic single-writer lifecycle engine for gate4agent sessions.
 
 use gate4agent_types::{
-    prepare_agent_command, prepare_input, AgentInstanceId, CommandEnvelope, CommandId,
-    ControlCommand, ControlEffect, ControlError, ControlEvent, ControlEventKind,
-    ControlObservation, ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope,
-    ObservationIgnoredReason, OperationId, SessionGeneration, SessionSnapshot, SessionStatus,
-    StartRequest, TerminalSize, CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    normalize_semantic_prompt, prepare_agent_command, prepare_input, AgentInstanceId,
+    CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError, ControlEvent,
+    ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope, InputAction,
+    ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind, ProviderEvent,
+    ProviderSnapshot, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest,
+    TerminalControl, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
+    WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -72,6 +74,7 @@ impl Gate4AgentEngine {
                             terminal_size: None,
                             terminal_frame: None,
                             terminal_stale: None,
+                            provider: ProviderSnapshot::default(),
                         },
                         pending_terminal_size: None,
                     },
@@ -157,6 +160,10 @@ impl Gate4AgentEngine {
             | (
                 SessionStatus::Running | SessionStatus::Stopping,
                 ControlObservation::TerminalFrame { .. } | ControlObservation::TerminalStale { .. },
+            )
+            | (
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping,
+                ControlObservation::ProviderEvent { .. } | ControlObservation::ProviderGap { .. },
             ) => true,
             (
                 SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping,
@@ -206,6 +213,53 @@ impl Gate4AgentEngine {
                 ControlEventKind::TerminalStale {
                     message: message.clone(),
                 },
+            );
+            return;
+        }
+        if let ControlObservation::ProviderEvent { sequence, event } = &envelope.observation {
+            if current.provider.sequence >= *sequence {
+                self.emit_ignored(
+                    instance_id,
+                    generation,
+                    ObservationIgnoredReason::StaleProviderEvent,
+                );
+                return;
+            }
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            reduce_provider_event(&mut state.snapshot.provider, *sequence, event.clone());
+            self.bump_revision();
+            self.emit_event(
+                None,
+                instance_id,
+                generation,
+                ControlEventKind::ProviderEvent {
+                    sequence: *sequence,
+                    event: event.clone(),
+                },
+            );
+            return;
+        }
+        if let ControlObservation::ProviderGap { missed } = &envelope.observation {
+            let missed = *missed;
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.snapshot.provider.gap_count = state
+                .snapshot
+                .provider
+                .gap_count
+                .saturating_add(missed);
+            state.snapshot.provider.stale = true;
+            self.bump_revision();
+            self.emit_event(
+                None,
+                instance_id,
+                generation,
+                ControlEventKind::ProviderGap { missed },
             );
             return;
         }
@@ -358,7 +412,10 @@ impl Gate4AgentEngine {
                 session.pending_operation = None;
                 ControlEventKind::ResizeFailed { message }
             }
-            ControlObservation::TerminalFrame { .. } | ControlObservation::TerminalStale { .. } => {
+            ControlObservation::TerminalFrame { .. }
+            | ControlObservation::TerminalStale { .. }
+            | ControlObservation::ProviderEvent { .. }
+            | ControlObservation::ProviderGap { .. } => {
                 unreachable!("terminal observations return before lifecycle event reduction")
             }
         };
@@ -413,7 +470,7 @@ impl Gate4AgentEngine {
         &mut self,
         command_id: CommandId,
         instance_id: AgentInstanceId,
-        request: StartRequest,
+        mut request: StartRequest,
     ) -> Result<(), ControlError> {
         if !request.terminal_size.is_valid() {
             return Err(ControlError::InvalidTerminalSize);
@@ -424,13 +481,12 @@ impl Gate4AgentEngine {
         {
             return Err(ControlError::InvalidWorkingDirectory);
         }
-        let status = self
+        let session = self
             .sessions
             .get(&instance_id)
-            .ok_or(ControlError::UnknownInstance { instance_id })?
-            .snapshot
-            .status
-            .clone();
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        let status = session.snapshot.status.clone();
+        let transport = session.snapshot.transport;
         if !matches!(
             status,
             SessionStatus::Registered | SessionStatus::Exited { .. } | SessionStatus::Failed { .. }
@@ -440,6 +496,21 @@ impl Gate4AgentEngine {
                 action: "start".to_owned(),
                 status,
             });
+        }
+
+        request.initial_prompt = request
+            .initial_prompt
+            .as_deref()
+            .map(normalize_semantic_prompt)
+            .transpose()
+            .map_err(|error| ControlError::InputRejected { error })?;
+        if transport == TransportKind::Pipe
+            && request
+                .initial_prompt
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(ControlError::MissingInitialPrompt);
         }
 
         let operation_id = self.allocate_operation();
@@ -458,6 +529,7 @@ impl Gate4AgentEngine {
             session.terminal_size = None;
             session.terminal_frame = None;
             session.terminal_stale = None;
+            session.provider = ProviderSnapshot::default();
             (
                 session.generation,
                 session.agent_id.clone(),
@@ -559,14 +631,40 @@ impl Gate4AgentEngine {
         }
 
         let agent_id = state.snapshot.agent_id.clone();
-        let input = match action {
-            InputAction::AgentCommand(command) => prepare_agent_command(command, &agent_id),
-            action => prepare_input(action),
-        }
-        .map_err(|error| ControlError::InputRejected { error })?;
+        let transport = state.snapshot.transport;
+        let (effect, input_kind) = match (transport, action) {
+            (TransportKind::Pty, InputAction::AgentCommand(command)) => {
+                let input = prepare_agent_command(command, &agent_id)
+                    .map_err(|error| ControlError::InputRejected { error })?;
+                let input_kind = input.kind();
+                (ControlEffect::WriteInput { input }, input_kind)
+            }
+            (TransportKind::Pty, action) => {
+                let input = prepare_input(action)
+                    .map_err(|error| ControlError::InputRejected { error })?;
+                let input_kind = input.kind();
+                (ControlEffect::WriteInput { input }, input_kind)
+            }
+            (TransportKind::Acp, InputAction::SubmitPrompt(prompt)) => {
+                let prompt = normalize_semantic_prompt(&prompt.text)
+                    .map_err(|error| ControlError::InputRejected { error })?;
+                (
+                    ControlEffect::SubmitPrompt { prompt },
+                    PreparedInputKind::SubmitPrompt,
+                )
+            }
+            (TransportKind::Acp, InputAction::TerminalControl(TerminalControl::Interrupt)) => {
+                (ControlEffect::Interrupt, PreparedInputKind::TerminalControl)
+            }
+            (transport, _) => {
+                return Err(ControlError::UnsupportedTransportOperation {
+                    transport,
+                    action: "this input action".to_owned(),
+                });
+            }
+        };
 
         let operation_id = self.allocate_operation();
-        let input_kind = input.kind();
         let generation = {
             let session = self.session_mut(instance_id);
             session.pending_operation = Some(operation_id);
@@ -578,7 +676,7 @@ impl Gate4AgentEngine {
             operation_id,
             instance_id,
             generation,
-            effect: ControlEffect::WriteInput { input },
+            effect,
         });
         self.bump_revision();
         self.emit_event(
@@ -606,6 +704,12 @@ impl Gate4AgentEngine {
             .sessions
             .get(&instance_id)
             .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.transport != TransportKind::Pty {
+            return Err(ControlError::UnsupportedTransportOperation {
+                transport: state.snapshot.transport,
+                action: "terminal resize".to_owned(),
+            });
+        }
         if state.snapshot.status != SessionStatus::Running {
             return Err(ControlError::InvalidTransition {
                 instance_id,
@@ -730,6 +834,61 @@ impl Gate4AgentEngine {
     }
 }
 
+fn reduce_provider_event(
+    snapshot: &mut ProviderSnapshot,
+    sequence: u64,
+    event: ProviderEvent,
+) {
+    match &event {
+        ProviderEvent::SessionStarted {
+            session_id,
+            model,
+            tools,
+        } => {
+            snapshot.session_id = Some(session_id.clone());
+            snapshot.model = (!model.is_empty()).then(|| model.clone());
+            snapshot.tools = tools.clone();
+        }
+        ProviderEvent::TurnCompleted {
+            usage,
+            is_cumulative,
+        } => {
+            snapshot.completed_turns = snapshot.completed_turns.saturating_add(1);
+            if *is_cumulative {
+                snapshot.usage = usage.clone();
+            } else {
+                add_token_usage(&mut snapshot.usage, usage);
+            }
+        }
+        ProviderEvent::Text { .. }
+        | ProviderEvent::Thinking { .. }
+        | ProviderEvent::ToolStarted { .. }
+        | ProviderEvent::ToolCompleted { .. }
+        | ProviderEvent::SessionEnded { .. }
+        | ProviderEvent::Error { .. } => {}
+    }
+    snapshot.sequence = sequence;
+    snapshot.last_event = Some(event);
+    snapshot.stale = false;
+}
+
+fn add_token_usage(total: &mut TokenUsage, delta: &TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(delta.cache_read_tokens);
+    total.cache_write_tokens = total
+        .cache_write_tokens
+        .saturating_add(delta.cache_write_tokens);
+    total.reasoning_tokens = total
+        .reasoning_tokens
+        .saturating_add(delta.reasoning_tokens);
+    if delta.context_window.is_some() {
+        total.context_window = delta.context_window;
+    }
+}
+
 impl Default for Gate4AgentEngine {
     fn default() -> Self {
         Self::new()
@@ -772,6 +931,7 @@ mod tests {
                         rows: 24,
                         columns: 80,
                     },
+                    initial_prompt: None,
                 },
             },
         }
@@ -823,12 +983,121 @@ mod tests {
                             rows: 1_001,
                             columns: 80,
                         },
+                        initial_prompt: None,
                     },
                 },
             })
             .unwrap_err();
         assert_eq!(error, ControlError::InvalidTerminalSize);
         assert!(engine.drain_effects().is_empty());
+    }
+
+    #[test]
+    fn provider_events_reduce_usage_and_reject_stale_sequence() {
+        let (mut engine, spawn) = running_engine();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                sequence: 1,
+                event: ProviderEvent::TurnCompleted {
+                    usage: TokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 5,
+                        context_window: Some(100),
+                        ..TokenUsage::default()
+                    },
+                    is_cumulative: false,
+                },
+            },
+        });
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderGap { missed: 2 },
+        });
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                sequence: 1,
+                event: ProviderEvent::TurnCompleted {
+                    usage: TokenUsage {
+                        input_tokens: 99,
+                        ..TokenUsage::default()
+                    },
+                    is_cumulative: false,
+                },
+            },
+        });
+
+        let snapshot = engine.snapshot();
+        let provider = &snapshot.sessions[0].provider;
+        assert_eq!(provider.completed_turns, 1);
+        assert_eq!(provider.usage.input_tokens, 3);
+        assert_eq!(provider.usage.output_tokens, 5);
+        assert_eq!(provider.gap_count, 2);
+        assert!(provider.stale);
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::StaleProviderEvent
+            }
+        )));
+    }
+
+    #[test]
+    fn pipe_requires_initial_prompt_and_rejects_followup_input() {
+        let mut engine = Gate4AgentEngine::new();
+        let mut register = register(1);
+        if let ControlCommand::Register { transport, .. } = &mut register.command {
+            *transport = TransportKind::Pipe;
+        }
+        engine.apply_command(register).unwrap();
+        assert_eq!(
+            engine.apply_command(start(2)).unwrap_err(),
+            ControlError::MissingInitialPrompt
+        );
+
+        let mut request = start(3);
+        if let ControlCommand::Start { request, .. } = &mut request.command {
+            request.initial_prompt = Some("hello".to_owned());
+        }
+        engine.apply_command(request).unwrap();
+        let spawn = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(spawn.operation_id),
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::Spawned { process_id: Some(1) },
+        });
+        let error = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(4),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::SubmitPrompt(PromptPayload {
+                        text: "again".to_owned(),
+                        framing: PromptFraming::Literal,
+                    }),
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlError::UnsupportedTransportOperation {
+                transport: TransportKind::Pipe,
+                ..
+            }
+        ));
     }
 
     #[test]

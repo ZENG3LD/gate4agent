@@ -70,6 +70,7 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
                         .to_string_lossy()
                         .into_owned(),
                     terminal_size: initial_size,
+                    initial_prompt: None,
                 },
             },
         ))
@@ -278,6 +279,7 @@ async fn two_agent_instances_progress_on_independent_effect_workers() {
                             rows: 12,
                             columns: 48,
                         },
+                        initial_prompt: None,
                     },
                 },
             ))

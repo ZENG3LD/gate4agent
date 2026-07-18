@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::core::types::CliTool;
+use gate4agent_types::LaunchSpec;
 
 // ---------------------------------------------------------------------------
 // AcpSpawnSpec
@@ -117,6 +118,38 @@ impl AcpProcess {
         })
     }
 
+    pub(crate) fn spawn_with_launch(
+        working_dir: &std::path::Path,
+        env_vars: &[(String, String)],
+        launch: &LaunchSpec,
+    ) -> Result<Self, std::io::Error> {
+        let mut cmd = Command::new(&launch.program);
+        cmd.args(&launch.fixed_args);
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+        cmd.current_dir(working_dir);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
+        let mut child = cmd.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin pipe"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout pipe"))?;
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || reader_thread(stdout, tx));
+        Ok(Self {
+            child,
+            stdin,
+            output_rx: rx,
+        })
+    }
+
     /// Write a line (without trailing newline) followed by `\n` to stdin.
     ///
     /// Returns `BrokenPipe` if the process has already exited and stdin is
@@ -152,6 +185,10 @@ impl AcpProcess {
             .flatten()
             .and_then(|s| s.code())
             .unwrap_or(0)
+    }
+
+    pub(crate) fn process_id(&self) -> u32 {
+        self.child.id()
     }
 }
 

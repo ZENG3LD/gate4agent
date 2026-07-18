@@ -3,17 +3,20 @@
 use gate4agent::pty::{PtyEvent, PtySession, PtyTerminalSnapshot};
 use gate4agent::agent::ReadinessStatus;
 use gate4agent::{
-    LaunchRequest, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
+    AcpSession, AcpSessionOptions, AgentEvent, CliTool, LaunchRequest, PipeProcessOptions,
+    PipeSession, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform, SessionConfig,
 };
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
-    AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope, ObservationEnvelope,
-    OperationId, PreparedInputKind, SessionGeneration, TerminalFrame, TerminalSize, TransportKind,
+    AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
+    ObservationEnvelope, OperationId, PreparedInputKind, ProviderAdapter, ProviderEvent,
+    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
     CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct NativeSessionKey {
@@ -28,11 +31,21 @@ struct OwnedPtySession {
     terminal_stale_published: bool,
 }
 
+struct OwnedProviderSession<S> {
+    session: S,
+    events: broadcast::Receiver<AgentEvent>,
+    pending_events: VecDeque<AgentEvent>,
+    next_provider_sequence: u64,
+    observed_exit_code: Option<i32>,
+}
+
 /// Executes native effects and returns exactly one completion observation for
 /// each accepted effect. Logical lifecycle state remains owned by the engine.
 pub struct NativeEffectShell {
     catalog: AgentRegistry,
     pty_sessions: BTreeMap<NativeSessionKey, OwnedPtySession>,
+    pipe_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<PipeSession>>,
+    acp_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<AcpSession>>,
 }
 
 impl NativeEffectShell {
@@ -40,11 +53,13 @@ impl NativeEffectShell {
         Self {
             catalog,
             pty_sessions: BTreeMap::new(),
+            pipe_sessions: BTreeMap::new(),
+            acp_sessions: BTreeMap::new(),
         }
     }
 
     pub fn active_session_count(&self) -> usize {
-        self.pty_sessions.len()
+        self.pty_sessions.len() + self.pipe_sessions.len() + self.acp_sessions.len()
     }
 
     pub fn spawn_operation_id(&self, key: NativeSessionKey) -> Option<OperationId> {
@@ -91,84 +106,10 @@ impl NativeEffectShell {
                     agent_id,
                     transport,
                     request,
-                } => {
-                    if transport != TransportKind::Pty {
-                        ControlObservation::SpawnFailed {
-                            message: format!(
-                                "native shell PTY provider cannot execute {transport:?} transport"
-                            ),
-                        }
-                    } else if self.pty_sessions.contains_key(&key) {
-                        ControlObservation::SpawnFailed {
-                            message: format!(
-                                "native session {instance_id:?}/{generation:?} already exists"
-                            ),
-                        }
-                    } else if !request.terminal_size.is_valid() {
-                        ControlObservation::SpawnFailed {
-                            message: "terminal size is outside the supported range".to_owned(),
-                        }
-                    } else if request.working_directory.is_empty()
-                        || request.working_directory.len() > WORKING_DIRECTORY_MAX_BYTES
-                        || request.working_directory.contains('\0')
-                    {
-                        ControlObservation::SpawnFailed {
-                            message: "working directory is invalid".to_owned(),
-                        }
-                    } else if let Some(spec) = self.catalog.get(&agent_id) {
-                        match PtySession::spawn_agent_with_size(
-                            spec,
-                            LaunchRequest {
-                                working_dir: PathBuf::from(request.working_directory),
-                                platform: RuntimePlatform::current(),
-                                ..LaunchRequest::default()
-                            },
-                            request.terminal_size.rows,
-                            request.terminal_size.columns,
-                        )
-                        .await
-                        {
-                            Ok(session) => {
-                                let process_id = session.root_pid();
-                                self.pty_sessions.insert(
-                                    key,
-                                    OwnedPtySession {
-                                        session,
-                                        spawn_operation_id: operation_id,
-                                        last_terminal_sequence: 0,
-                                        terminal_stale_published: false,
-                                    },
-                                );
-                                ControlObservation::Spawned { process_id }
-                            }
-                            Err(error) => ControlObservation::SpawnFailed {
-                                message: error.to_string(),
-                            },
-                        }
-                    } else {
-                        ControlObservation::SpawnFailed {
-                            message: format!("agent '{agent_id}' is absent from native catalog"),
-                        }
-                    }
-                }
-                ControlEffect::Stop { force } => match self.pty_sessions.remove(&key) {
-                    Some(owned) => match owned.session.shutdown().await {
-                        Ok(outcome) => {
-                            let forced = force || outcome.termination.is_some();
-                            ControlObservation::StopCompleted {
-                                forced,
-                                exit_code: outcome.exit_code,
-                                final_terminal: Some(terminal_frame(outcome.terminal)),
-                            }
-                        }
-                        Err(error) => ControlObservation::StopFailed {
-                            message: error.to_string(),
-                        },
-                    },
-                    None => ControlObservation::StopFailed {
-                        message: missing_session_message(key),
-                    },
-                },
+                } => self
+                    .spawn_native(key, operation_id, agent_id, transport, request)
+                    .await,
+                ControlEffect::Stop { force } => self.stop_native(key, force).await,
                 ControlEffect::WriteInput { input } => match self.pty_sessions.get(&key) {
                     Some(owned)
                         if matches!(
@@ -213,7 +154,29 @@ impl NativeEffectShell {
                         }
                     }
                     None => ControlObservation::InputFailed {
-                        message: missing_session_message(key),
+                        message: "typed PTY input requires a PTY session".to_owned(),
+                    },
+                },
+                ControlEffect::SubmitPrompt { prompt } => match self.acp_sessions.get(&key) {
+                    Some(owned) => match owned.session.start_prompt(&prompt).await {
+                        Ok(()) => ControlObservation::InputCompleted,
+                        Err(error) => ControlObservation::InputFailed {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => ControlObservation::InputFailed {
+                        message: "semantic follow-up prompts require an ACP session".to_owned(),
+                    },
+                },
+                ControlEffect::Interrupt => match self.acp_sessions.get(&key) {
+                    Some(owned) => match owned.session.cancel().await {
+                        Ok(()) => ControlObservation::InputCompleted,
+                        Err(error) => ControlObservation::InputFailed {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => ControlObservation::InputFailed {
+                        message: "semantic interrupt requires an ACP session".to_owned(),
                     },
                 },
                 ControlEffect::Resize { size } if !size.is_valid() => {
@@ -229,13 +192,265 @@ impl NativeEffectShell {
                         },
                     },
                     None => ControlObservation::ResizeFailed {
-                        message: missing_session_message(key),
+                        message: "terminal resize requires a PTY session".to_owned(),
                     },
                 },
             }
         };
 
         completion_observation(operation_id, instance_id, generation, observation)
+    }
+
+    async fn spawn_native(
+        &mut self,
+        key: NativeSessionKey,
+        operation_id: OperationId,
+        agent_id: AgentId,
+        transport: TransportKind,
+        request: StartRequest,
+    ) -> ControlObservation {
+        if self.session_exists(key) {
+            return ControlObservation::SpawnFailed {
+                message: format!(
+                    "native session {:?}/{:?} already exists",
+                    key.instance_id, key.generation
+                ),
+            };
+        }
+        if !request.terminal_size.is_valid() {
+            return ControlObservation::SpawnFailed {
+                message: "terminal size is outside the supported range".to_owned(),
+            };
+        }
+        if request.working_directory.is_empty()
+            || request.working_directory.len() > WORKING_DIRECTORY_MAX_BYTES
+            || request.working_directory.contains('\0')
+        {
+            return ControlObservation::SpawnFailed {
+                message: "working directory is invalid".to_owned(),
+            };
+        }
+        let Some(spec) = self.catalog.get(&agent_id).cloned() else {
+            return ControlObservation::SpawnFailed {
+                message: format!("agent '{agent_id}' is absent from native catalog"),
+            };
+        };
+        let working_dir = PathBuf::from(&request.working_directory);
+
+        match transport {
+            TransportKind::Pty if !spec.capabilities.transports.pty => {
+                ControlObservation::SpawnFailed {
+                    message: format!("agent '{agent_id}' does not support PTY transport"),
+                }
+            }
+            TransportKind::Pty => match PtySession::spawn_agent_with_size(
+                &spec,
+                LaunchRequest {
+                    working_dir,
+                    platform: RuntimePlatform::current(),
+                    prompt: request.initial_prompt,
+                    ..LaunchRequest::default()
+                },
+                request.terminal_size.rows,
+                request.terminal_size.columns,
+            )
+            .await
+            {
+                Ok(session) => {
+                    let process_id = session.root_pid();
+                    self.pty_sessions.insert(
+                        key,
+                        OwnedPtySession {
+                            session,
+                            spawn_operation_id: operation_id,
+                            last_terminal_sequence: 0,
+                            terminal_stale_published: false,
+                        },
+                    );
+                    ControlObservation::Spawned { process_id }
+                }
+                Err(error) => ControlObservation::SpawnFailed {
+                    message: error.to_string(),
+                },
+            },
+            TransportKind::Pipe => {
+                let Some(pipe_spec) = spec.capabilities.transports.pipe else {
+                    return ControlObservation::SpawnFailed {
+                        message: format!("agent '{agent_id}' does not support Pipe transport"),
+                    };
+                };
+                let tool = cli_tool(pipe_spec.adapter);
+                let prompt = request.initial_prompt.unwrap_or_default();
+                let config = SessionConfig {
+                    tool,
+                    working_dir,
+                    env_vars: Vec::new(),
+                    name: None,
+                };
+                let spawned = match pipe_spec.launch_override.as_ref() {
+                    Some(launch) => {
+                        PipeSession::spawn_with_launch(
+                            config,
+                            &prompt,
+                            launch,
+                            pipe_spec.prompt_delivery,
+                        )
+                        .await
+                    }
+                    None => PipeSession::spawn(config, &prompt, PipeProcessOptions::default()).await,
+                };
+                match spawned {
+                    Ok(session) => {
+                        let process_id = session.process_id();
+                        let session_id = session.session_id().to_owned();
+                        let events = session.subscribe();
+                        self.pipe_sessions.insert(
+                            key,
+                            OwnedProviderSession {
+                                session,
+                                events,
+                                pending_events: VecDeque::from([AgentEvent::SessionStart {
+                                    session_id,
+                                    model: String::new(),
+                                    tools: Vec::new(),
+                                }]),
+                                next_provider_sequence: 1,
+                                observed_exit_code: None,
+                            },
+                        );
+                        ControlObservation::Spawned { process_id }
+                    }
+                    Err(error) => ControlObservation::SpawnFailed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            TransportKind::Acp => {
+                let Some(acp_spec) = spec.capabilities.transports.acp else {
+                    return ControlObservation::SpawnFailed {
+                        message: format!("agent '{agent_id}' does not support ACP transport"),
+                    };
+                };
+                let tool = cli_tool(acp_spec.adapter);
+                let spawned = match acp_spec.launch_override.as_ref() {
+                    Some(launch) => {
+                        AcpSession::spawn_with_launch(
+                            tool,
+                            &working_dir,
+                            AcpSessionOptions::default(),
+                            launch,
+                        )
+                        .await
+                    }
+                    None => AcpSession::spawn(tool, &working_dir, AcpSessionOptions::default()).await,
+                };
+                match spawned {
+                    Ok(session) => {
+                        let process_id = session.process_id();
+                        let events = session.subscribe();
+                        let session_id = session
+                            .acp_session_id()
+                            .await
+                            .unwrap_or_else(|| session.session_id().to_owned());
+                        if let Some(prompt) = request.initial_prompt {
+                            if let Err(error) = session.start_prompt(&prompt).await {
+                                let _ = session.kill().await;
+                                return ControlObservation::SpawnFailed {
+                                    message: error.to_string(),
+                                };
+                            }
+                        }
+                        self.acp_sessions.insert(
+                            key,
+                            OwnedProviderSession {
+                                session,
+                                events,
+                                pending_events: VecDeque::from([AgentEvent::SessionStart {
+                                    session_id,
+                                    model: String::new(),
+                                    tools: Vec::new(),
+                                }]),
+                                next_provider_sequence: 1,
+                                observed_exit_code: None,
+                            },
+                        );
+                        ControlObservation::Spawned { process_id }
+                    }
+                    Err(error) => ControlObservation::SpawnFailed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+        }
+    }
+
+    async fn stop_native(
+        &mut self,
+        key: NativeSessionKey,
+        force: bool,
+    ) -> ControlObservation {
+        if let Some(owned) = self.pty_sessions.remove(&key) {
+            return match owned.session.shutdown().await {
+                Ok(outcome) => ControlObservation::StopCompleted {
+                    forced: force || outcome.termination.is_some(),
+                    exit_code: outcome.exit_code,
+                    final_terminal: Some(terminal_frame(outcome.terminal)),
+                },
+                Err(error) => ControlObservation::StopFailed {
+                    message: error.to_string(),
+                },
+            };
+        }
+        if let Some(owned) = self.pipe_sessions.remove(&key) {
+            return match owned.session.kill().await {
+                Ok(()) => ControlObservation::StopCompleted {
+                    forced: true,
+                    exit_code: owned.observed_exit_code,
+                    final_terminal: None,
+                },
+                Err(_) if owned.session.reader_finished() => {
+                    ControlObservation::StopCompleted {
+                        forced: false,
+                        exit_code: owned.observed_exit_code,
+                        final_terminal: None,
+                    }
+                }
+                Err(error) => ControlObservation::StopFailed {
+                    message: error.to_string(),
+                },
+            };
+        }
+        if let Some(owned) = self.acp_sessions.remove(&key) {
+            if !force {
+                let _ = owned.session.cancel().await;
+            }
+            return match owned.session.kill().await {
+                Ok(()) => ControlObservation::StopCompleted {
+                    forced: true,
+                    exit_code: owned.observed_exit_code,
+                    final_terminal: None,
+                },
+                Err(_) if owned.session.reader_finished() => {
+                    ControlObservation::StopCompleted {
+                        forced: false,
+                        exit_code: owned.observed_exit_code,
+                        final_terminal: None,
+                    }
+                }
+                Err(error) => ControlObservation::StopFailed {
+                    message: error.to_string(),
+                },
+            };
+        }
+        ControlObservation::StopFailed {
+            message: missing_session_message(key),
+        }
+    }
+
+    fn session_exists(&self, key: NativeSessionKey) -> bool {
+        self.pty_sessions.contains_key(&key)
+            || self.pipe_sessions.contains_key(&key)
+            || self.acp_sessions.contains_key(&key)
     }
 
     /// Convert naturally exited PTY children into generation-bound lifecycle
@@ -270,6 +485,21 @@ impl NativeEffectShell {
                 },
             });
         }
+        collect_provider_exits(&mut self.pipe_sessions, &mut observations, |session| {
+            session.reader_finished()
+        });
+        collect_provider_exits(&mut self.acp_sessions, &mut observations, |session| {
+            session.reader_finished()
+        });
+        observations
+    }
+
+    /// Drain normalized provider events without mixing them with replaceable
+    /// terminal frames. Broadcast lag is converted into an explicit stale gap.
+    pub fn collect_provider_events(&mut self) -> Vec<ObservationEnvelope> {
+        let mut observations = Vec::new();
+        collect_provider_map(&mut self.pipe_sessions, &mut observations);
+        collect_provider_map(&mut self.acp_sessions, &mut observations);
         observations
     }
 
@@ -319,6 +549,159 @@ fn missing_session_message(key: NativeSessionKey) -> String {
     )
 }
 
+fn collect_provider_map<S>(
+    sessions: &mut BTreeMap<NativeSessionKey, OwnedProviderSession<S>>,
+    observations: &mut Vec<ObservationEnvelope>,
+) {
+    for (key, owned) in sessions {
+        loop {
+            let next = match owned.pending_events.pop_front() {
+                Some(event) => Ok(event),
+                None => owned.events.try_recv(),
+            };
+            match next {
+                Ok(AgentEvent::Exited { code }) => {
+                    owned.observed_exit_code = Some(code);
+                }
+                Ok(event) => {
+                    let Some(event) = provider_event(event) else {
+                        continue;
+                    };
+                    let sequence = owned.next_provider_sequence;
+                    owned.next_provider_sequence = owned.next_provider_sequence.saturating_add(1);
+                    observations.push(ObservationEnvelope {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        operation_id: None,
+                        instance_id: key.instance_id,
+                        generation: key.generation,
+                        observation: ControlObservation::ProviderEvent { sequence, event },
+                    });
+                }
+                Err(broadcast::error::TryRecvError::Lagged(missed)) => {
+                    observations.push(ObservationEnvelope {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        operation_id: None,
+                        instance_id: key.instance_id,
+                        generation: key.generation,
+                        observation: ControlObservation::ProviderGap { missed },
+                    });
+                }
+                Err(
+                    broadcast::error::TryRecvError::Empty
+                    | broadcast::error::TryRecvError::Closed,
+                ) => break,
+            }
+        }
+    }
+}
+
+fn collect_provider_exits<S>(
+    sessions: &mut BTreeMap<NativeSessionKey, OwnedProviderSession<S>>,
+    observations: &mut Vec<ObservationEnvelope>,
+    finished: impl Fn(&S) -> bool,
+) {
+    let completed: Vec<_> = sessions
+        .iter()
+        .filter_map(|(key, owned)| {
+            (owned.observed_exit_code.is_some() || finished(&owned.session)).then_some(*key)
+        })
+        .collect();
+    for key in completed {
+        let owned = sessions
+            .remove(&key)
+            .expect("completed provider key came from the owned session map");
+        observations.push(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: key.instance_id,
+            generation: key.generation,
+            observation: ControlObservation::ProcessExited {
+                exit_code: owned.observed_exit_code,
+                final_terminal: None,
+            },
+        });
+    }
+}
+
+fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
+    match event {
+        AgentEvent::SessionStart {
+            session_id,
+            model,
+            tools,
+        } => Some(ProviderEvent::SessionStarted {
+            session_id,
+            model,
+            tools,
+        }),
+        AgentEvent::Text { text, is_delta } => Some(ProviderEvent::Text { text, is_delta }),
+        AgentEvent::Thinking { text } => Some(ProviderEvent::Thinking { text }),
+        AgentEvent::ToolStart { id, name, input } => Some(ProviderEvent::ToolStarted {
+            id,
+            name,
+            input_json: input.to_string(),
+        }),
+        AgentEvent::ToolResult {
+            id,
+            output,
+            is_error,
+            duration_ms,
+        } => Some(ProviderEvent::ToolCompleted {
+            id,
+            output,
+            is_error,
+            duration_ms,
+        }),
+        AgentEvent::TurnComplete {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            context_window,
+            is_cumulative,
+        } => Some(ProviderEvent::TurnCompleted {
+            usage: TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                context_window,
+            },
+            is_cumulative,
+        }),
+        AgentEvent::SessionEnd {
+            result,
+            cost_usd,
+            is_error,
+        } => Some(ProviderEvent::SessionEnded {
+            result,
+            cost_usd: cost_usd.map(|cost| cost.to_string()),
+            is_error,
+        }),
+        AgentEvent::Error { message } => Some(ProviderEvent::Error { message }),
+        AgentEvent::Started { .. }
+        | AgentEvent::Exited { .. }
+        | AgentEvent::PtyRaw { .. }
+        | AgentEvent::PtyParsed(_)
+        | AgentEvent::PtyReady
+        | AgentEvent::PtyToolApproval { .. }
+        | AgentEvent::RateLimit(_)
+        | AgentEvent::RpcNotification { .. }
+        | AgentEvent::RpcIncomingRequest { .. } => None,
+    }
+}
+
+fn cli_tool(adapter: ProviderAdapter) -> CliTool {
+    match adapter {
+        ProviderAdapter::ClaudeCode => CliTool::ClaudeCode,
+        ProviderAdapter::Codex => CliTool::Codex,
+        ProviderAdapter::Gemini => CliTool::Gemini,
+        ProviderAdapter::OpenCode => CliTool::OpenCode,
+    }
+}
+
 fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
     TerminalFrame {
         sequence: snapshot.sequence,
@@ -338,6 +721,9 @@ fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation
         ControlEffect::Spawn { .. } => ControlObservation::SpawnFailed { message },
         ControlEffect::Stop { .. } => ControlObservation::StopFailed { message },
         ControlEffect::WriteInput { .. } => ControlObservation::InputFailed { message },
+        ControlEffect::SubmitPrompt { .. } | ControlEffect::Interrupt => {
+            ControlObservation::InputFailed { message }
+        }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
     }
 }

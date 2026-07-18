@@ -25,6 +25,7 @@ use crate::core::error::AgentError;
 use crate::pipe::cli::{create_ndjson_parser, CliEvent};
 use crate::pipe::process::{PipeProcess, PipeProcessOptions};
 use crate::core::types::{AgentEvent, CliTool, SessionConfig};
+use gate4agent_types::{LaunchSpec, PipePromptDelivery};
 
 /// Async pipe session. Spawns a CLI tool in headless pipe mode and broadcasts
 /// NDJSON events as `AgentEvent` to all subscribers via a tokio broadcast channel.
@@ -83,12 +84,53 @@ impl PipeSession {
         })
     }
 
+    /// Spawn a catalog-declared command while retaining a verified provider
+    /// NDJSON adapter. Used for providers with a distinct headless executable
+    /// and for controlled process fixtures.
+    pub async fn spawn_with_launch(
+        config: SessionConfig,
+        initial_prompt: &str,
+        launch: &LaunchSpec,
+        prompt_delivery: PipePromptDelivery,
+    ) -> Result<Self, AgentError> {
+        let tool = config.tool;
+        let session_id = uuid_v4();
+        let pipe = PipeProcess::new_with_launch(
+            tool,
+            &config.working_dir,
+            initial_prompt,
+            launch,
+            prompt_delivery,
+        )
+        .map_err(|source| AgentError::Spawn { source })?;
+        let (tx, _) = broadcast::channel::<AgentEvent>(256);
+        let _ = tx.send(AgentEvent::Started {
+            session_id: session_id.clone(),
+        });
+        let pipe = Arc::new(Mutex::new(Some(pipe)));
+        let pipe_clone = pipe.clone();
+        let tx_clone = tx.clone();
+        let sid_clone = session_id.clone();
+        let reader_task = tokio::task::spawn_blocking(move || {
+            reader_loop(pipe_clone, tx_clone, tool, sid_clone);
+        });
+        Ok(Self {
+            session_id,
+            tx,
+            stdin: pipe,
+            reader_task,
+        })
+    }
+
     /// Subscribe to receive all future `AgentEvent` values from this session.
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.tx.subscribe()
     }
 
-    /// Send a follow-up prompt via stdin (for persistent session mode).
+    /// Attempt to send a follow-up prompt.
+    ///
+    /// Current Pipe adapters are one-shot and return `BrokenPipe`; use a new
+    /// process with the provider-native resume option for another turn.
     pub async fn send_prompt(&self, prompt: &str) -> Result<(), AgentError> {
         let prompt = prompt.to_owned();
         let pipe = self.stdin.clone();
@@ -109,6 +151,17 @@ impl PipeSession {
     /// Session ID assigned at spawn time.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn process_id(&self) -> Option<u32> {
+        self.stdin
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(PipeProcess::process_id))
+    }
+
+    pub fn reader_finished(&self) -> bool {
+        self.reader_task.is_finished()
     }
 
     /// Kill the pipe process.

@@ -15,9 +15,9 @@ use gate4agent_adapters::{builtin_adapter_registry, AdapterRuntimeRegistry};
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-    ObservationEnvelope, OperationId, PreparedInputKind, ProviderEvent, SessionGeneration,
-    StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
-    WORKING_DIRECTORY_MAX_BYTES,
+    ObservationEnvelope, OperationId, PreparedInputKind, ProviderEvent, ProviderSource,
+    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -40,6 +40,7 @@ struct OwnedPtySession {
 }
 
 struct OwnedPtyProvider {
+    source: ProviderSource,
     receiver: PtyEventReceiver,
     replay: VecDeque<PtyEventEnvelope>,
     pending_events: VecDeque<ProviderEvent>,
@@ -49,6 +50,7 @@ struct OwnedPtyProvider {
 }
 
 struct OwnedProviderSession<S> {
+    source: ProviderSource,
     session: S,
     events: broadcast::Receiver<AgentEvent>,
     pending_events: VecDeque<AgentEvent>,
@@ -307,6 +309,10 @@ impl NativeEffectShell {
                             };
                             match session.attach_events(session.beginning_cursor()) {
                                 Ok(attachment) => Some(OwnedPtyProvider {
+                                    source: ProviderSource {
+                                        family: AdapterFamily::PtySemantic,
+                                        binding: adapter.clone(),
+                                    },
                                     receiver: attachment.receiver,
                                     replay: attachment.replay.into(),
                                     pending_events: VecDeque::from([
@@ -363,6 +369,10 @@ impl NativeEffectShell {
                         }
                     }
                 };
+                let source = ProviderSource {
+                    family: AdapterFamily::Pipe,
+                    binding: pipe_spec.adapter.clone(),
+                };
                 let prompt = request.initial_prompt.unwrap_or_default();
                 let config = SessionConfig {
                     tool,
@@ -392,6 +402,7 @@ impl NativeEffectShell {
                         self.pipe_sessions.insert(
                             key,
                             OwnedProviderSession {
+                                source,
                                 session,
                                 events,
                                 pending_events: VecDeque::from([AgentEvent::SessionStart {
@@ -427,6 +438,10 @@ impl NativeEffectShell {
                         }
                     }
                 };
+                let source = ProviderSource {
+                    family: AdapterFamily::Acp,
+                    binding: acp_spec.adapter.clone(),
+                };
                 let spawned = match acp_spec.launch_override.as_ref() {
                     Some(launch) => {
                         AcpSession::spawn_with_launch(
@@ -460,6 +475,7 @@ impl NativeEffectShell {
                         self.acp_sessions.insert(
                             key,
                             OwnedProviderSession {
+                                source,
                                 session,
                                 events,
                                 pending_events: VecDeque::from([AgentEvent::SessionStart {
@@ -652,10 +668,7 @@ fn drain_pty_provider(
     loop {
         let envelope = match provider.replay.pop_front() {
             Some(envelope) => Some(envelope),
-            None => match provider.receiver.try_recv() {
-                Ok(envelope) => envelope,
-                Err(_) => None,
-            },
+            None => provider.receiver.try_recv().unwrap_or_default(),
         };
         let Some(envelope) = envelope else {
             break;
@@ -693,6 +706,7 @@ fn drain_pty_provider(
                     instance_id: key.instance_id,
                     generation: key.generation,
                     observation: ControlObservation::ProviderGap {
+                        source: provider.source.clone(),
                         missed: to_sequence.saturating_sub(from_sequence).saturating_add(1),
                     },
                 });
@@ -727,7 +741,11 @@ fn push_provider_observation(
         operation_id: None,
         instance_id: key.instance_id,
         generation: key.generation,
-        observation: ControlObservation::ProviderEvent { sequence, event },
+        observation: ControlObservation::ProviderEvent {
+            source: provider.source.clone(),
+            sequence,
+            event,
+        },
     });
 }
 
@@ -775,6 +793,7 @@ fn collect_provider_map<S>(
     for (key, owned) in sessions {
         drain_provider_stream(
             *key,
+            &owned.source,
             &mut owned.events,
             &mut owned.pending_events,
             &mut owned.next_provider_sequence,
@@ -786,6 +805,7 @@ fn collect_provider_map<S>(
 
 fn drain_provider_stream(
     key: NativeSessionKey,
+    source: &ProviderSource,
     events: &mut broadcast::Receiver<AgentEvent>,
     pending_events: &mut VecDeque<AgentEvent>,
     next_provider_sequence: &mut u64,
@@ -814,7 +834,11 @@ fn drain_provider_stream(
                     operation_id: None,
                     instance_id: key.instance_id,
                     generation: key.generation,
-                    observation: ControlObservation::ProviderEvent { sequence, event },
+                    observation: ControlObservation::ProviderEvent {
+                        source: source.clone(),
+                        sequence,
+                        event,
+                    },
                 });
             }
             Err(broadcast::error::TryRecvError::Lagged(missed)) => {
@@ -823,7 +847,10 @@ fn drain_provider_stream(
                     operation_id: None,
                     instance_id: key.instance_id,
                     generation: key.generation,
-                    observation: ControlObservation::ProviderGap { missed },
+                    observation: ControlObservation::ProviderGap {
+                        source: source.clone(),
+                        missed,
+                    },
                 });
             }
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {

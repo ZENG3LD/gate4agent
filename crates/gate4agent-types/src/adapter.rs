@@ -127,7 +127,7 @@ pub enum AdapterVerification {
     VendorCanary,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct AdapterBinding {
     pub id: AdapterId,
     pub revision: String,

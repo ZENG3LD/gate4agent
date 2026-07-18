@@ -1,11 +1,18 @@
-use crate::{AgentId, InputAction, InputPrepareError, PreparedInput, PreparedInputKind};
+use crate::{
+    AdapterBinding, AdapterFamily, AgentId, InputAction, InputPrepareError, PreparedInput,
+    PreparedInputKind,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 8;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 9;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
+pub const PROVIDER_INGRESS_EVENTS_MAX: usize = 32;
+pub const PROVIDER_EVENT_TEXT_MAX_BYTES: usize = 262_144;
+pub const PROVIDER_EVENT_ID_MAX_BYTES: usize = 512;
+pub const PROVIDER_EVENT_TOOLS_MAX: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -95,6 +102,13 @@ pub enum ControlCommand {
         instance_id: AgentInstanceId,
         size: TerminalSize,
     },
+    IngestProvider {
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+        source: ProviderSource,
+        source_sequence: u64,
+        events: Vec<ProviderEvent>,
+    },
     Remove {
         instance_id: AgentInstanceId,
     },
@@ -108,6 +122,7 @@ impl ControlCommand {
             | Self::Stop { instance_id, .. }
             | Self::SendInput { instance_id, .. }
             | Self::Resize { instance_id, .. }
+            | Self::IngestProvider { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
     }
@@ -192,10 +207,12 @@ pub enum ControlObservation {
         message: String,
     },
     ProviderEvent {
+        source: ProviderSource,
         sequence: u64,
         event: ProviderEvent,
     },
     ProviderGap {
+        source: ProviderSource,
         missed: u64,
     },
 }
@@ -304,6 +321,169 @@ pub enum ProviderEvent {
     },
 }
 
+impl ProviderEvent {
+    pub fn validate_ingress(&self) -> Result<(), ProviderEventValidationError> {
+        match self {
+            Self::SessionStarted {
+                session_id,
+                model,
+                tools,
+            } => {
+                validate_required("session_id", session_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                validate_identifier("model", model, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                if tools.len() > PROVIDER_EVENT_TOOLS_MAX {
+                    return Err(ProviderEventValidationError::TooManyTools {
+                        count: tools.len(),
+                        max: PROVIDER_EVENT_TOOLS_MAX,
+                    });
+                }
+                for tool in tools {
+                    validate_required("tool", tool, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                }
+            }
+            Self::TurnStarted { prompt } => {
+                if let Some(prompt) = prompt {
+                    validate_text("prompt", prompt, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                }
+            }
+            Self::Text { text, .. } | Self::Thinking { text } => {
+                validate_text("text", text, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+            }
+            Self::ToolStarted {
+                id,
+                name,
+                input_json,
+            } => {
+                validate_required("tool id", id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                validate_required("tool name", name, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                validate_text("tool input", input_json, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+            }
+            Self::ToolCompleted { id, output, .. } => {
+                validate_required("tool id", id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                validate_text("tool output", output, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+            }
+            Self::SessionEnded {
+                result, cost_usd, ..
+            } => {
+                validate_text("session result", result, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                if let Some(cost) = cost_usd {
+                    validate_identifier("cost", cost, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                }
+            }
+            Self::Error { message } => {
+                validate_required_text("error", message, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+            }
+            Self::ApprovalRequested {
+                tool_name,
+                description,
+            } => {
+                validate_required("approval tool", tool_name, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                if let Some(description) = description {
+                    validate_text(
+                        "approval description",
+                        description,
+                        PROVIDER_EVENT_TEXT_MAX_BYTES,
+                    )?;
+                }
+            }
+            Self::RateLimited {
+                limit_type,
+                resets_at,
+                usage_percent,
+                raw_message,
+            } => {
+                validate_required("limit type", limit_type, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                for (field, value) in [
+                    ("reset time", resets_at.as_deref()),
+                    ("usage percent", usage_percent.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        validate_identifier(field, value, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                    }
+                }
+                validate_text(
+                    "rate limit message",
+                    raw_message,
+                    PROVIDER_EVENT_TEXT_MAX_BYTES,
+                )?;
+            }
+            Self::TurnCompleted { .. } | Self::Ready => {}
+        }
+        Ok(())
+    }
+}
+
+fn validate_required(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), ProviderEventValidationError> {
+    if value.trim().is_empty() {
+        return Err(ProviderEventValidationError::Empty { field });
+    }
+    validate_identifier(field, value, max)
+}
+
+fn validate_required_text(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), ProviderEventValidationError> {
+    if value.trim().is_empty() {
+        return Err(ProviderEventValidationError::Empty { field });
+    }
+    validate_text(field, value, max)
+}
+
+fn validate_identifier(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), ProviderEventValidationError> {
+    if value.len() > max || value.chars().any(char::is_control) {
+        return Err(ProviderEventValidationError::InvalidField { field, max });
+    }
+    Ok(())
+}
+
+fn validate_text(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), ProviderEventValidationError> {
+    let has_unsafe_control = value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'));
+    if value.len() > max || has_unsafe_control {
+        return Err(ProviderEventValidationError::InvalidField { field, max });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ProviderEventValidationError {
+    #[error("provider event field '{field}' is required")]
+    Empty { field: &'static str },
+    #[error("provider event field '{field}' contains controls or exceeds {max} bytes")]
+    InvalidField { field: &'static str, max: usize },
+    #[error("provider event tool count {count} exceeds {max}")]
+    TooManyTools { count: usize, max: usize },
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ProviderSource {
+    pub family: AdapterFamily,
+    pub binding: AdapterBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSourceCursor {
+    pub source: ProviderSource,
+    pub sequence: u64,
+    pub gap_count: u64,
+    pub stale: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderActivity {
@@ -332,6 +512,7 @@ pub struct ProviderSnapshot {
     pub activity: ProviderActivity,
     pub current_prompt: Option<String>,
     pub active_tools: Vec<ActiveProviderTool>,
+    pub sources: Vec<ProviderSourceCursor>,
     pub last_event: Option<ProviderEvent>,
     pub gap_count: u64,
     pub stale: bool,
@@ -397,9 +578,13 @@ pub enum ControlEventKind {
     },
     ProviderEvent {
         sequence: u64,
+        source: ProviderSource,
+        source_sequence: u64,
         event: ProviderEvent,
     },
     ProviderGap {
+        sequence: u64,
+        source: ProviderSource,
         missed: u64,
     },
     Exited {
@@ -461,6 +646,17 @@ pub enum ControlError {
         action: String,
         status: SessionStatus,
     },
+    #[error("provider ingress generation {actual:?} is stale; expected {expected:?}")]
+    StaleProviderGeneration {
+        expected: SessionGeneration,
+        actual: SessionGeneration,
+    },
+    #[error("provider ingress source sequence must be greater than the current sequence")]
+    StaleProviderSequence,
+    #[error("provider ingress batch must contain between 1 and {max} events")]
+    InvalidProviderBatch { max: usize },
+    #[error("invalid provider ingress event: {message}")]
+    InvalidProviderEvent { message: String },
 }
 
 impl Default for ControlSnapshot {
@@ -470,5 +666,36 @@ impl Default for ControlSnapshot {
             revision: 0,
             sessions: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderEvent, ProviderEventValidationError};
+
+    #[test]
+    fn provider_ingress_allows_multiline_text_but_rejects_control_bytes() {
+        ProviderEvent::Text {
+            text: "first line\n\tsecond line".to_owned(),
+            is_delta: false,
+        }
+        .validate_ingress()
+        .unwrap();
+
+        assert!(matches!(
+            ProviderEvent::Text {
+                text: "unsafe\u{0000}text".to_owned(),
+                is_delta: false,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField { field: "text", .. })
+        ));
+        assert!(ProviderEvent::SessionStarted {
+            session_id: "session\nother".to_owned(),
+            model: "model".to_owned(),
+            tools: Vec::new(),
+        }
+        .validate_ingress()
+        .is_err());
     }
 }

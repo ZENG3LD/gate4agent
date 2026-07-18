@@ -16,9 +16,12 @@ pub use control::{
     ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
     ControlError, ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot,
     EffectEnvelope, ObservationEnvelope, ObservationIgnoredReason, OperationId, ProviderActivity,
-    ProviderEvent, ProviderSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
-    StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
-    TERMINAL_COLUMNS_MAX, TERMINAL_ROWS_MAX, WORKING_DIRECTORY_MAX_BYTES,
+    ProviderEvent, ProviderEventValidationError, ProviderSnapshot, ProviderSource,
+    ProviderSourceCursor, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest,
+    TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
+    PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES, PROVIDER_EVENT_TOOLS_MAX,
+    PROVIDER_INGRESS_EVENTS_MAX, TERMINAL_COLUMNS_MAX, TERMINAL_ROWS_MAX,
+    WORKING_DIRECTORY_MAX_BYTES,
 };
 pub use executable::normalize_executable_name;
 pub use id::{AgentId, AgentIdError};

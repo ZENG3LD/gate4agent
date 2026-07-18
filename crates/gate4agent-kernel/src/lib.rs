@@ -3,9 +3,9 @@
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_engine::Gate4AgentEngine;
 use gate4agent_types::{
-    AgentId, CommandEnvelope, CommandId, ControlCommand, ControlError, ControlEvent,
-    ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    AdapterBinding, AdapterFamily, AgentId, CommandEnvelope, CommandId, ControlCommand,
+    ControlError, ControlEvent, ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope,
+    ProviderSource, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -28,6 +28,15 @@ pub enum KernelCommandError {
     UnsupportedTransport {
         agent_id: AgentId,
         transport: TransportKind,
+    },
+    #[error(
+        "agent '{agent_id}' does not declare {family:?} provider source '{adapter_id}' at revision '{revision}'"
+    )]
+    InvalidProviderSource {
+        agent_id: AgentId,
+        family: AdapterFamily,
+        adapter_id: String,
+        revision: String,
     },
     #[error(transparent)]
     Control(#[from] ControlError),
@@ -75,11 +84,8 @@ impl Gate4AgentKernel {
             let instance_id = command.command.instance_id();
             let result = self.apply_validated_command(command);
             if let Err(error) = &result {
-                self.engine.record_command_rejection(
-                    command_id,
-                    instance_id,
-                    error.to_string(),
-                );
+                self.engine
+                    .record_command_rejection(command_id, instance_id, error.to_string());
             }
             command_outcomes.push(CommandOutcome { command_id, result });
         }
@@ -156,7 +162,51 @@ impl Gate4AgentKernel {
                 }
             }
         }
+        if let ControlCommand::IngestProvider {
+            instance_id,
+            source,
+            ..
+        } = &command.command
+        {
+            if let Some(session) = self.engine.session_snapshot(*instance_id) {
+                let spec = self
+                    .catalog
+                    .get(&session.agent_id)
+                    .expect("registered agent must remain in kernel catalog");
+                if declared_provider_binding(spec, source) != Some(&source.binding) {
+                    return Err(KernelCommandError::InvalidProviderSource {
+                        agent_id: session.agent_id.clone(),
+                        family: source.family,
+                        adapter_id: source.binding.id.to_string(),
+                        revision: source.binding.revision.clone(),
+                    });
+                }
+            }
+        }
         self.engine.apply_command(command).map_err(Into::into)
+    }
+}
+
+fn declared_provider_binding<'a>(
+    spec: &'a gate4agent_catalog::AgentSpec,
+    source: &ProviderSource,
+) -> Option<&'a AdapterBinding> {
+    match source.family {
+        AdapterFamily::PtySemantic => spec.capabilities.transports.pty_adapter.as_ref(),
+        AdapterFamily::Pipe => spec
+            .capabilities
+            .transports
+            .pipe
+            .as_ref()
+            .map(|transport| &transport.adapter),
+        AdapterFamily::Acp => spec
+            .capabilities
+            .transports
+            .acp
+            .as_ref()
+            .map(|transport| &transport.adapter),
+        AdapterFamily::Hook => spec.capabilities.adapters.hook.as_ref(),
+        AdapterFamily::History | AdapterFamily::Resume | AdapterFamily::CapabilityProbe => None,
     }
 }
 
@@ -170,8 +220,9 @@ impl Default for Gate4AgentKernel {
 mod tests {
     use super::*;
     use gate4agent_types::{
-        AgentInstanceId, ControlObservation, ObservationEnvelope, SessionStatus,
-        StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+        AgentInstanceId, ControlObservation, ObservationEnvelope, ProviderActivity, ProviderEvent,
+        ProviderSource, SessionStatus, StartRequest, TerminalSize, TransportKind,
+        CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
@@ -211,6 +262,92 @@ mod tests {
         assert!(matches!(
             step.events[0].event,
             gate4agent_types::ControlEventKind::CommandRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn external_provider_ingress_requires_the_declared_family_binding() {
+        let mut kernel = Gate4AgentKernel::default();
+        kernel.step([register(1, "grok")], []);
+        let started = kernel.step(
+            [command(
+                2,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                    },
+                },
+            )],
+            [],
+        );
+        let generation = started.snapshot.sessions[0].generation;
+        let grok_hook = kernel
+            .catalog()
+            .get_by_id("grok")
+            .unwrap()
+            .capabilities
+            .adapters
+            .hook
+            .clone()
+            .unwrap();
+        let accepted = kernel.step(
+            [command(
+                3,
+                ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation,
+                    source: ProviderSource {
+                        family: AdapterFamily::Hook,
+                        binding: grok_hook,
+                    },
+                    source_sequence: 1,
+                    events: vec![ProviderEvent::TurnStarted {
+                        prompt: Some("ground hook".to_owned()),
+                    }],
+                },
+            )],
+            [],
+        );
+        assert_eq!(accepted.command_outcomes[0].result, Ok(()));
+        assert_eq!(
+            accepted.snapshot.sessions[0].provider.activity,
+            ProviderActivity::Working
+        );
+
+        let kimi_hook = kernel
+            .catalog()
+            .get_by_id("kimi")
+            .unwrap()
+            .capabilities
+            .adapters
+            .hook
+            .clone()
+            .unwrap();
+        let rejected = kernel.step(
+            [command(
+                4,
+                ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation,
+                    source: ProviderSource {
+                        family: AdapterFamily::Hook,
+                        binding: kimi_hook,
+                    },
+                    source_sequence: 2,
+                    events: vec![ProviderEvent::Ready],
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::InvalidProviderSource { .. })
         ));
     }
 

@@ -1,15 +1,16 @@
 use std::time::Duration;
 
-use gate4agent_catalog::AgentRegistry;
+use gate4agent_catalog::{builtin_adapter_registry, AgentRegistry};
 use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_testkit::{
     acp_agent_spec, pipe_agent_spec, pty_provider_agent_spec, ACP_FIXTURE_ID, PIPE_FIXTURE_ID,
     PTY_PROVIDER_FIXTURE_ID,
 };
 use gate4agent_types::{
-    AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
-    ControlEventKind, InputAction, PromptFraming, PromptPayload, ProviderEvent, SessionStatus,
-    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
+    ControlEvent, ControlEventKind, InputAction, PromptFraming, PromptPayload, ProviderActivity,
+    ProviderEvent, ProviderSource, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
@@ -269,6 +270,119 @@ async fn pty_classification_uses_the_same_provider_event_contract() {
     handle
         .dispatch(command(
             22,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| matches!(session.status, SessionStatus::Exited { .. }))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authority() {
+    let mut spec = pty_provider_agent_spec();
+    let hook_binding = builtin_adapter_registry()
+        .binding(AdapterFamily::Hook, "grok")
+        .unwrap()
+        .clone();
+    spec.capabilities.adapters.hook = Some(hook_binding.clone());
+    let (handle, mut runtime) = runtime(spec);
+    let subscription = handle.subscribe(64);
+    let instance_id = AgentInstanceId(44);
+    handle
+        .dispatch(command(
+            30,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(PTY_PROVIDER_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            31,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                },
+            },
+        ))
+        .unwrap();
+
+    let mut events = Vec::new();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| session.status == SessionStatus::Running)
+    })
+    .await;
+    let generation = handle.snapshot().sessions[0].generation;
+    handle
+        .dispatch(command(
+            32,
+            ControlCommand::IngestProvider {
+                instance_id,
+                generation,
+                source: ProviderSource {
+                    family: AdapterFamily::Hook,
+                    binding: hook_binding,
+                },
+                source_sequence: 1,
+                events: vec![
+                    ProviderEvent::TurnStarted {
+                        prompt: Some("external hook turn".to_owned()),
+                    },
+                    ProviderEvent::ApprovalRequested {
+                        tool_name: "ask_user_question".to_owned(),
+                        description: Some("choose".to_owned()),
+                    },
+                ],
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| session.provider.activity == ProviderActivity::WaitingForInput)
+    })
+    .await;
+
+    let snapshot = handle.snapshot();
+    let provider = &snapshot.sessions[0].provider;
+    assert_eq!(
+        provider.current_prompt.as_deref(),
+        Some("external hook turn")
+    );
+    assert!(provider
+        .sources
+        .iter()
+        .any(|cursor| cursor.source.family == AdapterFamily::Hook && cursor.sequence == 1));
+
+    handle
+        .dispatch(command(
+            33,
             ControlCommand::Stop {
                 instance_id,
                 force: true,

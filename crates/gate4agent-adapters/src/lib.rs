@@ -87,6 +87,86 @@ impl AdapterRegistry {
     }
 }
 
+/// Runtime implementations keyed by the same revisioned family binding used
+/// by the declarative adapter registry.
+///
+/// `T` is intentionally generic: native shells may store process/parser
+/// implementations while WASM consumers may store pure client handlers. The
+/// registry itself performs no I/O and does not prescribe an execution model.
+#[derive(Clone, Debug, Default)]
+pub struct AdapterRuntimeRegistry<T> {
+    runtimes: BTreeMap<(AdapterFamily, AdapterId), AdapterRuntime<T>>,
+}
+
+#[derive(Clone, Debug)]
+struct AdapterRuntime<T> {
+    binding: AdapterBinding,
+    implementation: T,
+}
+
+impl<T> AdapterRuntimeRegistry<T> {
+    pub fn insert(
+        &mut self,
+        family: AdapterFamily,
+        binding: AdapterBinding,
+        implementation: T,
+    ) -> Result<(), AdapterRuntimeRegistryError> {
+        binding
+            .validate()
+            .map_err(|error| AdapterRuntimeRegistryError::InvalidBinding {
+                family,
+                adapter_id: binding.id.clone(),
+                message: error.to_string(),
+            })?;
+        let key = (family, binding.id.clone());
+        if self.runtimes.contains_key(&key) {
+            return Err(AdapterRuntimeRegistryError::Duplicate {
+                family,
+                adapter_id: binding.id,
+            });
+        }
+        self.runtimes.insert(
+            key,
+            AdapterRuntime {
+                binding,
+                implementation,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn resolve(
+        &self,
+        family: AdapterFamily,
+        binding: &AdapterBinding,
+    ) -> Result<&T, AdapterRuntimeRegistryError> {
+        let Some(runtime) = self.runtimes.get(&(family, binding.id.clone())) else {
+            return Err(AdapterRuntimeRegistryError::Unavailable {
+                family,
+                adapter_id: binding.id.clone(),
+                revision: binding.revision.clone(),
+            });
+        };
+        if runtime.binding.revision != binding.revision {
+            return Err(AdapterRuntimeRegistryError::RevisionMismatch {
+                family,
+                adapter_id: binding.id.clone(),
+                requested: binding.revision.clone(),
+                available: runtime.binding.revision.clone(),
+            });
+        }
+        Ok(&runtime.implementation)
+    }
+
+    pub fn len(&self) -> usize {
+        self.runtimes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runtimes.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum AdapterRegistryError {
     #[error("duplicate {family:?} adapter ID: {adapter_id}")]
@@ -104,6 +184,36 @@ pub enum AdapterRegistryError {
         family: AdapterFamily,
         adapter_id: AdapterId,
         message: String,
+    },
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AdapterRuntimeRegistryError {
+    #[error("duplicate runtime for {family:?} adapter {adapter_id}")]
+    Duplicate {
+        family: AdapterFamily,
+        adapter_id: AdapterId,
+    },
+    #[error("invalid runtime binding for {family:?} adapter {adapter_id}: {message}")]
+    InvalidBinding {
+        family: AdapterFamily,
+        adapter_id: AdapterId,
+        message: String,
+    },
+    #[error("runtime unavailable for {family:?} adapter {adapter_id} at revision {revision}")]
+    Unavailable {
+        family: AdapterFamily,
+        adapter_id: AdapterId,
+        revision: String,
+    },
+    #[error(
+        "runtime revision mismatch for {family:?} adapter {adapter_id}: requested {requested}, available {available}"
+    )]
+    RevisionMismatch {
+        family: AdapterFamily,
+        adapter_id: AdapterId,
+        requested: String,
+        available: String,
     },
 }
 
@@ -165,5 +275,34 @@ mod tests {
         )
         .unwrap();
         assert!(!registry.supports(AdapterFamily::Pipe, &binding));
+    }
+
+    #[test]
+    fn runtime_resolution_is_family_and_revision_exact() {
+        let binding = builtin_adapter_registry()
+            .binding(AdapterFamily::Pipe, "codex")
+            .unwrap()
+            .clone();
+        let mut registry = AdapterRuntimeRegistry::default();
+        registry
+            .insert(AdapterFamily::Pipe, binding.clone(), "pipe-runtime")
+            .unwrap();
+
+        assert_eq!(
+            registry.resolve(AdapterFamily::Pipe, &binding).unwrap(),
+            &"pipe-runtime"
+        );
+        assert!(matches!(
+            registry.resolve(AdapterFamily::PtySemantic, &binding),
+            Err(AdapterRuntimeRegistryError::Unavailable { .. })
+        ));
+
+        let other_revision =
+            AdapterBinding::new(binding.id, "other-revision", AdapterVerification::Reference)
+                .unwrap();
+        assert!(matches!(
+            registry.resolve(AdapterFamily::Pipe, &other_revision),
+            Err(AdapterRuntimeRegistryError::RevisionMismatch { .. })
+        ));
     }
 }

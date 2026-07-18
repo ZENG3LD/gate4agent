@@ -375,6 +375,7 @@ name = "gate4agent-shell-native"
 version = "0.2.37"
 dependencies = [
  "gate4agent",
+ "gate4agent-adapters",
  "gate4agent-catalog",
  "gate4agent-kernel",
  "gate4agent-testkit",

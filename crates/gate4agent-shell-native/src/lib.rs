@@ -11,9 +11,10 @@ use gate4agent::{
     PipeSession, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
     SessionConfig,
 };
+use gate4agent_adapters::{builtin_adapter_registry, AdapterRuntimeRegistry};
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
-    AdapterBinding, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
+    AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
     ObservationEnvelope, OperationId, PreparedInputKind, ProviderEvent, SessionGeneration,
     StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
     WORKING_DIRECTORY_MAX_BYTES,
@@ -59,6 +60,7 @@ struct OwnedProviderSession<S> {
 /// each accepted effect. Logical lifecycle state remains owned by the engine.
 pub struct NativeEffectShell {
     catalog: AgentRegistry,
+    legacy_adapters: AdapterRuntimeRegistry<CliTool>,
     pty_sessions: BTreeMap<NativeSessionKey, OwnedPtySession>,
     pipe_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<PipeSession>>,
     acp_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<AcpSession>>,
@@ -66,8 +68,21 @@ pub struct NativeEffectShell {
 
 impl NativeEffectShell {
     pub fn new(catalog: AgentRegistry) -> Self {
+        Self::new_with_runtime_adapters(catalog, builtin_legacy_adapter_runtimes())
+    }
+
+    /// Builds a native shell with consumer-provided compatibility runtimes.
+    ///
+    /// The runtime registry is deliberately separate from the declarative
+    /// catalog: both the adapter family and revision must resolve before a
+    /// process is spawned.
+    pub fn new_with_runtime_adapters(
+        catalog: AgentRegistry,
+        legacy_adapters: AdapterRuntimeRegistry<CliTool>,
+    ) -> Self {
         Self {
             catalog,
+            legacy_adapters,
             pty_sessions: BTreeMap::new(),
             pipe_sessions: BTreeMap::new(),
             acp_sessions: BTreeMap::new(),
@@ -278,11 +293,16 @@ impl NativeEffectShell {
                     let session_id = session.session_id().to_owned();
                     let provider = match spec.capabilities.transports.pty_adapter.as_ref() {
                         Some(adapter) => {
-                            let tool = match cli_tool(adapter) {
-                                Ok(tool) => tool,
-                                Err(message) => {
+                            let tool = match self
+                                .legacy_adapters
+                                .resolve(AdapterFamily::PtySemantic, adapter)
+                            {
+                                Ok(tool) => *tool,
+                                Err(error) => {
                                     let _ = session.shutdown().await;
-                                    return ControlObservation::SpawnFailed { message };
+                                    return ControlObservation::SpawnFailed {
+                                        message: error.to_string(),
+                                    };
                                 }
                             };
                             match session.attach_events(session.beginning_cursor()) {
@@ -332,9 +352,16 @@ impl NativeEffectShell {
                         message: format!("agent '{agent_id}' does not support Pipe transport"),
                     };
                 };
-                let tool = match cli_tool(&pipe_spec.adapter) {
-                    Ok(tool) => tool,
-                    Err(message) => return ControlObservation::SpawnFailed { message },
+                let tool = match self
+                    .legacy_adapters
+                    .resolve(AdapterFamily::Pipe, &pipe_spec.adapter)
+                {
+                    Ok(tool) => *tool,
+                    Err(error) => {
+                        return ControlObservation::SpawnFailed {
+                            message: error.to_string(),
+                        }
+                    }
                 };
                 let prompt = request.initial_prompt.unwrap_or_default();
                 let config = SessionConfig {
@@ -389,9 +416,16 @@ impl NativeEffectShell {
                         message: format!("agent '{agent_id}' does not support ACP transport"),
                     };
                 };
-                let tool = match cli_tool(&acp_spec.adapter) {
-                    Ok(tool) => tool,
-                    Err(message) => return ControlObservation::SpawnFailed { message },
+                let tool = match self
+                    .legacy_adapters
+                    .resolve(AdapterFamily::Acp, &acp_spec.adapter)
+                {
+                    Ok(tool) => *tool,
+                    Err(error) => {
+                        return ControlObservation::SpawnFailed {
+                            message: error.to_string(),
+                        }
+                    }
                 };
                 let spawned = match acp_spec.launch_override.as_ref() {
                     Some(launch) => {
@@ -903,17 +937,31 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
     }
 }
 
-fn cli_tool(adapter: &AdapterBinding) -> Result<CliTool, String> {
-    match adapter.id.as_str() {
-        "claude-code" => Ok(CliTool::ClaudeCode),
-        "codex" => Ok(CliTool::Codex),
-        "gemini" => Ok(CliTool::Gemini),
-        "opencode" => Ok(CliTool::OpenCode),
-        id => Err(format!(
-            "adapter '{id}' at revision '{}' has no legacy CLI bridge",
-            adapter.revision
-        )),
+fn builtin_legacy_adapter_runtimes() -> AdapterRuntimeRegistry<CliTool> {
+    let definitions = [
+        ("claude-code", CliTool::ClaudeCode),
+        ("codex", CliTool::Codex),
+        ("gemini", CliTool::Gemini),
+        ("opencode", CliTool::OpenCode),
+    ];
+    let mut runtimes = AdapterRuntimeRegistry::default();
+    for (id, tool) in definitions {
+        for family in [AdapterFamily::PtySemantic, AdapterFamily::Pipe] {
+            let binding = builtin_adapter_registry()
+                .binding(family, id)
+                .unwrap_or_else(|| panic!("missing built-in {family:?} adapter {id}"))
+                .clone();
+            runtimes
+                .insert(family, binding, tool)
+                .expect("built-in native adapter runtime must be unique");
+        }
+        if let Some(binding) = builtin_adapter_registry().binding(AdapterFamily::Acp, id) {
+            runtimes
+                .insert(AdapterFamily::Acp, binding.clone(), tool)
+                .expect("built-in native ACP adapter runtime must be unique");
+        }
     }
+    runtimes
 }
 
 fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {

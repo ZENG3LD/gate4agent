@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use gate4agent_catalog::AgentRegistry;
 use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
-use gate4agent_testkit::{acp_agent_spec, pipe_agent_spec, ACP_FIXTURE_ID, PIPE_FIXTURE_ID};
+use gate4agent_testkit::{
+    acp_agent_spec, pipe_agent_spec, pty_provider_agent_spec, ACP_FIXTURE_ID, PIPE_FIXTURE_ID,
+    PTY_PROVIDER_FIXTURE_ID,
+};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, InputAction, PromptFraming, PromptPayload, ProviderEvent, SessionStatus,
@@ -17,7 +20,9 @@ fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     }
 }
 
-fn runtime(spec: gate4agent_types::AgentSpec) -> (gate4agent_handle::Gate4AgentHandle, NativeRuntime) {
+fn runtime(
+    spec: gate4agent_types::AgentSpec,
+) -> (gate4agent_handle::Gate4AgentHandle, NativeRuntime) {
     NativeRuntime::new(
         AgentRegistry::new([spec]).expect("fixture registry"),
         NativeRuntimeConfig {
@@ -96,7 +101,10 @@ async fn pipe_one_shot_reaches_public_snapshot_with_semantic_events() {
 
     let snapshot = handle.snapshot();
     let session = snapshot.sessions.first().expect("pipe session snapshot");
-    assert_eq!(session.provider.session_id.as_deref(), Some("fixture-thread"));
+    assert_eq!(
+        session.provider.session_id.as_deref(),
+        Some("fixture-thread")
+    );
     assert_eq!(session.provider.completed_turns, 1);
     assert_eq!(session.provider.usage.input_tokens, 3);
     assert_eq!(session.provider.usage.output_tokens, 5);
@@ -197,6 +205,73 @@ async fn acp_multi_turn_prompt_streams_and_stops_through_public_handle() {
             ControlCommand::Stop {
                 instance_id,
                 force: false,
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| matches!(session.status, SessionStatus::Exited { .. }))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pty_classification_uses_the_same_provider_event_contract() {
+    let (handle, mut runtime) = runtime(pty_provider_agent_spec());
+    let subscription = handle.subscribe(64);
+    let instance_id = AgentInstanceId(43);
+    handle
+        .dispatch(command(
+            20,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(PTY_PROVIDER_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            21,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                },
+            },
+        ))
+        .unwrap();
+
+    let mut events = Vec::new();
+    drive_until(&mut runtime, &subscription, &mut events, |_, events| {
+        events.iter().any(|event| {
+            matches!(
+                &event.event,
+                ControlEventKind::ProviderEvent {
+                    event: ProviderEvent::Text { text, .. },
+                    ..
+                } if text.contains("fixture-pty-response")
+            )
+        })
+    })
+    .await;
+    handle
+        .dispatch(command(
+            22,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
             },
         ))
         .unwrap();

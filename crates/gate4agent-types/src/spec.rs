@@ -156,6 +156,8 @@ pub struct AgentTransportCapabilities {
     #[serde(default = "default_true")]
     pub pty: bool,
     #[serde(default)]
+    pub pty_adapter: Option<ProviderAdapter>,
+    #[serde(default)]
     pub pipe: Option<PipeTransportSpec>,
     #[serde(default)]
     pub acp: Option<AcpTransportSpec>,
@@ -165,6 +167,7 @@ impl Default for AgentTransportCapabilities {
     fn default() -> Self {
         Self {
             pty: true,
+            pty_adapter: None,
             pipe: None,
             acp: None,
         }

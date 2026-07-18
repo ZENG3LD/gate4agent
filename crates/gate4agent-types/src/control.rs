@@ -2,7 +2,7 @@ use crate::{AgentId, InputAction, InputPrepareError, PreparedInput, PreparedInpu
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 5;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 6;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -19,7 +19,9 @@ pub struct CommandId(pub u64);
 #[serde(transparent)]
 pub struct OperationId(pub u64);
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct SessionGeneration(pub u64);
 
@@ -286,6 +288,17 @@ pub enum ProviderEvent {
     Error {
         message: String,
     },
+    Ready,
+    ApprovalRequested {
+        tool_name: String,
+        description: Option<String>,
+    },
+    RateLimited {
+        limit_type: String,
+        resets_at: Option<String>,
+        usage_percent: Option<String>,
+        raw_message: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -321,16 +334,27 @@ pub struct ControlEvent {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlEventKind {
-    CommandRejected { message: String },
+    CommandRejected {
+        message: String,
+    },
     Registered,
-    StartRequested { operation_id: OperationId },
-    Running { process_id: Option<u32> },
-    StopRequested { operation_id: OperationId, force: bool },
+    StartRequested {
+        operation_id: OperationId,
+    },
+    Running {
+        process_id: Option<u32>,
+    },
+    StopRequested {
+        operation_id: OperationId,
+        force: bool,
+    },
     InputRequested {
         operation_id: OperationId,
         input_kind: PreparedInputKind,
     },
-    InputCompleted { input_kind: PreparedInputKind },
+    InputCompleted {
+        input_kind: PreparedInputKind,
+    },
     InputFailed {
         input_kind: PreparedInputKind,
         message: String,
@@ -345,13 +369,27 @@ pub enum ControlEventKind {
     ResizeFailed {
         message: String,
     },
-    TerminalStale { message: String },
-    ProviderEvent { sequence: u64, event: ProviderEvent },
-    ProviderGap { missed: u64 },
-    Exited { exit_code: Option<i32>, forced: bool },
-    Failed { message: String },
+    TerminalStale {
+        message: String,
+    },
+    ProviderEvent {
+        sequence: u64,
+        event: ProviderEvent,
+    },
+    ProviderGap {
+        missed: u64,
+    },
+    Exited {
+        exit_code: Option<i32>,
+        forced: bool,
+    },
+    Failed {
+        message: String,
+    },
     Removed,
-    ObservationIgnored { reason: ObservationIgnoredReason },
+    ObservationIgnored {
+        reason: ObservationIgnoredReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

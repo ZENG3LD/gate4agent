@@ -98,9 +98,7 @@ impl Gate4AgentEngine {
             ControlCommand::SendInput {
                 instance_id,
                 action,
-            } => {
-                self.send_input(command_id, instance_id, action)
-            }
+            } => self.send_input(command_id, instance_id, action),
             ControlCommand::Resize { instance_id, size } => {
                 self.resize(command_id, instance_id, size)
             }
@@ -120,12 +118,20 @@ impl Gate4AgentEngine {
             return;
         }
         let Some(current) = self.sessions.get(&instance_id).map(|state| &state.snapshot) else {
-            self.emit_ignored(instance_id, generation, ObservationIgnoredReason::UnknownInstance);
+            self.emit_ignored(
+                instance_id,
+                generation,
+                ObservationIgnoredReason::UnknownInstance,
+            );
             return;
         };
 
         if current.generation != generation {
-            self.emit_ignored(instance_id, generation, ObservationIgnoredReason::StaleGeneration);
+            self.emit_ignored(
+                instance_id,
+                generation,
+                ObservationIgnoredReason::StaleGeneration,
+            );
             return;
         }
 
@@ -172,7 +178,11 @@ impl Gate4AgentEngine {
             _ => false,
         };
         if !valid {
-            self.emit_ignored(instance_id, generation, ObservationIgnoredReason::InvalidState);
+            self.emit_ignored(
+                instance_id,
+                generation,
+                ObservationIgnoredReason::InvalidState,
+            );
             return;
         }
 
@@ -248,11 +258,8 @@ impl Gate4AgentEngine {
                 .sessions
                 .get_mut(&instance_id)
                 .expect("validated session");
-            state.snapshot.provider.gap_count = state
-                .snapshot
-                .provider
-                .gap_count
-                .saturating_add(missed);
+            state.snapshot.provider.gap_count =
+                state.snapshot.provider.gap_count.saturating_add(missed);
             state.snapshot.provider.stale = true;
             self.bump_revision();
             self.emit_event(
@@ -352,10 +359,7 @@ impl Gate4AgentEngine {
                     session.terminal_frame = Some(frame);
                     session.terminal_stale = None;
                 }
-                ControlEventKind::Exited {
-                    exit_code,
-                    forced,
-                }
+                ControlEventKind::Exited { exit_code, forced }
             }
             ControlObservation::StopFailed { message } => {
                 let state = self
@@ -381,8 +385,8 @@ impl Gate4AgentEngine {
                 ControlEventKind::InputCompleted { input_kind }
             }
             ControlObservation::InputFailed { message } => {
-                let input_kind = pending_input
-                    .expect("validated input failure must have a pending input kind");
+                let input_kind =
+                    pending_input.expect("validated input failure must have a pending input kind");
                 let session = self.session_mut(instance_id);
                 session.pending_operation = None;
                 session.pending_input = None;
@@ -505,10 +509,7 @@ impl Gate4AgentEngine {
             .transpose()
             .map_err(|error| ControlError::InputRejected { error })?;
         if transport == TransportKind::Pipe
-            && request
-                .initial_prompt
-                .as_deref()
-                .is_none_or(str::is_empty)
+            && request.initial_prompt.as_deref().is_none_or(str::is_empty)
         {
             return Err(ControlError::MissingInitialPrompt);
         }
@@ -640,8 +641,8 @@ impl Gate4AgentEngine {
                 (ControlEffect::WriteInput { input }, input_kind)
             }
             (TransportKind::Pty, action) => {
-                let input = prepare_input(action)
-                    .map_err(|error| ControlError::InputRejected { error })?;
+                let input =
+                    prepare_input(action).map_err(|error| ControlError::InputRejected { error })?;
                 let input_kind = input.kind();
                 (ControlEffect::WriteInput { input }, input_kind)
             }
@@ -834,11 +835,7 @@ impl Gate4AgentEngine {
     }
 }
 
-fn reduce_provider_event(
-    snapshot: &mut ProviderSnapshot,
-    sequence: u64,
-    event: ProviderEvent,
-) {
+fn reduce_provider_event(snapshot: &mut ProviderSnapshot, sequence: u64, event: ProviderEvent) {
     match &event {
         ProviderEvent::SessionStarted {
             session_id,
@@ -865,7 +862,10 @@ fn reduce_provider_event(
         | ProviderEvent::ToolStarted { .. }
         | ProviderEvent::ToolCompleted { .. }
         | ProviderEvent::SessionEnded { .. }
-        | ProviderEvent::Error { .. } => {}
+        | ProviderEvent::Error { .. }
+        | ProviderEvent::Ready
+        | ProviderEvent::ApprovalRequested { .. }
+        | ProviderEvent::RateLimited { .. } => {}
     }
     snapshot.sequence = sequence;
     snapshot.last_event = Some(event);
@@ -1076,7 +1076,9 @@ mod tests {
             operation_id: Some(spawn.operation_id),
             instance_id: spawn.instance_id,
             generation: spawn.generation,
-            observation: ControlObservation::Spawned { process_id: Some(1) },
+            observation: ControlObservation::Spawned {
+                process_id: Some(1),
+            },
         });
         let error = engine
             .apply_command(CommandEnvelope {
@@ -1244,7 +1246,10 @@ mod tests {
             })
             .unwrap();
         let effect = engine.drain_effects().pop().unwrap();
-        assert_eq!(engine.snapshot().sessions[0].status, SessionStatus::Stopping);
+        assert_eq!(
+            engine.snapshot().sessions[0].status,
+            SessionStatus::Stopping
+        );
 
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,

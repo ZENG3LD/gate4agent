@@ -300,6 +300,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
             .then_some(AgentCommandMode::SlashLine),
         transports: AgentTransportCapabilities {
             pty: true,
+            pty_adapter: adapter,
             pipe: adapter.map(|adapter| PipeTransportSpec {
                 adapter,
                 launch_override: None,
@@ -359,13 +360,34 @@ mod tests {
         assert!(!ids.contains(&"claude-agent-teams"));
 
         for id in ["claude", "codex", "gemini", "opencode"] {
-            assert!(registry.get_by_id(id).unwrap().capabilities.transports.pipe.is_some());
+            let transports = &registry.get_by_id(id).unwrap().capabilities.transports;
+            assert!(transports.pty_adapter.is_some());
+            assert!(transports.pipe.is_some());
         }
         for id in ["gemini", "opencode"] {
-            assert!(registry.get_by_id(id).unwrap().capabilities.transports.acp.is_some());
+            assert!(registry
+                .get_by_id(id)
+                .unwrap()
+                .capabilities
+                .transports
+                .acp
+                .is_some());
         }
         for id in ["claude", "codex", "grok"] {
-            assert!(registry.get_by_id(id).unwrap().capabilities.transports.acp.is_none());
+            assert!(registry
+                .get_by_id(id)
+                .unwrap()
+                .capabilities
+                .transports
+                .acp
+                .is_none());
         }
+        assert!(registry
+            .get_by_id("grok")
+            .unwrap()
+            .capabilities
+            .transports
+            .pty_adapter
+            .is_none());
     }
 }

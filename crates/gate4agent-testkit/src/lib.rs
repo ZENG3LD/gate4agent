@@ -10,6 +10,7 @@ use gate4agent_types::{
 pub const CONTROL_FIXTURE_ID: &str = "control-fixture";
 pub const PIPE_FIXTURE_ID: &str = "pipe-fixture";
 pub const ACP_FIXTURE_ID: &str = "acp-fixture";
+pub const PTY_PROVIDER_FIXTURE_ID: &str = "pty-provider-fixture";
 
 pub fn interactive_agent_spec() -> AgentSpec {
     #[cfg(windows)]
@@ -40,6 +41,7 @@ pub fn pipe_agent_spec() -> AgentSpec {
         launch.clone(),
         AgentTransportCapabilities {
             pty: false,
+            pty_adapter: None,
             pipe: Some(PipeTransportSpec {
                 adapter: ProviderAdapter::Codex,
                 launch_override: Some(launch),
@@ -77,11 +79,31 @@ for line in sys.stdin:
         launch.clone(),
         AgentTransportCapabilities {
             pty: false,
+            pty_adapter: None,
             pipe: None,
             acp: Some(AcpTransportSpec {
                 adapter: ProviderAdapter::Gemini,
                 launch_override: Some(launch),
             }),
+        },
+    )
+}
+
+pub fn pty_provider_agent_spec() -> AgentSpec {
+    #[cfg(windows)]
+    let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::WriteLine([char]0x2022 + ' fixture-pty-response'); [Console]::WriteLine([char]0x203A); Start-Sleep -Seconds 60";
+    #[cfg(not(windows))]
+    let script = "printf '• fixture-pty-response\\n›\\n'; sleep 60";
+    let launch = provider_launch(script);
+    provider_spec(
+        PTY_PROVIDER_FIXTURE_ID,
+        "Control-plane PTY provider fixture",
+        launch,
+        AgentTransportCapabilities {
+            pty: true,
+            pty_adapter: Some(ProviderAdapter::Codex),
+            pipe: None,
+            acp: None,
         },
     )
 }
@@ -155,10 +177,7 @@ fn fixture_spec(script: &str) -> AgentSpec {
     );
 
     #[cfg(not(windows))]
-    let (program, fixed_args) = (
-        "sh",
-        vec!["-c".to_owned(), script.to_owned()],
-    );
+    let (program, fixed_args) = ("sh", vec!["-c".to_owned(), script.to_owned()]);
 
     AgentSpec {
         id: AgentId::new(CONTROL_FIXTURE_ID).expect("fixture agent ID"),

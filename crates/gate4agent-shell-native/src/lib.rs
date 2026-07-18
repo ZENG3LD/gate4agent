@@ -1,10 +1,15 @@
 //! Native effect execution for gate4agent control-plane sessions.
 
-use gate4agent::pty::{PtyEvent, PtySession, PtyTerminalSnapshot};
 use gate4agent::agent::ReadinessStatus;
+use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
+use gate4agent::pty::{
+    PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtySession, PtyTerminalSnapshot,
+    RateLimitDetector,
+};
 use gate4agent::{
     AcpSession, AcpSessionOptions, AgentEvent, CliTool, LaunchRequest, PipeProcessOptions,
-    PipeSession, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform, SessionConfig,
+    PipeSession, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
+    SessionConfig,
 };
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
@@ -15,6 +20,7 @@ use gate4agent_types::{
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -29,6 +35,16 @@ struct OwnedPtySession {
     spawn_operation_id: OperationId,
     last_terminal_sequence: u64,
     terminal_stale_published: bool,
+    provider: Option<OwnedPtyProvider>,
+}
+
+struct OwnedPtyProvider {
+    receiver: PtyEventReceiver,
+    replay: VecDeque<PtyEventEnvelope>,
+    pending_events: VecDeque<ProviderEvent>,
+    pipeline: Mutex<ClassificationPipeline>,
+    rate_limits: RateLimitDetector,
+    next_provider_sequence: u64,
 }
 
 struct OwnedProviderSession<S> {
@@ -68,10 +84,7 @@ impl NativeEffectShell {
             .map(|owned| owned.spawn_operation_id)
     }
 
-    pub fn terminal_snapshot(
-        &self,
-        key: NativeSessionKey,
-    ) -> Result<PtyTerminalSnapshot, String> {
+    pub fn terminal_snapshot(&self, key: NativeSessionKey) -> Result<PtyTerminalSnapshot, String> {
         self.pty_sessions
             .get(&key)
             .ok_or_else(|| missing_session_message(key))?
@@ -106,21 +119,25 @@ impl NativeEffectShell {
                     agent_id,
                     transport,
                     request,
-                } => self
-                    .spawn_native(key, operation_id, agent_id, transport, request)
-                    .await,
+                } => {
+                    self.spawn_native(key, operation_id, agent_id, transport, request)
+                        .await
+                }
                 ControlEffect::Stop { force } => self.stop_native(key, force).await,
                 ControlEffect::WriteInput { input } => match self.pty_sessions.get(&key) {
                     Some(owned)
                         if matches!(
                             input.kind(),
                             PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl
-                        ) => match owned.session.send_terminal_input(input).await {
+                        ) =>
+                    {
+                        match owned.session.send_terminal_input(input).await {
                             Ok(()) => ControlObservation::InputCompleted,
                             Err(error) => ControlObservation::InputFailed {
                                 message: error.to_string(),
                             },
-                        },
+                        }
+                    }
                     Some(owned) => {
                         let intent = match input.kind() {
                             PreparedInputKind::InsertDraft | PreparedInputKind::AgentCommand => {
@@ -258,6 +275,30 @@ impl NativeEffectShell {
             {
                 Ok(session) => {
                     let process_id = session.root_pid();
+                    let session_id = session.session_id().to_owned();
+                    let provider = match spec.capabilities.transports.pty_adapter.map(cli_tool) {
+                        Some(tool) => match session.attach_events(session.beginning_cursor()) {
+                            Ok(attachment) => Some(OwnedPtyProvider {
+                                receiver: attachment.receiver,
+                                replay: attachment.replay.into(),
+                                pending_events: VecDeque::from([ProviderEvent::SessionStarted {
+                                    session_id,
+                                    model: String::new(),
+                                    tools: Vec::new(),
+                                }]),
+                                pipeline: Mutex::new(create_pipeline(tool)),
+                                rate_limits: RateLimitDetector::new_for_tool(tool),
+                                next_provider_sequence: 1,
+                            }),
+                            Err(error) => {
+                                let _ = session.shutdown().await;
+                                return ControlObservation::SpawnFailed {
+                                    message: error.to_string(),
+                                };
+                            }
+                        },
+                        None => None,
+                    };
                     self.pty_sessions.insert(
                         key,
                         OwnedPtySession {
@@ -265,6 +306,7 @@ impl NativeEffectShell {
                             spawn_operation_id: operation_id,
                             last_terminal_sequence: 0,
                             terminal_stale_published: false,
+                            provider,
                         },
                     );
                     ControlObservation::Spawned { process_id }
@@ -297,7 +339,9 @@ impl NativeEffectShell {
                         )
                         .await
                     }
-                    None => PipeSession::spawn(config, &prompt, PipeProcessOptions::default()).await,
+                    None => {
+                        PipeSession::spawn(config, &prompt, PipeProcessOptions::default()).await
+                    }
                 };
                 match spawned {
                     Ok(session) => {
@@ -342,7 +386,9 @@ impl NativeEffectShell {
                         )
                         .await
                     }
-                    None => AcpSession::spawn(tool, &working_dir, AcpSessionOptions::default()).await,
+                    None => {
+                        AcpSession::spawn(tool, &working_dir, AcpSessionOptions::default()).await
+                    }
                 };
                 match spawned {
                     Ok(session) => {
@@ -384,11 +430,7 @@ impl NativeEffectShell {
         }
     }
 
-    async fn stop_native(
-        &mut self,
-        key: NativeSessionKey,
-        force: bool,
-    ) -> ControlObservation {
+    async fn stop_native(&mut self, key: NativeSessionKey, force: bool) -> ControlObservation {
         if let Some(owned) = self.pty_sessions.remove(&key) {
             return match owned.session.shutdown().await {
                 Ok(outcome) => ControlObservation::StopCompleted {
@@ -408,13 +450,11 @@ impl NativeEffectShell {
                     exit_code: owned.observed_exit_code,
                     final_terminal: None,
                 },
-                Err(_) if owned.session.reader_finished() => {
-                    ControlObservation::StopCompleted {
-                        forced: false,
-                        exit_code: owned.observed_exit_code,
-                        final_terminal: None,
-                    }
-                }
+                Err(_) if owned.session.reader_finished() => ControlObservation::StopCompleted {
+                    forced: false,
+                    exit_code: owned.observed_exit_code,
+                    final_terminal: None,
+                },
                 Err(error) => ControlObservation::StopFailed {
                     message: error.to_string(),
                 },
@@ -430,13 +470,11 @@ impl NativeEffectShell {
                     exit_code: owned.observed_exit_code,
                     final_terminal: None,
                 },
-                Err(_) if owned.session.reader_finished() => {
-                    ControlObservation::StopCompleted {
-                        forced: false,
-                        exit_code: owned.observed_exit_code,
-                        final_terminal: None,
-                    }
-                }
+                Err(_) if owned.session.reader_finished() => ControlObservation::StopCompleted {
+                    forced: false,
+                    exit_code: owned.observed_exit_code,
+                    final_terminal: None,
+                },
                 Err(error) => ControlObservation::StopFailed {
                     message: error.to_string(),
                 },
@@ -468,10 +506,7 @@ impl NativeEffectShell {
                 .remove(&key)
                 .expect("completed key came from the owned session map");
             let (exit_code, final_terminal) = match owned.session.shutdown().await {
-                Ok(outcome) => (
-                    outcome.exit_code,
-                    Some(terminal_frame(outcome.terminal)),
-                ),
+                Ok(outcome) => (outcome.exit_code, Some(terminal_frame(outcome.terminal))),
                 Err(_) => (None, None),
             };
             observations.push(ObservationEnvelope {
@@ -498,6 +533,11 @@ impl NativeEffectShell {
     /// terminal frames. Broadcast lag is converted into an explicit stale gap.
     pub fn collect_provider_events(&mut self) -> Vec<ObservationEnvelope> {
         let mut observations = Vec::new();
+        for (key, owned) in &mut self.pty_sessions {
+            if let Some(provider) = &mut owned.provider {
+                drain_pty_provider(*key, provider, &mut observations);
+            }
+        }
         collect_provider_map(&mut self.pipe_sessions, &mut observations);
         collect_provider_map(&mut self.acp_sessions, &mut observations);
         observations
@@ -549,47 +589,194 @@ fn missing_session_message(key: NativeSessionKey) -> String {
     )
 }
 
+fn drain_pty_provider(
+    key: NativeSessionKey,
+    provider: &mut OwnedPtyProvider,
+    observations: &mut Vec<ObservationEnvelope>,
+) {
+    while let Some(event) = provider.pending_events.pop_front() {
+        push_provider_observation(key, provider, event, observations);
+    }
+
+    loop {
+        let envelope = match provider.replay.pop_front() {
+            Some(envelope) => Some(envelope),
+            None => match provider.receiver.try_recv() {
+                Ok(envelope) => envelope,
+                Err(_) => None,
+            },
+        };
+        let Some(envelope) = envelope else {
+            break;
+        };
+        match envelope.event {
+            PtyEvent::Output(data) => {
+                let raw = String::from_utf8_lossy(&data);
+                if let Some(info) = provider.rate_limits.detect(&raw) {
+                    push_provider_observation(key, provider, rate_limit_event(info), observations);
+                }
+                let messages = provider
+                    .pipeline
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .process(&raw);
+                for message in messages {
+                    if let Some(event) = parsed_provider_event(message) {
+                        push_provider_observation(key, provider, event, observations);
+                    }
+                }
+            }
+            PtyEvent::DataGap {
+                from_sequence,
+                to_sequence,
+                ..
+            } => {
+                provider
+                    .pipeline
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
+                observations.push(ObservationEnvelope {
+                    protocol_version: CONTROL_PROTOCOL_VERSION,
+                    operation_id: None,
+                    instance_id: key.instance_id,
+                    generation: key.generation,
+                    observation: ControlObservation::ProviderGap {
+                        missed: to_sequence.saturating_sub(from_sequence).saturating_add(1),
+                    },
+                });
+            }
+            PtyEvent::ReaderError { message } | PtyEvent::OperatorActionRequired { message } => {
+                push_provider_observation(
+                    key,
+                    provider,
+                    ProviderEvent::Error { message },
+                    observations,
+                );
+            }
+            PtyEvent::Started
+            | PtyEvent::Resized(_)
+            | PtyEvent::ForegroundProcess(_)
+            | PtyEvent::SnapshotAvailable { .. }
+            | PtyEvent::Exited { .. } => {}
+        }
+    }
+}
+
+fn push_provider_observation(
+    key: NativeSessionKey,
+    provider: &mut OwnedPtyProvider,
+    event: ProviderEvent,
+    observations: &mut Vec<ObservationEnvelope>,
+) {
+    let sequence = provider.next_provider_sequence;
+    provider.next_provider_sequence = provider.next_provider_sequence.saturating_add(1);
+    observations.push(ObservationEnvelope {
+        protocol_version: CONTROL_PROTOCOL_VERSION,
+        operation_id: None,
+        instance_id: key.instance_id,
+        generation: key.generation,
+        observation: ControlObservation::ProviderEvent { sequence, event },
+    });
+}
+
+fn parsed_provider_event(message: ParsedMessage) -> Option<ProviderEvent> {
+    match message.class {
+        MessageClass::AiResponse => Some(ProviderEvent::Text {
+            text: message.content,
+            is_delta: message.metadata.is_partial,
+        }),
+        MessageClass::ThinkingIndicator => Some(ProviderEvent::Thinking {
+            text: message.content,
+        }),
+        MessageClass::Error => Some(ProviderEvent::Error {
+            message: message.content,
+        }),
+        MessageClass::PromptReady => Some(ProviderEvent::Ready),
+        MessageClass::ToolApproval => Some(ProviderEvent::ApprovalRequested {
+            tool_name: message
+                .metadata
+                .tool_name
+                .unwrap_or_else(|| "unknown".to_owned()),
+            description: (!message.content.is_empty()).then_some(message.content),
+        }),
+        MessageClass::InfoMessage
+        | MessageClass::UiElement
+        | MessageClass::UserEcho
+        | MessageClass::Menu
+        | MessageClass::Raw => None,
+    }
+}
+
+fn rate_limit_event(info: gate4agent::core::types::RateLimitInfo) -> ProviderEvent {
+    ProviderEvent::RateLimited {
+        limit_type: format!("{:?}", info.limit_type),
+        resets_at: info.resets_at.map(|value| value.to_rfc3339()),
+        usage_percent: info.usage_percent.map(|value| value.to_string()),
+        raw_message: info.raw_message,
+    }
+}
+
 fn collect_provider_map<S>(
     sessions: &mut BTreeMap<NativeSessionKey, OwnedProviderSession<S>>,
     observations: &mut Vec<ObservationEnvelope>,
 ) {
     for (key, owned) in sessions {
-        loop {
-            let next = match owned.pending_events.pop_front() {
-                Some(event) => Ok(event),
-                None => owned.events.try_recv(),
-            };
-            match next {
-                Ok(AgentEvent::Exited { code }) => {
-                    owned.observed_exit_code = Some(code);
+        drain_provider_stream(
+            *key,
+            &mut owned.events,
+            &mut owned.pending_events,
+            &mut owned.next_provider_sequence,
+            Some(&mut owned.observed_exit_code),
+            observations,
+        );
+    }
+}
+
+fn drain_provider_stream(
+    key: NativeSessionKey,
+    events: &mut broadcast::Receiver<AgentEvent>,
+    pending_events: &mut VecDeque<AgentEvent>,
+    next_provider_sequence: &mut u64,
+    mut observed_exit_code: Option<&mut Option<i32>>,
+    observations: &mut Vec<ObservationEnvelope>,
+) {
+    loop {
+        let next = match pending_events.pop_front() {
+            Some(event) => Ok(event),
+            None => events.try_recv(),
+        };
+        match next {
+            Ok(AgentEvent::Exited { code }) => {
+                if let Some(exit_code) = observed_exit_code.as_deref_mut() {
+                    *exit_code = Some(code);
                 }
-                Ok(event) => {
-                    let Some(event) = provider_event(event) else {
-                        continue;
-                    };
-                    let sequence = owned.next_provider_sequence;
-                    owned.next_provider_sequence = owned.next_provider_sequence.saturating_add(1);
-                    observations.push(ObservationEnvelope {
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
-                        operation_id: None,
-                        instance_id: key.instance_id,
-                        generation: key.generation,
-                        observation: ControlObservation::ProviderEvent { sequence, event },
-                    });
-                }
-                Err(broadcast::error::TryRecvError::Lagged(missed)) => {
-                    observations.push(ObservationEnvelope {
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
-                        operation_id: None,
-                        instance_id: key.instance_id,
-                        generation: key.generation,
-                        observation: ControlObservation::ProviderGap { missed },
-                    });
-                }
-                Err(
-                    broadcast::error::TryRecvError::Empty
-                    | broadcast::error::TryRecvError::Closed,
-                ) => break,
+            }
+            Ok(event) => {
+                let Some(event) = provider_event(event) else {
+                    continue;
+                };
+                let sequence = *next_provider_sequence;
+                *next_provider_sequence = next_provider_sequence.saturating_add(1);
+                observations.push(ObservationEnvelope {
+                    protocol_version: CONTROL_PROTOCOL_VERSION,
+                    operation_id: None,
+                    instance_id: key.instance_id,
+                    generation: key.generation,
+                    observation: ControlObservation::ProviderEvent { sequence, event },
+                });
+            }
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => {
+                observations.push(ObservationEnvelope {
+                    protocol_version: CONTROL_PROTOCOL_VERSION,
+                    operation_id: None,
+                    instance_id: key.instance_id,
+                    generation: key.generation,
+                    observation: ControlObservation::ProviderGap { missed },
+                });
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                break
             }
         }
     }
@@ -681,13 +868,19 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
             is_error,
         }),
         AgentEvent::Error { message } => Some(ProviderEvent::Error { message }),
+        AgentEvent::PtyParsed(message) => parsed_provider_event(message),
+        AgentEvent::PtyReady => Some(ProviderEvent::Ready),
+        AgentEvent::PtyToolApproval {
+            tool_name,
+            description,
+        } => Some(ProviderEvent::ApprovalRequested {
+            tool_name,
+            description,
+        }),
+        AgentEvent::RateLimit(info) => Some(rate_limit_event(info)),
         AgentEvent::Started { .. }
         | AgentEvent::Exited { .. }
         | AgentEvent::PtyRaw { .. }
-        | AgentEvent::PtyParsed(_)
-        | AgentEvent::PtyReady
-        | AgentEvent::PtyToolApproval { .. }
-        | AgentEvent::RateLimit(_)
         | AgentEvent::RpcNotification { .. }
         | AgentEvent::RpcIncomingRequest { .. } => None,
     }

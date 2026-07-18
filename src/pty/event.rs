@@ -143,6 +143,44 @@ pub struct PtyEventReceiver {
 }
 
 impl PtyEventReceiver {
+    pub fn try_recv(&mut self) -> Result<Option<PtyEventEnvelope>, PtyEventRecvError> {
+        if let Some(event) = self.pending.take() {
+            self.expected_sequence = event.sequence.saturating_add(1);
+            return Ok(Some(event));
+        }
+
+        loop {
+            match self.rx.try_recv() {
+                Ok(event) if event.generation != self.generation => continue,
+                Ok(event) if event.sequence < self.expected_sequence => continue,
+                Ok(event) if event.sequence > self.expected_sequence => {
+                    let gap = PtyEventEnvelope {
+                        pty_id: self.pty_id.clone(),
+                        provider_revision: self.provider_revision.clone(),
+                        generation: self.generation,
+                        sequence: event.sequence - 1,
+                        event: PtyEvent::DataGap {
+                            from_sequence: self.expected_sequence,
+                            to_sequence: event.sequence - 1,
+                            reason: PtyGapReason::SubscriberLagged,
+                        },
+                    };
+                    self.pending = Some(event);
+                    return Ok(Some(gap));
+                }
+                Ok(event) => {
+                    self.expected_sequence = event.sequence.saturating_add(1);
+                    return Ok(Some(event));
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Empty) => return Ok(None),
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(PtyEventRecvError::Closed);
+                }
+            }
+        }
+    }
+
     pub async fn recv(&mut self) -> Result<PtyEventEnvelope, PtyEventRecvError> {
         if let Some(event) = self.pending.take() {
             self.expected_sequence = event.sequence.saturating_add(1);
@@ -450,6 +488,28 @@ mod tests {
             }
         ));
         assert_eq!(receiver.recv().await.expect("first retained").sequence, 3);
+    }
+
+    #[test]
+    fn nonblocking_receiver_preserves_exact_gap_and_pending_event() {
+        let publisher =
+            PtyEventPublisher::new("pty-test".to_owned(), REVISION.to_owned(), 1, 2, 64, 24, 80);
+        let mut receiver = publisher.subscribe().expect("subscribe");
+        for value in 0..4 {
+            publisher.publish(PtyEvent::Output(vec![value]));
+        }
+        let gap = receiver.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            gap.event,
+            PtyEvent::DataGap {
+                from_sequence: 1,
+                to_sequence: 2,
+                reason: PtyGapReason::SubscriberLagged,
+            }
+        ));
+        assert_eq!(receiver.try_recv().unwrap().unwrap().sequence, 3);
+        assert_eq!(receiver.try_recv().unwrap().unwrap().sequence, 4);
+        assert!(receiver.try_recv().unwrap().is_none());
     }
 
     #[test]

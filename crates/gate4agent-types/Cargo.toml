@@ -1,0 +1,13 @@
+[package]
+name = "gate4agent-types"
+version = "0.2.37"
+edition = "2021"
+description = "Pure data contracts for gate4agent backends and shells"
+license = "MIT"
+
+[lib]
+name = "gate4agent_types"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

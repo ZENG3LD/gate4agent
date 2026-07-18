@@ -1,4 +1,4 @@
-use super::{AgentId, AgentReadinessSpec};
+use crate::{normalize_executable_name, AgentId, AgentReadinessSpec};
 use serde::{Deserialize, Serialize};
 
 /// Runtime in which an executable is detected or launched.
@@ -51,10 +51,10 @@ pub enum ProcessMatcher {
 
 impl ProcessMatcher {
     pub fn matches(&self, process_or_path: &str, platform: RuntimePlatform) -> bool {
-        let process = super::registry::normalize_executable_name(process_or_path, platform);
+        let process = normalize_executable_name(process_or_path, platform);
         match self {
             Self::Exact { name } => {
-                let expected = super::registry::normalize_executable_name(name, platform);
+                let expected = normalize_executable_name(name, platform);
                 process == expected
             }
             Self::Prefix { prefix } => {

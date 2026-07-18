@@ -1,41 +1,11 @@
 use super::{is_agent_foreground_wrapper, is_expected_agent_process, AgentSpec, RuntimePlatform};
 use serde::{Deserialize, Serialize};
+pub use gate4agent_types::DraftReadySignal;
 
 const DECSET_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 const DECTCEM_SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const CODEX_COMPOSER_PROMPT: &[u8] = "›".as_bytes();
 const SCANNER_TAIL_BYTES: usize = 512;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DraftReadySignal {
-    QuietAfterBracketedPaste,
-    CodexComposerPrompt,
-    CursorAfterBracketedPaste,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentReadinessSpec {
-    pub timeout_ms: u64,
-    pub poll_interval_ms: u64,
-    pub wrapper_child_fallback_after_polls: Option<u32>,
-    pub allow_title_idle: bool,
-    pub draft_signal: DraftReadySignal,
-    pub draft_quiet_ms: u64,
-}
-
-impl Default for AgentReadinessSpec {
-    fn default() -> Self {
-        Self {
-            timeout_ms: 5_000,
-            poll_interval_ms: 150,
-            wrapper_child_fallback_after_polls: Some(4),
-            allow_title_idle: true,
-            draft_signal: DraftReadySignal::QuietAfterBracketedPaste,
-            draft_quiet_ms: 1_500,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadinessIntent {

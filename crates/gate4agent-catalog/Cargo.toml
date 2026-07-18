@@ -1,0 +1,13 @@
+[package]
+name = "gate4agent-catalog"
+version = "0.2.37"
+edition = "2021"
+description = "Validated provider catalog and shell-free launch planning for gate4agent"
+license = "MIT"
+
+[lib]
+name = "gate4agent_catalog"
+
+[dependencies]
+gate4agent-types = { path = "../gate4agent-types" }
+thiserror = "2"

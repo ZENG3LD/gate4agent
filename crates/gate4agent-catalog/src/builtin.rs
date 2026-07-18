@@ -1,4 +1,4 @@
-use super::{
+use crate::{
     AgentCapabilities, AgentCommandMode, AgentId, AgentReadinessSpec, AgentRegistry, AgentSpec,
     DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, NativeDraftMode,
     ProcessMatcher, PromptSpec, SpecVerification,

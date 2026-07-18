@@ -8,7 +8,7 @@ const MAX_AGENT_ID_LEN: usize = 64;
 
 /// Stable, extensible identifier for an agent CLI.
 ///
-/// Unlike [`crate::CliTool`], this type can preserve agent IDs that were added
+/// Unlike a consumer's legacy closed tool enum, this type preserves IDs added
 /// after a consumer was compiled. IDs use lowercase ASCII slugs so they remain
 /// safe as registry keys and serialized protocol values.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

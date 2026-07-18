@@ -10,6 +10,9 @@ keywords = ["claude", "agent", "cli", "pipe", "pty"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
+gate4agent-types = { path = "crates/gate4agent-types" }
+gate4agent-catalog = { path = "crates/gate4agent-catalog" }
+
 # PTY creation and cross-platform ConPTY support
 portable-pty = "0.8"
 
@@ -56,5 +59,10 @@ cure-network = ["dep:reqwest"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 
-# Standalone crate — not part of the parent workspace
+# Internal workspace; still independent from the parent NEMO workspace.
 [workspace]
+members = [
+    "crates/gate4agent-types",
+    "crates/gate4agent-catalog",
+]
+resolver = "2"

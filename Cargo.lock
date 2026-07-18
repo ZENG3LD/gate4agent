@@ -299,6 +299,8 @@ name = "gate4agent"
 version = "0.2.37"
 dependencies = [
  "chrono",
+ "gate4agent-catalog",
+ "gate4agent-types",
  "portable-pty",
  "regex",
  "reqwest",
@@ -310,6 +312,22 @@ dependencies = [
  "uuid",
  "vt100",
  "vte 0.13.1",
+]
+
+[[package]]
+name = "gate4agent-catalog"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-types"
+version = "0.2.37"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

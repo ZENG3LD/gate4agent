@@ -1,4 +1,5 @@
-use super::{AgentId, AgentSpec, InitialPromptMode, ProcessMatcher, RuntimePlatform};
+use crate::{AgentId, AgentSpec, InitialPromptMode, ProcessMatcher, RuntimePlatform};
+use gate4agent_types::normalize_executable_name;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -186,28 +187,6 @@ fn validate_program(agent: &AgentId, value: &str) -> Result<(), RegistryError> {
     Ok(())
 }
 
-pub(crate) fn normalize_executable_name(
-    command_or_path: &str,
-    platform: RuntimePlatform,
-) -> String {
-    let basename = command_or_path
-        .trim()
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default();
-    if platform == RuntimePlatform::Windows {
-        let lowercase = basename.to_ascii_lowercase();
-        for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
-            if let Some(stripped) = lowercase.strip_suffix(suffix) {
-                return stripped.to_owned();
-            }
-        }
-        lowercase
-    } else {
-        basename.to_owned()
-    }
-}
-
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum RegistryError {
     #[error("duplicate agent ID: {0}")]
@@ -243,7 +222,7 @@ pub enum RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{DetectionSpec, LaunchSpec, ProcessMatcher, PromptSpec, SpecVerification};
+    use crate::{DetectionSpec, LaunchSpec, ProcessMatcher, PromptSpec, SpecVerification};
 
     fn spec(id: &str, command: &str) -> AgentSpec {
         AgentSpec {
@@ -267,8 +246,8 @@ mod tests {
                 initial: InitialPromptMode::AfterReady,
                 native_draft: None,
             },
-            readiness: crate::agent::AgentReadinessSpec::default(),
-            capabilities: crate::agent::AgentCapabilities::default(),
+            readiness: crate::AgentReadinessSpec::default(),
+            capabilities: crate::AgentCapabilities::default(),
             verification: SpecVerification::Reference,
         }
     }

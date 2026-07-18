@@ -1,4 +1,4 @@
-use super::{AgentId, AgentSpec, InitialPromptMode, NativeDraftMode, RuntimePlatform};
+use crate::{AgentId, AgentSpec, InitialPromptMode, NativeDraftMode, RuntimePlatform};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -224,7 +224,7 @@ pub enum LaunchPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::builtin_registry;
+    use crate::builtin_registry;
 
     fn request(prompt: &str) -> LaunchRequest {
         LaunchRequest {

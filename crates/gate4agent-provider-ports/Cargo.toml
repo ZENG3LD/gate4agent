@@ -1,0 +1,18 @@
+[package]
+name = "gate4agent-provider-ports"
+version = "0.2.37"
+edition = "2021"
+description = "Shell-neutral history and resume authority ports for gate4agent"
+license = "MIT"
+publish = false
+
+[lib]
+name = "gate4agent_provider_ports"
+
+[dependencies]
+gate4agent-adapters = { path = "../gate4agent-adapters" }
+gate4agent-types = { path = "../gate4agent-types" }
+thiserror = "2"
+
+[dev-dependencies]
+gate4agent-catalog = { path = "../gate4agent-catalog" }

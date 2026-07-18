@@ -359,6 +359,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-provider-ports"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-adapters",
+ "gate4agent-catalog",
+ "gate4agent-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "gate4agent-runtime-native"
 version = "0.2.37"
 dependencies = [

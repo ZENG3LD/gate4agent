@@ -64,6 +64,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 members = [
     "crates/gate4agent-types",
     "crates/gate4agent-adapters",
+    "crates/gate4agent-provider-ports",
     "crates/gate4agent-catalog",
     "crates/gate4agent-engine",
     "crates/gate4agent-kernel",

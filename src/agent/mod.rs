@@ -5,7 +5,6 @@
 //! prompt delivery only; transport ownership and provider-specific parsers stay
 //! in their existing modules during the migration.
 
-mod input;
 mod process;
 mod readiness;
 
@@ -19,7 +18,7 @@ pub use gate4agent_types::{
     DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, NativeDraftMode,
     ProcessMatcher, PromptSpec, RuntimePlatform, SpecVerification,
 };
-pub use input::{
+pub use gate4agent_types::{
     prepare_agent_command, prepare_input, prepare_input_with_limits, sanitize_prompt_text,
     AgentCommand, InputAction, InputPrepareError, PreparedInput, PreparedInputKind, PreparedWrite,
     PreparedWriteKind, PromptFraming, PromptPayload, ShellCommand, TerminalControl, TerminalText,

@@ -1,10 +1,11 @@
 //! Deterministic single-writer lifecycle engine for gate4agent sessions.
 
 use gate4agent_types::{
-    AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
-    ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
-    ObservationEnvelope, ObservationIgnoredReason, OperationId, SessionGeneration,
-    SessionSnapshot, SessionStatus, CONTROL_PROTOCOL_VERSION,
+    prepare_agent_command, prepare_input, AgentInstanceId, CommandEnvelope, CommandId,
+    ControlCommand, ControlEffect, ControlError, ControlEvent, ControlEventKind,
+    ControlObservation, ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope,
+    ObservationIgnoredReason, OperationId, SessionGeneration, SessionSnapshot, SessionStatus,
+    CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
 
@@ -65,6 +66,7 @@ impl Gate4AgentEngine {
                             generation,
                             status: SessionStatus::Registered,
                             pending_operation: None,
+                            pending_input: None,
                             process_id: None,
                         },
                     },
@@ -81,6 +83,12 @@ impl Gate4AgentEngine {
             ControlCommand::Start { instance_id } => self.start(command_id, instance_id),
             ControlCommand::Stop { instance_id, force } => {
                 self.stop(command_id, instance_id, force)
+            }
+            ControlCommand::SendInput {
+                instance_id,
+                action,
+            } => {
+                self.send_input(command_id, instance_id, action)
             }
             ControlCommand::Remove { instance_id } => self.remove(command_id, instance_id),
         }
@@ -129,7 +137,9 @@ impl Gate4AgentEngine {
         let valid = match (&current.status, &envelope.observation) {
             (SessionStatus::Starting, ControlObservation::Spawned { .. })
             | (SessionStatus::Starting, ControlObservation::SpawnFailed { .. })
-            | (SessionStatus::Stopping, ControlObservation::StopCompleted { .. }) => true,
+            | (SessionStatus::Stopping, ControlObservation::StopCompleted { .. })
+            | (SessionStatus::Running, ControlObservation::InputCompleted)
+            | (SessionStatus::Running, ControlObservation::InputFailed { .. }) => true,
             (
                 SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping,
                 ControlObservation::ProcessExited { .. },
@@ -141,11 +151,13 @@ impl Gate4AgentEngine {
             return;
         }
 
+        let pending_input = current.pending_input;
         let event = match envelope.observation {
             ControlObservation::Spawned { process_id } => {
                 let session = self.session_mut(instance_id);
                 session.status = SessionStatus::Running;
                 session.pending_operation = None;
+                session.pending_input = None;
                 session.process_id = process_id;
                 ControlEventKind::Running { process_id }
             }
@@ -155,6 +167,7 @@ impl Gate4AgentEngine {
                     message: message.clone(),
                 };
                 session.pending_operation = None;
+                session.pending_input = None;
                 session.process_id = None;
                 ControlEventKind::Failed { message }
             }
@@ -162,6 +175,7 @@ impl Gate4AgentEngine {
                 let session = self.session_mut(instance_id);
                 session.status = SessionStatus::Exited { exit_code };
                 session.pending_operation = None;
+                session.pending_input = None;
                 session.process_id = None;
                 ControlEventKind::Exited {
                     exit_code,
@@ -172,10 +186,30 @@ impl Gate4AgentEngine {
                 let session = self.session_mut(instance_id);
                 session.status = SessionStatus::Exited { exit_code: None };
                 session.pending_operation = None;
+                session.pending_input = None;
                 session.process_id = None;
                 ControlEventKind::Exited {
                     exit_code: None,
                     forced,
+                }
+            }
+            ControlObservation::InputCompleted => {
+                let input_kind = pending_input
+                    .expect("validated input completion must have a pending input kind");
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                session.pending_input = None;
+                ControlEventKind::InputCompleted { input_kind }
+            }
+            ControlObservation::InputFailed { message } => {
+                let input_kind = pending_input
+                    .expect("validated input failure must have a pending input kind");
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                session.pending_input = None;
+                ControlEventKind::InputFailed {
+                    input_kind,
+                    message,
                 }
             }
         };
@@ -232,6 +266,7 @@ impl Gate4AgentEngine {
             session.generation = SessionGeneration(session.generation.0.saturating_add(1));
             session.status = SessionStatus::Starting;
             session.pending_operation = Some(operation_id);
+            session.pending_input = None;
             session.process_id = None;
             (
                 session.generation,
@@ -285,6 +320,7 @@ impl Gate4AgentEngine {
             let session = self.session_mut(instance_id);
             session.status = SessionStatus::Stopping;
             session.pending_operation = Some(operation_id);
+            session.pending_input = None;
             session.generation
         };
         self.effects.push(EffectEnvelope {
@@ -302,6 +338,65 @@ impl Gate4AgentEngine {
             ControlEventKind::StopRequested {
                 operation_id,
                 force,
+            },
+        );
+        Ok(())
+    }
+
+    fn send_input(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        action: InputAction,
+    ) -> Result<(), ControlError> {
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.status != SessionStatus::Running {
+            return Err(ControlError::InvalidTransition {
+                instance_id,
+                action: "send input".to_owned(),
+                status: state.snapshot.status.clone(),
+            });
+        }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
+
+        let agent_id = state.snapshot.agent_id.clone();
+        let input = match action {
+            InputAction::AgentCommand(command) => prepare_agent_command(command, &agent_id),
+            action => prepare_input(action),
+        }
+        .map_err(|error| ControlError::InputRejected { error })?;
+
+        let operation_id = self.allocate_operation();
+        let input_kind = input.kind();
+        let generation = {
+            let session = self.session_mut(instance_id);
+            session.pending_operation = Some(operation_id);
+            session.pending_input = Some(input_kind);
+            session.generation
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::WriteInput { input },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::InputRequested {
+                operation_id,
+                input_kind,
             },
         );
         Ok(())
@@ -399,7 +494,9 @@ impl Default for Gate4AgentEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_types::{AgentId, TransportKind};
+    use gate4agent_types::{
+        AgentId, InputAction, PreparedInputKind, PromptFraming, PromptPayload, TransportKind,
+    };
 
     fn instance() -> AgentInstanceId {
         AgentInstanceId(7)
@@ -509,6 +606,72 @@ mod tests {
             engine.snapshot().sessions[0].status,
             SessionStatus::Exited { exit_code: None }
         );
+    }
+
+    #[test]
+    fn typed_input_is_an_effect_until_executor_confirms_it() {
+        let (mut engine, _) = running_engine();
+        engine.drain_events();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(7),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::SubmitPrompt(PromptPayload {
+                        text: "inspect the lifecycle".to_owned(),
+                        framing: PromptFraming::BracketedPaste,
+                    }),
+                },
+            })
+            .unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        assert!(matches!(effect.effect, ControlEffect::WriteInput { .. }));
+        assert_eq!(
+            engine.snapshot().sessions[0].pending_input,
+            Some(PreparedInputKind::SubmitPrompt)
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(effect.operation_id),
+            instance_id: effect.instance_id,
+            generation: effect.generation,
+            observation: ControlObservation::InputCompleted,
+        });
+        let session = &engine.snapshot().sessions[0];
+        assert_eq!(session.status, SessionStatus::Running);
+        assert_eq!(session.pending_operation, None);
+        assert_eq!(session.pending_input, None);
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::InputCompleted {
+                input_kind: PreparedInputKind::SubmitPrompt
+            }
+        )));
+    }
+
+    #[test]
+    fn provider_command_cannot_target_another_running_agent() {
+        let (mut engine, _) = running_engine();
+        let error = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(8),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::AgentCommand(gate4agent_types::AgentCommand {
+                        agent_id: AgentId::new("kimi").unwrap(),
+                        name: "help".to_owned(),
+                        arguments: Vec::new(),
+                    }),
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ControlError::InputRejected { .. }));
+        assert!(engine.drain_effects().is_empty());
+        assert_eq!(engine.snapshot().sessions[0].pending_operation, None);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use super::AgentId;
+use crate::AgentId;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const TERMINAL_INPUT_CHUNK_MAX_BYTES: usize = 16 * 1024;
@@ -8,36 +9,36 @@ pub const TERMINAL_WRITE_DELAY_MAX_MS: u64 = 5_000;
 pub const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 pub const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PromptFraming {
     BracketedPaste,
     Literal,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PromptPayload {
     pub text: String,
     pub framing: PromptFraming,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentCommand {
     pub agent_id: AgentId,
     pub name: String,
     pub arguments: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShellCommand {
     pub text: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminalText {
     pub text: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TerminalControl {
     Interrupt,
     EndOfFile,
@@ -62,7 +63,7 @@ impl TerminalControl {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InputAction {
     InsertDraft(PromptPayload),
     SubmitPrompt(PromptPayload),
@@ -72,7 +73,7 @@ pub enum InputAction {
     TerminalControl(TerminalControl),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PreparedWriteKind {
     Framing,
     Data,
@@ -80,7 +81,7 @@ pub enum PreparedWriteKind {
     Control,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreparedWrite {
     pub kind: PreparedWriteKind,
     pub bytes: Vec<u8>,
@@ -88,13 +89,13 @@ pub struct PreparedWrite {
     pub delay_before_ms: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreparedInput {
     kind: PreparedInputKind,
     writes: Vec<PreparedWrite>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PreparedInputKind {
     InsertDraft,
     SubmitPrompt,
@@ -114,7 +115,7 @@ impl PreparedInput {
         &self.writes
     }
 
-    pub(crate) fn into_writes(self) -> Vec<PreparedWrite> {
+    pub fn into_writes(self) -> Vec<PreparedWrite> {
         self.writes
     }
 }
@@ -353,7 +354,7 @@ fn bounded_chunks(
     Ok(chunks)
 }
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
 pub enum InputPrepareError {
     #[error("terminal input chunk limit cannot be zero")]
     ZeroChunkLimit,

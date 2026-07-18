@@ -1,4 +1,4 @@
-use crate::AgentId;
+use crate::{AgentId, InputAction, InputPrepareError, PreparedInput, PreparedInputKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -50,6 +50,10 @@ pub enum ControlCommand {
         instance_id: AgentInstanceId,
         force: bool,
     },
+    SendInput {
+        instance_id: AgentInstanceId,
+        action: InputAction,
+    },
     Remove {
         instance_id: AgentInstanceId,
     },
@@ -61,6 +65,7 @@ impl ControlCommand {
             Self::Register { instance_id, .. }
             | Self::Start { instance_id }
             | Self::Stop { instance_id, .. }
+            | Self::SendInput { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
     }
@@ -84,6 +89,9 @@ pub enum ControlEffect {
     },
     Stop {
         force: bool,
+    },
+    WriteInput {
+        input: PreparedInput,
     },
 }
 
@@ -110,6 +118,10 @@ pub enum ControlObservation {
     },
     StopCompleted {
         forced: bool,
+    },
+    InputCompleted,
+    InputFailed {
+        message: String,
     },
 }
 
@@ -138,6 +150,7 @@ pub struct SessionSnapshot {
     pub generation: SessionGeneration,
     pub status: SessionStatus,
     pub pending_operation: Option<OperationId>,
+    pub pending_input: Option<PreparedInputKind>,
     pub process_id: Option<u32>,
 }
 
@@ -165,6 +178,15 @@ pub enum ControlEventKind {
     StartRequested { operation_id: OperationId },
     Running { process_id: Option<u32> },
     StopRequested { operation_id: OperationId, force: bool },
+    InputRequested {
+        operation_id: OperationId,
+        input_kind: PreparedInputKind,
+    },
+    InputCompleted { input_kind: PreparedInputKind },
+    InputFailed {
+        input_kind: PreparedInputKind,
+        message: String,
+    },
     Exited { exit_code: Option<i32>, forced: bool },
     Failed { message: String },
     Removed,
@@ -191,6 +213,13 @@ pub enum ControlError {
     DuplicateInstance { instance_id: AgentInstanceId },
     #[error("agent instance {instance_id:?} is not registered")]
     UnknownInstance { instance_id: AgentInstanceId },
+    #[error("agent instance {instance_id:?} already has pending operation {operation_id:?}")]
+    OperationPending {
+        instance_id: AgentInstanceId,
+        operation_id: OperationId,
+    },
+    #[error("agent input was rejected: {error}")]
+    InputRejected { error: InputPrepareError },
     #[error("agent instance {instance_id:?} cannot {action} while in state {status:?}")]
     InvalidTransition {
         instance_id: AgentInstanceId,

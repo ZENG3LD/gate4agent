@@ -13,12 +13,12 @@ pub use adapter::{
     AdapterVerification, MAX_ADAPTER_REVISION_LEN,
 };
 pub use control::{
-    AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
-    ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
-    ObservationEnvelope, ObservationIgnoredReason, OperationId, ProviderEvent, ProviderSnapshot,
-    SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalFrame, TerminalSize,
-    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, TERMINAL_COLUMNS_MAX, TERMINAL_ROWS_MAX,
-    WORKING_DIRECTORY_MAX_BYTES,
+    ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
+    ControlError, ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot,
+    EffectEnvelope, ObservationEnvelope, ObservationIgnoredReason, OperationId, ProviderActivity,
+    ProviderEvent, ProviderSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
+    StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
+    TERMINAL_COLUMNS_MAX, TERMINAL_ROWS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 pub use executable::normalize_executable_name;
 pub use id::{AgentId, AgentIdError};

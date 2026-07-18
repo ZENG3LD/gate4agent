@@ -8,6 +8,7 @@
 
 mod history;
 mod hook;
+mod hook_session;
 mod resume;
 
 use gate4agent_types::{AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId};
@@ -23,6 +24,10 @@ pub use history::{
 pub use hook::{
     normalize_hook_event, HookAdapterError, HOOK_EVENT_NAME_MAX_BYTES, HOOK_PAYLOAD_MAX_BYTES,
     HOOK_TEXT_MAX_CHARS,
+};
+pub use hook_session::{
+    HookEventDisposition, HookEventEnvelope, HookReduction, HookSessionReducer,
+    HookSessionReducerError, HOOK_EVENT_ID_MAX_BYTES, HOOK_SEEN_EVENT_IDS_MAX,
 };
 pub use resume::{build_resume_plan, ResumeAdapterError, ResumePlan, RESUME_SESSION_ID_MAX_BYTES};
 

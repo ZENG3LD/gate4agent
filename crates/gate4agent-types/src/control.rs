@@ -2,7 +2,7 @@ use crate::{AgentId, InputAction, InputPrepareError, PreparedInput, PreparedInpu
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 7;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 8;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -258,6 +258,9 @@ pub enum ProviderEvent {
         model: String,
         tools: Vec<String>,
     },
+    TurnStarted {
+        prompt: Option<String>,
+    },
     Text {
         text: String,
         is_delta: bool,
@@ -301,6 +304,23 @@ pub enum ProviderEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderActivity {
+    #[default]
+    Idle,
+    Working,
+    WaitingForInput,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActiveProviderTool {
+    pub id: String,
+    pub name: String,
+    pub input_json: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSnapshot {
     pub sequence: u64,
@@ -309,6 +329,9 @@ pub struct ProviderSnapshot {
     pub tools: Vec<String>,
     pub completed_turns: u64,
     pub usage: TokenUsage,
+    pub activity: ProviderActivity,
+    pub current_prompt: Option<String>,
+    pub active_tools: Vec<ActiveProviderTool>,
     pub last_event: Option<ProviderEvent>,
     pub gap_count: u64,
     pub stale: bool,

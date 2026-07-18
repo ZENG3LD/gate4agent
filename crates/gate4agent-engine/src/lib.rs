@@ -1,13 +1,13 @@
 //! Deterministic single-writer lifecycle engine for gate4agent sessions.
 
 use gate4agent_types::{
-    normalize_semantic_prompt, prepare_agent_command, prepare_input, AgentInstanceId,
-    CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError, ControlEvent,
-    ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope, InputAction,
-    ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind, ProviderEvent,
-    ProviderSnapshot, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest,
-    TerminalControl, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
-    WORKING_DIRECTORY_MAX_BYTES,
+    normalize_semantic_prompt, prepare_agent_command, prepare_input, ActiveProviderTool,
+    AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
+    ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
+    InputAction, ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind,
+    ProviderActivity, ProviderEvent, ProviderSnapshot, SessionGeneration, SessionSnapshot,
+    SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -845,6 +845,34 @@ fn reduce_provider_event(snapshot: &mut ProviderSnapshot, sequence: u64, event: 
             snapshot.session_id = Some(session_id.clone());
             snapshot.model = (!model.is_empty()).then(|| model.clone());
             snapshot.tools = tools.clone();
+            snapshot.activity = ProviderActivity::Idle;
+            snapshot.current_prompt = None;
+            snapshot.active_tools.clear();
+        }
+        ProviderEvent::TurnStarted { prompt } => {
+            snapshot.activity = ProviderActivity::Working;
+            snapshot.current_prompt = prompt.clone();
+            snapshot.active_tools.clear();
+        }
+        ProviderEvent::ToolStarted {
+            id,
+            name,
+            input_json,
+        } => {
+            snapshot.activity = ProviderActivity::Working;
+            if let Some(active) = snapshot.active_tools.iter_mut().find(|tool| tool.id == *id) {
+                active.name = name.clone();
+                active.input_json = input_json.clone();
+            } else {
+                snapshot.active_tools.push(ActiveProviderTool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input_json: input_json.clone(),
+                });
+            }
+        }
+        ProviderEvent::ToolCompleted { id, .. } => {
+            snapshot.active_tools.retain(|tool| tool.id != *id);
         }
         ProviderEvent::TurnCompleted {
             usage,
@@ -856,16 +884,25 @@ fn reduce_provider_event(snapshot: &mut ProviderSnapshot, sequence: u64, event: 
             } else {
                 add_token_usage(&mut snapshot.usage, usage);
             }
+            snapshot.activity = ProviderActivity::Idle;
+            snapshot.current_prompt = None;
+            snapshot.active_tools.clear();
         }
-        ProviderEvent::Text { .. }
-        | ProviderEvent::Thinking { .. }
-        | ProviderEvent::ToolStarted { .. }
-        | ProviderEvent::ToolCompleted { .. }
-        | ProviderEvent::SessionEnded { .. }
-        | ProviderEvent::Error { .. }
-        | ProviderEvent::Ready
-        | ProviderEvent::ApprovalRequested { .. }
-        | ProviderEvent::RateLimited { .. } => {}
+        ProviderEvent::ApprovalRequested { .. } => {
+            snapshot.activity = ProviderActivity::WaitingForInput;
+        }
+        ProviderEvent::RateLimited { .. } | ProviderEvent::Error { .. } => {
+            snapshot.activity = ProviderActivity::Blocked;
+        }
+        ProviderEvent::Ready => {
+            snapshot.activity = ProviderActivity::Idle;
+        }
+        ProviderEvent::SessionEnded { .. } => {
+            snapshot.activity = ProviderActivity::Idle;
+            snapshot.current_prompt = None;
+            snapshot.active_tools.clear();
+        }
+        ProviderEvent::Text { .. } | ProviderEvent::Thinking { .. } => {}
     }
     snapshot.sequence = sequence;
     snapshot.last_event = Some(event);
@@ -1050,6 +1087,64 @@ mod tests {
                 reason: ObservationIgnoredReason::StaleProviderEvent
             }
         )));
+    }
+
+    #[test]
+    fn provider_activity_tracks_turn_tools_and_attention_without_late_text_resurrection() {
+        let (mut engine, spawn) = running_engine();
+        let events = [
+            ProviderEvent::TurnStarted {
+                prompt: Some("fix tests".to_owned()),
+            },
+            ProviderEvent::ToolStarted {
+                id: "tool-1".to_owned(),
+                name: "shell".to_owned(),
+                input_json: "{\"command\":\"cargo test\"}".to_owned(),
+            },
+            ProviderEvent::ApprovalRequested {
+                tool_name: "shell".to_owned(),
+                description: Some("approve".to_owned()),
+            },
+            ProviderEvent::ToolCompleted {
+                id: "tool-1".to_owned(),
+                output: "ok".to_owned(),
+                is_error: false,
+                duration_ms: None,
+            },
+            ProviderEvent::TurnCompleted {
+                usage: TokenUsage::default(),
+                is_cumulative: false,
+            },
+            ProviderEvent::Text {
+                text: "late final text".to_owned(),
+                is_delta: false,
+            },
+        ];
+
+        for (index, event) in events.into_iter().enumerate() {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    sequence: u64::try_from(index + 1).unwrap(),
+                    event,
+                },
+            });
+            let provider = &engine.snapshot().sessions[0].provider;
+            match index {
+                0 => {
+                    assert_eq!(provider.activity, ProviderActivity::Working);
+                    assert_eq!(provider.current_prompt.as_deref(), Some("fix tests"));
+                }
+                1 => assert_eq!(provider.active_tools.len(), 1),
+                2 => assert_eq!(provider.activity, ProviderActivity::WaitingForInput),
+                3 => assert!(provider.active_tools.is_empty()),
+                4 | 5 => assert_eq!(provider.activity, ProviderActivity::Idle),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

@@ -49,6 +49,7 @@ fn normalize_grok(
     let event = snake_event_name(event_name);
     match event.as_str() {
         "session_start" => Ok(session_started(payload, &["sessionId", "session_id"])),
+        "user_prompt_submit" => Ok(vec![turn_started(payload)]),
         "pre_tool_use" if is_ask_user_question(tool_name(payload).as_deref()) => {
             Ok(vec![approval_event(payload)])
         }
@@ -72,6 +73,7 @@ fn normalize_kimi(
 ) -> Result<Vec<ProviderEvent>, HookAdapterError> {
     match event_name {
         "SessionStart" => Ok(session_started(payload, &["session_id"])),
+        "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" if is_ask_user_question(tool_name(payload).as_deref()) => {
             Ok(vec![approval_event(payload)])
         }
@@ -91,6 +93,7 @@ fn normalize_copilot(
     let event = copilot_event_name(event_name);
     match event.as_str() {
         "SessionStart" => Ok(session_started_from_copilot(payload)),
+        "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" | "PermissionRequest" if is_ask_user(tool_name(payload).as_deref()) => {
             Ok(vec![approval_event(payload)])
         }
@@ -122,6 +125,7 @@ fn normalize_droid(
 ) -> Result<Vec<ProviderEvent>, HookAdapterError> {
     match event_name {
         "SessionStart" => Ok(session_started(payload, &["session_id"])),
+        "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" if is_ask_user(tool_name(payload).as_deref()) || is_high_risk(payload) => {
             Ok(vec![approval_event(payload)])
         }
@@ -145,6 +149,7 @@ fn normalize_cursor(
 ) -> Result<Vec<ProviderEvent>, HookAdapterError> {
     match event_name {
         "sessionStart" => Ok(session_started(payload, &["session_id", "sessionId"])),
+        "beforeSubmitPrompt" => Ok(vec![turn_started(payload)]),
         "preToolUse" => Ok(vec![tool_started(payload)]),
         "postToolUse" => Ok(vec![tool_completed(payload, false)]),
         "postToolUseFailure" => Ok(vec![tool_completed(payload, true)]),
@@ -215,6 +220,23 @@ fn tool_started(payload: &Map<String, Value>) -> ProviderEvent {
             payload,
             &["toolInput", "tool_input", "toolArgs", "input", "arguments"],
         )),
+    }
+}
+
+fn turn_started(payload: &Map<String, Value>) -> ProviderEvent {
+    ProviderEvent::TurnStarted {
+        prompt: string(
+            payload,
+            &[
+                "prompt",
+                "user_prompt",
+                "userPrompt",
+                "user_message",
+                "initial_prompt",
+                "initialPrompt",
+            ],
+        )
+        .map(bounded_string),
     }
 }
 

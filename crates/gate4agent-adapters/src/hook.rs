@@ -446,6 +446,9 @@ fn normalize_claude(
             payload,
             ProviderInteractionKind::Approval,
         )]),
+        "Stop" if bool_value(payload, &["is_interrupt"]) == Some(true) => {
+            Ok(turn_interrupted(payload))
+        }
         "Stop" | "StopFailure" => Ok(turn_completed(payload)),
         "SubagentStart" => Ok(subagent_started(payload)),
         "SubagentStop" => Ok(subagent_stopped(payload)),
@@ -474,14 +477,15 @@ fn normalize_grok(
         "post_tool_use" => Ok(vec![tool_completed(payload, false)]),
         "post_tool_use_failure" => Ok(vec![tool_completed(payload, true)]),
         "stop" | "stop_failure" | "session_end" => Ok(turn_completed(payload)),
-        "notification" if is_permission_message(string(payload, &["message"]).as_deref()) => {
+        "notification" if is_routine_grok_permission_notification(payload) => Ok(Vec::new()),
+        "notification" if is_grok_permission_message(string(payload, &["message"]).as_deref()) => {
             Ok(vec![interaction_event(
                 payload,
                 ProviderInteractionKind::Approval,
             )])
         }
         "notification" if is_idle_message(string(payload, &["message"]).as_deref()) => {
-            Ok(vec![ProviderEvent::Ready])
+            Ok(vec![ProviderEvent::TurnInterrupted])
         }
         _ => Ok(Vec::new()),
     }
@@ -509,6 +513,9 @@ fn normalize_kimi(
             payload,
             ProviderInteractionKind::Approval,
         )]),
+        "Stop" if bool_value(payload, &["is_interrupt"]) == Some(true) => {
+            Ok(turn_interrupted(payload))
+        }
         "Stop" | "StopFailure" => Ok(turn_completed(payload)),
         _ => Ok(Vec::new()),
     }
@@ -537,8 +544,8 @@ fn normalize_copilot(
             payload,
             ProviderInteractionKind::Approval,
         )]),
-        "ErrorOccurred" if payload.get("recoverable") != Some(&Value::Bool(true)) => {
-            Ok(vec![ProviderEvent::Error {
+        "ErrorOccurred" => {
+            let mut events = vec![ProviderEvent::Error {
                 message: bounded_string(
                     string(
                         payload,
@@ -546,7 +553,13 @@ fn normalize_copilot(
                     )
                     .unwrap_or_else(|| "Copilot hook reported an error".to_owned()),
                 ),
-            }])
+            }];
+            events.push(if payload.get("recoverable") == Some(&Value::Bool(true)) {
+                ProviderEvent::WorkingObserved
+            } else {
+                ProviderEvent::TurnInterrupted
+            });
+            Ok(events)
         }
         "Stop" | "SessionEnd" => Ok(turn_completed(payload)),
         _ => Ok(Vec::new()),
@@ -583,7 +596,7 @@ fn normalize_droid(
             )])
         }
         "Notification" if is_idle_message(string(payload, &["message"]).as_deref()) => {
-            Ok(vec![ProviderEvent::Ready])
+            Ok(vec![ProviderEvent::TurnInterrupted])
         }
         "Stop" => Ok(turn_completed(payload)),
         _ => Ok(Vec::new()),
@@ -595,7 +608,11 @@ fn normalize_cursor(
     payload: &Map<String, Value>,
 ) -> Result<Vec<ProviderEvent>, HookAdapterError> {
     match event_name {
-        "sessionStart" => Ok(session_started(payload, &["session_id", "sessionId"])),
+        "sessionStart" => {
+            let mut events = session_started(payload, &["session_id", "sessionId"]);
+            events.push(ProviderEvent::WorkingObserved);
+            Ok(events)
+        }
         "subagentStart" => Ok(subagent_started(payload)),
         "subagentStop" => Ok(subagent_stopped(payload)),
         "beforeSubmitPrompt" => Ok(vec![turn_started(payload)]),
@@ -617,14 +634,22 @@ fn normalize_cursor(
                 agent_id: provider_agent_id(payload),
             }])
         }
-        "afterAgentResponse" => Ok(string(payload, &["text"])
-            .map(|text| {
-                vec![ProviderEvent::Text {
+        "afterAgentResponse" => {
+            let mut events = vec![ProviderEvent::WorkingObserved];
+            if let Some(text) = string(payload, &["text"]) {
+                events.push(ProviderEvent::Text {
                     text: bounded_string(text),
                     is_delta: false,
-                }]
-            })
-            .unwrap_or_default()),
+                });
+            }
+            Ok(events)
+        }
+        "stop"
+            if string(payload, &["status"])
+                .is_some_and(|status| status.as_str() != "completed") =>
+        {
+            Ok(turn_interrupted(payload))
+        }
         "stop" | "sessionEnd" => Ok(turn_completed(payload)),
         _ => Ok(Vec::new()),
     }
@@ -970,6 +995,40 @@ fn is_permission_message(message: Option<&str>) -> bool {
     })
 }
 
+fn is_grok_permission_message(message: Option<&str>) -> bool {
+    message.is_some_and(|message| {
+        let lower = message.to_ascii_lowercase();
+        [
+            "permission",
+            "approval",
+            "approve",
+            "allow",
+            "confirm",
+            "needs your",
+            "requires your",
+            "feedback",
+            "clarify",
+            "question",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    })
+}
+
+fn is_routine_grok_permission_notification(payload: &Map<String, Value>) -> bool {
+    let notification_type = string(payload, &["notificationType", "notification_type", "type"])
+        .map(|value| snake_event_name(&value));
+    let message = string(payload, &["message"]);
+    let level = string(payload, &["level"]);
+    notification_type.as_deref() == Some("permission_prompt")
+        && message.is_some_and(|message| {
+            message
+                .trim()
+                .eq_ignore_ascii_case("tool permission requested")
+        })
+        && level.is_none_or(|level| level.trim().eq_ignore_ascii_case("info"))
+}
+
 fn is_idle_message(message: Option<&str>) -> bool {
     message.is_some_and(|message| {
         let lower = message.to_ascii_lowercase();
@@ -1066,6 +1125,66 @@ mod tests {
     }
 
     #[test]
+    fn grok_suppresses_routine_permission_chatter_but_keeps_feedback_boundaries() {
+        let routine = normalize_hook_event(
+            &id("grok"),
+            "Notification",
+            &json!({
+                "notificationType": "permission_prompt",
+                "message": "Tool permission requested",
+                "level": "info"
+            }),
+        )
+        .unwrap();
+        assert!(routine.is_empty());
+
+        let feedback = normalize_hook_event(
+            &id("grok"),
+            "Notification",
+            &json!({"message": "Grok needs your feedback to proceed"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            feedback.as_slice(),
+            [ProviderEvent::InteractionRequested {
+                interaction_kind: ProviderInteractionKind::Approval,
+                prompt,
+                ..
+            }] if prompt.contains("feedback")
+        ));
+    }
+
+    #[test]
+    fn pinned_interrupt_markers_do_not_count_as_completed_turns() {
+        for (adapter, event_name, payload) in [
+            (
+                "claude-code",
+                "Stop",
+                json!({"is_interrupt": true, "last_assistant_message": "cancelled"}),
+            ),
+            (
+                "kimi",
+                "Stop",
+                json!({"is_interrupt": true, "last_assistant_message": "cancelled"}),
+            ),
+            (
+                "cursor",
+                "stop",
+                json!({"status": "aborted", "last_assistant_message": "cancelled"}),
+            ),
+        ] {
+            let events = normalize_hook_event(&id(adapter), event_name, &payload).unwrap();
+            assert!(matches!(
+                events.last(),
+                Some(ProviderEvent::TurnInterrupted)
+            ));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::TurnCompleted { .. })));
+        }
+    }
+
+    #[test]
     fn copilot_generic_permission_is_progress_but_ask_user_blocks() {
         let generic = normalize_hook_event(
             &id("copilot"),
@@ -1090,6 +1209,33 @@ mod tests {
                 interaction_kind: ProviderInteractionKind::Question,
                 ..
             }]
+        ));
+    }
+
+    #[test]
+    fn copilot_error_recovery_matches_provider_liveness() {
+        let recoverable = normalize_hook_event(
+            &id("copilot"),
+            "ErrorOccurred",
+            &json!({"recoverable": true, "message": "retrying"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            recoverable.as_slice(),
+            [ProviderEvent::Error { message }, ProviderEvent::WorkingObserved]
+                if message == "retrying"
+        ));
+
+        let terminal = normalize_hook_event(
+            &id("copilot"),
+            "errorOccurred",
+            &json!({"recoverable": false, "errorMessage": "stopped"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            terminal.as_slice(),
+            [ProviderEvent::Error { message }, ProviderEvent::TurnInterrupted]
+                if message == "stopped"
         ));
     }
 
@@ -1126,6 +1272,20 @@ mod tests {
                 ..
             }] if tool_name == "shell"
         ));
+    }
+
+    #[test]
+    fn idle_notifications_terminate_incomplete_provider_turns() {
+        for (adapter, message) in [
+            ("droid", "Droid is waiting for your input"),
+            ("grok", "Type your message"),
+        ] {
+            assert_eq!(
+                normalize_hook_event(&id(adapter), "Notification", &json!({"message": message}),)
+                    .unwrap(),
+                vec![ProviderEvent::TurnInterrupted]
+            );
+        }
     }
 
     #[test]
@@ -1905,8 +2065,9 @@ mod tests {
         let events =
             normalize_hook_event(&id("cursor"), "afterAgentResponse", &json!({"text": text}))
                 .unwrap();
-        let [ProviderEvent::Text { text, .. }] = events.as_slice() else {
-            panic!("expected one text event");
+        let [ProviderEvent::WorkingObserved, ProviderEvent::Text { text, .. }] = events.as_slice()
+        else {
+            panic!("expected working and text events");
         };
         assert_eq!(text.chars().count(), HOOK_TEXT_MAX_CHARS);
         assert!(text.starts_with("привет"));

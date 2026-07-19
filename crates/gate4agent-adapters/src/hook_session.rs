@@ -77,6 +77,7 @@ pub struct HookSessionReducer {
     antigravity_completed_transcript: Option<String>,
     amp_completed_threads: BTreeSet<String>,
     amp_completed_thread_order: VecDeque<String>,
+    cursor_turn_completed: bool,
 }
 
 impl HookSessionReducer {
@@ -92,6 +93,7 @@ impl HookSessionReducer {
             antigravity_completed_transcript: None,
             amp_completed_threads: BTreeSet::new(),
             amp_completed_thread_order: VecDeque::new(),
+            cursor_turn_completed: false,
         }
     }
 
@@ -149,6 +151,7 @@ impl HookSessionReducer {
             .saturating_sub(1);
         if missed_before > 0 {
             self.tool_correlations.clear();
+            self.cursor_turn_completed = false;
         }
         self.last_source_sequence = envelope.source_sequence;
 
@@ -175,6 +178,7 @@ impl HookSessionReducer {
 
         let mut events =
             normalize_hook_event(&self.adapter_id, &envelope.event_name, &envelope.payload)?;
+        self.reconcile_cursor_completion(&envelope.event_name, &mut events);
         self.record_provider_completion(&envelope.event_name, &envelope.payload);
         if self.adapter_id.as_str() == "claude-code" {
             self.reconcile_claude_subagents(&envelope.event_name, &envelope.payload, &mut events);
@@ -203,6 +207,24 @@ impl HookSessionReducer {
         self.tool_correlations.clear();
         self.next_tool_id = 1;
         self.claude_subagents.clear();
+        self.antigravity_completed_transcript = None;
+        self.amp_completed_threads.clear();
+        self.amp_completed_thread_order.clear();
+        self.cursor_turn_completed = false;
+    }
+
+    fn reconcile_cursor_completion(&mut self, event_name: &str, events: &mut Vec<ProviderEvent>) {
+        if self.adapter_id.as_str() != "cursor" {
+            return;
+        }
+        match event_name {
+            "sessionStart" | "beforeSubmitPrompt" => self.cursor_turn_completed = false,
+            "afterAgentResponse" if self.cursor_turn_completed => {
+                events.retain(|event| !matches!(event, ProviderEvent::WorkingObserved));
+            }
+            "stop" | "sessionEnd" => self.cursor_turn_completed = true,
+            _ => {}
+        }
     }
 
     fn reconcile_claude_subagents(
@@ -834,6 +856,90 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(resumed.disposition, HookEventDisposition::Applied);
+    }
+
+    #[test]
+    fn cursor_late_response_enriches_completion_without_resurrecting_work() {
+        let mut reducer = HookSessionReducer::new(AdapterId::new("cursor").unwrap());
+        reducer
+            .reduce(envelope(
+                1,
+                "cursor-1",
+                "beforeSubmitPrompt",
+                json!({"prompt": "add tests"}),
+            ))
+            .unwrap();
+        reducer
+            .reduce(envelope(
+                2,
+                "cursor-2",
+                "stop",
+                json!({"status": "completed"}),
+            ))
+            .unwrap();
+
+        let late = reducer
+            .reduce(envelope(
+                3,
+                "cursor-3",
+                "afterAgentResponse",
+                json!({"text": "All set"}),
+            ))
+            .unwrap();
+        assert!(matches!(
+            late.events.as_slice(),
+            [ProviderEvent::Text { text, .. }] if text == "All set"
+        ));
+
+        reducer
+            .reduce(envelope(
+                4,
+                "cursor-4",
+                "beforeSubmitPrompt",
+                json!({"prompt": "next"}),
+            ))
+            .unwrap();
+        let active = reducer
+            .reduce(envelope(
+                5,
+                "cursor-5",
+                "afterAgentResponse",
+                json!({"text": "Draft"}),
+            ))
+            .unwrap();
+        assert!(matches!(
+            active.events.as_slice(),
+            [ProviderEvent::WorkingObserved, ProviderEvent::Text { text, .. }]
+                if text == "Draft"
+        ));
+    }
+
+    #[test]
+    fn clearing_protocol_state_clears_provider_late_event_caches() {
+        let mut reducer = HookSessionReducer::new(AdapterId::new("cursor").unwrap());
+        reducer
+            .reduce(envelope(
+                1,
+                "cursor-1",
+                "stop",
+                json!({"status": "completed"}),
+            ))
+            .unwrap();
+        reducer.clear_protocol_state();
+
+        let response = reducer
+            .reduce(envelope(
+                1,
+                "cursor-2",
+                "afterAgentResponse",
+                json!({"text": "fresh"}),
+            ))
+            .unwrap();
+        assert!(matches!(
+            response.events.as_slice(),
+            [ProviderEvent::WorkingObserved, ProviderEvent::Text { text, .. }]
+                if text == "fresh"
+        ));
     }
 
     #[test]

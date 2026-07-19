@@ -3,8 +3,8 @@
 use gate4agent::agent::ReadinessStatus;
 use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
 use gate4agent::pty::{
-    PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtySession, PtyTerminalSnapshot,
-    RateLimitDetector,
+    PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtyForegroundObservation, PtySession,
+    PtyTerminalSnapshot, RateLimitDetector,
 };
 use gate4agent::{
     AcpSession, AcpSessionOptions, AgentEvent, CliTool, LaunchRequest, PipeProcessOptions,
@@ -15,9 +15,9 @@ use gate4agent_adapters::{builtin_adapter_registry, AdapterRuntimeRegistry};
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-    ObservationEnvelope, OperationId, PreparedInputKind, ProviderEvent, ProviderSource,
-    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    ForegroundProcess, ForegroundProcessKind, ObservationEnvelope, OperationId, PreparedInputKind,
+    ProviderEvent, ProviderSource, SessionGeneration, StartRequest, TerminalFrame, TerminalSize,
+    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -227,6 +227,22 @@ impl NativeEffectShell {
                     },
                     None => ControlObservation::ResizeFailed {
                         message: "terminal resize requires a PTY session".to_owned(),
+                    },
+                },
+                ControlEffect::ObserveForeground => match self.pty_sessions.get(&key) {
+                    Some(owned) => match owned.session.observe_foreground().await {
+                        Ok(observation) => ControlObservation::ForegroundObserved {
+                            process: canonical_foreground(
+                                owned.session.agent_id().clone(),
+                                &observation,
+                            ),
+                        },
+                        Err(error) => ControlObservation::ForegroundFailed {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => ControlObservation::ForegroundFailed {
+                        message: "foreground observation requires a PTY session".to_owned(),
                     },
                 },
             }
@@ -1005,6 +1021,25 @@ fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
     }
 }
 
+fn canonical_foreground(
+    agent_id: AgentId,
+    observation: &PtyForegroundObservation,
+) -> ForegroundProcess {
+    let kind = if observation.readiness.process_name.as_deref() == Some(agent_id.as_str()) {
+        ForegroundProcessKind::Agent { agent_id }
+    } else if observation.readiness.is_shell {
+        ForegroundProcessKind::Shell
+    } else {
+        ForegroundProcessKind::Other
+    };
+    ForegroundProcess {
+        root_process_id: observation.root_pid,
+        process_id: observation.observed_pid,
+        process_name: observation.observed_process.clone(),
+        kind,
+    }
+}
+
 fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation {
     match effect {
         ControlEffect::Spawn { .. } => ControlObservation::SpawnFailed { message },
@@ -1014,6 +1049,7 @@ fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation
             ControlObservation::InputFailed { message }
         }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
+        ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
     }
 }
 

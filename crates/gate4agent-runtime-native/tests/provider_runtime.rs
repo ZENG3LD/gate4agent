@@ -8,9 +8,9 @@ use gate4agent_testkit::{
 };
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
-    ControlEvent, ControlEventKind, InputAction, PromptFraming, PromptPayload, ProviderActivity,
-    ProviderEvent, ProviderSource, SessionStatus, StartRequest, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    ControlEvent, ControlEventKind, ForegroundAuthority, ForegroundProcessKind, InputAction,
+    PromptFraming, PromptPayload, ProviderActivity, ProviderEvent, ProviderSource, SessionStatus,
+    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
@@ -270,6 +270,36 @@ async fn pty_classification_uses_the_same_provider_event_contract() {
     handle
         .dispatch(command(
             22,
+            ControlCommand::RefreshForeground { instance_id },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| session.foreground.authority == ForegroundAuthority::Confirmed)
+    })
+    .await;
+    let foreground = handle.snapshot().sessions[0]
+        .foreground
+        .process
+        .clone()
+        .expect("confirmed foreground process");
+    assert!(matches!(
+        foreground.kind,
+        ForegroundProcessKind::Agent { agent_id }
+            if agent_id.as_str() == PTY_PROVIDER_FIXTURE_ID
+    ));
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        ControlEventKind::ForegroundObserved { process }
+            if process.process_id == foreground.process_id
+    )));
+
+    handle
+        .dispatch(command(
+            23,
             ControlCommand::Stop {
                 instance_id,
                 force: true,

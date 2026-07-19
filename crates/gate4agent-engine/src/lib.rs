@@ -4,11 +4,11 @@ use gate4agent_types::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, ActiveProviderTool,
     AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
     ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
-    InputAction, ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind,
-    ProviderActivity, ProviderEvent, ProviderSnapshot, ProviderSource, ProviderSourceCursor,
-    SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize,
-    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
-    WORKING_DIRECTORY_MAX_BYTES,
+    ForegroundAuthority, ForegroundSnapshot, InputAction, ObservationEnvelope,
+    ObservationIgnoredReason, OperationId, PreparedInputKind, ProviderActivity, ProviderEvent,
+    ProviderSnapshot, ProviderSource, ProviderSourceCursor, SessionGeneration, SessionSnapshot,
+    SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -75,6 +75,7 @@ impl Gate4AgentEngine {
                             terminal_size: None,
                             terminal_frame: None,
                             terminal_stale: None,
+                            foreground: ForegroundSnapshot::default(),
                             provider: ProviderSnapshot::default(),
                         },
                         pending_terminal_size: None,
@@ -102,6 +103,9 @@ impl Gate4AgentEngine {
             } => self.send_input(command_id, instance_id, action),
             ControlCommand::Resize { instance_id, size } => {
                 self.resize(command_id, instance_id, size)
+            }
+            ControlCommand::RefreshForeground { instance_id } => {
+                self.refresh_foreground(command_id, instance_id)
             }
             ControlCommand::IngestProvider {
                 instance_id,
@@ -169,6 +173,21 @@ impl Gate4AgentEngine {
             }
         }
 
+        if let ControlObservation::ForegroundObserved { process } = &envelope.observation {
+            if !process.is_valid_for(&current.agent_id)
+                || current
+                    .process_id
+                    .is_some_and(|root_process_id| root_process_id != process.root_process_id)
+            {
+                self.emit_ignored(
+                    instance_id,
+                    generation,
+                    ObservationIgnoredReason::InvalidForegroundObservation,
+                );
+                return;
+            }
+        }
+
         let valid = matches!(
             (&current.status, &envelope.observation),
             (SessionStatus::Starting, ControlObservation::Spawned { .. })
@@ -196,6 +215,11 @@ impl Gate4AgentEngine {
                 | (
                     SessionStatus::Running,
                     ControlObservation::ResizeFailed { .. }
+                )
+                | (
+                    SessionStatus::Running,
+                    ControlObservation::ForegroundObserved { .. }
+                        | ControlObservation::ForegroundFailed { .. },
                 )
                 | (
                     SessionStatus::Running | SessionStatus::Stopping,
@@ -250,6 +274,7 @@ impl Gate4AgentEngine {
                 .get_mut(&instance_id)
                 .expect("validated session");
             state.snapshot.terminal_stale = Some(message.clone());
+            invalidate_foreground(&mut state.snapshot, message.clone());
             self.bump_revision();
             self.emit_event(
                 None,
@@ -350,6 +375,7 @@ impl Gate4AgentEngine {
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
+                session.foreground = ForegroundSnapshot::default();
                 ControlEventKind::Failed { message }
             }
             ControlObservation::ProcessExited {
@@ -369,6 +395,7 @@ impl Gate4AgentEngine {
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
+                session.foreground = ForegroundSnapshot::default();
                 if let Some(frame) = final_terminal.filter(|frame| {
                     session
                         .terminal_frame
@@ -399,6 +426,7 @@ impl Gate4AgentEngine {
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
+                session.foreground = ForegroundSnapshot::default();
                 if let Some(frame) = final_terminal.filter(|frame| {
                     session
                         .terminal_frame
@@ -424,6 +452,7 @@ impl Gate4AgentEngine {
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
+                session.foreground = ForegroundSnapshot::default();
                 ControlEventKind::Failed { message }
             }
             ControlObservation::InputCompleted => {
@@ -465,6 +494,22 @@ impl Gate4AgentEngine {
                 let session = &mut state.snapshot;
                 session.pending_operation = None;
                 ControlEventKind::ResizeFailed { message }
+            }
+            ControlObservation::ForegroundObserved { process } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                session.foreground = ForegroundSnapshot {
+                    authority: ForegroundAuthority::Confirmed,
+                    process: Some(process.clone()),
+                    stale_reason: None,
+                };
+                ControlEventKind::ForegroundObserved { process }
+            }
+            ControlObservation::ForegroundFailed { message } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                invalidate_foreground(session, message.clone());
+                ControlEventKind::ForegroundFailed { message }
             }
             ControlObservation::TerminalFrame { .. }
             | ControlObservation::TerminalStale { .. }
@@ -580,6 +625,7 @@ impl Gate4AgentEngine {
             session.terminal_size = None;
             session.terminal_frame = None;
             session.terminal_stale = None;
+            session.foreground = ForegroundSnapshot::default();
             session.provider = ProviderSnapshot::default();
             (
                 session.generation,
@@ -635,6 +681,7 @@ impl Gate4AgentEngine {
             session.status = SessionStatus::Stopping;
             session.pending_operation = Some(operation_id);
             session.pending_input = None;
+            invalidate_foreground(session, "stop requested".to_owned());
             session.generation
         };
         self.effects.push(EffectEnvelope {
@@ -720,6 +767,7 @@ impl Gate4AgentEngine {
             let session = self.session_mut(instance_id);
             session.pending_operation = Some(operation_id);
             session.pending_input = Some(input_kind);
+            invalidate_foreground(session, "input requested".to_owned());
             session.generation
         };
         self.effects.push(EffectEnvelope {
@@ -798,6 +846,59 @@ impl Gate4AgentEngine {
             instance_id,
             generation,
             ControlEventKind::ResizeRequested { operation_id, size },
+        );
+        Ok(())
+    }
+
+    fn refresh_foreground(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+    ) -> Result<(), ControlError> {
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.transport != TransportKind::Pty {
+            return Err(ControlError::UnsupportedTransportOperation {
+                transport: state.snapshot.transport,
+                action: "foreground refresh".to_owned(),
+            });
+        }
+        if state.snapshot.status != SessionStatus::Running {
+            return Err(ControlError::InvalidTransition {
+                instance_id,
+                action: "refresh foreground".to_owned(),
+                status: state.snapshot.status.clone(),
+            });
+        }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
+
+        let operation_id = self.allocate_operation();
+        let generation = {
+            let session = self.session_mut(instance_id);
+            session.pending_operation = Some(operation_id);
+            invalidate_foreground(session, "foreground refresh pending".to_owned());
+            session.generation
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::ObserveForeground,
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::ForegroundRefreshRequested { operation_id },
         );
         Ok(())
     }
@@ -990,6 +1091,11 @@ impl Gate4AgentEngine {
     }
 }
 
+fn invalidate_foreground(snapshot: &mut SessionSnapshot, reason: String) {
+    snapshot.foreground.authority = ForegroundAuthority::Stale;
+    snapshot.foreground.stale_reason = Some(reason);
+}
+
 fn provider_source_sequence(snapshot: &ProviderSnapshot, source: &ProviderSource) -> u64 {
     snapshot
         .sources
@@ -1144,7 +1250,8 @@ impl Default for Gate4AgentEngine {
 mod tests {
     use super::*;
     use gate4agent_types::{
-        AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId, InputAction,
+        AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId,
+        ForegroundAuthority, ForegroundProcess, ForegroundProcessKind, InputAction,
         PreparedInputKind, PromptFraming, PromptPayload, TerminalFrame, TransportKind,
     };
 
@@ -1631,6 +1738,98 @@ mod tests {
     }
 
     #[test]
+    fn foreground_refresh_is_generation_bound_replaceable_authority() {
+        let (mut engine, _) = running_engine();
+        engine.drain_events();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(10),
+                command: ControlCommand::RefreshForeground {
+                    instance_id: instance(),
+                },
+            })
+            .unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        assert_eq!(effect.effect, ControlEffect::ObserveForeground);
+        assert_eq!(
+            engine.snapshot().sessions[0].foreground.authority,
+            ForegroundAuthority::Stale
+        );
+
+        let process = ForegroundProcess {
+            root_process_id: 42,
+            process_id: 84,
+            process_name: "claude".to_owned(),
+            kind: ForegroundProcessKind::Agent {
+                agent_id: AgentId::new("claude").unwrap(),
+            },
+        };
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(effect.operation_id),
+            instance_id: effect.instance_id,
+            generation: effect.generation,
+            observation: ControlObservation::ForegroundObserved {
+                process: process.clone(),
+            },
+        });
+
+        let session = &engine.snapshot().sessions[0];
+        assert_eq!(session.pending_operation, None);
+        assert_eq!(session.foreground.authority, ForegroundAuthority::Confirmed);
+        assert_eq!(session.foreground.process.as_ref(), Some(&process));
+        assert_eq!(session.foreground.stale_reason, None);
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            &event.event,
+            ControlEventKind::ForegroundObserved { process: observed } if observed == &process
+        )));
+    }
+
+    #[test]
+    fn foreground_refresh_rejects_another_root_process() {
+        let (mut engine, _) = running_engine();
+        engine.drain_events();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(11),
+                command: ControlCommand::RefreshForeground {
+                    instance_id: instance(),
+                },
+            })
+            .unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(effect.operation_id),
+            instance_id: effect.instance_id,
+            generation: effect.generation,
+            observation: ControlObservation::ForegroundObserved {
+                process: ForegroundProcess {
+                    root_process_id: 999,
+                    process_id: 1_000,
+                    process_name: "claude".to_owned(),
+                    kind: ForegroundProcessKind::Agent {
+                        agent_id: AgentId::new("claude").unwrap(),
+                    },
+                },
+            },
+        });
+
+        assert_eq!(
+            engine.snapshot().sessions[0].foreground.authority,
+            ForegroundAuthority::Stale
+        );
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::InvalidForegroundObservation
+            }
+        )));
+    }
+
+    #[test]
     fn terminal_frames_are_replaceable_and_never_move_backwards() {
         let (mut engine, spawn) = running_engine();
         engine.drain_events();
@@ -1751,6 +1950,10 @@ mod tests {
         assert_eq!(
             engine.snapshot().sessions[0].pending_input,
             Some(PreparedInputKind::SubmitPrompt)
+        );
+        assert_eq!(
+            engine.snapshot().sessions[0].foreground.authority,
+            ForegroundAuthority::Stale
         );
 
         engine.apply_observation(ObservationEnvelope {

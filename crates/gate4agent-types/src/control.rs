@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 9;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 10;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -56,6 +56,54 @@ pub struct TerminalFrame {
     pub formatted: Vec<u8>,
 }
 
+pub const FOREGROUND_PROCESS_NAME_MAX_BYTES: usize = 512;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ForegroundProcessKind {
+    Agent { agent_id: AgentId },
+    Shell,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ForegroundProcess {
+    pub root_process_id: u32,
+    pub process_id: u32,
+    pub process_name: String,
+    pub kind: ForegroundProcessKind,
+}
+
+impl ForegroundProcess {
+    pub fn is_valid_for(&self, session_agent_id: &AgentId) -> bool {
+        self.root_process_id > 0
+            && self.process_id > 0
+            && !self.process_name.trim().is_empty()
+            && self.process_name.len() <= FOREGROUND_PROCESS_NAME_MAX_BYTES
+            && !self.process_name.chars().any(char::is_control)
+            && match &self.kind {
+                ForegroundProcessKind::Agent { agent_id } => agent_id == session_agent_id,
+                ForegroundProcessKind::Shell | ForegroundProcessKind::Other => true,
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForegroundAuthority {
+    #[default]
+    Unknown,
+    Confirmed,
+    Stale,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ForegroundSnapshot {
+    pub authority: ForegroundAuthority,
+    pub process: Option<ForegroundProcess>,
+    pub stale_reason: Option<String>,
+}
+
 impl TerminalSize {
     pub fn is_valid(self) -> bool {
         (1..=TERMINAL_ROWS_MAX).contains(&self.rows)
@@ -102,6 +150,9 @@ pub enum ControlCommand {
         instance_id: AgentInstanceId,
         size: TerminalSize,
     },
+    RefreshForeground {
+        instance_id: AgentInstanceId,
+    },
     IngestProvider {
         instance_id: AgentInstanceId,
         generation: SessionGeneration,
@@ -122,6 +173,7 @@ impl ControlCommand {
             | Self::Stop { instance_id, .. }
             | Self::SendInput { instance_id, .. }
             | Self::Resize { instance_id, .. }
+            | Self::RefreshForeground { instance_id }
             | Self::IngestProvider { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
@@ -158,6 +210,7 @@ pub enum ControlEffect {
     Resize {
         size: TerminalSize,
     },
+    ObserveForeground,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -198,6 +251,12 @@ pub enum ControlObservation {
         size: TerminalSize,
     },
     ResizeFailed {
+        message: String,
+    },
+    ForegroundObserved {
+        process: ForegroundProcess,
+    },
+    ForegroundFailed {
         message: String,
     },
     TerminalFrame {
@@ -254,6 +313,7 @@ pub struct SessionSnapshot {
     pub terminal_size: Option<TerminalSize>,
     pub terminal_frame: Option<TerminalFrame>,
     pub terminal_stale: Option<String>,
+    pub foreground: ForegroundSnapshot,
     pub provider: ProviderSnapshot,
 }
 
@@ -573,6 +633,15 @@ pub enum ControlEventKind {
     ResizeFailed {
         message: String,
     },
+    ForegroundRefreshRequested {
+        operation_id: OperationId,
+    },
+    ForegroundObserved {
+        process: ForegroundProcess,
+    },
+    ForegroundFailed {
+        message: String,
+    },
     TerminalStale {
         message: String,
     },
@@ -611,6 +680,7 @@ pub enum ObservationIgnoredReason {
     InvalidState,
     StaleTerminalFrame,
     StaleProviderEvent,
+    InvalidForegroundObservation,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
@@ -671,7 +741,31 @@ impl Default for ControlSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderEvent, ProviderEventValidationError};
+    use super::{
+        ForegroundProcess, ForegroundProcessKind, ProviderEvent, ProviderEventValidationError,
+        FOREGROUND_PROCESS_NAME_MAX_BYTES,
+    };
+    use crate::AgentId;
+
+    #[test]
+    fn foreground_process_is_bounded_and_agent_bound() {
+        let claude = AgentId::new("claude").unwrap();
+        let process = ForegroundProcess {
+            root_process_id: 1,
+            process_id: 2,
+            process_name: "claude".to_owned(),
+            kind: ForegroundProcessKind::Agent {
+                agent_id: claude.clone(),
+            },
+        };
+        assert!(process.is_valid_for(&claude));
+        assert!(!process.is_valid_for(&AgentId::new("codex").unwrap()));
+        assert!(!ForegroundProcess {
+            process_name: "x".repeat(FOREGROUND_PROCESS_NAME_MAX_BYTES + 1),
+            ..process
+        }
+        .is_valid_for(&claude));
+    }
 
     #[test]
     fn provider_ingress_allows_multiline_text_but_rejects_control_bytes() {

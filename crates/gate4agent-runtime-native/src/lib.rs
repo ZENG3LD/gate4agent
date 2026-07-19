@@ -62,10 +62,7 @@ pub struct NativeRuntime {
 }
 
 impl NativeRuntime {
-    pub fn new(
-        catalog: AgentRegistry,
-        config: NativeRuntimeConfig,
-    ) -> (Gate4AgentHandle, Self) {
+    pub fn new(catalog: AgentRegistry, config: NativeRuntimeConfig) -> (Gate4AgentHandle, Self) {
         let (handle, port) = bounded_port(config.command_capacity);
         let runtime = Self {
             config,
@@ -358,6 +355,7 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
             ControlObservation::InputFailed { message }
         }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
+        ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
     };
     ObservationEnvelope {
         protocol_version: CONTROL_PROTOCOL_VERSION,

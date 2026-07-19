@@ -17,9 +17,10 @@ use std::sync::OnceLock;
 use thiserror::Error;
 
 pub use history::{
-    parse_history, HistoryAdapterError, HistoryDocument, HistoryMessage, HistoryRole,
-    HistorySession, HISTORY_DOCUMENT_MAX_BYTES, HISTORY_MESSAGE_MAX_CHARS,
-    HISTORY_METADATA_MAX_BYTES, HISTORY_STORED_MESSAGES_MAX,
+    history_source_variants, parse_history, HistoryAdapterError, HistoryDocument, HistoryMessage,
+    HistoryRole, HistorySession, HistorySourceLayout, HistorySourceVariant,
+    HISTORY_DOCUMENT_MAX_BYTES, HISTORY_MESSAGE_MAX_CHARS, HISTORY_METADATA_MAX_BYTES,
+    HISTORY_STORED_MESSAGES_MAX,
 };
 pub use hook::{
     normalize_hook_event, HookAdapterError, HOOK_EVENT_NAME_MAX_BYTES, HOOK_PAYLOAD_MAX_BYTES,
@@ -274,6 +275,21 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         "claude-code",
         "codex",
         "gemini",
+        "antigravity",
+        "opencode",
+        "hermes",
+        "rovo",
+        "openclaw",
+        "pi",
+        "omp",
+        "devin",
+    ] {
+        descriptors.push(descriptor(AdapterFamily::History, id));
+    }
+    for id in [
+        "claude-code",
+        "codex",
+        "gemini",
         "opencode",
         "grok",
         "droid",
@@ -309,27 +325,63 @@ mod tests {
         assert!(registry.get(AdapterFamily::Pipe, &id).is_some());
         assert!(registry.get(AdapterFamily::Acp, &id).is_some());
         assert!(registry.get(AdapterFamily::Hook, &id).is_some());
-        assert!(registry.get(AdapterFamily::History, &id).is_none());
+        assert!(registry.get(AdapterFamily::History, &id).is_some());
         let claude = AdapterId::new("claude-code").unwrap();
         assert!(registry.get(AdapterFamily::Hook, &claude).is_some());
-        assert!(registry.get(AdapterFamily::History, &claude).is_none());
+        assert!(registry.get(AdapterFamily::History, &claude).is_some());
         for id in [
             "codex",
-            "gemini",
             "opencode",
-            "mimo-code",
             "pi",
             "omp",
             "antigravity",
-            "amp",
-            "command-code",
             "hermes",
             "devin",
         ] {
             let id = AdapterId::new(id).unwrap();
             assert!(registry.get(AdapterFamily::Hook, &id).is_some());
+            assert!(registry.get(AdapterFamily::History, &id).is_some());
+        }
+        for id in ["mimo-code", "amp", "command-code"] {
+            let id = AdapterId::new(id).unwrap();
+            assert!(registry.get(AdapterFamily::Hook, &id).is_some());
             assert!(registry.get(AdapterFamily::History, &id).is_none());
         }
+        for id in ["rovo", "openclaw"] {
+            let id = AdapterId::new(id).unwrap();
+            assert!(registry.get(AdapterFamily::Hook, &id).is_none());
+            assert!(registry.get(AdapterFamily::History, &id).is_some());
+        }
+    }
+
+    #[test]
+    fn history_registry_matches_the_pinned_orca_source_inventory() {
+        let actual = builtin_adapter_registry()
+            .iter()
+            .filter(|descriptor| descriptor.family == AdapterFamily::History)
+            .map(|descriptor| descriptor.binding.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "antigravity",
+            "claude-code",
+            "codex",
+            "copilot",
+            "cursor",
+            "devin",
+            "droid",
+            "gemini",
+            "grok",
+            "hermes",
+            "kimi",
+            "omp",
+            "opencode",
+            "openclaw",
+            "pi",
+            "rovo",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -42,12 +42,118 @@ pub enum HistoryRole {
     Assistant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistorySourceLayout {
+    SingleNdjson,
+    SingleJson,
+    JsonOrNdjson,
+    NdjsonWithOptionalIndex,
+    SummaryJsonWithSiblingNdjson,
+    MetadataJsonWithSiblingJson,
+    SessionJsonWithSiblingMessageJson,
+    ReadOnlySqliteProjection,
+    StateJsonWithIndexAndSiblingNdjson,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistorySourceVariant {
+    pub layout: HistorySourceLayout,
+    pub requires_sibling_reads: bool,
+    pub requires_auxiliary_index: bool,
+    pub requires_readonly_database: bool,
+}
+
+/// Declares the provider-owned source layouts an effect-owning history shell
+/// may project into [`HistoryDocument`]. The pure adapter never opens paths or
+/// databases; callers must bound and authorize every candidate and related
+/// read before supplying metadata/transcript content.
+pub fn history_source_variants(
+    adapter_id: &AdapterId,
+) -> Result<&'static [HistorySourceVariant], HistoryAdapterError> {
+    const NDJSON: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::SingleNdjson,
+        requires_sibling_reads: false,
+        requires_auxiliary_index: false,
+        requires_readonly_database: false,
+    };
+    const JSON: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::SingleJson,
+        requires_sibling_reads: false,
+        requires_auxiliary_index: false,
+        requires_readonly_database: false,
+    };
+    const JSON_OR_NDJSON: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::JsonOrNdjson,
+        requires_sibling_reads: false,
+        requires_auxiliary_index: false,
+        requires_readonly_database: false,
+    };
+    const CODEX: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::NdjsonWithOptionalIndex,
+        requires_sibling_reads: false,
+        requires_auxiliary_index: true,
+        requires_readonly_database: false,
+    };
+    const GROK: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::SummaryJsonWithSiblingNdjson,
+        requires_sibling_reads: true,
+        requires_auxiliary_index: false,
+        requires_readonly_database: false,
+    };
+    const ROVO: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::MetadataJsonWithSiblingJson,
+        requires_sibling_reads: true,
+        requires_auxiliary_index: false,
+        requires_readonly_database: false,
+    };
+    const OPENCODE_FILES: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::SessionJsonWithSiblingMessageJson,
+        requires_sibling_reads: true,
+        requires_auxiliary_index: false,
+        requires_readonly_database: false,
+    };
+    const OPENCODE_SQLITE: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::ReadOnlySqliteProjection,
+        requires_sibling_reads: false,
+        requires_auxiliary_index: false,
+        requires_readonly_database: true,
+    };
+    const KIMI: HistorySourceVariant = HistorySourceVariant {
+        layout: HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson,
+        requires_sibling_reads: true,
+        requires_auxiliary_index: true,
+        requires_readonly_database: false,
+    };
+
+    match adapter_id.as_str() {
+        "claude-code" | "copilot" | "cursor" | "openclaw" | "pi" | "omp" | "droid"
+        | "antigravity" => Ok(&[NDJSON]),
+        "codex" => Ok(&[CODEX]),
+        "gemini" => Ok(&[JSON_OR_NDJSON]),
+        "hermes" | "devin" => Ok(&[JSON]),
+        "grok" => Ok(&[GROK]),
+        "rovo" => Ok(&[ROVO]),
+        "opencode" => Ok(&[OPENCODE_FILES, OPENCODE_SQLITE]),
+        "kimi" => Ok(&[KIMI]),
+        id => Err(HistoryAdapterError::UnsupportedAdapter(id.to_owned())),
+    }
+}
+
 pub fn parse_history(
     adapter_id: &AdapterId,
     document: &HistoryDocument,
 ) -> Result<HistorySession, HistoryAdapterError> {
     validate_document(document)?;
     match adapter_id.as_str() {
+        "claude-code" => parse_claude(document),
+        "codex" => parse_codex(document),
+        "gemini" => parse_gemini(document),
+        "antigravity" => parse_antigravity(document),
+        "opencode" => parse_opencode(document),
+        "hermes" => parse_hermes(document),
+        "rovo" => parse_rovo(document),
+        "openclaw" | "pi" | "omp" => parse_message_graph(document),
+        "devin" => parse_devin(document),
         "grok" => parse_grok(document),
         "kimi" => parse_kimi(document),
         "copilot" => parse_copilot(document),
@@ -69,6 +175,243 @@ fn validate_document(document: &HistoryDocument) -> Result<(), HistoryAdapterErr
         return Err(HistoryAdapterError::MetadataTooLarge);
     }
     validate_session_id(&document.session_id_hint)
+}
+
+fn parse_claude(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    let mut custom_title = None;
+    let mut generated_title = None;
+    let mut first_user_title = None;
+    let mut meta_title = None;
+
+    for record in ndjson_records(&document.transcript) {
+        if let Some(id) = string(&record, &["sessionId"]) {
+            session.session_id = select_session_id(Some(id), &session.session_id)?;
+        }
+        session.cwd = string(&record, &["cwd"]).or(session.cwd);
+        match record.get("type").and_then(Value::as_str) {
+            Some("custom-title") => {
+                custom_title = string(&record, &["customTitle"]).and_then(normalize_title);
+            }
+            Some("ai-title") => {
+                if let Some(title) = string(&record, &["aiTitle"]).and_then(normalize_title) {
+                    generated_title = Some(title);
+                }
+            }
+            Some("agent-name") if generated_title.is_none() => {
+                meta_title = meta_title
+                    .or_else(|| string(&record, &["agentName"]).and_then(normalize_title));
+            }
+            Some("user") => {
+                let message = record.get("message").and_then(Value::as_object);
+                let text = message
+                    .and_then(|message| message.get("content"))
+                    .and_then(content_text);
+                if let Some(title) = text.clone().and_then(normalize_title) {
+                    if record.get("isMeta").and_then(Value::as_bool) == Some(true)
+                        || is_known_harness_injected_user_turn(&title)
+                    {
+                        meta_title = meta_title.or(Some(title));
+                    } else {
+                        first_user_title = first_user_title.or(Some(title));
+                    }
+                }
+                session.push(HistoryRole::User, text);
+            }
+            Some("assistant") => {
+                let message = record.get("message").and_then(Value::as_object);
+                session.model = message
+                    .and_then(|message| string(message, &["model"]))
+                    .or(session.model);
+                if let Some(usage) = message.and_then(|message| message.get("usage")) {
+                    session.total_tokens = session
+                        .total_tokens
+                        .saturating_add(claude_usage_total(usage));
+                }
+                session.push(
+                    HistoryRole::Assistant,
+                    message
+                        .and_then(|message| message.get("content"))
+                        .and_then(content_text),
+                );
+            }
+            _ => {}
+        }
+    }
+    session.title = custom_title
+        .or(generated_title)
+        .or(first_user_title)
+        .or(meta_title);
+    Ok(session.finish())
+}
+
+fn parse_codex(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    let mut saw_session_meta = false;
+    let mut metadata_title = None;
+    let mut user_title = None;
+    let mut previous_usage = None;
+
+    for record in ndjson_records(&document.transcript) {
+        let payload = record.get("payload").and_then(Value::as_object);
+        match (record.get("type").and_then(Value::as_str), payload) {
+            (Some("session_meta"), Some(payload)) => {
+                if is_codex_worker_session(payload) {
+                    return Err(HistoryAdapterError::ExcludedProviderSession);
+                }
+                saw_session_meta = true;
+                if let Some(id) = string(payload, &["id"]) {
+                    session.session_id = select_session_id(Some(id), &session.session_id)?;
+                }
+                metadata_title = string(payload, &["title", "thread_name", "threadName"])
+                    .and_then(normalize_title)
+                    .or(metadata_title);
+                session.cwd = string(payload, &["cwd"]).or(session.cwd);
+            }
+            (Some("turn_context"), Some(payload)) => {
+                session.cwd = string(payload, &["cwd"]).or(session.cwd);
+                session.model = model_from_nested_record(payload).or(session.model);
+            }
+            (Some("response_item"), Some(payload))
+                if payload.get("type").and_then(Value::as_str) == Some("message") =>
+            {
+                let role = role_from_value(payload.get("role"));
+                if let Some(role) = role {
+                    let text = payload.get("content").and_then(content_text);
+                    if role == HistoryRole::User {
+                        user_title = user_title.or_else(|| text.clone().and_then(normalize_title));
+                    }
+                    session.push(role, text);
+                } else {
+                    session.message_count = session.message_count.saturating_add(1);
+                }
+            }
+            (Some("event_msg"), Some(payload)) => {
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("user_message") => {
+                        let text = payload.get("message").and_then(content_text);
+                        user_title = user_title.or_else(|| text.clone().and_then(normalize_title));
+                        session.push(HistoryRole::User, text);
+                    }
+                    Some("agent_message") => session.push(
+                        HistoryRole::Assistant,
+                        payload.get("message").and_then(content_text),
+                    ),
+                    Some("token_count") => {
+                        if let Some(info) = payload.get("info").and_then(Value::as_object) {
+                            let total = info
+                                .get("total_token_usage")
+                                .and_then(normalize_codex_usage);
+                            let last = info.get("last_token_usage").and_then(normalize_codex_usage);
+                            if let Some(total) = total {
+                                session.total_tokens = session.total_tokens.saturating_add(
+                                    total.total_tokens.saturating_sub(
+                                        previous_usage
+                                            .map(|usage: CodexUsage| usage.total_tokens)
+                                            .unwrap_or(0),
+                                    ),
+                                );
+                                previous_usage = Some(total);
+                            } else if let Some(last) = last {
+                                session.total_tokens =
+                                    session.total_tokens.saturating_add(last.total_tokens);
+                                previous_usage = Some(previous_usage.unwrap_or_default().add(last));
+                            }
+                        }
+                        session.model = model_from_nested_record(payload).or(session.model);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let indexed_title = if saw_session_meta {
+        document
+            .metadata_json
+            .as_deref()
+            .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+            .and_then(|value| value.as_object().cloned())
+            .and_then(|metadata| string(&metadata, &["indexed_title", "title"]))
+            .and_then(normalize_title)
+    } else {
+        None
+    };
+    session.title = metadata_title.or(indexed_title).or(user_title);
+    Ok(session.finish())
+}
+
+fn parse_gemini(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let trimmed = document.transcript.trim();
+    let legacy = serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .filter(|record| record.get("messages").is_some());
+    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    if let Some(record) = legacy {
+        if let Some(id) = string(&record, &["sessionId"]) {
+            session.session_id = select_session_id(Some(id), &session.session_id)?;
+        }
+        if let Some(messages) = record.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                if let Some(message) = message.as_object() {
+                    consume_gemini_message(&mut session, message);
+                }
+            }
+        }
+    } else {
+        for record in ndjson_records(&document.transcript) {
+            if record.get("$set").and_then(Value::as_object).is_some() {
+                continue;
+            }
+            if let Some(id) = string(&record, &["sessionId"]) {
+                session.session_id = select_session_id(Some(id), &session.session_id)?;
+            }
+            consume_gemini_message(&mut session, &record);
+        }
+    }
+    Ok(session.finish())
+}
+
+fn consume_gemini_message(session: &mut SessionBuilder, record: &Map<String, Value>) {
+    match record.get("type").and_then(Value::as_str) {
+        Some("user") => session.push(
+            HistoryRole::User,
+            record.get("content").and_then(content_text),
+        ),
+        Some("gemini") => {
+            session.model = string(record, &["model"]).or(session.model.take());
+            if let Some(tokens) = record.get("tokens") {
+                session.total_tokens = session.total_tokens.saturating_add(token_total(tokens));
+            }
+            session.push(
+                HistoryRole::Assistant,
+                record.get("content").and_then(content_text),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn parse_antigravity(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    for record in ndjson_records(&document.transcript) {
+        let source = string(&record, &["source"]);
+        let kind = string(&record, &["type"]);
+        let content = string(&record, &["content"]);
+        if matches!(source.as_deref(), Some("USER_EXPLICIT" | "USER"))
+            && matches!(kind.as_deref(), Some("USER_INPUT" | "REQUEST"))
+        {
+            session.push(
+                HistoryRole::User,
+                content.and_then(extract_antigravity_user_request),
+            );
+        } else if source.as_deref() == Some("MODEL") && kind.as_deref() == Some("PLANNER_RESPONSE")
+        {
+            session.push(HistoryRole::Assistant, content);
+        }
+    }
+    Ok(session.finish())
 }
 
 fn parse_grok(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
@@ -194,7 +537,11 @@ fn parse_copilot(document: &HistoryDocument) -> Result<HistorySession, HistoryAd
             }
             Some("session.info") => {
                 session.cwd = data
-                    .and_then(|value| string(value, &["trustedFolder", "cwd"]))
+                    .and_then(|value| {
+                        string(value, &["trustedFolder", "cwd"]).or_else(|| {
+                            string(value, &["message"]).and_then(copilot_trusted_folder)
+                        })
+                    })
                     .or(session.cwd);
             }
             Some("user.message") => session.push(
@@ -216,7 +563,7 @@ fn parse_copilot(document: &HistoryDocument) -> Result<HistorySession, HistoryAd
                     if let Some(metrics) = data.get("modelMetrics") {
                         session.total_tokens = session
                             .total_tokens
-                            .saturating_add(sum_numeric_leaves(metrics));
+                            .saturating_add(copilot_model_metrics_total(metrics));
                     }
                 }
             }
@@ -263,9 +610,7 @@ fn parse_droid(document: &HistoryDocument) -> Result<HistorySession, HistoryAdap
             Some("completion") => {
                 session.push(HistoryRole::Assistant, string(&record, &["finalText"]));
                 if let Some(usage) = record.get("usage") {
-                    session.total_tokens = session
-                        .total_tokens
-                        .saturating_add(sum_numeric_leaves(usage));
+                    session.total_tokens = session.total_tokens.saturating_add(token_total(usage));
                 }
             }
             _ => {}
@@ -291,6 +636,231 @@ fn parse_cursor(document: &HistoryDocument) -> Result<HistorySession, HistoryAda
             .or_else(|| record.get("content"))
             .and_then(content_text);
         session.push(role, text);
+    }
+    Ok(session.finish())
+}
+
+fn parse_opencode(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let metadata = metadata_object(document)?;
+    let mut session = SessionBuilder::new(select_session_id(
+        string(&metadata, &["id"]),
+        &document.session_id_hint,
+    )?);
+    session.title = string(&metadata, &["title"]).and_then(normalize_title);
+    session.cwd = string(&metadata, &["directory"]);
+    session.model = opencode_model(&metadata);
+    session.total_tokens = sum_named_numbers(
+        &metadata,
+        &[
+            "tokens_input",
+            "tokens_output",
+            "tokens_reasoning",
+            "tokens_cache_read",
+        ],
+    );
+    let declared_count = u64_value(&metadata, &["message_count"]);
+
+    for record in ndjson_records(&document.transcript) {
+        let Some(role) = role_from_value(record.get("role")) else {
+            continue;
+        };
+        if role == HistoryRole::User && session.title.is_none() {
+            session.title = string(&record, &["summary_title", "summary_body"])
+                .or_else(|| {
+                    record
+                        .get("summary")
+                        .and_then(Value::as_object)
+                        .and_then(|summary| string(summary, &["title", "body"]))
+                })
+                .and_then(normalize_title);
+        }
+        let text = record
+            .get("part_data")
+            .and_then(Value::as_str)
+            .and_then(json_string_field_text)
+            .or_else(|| record.get("content").and_then(content_text))
+            .or_else(|| {
+                record
+                    .get("summary")
+                    .and_then(Value::as_object)
+                    .and_then(|summary| string(summary, &["body", "title"]))
+            });
+        session.push(role, text);
+        session.model = opencode_model(&record).or(session.model);
+        if let Some(tokens) = record.get("tokens") {
+            session.total_tokens = session.total_tokens.saturating_add(token_total(tokens));
+        }
+    }
+    if let Some(declared_count) = declared_count {
+        session.message_count = session.message_count.max(declared_count);
+    }
+    Ok(session.finish())
+}
+
+fn parse_hermes(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let record = transcript_object(document, false)?;
+    let mut session = SessionBuilder::new(select_session_id(
+        string(&record, &["session_id"]),
+        &document.session_id_hint,
+    )?);
+    session.model = string(&record, &["model"]);
+    session.cwd = string(&record, &["cwd"]);
+    if let Some(messages) = record.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let Some(message) = message.as_object() else {
+                continue;
+            };
+            let Some(role) = role_from_value(message.get("role")) else {
+                continue;
+            };
+            session.push(role, message.get("content").and_then(content_text));
+        }
+    }
+    if session.message_count == 0 {
+        session.message_count = u64_value(&record, &["message_count"]).unwrap_or(0);
+    }
+    Ok(session.finish())
+}
+
+fn parse_rovo(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let metadata = metadata_object(document)?;
+    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    session.title = string(&metadata, &["title", "name", "summary"]).and_then(normalize_title);
+    session.cwd = string(
+        &metadata,
+        &[
+            "workspace_path",
+            "workspacePath",
+            "workspace",
+            "cwd",
+            "working_directory",
+            "workingDirectory",
+            "project_path",
+            "projectPath",
+        ],
+    );
+    let context = transcript_object(document, true)?;
+    if let Some(messages) = context.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let Some(message) = message.as_object() else {
+                continue;
+            };
+            let Some(role) = role_from_value(message.get("role")) else {
+                continue;
+            };
+            session.push(role, message.get("content").and_then(content_text));
+        }
+    }
+    if let Some(history) = context.get("message_history").and_then(Value::as_array) {
+        for entry in history {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            let role = role_from_value(entry.get("role")).or_else(|| {
+                match string(entry, &["kind"]).as_deref() {
+                    Some("request") => Some(HistoryRole::User),
+                    Some("response") => Some(HistoryRole::Assistant),
+                    _ => None,
+                }
+            });
+            let Some(role) = role else {
+                continue;
+            };
+            if let Some(text) = rovo_parts_text(entry.get("parts"), role) {
+                session.push(role, Some(text));
+            }
+        }
+    }
+    Ok(session.finish())
+}
+
+fn parse_message_graph(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    for record in ndjson_records(&document.transcript) {
+        match record.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                if let Some(id) = string(&record, &["id"]) {
+                    session.session_id = select_session_id(Some(id), &session.session_id)?;
+                }
+                session.cwd = string(&record, &["cwd"]).or(session.cwd);
+            }
+            Some("model_change") => {
+                session.model = string(&record, &["modelId", "model"]).or(session.model);
+            }
+            Some("message") => {
+                let Some(message) = record.get("message").and_then(Value::as_object) else {
+                    continue;
+                };
+                let Some(role) = role_from_value(message.get("role")) else {
+                    continue;
+                };
+                if role == HistoryRole::Assistant {
+                    session.model = string(message, &["model"]).or(session.model);
+                    if let Some(usage) = message.get("usage") {
+                        session.total_tokens =
+                            session.total_tokens.saturating_add(token_total(usage));
+                    }
+                }
+                session.push(role, message.get("content").and_then(content_text));
+            }
+            _ => {}
+        }
+    }
+    Ok(session.finish())
+}
+
+fn parse_devin(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let record = transcript_object(document, false)?;
+    let mut session = SessionBuilder::new(select_session_id(
+        string(&record, &["session_id", "sessionId"]),
+        &document.session_id_hint,
+    )?);
+    let agent = record.get("agent").and_then(Value::as_object);
+    session.model = agent
+        .and_then(|agent| string(agent, &["model_name", "model"]))
+        .or_else(|| string(&record, &["generation_model"]));
+    session.cwd = string(&record, &["working_directory"]);
+    if let Some(steps) = record.get("steps").and_then(Value::as_array) {
+        for step in steps {
+            let Some(step) = step.as_object() else {
+                continue;
+            };
+            let metadata = step.get("metadata").and_then(Value::as_object);
+            let metrics = metadata
+                .and_then(|metadata| metadata.get("metrics"))
+                .and_then(Value::as_object);
+            session.model = metadata
+                .and_then(|metadata| string(metadata, &["generation_model"]))
+                .or_else(|| metrics.and_then(|metrics| string(metrics, &["generation_model"])))
+                .or(session.model);
+            session.total_tokens = session
+                .total_tokens
+                .saturating_add(devin_step_token_total(metadata, metrics));
+            let is_user = metadata
+                .and_then(|metadata| metadata.get("is_user_input"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let is_assistant = string(step, &["role"]).as_deref() == Some("assistant")
+                || step.get("tool_calls").is_some();
+            let role = if is_user {
+                Some(HistoryRole::User)
+            } else if is_assistant {
+                Some(HistoryRole::Assistant)
+            } else {
+                None
+            };
+            let Some(role) = role else {
+                continue;
+            };
+            let text = step
+                .get("message")
+                .and_then(Value::as_object)
+                .and_then(|message| message.get("content"))
+                .and_then(content_text)
+                .or_else(|| string(step, &["text"]))
+                .or_else(|| step.get("content").and_then(content_text));
+            session.push(role, text);
+        }
     }
     Ok(session.finish())
 }
@@ -353,6 +923,19 @@ fn metadata_object(document: &HistoryDocument) -> Result<Map<String, Value>, His
         .ok()
         .and_then(|value| value.as_object().cloned())
         .ok_or(HistoryAdapterError::InvalidMetadata)
+}
+
+fn transcript_object(
+    document: &HistoryDocument,
+    empty_is_object: bool,
+) -> Result<Map<String, Value>, HistoryAdapterError> {
+    if empty_is_object && document.transcript.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    serde_json::from_str::<Value>(&document.transcript)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or(HistoryAdapterError::InvalidTranscript)
 }
 
 fn ndjson_records(content: &str) -> impl Iterator<Item = Map<String, Value>> + '_ {
@@ -423,19 +1006,254 @@ fn sum_named_numbers(record: &Map<String, Value>, keys: &[&str]) -> u64 {
         .fold(0, u64::saturating_add)
 }
 
-fn sum_numeric_leaves(value: &Value) -> u64 {
-    match value {
-        Value::Number(number) => number.as_u64().unwrap_or(0),
-        Value::Array(values) => values
-            .iter()
-            .map(sum_numeric_leaves)
-            .fold(0, u64::saturating_add),
-        Value::Object(values) => values
-            .values()
-            .map(sum_numeric_leaves)
-            .fold(0, u64::saturating_add),
-        _ => 0,
+fn claude_usage_total(value: &Value) -> u64 {
+    let Some(usage) = value.as_object() else {
+        return 0;
+    };
+    sum_named_numbers(
+        usage,
+        &[
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ],
+    )
+}
+
+fn copilot_trusted_folder(message: String) -> Option<String> {
+    message
+        .strip_prefix("Folder ")
+        .and_then(|value| value.strip_suffix(" has been added to trusted folders."))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn copilot_model_metrics_total(value: &Value) -> u64 {
+    value
+        .as_object()
+        .into_iter()
+        .flat_map(|metrics| metrics.values())
+        .filter_map(Value::as_object)
+        .filter_map(|metric| metric.get("usage"))
+        .map(token_total)
+        .fold(0, u64::saturating_add)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CodexUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+impl CodexUsage {
+    fn add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+        }
     }
+}
+
+fn normalize_codex_usage(value: &Value) -> Option<CodexUsage> {
+    let usage = value.as_object()?;
+    let input_tokens = u64_value(usage, &["input_tokens"]).unwrap_or(0);
+    let output_tokens = u64_value(usage, &["output_tokens"]).unwrap_or(0);
+    Some(CodexUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: u64_value(usage, &["total_tokens"])
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
+    })
+}
+
+fn model_from_nested_record(record: &Map<String, Value>) -> Option<String> {
+    string(record, &["model", "model_name"])
+        .or_else(|| {
+            record
+                .get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|metadata| string(metadata, &["model"]))
+        })
+        .or_else(|| {
+            record
+                .get("info")
+                .and_then(Value::as_object)
+                .and_then(|info| string(info, &["model"]))
+        })
+}
+
+fn is_codex_worker_session(payload: &Map<String, Value>) -> bool {
+    if let Some(source) = string(payload, &["thread_source", "threadSource"]) {
+        return !source.eq_ignore_ascii_case("user");
+    }
+    payload
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|source| source.get("subagent"))
+        .and_then(Value::as_object)
+        .is_some()
+}
+
+fn is_known_harness_injected_user_turn(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    let tag = normalized
+        .strip_prefix('<')
+        .and_then(|value| value.split([' ', '>']).next());
+    let known_tag = tag.is_some_and(|tag| {
+        matches!(
+            tag,
+            "agent-message"
+                | "bash-input"
+                | "bash-stderr"
+                | "bash-stdout"
+                | "command-args"
+                | "command-message"
+                | "command-name"
+                | "cross-session-message"
+                | "fork-boilerplate"
+                | "local-command-caveat"
+                | "local-command-stderr"
+                | "local-command-stdout"
+                | "mcp-polling-update"
+                | "mcp-resource-update"
+                | "system-reminder"
+                | "task-notification"
+                | "teammate-message"
+                | "user-memory-input"
+                | "user-prompt-submit-hook"
+        )
+    });
+    known_tag
+        || [
+            "<channel source=",
+            "[request interrupted",
+            "a message arrived from ",
+            "another claude session sent a message",
+            "no response requested.",
+            "caveat: the messages below were generated by the user while running local commands",
+            "this session is being continued from a previous conversation",
+        ]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn extract_antigravity_user_request(content: String) -> Option<String> {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    let Some(start) = content.find(OPEN) else {
+        return normalize_message(content);
+    };
+    let body_start = start + OPEN.len();
+    let body_end = content[body_start..]
+        .find(CLOSE)
+        .map(|offset| body_start + offset)
+        .unwrap_or(content.len());
+    normalize_message(content[body_start..body_end].to_owned())
+}
+
+fn token_total(value: &Value) -> u64 {
+    let Some(usage) = value.as_object() else {
+        return 0;
+    };
+    if let Some(total) =
+        u64_value(usage, &["total", "totalTokens", "total_tokens"]).filter(|total| *total > 0)
+    {
+        return total;
+    }
+    sum_named_numbers(
+        usage,
+        &[
+            "input",
+            "inputTokens",
+            "input_tokens",
+            "output",
+            "outputTokens",
+            "output_tokens",
+            "cacheRead",
+            "cacheReadTokens",
+            "cache_read_input_tokens",
+            "cacheWrite",
+            "cacheWriteTokens",
+            "cache_creation_input_tokens",
+            "cached",
+            "cachedInputTokens",
+            "cached_input_tokens",
+            "reasoning",
+            "reasoningOutputTokens",
+            "reasoning_output_tokens",
+        ],
+    )
+}
+
+fn opencode_model(record: &Map<String, Value>) -> Option<String> {
+    if let Some(model) = record.get("model").and_then(Value::as_object) {
+        return string(model, &["id", "modelID"]);
+    }
+    if let Some(model_json) = string(record, &["model_json"]) {
+        if let Some(model) = serde_json::from_str::<Value>(&model_json)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .and_then(|model| string(&model, &["id", "modelID"]))
+        {
+            return Some(model);
+        }
+    }
+    string(record, &["modelID"])
+}
+
+fn json_string_field_text(value: &str) -> Option<String> {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .and_then(|record| string(&record, &["text"]))
+        .and_then(normalize_message)
+}
+
+fn rovo_parts_text(value: Option<&Value>, role: HistoryRole) -> Option<String> {
+    let parts = value.and_then(Value::as_array)?;
+    let mut text = Vec::new();
+    for part in parts {
+        let Some(part) = part.as_object() else {
+            continue;
+        };
+        let kind = string(part, &["part_kind"]);
+        let accepted = match role {
+            HistoryRole::User => matches!(kind.as_deref(), Some("user-prompt" | "text")),
+            HistoryRole::Assistant => kind.as_deref() == Some("text"),
+        };
+        if accepted {
+            if let Some(value) = string(part, &["content", "text"]) {
+                text.push(value);
+            }
+        }
+    }
+    normalize_message(text.join(" "))
+}
+
+fn devin_step_token_total(
+    metadata: Option<&Map<String, Value>>,
+    metrics: Option<&Map<String, Value>>,
+) -> u64 {
+    [
+        &["total_input_tokens", "input_tokens"][..],
+        &["output_tokens"][..],
+        &["cache_read_tokens", "cache_read_input_tokens"][..],
+        &["cache_creation_tokens", "cache_creation_input_tokens"][..],
+    ]
+    .iter()
+    .map(|keys| {
+        [metadata, metrics]
+            .into_iter()
+            .flatten()
+            .find_map(|source| u64_value(source, keys).filter(|value| *value > 0))
+            .unwrap_or(0)
+    })
+    .fold(0, u64::saturating_add)
 }
 
 fn grok_content_text(value: &Value) -> Option<String> {
@@ -488,8 +1306,57 @@ fn flush_assistant(session: &mut SessionBuilder, parts: &mut Vec<String>) {
 }
 
 fn normalize_message(value: String) -> Option<String> {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible = strip_hidden_context_blocks(value);
+    let normalized = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    if lower.starts_with("# agents.md instructions") || lower.starts_with("<instructions>") {
+        return None;
+    }
     (!normalized.is_empty()).then(|| normalized.chars().take(HISTORY_MESSAGE_MAX_CHARS).collect())
+}
+
+fn strip_hidden_context_blocks(mut value: String) -> String {
+    const HIDDEN: [(&str, &str); 3] = [
+        ("system-reminder", "</system-reminder>"),
+        ("codex_internal_context", "</codex_internal_context>"),
+        ("goal_context", "</goal_context>"),
+    ];
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let next = HIDDEN
+            .iter()
+            .filter_map(|(name, close)| find_open_tag(&lower, name).map(|start| (start, *close)))
+            .min_by_key(|(start, _)| *start);
+        let Some((start, close)) = next else {
+            return value;
+        };
+        let Some(open_end) = lower[start..].find('>').map(|offset| start + offset + 1) else {
+            value.truncate(start);
+            return value;
+        };
+        let Some(close_start) = lower[open_end..]
+            .find(close)
+            .map(|offset| open_end + offset)
+        else {
+            value.truncate(start);
+            return value;
+        };
+        value.replace_range(start..close_start + close.len(), " ");
+    }
+}
+
+fn find_open_tag(value: &str, name: &str) -> Option<usize> {
+    let needle = format!("<{name}");
+    let mut from = 0;
+    while let Some(offset) = value[from..].find(&needle) {
+        let start = from + offset;
+        let boundary = value.as_bytes().get(start + needle.len()).copied();
+        if boundary.is_none_or(|byte| byte == b'>' || byte.is_ascii_whitespace()) {
+            return Some(start);
+        }
+        from = start + needle.len();
+    }
+    None
 }
 
 fn normalize_title(value: String) -> Option<String> {
@@ -507,8 +1374,12 @@ pub enum HistoryAdapterError {
     MetadataTooLarge,
     #[error("history transcript exceeds the supported bound")]
     TranscriptTooLarge,
+    #[error("history transcript is not the required JSON object")]
+    InvalidTranscript,
     #[error("history session ID is empty, unsafe, or too large")]
     InvalidSessionId,
+    #[error("provider history belongs to an internal worker session")]
+    ExcludedProviderSession,
     #[error("history adapter is unavailable for {0}")]
     UnsupportedAdapter(String),
 }
@@ -544,6 +1415,126 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("fix tests"));
         assert_eq!(session.model.as_deref(), Some("grok-4"));
         assert_eq!(session.message_count, 2);
+    }
+
+    #[test]
+    fn parses_claude_titles_usage_and_injected_user_turns() {
+        let transcript = [
+            r#"{"type":"user","sessionId":"claude-1","cwd":"/repo","isMeta":true,"message":{"content":"<system-reminder>internal</system-reminder>"}}"#,
+            r#"{"type":"user","sessionId":"claude-1","message":{"content":"fix the tests"}}"#,
+            r#"{"type":"assistant","sessionId":"claude-1","message":{"model":"claude-sonnet","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}}"#,
+            r#"{"type":"ai-title","sessionId":"claude-1","aiTitle":"Generated title"}"#,
+            r#"{"type":"ai-title","sessionId":"claude-1","aiTitle":"   "}"#,
+        ]
+        .join("\n");
+        let session = parse_history(
+            &id("claude-code"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript,
+            },
+        )
+        .unwrap();
+        assert_eq!(session.session_id, "claude-1");
+        assert_eq!(session.title.as_deref(), Some("Generated title"));
+        assert_eq!(session.cwd.as_deref(), Some("/repo"));
+        assert_eq!(session.model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(session.total_tokens, 14);
+        assert_eq!(session.message_count, 3);
+    }
+
+    #[test]
+    fn parses_codex_cumulative_usage_and_excludes_worker_transcripts() {
+        let transcript = [
+            r#"{"type":"session_meta","payload":{"id":"codex-1","thread_source":"user","cwd":"/repo"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5","cwd":"/repo/new"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"fix tests"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"working"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":"internal"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":6,"output_tokens":4,"total_tokens":10}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":9,"output_tokens":6,"total_tokens":15}}}}"#,
+        ]
+        .join("\n");
+        let session = parse_history(
+            &id("codex"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: Some(r#"{"indexed_title":"Indexed title"}"#.to_owned()),
+                transcript,
+            },
+        )
+        .unwrap();
+        assert_eq!(session.session_id, "codex-1");
+        assert_eq!(session.title.as_deref(), Some("Indexed title"));
+        assert_eq!(session.cwd.as_deref(), Some("/repo/new"));
+        assert_eq!(session.model.as_deref(), Some("gpt-5"));
+        assert_eq!(session.total_tokens, 15);
+        assert_eq!(session.message_count, 3);
+
+        let worker = parse_history(
+            &id("codex"),
+            &HistoryDocument {
+                session_id_hint: "worker".to_owned(),
+                metadata_json: None,
+                transcript: r#"{"type":"session_meta","payload":{"thread_source":"subagent"}}"#
+                    .to_owned(),
+            },
+        );
+        assert_eq!(worker, Err(HistoryAdapterError::ExcludedProviderSession));
+    }
+
+    #[test]
+    fn parses_gemini_json_and_jsonl_session_formats() {
+        let legacy = parse_history(
+            &id("gemini"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript: r#"{"sessionId":"gemini-json","messages":[{"type":"user","content":"question"},{"type":"gemini","content":"answer","model":"gemini-3","tokens":{"input":2,"output":3}}]}"#.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy.session_id, "gemini-json");
+        assert_eq!(legacy.total_tokens, 5);
+
+        let jsonl = parse_history(
+            &id("gemini"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript: [
+                    r#"{"sessionId":"gemini-jsonl","type":"user","content":"question"}"#,
+                    r#"{"type":"gemini","content":"answer","model":"gemini-3","tokens":{"totalTokens":7}}"#,
+                ]
+                .join("\n"),
+            },
+        )
+        .unwrap();
+        assert_eq!(jsonl.session_id, "gemini-jsonl");
+        assert_eq!(jsonl.message_count, 2);
+        assert_eq!(jsonl.total_tokens, 7);
+    }
+
+    #[test]
+    fn parses_antigravity_user_envelopes_and_planner_responses() {
+        let session = parse_history(
+            &id("antigravity"),
+            &HistoryDocument {
+                session_id_hint: "conversation-1".to_owned(),
+                metadata_json: None,
+                transcript: [
+                    r#"{"source":"USER_EXPLICIT","type":"USER_INPUT","content":"prefix<USER_REQUEST>ship it</USER_REQUEST>suffix"}"#,
+                    r#"{"source":"MODEL","type":"PLANNER_RESPONSE","content":"done"}"#,
+                    r#"{"source":"MODEL","type":"TOOL_RESPONSE","content":"hidden"}"#,
+                ]
+                .join("\n"),
+            },
+        )
+        .unwrap();
+        assert_eq!(session.title.as_deref(), Some("ship it"));
+        assert_eq!(session.message_count, 2);
+        assert_eq!(session.messages[1].text, "done");
     }
 
     #[test]
@@ -620,6 +1611,124 @@ mod tests {
             assert_eq!(session.message_count, 2);
             assert_eq!(session.title.as_deref(), Some("question"));
         }
+    }
+
+    #[test]
+    fn copilot_history_extracts_trusted_folder_and_only_usage_metrics() {
+        let session = parse_history(
+            &id("copilot"),
+            &HistoryDocument {
+                session_id_hint: "copilot-1".to_owned(),
+                metadata_json: None,
+                transcript: [
+                    r#"{"type":"session.info","data":{"message":"Folder /repo has been added to trusted folders."}}"#,
+                    r#"{"type":"session.shutdown","data":{"currentTokens":5,"modelMetrics":{"model-a":{"usage":{"total":7},"latency":999},"unrelated":42}}}"#,
+                ]
+                .join("\n"),
+            },
+        )
+        .unwrap();
+        assert_eq!(session.cwd.as_deref(), Some("/repo"));
+        assert_eq!(session.total_tokens, 12);
+    }
+
+    #[test]
+    fn parses_opencode_legacy_and_sqlite_authority_shapes() {
+        let session = parse_history(
+            &id("opencode"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: Some(
+                    r#"{"id":"ses_1","title":"OpenCode title","directory":"/repo","model_json":"{\"id\":\"glm-5.2\"}","tokens_input":5,"tokens_output":3,"tokens_reasoning":2,"message_count":3}"#
+                        .to_owned(),
+                ),
+                transcript: [
+                    r#"{"role":"user","part_data":"{\"type\":\"text\",\"text\":\"Plan the work\"}","summary_title":"fallback title"}"#,
+                    r#"{"role":"assistant","content":[{"type":"text","text":"Done"}],"tokens":{"input":1,"output":2}}"#,
+                ]
+                .join("\n"),
+            },
+        )
+        .unwrap();
+        assert_eq!(session.session_id, "ses_1");
+        assert_eq!(session.title.as_deref(), Some("OpenCode title"));
+        assert_eq!(session.cwd.as_deref(), Some("/repo"));
+        assert_eq!(session.model.as_deref(), Some("glm-5.2"));
+        assert_eq!(session.message_count, 3);
+        assert_eq!(session.total_tokens, 13);
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    #[test]
+    fn parses_pi_omp_and_openclaw_message_graphs() {
+        let transcript = [
+            r#"{"type":"session","id":"graph-1","cwd":"/repo"}"#,
+            r#"{"type":"model_change","modelId":"model-a"}"#,
+            r#"{"type":"message","message":{"role":"user","content":"question"}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"model":"model-b","usage":{"input":2,"output":3,"cacheRead":4}}}"#,
+        ]
+        .join("\n");
+        for adapter in ["pi", "omp", "openclaw"] {
+            let session = parse_history(
+                &id(adapter),
+                &HistoryDocument {
+                    session_id_hint: "fallback".to_owned(),
+                    metadata_json: None,
+                    transcript: transcript.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(session.session_id, "graph-1");
+            assert_eq!(session.cwd.as_deref(), Some("/repo"));
+            assert_eq!(session.model.as_deref(), Some("model-b"));
+            assert_eq!(session.total_tokens, 9);
+            assert_eq!(session.message_count, 2);
+        }
+    }
+
+    #[test]
+    fn parses_hermes_rovo_and_devin_object_contracts() {
+        let hermes = parse_history(
+            &id("hermes"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript: r#"{"session_id":"hermes-1","model":"qwen","cwd":"/repo","messages":[{"role":"user","content":"question"},{"role":"assistant","content":"answer"}]}"#.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(hermes.session_id, "hermes-1");
+        assert_eq!(hermes.message_count, 2);
+
+        let rovo = parse_history(
+            &id("rovo"),
+            &HistoryDocument {
+                session_id_hint: "rovo-dir-1".to_owned(),
+                metadata_json: Some(
+                    r#"{"title":"Rovo task","workspace_path":"/repo"}"#.to_owned(),
+                ),
+                transcript: r#"{"messages":[{"role":"user","content":"question"}],"message_history":[{"kind":"response","parts":[{"part_kind":"text","content":"answer"},{"part_kind":"tool","content":"hidden"}]}]}"#.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(rovo.session_id, "rovo-dir-1");
+        assert_eq!(rovo.title.as_deref(), Some("Rovo task"));
+        assert_eq!(rovo.message_count, 2);
+        assert_eq!(rovo.messages[1].text, "answer");
+
+        let devin = parse_history(
+            &id("devin"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript: r#"{"session_id":"devin-1","working_directory":"/repo","agent":{"model_name":"sonnet"},"steps":[{"metadata":{"is_user_input":true,"total_input_tokens":2},"message":{"content":"question"}},{"role":"assistant","metadata":{"metrics":{"output_tokens":3,"cache_read_tokens":4}},"content":"answer"}]}"#.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(devin.session_id, "devin-1");
+        assert_eq!(devin.model.as_deref(), Some("sonnet"));
+        assert_eq!(devin.total_tokens, 9);
+        assert_eq!(devin.message_count, 2);
     }
 
     #[test]
@@ -701,5 +1810,46 @@ mod tests {
             parse_history(&id("kimi"), &invalid),
             Err(HistoryAdapterError::InvalidMetadata)
         );
+    }
+
+    #[test]
+    fn source_contracts_keep_related_reads_in_the_effect_owning_shell() {
+        let opencode = history_source_variants(&id("opencode")).unwrap();
+        assert_eq!(opencode.len(), 2);
+        assert!(opencode.iter().any(|variant| {
+            variant.layout == HistorySourceLayout::ReadOnlySqliteProjection
+                && variant.requires_readonly_database
+        }));
+        assert!(opencode.iter().any(|variant| {
+            variant.layout == HistorySourceLayout::SessionJsonWithSiblingMessageJson
+                && variant.requires_sibling_reads
+        }));
+
+        let codex = history_source_variants(&id("codex")).unwrap();
+        assert_eq!(codex.len(), 1);
+        assert!(codex[0].requires_auxiliary_index);
+        assert!(matches!(
+            history_source_variants(&id("unknown")),
+            Err(HistoryAdapterError::UnsupportedAdapter(_))
+        ));
+    }
+
+    #[test]
+    fn hidden_harness_context_is_not_retained_as_history_text() {
+        let session = parse_history(
+            &id("cursor"),
+            &HistoryDocument {
+                session_id_hint: "cursor-1".to_owned(),
+                metadata_json: None,
+                transcript: [
+                    r#"{"role":"user","content":"<system-reminder secret=\"x\">internal</system-reminder> real request"}"#,
+                    r#"{"role":"assistant","content":"<goal_context>private</goal_context>answer"}"#,
+                ]
+                .join("\n"),
+            },
+        )
+        .unwrap();
+        assert_eq!(session.messages[0].text, "real request");
+        assert_eq!(session.messages[1].text, "answer");
     }
 }

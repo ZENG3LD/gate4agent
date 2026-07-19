@@ -475,7 +475,7 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
                 generation,
                 source: ProviderSource {
                     family: AdapterFamily::Hook,
-                    binding: hook_binding,
+                    binding: hook_binding.clone(),
                 },
                 source_sequence: 1,
                 events: vec![
@@ -555,6 +555,62 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
     handle
         .dispatch(command(
             34,
+            ControlCommand::IngestProvider {
+                instance_id,
+                generation,
+                source: ProviderSource {
+                    family: AdapterFamily::Hook,
+                    binding: hook_binding.clone(),
+                },
+                source_sequence: 2,
+                events: vec![
+                    ProviderEvent::SubagentStarted {
+                        agent_id: "child-public-1".to_owned(),
+                        agent_type: Some("reviewer".to_owned()),
+                        description: Some("public path review".to_owned()),
+                    },
+                    ProviderEvent::TurnCompleted {
+                        usage: Default::default(),
+                        is_cumulative: false,
+                    },
+                ],
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        let provider = &handle.snapshot().sessions[0].provider;
+        provider.lead_activity == ProviderActivity::Idle
+            && provider.activity == ProviderActivity::Working
+            && provider.subagents.len() == 1
+    })
+    .await;
+
+    handle
+        .dispatch(command(
+            35,
+            ControlCommand::IngestProvider {
+                instance_id,
+                generation,
+                source: ProviderSource {
+                    family: AdapterFamily::Hook,
+                    binding: hook_binding,
+                },
+                source_sequence: 3,
+                events: vec![ProviderEvent::SubagentStopped {
+                    agent_id: "child-public-1".to_owned(),
+                }],
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        let provider = &handle.snapshot().sessions[0].provider;
+        provider.activity == ProviderActivity::Idle && provider.subagents.is_empty()
+    })
+    .await;
+
+    handle
+        .dispatch(command(
+            36,
             ControlCommand::Stop {
                 instance_id,
                 force: true,

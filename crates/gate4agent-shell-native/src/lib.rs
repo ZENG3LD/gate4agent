@@ -16,9 +16,9 @@ use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
     ForegroundProcess, ForegroundProcessKind, ForegroundRequirement, ObservationEnvelope,
-    OperationId, PreparedInputKind, ProviderEvent, ProviderSource, SessionGeneration, StartRequest,
-    TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
-    WORKING_DIRECTORY_MAX_BYTES,
+    OperationId, PreparedInputKind, ProviderEvent, ProviderInteractionKind, ProviderSource,
+    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -815,12 +815,14 @@ fn parsed_provider_event(message: ParsedMessage) -> Option<ProviderEvent> {
             message: message.content,
         }),
         MessageClass::PromptReady => Some(ProviderEvent::Ready),
-        MessageClass::ToolApproval => Some(ProviderEvent::ApprovalRequested {
+        MessageClass::ToolApproval => Some(ProviderEvent::InteractionRequested {
+            request_id: None,
+            interaction_kind: ProviderInteractionKind::Approval,
             tool_name: message
                 .metadata
                 .tool_name
                 .unwrap_or_else(|| "unknown".to_owned()),
-            description: (!message.content.is_empty()).then_some(message.content),
+            prompt: message.content,
         }),
         MessageClass::InfoMessage
         | MessageClass::UiElement
@@ -1004,9 +1006,11 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
         AgentEvent::PtyToolApproval {
             tool_name,
             description,
-        } => Some(ProviderEvent::ApprovalRequested {
+        } => Some(ProviderEvent::InteractionRequested {
+            request_id: None,
+            interaction_kind: ProviderInteractionKind::Approval,
             tool_name,
-            description,
+            prompt: description.unwrap_or_default(),
         }),
         AgentEvent::RateLimit(info) => Some(rate_limit_event(info)),
         AgentEvent::Started { .. }

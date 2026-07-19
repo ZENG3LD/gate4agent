@@ -10,7 +10,8 @@ use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEvent, ControlEventKind, ForegroundAuthority, ForegroundProcessKind, InputAction,
     PreparedInputKind, PromptFraming, PromptPayload, ProviderActivity, ProviderEvent,
-    ProviderSource, SessionStatus, ShellCommand, StartRequest, TerminalSize, TransportKind,
+    ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus, ProviderSource,
+    SessionStatus, ShellCommand, StartRequest, TerminalControl, TerminalSize, TransportKind,
     CONTROL_PROTOCOL_VERSION,
 };
 
@@ -481,9 +482,11 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
                     ProviderEvent::TurnStarted {
                         prompt: Some("external hook turn".to_owned()),
                     },
-                    ProviderEvent::ApprovalRequested {
+                    ProviderEvent::InteractionRequested {
+                        request_id: Some("question-1".to_owned()),
+                        interaction_kind: ProviderInteractionKind::Question,
                         tool_name: "ask_user_question".to_owned(),
-                        description: Some("choose".to_owned()),
+                        prompt: "{\"question\":\"choose\"}".to_owned(),
                     },
                 ],
             },
@@ -508,10 +511,50 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
         .sources
         .iter()
         .any(|cursor| cursor.source.family == AdapterFamily::Hook && cursor.sequence == 1));
+    assert!(matches!(
+        provider.interactions.as_slice(),
+        [interaction]
+            if interaction.interaction_kind == ProviderInteractionKind::Question
+                && interaction.status == ProviderInteractionStatus::Pending
+    ));
+    let interaction_id = provider.interactions[0].id;
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        ControlEventKind::InteractionRequested { interaction }
+            if interaction.id == interaction_id
+    )));
 
     handle
         .dispatch(command(
             33,
+            ControlCommand::SendInput {
+                instance_id,
+                action: InputAction::TerminalControl(TerminalControl::Interrupt),
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, events| {
+        events.iter().any(|event| {
+            matches!(
+                event.event,
+                ControlEventKind::InteractionResolved {
+                    interaction_id: observed,
+                    outcome: ProviderInteractionOutcome::Interrupted,
+                } if observed == interaction_id
+            )
+        })
+    })
+    .await;
+    assert_eq!(
+        handle.snapshot().sessions[0].provider.interactions[0].status,
+        ProviderInteractionStatus::Resolved {
+            outcome: ProviderInteractionOutcome::Interrupted
+        }
+    );
+
+    handle
+        .dispatch(command(
+            34,
             ControlCommand::Stop {
                 instance_id,
                 force: true,

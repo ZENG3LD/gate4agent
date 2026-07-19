@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 11;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 12;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -13,6 +13,7 @@ pub const PROVIDER_INGRESS_EVENTS_MAX: usize = 32;
 pub const PROVIDER_EVENT_TEXT_MAX_BYTES: usize = 262_144;
 pub const PROVIDER_EVENT_ID_MAX_BYTES: usize = 512;
 pub const PROVIDER_EVENT_TOOLS_MAX: usize = 256;
+pub const PROVIDER_INTERACTIONS_MAX: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -343,6 +344,24 @@ pub struct TokenUsage {
     pub context_window: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderInteractionKind {
+    Approval,
+    Question,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderInteractionOutcome {
+    Approved,
+    Answered,
+    Denied,
+    Interrupted,
+    TurnEnded,
+    Superseded,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderEvent {
@@ -385,9 +404,11 @@ pub enum ProviderEvent {
         message: String,
     },
     Ready,
-    ApprovalRequested {
+    InteractionRequested {
+        request_id: Option<String>,
+        interaction_kind: ProviderInteractionKind,
         tool_name: String,
-        description: Option<String>,
+        prompt: String,
     },
     RateLimited {
         limit_type: String,
@@ -449,17 +470,28 @@ impl ProviderEvent {
             Self::Error { message } => {
                 validate_required_text("error", message, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
             }
-            Self::ApprovalRequested {
+            Self::InteractionRequested {
+                request_id,
+                interaction_kind,
                 tool_name,
-                description,
+                prompt,
             } => {
-                validate_required("approval tool", tool_name, PROVIDER_EVENT_ID_MAX_BYTES)?;
-                if let Some(description) = description {
-                    validate_text(
-                        "approval description",
-                        description,
+                if let Some(request_id) = request_id {
+                    validate_required(
+                        "interaction request id",
+                        request_id,
+                        PROVIDER_EVENT_ID_MAX_BYTES,
+                    )?;
+                }
+                validate_required("interaction tool", tool_name, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                if *interaction_kind == ProviderInteractionKind::Question {
+                    validate_required_text(
+                        "interaction prompt",
+                        prompt,
                         PROVIDER_EVENT_TEXT_MAX_BYTES,
                     )?;
+                } else {
+                    validate_text("interaction prompt", prompt, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
                 }
             }
             Self::RateLimited {
@@ -560,6 +592,28 @@ pub struct ProviderSourceCursor {
     pub stale: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderInteractionId(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ProviderInteractionStatus {
+    Pending,
+    Resolved { outcome: ProviderInteractionOutcome },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderInteraction {
+    pub id: ProviderInteractionId,
+    pub source: ProviderSource,
+    pub provider_request_id: Option<String>,
+    pub interaction_kind: ProviderInteractionKind,
+    pub tool_name: String,
+    pub prompt: String,
+    pub status: ProviderInteractionStatus,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderActivity {
@@ -588,6 +642,7 @@ pub struct ProviderSnapshot {
     pub activity: ProviderActivity,
     pub current_prompt: Option<String>,
     pub active_tools: Vec<ActiveProviderTool>,
+    pub interactions: Vec<ProviderInteraction>,
     pub sources: Vec<ProviderSourceCursor>,
     pub last_event: Option<ProviderEvent>,
     pub gap_count: u64,
@@ -671,6 +726,13 @@ pub enum ControlEventKind {
         sequence: u64,
         source: ProviderSource,
         missed: u64,
+    },
+    InteractionRequested {
+        interaction: ProviderInteraction,
+    },
+    InteractionResolved {
+        interaction_id: ProviderInteractionId,
+        outcome: ProviderInteractionOutcome,
     },
     Exited {
         exit_code: Option<i32>,
@@ -759,7 +821,7 @@ impl Default for ControlSnapshot {
 mod tests {
     use super::{
         ForegroundProcess, ForegroundProcessKind, ProviderEvent, ProviderEventValidationError,
-        FOREGROUND_PROCESS_NAME_MAX_BYTES,
+        ProviderInteractionKind, FOREGROUND_PROCESS_NAME_MAX_BYTES,
     };
     use crate::AgentId;
 
@@ -781,6 +843,43 @@ mod tests {
             ..process
         }
         .is_valid_for(&claude));
+    }
+
+    #[test]
+    fn provider_interactions_require_bounded_identity_and_question_payloads() {
+        let question = ProviderEvent::InteractionRequested {
+            request_id: Some("question-1".to_owned()),
+            interaction_kind: ProviderInteractionKind::Question,
+            tool_name: "AskUserQuestion".to_owned(),
+            prompt: "{\"question\":\"Continue?\"}".to_owned(),
+        };
+        assert_eq!(question.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::InteractionRequested {
+                request_id: Some("bad\nrequest".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "shell".to_owned(),
+                prompt: String::new(),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "interaction request id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            ProviderEvent::InteractionRequested {
+                request_id: None,
+                interaction_kind: ProviderInteractionKind::Question,
+                tool_name: "AskUserQuestion".to_owned(),
+                prompt: String::new(),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::Empty {
+                field: "interaction prompt"
+            })
+        ));
     }
 
     #[test]

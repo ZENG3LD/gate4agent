@@ -1,4 +1,4 @@
-use gate4agent_types::{AdapterId, ProviderEvent, TokenUsage};
+use gate4agent_types::{AdapterId, ProviderEvent, ProviderInteractionKind, TokenUsage};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
@@ -51,14 +51,20 @@ fn normalize_grok(
         "session_start" => Ok(session_started(payload, &["sessionId", "session_id"])),
         "user_prompt_submit" => Ok(vec![turn_started(payload)]),
         "pre_tool_use" if is_ask_user_question(tool_name(payload).as_deref()) => {
-            Ok(vec![approval_event(payload)])
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Question,
+            )])
         }
         "pre_tool_use" => Ok(vec![tool_started(payload)]),
         "post_tool_use" => Ok(vec![tool_completed(payload, false)]),
         "post_tool_use_failure" => Ok(vec![tool_completed(payload, true)]),
         "stop" | "stop_failure" | "session_end" => Ok(turn_completed(payload)),
         "notification" if is_permission_message(string(payload, &["message"]).as_deref()) => {
-            Ok(vec![approval_event(payload)])
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Approval,
+            )])
         }
         "notification" if is_idle_message(string(payload, &["message"]).as_deref()) => {
             Ok(vec![ProviderEvent::Ready])
@@ -75,12 +81,18 @@ fn normalize_kimi(
         "SessionStart" => Ok(session_started(payload, &["session_id"])),
         "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" if is_ask_user_question(tool_name(payload).as_deref()) => {
-            Ok(vec![approval_event(payload)])
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Question,
+            )])
         }
         "PreToolUse" => Ok(vec![tool_started(payload)]),
         "PostToolUse" => Ok(vec![tool_completed(payload, false)]),
         "PostToolUseFailure" => Ok(vec![tool_completed(payload, true)]),
-        "PermissionRequest" => Ok(vec![approval_event(payload)]),
+        "PermissionRequest" => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
         "Stop" | "StopFailure" => Ok(turn_completed(payload)),
         _ => Ok(Vec::new()),
     }
@@ -95,14 +107,18 @@ fn normalize_copilot(
         "SessionStart" => Ok(session_started_from_copilot(payload)),
         "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" | "PermissionRequest" if is_ask_user(tool_name(payload).as_deref()) => {
-            Ok(vec![approval_event(payload)])
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Question,
+            )])
         }
         "PreToolUse" | "PermissionRequest" => Ok(vec![tool_started(payload)]),
         "PostToolUse" => Ok(vec![tool_completed(payload, false)]),
         "PostToolUseFailure" => Ok(vec![tool_completed(payload, true)]),
-        "Notification" if is_blocking_copilot_notification(payload) => {
-            Ok(vec![approval_event(payload)])
-        }
+        "Notification" if is_blocking_copilot_notification(payload) => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
         "ErrorOccurred" if payload.get("recoverable") != Some(&Value::Bool(true)) => {
             Ok(vec![ProviderEvent::Error {
                 message: bounded_string(
@@ -126,14 +142,25 @@ fn normalize_droid(
     match event_name {
         "SessionStart" => Ok(session_started(payload, &["session_id"])),
         "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
-        "PreToolUse" if is_ask_user(tool_name(payload).as_deref()) || is_high_risk(payload) => {
-            Ok(vec![approval_event(payload)])
-        }
+        "PreToolUse" if is_ask_user(tool_name(payload).as_deref()) => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Question,
+        )]),
+        "PreToolUse" if is_high_risk(payload) => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
         "PreToolUse" => Ok(vec![tool_started(payload)]),
         "PostToolUse" => Ok(vec![tool_completed(payload, false)]),
-        "PermissionRequest" => Ok(vec![approval_event(payload)]),
+        "PermissionRequest" => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
         "Notification" if is_permission_message(string(payload, &["message"]).as_deref()) => {
-            Ok(vec![approval_event(payload)])
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Approval,
+            )])
         }
         "Notification" if is_idle_message(string(payload, &["message"]).as_deref()) => {
             Ok(vec![ProviderEvent::Ready])
@@ -265,14 +292,37 @@ fn tool_completed(payload: &Map<String, Value>, is_error: bool) -> ProviderEvent
     }
 }
 
-fn approval_event(payload: &Map<String, Value>) -> ProviderEvent {
-    ProviderEvent::ApprovalRequested {
-        tool_name: tool_name(payload).unwrap_or_else(|| "approval".to_owned()),
-        description: string(
+fn interaction_event(
+    payload: &Map<String, Value>,
+    interaction_kind: ProviderInteractionKind,
+) -> ProviderEvent {
+    let tool_name = tool_name(payload).unwrap_or_else(|| match interaction_kind {
+        ProviderInteractionKind::Approval => "approval".to_owned(),
+        ProviderInteractionKind::Question => "question".to_owned(),
+    });
+    let prompt = if interaction_kind == ProviderInteractionKind::Question {
+        input_json(first_value(
+            payload,
+            &["toolInput", "tool_input", "toolArgs", "input", "arguments"],
+        ))
+    } else {
+        string(
             payload,
             &["description", "message", "body", "text", "title"],
         )
-        .map(bounded_string),
+        .map(bounded_string)
+        .unwrap_or_else(|| {
+            input_json(first_value(
+                payload,
+                &["toolInput", "tool_input", "toolArgs", "input", "arguments"],
+            ))
+        })
+    };
+    ProviderEvent::InteractionRequested {
+        request_id: explicit_tool_id(payload).map(bounded_string),
+        interaction_kind,
+        tool_name,
+        prompt,
     }
 }
 
@@ -309,18 +359,19 @@ fn tool_name(payload: &Map<String, Value>) -> Option<String> {
 }
 
 fn tool_id(payload: &Map<String, Value>, fallback: &str) -> String {
-    bounded_string(
-        string(
-            payload,
-            &[
-                "tool_use_id",
-                "toolUseId",
-                "tool_call_id",
-                "toolCallId",
-                "id",
-            ],
-        )
-        .unwrap_or_else(|| fallback.to_owned()),
+    bounded_string(explicit_tool_id(payload).unwrap_or_else(|| fallback.to_owned()))
+}
+
+fn explicit_tool_id(payload: &Map<String, Value>) -> Option<String> {
+    string(
+        payload,
+        &[
+            "tool_use_id",
+            "toolUseId",
+            "tool_call_id",
+            "toolCallId",
+            "id",
+        ],
     )
 }
 
@@ -480,19 +531,28 @@ mod tests {
     }
 
     #[test]
-    fn kimi_ask_user_pre_tool_is_an_approval_boundary() {
+    fn kimi_ask_user_pre_tool_is_a_structured_question_boundary() {
         let events = normalize_hook_event(
             &id("kimi"),
             "PreToolUse",
             &json!({
                 "tool_name": "AskUserQuestion",
+                "tool_use_id": "question-k1",
                 "tool_input": {"question": "Continue?"}
             }),
         )
         .unwrap();
         assert!(matches!(
             events.as_slice(),
-            [ProviderEvent::ApprovalRequested { tool_name, .. }] if tool_name == "AskUserQuestion"
+            [ProviderEvent::InteractionRequested {
+                interaction_kind: ProviderInteractionKind::Question,
+                request_id: Some(request_id),
+                tool_name,
+                prompt,
+                ..
+            }] if request_id == "question-k1"
+                && tool_name == "AskUserQuestion"
+                && prompt.contains("Continue?")
         ));
     }
 
@@ -531,7 +591,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             blocked.as_slice(),
-            [ProviderEvent::ApprovalRequested { .. }]
+            [ProviderEvent::InteractionRequested {
+                interaction_kind: ProviderInteractionKind::Question,
+                ..
+            }]
         ));
     }
 
@@ -562,7 +625,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             events.as_slice(),
-            [ProviderEvent::ApprovalRequested { tool_name, .. }] if tool_name == "shell"
+            [ProviderEvent::InteractionRequested {
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name,
+                ..
+            }] if tool_name == "shell"
         ));
     }
 

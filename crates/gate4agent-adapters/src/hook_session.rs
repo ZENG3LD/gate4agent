@@ -178,7 +178,7 @@ impl HookSessionReducer {
                 | ProviderEvent::Thinking { .. }
                 | ProviderEvent::Error { .. }
                 | ProviderEvent::Ready
-                | ProviderEvent::ApprovalRequested { .. }
+                | ProviderEvent::InteractionRequested { .. }
                 | ProviderEvent::RateLimited { .. } => {}
             }
         }

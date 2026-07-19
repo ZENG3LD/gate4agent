@@ -6,9 +6,11 @@ use gate4agent_types::{
     ControlError, ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot,
     EffectEnvelope, ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot, InputAction,
     ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind,
-    ProviderActivity, ProviderEvent, ProviderSnapshot, ProviderSource, ProviderSourceCursor,
-    SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize,
-    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
+    ProviderActivity, ProviderEvent, ProviderInteraction, ProviderInteractionId,
+    ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
+    ProviderSnapshot, ProviderSource, ProviderSourceCursor, SessionGeneration, SessionSnapshot,
+    SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX,
     WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
@@ -17,6 +19,8 @@ use std::collections::BTreeMap;
 struct SessionState {
     snapshot: SessionSnapshot,
     pending_terminal_size: Option<TerminalSize>,
+    pending_interrupt: bool,
+    pending_question_answer: bool,
 }
 
 /// Owns logical session lifecycle state. External work is emitted as effects
@@ -80,6 +84,8 @@ impl Gate4AgentEngine {
                             provider: ProviderSnapshot::default(),
                         },
                         pending_terminal_size: None,
+                        pending_interrupt: false,
+                        pending_question_answer: false,
                     },
                 );
                 self.bump_revision();
@@ -305,7 +311,7 @@ impl Gate4AgentEngine {
                 .sessions
                 .get_mut(&instance_id)
                 .expect("validated session");
-            let canonical_sequence = reduce_provider_event(
+            let reduction = reduce_provider_event(
                 &mut state.snapshot.provider,
                 source,
                 *sequence,
@@ -317,11 +323,17 @@ impl Gate4AgentEngine {
                 instance_id,
                 generation,
                 ControlEventKind::ProviderEvent {
-                    sequence: canonical_sequence,
+                    sequence: reduction.sequence,
                     source: source.clone(),
                     source_sequence: *sequence,
                     event: event.clone(),
                 },
+            );
+            self.emit_interaction_transitions(
+                None,
+                instance_id,
+                generation,
+                reduction.interaction_transitions,
             );
             return;
         }
@@ -348,12 +360,24 @@ impl Gate4AgentEngine {
         }
 
         let pending_input = current.pending_input;
+        let pending_interrupt = self
+            .sessions
+            .get(&instance_id)
+            .expect("validated session")
+            .pending_interrupt;
+        let pending_question_answer = self
+            .sessions
+            .get(&instance_id)
+            .expect("validated session")
+            .pending_question_answer;
+        let mut interaction_transitions = Vec::new();
         let event = match envelope.observation {
             ControlObservation::Spawned { process_id } => {
                 let state = self
                     .sessions
                     .get_mut(&instance_id)
                     .expect("validated session");
+                state.pending_interrupt = false;
                 let terminal_size = state.pending_terminal_size.take();
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Running;
@@ -369,6 +393,7 @@ impl Gate4AgentEngine {
                     .get_mut(&instance_id)
                     .expect("validated session");
                 state.pending_terminal_size = None;
+                state.pending_interrupt = false;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Failed {
                     message: message.clone(),
@@ -377,6 +402,10 @@ impl Gate4AgentEngine {
                 session.pending_input = None;
                 session.process_id = None;
                 session.foreground = ForegroundSnapshot::default();
+                interaction_transitions = resolve_all_pending_interactions(
+                    &mut session.provider,
+                    ProviderInteractionOutcome::TurnEnded,
+                );
                 ControlEventKind::Failed { message }
             }
             ControlObservation::ProcessExited {
@@ -391,12 +420,17 @@ impl Gate4AgentEngine {
                     .get_mut(&instance_id)
                     .expect("validated session");
                 state.pending_terminal_size = None;
+                state.pending_interrupt = false;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Exited { exit_code };
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
                 session.foreground = ForegroundSnapshot::default();
+                interaction_transitions = resolve_all_pending_interactions(
+                    &mut session.provider,
+                    ProviderInteractionOutcome::TurnEnded,
+                );
                 if let Some(frame) = final_terminal.filter(|frame| {
                     session
                         .terminal_frame
@@ -422,12 +456,17 @@ impl Gate4AgentEngine {
                     .get_mut(&instance_id)
                     .expect("validated session");
                 state.pending_terminal_size = None;
+                state.pending_interrupt = false;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Exited { exit_code };
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
                 session.foreground = ForegroundSnapshot::default();
+                interaction_transitions = resolve_all_pending_interactions(
+                    &mut session.provider,
+                    ProviderInteractionOutcome::TurnEnded,
+                );
                 if let Some(frame) = final_terminal.filter(|frame| {
                     session
                         .terminal_frame
@@ -446,6 +485,7 @@ impl Gate4AgentEngine {
                     .get_mut(&instance_id)
                     .expect("validated session");
                 state.pending_terminal_size = None;
+                state.pending_interrupt = false;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Failed {
                     message: message.clone(),
@@ -454,20 +494,59 @@ impl Gate4AgentEngine {
                 session.pending_input = None;
                 session.process_id = None;
                 session.foreground = ForegroundSnapshot::default();
+                interaction_transitions = resolve_all_pending_interactions(
+                    &mut session.provider,
+                    ProviderInteractionOutcome::TurnEnded,
+                );
                 ControlEventKind::Failed { message }
             }
             ControlObservation::InputCompleted => {
                 let input_kind = pending_input
                     .expect("validated input completion must have a pending input kind");
-                let session = self.session_mut(instance_id);
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_interrupt = false;
+                let session = &mut state.snapshot;
                 session.pending_operation = None;
                 session.pending_input = None;
+                if pending_interrupt {
+                    interaction_transitions = resolve_all_pending_interactions(
+                        &mut session.provider,
+                        ProviderInteractionOutcome::Interrupted,
+                    );
+                    session.provider.activity = ProviderActivity::Idle;
+                    session.provider.current_prompt = None;
+                    session.provider.active_tools.clear();
+                } else if pending_question_answer {
+                    interaction_transitions = resolve_latest_pending_interaction_by_kind(
+                        &mut session.provider,
+                        ProviderInteractionKind::Question,
+                        ProviderInteractionOutcome::Answered,
+                    );
+                    if !interaction_transitions.is_empty() {
+                        session.provider.activity =
+                            if session.provider.interactions.iter().any(|interaction| {
+                                matches!(interaction.status, ProviderInteractionStatus::Pending)
+                            }) {
+                                ProviderActivity::WaitingForInput
+                            } else {
+                                ProviderActivity::Working
+                            };
+                    }
+                }
                 ControlEventKind::InputCompleted { input_kind }
             }
             ControlObservation::InputFailed { message } => {
                 let input_kind =
                     pending_input.expect("validated input failure must have a pending input kind");
-                let session = self.session_mut(instance_id);
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                state.pending_interrupt = false;
+                let session = &mut state.snapshot;
                 session.pending_operation = None;
                 session.pending_input = None;
                 ControlEventKind::InputFailed {
@@ -519,8 +598,13 @@ impl Gate4AgentEngine {
                 unreachable!("terminal observations return before lifecycle event reduction")
             }
         };
+        self.sessions
+            .get_mut(&instance_id)
+            .expect("validated session")
+            .pending_question_answer = false;
         self.bump_revision();
         self.emit_event(None, instance_id, generation, event);
+        self.emit_interaction_transitions(None, instance_id, generation, interaction_transitions);
     }
 
     pub fn snapshot(&self) -> ControlSnapshot {
@@ -617,6 +701,8 @@ impl Gate4AgentEngine {
                 .get_mut(&instance_id)
                 .expect("validated session");
             state.pending_terminal_size = Some(request.terminal_size);
+            state.pending_interrupt = false;
+            state.pending_question_answer = false;
             let session = &mut state.snapshot;
             session.generation = SessionGeneration(session.generation.0.saturating_add(1));
             session.status = SessionStatus::Starting;
@@ -678,7 +764,13 @@ impl Gate4AgentEngine {
 
         let operation_id = self.allocate_operation();
         let generation = {
-            let session = self.session_mut(instance_id);
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.pending_interrupt = false;
+            state.pending_question_answer = false;
+            let session = &mut state.snapshot;
             session.status = SessionStatus::Stopping;
             session.pending_operation = Some(operation_id);
             session.pending_input = None;
@@ -731,6 +823,14 @@ impl Gate4AgentEngine {
 
         let agent_id = state.snapshot.agent_id.clone();
         let transport = state.snapshot.transport;
+        let interrupt_requested = matches!(
+            &action,
+            InputAction::TerminalControl(TerminalControl::Interrupt)
+        );
+        let question_answer_submitted = matches!(
+            &action,
+            InputAction::SubmitPrompt(_) | InputAction::TerminalControl(TerminalControl::Enter)
+        );
         let (effect, input_kind) = match (transport, action) {
             (TransportKind::Pty, InputAction::AgentCommand(command)) => {
                 let input = prepare_agent_command(command, &agent_id)
@@ -800,7 +900,13 @@ impl Gate4AgentEngine {
 
         let operation_id = self.allocate_operation();
         let generation = {
-            let session = self.session_mut(instance_id);
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.pending_interrupt = interrupt_requested;
+            state.pending_question_answer = question_answer_submitted;
+            let session = &mut state.snapshot;
             session.pending_operation = Some(operation_id);
             session.pending_input = Some(input_kind);
             invalidate_foreground(session, "input requested".to_owned());
@@ -1019,7 +1125,7 @@ impl Gate4AgentEngine {
         }
 
         for event in events {
-            let canonical_sequence = {
+            let reduction = {
                 let snapshot = &mut self
                     .sessions
                     .get_mut(&instance_id)
@@ -1034,11 +1140,17 @@ impl Gate4AgentEngine {
                 instance_id,
                 generation,
                 ControlEventKind::ProviderEvent {
-                    sequence: canonical_sequence,
+                    sequence: reduction.sequence,
                     source: source.clone(),
                     source_sequence,
                     event,
                 },
+            );
+            self.emit_interaction_transitions(
+                Some(command_id),
+                instance_id,
+                generation,
+                reduction.interaction_transitions,
             );
         }
         Ok(())
@@ -1107,6 +1219,30 @@ impl Gate4AgentEngine {
         );
     }
 
+    fn emit_interaction_transitions(
+        &mut self,
+        command_id: Option<CommandId>,
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+        transitions: Vec<ProviderInteractionTransition>,
+    ) {
+        for transition in transitions {
+            let event = match transition {
+                ProviderInteractionTransition::Requested(interaction) => {
+                    ControlEventKind::InteractionRequested { interaction }
+                }
+                ProviderInteractionTransition::Resolved {
+                    interaction_id,
+                    outcome,
+                } => ControlEventKind::InteractionResolved {
+                    interaction_id,
+                    outcome,
+                },
+            };
+            self.emit_event(command_id, instance_id, generation, event);
+        }
+    }
+
     fn emit_event(
         &mut self,
         command_id: Option<CommandId>,
@@ -1130,6 +1266,21 @@ impl Gate4AgentEngine {
 fn invalidate_foreground(snapshot: &mut SessionSnapshot, reason: String) {
     snapshot.foreground.authority = ForegroundAuthority::Stale;
     snapshot.foreground.stale_reason = Some(reason);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderInteractionTransition {
+    Requested(ProviderInteraction),
+    Resolved {
+        interaction_id: ProviderInteractionId,
+        outcome: ProviderInteractionOutcome,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderReduction {
+    sequence: u64,
+    interaction_transitions: Vec<ProviderInteractionTransition>,
 }
 
 fn provider_source_sequence(snapshot: &ProviderSnapshot, source: &ProviderSource) -> u64 {
@@ -1168,7 +1319,9 @@ fn reduce_provider_event(
     source: &ProviderSource,
     source_sequence: u64,
     event: ProviderEvent,
-) -> u64 {
+) -> ProviderReduction {
+    let canonical_sequence = snapshot.sequence.saturating_add(1);
+    let mut interaction_transitions = Vec::new();
     match &event {
         ProviderEvent::SessionStarted {
             session_id,
@@ -1181,8 +1334,18 @@ fn reduce_provider_event(
             snapshot.activity = ProviderActivity::Idle;
             snapshot.current_prompt = None;
             snapshot.active_tools.clear();
+            interaction_transitions.extend(resolve_source_pending_interactions(
+                snapshot,
+                source,
+                ProviderInteractionOutcome::TurnEnded,
+            ));
         }
         ProviderEvent::TurnStarted { prompt } => {
+            interaction_transitions.extend(resolve_source_pending_interactions(
+                snapshot,
+                source,
+                ProviderInteractionOutcome::Superseded,
+            ));
             snapshot.activity = ProviderActivity::Working;
             snapshot.current_prompt = prompt.clone();
             snapshot.active_tools.clear();
@@ -1192,6 +1355,8 @@ fn reduce_provider_event(
             name,
             input_json,
         } => {
+            interaction_transitions
+                .extend(resolve_matching_provider_interactions(snapshot, source, id));
             snapshot.activity = ProviderActivity::Working;
             if let Some(active) = snapshot.active_tools.iter_mut().find(|tool| tool.id == *id) {
                 active.name = name.clone();
@@ -1205,6 +1370,11 @@ fn reduce_provider_event(
             }
         }
         ProviderEvent::ToolCompleted { id, .. } => {
+            let resolved = resolve_matching_provider_interactions(snapshot, source, id);
+            if !resolved.is_empty() {
+                snapshot.activity = ProviderActivity::Working;
+            }
+            interaction_transitions.extend(resolved);
             snapshot.active_tools.retain(|tool| tool.id != *id);
         }
         ProviderEvent::TurnCompleted {
@@ -1220,29 +1390,210 @@ fn reduce_provider_event(
             snapshot.activity = ProviderActivity::Idle;
             snapshot.current_prompt = None;
             snapshot.active_tools.clear();
+            interaction_transitions.extend(resolve_source_pending_interactions(
+                snapshot,
+                source,
+                ProviderInteractionOutcome::TurnEnded,
+            ));
         }
-        ProviderEvent::ApprovalRequested { .. } => {
+        ProviderEvent::InteractionRequested {
+            request_id,
+            interaction_kind,
+            tool_name,
+            prompt,
+        } => {
+            if let Some(request_id) = request_id {
+                interaction_transitions.extend(resolve_provider_request_interactions(
+                    snapshot,
+                    source,
+                    request_id,
+                    ProviderInteractionOutcome::Superseded,
+                ));
+            }
+            let interaction = ProviderInteraction {
+                id: ProviderInteractionId(canonical_sequence),
+                source: source.clone(),
+                provider_request_id: request_id.clone(),
+                interaction_kind: *interaction_kind,
+                tool_name: tool_name.clone(),
+                prompt: prompt.clone(),
+                status: ProviderInteractionStatus::Pending,
+            };
+            push_provider_interaction(snapshot, interaction.clone(), &mut interaction_transitions);
+            interaction_transitions.push(ProviderInteractionTransition::Requested(interaction));
             snapshot.activity = ProviderActivity::WaitingForInput;
         }
         ProviderEvent::RateLimited { .. } | ProviderEvent::Error { .. } => {
             snapshot.activity = ProviderActivity::Blocked;
         }
         ProviderEvent::Ready => {
-            snapshot.activity = ProviderActivity::Idle;
+            snapshot.activity =
+                if snapshot.interactions.iter().any(|interaction| {
+                    matches!(interaction.status, ProviderInteractionStatus::Pending)
+                }) {
+                    ProviderActivity::WaitingForInput
+                } else {
+                    ProviderActivity::Idle
+                };
         }
         ProviderEvent::SessionEnded { .. } => {
             snapshot.activity = ProviderActivity::Idle;
             snapshot.current_prompt = None;
             snapshot.active_tools.clear();
+            interaction_transitions.extend(resolve_source_pending_interactions(
+                snapshot,
+                source,
+                ProviderInteractionOutcome::TurnEnded,
+            ));
         }
         ProviderEvent::Text { .. } | ProviderEvent::Thinking { .. } => {}
     }
     provider_source_cursor_mut(snapshot, source).sequence = source_sequence;
     provider_source_cursor_mut(snapshot, source).stale = false;
-    snapshot.sequence = snapshot.sequence.saturating_add(1);
+    snapshot.sequence = canonical_sequence;
     snapshot.last_event = Some(event);
     snapshot.stale = snapshot.sources.iter().any(|cursor| cursor.stale);
-    snapshot.sequence
+    ProviderReduction {
+        sequence: canonical_sequence,
+        interaction_transitions,
+    }
+}
+
+fn push_provider_interaction(
+    snapshot: &mut ProviderSnapshot,
+    interaction: ProviderInteraction,
+    transitions: &mut Vec<ProviderInteractionTransition>,
+) {
+    if snapshot.interactions.len() >= PROVIDER_INTERACTIONS_MAX {
+        let remove_index = snapshot
+            .interactions
+            .iter()
+            .position(|existing| {
+                matches!(existing.status, ProviderInteractionStatus::Resolved { .. })
+            })
+            .unwrap_or(0);
+        let removed = snapshot.interactions.remove(remove_index);
+        if matches!(removed.status, ProviderInteractionStatus::Pending) {
+            transitions.push(ProviderInteractionTransition::Resolved {
+                interaction_id: removed.id,
+                outcome: ProviderInteractionOutcome::Superseded,
+            });
+        }
+    }
+    snapshot.interactions.push(interaction);
+}
+
+fn resolve_matching_provider_interactions(
+    snapshot: &mut ProviderSnapshot,
+    source: &ProviderSource,
+    provider_request_id: &str,
+) -> Vec<ProviderInteractionTransition> {
+    let matching: Vec<_> = snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.source == *source
+                && interaction.provider_request_id.as_deref() == Some(provider_request_id)
+                && matches!(interaction.status, ProviderInteractionStatus::Pending)
+        })
+        .map(|interaction| {
+            let outcome = match interaction.interaction_kind {
+                ProviderInteractionKind::Approval => ProviderInteractionOutcome::Approved,
+                ProviderInteractionKind::Question => ProviderInteractionOutcome::Answered,
+            };
+            (interaction.id, outcome)
+        })
+        .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_provider_request_interactions(
+    snapshot: &mut ProviderSnapshot,
+    source: &ProviderSource,
+    provider_request_id: &str,
+    outcome: ProviderInteractionOutcome,
+) -> Vec<ProviderInteractionTransition> {
+    let matching = snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.source == *source
+                && interaction.provider_request_id.as_deref() == Some(provider_request_id)
+                && matches!(interaction.status, ProviderInteractionStatus::Pending)
+        })
+        .map(|interaction| (interaction.id, outcome))
+        .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_source_pending_interactions(
+    snapshot: &mut ProviderSnapshot,
+    source: &ProviderSource,
+    outcome: ProviderInteractionOutcome,
+) -> Vec<ProviderInteractionTransition> {
+    let matching = snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.source == *source
+                && matches!(interaction.status, ProviderInteractionStatus::Pending)
+        })
+        .map(|interaction| (interaction.id, outcome))
+        .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_all_pending_interactions(
+    snapshot: &mut ProviderSnapshot,
+    outcome: ProviderInteractionOutcome,
+) -> Vec<ProviderInteractionTransition> {
+    let matching = snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| matches!(interaction.status, ProviderInteractionStatus::Pending))
+        .map(|interaction| (interaction.id, outcome))
+        .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_latest_pending_interaction_by_kind(
+    snapshot: &mut ProviderSnapshot,
+    interaction_kind: ProviderInteractionKind,
+    outcome: ProviderInteractionOutcome,
+) -> Vec<ProviderInteractionTransition> {
+    let matching = snapshot
+        .interactions
+        .iter()
+        .rev()
+        .find(|interaction| {
+            interaction.interaction_kind == interaction_kind
+                && matches!(interaction.status, ProviderInteractionStatus::Pending)
+        })
+        .map(|interaction| (interaction.id, outcome))
+        .into_iter()
+        .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_interaction_ids(
+    snapshot: &mut ProviderSnapshot,
+    matching: Vec<(ProviderInteractionId, ProviderInteractionOutcome)>,
+) -> Vec<ProviderInteractionTransition> {
+    let mut transitions = Vec::with_capacity(matching.len());
+    for (interaction_id, outcome) in matching {
+        if let Some(interaction) = snapshot
+            .interactions
+            .iter_mut()
+            .find(|interaction| interaction.id == interaction_id)
+        {
+            interaction.status = ProviderInteractionStatus::Resolved { outcome };
+            transitions.push(ProviderInteractionTransition::Resolved {
+                interaction_id,
+                outcome,
+            });
+        }
+    }
+    transitions
 }
 
 fn reduce_provider_gap(
@@ -1482,9 +1833,11 @@ mod tests {
                 name: "shell".to_owned(),
                 input_json: "{\"command\":\"cargo test\"}".to_owned(),
             },
-            ProviderEvent::ApprovalRequested {
+            ProviderEvent::InteractionRequested {
+                request_id: Some("tool-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "shell".to_owned(),
-                description: Some("approve".to_owned()),
+                prompt: "approve".to_owned(),
             },
             ProviderEvent::ToolCompleted {
                 id: "tool-1".to_owned(),
@@ -1522,11 +1875,283 @@ mod tests {
                 }
                 1 => assert_eq!(provider.active_tools.len(), 1),
                 2 => assert_eq!(provider.activity, ProviderActivity::WaitingForInput),
-                3 => assert!(provider.active_tools.is_empty()),
+                3 => {
+                    assert!(provider.active_tools.is_empty());
+                    assert_eq!(provider.activity, ProviderActivity::Working);
+                    assert_eq!(
+                        provider.interactions[0].status,
+                        ProviderInteractionStatus::Resolved {
+                            outcome: ProviderInteractionOutcome::Approved
+                        }
+                    );
+                }
                 4 | 5 => assert_eq!(provider.activity, ProviderActivity::Idle),
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn provider_question_has_canonical_identity_and_matching_tool_resolution() {
+        let (mut engine, spawn) = running_engine();
+        engine.drain_events();
+        let source = provider_source();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: source.clone(),
+                sequence: 1,
+                event: ProviderEvent::InteractionRequested {
+                    request_id: Some("question-7".to_owned()),
+                    interaction_kind: ProviderInteractionKind::Question,
+                    tool_name: "AskUserQuestion".to_owned(),
+                    prompt: "{\"question\":\"Continue?\"}".to_owned(),
+                },
+            },
+        });
+
+        let interaction = engine.snapshot().sessions[0].provider.interactions[0].clone();
+        assert_eq!(interaction.id, ProviderInteractionId(1));
+        assert_eq!(interaction.source, source);
+        assert_eq!(interaction.status, ProviderInteractionStatus::Pending);
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            &event.event,
+            ControlEventKind::InteractionRequested { interaction: observed }
+                if observed.id == interaction.id
+        )));
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 2,
+                event: ProviderEvent::ToolStarted {
+                    id: "question-7".to_owned(),
+                    name: "AskUserQuestion".to_owned(),
+                    input_json: "{}".to_owned(),
+                },
+            },
+        });
+
+        let interaction = &engine.snapshot().sessions[0].provider.interactions[0];
+        assert_eq!(
+            interaction.status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Answered
+            }
+        );
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::InteractionResolved {
+                interaction_id: ProviderInteractionId(1),
+                outcome: ProviderInteractionOutcome::Answered,
+            }
+        )));
+    }
+
+    #[test]
+    fn interrupt_resolves_pending_interactions_only_after_effect_completion() {
+        let (mut engine, spawn) = running_engine();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 1,
+                event: ProviderEvent::InteractionRequested {
+                    request_id: Some("approval-1".to_owned()),
+                    interaction_kind: ProviderInteractionKind::Approval,
+                    tool_name: "shell".to_owned(),
+                    prompt: "cargo test".to_owned(),
+                },
+            },
+        });
+        engine.drain_events();
+
+        let send_interrupt = |id| CommandEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            id: CommandId(id),
+            command: ControlCommand::SendInput {
+                instance_id: instance(),
+                action: InputAction::TerminalControl(TerminalControl::Interrupt),
+            },
+        };
+        engine.apply_command(send_interrupt(80)).unwrap();
+        let failed = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(failed.operation_id),
+            instance_id: failed.instance_id,
+            generation: failed.generation,
+            observation: ControlObservation::InputFailed {
+                message: "write rejected".to_owned(),
+            },
+        });
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.interactions[0].status,
+            ProviderInteractionStatus::Pending
+        );
+
+        engine.apply_command(send_interrupt(81)).unwrap();
+        let completed = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(completed.operation_id),
+            instance_id: completed.instance_id,
+            generation: completed.generation,
+            observation: ControlObservation::InputCompleted,
+        });
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.interactions[0].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Interrupted
+            }
+        );
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::InteractionResolved {
+                interaction_id: ProviderInteractionId(1),
+                outcome: ProviderInteractionOutcome::Interrupted,
+            }
+        )));
+    }
+
+    #[test]
+    fn submit_resolves_questions_but_never_infers_permission_approval() {
+        let (mut engine, spawn) = running_engine();
+        for (sequence, event) in [
+            ProviderEvent::InteractionRequested {
+                request_id: Some("approval-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "shell".to_owned(),
+                prompt: "cargo test".to_owned(),
+            },
+            ProviderEvent::InteractionRequested {
+                request_id: Some("question-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Question,
+                tool_name: "AskUserQuestion".to_owned(),
+                prompt: "{\"question\":\"Continue?\"}".to_owned(),
+            },
+            ProviderEvent::InteractionRequested {
+                request_id: Some("question-2".to_owned()),
+                interaction_kind: ProviderInteractionKind::Question,
+                tool_name: "AskUserQuestion".to_owned(),
+                prompt: "{\"question\":\"Use the latest answer?\"}".to_owned(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: provider_source(),
+                    sequence: u64::try_from(sequence + 1).unwrap(),
+                    event,
+                },
+            });
+        }
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 4,
+                event: ProviderEvent::Ready,
+            },
+        });
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.activity,
+            ProviderActivity::WaitingForInput
+        );
+
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(82),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::TerminalControl(TerminalControl::Enter),
+                },
+            })
+            .unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(effect.operation_id),
+            instance_id: effect.instance_id,
+            generation: effect.generation,
+            observation: ControlObservation::InputCompleted,
+        });
+
+        let snapshot = engine.snapshot();
+        let interactions = &snapshot.sessions[0].provider.interactions;
+        assert_eq!(interactions[0].status, ProviderInteractionStatus::Pending);
+        assert_eq!(interactions[1].status, ProviderInteractionStatus::Pending);
+        assert_eq!(
+            interactions[2].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Answered
+            }
+        );
+        assert_eq!(
+            snapshot.sessions[0].provider.activity,
+            ProviderActivity::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn pending_interaction_roster_is_bounded_with_explicit_supersession() {
+        let (mut engine, spawn) = running_engine();
+        engine.drain_events();
+        for index in 0..=PROVIDER_INTERACTIONS_MAX {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: provider_source(),
+                    sequence: u64::try_from(index + 1).unwrap(),
+                    event: ProviderEvent::InteractionRequested {
+                        request_id: Some(format!("approval-{index}")),
+                        interaction_kind: ProviderInteractionKind::Approval,
+                        tool_name: "shell".to_owned(),
+                        prompt: String::new(),
+                    },
+                },
+            });
+        }
+
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.sessions[0].provider.interactions.len(),
+            PROVIDER_INTERACTIONS_MAX
+        );
+        assert_eq!(
+            snapshot.sessions[0].provider.interactions[0].id,
+            ProviderInteractionId(2)
+        );
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::InteractionResolved {
+                interaction_id: ProviderInteractionId(1),
+                outcome: ProviderInteractionOutcome::Superseded,
+            }
+        )));
     }
 
     #[test]

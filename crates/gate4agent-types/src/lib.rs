@@ -7,6 +7,7 @@ mod history;
 mod id;
 mod input;
 mod readiness;
+mod resume;
 mod session_options;
 mod spec;
 
@@ -48,6 +49,11 @@ pub use input::{
     TERMINAL_INPUT_MAX_BYTES, TERMINAL_SUBMIT_DELAY_MS, TERMINAL_WRITE_DELAY_MAX_MS,
 };
 pub use readiness::{AgentReadinessSpec, DraftReadySignal};
+pub use resume::{
+    validate_resume_error, PendingResumeOperation, ResumeAuthorityTarget, ResumeLaunchRequest,
+    ResumePhase, ResumeSessionSummary, ResumeSnapshot, ResumeTarget, ResumeValidationError,
+    RESUME_ERROR_MAX_BYTES,
+};
 pub use session_options::{
     SessionOptionSelection, SessionOptionValidationError, SessionOptionValue,
     SESSION_OPTION_ID_MAX_BYTES, SESSION_OPTION_VALUES_MAX, SESSION_OPTION_VALUE_MAX_BYTES,

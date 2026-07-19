@@ -44,6 +44,22 @@ pub(crate) fn signatures_are_current(signatures: &[ComponentSignature]) -> bool 
     })
 }
 
+pub(crate) fn validated_resume_file(
+    authorized_root: &Path,
+    path: &Path,
+) -> Result<PathBuf, NativeHistoryError> {
+    validate_root(authorized_root)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| NativeHistoryError::SourceChanged)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| NativeHistoryError::SourceChanged)?;
+    if !canonical.starts_with(authorized_root) {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    Ok(canonical)
+}
+
 fn load_file_layout(
     root: &Path,
     primary: &Path,

@@ -16,7 +16,9 @@ use gate4agent_provider_ports::{
     HistoryAuthority, HistoryCandidate, HistoryCandidateId, HistoryDiscoveryRequest,
     HistoryLoadRequest,
 };
-use gate4agent_types::{AdapterBinding, AdapterId, AgentId};
+use gate4agent_types::{
+    AdapterBinding, AdapterId, AgentId, ProviderSessionIdentity, ProviderSessionKey,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -489,6 +491,45 @@ impl NativeHistoryAuthority {
             self.touch_source(&source);
         }
         Ok(candidates)
+    }
+
+    pub fn resume_provider_session(
+        &self,
+        request: &HistoryLoadRequest,
+        session_id: impl Into<String>,
+    ) -> Result<ProviderSessionIdentity, NativeHistoryError> {
+        let id = request.candidate().id().as_str();
+        let record = self
+            .candidates
+            .get(id)
+            .ok_or(NativeHistoryError::CandidateExpired)?;
+        if !record.key.source.matches_load(request)
+            || record.session_id_hint != request.candidate().session_id_hint()
+        {
+            return Err(NativeHistoryError::CandidateSourceMismatch);
+        }
+        let transcript_path = if request.binding().id.as_str() == "pi" {
+            let CandidateLocator::File { root, primary, .. } = &record.key.locator else {
+                return Err(NativeHistoryError::CandidateSourceMismatch);
+            };
+            Some(
+                load::validated_resume_file(root, primary)?
+                    .to_str()
+                    .ok_or(NativeHistoryError::InvalidUtf8)?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        Ok(ProviderSessionIdentity {
+            key: if request.binding().id.as_str() == "antigravity" {
+                ProviderSessionKey::ConversationId
+            } else {
+                ProviderSessionKey::SessionId
+            },
+            id: session_id.into(),
+            transcript_path,
+        })
     }
 
     fn load_candidate(

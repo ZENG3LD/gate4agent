@@ -180,6 +180,20 @@ impl Gate4AgentKernel {
                 }
             }
         }
+        if let ControlCommand::Resume { instance_id, .. } = &command.command {
+            if let Some(session) = self.engine.session_snapshot(*instance_id) {
+                let supports_resume = self
+                    .catalog
+                    .get(&session.agent_id)
+                    .is_some_and(|spec| spec.capabilities.adapters.resume.is_some());
+                if !supports_resume || session.transport != TransportKind::Pty {
+                    return Err(KernelCommandError::UnsupportedCapability {
+                        agent_id: session.agent_id.clone(),
+                        capability: "pty-resume",
+                    });
+                }
+            }
+        }
         if let ControlCommand::Start {
             instance_id,
             request,
@@ -270,8 +284,8 @@ mod tests {
     use super::*;
     use gate4agent_types::{
         AgentInstanceId, ControlObservation, HistoryQuery, ObservationEnvelope, ProviderActivity,
-        ProviderEvent, ProviderSource, SessionOptionSelection, SessionStatus, StartRequest,
-        TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+        ProviderEvent, ProviderSource, ResumeLaunchRequest, ResumeTarget, SessionOptionSelection,
+        SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
@@ -598,6 +612,60 @@ mod tests {
             rejected.command_outcomes[0].result,
             Err(KernelCommandError::UnsupportedCapability {
                 capability: "history",
+                ..
+            })
+        ));
+        assert!(rejected.effects.is_empty());
+    }
+
+    #[test]
+    fn resume_requires_a_declared_adapter_and_pty_before_engine_mutation() {
+        let resume = || {
+            command(
+                2,
+                ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                    },
+                },
+            )
+        };
+
+        let mut unsupported = Gate4AgentKernel::default();
+        unsupported.step([register(1, "kimi")], []);
+        let rejected = unsupported.step([resume()], []);
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedCapability {
+                capability: "pty-resume",
+                ..
+            })
+        ));
+        assert!(rejected.effects.is_empty());
+
+        let mut wrong_transport = Gate4AgentKernel::default();
+        wrong_transport.step(
+            [command(
+                1,
+                ControlCommand::Register {
+                    instance_id: instance(),
+                    agent_id: AgentId::new("codex").unwrap(),
+                    transport: TransportKind::Pipe,
+                },
+            )],
+            [],
+        );
+        let rejected = wrong_transport.step([resume()], []);
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedCapability {
+                capability: "pty-resume",
                 ..
             })
         ));

@@ -109,6 +109,7 @@ pub struct PendingHistoryOperation {
 pub struct HistorySnapshot {
     pub pending: Option<PendingHistoryOperation>,
     pub candidates: Vec<HistoryCandidateSummary>,
+    pub loaded_candidate_id: Option<String>,
     pub loaded: Option<HistorySessionRecord>,
     pub last_error: Option<String>,
 }

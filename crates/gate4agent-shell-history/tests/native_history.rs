@@ -8,7 +8,7 @@ use gate4agent_shell_history::{
     orca_home_roots, NativeHistoryAuthority, NativeHistoryConfig, NativeHistoryDiscoveryIssueKind,
     NativeHistoryError, NativeHistoryLimits, NativeHistoryRoot,
 };
-use gate4agent_types::AdapterId;
+use gate4agent_types::{AdapterId, ProviderSessionKey};
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -338,6 +338,50 @@ fn rediscovery_revokes_disappeared_candidate() {
     assert_eq!(
         authority.load(&load),
         Err(NativeHistoryError::CandidateExpired)
+    );
+}
+
+#[test]
+fn pi_resume_identity_uses_the_validated_primary_transcript() {
+    let fixture = FixtureDir::new("pi-resume");
+    let sessions = fixture.path().join("sessions");
+    let transcript = sessions.join("pi-session-1.jsonl");
+    write(
+        &transcript,
+        concat!(
+            r#"{"type":"session","id":"parsed-pi-session-1"}"#,
+            "\n",
+            r#"{"role":"user","content":"hello"}"#
+        ),
+    );
+    let mut authority = NativeHistoryAuthority::new(
+        NativeHistoryConfig::new(vec![root(
+            "pi",
+            HistorySourceLayout::SingleNdjson,
+            &sessions,
+        )])
+        .unwrap(),
+    );
+    let discovery = request("pi", 8);
+    let candidate = discover_history(&mut authority, &discovery)
+        .unwrap()
+        .remove(0);
+    let load = HistoryLoadRequest::new(&discovery, candidate).unwrap();
+    let parsed = load_history_session(&mut authority, &load).unwrap();
+    let identity = authority
+        .resume_provider_session(&load, parsed.session_id)
+        .unwrap();
+
+    assert_eq!(identity.key, ProviderSessionKey::SessionId);
+    assert_eq!(identity.id, "parsed-pi-session-1");
+    assert_eq!(
+        identity.transcript_path.as_deref(),
+        Some(
+            fs::canonicalize(transcript)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        )
     );
 }
 

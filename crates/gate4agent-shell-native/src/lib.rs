@@ -11,16 +11,19 @@ use gate4agent::{
     PipeSession, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
     SessionConfig,
 };
-use gate4agent_adapters::{builtin_adapter_registry, AdapterRuntimeRegistry};
+use gate4agent_adapters::{
+    build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
+};
 use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
     ForegroundProcess, ForegroundProcessKind, ForegroundRequirement, ObservationEnvelope,
     OperationId, PreparedInputKind, ProviderEvent, ProviderInteractionKind, ProviderSource,
-    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    ResumeLaunchRequest, SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage,
+    TransportKind, CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -30,6 +33,14 @@ use tokio::sync::broadcast;
 pub struct NativeSessionKey {
     pub instance_id: AgentInstanceId,
     pub generation: SessionGeneration,
+}
+
+struct NativeSpawnRequest {
+    agent_id: AgentId,
+    transport: TransportKind,
+    request: StartRequest,
+    launch_extra_args: Vec<OsString>,
+    resumed_provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
 }
 
 struct OwnedPtySession {
@@ -149,8 +160,34 @@ impl NativeEffectShell {
                     transport,
                     request,
                 } => {
-                    self.spawn_native(key, operation_id, agent_id, transport, request, pty_env)
-                        .await
+                    self.spawn_native(
+                        key,
+                        operation_id,
+                        NativeSpawnRequest {
+                            agent_id,
+                            transport,
+                            request,
+                            launch_extra_args: Vec::new(),
+                            resumed_provider_session: None,
+                        },
+                        pty_env,
+                    )
+                    .await
+                }
+                ControlEffect::SpawnResume {
+                    agent_id,
+                    provider_session,
+                    request,
+                } => {
+                    self.spawn_resume(
+                        key,
+                        operation_id,
+                        agent_id,
+                        provider_session,
+                        request,
+                        pty_env,
+                    )
+                    .await
                 }
                 ControlEffect::Stop { force } => self.stop_native(key, force).await,
                 ControlEffect::WriteInput {
@@ -299,6 +336,10 @@ impl NativeEffectShell {
                             .to_owned(),
                     }
                 }
+                ControlEffect::AuthorizeResume { .. } => ControlObservation::ResumeFailed {
+                    message: "resume authorization requires the dedicated native authority"
+                        .to_owned(),
+                },
             }
         };
 
@@ -309,11 +350,16 @@ impl NativeEffectShell {
         &mut self,
         key: NativeSessionKey,
         operation_id: OperationId,
-        agent_id: AgentId,
-        transport: TransportKind,
-        request: StartRequest,
+        spawn: NativeSpawnRequest,
         pty_env: Vec<EnvMutation>,
     ) -> ControlObservation {
+        let NativeSpawnRequest {
+            agent_id,
+            transport,
+            request,
+            launch_extra_args,
+            resumed_provider_session,
+        } = spawn;
         if self.session_exists(key) {
             return ControlObservation::SpawnFailed {
                 message: format!(
@@ -356,7 +402,7 @@ impl NativeEffectShell {
                     platform: RuntimePlatform::current(),
                     prompt: request.initial_prompt,
                     session_options: request.session_options,
-                    ..LaunchRequest::default()
+                    extra_args: launch_extra_args,
                 },
                 request.terminal_size.rows,
                 request.terminal_size.columns,
@@ -381,24 +427,31 @@ impl NativeEffectShell {
                                 }
                             };
                             match session.attach_events(session.beginning_cursor()) {
-                                Ok(attachment) => Some(OwnedPtyProvider {
-                                    source: ProviderSource {
-                                        family: AdapterFamily::PtySemantic,
-                                        binding: adapter.clone(),
-                                    },
-                                    receiver: attachment.receiver,
-                                    replay: attachment.replay.into(),
-                                    pending_events: VecDeque::from([
-                                        ProviderEvent::SessionStarted {
+                                Ok(attachment) => {
+                                    let mut pending_events =
+                                        VecDeque::from([ProviderEvent::SessionStarted {
                                             session_id,
                                             model: String::new(),
                                             tools: Vec::new(),
+                                        }]);
+                                    if let Some(identity) = resumed_provider_session {
+                                        pending_events.push_back(
+                                            ProviderEvent::SessionIdentityObserved { identity },
+                                        );
+                                    }
+                                    Some(OwnedPtyProvider {
+                                        source: ProviderSource {
+                                            family: AdapterFamily::PtySemantic,
+                                            binding: adapter.clone(),
                                         },
-                                    ]),
-                                    pipeline: Mutex::new(create_pipeline(tool)),
-                                    rate_limits: RateLimitDetector::new_for_tool(tool),
-                                    next_provider_sequence: 1,
-                                }),
+                                        receiver: attachment.receiver,
+                                        replay: attachment.replay.into(),
+                                        pending_events,
+                                        pipeline: Mutex::new(create_pipeline(tool)),
+                                        rate_limits: RateLimitDetector::new_for_tool(tool),
+                                        next_provider_sequence: 1,
+                                    })
+                                }
                                 Err(error) => {
                                     let _ = session.shutdown().await;
                                     return ControlObservation::SpawnFailed {
@@ -568,6 +621,64 @@ impl NativeEffectShell {
                 }
             }
         }
+    }
+
+    async fn spawn_resume(
+        &mut self,
+        key: NativeSessionKey,
+        operation_id: OperationId,
+        agent_id: AgentId,
+        provider_session: gate4agent_types::ProviderSessionIdentity,
+        request: ResumeLaunchRequest,
+        pty_env: Vec<EnvMutation>,
+    ) -> ControlObservation {
+        if let Err(error) = request.validate() {
+            return ControlObservation::SpawnFailed {
+                message: error.to_string(),
+            };
+        }
+        let Some(spec) = self.catalog.get(&agent_id) else {
+            return ControlObservation::SpawnFailed {
+                message: format!("agent '{agent_id}' is absent from native catalog"),
+            };
+        };
+        let Some(binding) = spec.capabilities.adapters.resume.as_ref() else {
+            return ControlObservation::SpawnFailed {
+                message: format!("agent '{agent_id}' does not declare Resume capability"),
+            };
+        };
+        let plan = match build_resume_plan_for_identity(&binding.id, &provider_session) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                return ControlObservation::SpawnFailed {
+                    message: format!("agent '{agent_id}' has no live Resume plan"),
+                }
+            }
+            Err(error) => {
+                return ControlObservation::SpawnFailed {
+                    message: error.to_string(),
+                }
+            }
+        };
+        let start = StartRequest {
+            working_directory: request.working_directory,
+            terminal_size: request.terminal_size,
+            initial_prompt: None,
+            session_options: None,
+        };
+        self.spawn_native(
+            key,
+            operation_id,
+            NativeSpawnRequest {
+                agent_id,
+                transport: TransportKind::Pty,
+                request: start,
+                launch_extra_args: plan.args.into_iter().map(OsString::from).collect(),
+                resumed_provider_session: Some(provider_session),
+            },
+            pty_env,
+        )
+        .await
     }
 
     async fn stop_native(&mut self, key: NativeSessionKey, force: bool) -> ControlObservation {
@@ -1118,6 +1229,8 @@ fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation
         ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
             ControlObservation::HistoryFailed { message }
         }
+        ControlEffect::AuthorizeResume { .. } => ControlObservation::ResumeFailed { message },
+        ControlEffect::SpawnResume { .. } => ControlObservation::SpawnFailed { message },
     }
 }
 

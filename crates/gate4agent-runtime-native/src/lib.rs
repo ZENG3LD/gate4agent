@@ -4,8 +4,9 @@ use gate4agent_catalog::{AgentRegistry, EnvMutation};
 use gate4agent_handle::{bounded_port, Gate4AgentHandle, KernelPort, PublishReport};
 use gate4agent_kernel::{CommandOutcome, Gate4AgentKernel};
 use gate4agent_provider_ports::{
-    discover_history, load_history_session, HistoryCandidate, HistoryDiscoveryRequest,
-    HistoryLoadRequest,
+    discover_history, load_history_session, prepare_resume, HistoryCandidate,
+    HistoryDiscoveryRequest, HistoryLoadRequest, PreparedResume, ResumeAuthority,
+    ResumeAuthorityDecision, ResumeOutcome, ResumeRequest,
 };
 use gate4agent_shell_history::NativeHistoryAuthority;
 pub use gate4agent_shell_history::{NativeHistoryConfig, NativeHistoryRoot};
@@ -15,9 +16,11 @@ use gate4agent_shell_native::NativeEffectShell;
 use gate4agent_types::{
     AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
     HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole, HistorySessionRecord,
-    ObservationEnvelope, SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
+    ObservationEnvelope, ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration,
+    SessionStatus, CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -222,7 +225,7 @@ struct NativeEffectDispatcher {
     catalog: AgentRegistry,
     config: NativeRuntimeConfig,
     workers: HashMap<AgentInstanceId, EffectWorker>,
-    history_worker: Option<EffectWorker>,
+    authority_worker: Option<EffectWorker>,
     history_config: Option<NativeHistoryConfig>,
     control_tx: Sender<ObservationEnvelope>,
     control_rx: Receiver<ObservationEnvelope>,
@@ -243,7 +246,7 @@ impl NativeEffectDispatcher {
             catalog,
             config,
             workers: HashMap::new(),
-            history_worker: None,
+            authority_worker: None,
             history_config,
             control_tx,
             control_rx,
@@ -264,9 +267,11 @@ impl NativeEffectDispatcher {
     fn dispatch(&mut self, effect: EffectEnvelope) {
         if matches!(
             effect.effect,
-            ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. }
+            ControlEffect::DiscoverHistory { .. }
+                | ControlEffect::LoadHistory { .. }
+                | ControlEffect::AuthorizeResume { .. }
         ) {
-            self.dispatch_history(effect);
+            self.dispatch_authority(effect);
             return;
         }
         self.workers.retain(|_, worker| !worker.sender.is_closed());
@@ -305,30 +310,35 @@ impl NativeEffectDispatcher {
         ));
     }
 
-    fn dispatch_history(&mut self, effect: EffectEnvelope) {
-        let Some(history_config) = self.history_config.clone() else {
+    fn dispatch_authority(&mut self, effect: EffectEnvelope) {
+        if self.history_config.is_none()
+            && matches!(
+                effect.effect,
+                ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. }
+            )
+        {
             self.pending_failures.push_back(effect_failure(
                 effect,
                 "native history authority is not configured".to_owned(),
             ));
             return;
-        };
+        }
         let mut pending = NativeEffectRequest {
             effect,
             pty_env: Vec::new(),
         };
         for _ in 0..2 {
-            let sender = self.history_sender(history_config.clone());
+            let sender = self.authority_sender();
             match sender.try_send(pending) {
                 Ok(()) => return,
                 Err(TrySendError::Closed(request)) => {
-                    self.history_worker = None;
+                    self.authority_worker = None;
                     pending = request;
                 }
                 Err(TrySendError::Full(request)) => {
                     self.pending_failures.push_back(effect_failure(
                         request.effect,
-                        "native history effect queue is full".to_owned(),
+                        "native authority effect queue is full".to_owned(),
                     ));
                     return;
                 }
@@ -336,37 +346,38 @@ impl NativeEffectDispatcher {
         }
         self.pending_failures.push_back(effect_failure(
             pending.effect,
-            "native history effect worker is unavailable".to_owned(),
+            "native authority effect worker is unavailable".to_owned(),
         ));
     }
 
-    fn history_sender(&mut self, config: NativeHistoryConfig) -> Sender<NativeEffectRequest> {
-        if let Some(worker) = &self.history_worker {
+    fn authority_sender(&mut self) -> Sender<NativeEffectRequest> {
+        if let Some(worker) = &self.authority_worker {
             if !worker.sender.is_closed() {
                 return worker.sender.clone();
             }
         }
         let (sender, receiver) = mpsc::channel(self.config.effect_capacity_per_session.max(1));
-        tokio::spawn(run_history_worker(
+        tokio::spawn(run_authority_worker(
             self.catalog.clone(),
-            config,
+            self.history_config.clone(),
             receiver,
             self.control_tx.clone(),
         ));
-        self.history_worker = Some(EffectWorker {
+        self.authority_worker = Some(EffectWorker {
             sender: sender.clone(),
         });
         sender
     }
 
     fn hook_pty_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
-        let ControlEffect::Spawn {
-            agent_id,
-            transport: gate4agent_types::TransportKind::Pty,
-            ..
-        } = &effect.effect
-        else {
-            return Ok(Vec::new());
+        let agent_id = match &effect.effect {
+            ControlEffect::Spawn {
+                agent_id,
+                transport: gate4agent_types::TransportKind::Pty,
+                ..
+            }
+            | ControlEffect::SpawnResume { agent_id, .. } => agent_id,
+            _ => return Ok(Vec::new()),
         };
         let control = self
             .hook_ingress
@@ -397,7 +408,10 @@ impl NativeEffectDispatcher {
     }
 
     fn remove_hook_route(&self, effect: &EffectEnvelope) {
-        if !matches!(effect.effect, ControlEffect::Spawn { .. }) {
+        if !matches!(
+            effect.effect,
+            ControlEffect::Spawn { .. } | ControlEffect::SpawnResume { .. }
+        ) {
             return;
         }
         if let Some(control) = self
@@ -477,18 +491,18 @@ struct InstanceHistoryDiscovery {
     candidates: HashMap<String, HistoryCandidate>,
 }
 
-struct NativeHistoryWorkerState {
+struct NativeAuthorityWorkerState {
     catalog: AgentRegistry,
-    authority: NativeHistoryAuthority,
+    authority: Option<NativeHistoryAuthority>,
     discoveries: HashMap<AgentInstanceId, InstanceHistoryDiscovery>,
     discovery_order: VecDeque<AgentInstanceId>,
 }
 
-impl NativeHistoryWorkerState {
-    fn new(catalog: AgentRegistry, config: NativeHistoryConfig) -> Self {
+impl NativeAuthorityWorkerState {
+    fn new(catalog: AgentRegistry, config: Option<NativeHistoryConfig>) -> Self {
         Self {
             catalog,
-            authority: NativeHistoryAuthority::new(config),
+            authority: config.map(NativeHistoryAuthority::new),
             discoveries: HashMap::new(),
             discovery_order: VecDeque::new(),
         }
@@ -502,12 +516,14 @@ impl NativeHistoryWorkerState {
             generation,
             effect,
         } = envelope;
+        let is_resume = matches!(effect, ControlEffect::AuthorizeResume { .. });
         let observation = if protocol_version != CONTROL_PROTOCOL_VERSION {
-            ControlObservation::HistoryFailed {
-                message: format!(
-                    "history effect protocol version {protocol_version} is unsupported; expected {CONTROL_PROTOCOL_VERSION}"
+            authority_failure(
+                is_resume,
+                format!(
+                    "authority effect protocol version {protocol_version} is unsupported; expected {CONTROL_PROTOCOL_VERSION}"
                 ),
-            }
+            )
         } else {
             match effect {
                 ControlEffect::DiscoverHistory { agent_id, query } => {
@@ -517,9 +533,14 @@ impl NativeHistoryWorkerState {
                     agent_id,
                     candidate_id,
                 } => self.load(instance_id, generation, agent_id, candidate_id),
-                _ => ControlObservation::HistoryFailed {
-                    message: "native history worker received a non-history effect".to_owned(),
-                },
+                ControlEffect::AuthorizeResume {
+                    agent_id,
+                    target,
+                    request,
+                } => self.authorize_resume(instance_id, generation, agent_id, target, request),
+                _ => {
+                    history_failure("native authority worker received an invalid effect".to_owned())
+                }
             }
         };
         ObservationEnvelope {
@@ -538,15 +559,18 @@ impl NativeHistoryWorkerState {
         agent_id: AgentId,
         query: gate4agent_types::HistoryQuery,
     ) -> ControlObservation {
-        let Some(spec) = self.catalog.get(&agent_id) else {
+        let Some(spec) = self.catalog.get(&agent_id).cloned() else {
             return history_failure(format!("agent '{agent_id}' is absent from native catalog"));
         };
         let request =
-            match HistoryDiscoveryRequest::from_spec(spec, query.working_directory, query.limit) {
+            match HistoryDiscoveryRequest::from_spec(&spec, query.working_directory, query.limit) {
                 Ok(request) => request,
                 Err(error) => return history_failure(error.to_string()),
             };
-        let candidates = match discover_history(&mut self.authority, &request) {
+        let Some(authority) = self.authority.as_mut() else {
+            return history_failure("native history authority is not configured".to_owned());
+        };
+        let candidates = match discover_history(authority, &request) {
             Ok(candidates) => candidates,
             Err(error) => return history_failure(error.to_string()),
         };
@@ -607,7 +631,10 @@ impl NativeHistoryWorkerState {
             Ok(load) => load,
             Err(error) => return history_failure(error.to_string()),
         };
-        match load_history_session(&mut self.authority, &load) {
+        let Some(authority) = self.authority.as_mut() else {
+            return history_failure("native history authority is not configured".to_owned());
+        };
+        match load_history_session(authority, &load) {
             Ok(session) => {
                 let session = history_session_record(session);
                 if let Err(error) = session.validate() {
@@ -617,6 +644,76 @@ impl NativeHistoryWorkerState {
                 }
             }
             Err(error) => history_failure(error.to_string()),
+        }
+    }
+
+    fn authorize_resume(
+        &mut self,
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+        agent_id: AgentId,
+        target: ResumeAuthorityTarget,
+        request: ResumeLaunchRequest,
+    ) -> ControlObservation {
+        if let Err(error) = request.validate() {
+            return resume_failure(error.to_string());
+        }
+        let Some(spec) = self.catalog.get(&agent_id).cloned() else {
+            return resume_failure(format!("agent '{agent_id}' is absent from native catalog"));
+        };
+
+        let provider_session = match target {
+            ResumeAuthorityTarget::ProviderSession { identity } => identity,
+            ResumeAuthorityTarget::HistoryCandidate { candidate_id } => {
+                let Some(discovery) = self.discoveries.get(&instance_id) else {
+                    return resume_failure("history candidate discovery is expired".to_owned());
+                };
+                if discovery.generation != generation || discovery.agent_id != agent_id {
+                    return resume_failure("history candidate generation is stale".to_owned());
+                }
+                let Some(candidate) = discovery.candidates.get(&candidate_id).cloned() else {
+                    return resume_failure("history candidate is expired or unknown".to_owned());
+                };
+                let discovery_request = discovery.request.clone();
+                self.touch_discovery(instance_id);
+                let load = match HistoryLoadRequest::new(&discovery_request, candidate) {
+                    Ok(load) => load,
+                    Err(error) => return resume_failure(error.to_string()),
+                };
+                let Some(authority) = self.authority.as_mut() else {
+                    return resume_failure("native history authority is not configured".to_owned());
+                };
+                let session = match load_history_session(authority, &load) {
+                    Ok(session) => session,
+                    Err(error) => return resume_failure(error.to_string()),
+                };
+                match authority.resume_provider_session(&load, session.session_id) {
+                    Ok(identity) => identity,
+                    Err(error) => return resume_failure(error.to_string()),
+                }
+            }
+        };
+        let resume_request = match ResumeRequest::from_provider_session(
+            &spec,
+            provider_session,
+            Some(request.working_directory.clone()),
+        ) {
+            Ok(request) => request,
+            Err(error) => return resume_failure(error.to_string()),
+        };
+        match prepare_resume(&mut ExplicitResumeAuthority, resume_request) {
+            Ok(ResumeOutcome::Authorized(prepared)) => {
+                if prepared.working_directory() != Some(request.working_directory.as_str()) {
+                    return resume_failure(
+                        "resume authority changed the requested working directory".to_owned(),
+                    );
+                }
+                ControlObservation::ResumeAuthorized {
+                    provider_session: prepared.provider_session().clone(),
+                }
+            }
+            Ok(ResumeOutcome::Denied { reason }) => ControlObservation::ResumeDenied { reason },
+            Err(error) => resume_failure(error.to_string()),
         }
     }
 
@@ -632,13 +729,13 @@ impl NativeHistoryWorkerState {
     }
 }
 
-async fn run_history_worker(
+async fn run_authority_worker(
     catalog: AgentRegistry,
-    config: NativeHistoryConfig,
+    config: Option<NativeHistoryConfig>,
     mut effects: Receiver<NativeEffectRequest>,
     control_tx: Sender<ObservationEnvelope>,
 ) {
-    let state = Arc::new(Mutex::new(NativeHistoryWorkerState::new(catalog, config)));
+    let state = Arc::new(Mutex::new(NativeAuthorityWorkerState::new(catalog, config)));
     while let Some(request) = effects.recv().await {
         let fallback = request.effect.clone();
         let worker_state = Arc::clone(&state);
@@ -651,7 +748,7 @@ async fn run_history_worker(
         .await
         {
             Ok(completion) => completion,
-            Err(_) => effect_failure(fallback, "native history worker task failed".to_owned()),
+            Err(_) => effect_failure(fallback, "native authority worker task failed".to_owned()),
         };
         if control_tx.send(completion).await.is_err() {
             break;
@@ -661,6 +758,31 @@ async fn run_history_worker(
 
 fn history_failure(message: String) -> ControlObservation {
     ControlObservation::HistoryFailed { message }
+}
+
+fn resume_failure(message: String) -> ControlObservation {
+    ControlObservation::ResumeFailed { message }
+}
+
+fn authority_failure(is_resume: bool, message: String) -> ControlObservation {
+    if is_resume {
+        resume_failure(message)
+    } else {
+        history_failure(message)
+    }
+}
+
+struct ExplicitResumeAuthority;
+
+impl ResumeAuthority for ExplicitResumeAuthority {
+    type Error = Infallible;
+
+    fn authorize(
+        &mut self,
+        _prepared: &PreparedResume,
+    ) -> Result<ResumeAuthorityDecision, Self::Error> {
+        Ok(ResumeAuthorityDecision::Authorized)
+    }
 }
 
 fn history_session_record(session: gate4agent_adapters::HistorySession) -> HistorySessionRecord {
@@ -829,7 +951,9 @@ fn update_active_count(counter: &AtomicUsize, before: usize, after: usize) {
 
 fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelope {
     let observation = match effect.effect {
-        ControlEffect::Spawn { .. } => ControlObservation::SpawnFailed { message },
+        ControlEffect::Spawn { .. } | ControlEffect::SpawnResume { .. } => {
+            ControlObservation::SpawnFailed { message }
+        }
         ControlEffect::Stop { .. } => ControlObservation::StopFailed { message },
         ControlEffect::WriteInput { .. } => ControlObservation::InputFailed { message },
         ControlEffect::SubmitPrompt { .. } | ControlEffect::Interrupt => {
@@ -840,6 +964,7 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
         ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
             ControlObservation::HistoryFailed { message }
         }
+        ControlEffect::AuthorizeResume { .. } => ControlObservation::ResumeFailed { message },
     };
     ObservationEnvelope {
         protocol_version: CONTROL_PROTOCOL_VERSION,

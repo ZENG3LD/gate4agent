@@ -1,12 +1,13 @@
 use crate::{
     AdapterBinding, AdapterFamily, AgentId, HistoryCandidateSummary, HistoryOperation,
     HistoryQuery, HistorySessionRecord, HistorySnapshot, InputAction, InputPrepareError,
-    PreparedInput, PreparedInputKind, SessionOptionSelection,
+    PreparedInput, PreparedInputKind, ResumeAuthorityTarget, ResumeLaunchRequest,
+    ResumeSessionSummary, ResumeSnapshot, ResumeTarget, SessionOptionSelection,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 20;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 21;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -167,6 +168,11 @@ pub enum ControlCommand {
         instance_id: AgentInstanceId,
         candidate_id: String,
     },
+    Resume {
+        instance_id: AgentInstanceId,
+        target: ResumeTarget,
+        request: ResumeLaunchRequest,
+    },
     IngestProvider {
         instance_id: AgentInstanceId,
         generation: SessionGeneration,
@@ -190,6 +196,7 @@ impl ControlCommand {
             | Self::RefreshForeground { instance_id }
             | Self::DiscoverHistory { instance_id, .. }
             | Self::LoadHistory { instance_id, .. }
+            | Self::Resume { instance_id, .. }
             | Self::IngestProvider { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
@@ -251,6 +258,16 @@ pub enum ControlEffect {
         agent_id: AgentId,
         candidate_id: String,
     },
+    AuthorizeResume {
+        agent_id: AgentId,
+        target: ResumeAuthorityTarget,
+        request: ResumeLaunchRequest,
+    },
+    SpawnResume {
+        agent_id: AgentId,
+        provider_session: ProviderSessionIdentity,
+        request: ResumeLaunchRequest,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -306,6 +323,15 @@ pub enum ControlObservation {
         session: HistorySessionRecord,
     },
     HistoryFailed {
+        message: String,
+    },
+    ResumeAuthorized {
+        provider_session: ProviderSessionIdentity,
+    },
+    ResumeDenied {
+        reason: String,
+    },
+    ResumeFailed {
         message: String,
     },
     TerminalFrame {
@@ -364,6 +390,7 @@ pub struct SessionSnapshot {
     pub terminal_stale: Option<String>,
     pub session_options: Option<SessionOptionSelection>,
     pub history: HistorySnapshot,
+    pub resume: ResumeSnapshot,
     pub foreground: ForegroundSnapshot,
     pub provider: ProviderSnapshot,
 }
@@ -408,6 +435,26 @@ pub struct ProviderSessionIdentity {
     pub key: ProviderSessionKey,
     pub id: String,
     pub transcript_path: Option<String>,
+}
+
+impl ProviderSessionIdentity {
+    pub fn validate(&self) -> Result<(), ProviderEventValidationError> {
+        validate_required("provider session id", &self.id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+        if self.id.starts_with('-') {
+            return Err(ProviderEventValidationError::InvalidField {
+                field: "provider session id",
+                max: PROVIDER_EVENT_ID_MAX_BYTES,
+            });
+        }
+        if let Some(path) = &self.transcript_path {
+            validate_required(
+                "provider transcript path",
+                path,
+                PROVIDER_SESSION_LOCATOR_MAX_BYTES,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -511,24 +558,7 @@ impl ProviderEvent {
                 }
             }
             Self::SessionIdentityObserved { identity } => {
-                validate_required(
-                    "provider session id",
-                    &identity.id,
-                    PROVIDER_EVENT_ID_MAX_BYTES,
-                )?;
-                if identity.id.starts_with('-') {
-                    return Err(ProviderEventValidationError::InvalidField {
-                        field: "provider session id",
-                        max: PROVIDER_EVENT_ID_MAX_BYTES,
-                    });
-                }
-                if let Some(path) = &identity.transcript_path {
-                    validate_required(
-                        "provider transcript path",
-                        path,
-                        PROVIDER_SESSION_LOCATOR_MAX_BYTES,
-                    )?;
-                }
+                identity.validate()?;
             }
             Self::TurnStarted { prompt } => {
                 if let Some(prompt) = prompt {
@@ -864,6 +894,23 @@ pub enum ControlEventKind {
     HistoryFailed {
         message: String,
     },
+    ResumeRequested {
+        operation_id: OperationId,
+        target: ResumeTarget,
+    },
+    ResumeAuthorized {
+        session: ResumeSessionSummary,
+    },
+    Resumed {
+        session: ResumeSessionSummary,
+        process_id: Option<u32>,
+    },
+    ResumeDenied {
+        reason: String,
+    },
+    ResumeFailed {
+        message: String,
+    },
     TerminalStale {
         message: String,
     },
@@ -911,6 +958,7 @@ pub enum ObservationIgnoredReason {
     StaleProviderEvent,
     InvalidForegroundObservation,
     InvalidHistoryObservation,
+    InvalidResumeObservation,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
@@ -943,6 +991,12 @@ pub enum ControlError {
     HistoryOperationPending { operation_id: OperationId },
     #[error("history candidate is not present in the current discovery snapshot")]
     UnknownHistoryCandidate,
+    #[error("resume request is invalid: {message}")]
+    InvalidResumeRequest { message: String },
+    #[error("resume requires a canonical provider session identity")]
+    MissingProviderSession,
+    #[error("resume history candidate must be the currently loaded candidate")]
+    HistoryCandidateNotLoaded,
     #[error("transport {transport:?} does not support {action}")]
     UnsupportedTransportOperation {
         transport: TransportKind,

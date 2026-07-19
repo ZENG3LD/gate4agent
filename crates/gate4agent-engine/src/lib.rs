@@ -2,17 +2,18 @@
 
 use gate4agent_types::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_shell_command,
-    validate_candidate_id, validate_history_error, ActiveProviderTool, AgentInstanceId,
-    CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError, ControlEvent,
-    ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope, ForegroundAuthority,
-    ForegroundRequirement, ForegroundSnapshot, HistoryOperation, HistoryQuery, HistorySnapshot,
-    InputAction, ObservationEnvelope, ObservationIgnoredReason, OperationId,
-    PendingHistoryOperation, PreparedInputKind, ProviderActivity, ProviderEvent,
-    ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
+    validate_candidate_id, validate_history_error, validate_resume_error, ActiveProviderTool,
+    AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
+    ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
+    ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot, HistoryOperation, HistoryQuery,
+    HistorySnapshot, InputAction, ObservationEnvelope, ObservationIgnoredReason, OperationId,
+    PendingHistoryOperation, PendingResumeOperation, PreparedInputKind, ProviderActivity,
+    ProviderEvent, ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
     ProviderInteractionOutcome, ProviderInteractionStatus, ProviderSessionIdentity,
     ProviderSessionKey, ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent,
-    SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize,
-    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
+    ResumeAuthorityTarget, ResumeLaunchRequest, ResumePhase, ResumeSessionSummary, ResumeSnapshot,
+    ResumeTarget, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl,
+    TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
     PROVIDER_INTERACTIONS_MAX, PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +24,7 @@ struct SessionState {
     pending_terminal_size: Option<TerminalSize>,
     pending_interrupt: bool,
     pending_question_answer: bool,
+    pending_resume_identity: Option<ProviderSessionIdentity>,
 }
 
 /// Owns logical session lifecycle state. External work is emitted as effects
@@ -84,12 +86,14 @@ impl Gate4AgentEngine {
                             terminal_stale: None,
                             session_options: None,
                             history: HistorySnapshot::default(),
+                            resume: ResumeSnapshot::default(),
                             foreground: ForegroundSnapshot::default(),
                             provider: ProviderSnapshot::default(),
                         },
                         pending_terminal_size: None,
                         pending_interrupt: false,
                         pending_question_answer: false,
+                        pending_resume_identity: None,
                     },
                 );
                 self.bump_revision();
@@ -125,6 +129,11 @@ impl Gate4AgentEngine {
                 instance_id,
                 candidate_id,
             } => self.load_history(command_id, instance_id, candidate_id),
+            ControlCommand::Resume {
+                instance_id,
+                target,
+                request,
+            } => self.resume(command_id, instance_id, target, request),
             ControlCommand::IngestProvider {
                 instance_id,
                 generation,
@@ -268,6 +277,12 @@ impl Gate4AgentEngine {
                         | ControlObservation::HistoryLoaded { .. }
                         | ControlObservation::HistoryFailed { .. },
                 )
+                | (
+                    _,
+                    ControlObservation::ResumeAuthorized { .. }
+                        | ControlObservation::ResumeDenied { .. }
+                        | ControlObservation::ResumeFailed { .. },
+                )
         );
         if !valid {
             self.emit_ignored(
@@ -325,10 +340,17 @@ impl Gate4AgentEngine {
             match envelope.observation {
                 ControlObservation::HistoryDiscovered { candidates } => {
                     state.snapshot.history.candidates = candidates;
+                    state.snapshot.history.loaded_candidate_id = None;
                     state.snapshot.history.loaded = None;
                     state.snapshot.history.last_error = None;
                 }
                 ControlObservation::HistoryLoaded { session } => {
+                    state.snapshot.history.loaded_candidate_id = match pending.operation {
+                        HistoryOperation::Load { candidate_id } => Some(candidate_id),
+                        HistoryOperation::Discover { .. } => {
+                            unreachable!("loaded history matched a load operation")
+                        }
+                    };
                     state.snapshot.history.loaded = Some(session);
                     state.snapshot.history.last_error = None;
                 }
@@ -339,6 +361,132 @@ impl Gate4AgentEngine {
             }
             self.bump_revision();
             self.emit_event(None, instance_id, generation, event);
+            return;
+        }
+
+        if is_resume_authority_observation(&envelope.observation) {
+            let Some(pending) = current.resume.pending.as_ref().cloned() else {
+                self.emit_ignored(
+                    instance_id,
+                    generation,
+                    ObservationIgnoredReason::InvalidResumeObservation,
+                );
+                return;
+            };
+            if pending.phase != ResumePhase::Authorizing {
+                self.emit_ignored(
+                    instance_id,
+                    generation,
+                    ObservationIgnoredReason::InvalidResumeObservation,
+                );
+                return;
+            }
+            let operation_id = pending.operation_id;
+            match envelope.observation {
+                ControlObservation::ResumeAuthorized { provider_session }
+                    if provider_session.validate().is_ok()
+                        && resume_identity_matches_target(
+                            current,
+                            &pending.target,
+                            &provider_session,
+                        ) =>
+                {
+                    let summary = ResumeSessionSummary::from(&provider_session);
+                    let (next_generation, agent_id) = {
+                        let state = self
+                            .sessions
+                            .get_mut(&instance_id)
+                            .expect("validated session");
+                        state.pending_terminal_size = Some(pending.request.terminal_size);
+                        state.pending_interrupt = false;
+                        state.pending_question_answer = false;
+                        state.pending_resume_identity = Some(provider_session.clone());
+                        let session = &mut state.snapshot;
+                        session.generation =
+                            SessionGeneration(session.generation.0.saturating_add(1));
+                        session.status = SessionStatus::Starting;
+                        session.pending_operation = Some(operation_id);
+                        session.pending_input = None;
+                        session.process_id = None;
+                        session.terminal_size = None;
+                        session.terminal_frame = None;
+                        session.terminal_stale = None;
+                        session.session_options = None;
+                        session.history = HistorySnapshot::default();
+                        session.foreground = ForegroundSnapshot::default();
+                        session.provider = ProviderSnapshot::default();
+                        session.resume.pending = Some(PendingResumeOperation {
+                            phase: ResumePhase::Spawning,
+                            ..pending.clone()
+                        });
+                        session.resume.last_error = None;
+                        (session.generation, session.agent_id.clone())
+                    };
+                    self.effects.push(EffectEnvelope {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        operation_id,
+                        instance_id,
+                        generation: next_generation,
+                        effect: ControlEffect::SpawnResume {
+                            agent_id,
+                            provider_session,
+                            request: pending.request,
+                        },
+                    });
+                    self.bump_revision();
+                    self.emit_event(
+                        None,
+                        instance_id,
+                        next_generation,
+                        ControlEventKind::ResumeAuthorized { session: summary },
+                    );
+                }
+                ControlObservation::ResumeDenied { reason }
+                    if validate_resume_error(&reason).is_ok() =>
+                {
+                    let state = self
+                        .sessions
+                        .get_mut(&instance_id)
+                        .expect("validated session");
+                    state.pending_resume_identity = None;
+                    state.snapshot.pending_operation = None;
+                    state.snapshot.resume.pending = None;
+                    state.snapshot.resume.last_error = Some(reason.clone());
+                    self.bump_revision();
+                    self.emit_event(
+                        None,
+                        instance_id,
+                        generation,
+                        ControlEventKind::ResumeDenied { reason },
+                    );
+                }
+                ControlObservation::ResumeFailed { message }
+                    if validate_resume_error(&message).is_ok() =>
+                {
+                    let state = self
+                        .sessions
+                        .get_mut(&instance_id)
+                        .expect("validated session");
+                    state.pending_resume_identity = None;
+                    state.snapshot.pending_operation = None;
+                    state.snapshot.resume.pending = None;
+                    state.snapshot.resume.last_error = Some(message.clone());
+                    self.bump_revision();
+                    self.emit_event(
+                        None,
+                        instance_id,
+                        generation,
+                        ControlEventKind::ResumeFailed { message },
+                    );
+                }
+                _ => {
+                    self.emit_ignored(
+                        instance_id,
+                        generation,
+                        ObservationIgnoredReason::InvalidResumeObservation,
+                    );
+                }
+            }
             return;
         }
 
@@ -460,6 +608,13 @@ impl Gate4AgentEngine {
             .get(&instance_id)
             .expect("validated session")
             .pending_question_answer;
+        let pending_resume = current.resume.pending.clone();
+        let pending_resume_identity = self
+            .sessions
+            .get(&instance_id)
+            .expect("validated session")
+            .pending_resume_identity
+            .clone();
         let mut interaction_transitions = Vec::new();
         let event = match envelope.observation {
             ControlObservation::Spawned { process_id } => {
@@ -468,6 +623,7 @@ impl Gate4AgentEngine {
                     .get_mut(&instance_id)
                     .expect("validated session");
                 state.pending_interrupt = false;
+                state.pending_resume_identity = None;
                 let terminal_size = state.pending_terminal_size.take();
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Running;
@@ -475,7 +631,25 @@ impl Gate4AgentEngine {
                 session.pending_input = None;
                 session.process_id = process_id;
                 session.terminal_size = terminal_size;
-                ControlEventKind::Running { process_id }
+                if pending_resume
+                    .as_ref()
+                    .is_some_and(|pending| pending.phase == ResumePhase::Spawning)
+                {
+                    let identity = pending_resume_identity
+                        .as_ref()
+                        .expect("resume spawn must retain its authorized identity");
+                    let summary = ResumeSessionSummary::from(identity);
+                    session.provider.session = Some(identity.clone());
+                    session.resume.pending = None;
+                    session.resume.last_session = Some(summary.clone());
+                    session.resume.last_error = None;
+                    ControlEventKind::Resumed {
+                        session: summary,
+                        process_id,
+                    }
+                } else {
+                    ControlEventKind::Running { process_id }
+                }
             }
             ControlObservation::SpawnFailed { message } => {
                 let state = self
@@ -484,6 +658,7 @@ impl Gate4AgentEngine {
                     .expect("validated session");
                 state.pending_terminal_size = None;
                 state.pending_interrupt = false;
+                state.pending_resume_identity = None;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Failed {
                     message: message.clone(),
@@ -496,7 +671,17 @@ impl Gate4AgentEngine {
                     &mut session.provider,
                     ProviderInteractionOutcome::TurnEnded,
                 );
-                ControlEventKind::Failed { message }
+                if pending_resume
+                    .as_ref()
+                    .is_some_and(|pending| pending.phase == ResumePhase::Spawning)
+                {
+                    session.provider.session = pending_resume_identity.clone();
+                    session.resume.pending = None;
+                    session.resume.last_error = Some(message.clone());
+                    ControlEventKind::ResumeFailed { message }
+                } else {
+                    ControlEventKind::Failed { message }
+                }
             }
             ControlObservation::ProcessExited {
                 exit_code,
@@ -511,12 +696,14 @@ impl Gate4AgentEngine {
                     .expect("validated session");
                 state.pending_terminal_size = None;
                 state.pending_interrupt = false;
+                state.pending_resume_identity = None;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Exited { exit_code };
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
                 session.foreground = ForegroundSnapshot::default();
+                session.resume.pending = None;
                 interaction_transitions = resolve_all_pending_interactions(
                     &mut session.provider,
                     ProviderInteractionOutcome::TurnEnded,
@@ -547,12 +734,14 @@ impl Gate4AgentEngine {
                     .expect("validated session");
                 state.pending_terminal_size = None;
                 state.pending_interrupt = false;
+                state.pending_resume_identity = None;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Exited { exit_code };
                 session.pending_operation = None;
                 session.pending_input = None;
                 session.process_id = None;
                 session.foreground = ForegroundSnapshot::default();
+                session.resume.pending = None;
                 interaction_transitions = resolve_all_pending_interactions(
                     &mut session.provider,
                     ProviderInteractionOutcome::TurnEnded,
@@ -576,6 +765,7 @@ impl Gate4AgentEngine {
                     .expect("validated session");
                 state.pending_terminal_size = None;
                 state.pending_interrupt = false;
+                state.pending_resume_identity = None;
                 let session = &mut state.snapshot;
                 session.status = SessionStatus::Failed {
                     message: message.clone(),
@@ -584,6 +774,7 @@ impl Gate4AgentEngine {
                 session.pending_input = None;
                 session.process_id = None;
                 session.foreground = ForegroundSnapshot::default();
+                session.resume.pending = None;
                 interaction_transitions = resolve_all_pending_interactions(
                     &mut session.provider,
                     ProviderInteractionOutcome::TurnEnded,
@@ -693,7 +884,10 @@ impl Gate4AgentEngine {
             | ControlObservation::ProviderGap { .. }
             | ControlObservation::HistoryDiscovered { .. }
             | ControlObservation::HistoryLoaded { .. }
-            | ControlObservation::HistoryFailed { .. } => {
+            | ControlObservation::HistoryFailed { .. }
+            | ControlObservation::ResumeAuthorized { .. }
+            | ControlObservation::ResumeDenied { .. }
+            | ControlObservation::ResumeFailed { .. } => {
                 unreachable!("stream observations return before lifecycle event reduction")
             }
         };
@@ -770,6 +964,12 @@ impl Gate4AgentEngine {
             .ok_or(ControlError::UnknownInstance { instance_id })?;
         let status = session.snapshot.status.clone();
         let transport = session.snapshot.transport;
+        if let Some(operation_id) = session.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
         if !matches!(
             status,
             SessionStatus::Registered | SessionStatus::Exited { .. } | SessionStatus::Failed { .. }
@@ -809,8 +1009,10 @@ impl Gate4AgentEngine {
             state.pending_terminal_size = Some(request.terminal_size);
             state.pending_interrupt = false;
             state.pending_question_answer = false;
+            state.pending_resume_identity = None;
             let session = &mut state.snapshot;
             session.history = HistorySnapshot::default();
+            session.resume = ResumeSnapshot::default();
             session.generation = SessionGeneration(session.generation.0.saturating_add(1));
             session.status = SessionStatus::Starting;
             session.pending_operation = Some(operation_id);
@@ -1184,6 +1386,7 @@ impl Gate4AgentEngine {
                 operation: operation.clone(),
             });
             session.history.candidates.clear();
+            session.history.loaded_candidate_id = None;
             session.history.loaded = None;
             session.history.last_error = None;
             (session.generation, session.agent_id.clone(), operation)
@@ -1242,6 +1445,7 @@ impl Gate4AgentEngine {
                 operation: operation.clone(),
             });
             session.history.loaded = None;
+            session.history.loaded_candidate_id = None;
             session.history.last_error = None;
             (session.generation, session.agent_id.clone(), operation)
         };
@@ -1263,6 +1467,122 @@ impl Gate4AgentEngine {
             ControlEventKind::HistoryRequested {
                 operation_id,
                 operation,
+            },
+        );
+        Ok(())
+    }
+
+    fn resume(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        target: ResumeTarget,
+        request: ResumeLaunchRequest,
+    ) -> Result<(), ControlError> {
+        request
+            .validate()
+            .map_err(|error| ControlError::InvalidResumeRequest {
+                message: error.to_string(),
+            })?;
+        target
+            .validate()
+            .map_err(|error| ControlError::InvalidResumeRequest {
+                message: error.to_string(),
+            })?;
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.transport != TransportKind::Pty {
+            return Err(ControlError::UnsupportedTransportOperation {
+                transport: state.snapshot.transport,
+                action: "resume".to_owned(),
+            });
+        }
+        let status = state.snapshot.status.clone();
+        if !matches!(
+            status,
+            SessionStatus::Registered | SessionStatus::Exited { .. } | SessionStatus::Failed { .. }
+        ) {
+            return Err(ControlError::InvalidTransition {
+                instance_id,
+                action: "resume".to_owned(),
+                status,
+            });
+        }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
+
+        let authority_target = match &target {
+            ResumeTarget::CurrentProvider => {
+                let identity = state
+                    .snapshot
+                    .provider
+                    .session
+                    .clone()
+                    .ok_or(ControlError::MissingProviderSession)?;
+                identity
+                    .validate()
+                    .map_err(|error| ControlError::InvalidResumeRequest {
+                        message: error.to_string(),
+                    })?;
+                ResumeAuthorityTarget::ProviderSession { identity }
+            }
+            ResumeTarget::HistoryCandidate { candidate_id } => {
+                if state.snapshot.history.candidate(candidate_id).is_none()
+                    || state.snapshot.history.loaded_candidate_id.as_deref()
+                        != Some(candidate_id.as_str())
+                    || state.snapshot.history.loaded.is_none()
+                {
+                    return Err(ControlError::HistoryCandidateNotLoaded);
+                }
+                ResumeAuthorityTarget::HistoryCandidate {
+                    candidate_id: candidate_id.clone(),
+                }
+            }
+        };
+
+        let operation_id = self.allocate_operation();
+        let (generation, agent_id) = {
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.pending_resume_identity = None;
+            let session = &mut state.snapshot;
+            session.pending_operation = Some(operation_id);
+            session.resume.pending = Some(PendingResumeOperation {
+                operation_id,
+                target: target.clone(),
+                request: request.clone(),
+                phase: ResumePhase::Authorizing,
+            });
+            session.resume.last_error = None;
+            (session.generation, session.agent_id.clone())
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::AuthorizeResume {
+                agent_id,
+                target: authority_target,
+                request,
+            },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::ResumeRequested {
+                operation_id,
+                target,
             },
         );
         Ok(())
@@ -1398,6 +1718,12 @@ impl Gate4AgentEngine {
                 status: state.snapshot.status.clone(),
             });
         }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
         let generation = state.snapshot.generation;
         self.sessions.remove(&instance_id);
         self.bump_revision();
@@ -1498,6 +1824,33 @@ fn is_history_observation(observation: &ControlObservation) -> bool {
             | ControlObservation::HistoryLoaded { .. }
             | ControlObservation::HistoryFailed { .. }
     )
+}
+
+fn is_resume_authority_observation(observation: &ControlObservation) -> bool {
+    matches!(
+        observation,
+        ControlObservation::ResumeAuthorized { .. }
+            | ControlObservation::ResumeDenied { .. }
+            | ControlObservation::ResumeFailed { .. }
+    )
+}
+
+fn resume_identity_matches_target(
+    snapshot: &SessionSnapshot,
+    target: &ResumeTarget,
+    identity: &ProviderSessionIdentity,
+) -> bool {
+    match target {
+        ResumeTarget::CurrentProvider => snapshot.provider.session.as_ref() == Some(identity),
+        ResumeTarget::HistoryCandidate { candidate_id } => {
+            snapshot.history.loaded_candidate_id.as_deref() == Some(candidate_id.as_str())
+                && snapshot
+                    .history
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|session| session.session_id == identity.id)
+        }
+    }
 }
 
 fn history_candidates_are_valid(
@@ -2160,6 +2513,40 @@ mod tests {
             },
         });
         (engine, effect)
+    }
+
+    fn inactive_engine_with_provider_session() -> (Gate4AgentEngine, ProviderSessionIdentity) {
+        let (mut engine, spawn) = running_engine();
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "provider-session-1".to_owned(),
+            transcript_path: None,
+        };
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 1,
+                event: ProviderEvent::SessionIdentityObserved {
+                    identity: identity.clone(),
+                },
+            },
+        });
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::ProcessExited {
+                exit_code: Some(0),
+                final_terminal: None,
+            },
+        });
+        engine.drain_events();
+        (engine, identity)
     }
 
     #[test]
@@ -3815,6 +4202,332 @@ mod tests {
             event.event,
             ControlEventKind::ObservationIgnored {
                 reason: ObservationIgnoredReason::InvalidHistoryObservation
+            }
+        )));
+    }
+
+    #[test]
+    fn resume_is_authorized_before_a_new_generation_can_spawn() {
+        let (mut engine, identity) = inactive_engine_with_provider_session();
+        let previous_generation = engine.snapshot().sessions[0].generation;
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(10),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        assert_eq!(authorize.generation, previous_generation);
+        assert!(matches!(
+            &authorize.effect,
+            ControlEffect::AuthorizeResume {
+                target: ResumeAuthorityTarget::ProviderSession { identity: authorized },
+                ..
+            } if authorized == &identity
+        ));
+        assert_eq!(
+            engine.snapshot().sessions[0]
+                .resume
+                .pending
+                .as_ref()
+                .map(|pending| pending.phase),
+            Some(ResumePhase::Authorizing)
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: identity.clone(),
+            },
+        });
+        let spawn = engine.drain_effects().pop().unwrap();
+        assert_eq!(spawn.operation_id, authorize.operation_id);
+        assert_eq!(spawn.generation.0, previous_generation.0 + 1);
+        assert!(matches!(
+            &spawn.effect,
+            ControlEffect::SpawnResume {
+                provider_session,
+                ..
+            } if provider_session == &identity
+        ));
+        assert_eq!(
+            engine.snapshot().sessions[0].status,
+            SessionStatus::Starting
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(spawn.operation_id),
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::Spawned {
+                process_id: Some(77),
+            },
+        });
+        let session = &engine.snapshot().sessions[0];
+        assert_eq!(session.status, SessionStatus::Running);
+        assert!(session.resume.pending.is_none());
+        assert_eq!(session.provider.session.as_ref(), Some(&identity));
+        assert_eq!(
+            session.resume.last_session,
+            Some(ResumeSessionSummary::from(&identity))
+        );
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            &event.event,
+            ControlEventKind::Resumed { session, process_id: Some(77) }
+                if session.id == "provider-session-1"
+        )));
+    }
+
+    #[test]
+    fn resume_spawn_failure_retains_the_authorized_identity_for_retry() {
+        let (mut engine, identity) = inactive_engine_with_provider_session();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(12),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: identity.clone(),
+            },
+        });
+        let spawn = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(spawn.operation_id),
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::SpawnFailed {
+                message: "controlled spawn failure".to_owned(),
+            },
+        });
+
+        let session = &engine.snapshot().sessions[0];
+        assert_eq!(session.provider.session.as_ref(), Some(&identity));
+        assert_eq!(
+            session.resume.last_error.as_deref(),
+            Some("controlled spawn failure")
+        );
+        assert!(session.resume.last_session.is_none());
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(13),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            engine.drain_effects().pop().unwrap().effect,
+            ControlEffect::AuthorizeResume { .. }
+        ));
+    }
+
+    #[test]
+    fn resume_denial_preserves_the_inactive_session_generation_and_status() {
+        let (mut engine, _) = inactive_engine_with_provider_session();
+        let before = engine.snapshot().sessions[0].clone();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(11),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeDenied {
+                reason: "vendor login is required".to_owned(),
+            },
+        });
+
+        let session = &engine.snapshot().sessions[0];
+        assert_eq!(session.generation, before.generation);
+        assert_eq!(session.status, before.status);
+        assert_eq!(
+            session.resume.last_error.as_deref(),
+            Some("vendor login is required")
+        );
+        assert!(session.resume.pending.is_none());
+        assert!(engine.drain_effects().is_empty());
+    }
+
+    #[test]
+    fn history_resume_requires_the_loaded_candidate_and_exact_parsed_session() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: None,
+                        limit: 4,
+                    },
+                },
+            })
+            .unwrap();
+        let discover = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(discover.operation_id),
+            instance_id: instance(),
+            generation: discover.generation,
+            observation: ControlObservation::HistoryDiscovered {
+                candidates: vec![HistoryCandidateSummary {
+                    id: "hist_resume_1".to_owned(),
+                    session_id_hint: "hint-only".to_owned(),
+                    modified_at_unix_ms: None,
+                }],
+            },
+        });
+        let request = ResumeLaunchRequest {
+            working_directory: ".".to_owned(),
+            terminal_size: TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+        };
+        assert_eq!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::HistoryCandidate {
+                        candidate_id: "hist_resume_1".to_owned(),
+                    },
+                    request: request.clone(),
+                },
+            }),
+            Err(ControlError::HistoryCandidateNotLoaded)
+        );
+
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(4),
+                command: ControlCommand::LoadHistory {
+                    instance_id: instance(),
+                    candidate_id: "hist_resume_1".to_owned(),
+                },
+            })
+            .unwrap();
+        let load = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(load.operation_id),
+            instance_id: instance(),
+            generation: load.generation,
+            observation: ControlObservation::HistoryLoaded {
+                session: HistorySessionRecord {
+                    session_id: "parsed-session-1".to_owned(),
+                    title: None,
+                    cwd: None,
+                    model: None,
+                    message_count: 0,
+                    total_tokens: 0,
+                    messages: Vec::new(),
+                },
+            },
+        });
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(5),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::HistoryCandidate {
+                        candidate_id: "hist_resume_1".to_owned(),
+                    },
+                    request,
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id: "wrong-session".to_owned(),
+                    transcript_path: None,
+                },
+            },
+        });
+        assert!(engine.drain_effects().is_empty());
+        assert_eq!(
+            engine.snapshot().sessions[0]
+                .resume
+                .pending
+                .as_ref()
+                .map(|pending| pending.phase),
+            Some(ResumePhase::Authorizing)
+        );
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::InvalidResumeObservation
             }
         )));
     }

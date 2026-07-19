@@ -41,6 +41,8 @@ pub fn normalize_hook_event(
         "gemini" => normalize_gemini(event_name, record),
         "opencode" | "mimo-code" => normalize_opencode_family(event_name, record),
         "pi" | "omp" => normalize_pi_family(event_name, record),
+        "antigravity" => normalize_antigravity(event_name, record),
+        "amp" => normalize_amp(event_name, record),
         "grok" => normalize_grok(event_name, record),
         "kimi" => normalize_kimi(event_name, record),
         "copilot" => normalize_copilot(event_name, record),
@@ -68,6 +70,7 @@ fn provider_session_id(adapter_id: &AdapterId, payload: &Map<String, Value>) -> 
     let keys: &[&str] = match adapter_id.as_str() {
         "claude-code" | "codex" | "gemini" | "droid" | "kimi" => &["session_id"],
         "opencode" | "mimo-code" => &["sessionID"],
+        "antigravity" => &["conversationId"],
         "grok" => &["sessionId", "session_id"],
         _ => return None,
     };
@@ -159,6 +162,135 @@ fn normalize_pi_family(
             Ok(events)
         }
         "agent_end" => Ok(vec![ProviderEvent::TurnCompleted {
+            usage: TokenUsage::default(),
+            is_cumulative: false,
+        }]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn normalize_antigravity(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "PreInvocation" => Ok(vec![turn_started(payload)]),
+        "PostInvocation" => Ok(vec![ProviderEvent::WorkingObserved]),
+        "PreToolUse" => {
+            let (name, _, _, _) = antigravity_tool_fields(payload);
+            match name.as_str() {
+                "ask_question" => Ok(vec![antigravity_interaction_event(
+                    payload,
+                    ProviderInteractionKind::Question,
+                )]),
+                "ask_permission" => Ok(vec![antigravity_interaction_event(
+                    payload,
+                    ProviderInteractionKind::Approval,
+                )]),
+                _ => Ok(vec![antigravity_tool_started(payload)]),
+            }
+        }
+        "PostToolUse" => Ok(vec![
+            antigravity_tool_completed(payload),
+            ProviderEvent::WorkingObserved,
+        ]),
+        "Stop" if bool_value(payload, &["fullyIdle", "fully_idle"]) == Some(false) => {
+            Ok(vec![ProviderEvent::WorkingObserved])
+        }
+        "Stop" => Ok(turn_completed(payload)),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn antigravity_tool_fields(
+    payload: &Map<String, Value>,
+) -> (String, String, String, Option<&Value>) {
+    let tool_call = payload.get("toolCall").and_then(Value::as_object);
+    let name = tool_call
+        .and_then(|call| string(call, &["name", "toolName", "tool_name"]))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let id = tool_call
+        .and_then(explicit_tool_id)
+        .unwrap_or_else(|| name.clone());
+    let input = tool_call.and_then(|call| first_value(call, &["args", "input", "arguments"]));
+    let output = first_value(
+        payload,
+        &[
+            "toolResult",
+            "tool_result",
+            "output",
+            "result",
+            "error",
+            "message",
+        ],
+    )
+    .map(value_text)
+    .unwrap_or_default();
+    (name, id, output, input)
+}
+
+fn antigravity_tool_started(payload: &Map<String, Value>) -> ProviderEvent {
+    let (name, id, _, input) = antigravity_tool_fields(payload);
+    ProviderEvent::ToolStarted {
+        id: bounded_string(id),
+        name: bounded_string(name),
+        input_json: input_json(input),
+        agent_id: None,
+    }
+}
+
+fn antigravity_tool_completed(payload: &Map<String, Value>) -> ProviderEvent {
+    let (name, id, output, _) = antigravity_tool_fields(payload);
+    let is_error = first_value(payload, &["error"]).is_some()
+        || string(payload, &["status"])
+            .is_some_and(|status| matches!(status.as_str(), "error" | "failed"));
+    ProviderEvent::ToolCompleted {
+        id: bounded_string(if id.is_empty() { name } else { id }),
+        output: bounded_string(output),
+        is_error,
+        duration_ms: first_value(payload, &["duration_ms", "durationMs"]).and_then(Value::as_u64),
+        agent_id: None,
+    }
+}
+
+fn antigravity_interaction_event(
+    payload: &Map<String, Value>,
+    interaction_kind: ProviderInteractionKind,
+) -> ProviderEvent {
+    let (name, id, _, input) = antigravity_tool_fields(payload);
+    ProviderEvent::InteractionRequested {
+        request_id: (id != name).then(|| bounded_string(id)),
+        interaction_kind,
+        tool_name: bounded_string(name),
+        prompt: input_json(input),
+        agent_id: None,
+    }
+}
+
+fn normalize_amp(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "session.start" => Ok(Vec::new()),
+        "agent.start" => Ok(vec![ProviderEvent::TurnStarted {
+            prompt: string(payload, &["prompt", "user_prompt", "userPrompt", "message"])
+                .map(bounded_string),
+        }]),
+        "tool.call" => Ok(vec![tool_started(payload)]),
+        "tool.result" => {
+            let is_error = first_value(payload, &["error"]).is_some()
+                || string(payload, &["status"])
+                    .is_some_and(|status| matches!(status.as_str(), "error" | "failed"));
+            Ok(vec![
+                tool_completed(payload, is_error),
+                ProviderEvent::WorkingObserved,
+            ])
+        }
+        "agent.end" if string(payload, &["status"]).as_deref() == Some("cancelled") => {
+            Ok(vec![ProviderEvent::TurnInterrupted])
+        }
+        "agent.end" => Ok(vec![ProviderEvent::TurnCompleted {
             usage: TokenUsage::default(),
             is_cumulative: false,
         }]),
@@ -527,6 +659,7 @@ fn tool_completed(payload: &Map<String, Value>, is_error: bool) -> ProviderEvent
             "tool_result",
             "toolOutput",
             "tool_output",
+            "output",
             "error",
             "message",
         ],
@@ -605,7 +738,7 @@ fn turn_completed(payload: &Map<String, Value>) -> Vec<ProviderEvent> {
 }
 
 fn tool_name(payload: &Map<String, Value>) -> Option<String> {
-    string(payload, &["toolName", "tool_name", "name"]).or_else(|| {
+    string(payload, &["toolName", "tool_name", "tool", "name"]).or_else(|| {
         payload
             .get("toolCall")
             .and_then(Value::as_object)
@@ -640,6 +773,10 @@ fn string(payload: &Map<String, Value>, keys: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn bool_value(payload: &Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    first_value(payload, keys).and_then(Value::as_bool)
 }
 
 fn input_json(value: Option<&Value>) -> String {
@@ -1297,6 +1434,147 @@ mod tests {
 
         let progress = normalize_hook_event(&adapter, "agent_start", &json!({})).unwrap();
         assert_eq!(progress, vec![ProviderEvent::WorkingObserved]);
+    }
+
+    #[test]
+    fn antigravity_maps_invocation_nested_tools_feedback_and_idle_stop() {
+        let adapter = id("antigravity");
+        let started = normalize_hook_event(
+            &adapter,
+            "PreInvocation",
+            &json!({"conversationId": "conversation-1", "prompt": "run tests"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::TurnStarted { prompt }
+            ] if session_id == "conversation-1" && prompt.as_deref() == Some("run tests")
+        ));
+
+        let tool = normalize_hook_event(
+            &adapter,
+            "PreToolUse",
+            &json!({
+                "toolCall": {
+                    "id": "tool-1",
+                    "name": "run_command",
+                    "args": {"CommandLine": "cargo test"}
+                }
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            tool.as_slice(),
+            [ProviderEvent::ToolStarted { id, name, input_json, .. }]
+                if id == "tool-1" && name == "run_command" && input_json.contains("cargo test")
+        ));
+
+        let question = normalize_hook_event(
+            &adapter,
+            "PreToolUse",
+            &json!({
+                "toolCall": {
+                    "id": "question-1",
+                    "name": "ask_question",
+                    "args": {"Prompt": "Which path?"}
+                }
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            question.as_slice(),
+            [ProviderEvent::InteractionRequested {
+                request_id: Some(request_id),
+                interaction_kind: ProviderInteractionKind::Question,
+                prompt,
+                ..
+            }] if request_id == "question-1" && prompt.contains("Which path?")
+        ));
+
+        let non_idle =
+            normalize_hook_event(&adapter, "Stop", &json!({"fullyIdle": false})).unwrap();
+        assert_eq!(non_idle, vec![ProviderEvent::WorkingObserved]);
+
+        let idle = normalize_hook_event(
+            &adapter,
+            "Stop",
+            &json!({"fullyIdle": true, "last_assistant_message": "done"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            idle.as_slice(),
+            [ProviderEvent::Text { text, .. }, ProviderEvent::TurnCompleted { .. }]
+                if text == "done"
+        ));
+    }
+
+    #[test]
+    fn amp_maps_thread_lifecycle_and_cancelled_end_without_resume_claim() {
+        let adapter = id("amp");
+        let started = normalize_hook_event(
+            &adapter,
+            "agent.start",
+            &json!({"threadId": "thread-1", "id": "agent-1", "message": "fix tests"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [ProviderEvent::TurnStarted { prompt }] if prompt.as_deref() == Some("fix tests")
+        ));
+
+        let tool = normalize_hook_event(
+            &adapter,
+            "tool.call",
+            &json!({
+                "threadId": "thread-1",
+                "toolUseId": "tool-1",
+                "tool": "bash",
+                "input": {"command": "cargo check"}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            tool.as_slice(),
+            [ProviderEvent::ToolStarted { id, name, input_json, .. }]
+                if id == "tool-1" && name == "bash" && input_json.contains("cargo check")
+        ));
+
+        let result = normalize_hook_event(
+            &adapter,
+            "tool.result",
+            &json!({
+                "threadId": "thread-1",
+                "toolUseId": "tool-1",
+                "tool": "bash",
+                "status": "error",
+                "error": "exit 1",
+                "output": "failed"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.as_slice(),
+            [
+                ProviderEvent::ToolCompleted { id, output, is_error: true, .. },
+                ProviderEvent::WorkingObserved
+            ] if id == "tool-1" && output == "failed"
+        ));
+
+        let cancelled = normalize_hook_event(
+            &adapter,
+            "agent.end",
+            &json!({"threadId": "thread-1", "status": "cancelled"}),
+        )
+        .unwrap();
+        assert_eq!(cancelled, vec![ProviderEvent::TurnInterrupted]);
+
+        assert!(
+            normalize_hook_event(&adapter, "session.start", &json!({"threadId": "thread-2"}))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

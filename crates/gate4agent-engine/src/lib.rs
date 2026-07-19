@@ -1427,6 +1427,16 @@ fn reduce_provider_event(
                 ProviderInteractionOutcome::TurnEnded,
             ));
         }
+        ProviderEvent::TurnInterrupted => {
+            snapshot.lead_activity = ProviderActivity::Idle;
+            snapshot.current_prompt = None;
+            snapshot.active_tools.clear();
+            interaction_transitions.extend(resolve_source_pending_interactions(
+                snapshot,
+                source,
+                ProviderInteractionOutcome::Interrupted,
+            ));
+        }
         ProviderEvent::InteractionRequested {
             request_id,
             interaction_kind,
@@ -2575,6 +2585,49 @@ mod tests {
             provider.interactions[1].status,
             ProviderInteractionStatus::Resolved {
                 outcome: ProviderInteractionOutcome::Answered
+            }
+        );
+    }
+
+    #[test]
+    fn provider_interruption_ends_the_turn_without_counting_completion() {
+        let (mut engine, spawn) = running_engine();
+        for (sequence, event) in [
+            ProviderEvent::TurnStarted {
+                prompt: Some("cancel me".to_owned()),
+            },
+            ProviderEvent::InteractionRequested {
+                request_id: Some("approval-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "bash".to_owned(),
+                prompt: "approve".to_owned(),
+                agent_id: None,
+            },
+            ProviderEvent::TurnInterrupted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: provider_source(),
+                    sequence: u64::try_from(sequence + 1).unwrap(),
+                    event,
+                },
+            });
+        }
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(provider.activity, ProviderActivity::Idle);
+        assert_eq!(provider.completed_turns, 0);
+        assert_eq!(provider.current_prompt, None);
+        assert_eq!(
+            provider.interactions[0].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Interrupted
             }
         );
     }

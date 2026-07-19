@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 16;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 17;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -410,6 +410,7 @@ pub enum ProviderEvent {
         usage: TokenUsage,
         is_cumulative: bool,
     },
+    TurnInterrupted,
     SessionEnded {
         result: String,
         cost_usd: Option<String>,
@@ -572,7 +573,10 @@ impl ProviderEvent {
                     PROVIDER_EVENT_TEXT_MAX_BYTES,
                 )?;
             }
-            Self::WorkingObserved | Self::TurnCompleted { .. } | Self::Ready => {}
+            Self::WorkingObserved
+            | Self::TurnCompleted { .. }
+            | Self::TurnInterrupted
+            | Self::Ready => {}
         }
         Ok(())
     }

@@ -9,6 +9,8 @@ use thiserror::Error;
 pub const HOOK_EVENT_ID_MAX_BYTES: usize = 256;
 pub const HOOK_SEEN_EVENT_IDS_MAX: usize = 256;
 const CLAUDE_SUBAGENT_ID_MAX_BYTES: usize = 64;
+const HOOK_PROVIDER_CACHE_KEYS_MAX: usize = 32;
+const HOOK_PROVIDER_CACHE_KEY_MAX_BYTES: usize = 32_768;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ClaudeTrackedSubagent {
@@ -72,6 +74,9 @@ pub struct HookSessionReducer {
     tool_correlations: BTreeMap<String, VecDeque<String>>,
     next_tool_id: u64,
     claude_subagents: BTreeMap<String, ClaudeTrackedSubagent>,
+    antigravity_completed_transcript: Option<String>,
+    amp_completed_threads: BTreeSet<String>,
+    amp_completed_thread_order: VecDeque<String>,
 }
 
 impl HookSessionReducer {
@@ -84,6 +89,9 @@ impl HookSessionReducer {
             tool_correlations: BTreeMap::new(),
             next_tool_id: 1,
             claude_subagents: BTreeMap::new(),
+            antigravity_completed_transcript: None,
+            amp_completed_threads: BTreeSet::new(),
+            amp_completed_thread_order: VecDeque::new(),
         }
     }
 
@@ -156,8 +164,18 @@ impl HookSessionReducer {
             self.remember_event_id(event_id);
         }
 
+        if self.ignore_late_provider_event(&envelope.event_name, &envelope.payload) {
+            return Ok(HookReduction {
+                source_sequence: envelope.source_sequence,
+                missed_before,
+                disposition: HookEventDisposition::IgnoredUnknown,
+                events: Vec::new(),
+            });
+        }
+
         let mut events =
             normalize_hook_event(&self.adapter_id, &envelope.event_name, &envelope.payload)?;
+        self.record_provider_completion(&envelope.event_name, &envelope.payload);
         if self.adapter_id.as_str() == "claude-code" {
             self.reconcile_claude_subagents(&envelope.event_name, &envelope.payload, &mut events);
         }
@@ -367,6 +385,66 @@ impl HookSessionReducer {
         }
     }
 
+    fn ignore_late_provider_event(&mut self, event_name: &str, payload: &Value) -> bool {
+        match self.adapter_id.as_str() {
+            "antigravity" => {
+                if event_name == "PreInvocation" {
+                    self.antigravity_completed_transcript = None;
+                    return false;
+                }
+                event_name != "Stop"
+                    && payload_string(
+                        payload,
+                        &["transcriptPath", "transcript_path"],
+                        HOOK_PROVIDER_CACHE_KEY_MAX_BYTES,
+                    )
+                    .is_some_and(|transcript| {
+                        self.antigravity_completed_transcript.as_deref()
+                            == Some(transcript.as_str())
+                    })
+            }
+            "amp" => {
+                let thread = amp_thread_key(payload);
+                if matches!(event_name, "session.start" | "agent.start") {
+                    self.amp_completed_threads.remove(&thread);
+                    self.amp_completed_thread_order
+                        .retain(|existing| existing != &thread);
+                    return false;
+                }
+                matches!(event_name, "tool.call" | "tool.result")
+                    && self.amp_completed_threads.contains(&thread)
+            }
+            _ => false,
+        }
+    }
+
+    fn record_provider_completion(&mut self, event_name: &str, payload: &Value) {
+        match self.adapter_id.as_str() {
+            "antigravity"
+                if event_name == "Stop"
+                    && payload_bool(payload, &["fullyIdle", "fully_idle"]) != Some(false) =>
+            {
+                self.antigravity_completed_transcript = payload_string(
+                    payload,
+                    &["transcriptPath", "transcript_path"],
+                    HOOK_PROVIDER_CACHE_KEY_MAX_BYTES,
+                );
+            }
+            "amp" if event_name == "agent.end" => {
+                let thread = amp_thread_key(payload);
+                if self.amp_completed_threads.insert(thread.clone()) {
+                    self.amp_completed_thread_order.push_back(thread);
+                }
+                while self.amp_completed_thread_order.len() > HOOK_PROVIDER_CACHE_KEYS_MAX {
+                    if let Some(expired) = self.amp_completed_thread_order.pop_front() {
+                        self.amp_completed_threads.remove(&expired);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn correlate_tools(&mut self, event_name: &str, events: &mut [ProviderEvent]) {
         for event in events {
             match event {
@@ -416,7 +494,9 @@ impl HookSessionReducer {
                         }
                     }
                 }
-                ProviderEvent::TurnCompleted { .. } | ProviderEvent::SessionEnded { .. } => {
+                ProviderEvent::TurnCompleted { .. }
+                | ProviderEvent::TurnInterrupted
+                | ProviderEvent::SessionEnded { .. } => {
                     self.tool_correlations.clear();
                 }
                 ProviderEvent::Text { .. }
@@ -437,6 +517,29 @@ impl HookSessionReducer {
 fn read_nonempty_string(value: Option<&Value>) -> Option<String> {
     let value = value?.as_str()?.trim();
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn payload_string(payload: &Value, keys: &[&str], max_bytes: usize) -> Option<String> {
+    let record = payload.as_object()?;
+    let value = keys
+        .iter()
+        .find_map(|key| read_nonempty_string(record.get(*key)))?;
+    (value.len() <= max_bytes && !value.chars().any(char::is_control)).then_some(value)
+}
+
+fn payload_bool(payload: &Value, keys: &[&str]) -> Option<bool> {
+    let record = payload.as_object()?;
+    keys.iter()
+        .find_map(|key| record.get(*key).and_then(Value::as_bool))
+}
+
+fn amp_thread_key(payload: &Value) -> String {
+    payload_string(
+        payload,
+        &["threadId", "threadID", "thread_id"],
+        HOOK_EVENT_ID_MAX_BYTES,
+    )
+    .unwrap_or_else(|| "amp-default-thread".to_owned())
 }
 
 fn tool_correlation_key(agent_id: Option<&str>, raw_id: &str) -> String {
@@ -622,6 +725,115 @@ mod tests {
             };
             assert_eq!(completed_id, called_id);
         }
+    }
+
+    #[test]
+    fn antigravity_drops_late_tool_events_only_after_fully_idle_stop() {
+        let mut reducer = HookSessionReducer::new(AdapterId::new("antigravity").unwrap());
+        let transcript = "C:/tmp/antigravity.jsonl";
+        let non_idle = reducer
+            .reduce(envelope(
+                1,
+                "e1",
+                "Stop",
+                json!({"transcriptPath": transcript, "fullyIdle": false}),
+            ))
+            .unwrap();
+        assert_eq!(non_idle.events, vec![ProviderEvent::WorkingObserved]);
+        assert_eq!(
+            reducer
+                .reduce(envelope(
+                    2,
+                    "e2",
+                    "PostToolUse",
+                    json!({"transcriptPath": transcript, "toolCall": {"name": "read"}}),
+                ))
+                .unwrap()
+                .disposition,
+            HookEventDisposition::Applied
+        );
+
+        reducer
+            .reduce(envelope(
+                3,
+                "e3",
+                "Stop",
+                json!({"transcriptPath": transcript, "fullyIdle": true}),
+            ))
+            .unwrap();
+        let late = reducer
+            .reduce(envelope(
+                4,
+                "e4",
+                "PostToolUse",
+                json!({"transcriptPath": transcript, "toolCall": {"name": "read"}}),
+            ))
+            .unwrap();
+        assert_eq!(late.disposition, HookEventDisposition::IgnoredUnknown);
+        assert!(late.events.is_empty());
+
+        let next = reducer
+            .reduce(envelope(
+                5,
+                "e5",
+                "PreInvocation",
+                json!({"transcriptPath": transcript, "prompt": "next"}),
+            ))
+            .unwrap();
+        assert!(matches!(
+            next.events.as_slice(),
+            [ProviderEvent::TurnStarted { .. }]
+        ));
+    }
+
+    #[test]
+    fn amp_drops_late_tool_events_per_thread_until_restart() {
+        let mut reducer = HookSessionReducer::new(AdapterId::new("amp").unwrap());
+        reducer
+            .reduce(envelope(
+                1,
+                "e1",
+                "agent.end",
+                json!({"threadId": "thread-1", "status": "completed"}),
+            ))
+            .unwrap();
+        let late = reducer
+            .reduce(envelope(
+                2,
+                "e2",
+                "tool.result",
+                json!({"threadId": "thread-1", "toolUseId": "t1", "tool": "bash"}),
+            ))
+            .unwrap();
+        assert_eq!(late.disposition, HookEventDisposition::IgnoredUnknown);
+
+        let other_thread = reducer
+            .reduce(envelope(
+                3,
+                "e3",
+                "tool.call",
+                json!({"threadId": "thread-2", "toolUseId": "t2", "tool": "read"}),
+            ))
+            .unwrap();
+        assert_eq!(other_thread.disposition, HookEventDisposition::Applied);
+
+        reducer
+            .reduce(envelope(
+                4,
+                "e4",
+                "agent.start",
+                json!({"threadId": "thread-1", "message": "retry"}),
+            ))
+            .unwrap();
+        let resumed = reducer
+            .reduce(envelope(
+                5,
+                "e5",
+                "tool.call",
+                json!({"threadId": "thread-1", "toolUseId": "t3", "tool": "read"}),
+            ))
+            .unwrap();
+        assert_eq!(resumed.disposition, HookEventDisposition::Applied);
     }
 
     #[test]

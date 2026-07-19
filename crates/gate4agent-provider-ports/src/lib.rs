@@ -86,4 +86,8 @@ pub enum ProviderPortValidationError {
     HistoryCandidateSourceMismatch,
     #[error("resume session ID is empty, unsafe, or too large")]
     InvalidResumeSessionId,
+    #[error("resume transcript path is empty, unsafe, or too large")]
+    InvalidResumeTranscriptPath,
+    #[error("resume adapter requires a provider transcript path; use a typed provider session")]
+    MissingResumeTranscriptPath,
 }

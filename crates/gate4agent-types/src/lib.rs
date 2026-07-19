@@ -19,11 +19,12 @@ pub use control::{
     ForegroundRequirement, ForegroundSnapshot, ObservationEnvelope, ObservationIgnoredReason,
     OperationId, ProviderActivity, ProviderEvent, ProviderEventValidationError,
     ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
-    ProviderInteractionOutcome, ProviderInteractionStatus, ProviderSnapshot, ProviderSource,
-    ProviderSourceCursor, ProviderSubagent, SessionGeneration, SessionSnapshot, SessionStatus,
-    StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
-    FOREGROUND_PROCESS_NAME_MAX_BYTES, PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES,
-    PROVIDER_EVENT_TOOLS_MAX, PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX,
+    ProviderInteractionOutcome, ProviderInteractionStatus, ProviderSessionIdentity,
+    ProviderSessionKey, ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent,
+    SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalFrame, TerminalSize,
+    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, FOREGROUND_PROCESS_NAME_MAX_BYTES,
+    PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES, PROVIDER_EVENT_TOOLS_MAX,
+    PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX, PROVIDER_SESSION_LOCATOR_MAX_BYTES,
     PROVIDER_SUBAGENTS_MAX, TERMINAL_COLUMNS_MAX, TERMINAL_ROWS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 pub use executable::normalize_executable_name;

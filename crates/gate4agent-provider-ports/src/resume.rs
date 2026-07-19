@@ -1,8 +1,11 @@
 use crate::{declared_binding, validate_working_directory, ProviderPortValidationError};
 use gate4agent_adapters::{
-    build_resume_plan, ResumeAdapterError, ResumePlan, RESUME_SESSION_ID_MAX_BYTES,
+    build_resume_plan_for_identity, ResumeAdapterError, ResumePlan, RESUME_SESSION_ID_MAX_BYTES,
 };
-use gate4agent_types::{AdapterBinding, AdapterFamily, AgentId, AgentSpec};
+use gate4agent_types::{
+    AdapterBinding, AdapterFamily, AgentId, AgentSpec, ProviderSessionIdentity, ProviderSessionKey,
+    PROVIDER_SESSION_LOCATOR_MAX_BYTES,
+};
 use std::error::Error;
 use thiserror::Error;
 
@@ -12,7 +15,7 @@ pub const RESUME_DENIAL_REASON_MAX_BYTES: usize = 1_024;
 pub struct ResumeRequest {
     agent_id: AgentId,
     binding: AdapterBinding,
-    session_id: String,
+    provider_session: ProviderSessionIdentity,
     working_directory: Option<String>,
 }
 
@@ -22,11 +25,46 @@ impl ResumeRequest {
         session_id: impl Into<String>,
         working_directory: Option<String>,
     ) -> Result<Self, ProviderPortValidationError> {
-        let session_id = normalize_session_id(session_id.into())?;
+        let binding = declared_binding(spec, AdapterFamily::Resume)?;
+        if binding.id.as_str() == "pi" {
+            return Err(ProviderPortValidationError::MissingResumeTranscriptPath);
+        }
+        let key = if binding.id.as_str() == "antigravity" {
+            ProviderSessionKey::ConversationId
+        } else {
+            ProviderSessionKey::SessionId
+        };
+        Self::from_parts(
+            spec,
+            binding,
+            ProviderSessionIdentity {
+                key,
+                id: session_id.into(),
+                transcript_path: None,
+            },
+            working_directory,
+        )
+    }
+
+    pub fn from_provider_session(
+        spec: &AgentSpec,
+        provider_session: ProviderSessionIdentity,
+        working_directory: Option<String>,
+    ) -> Result<Self, ProviderPortValidationError> {
+        let binding = declared_binding(spec, AdapterFamily::Resume)?;
+        Self::from_parts(spec, binding, provider_session, working_directory)
+    }
+
+    fn from_parts(
+        spec: &AgentSpec,
+        binding: AdapterBinding,
+        provider_session: ProviderSessionIdentity,
+        working_directory: Option<String>,
+    ) -> Result<Self, ProviderPortValidationError> {
         Ok(Self {
             agent_id: spec.id.clone(),
-            binding: declared_binding(spec, AdapterFamily::Resume)?,
-            session_id,
+            binding,
+            provider_session: normalize_provider_session(provider_session)?,
             working_directory: validate_working_directory(working_directory)?,
         })
     }
@@ -40,7 +78,11 @@ impl ResumeRequest {
     }
 
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        &self.provider_session.id
+    }
+
+    pub fn provider_session(&self) -> &ProviderSessionIdentity {
+        &self.provider_session
     }
 
     pub fn working_directory(&self) -> Option<&str> {
@@ -52,7 +94,7 @@ impl ResumeRequest {
 pub struct PreparedResume {
     agent_id: AgentId,
     binding: AdapterBinding,
-    session_id: String,
+    provider_session: ProviderSessionIdentity,
     working_directory: Option<String>,
     plan: ResumePlan,
 }
@@ -67,7 +109,11 @@ impl PreparedResume {
     }
 
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        &self.provider_session.id
+    }
+
+    pub fn provider_session(&self) -> &ProviderSessionIdentity {
+        &self.provider_session
     }
 
     pub fn working_directory(&self) -> Option<&str> {
@@ -109,7 +155,7 @@ pub fn prepare_resume<A: ResumeAuthority>(
     authority: &mut A,
     request: ResumeRequest,
 ) -> Result<ResumeOutcome, ResumePortError<A::Error>> {
-    let plan = build_resume_plan(&request.binding.id, &request.session_id)
+    let plan = build_resume_plan_for_identity(&request.binding.id, &request.provider_session)
         .map_err(ResumePortError::Adapter)?
         .ok_or_else(|| ResumePortError::DeclaredAdapterHasNoPlan {
             agent_id: request.agent_id.clone(),
@@ -118,7 +164,7 @@ pub fn prepare_resume<A: ResumeAuthority>(
     let prepared = PreparedResume {
         agent_id: request.agent_id,
         binding: request.binding,
-        session_id: request.session_id,
+        provider_session: request.provider_session,
         working_directory: request.working_directory,
         plan,
     };
@@ -150,6 +196,24 @@ fn normalize_session_id(value: String) -> Result<String, ProviderPortValidationE
         return Err(ProviderPortValidationError::InvalidResumeSessionId);
     }
     Ok(value.to_owned())
+}
+
+fn normalize_provider_session(
+    mut value: ProviderSessionIdentity,
+) -> Result<ProviderSessionIdentity, ProviderPortValidationError> {
+    value.id = normalize_session_id(value.id)?;
+    if let Some(path) = value.transcript_path {
+        let path = path.trim();
+        if path.is_empty()
+            || path.len() > PROVIDER_SESSION_LOCATOR_MAX_BYTES
+            || path.starts_with('-')
+            || path.chars().any(char::is_control)
+        {
+            return Err(ProviderPortValidationError::InvalidResumeTranscriptPath);
+        }
+        value.transcript_path = Some(path.to_owned());
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Error)]
@@ -218,6 +282,46 @@ mod tests {
         };
         assert_eq!(prepared.plan().program, "grok");
         assert_eq!(prepared.plan().args, ["--resume", "session-1"]);
+        assert_eq!(authority.calls, 1);
+    }
+
+    #[test]
+    fn pi_resume_preserves_the_authoritative_session_file_through_authorization() {
+        let registry = builtin_registry();
+        let pi = registry.get_by_id("pi").unwrap();
+        assert_eq!(
+            ResumeRequest::from_spec(pi, "pi-session-1", None),
+            Err(ProviderPortValidationError::MissingResumeTranscriptPath)
+        );
+        let request = ResumeRequest::from_provider_session(
+            pi,
+            ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: "pi-session-1".to_owned(),
+                transcript_path: Some("C:/sessions/pi-session-1.jsonl".to_owned()),
+            },
+            Some("C:/repo".to_owned()),
+        )
+        .unwrap();
+        let mut authority = FakeResumeAuthority {
+            calls: 0,
+            decision: ResumeAuthorityDecision::Authorized,
+        };
+
+        let ResumeOutcome::Authorized(prepared) = prepare_resume(&mut authority, request).unwrap()
+        else {
+            panic!("expected authorization")
+        };
+        assert_eq!(prepared.session_id(), "pi-session-1");
+        assert_eq!(
+            prepared.provider_session().transcript_path.as_deref(),
+            Some("C:/sessions/pi-session-1.jsonl")
+        );
+        assert_eq!(prepared.plan().program, "pi");
+        assert_eq!(
+            prepared.plan().args,
+            ["--session", "C:/sessions/pi-session-1.jsonl"]
+        );
         assert_eq!(authority.calls, 1);
     }
 

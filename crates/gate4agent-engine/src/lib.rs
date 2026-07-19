@@ -8,10 +8,11 @@ use gate4agent_types::{
     ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind,
     ProviderActivity, ProviderEvent, ProviderInteraction, ProviderInteractionId,
     ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
-    ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent, SessionGeneration,
-    SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage,
-    TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
-    PROVIDER_INTERACTIONS_MAX, PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
+    ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
+    ProviderSourceCursor, ProviderSubagent, SessionGeneration, SessionSnapshot, SessionStatus,
+    StartRequest, TerminalControl, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX,
+    PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -1334,7 +1335,11 @@ fn reduce_provider_event(
             model,
             tools,
         } => {
-            snapshot.session_id = Some(session_id.clone());
+            snapshot.session = Some(ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: session_id.clone(),
+                transcript_path: None,
+            });
             snapshot.model = (!model.is_empty()).then(|| model.clone());
             snapshot.tools = tools.clone();
             snapshot.lead_activity = ProviderActivity::Idle;
@@ -1347,8 +1352,8 @@ fn reduce_provider_event(
                 ProviderInteractionOutcome::TurnEnded,
             ));
         }
-        ProviderEvent::SessionIdentityObserved { session_id } => {
-            snapshot.session_id = Some(session_id.clone());
+        ProviderEvent::SessionIdentityObserved { identity } => {
+            snapshot.session = Some(identity.clone());
         }
         ProviderEvent::TurnStarted { prompt } => {
             interaction_transitions.extend(resolve_source_pending_interactions(
@@ -2497,7 +2502,11 @@ mod tests {
                 agent_id: Some("child-1".to_owned()),
             },
             ProviderEvent::SessionIdentityObserved {
-                session_id: "provider-session-1".to_owned(),
+                identity: ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id: "provider-session-1".to_owned(),
+                    transcript_path: Some("C:/sessions/provider-session-1.jsonl".to_owned()),
+                },
             },
         ]
         .into_iter()
@@ -2516,7 +2525,14 @@ mod tests {
             });
         }
         let provider = &engine.snapshot().sessions[0].provider;
-        assert_eq!(provider.session_id.as_deref(), Some("provider-session-1"));
+        assert_eq!(
+            provider.session,
+            Some(ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: "provider-session-1".to_owned(),
+                transcript_path: Some("C:/sessions/provider-session-1.jsonl".to_owned()),
+            })
+        );
         assert_eq!(provider.activity, ProviderActivity::WaitingForInput);
         assert_eq!(provider.subagents.len(), 1);
         assert_eq!(provider.interactions.len(), 1);

@@ -1,5 +1,6 @@
 use gate4agent_types::{
-    AdapterId, ProviderEvent, ProviderEventValidationError, ProviderInteractionKind, TokenUsage,
+    AdapterId, ProviderEvent, ProviderEventValidationError, ProviderInteractionKind,
+    ProviderSessionIdentity, ProviderSessionKey, TokenUsage, PROVIDER_SESSION_LOCATOR_MAX_BYTES,
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -53,14 +54,19 @@ pub fn normalize_hook_event(
         "cursor" => normalize_cursor(event_name, record),
         id => Err(HookAdapterError::UnsupportedAdapter(id.to_owned())),
     }?;
-    if !events.iter().any(|event| {
-        matches!(
-            event,
-            ProviderEvent::SessionStarted { .. } | ProviderEvent::SessionIdentityObserved { .. }
-        )
-    }) {
-        if let Some(session_id) = provider_session_id(adapter_id, record) {
-            events.insert(0, ProviderEvent::SessionIdentityObserved { session_id });
+    if !events
+        .iter()
+        .any(|event| matches!(event, ProviderEvent::SessionIdentityObserved { .. }))
+    {
+        if let Some(identity) = provider_session_identity(adapter_id, record) {
+            let position = events
+                .iter()
+                .rposition(|event| matches!(event, ProviderEvent::SessionStarted { .. }))
+                .map_or(0, |index| index + 1);
+            events.insert(
+                position,
+                ProviderEvent::SessionIdentityObserved { identity },
+            );
         }
     }
     for event in &events {
@@ -69,16 +75,35 @@ pub fn normalize_hook_event(
     Ok(events)
 }
 
-fn provider_session_id(adapter_id: &AdapterId, payload: &Map<String, Value>) -> Option<String> {
-    let keys: &[&str] = match adapter_id.as_str() {
-        "claude-code" | "codex" | "gemini" | "droid" | "kimi" => &["session_id"],
-        "devin" => &["session_id", "sessionId"],
-        "opencode" | "mimo-code" => &["sessionID"],
-        "antigravity" => &["conversationId"],
-        "grok" => &["sessionId", "session_id"],
+fn provider_session_identity(
+    adapter_id: &AdapterId,
+    payload: &Map<String, Value>,
+) -> Option<ProviderSessionIdentity> {
+    let (key, keys): (ProviderSessionKey, &[&str]) = match adapter_id.as_str() {
+        "claude-code" | "codex" | "gemini" | "droid" | "kimi" | "pi" => {
+            (ProviderSessionKey::SessionId, &["session_id"])
+        }
+        "devin" => (ProviderSessionKey::SessionId, &["session_id", "sessionId"]),
+        "opencode" | "mimo-code" => (ProviderSessionKey::SessionId, &["sessionID"]),
+        "antigravity" => (ProviderSessionKey::ConversationId, &["conversationId"]),
+        "grok" => (ProviderSessionKey::SessionId, &["sessionId", "session_id"]),
         _ => return None,
     };
-    string(payload, keys).and_then(normalize_provider_session_id)
+    let id = string(payload, keys).and_then(normalize_provider_session_id)?;
+    let transcript_path = match adapter_id.as_str() {
+        "claude-code" | "codex" => string(payload, &["transcript_path", "transcriptPath"])
+            .and_then(normalize_provider_transcript_path),
+        "pi" => string(payload, &["session_file"]).and_then(normalize_provider_transcript_path),
+        _ => None,
+    };
+    if adapter_id.as_str() == "pi" && transcript_path.is_none() {
+        return None;
+    }
+    Some(ProviderSessionIdentity {
+        key,
+        id,
+        transcript_path,
+    })
 }
 
 fn normalize_opencode_family(
@@ -1061,6 +1086,17 @@ fn normalize_provider_session_id(value: String) -> Option<String> {
     Some(value.to_owned())
 }
 
+fn normalize_provider_transcript_path(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > PROVIDER_SESSION_LOCATOR_MAX_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HookAdapterError {
     #[error("hook event name is empty, unsafe, or too large")]
@@ -1357,15 +1393,25 @@ mod tests {
         let started = normalize_hook_event(
             &adapter,
             "SessionStart",
-            &json!({"session_id": "codex-session-1", "prompt": "resume work"}),
+            &json!({
+                "session_id": "codex-session-1",
+                "transcript_path": "C:/sessions/codex-rollout-1.jsonl",
+                "prompt": "resume work"
+            }),
         )
         .unwrap();
         assert!(matches!(
             started.as_slice(),
             [
                 ProviderEvent::SessionStarted { session_id, .. },
+                ProviderEvent::SessionIdentityObserved { identity },
                 ProviderEvent::TurnStarted { prompt }
-            ] if session_id == "codex-session-1" && prompt.as_deref() == Some("resume work")
+            ] if session_id == "codex-session-1"
+                && identity.key == ProviderSessionKey::SessionId
+                && identity.id == "codex-session-1"
+                && identity.transcript_path.as_deref()
+                    == Some("C:/sessions/codex-rollout-1.jsonl")
+                && prompt.as_deref() == Some("resume work")
         ));
 
         let approval = normalize_hook_event(
@@ -1429,9 +1475,11 @@ mod tests {
         assert!(matches!(
             started.as_slice(),
             [
-                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::SessionIdentityObserved { identity },
                 ProviderEvent::TurnStarted { prompt }
-            ] if session_id == "gemini-session-1"
+            ] if identity.key == ProviderSessionKey::SessionId
+                && identity.id == "gemini-session-1"
+                && identity.transcript_path.is_none()
                 && prompt.as_deref() == Some("inspect repository")
         ));
 
@@ -1486,9 +1534,10 @@ mod tests {
         assert!(matches!(
             user.as_slice(),
             [
-                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::SessionIdentityObserved { identity },
                 ProviderEvent::TurnStarted { prompt }
-            ] if session_id == "opencode-session-1"
+            ] if identity.key == ProviderSessionKey::SessionId
+                && identity.id == "opencode-session-1"
                 && prompt.as_deref() == Some("ship the fix")
         ));
 
@@ -1575,9 +1624,10 @@ mod tests {
         assert!(matches!(
             busy.as_slice(),
             [
-                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::SessionIdentityObserved { identity },
                 ProviderEvent::WorkingObserved
-            ] if session_id == "mimo-session-1"
+            ] if identity.key == ProviderSessionKey::SessionId
+                && identity.id == "mimo-session-1"
         ));
 
         let idle = normalize_hook_event(
@@ -1607,7 +1657,24 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(session_start.is_empty());
+        assert_eq!(
+            session_start,
+            vec![ProviderEvent::SessionIdentityObserved {
+                identity: ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id: "pi-session-1".to_owned(),
+                    transcript_path: Some("/tmp/pi-session-1.jsonl".to_owned()),
+                },
+            }]
+        );
+
+        assert!(normalize_hook_event(
+            &adapter,
+            "session_start",
+            &json!({"session_id": "pi-session-without-file"}),
+        )
+        .unwrap()
+        .is_empty());
 
         let started = normalize_hook_event(
             &adapter,
@@ -1703,9 +1770,11 @@ mod tests {
         assert!(matches!(
             started.as_slice(),
             [
-                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::SessionIdentityObserved { identity },
                 ProviderEvent::TurnStarted { prompt }
-            ] if session_id == "conversation-1" && prompt.as_deref() == Some("run tests")
+            ] if identity.key == ProviderSessionKey::ConversationId
+                && identity.id == "conversation-1"
+                && prompt.as_deref() == Some("run tests")
         ));
 
         let tool = normalize_hook_event(
@@ -1965,8 +2034,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             session.as_slice(),
-            [ProviderEvent::SessionIdentityObserved { session_id }]
-                if session_id == "devin-session-1"
+            [ProviderEvent::SessionIdentityObserved { identity }]
+                if identity.key == ProviderSessionKey::SessionId
+                    && identity.id == "devin-session-1"
         ));
 
         let prompt = normalize_hook_event(
@@ -2027,6 +2097,26 @@ mod tests {
     #[test]
     fn claude_question_and_lifecycle_are_independent_canonical_events() {
         let adapter = id("claude-code");
+        let session = normalize_hook_event(
+            &adapter,
+            "SessionStart",
+            &json!({
+                "session_id": "claude-session-1",
+                "transcript_path": "C:/sessions/claude-rollout-1.jsonl"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            session.as_slice(),
+            [
+                ProviderEvent::SessionStarted { session_id, .. },
+                ProviderEvent::SessionIdentityObserved { identity },
+            ] if session_id == "claude-session-1"
+                && identity.key == ProviderSessionKey::SessionId
+                && identity.id == "claude-session-1"
+                && identity.transcript_path.as_deref()
+                    == Some("C:/sessions/claude-rollout-1.jsonl")
+        ));
         let question = normalize_hook_event(
             &adapter,
             "PreToolUse",

@@ -30,7 +30,10 @@ pub use hook_session::{
     HookEventDisposition, HookEventEnvelope, HookReduction, HookSessionReducer,
     HookSessionReducerError, HookSubagentSeed, HOOK_EVENT_ID_MAX_BYTES, HOOK_SEEN_EVENT_IDS_MAX,
 };
-pub use resume::{build_resume_plan, ResumeAdapterError, ResumePlan, RESUME_SESSION_ID_MAX_BYTES};
+pub use resume::{
+    build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,
+    RESUME_SESSION_ID_MAX_BYTES,
+};
 
 pub const BUILTIN_ADAPTER_REVISION: &str = "gate4agent-adapter/v1";
 
@@ -290,9 +293,13 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         "claude-code",
         "codex",
         "gemini",
+        "antigravity",
         "opencode",
+        "pi",
+        "mimo-code",
         "grok",
         "droid",
+        "devin",
     ] {
         descriptors.push(descriptor(AdapterFamily::Resume, id));
     }
@@ -407,6 +414,30 @@ mod tests {
             "kimi",
             "mimo-code",
             "omp",
+            "opencode",
+            "pi",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn resume_registry_matches_the_pinned_orca_live_inventory() {
+        let actual = builtin_adapter_registry()
+            .iter()
+            .filter(|descriptor| descriptor.family == AdapterFamily::Resume)
+            .map(|descriptor| descriptor.binding.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "antigravity",
+            "claude-code",
+            "codex",
+            "devin",
+            "droid",
+            "gemini",
+            "grok",
+            "mimo-code",
             "opencode",
             "pi",
         ]

@@ -407,7 +407,18 @@ mod tests {
                 "missing history adapter for {id}"
             );
         }
-        for id in ["claude", "codex", "gemini", "opencode", "grok", "droid"] {
+        for id in [
+            "claude",
+            "codex",
+            "gemini",
+            "antigravity",
+            "opencode",
+            "pi",
+            "mimo-code",
+            "droid",
+            "grok",
+            "devin",
+        ] {
             assert!(
                 registry
                     .get_by_id(id)
@@ -419,7 +430,16 @@ mod tests {
                 "missing resume adapter for {id}"
             );
         }
-        for id in ["kimi", "copilot", "cursor", "qwen-code"] {
+        for id in [
+            "kimi",
+            "copilot",
+            "cursor",
+            "qwen-code",
+            "omp",
+            "amp",
+            "command-code",
+            "hermes",
+        ] {
             assert!(
                 registry
                     .get_by_id(id)

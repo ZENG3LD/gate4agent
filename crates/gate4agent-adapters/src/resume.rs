@@ -1,4 +1,6 @@
-use gate4agent_types::AdapterId;
+use gate4agent_types::{
+    AdapterId, ProviderSessionIdentity, ProviderSessionKey, PROVIDER_SESSION_LOCATOR_MAX_BYTES,
+};
 use thiserror::Error;
 
 pub const RESUME_SESSION_ID_MAX_BYTES: usize = 512;
@@ -19,29 +21,132 @@ pub fn build_resume_plan(
     adapter_id: &AdapterId,
     session_id: &str,
 ) -> Result<Option<ResumePlan>, ResumeAdapterError> {
-    let Some((program, prefix)) = (match adapter_id.as_str() {
-        "claude-code" => Some(("claude", &["--resume"][..])),
-        "codex" => Some(("codex", &["resume"][..])),
-        "gemini" => Some(("gemini", &["--resume"][..])),
-        "opencode" => Some(("opencode", &["--session"][..])),
-        "droid" => Some(("droid", &["--resume"][..])),
-        "grok" => Some(("grok", &["--resume"][..])),
-        "kimi" | "copilot" | "cursor" | "qwen-code" => None,
+    let key = if adapter_id.as_str() == "antigravity" {
+        ProviderSessionKey::ConversationId
+    } else {
+        ProviderSessionKey::SessionId
+    };
+    build_resume_plan_for_identity(
+        adapter_id,
+        &ProviderSessionIdentity {
+            key,
+            id: session_id.to_owned(),
+            transcript_path: None,
+        },
+    )
+}
+
+pub fn build_resume_plan_for_identity(
+    adapter_id: &AdapterId,
+    identity: &ProviderSessionIdentity,
+) -> Result<Option<ResumePlan>, ResumeAdapterError> {
+    let Some((program, prefix, expected_key, use_transcript_path)) = (match adapter_id.as_str() {
+        "claude-code" => Some((
+            "claude",
+            &["--resume"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "codex" => Some((
+            "codex",
+            &["resume"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "gemini" => Some((
+            "gemini",
+            &["--resume"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "antigravity" => Some((
+            "agy",
+            &["--conversation"][..],
+            ProviderSessionKey::ConversationId,
+            false,
+        )),
+        "opencode" => Some((
+            "opencode",
+            &["--session"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "pi" => Some((
+            "pi",
+            &["--session"][..],
+            ProviderSessionKey::SessionId,
+            true,
+        )),
+        "mimo-code" => Some((
+            "mimo",
+            &["--session"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "droid" => Some((
+            "droid",
+            &["--resume"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "grok" => Some((
+            "grok",
+            &["--resume"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "devin" => Some((
+            "devin",
+            &["--resume"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "kimi" | "copilot" | "cursor" | "qwen-code" | "omp" | "amp" | "command-code" | "hermes" => {
+            None
+        }
         id => return Err(ResumeAdapterError::UnsupportedAdapter(id.to_owned())),
     }) else {
         return Ok(None);
     };
 
-    let session_id = normalize_session_id(session_id)?;
+    if identity.key != expected_key {
+        return Err(ResumeAdapterError::InvalidSessionKey);
+    }
+
+    let session_id = normalize_session_id(&identity.id)?;
+    let target = if use_transcript_path {
+        normalize_transcript_path(
+            identity
+                .transcript_path
+                .as_deref()
+                .ok_or(ResumeAdapterError::MissingTranscriptPath)?,
+        )?
+    } else {
+        session_id
+    };
     let mut args = prefix
         .iter()
         .map(|value| (*value).to_owned())
         .collect::<Vec<_>>();
-    args.push(session_id);
+    args.push(target);
     Ok(Some(ResumePlan {
         program: program.to_owned(),
         args,
     }))
+}
+
+fn normalize_transcript_path(value: &str) -> Result<String, ResumeAdapterError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > PROVIDER_SESSION_LOCATOR_MAX_BYTES
+        || value.starts_with('-')
+        || value
+            .chars()
+            .any(|character| character.is_control() || character == '\u{7f}')
+    {
+        return Err(ResumeAdapterError::InvalidTranscriptPath);
+    }
+    Ok(value.to_owned())
 }
 
 fn normalize_session_id(value: &str) -> Result<String, ResumeAdapterError> {
@@ -62,6 +167,12 @@ fn normalize_session_id(value: &str) -> Result<String, ResumeAdapterError> {
 pub enum ResumeAdapterError {
     #[error("resume session ID is empty, unsafe, or too large")]
     InvalidSessionId,
+    #[error("resume provider session key does not match the adapter contract")]
+    InvalidSessionKey,
+    #[error("resume adapter requires an authoritative transcript path")]
+    MissingTranscriptPath,
+    #[error("resume transcript path is empty, unsafe, or too large")]
+    InvalidTranscriptPath,
     #[error("resume adapter is unavailable for {0}")]
     UnsupportedAdapter(String),
 }
@@ -80,14 +191,73 @@ mod tests {
             ("claude-code", "claude", vec!["--resume", "s1"]),
             ("codex", "codex", vec!["resume", "s1"]),
             ("gemini", "gemini", vec!["--resume", "s1"]),
+            ("antigravity", "agy", vec!["--conversation", "s1"]),
             ("opencode", "opencode", vec!["--session", "s1"]),
+            ("mimo-code", "mimo", vec!["--session", "s1"]),
             ("droid", "droid", vec!["--resume", "s1"]),
             ("grok", "grok", vec!["--resume", "s1"]),
+            ("devin", "devin", vec!["--resume", "s1"]),
         ];
         for (adapter, program, args) in cases {
             let plan = build_resume_plan(&id(adapter), "s1").unwrap().unwrap();
             assert_eq!(plan.program, program);
             assert_eq!(plan.args, args);
+        }
+    }
+
+    #[test]
+    fn pi_resume_requires_the_paired_authoritative_session_file() {
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "pi-session-1".to_owned(),
+            transcript_path: Some("C:/sessions/pi-session-1.jsonl".to_owned()),
+        };
+        let plan = build_resume_plan_for_identity(&id("pi"), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.program, "pi");
+        assert_eq!(plan.args, ["--session", "C:/sessions/pi-session-1.jsonl"]);
+        assert_eq!(
+            build_resume_plan(&id("pi"), "pi-session-1"),
+            Err(ResumeAdapterError::MissingTranscriptPath)
+        );
+    }
+
+    #[test]
+    fn provider_session_key_must_match_the_resume_contract() {
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "conversation-1".to_owned(),
+            transcript_path: None,
+        };
+        assert_eq!(
+            build_resume_plan_for_identity(&id("antigravity"), &identity),
+            Err(ResumeAdapterError::InvalidSessionKey)
+        );
+    }
+
+    #[test]
+    fn transcript_locator_is_used_only_by_pi_and_never_as_an_option() {
+        let claude = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "claude-session-1".to_owned(),
+            transcript_path: Some("C:/sessions/claude-rollout-1.jsonl".to_owned()),
+        };
+        let plan = build_resume_plan_for_identity(&id("claude-code"), &claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.args, ["--resume", "claude-session-1"]);
+
+        for path in ["", " --help", "bad\npath"] {
+            let pi = ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: "pi-session-1".to_owned(),
+                transcript_path: Some(path.to_owned()),
+            };
+            assert_eq!(
+                build_resume_plan_for_identity(&id("pi"), &pi),
+                Err(ResumeAdapterError::InvalidTranscriptPath)
+            );
         }
     }
 

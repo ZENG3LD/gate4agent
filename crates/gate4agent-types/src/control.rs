@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 17;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 18;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -15,6 +15,7 @@ pub const PROVIDER_EVENT_ID_MAX_BYTES: usize = 512;
 pub const PROVIDER_EVENT_TOOLS_MAX: usize = 256;
 pub const PROVIDER_INTERACTIONS_MAX: usize = 64;
 pub const PROVIDER_SUBAGENTS_MAX: usize = 64;
+pub const PROVIDER_SESSION_LOCATOR_MAX_BYTES: usize = 32_768;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -363,6 +364,20 @@ pub enum ProviderInteractionOutcome {
     Superseded,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderSessionKey {
+    SessionId,
+    ConversationId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSessionIdentity {
+    pub key: ProviderSessionKey,
+    pub id: String,
+    pub transcript_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSubagent {
     pub source: ProviderSource,
@@ -380,7 +395,7 @@ pub enum ProviderEvent {
         tools: Vec<String>,
     },
     SessionIdentityObserved {
-        session_id: String,
+        identity: ProviderSessionIdentity,
     },
     TurnStarted {
         prompt: Option<String>,
@@ -463,8 +478,25 @@ impl ProviderEvent {
                     validate_required("tool", tool, PROVIDER_EVENT_ID_MAX_BYTES)?;
                 }
             }
-            Self::SessionIdentityObserved { session_id } => {
-                validate_required("session_id", session_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+            Self::SessionIdentityObserved { identity } => {
+                validate_required(
+                    "provider session id",
+                    &identity.id,
+                    PROVIDER_EVENT_ID_MAX_BYTES,
+                )?;
+                if identity.id.starts_with('-') {
+                    return Err(ProviderEventValidationError::InvalidField {
+                        field: "provider session id",
+                        max: PROVIDER_EVENT_ID_MAX_BYTES,
+                    });
+                }
+                if let Some(path) = &identity.transcript_path {
+                    validate_required(
+                        "provider transcript path",
+                        path,
+                        PROVIDER_SESSION_LOCATOR_MAX_BYTES,
+                    )?;
+                }
             }
             Self::TurnStarted { prompt } => {
                 if let Some(prompt) = prompt {
@@ -706,7 +738,7 @@ pub struct ActiveProviderTool {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSnapshot {
     pub sequence: u64,
-    pub session_id: Option<String>,
+    pub session: Option<ProviderSessionIdentity>,
     pub model: Option<String>,
     pub tools: Vec<String>,
     pub completed_turns: u64,
@@ -895,7 +927,8 @@ impl Default for ControlSnapshot {
 mod tests {
     use super::{
         ForegroundProcess, ForegroundProcessKind, ProviderEvent, ProviderEventValidationError,
-        ProviderInteractionKind, FOREGROUND_PROCESS_NAME_MAX_BYTES,
+        ProviderInteractionKind, ProviderSessionIdentity, ProviderSessionKey,
+        FOREGROUND_PROCESS_NAME_MAX_BYTES,
     };
     use crate::AgentId;
 
@@ -983,5 +1016,34 @@ mod tests {
         }
         .validate_ingress()
         .is_err());
+    }
+
+    #[test]
+    fn provider_session_identity_is_typed_and_bounded_at_ingress() {
+        let valid = ProviderEvent::SessionIdentityObserved {
+            identity: ProviderSessionIdentity {
+                key: ProviderSessionKey::ConversationId,
+                id: "conversation-1".to_owned(),
+                transcript_path: Some("C:/sessions/conversation-1.jsonl".to_owned()),
+            },
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        for identity in [
+            ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: "--help".to_owned(),
+                transcript_path: None,
+            },
+            ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: "session-1".to_owned(),
+                transcript_path: Some("bad\npath".to_owned()),
+            },
+        ] {
+            assert!(ProviderEvent::SessionIdentityObserved { identity }
+                .validate_ingress()
+                .is_err());
+        }
     }
 }

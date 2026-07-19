@@ -16,15 +16,15 @@
 //! This guarantees exactly one `SessionEnd` per session regardless of CLI.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::core::error::AgentError;
-use crate::pipe::cli::{create_ndjson_parser, CliEvent};
-use crate::pipe::process::{PipeProcess, PipeProcessOptions};
 use crate::core::types::{AgentEvent, CliTool, SessionConfig};
+use crate::pipe::cli::{create_ndjson_parser, CliEvent};
+use crate::pipe::process::{PipeOutput, PipeProcess, PipeProcessOptions, PIPE_TIMEOUT_SECONDS};
 use gate4agent_types::{LaunchSpec, PipePromptDelivery};
 
 /// Async pipe session. Spawns a CLI tool in headless pipe mode and broadcasts
@@ -35,6 +35,7 @@ use gate4agent_types::{LaunchSpec, PipePromptDelivery};
 pub struct PipeSession {
     session_id: String,
     tx: broadcast::Sender<AgentEvent>,
+    initial_events: Mutex<Option<broadcast::Receiver<AgentEvent>>>,
     stdin: Arc<Mutex<Option<PipeProcess>>>,
     reader_task: JoinHandle<()>,
 }
@@ -53,15 +54,11 @@ impl PipeSession {
         let tool = config.tool;
         let session_id = uuid_v4();
 
-        let pipe = PipeProcess::new_with_options(
-            tool,
-            &config.working_dir,
-            initial_prompt,
-            options,
-        )
-        .map_err(|e| AgentError::Spawn { source: e })?;
+        let pipe =
+            PipeProcess::new_with_options(tool, &config.working_dir, initial_prompt, options)
+                .map_err(|e| AgentError::Spawn { source: e })?;
 
-        let (tx, _) = broadcast::channel::<AgentEvent>(256);
+        let (tx, initial_events) = broadcast::channel::<AgentEvent>(256);
 
         let _ = tx.send(AgentEvent::Started {
             session_id: session_id.clone(),
@@ -79,6 +76,7 @@ impl PipeSession {
         Ok(Self {
             session_id,
             tx,
+            initial_events: Mutex::new(Some(initial_events)),
             stdin: pipe,
             reader_task,
         })
@@ -103,7 +101,7 @@ impl PipeSession {
             prompt_delivery,
         )
         .map_err(|source| AgentError::Spawn { source })?;
-        let (tx, _) = broadcast::channel::<AgentEvent>(256);
+        let (tx, initial_events) = broadcast::channel::<AgentEvent>(256);
         let _ = tx.send(AgentEvent::Started {
             session_id: session_id.clone(),
         });
@@ -117,6 +115,7 @@ impl PipeSession {
         Ok(Self {
             session_id,
             tx,
+            initial_events: Mutex::new(Some(initial_events)),
             stdin: pipe,
             reader_task,
         })
@@ -124,7 +123,11 @@ impl PipeSession {
 
     /// Subscribe to receive all future `AgentEvent` values from this session.
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
-        self.tx.subscribe()
+        self.initial_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_else(|| self.tx.subscribe())
     }
 
     /// Attempt to send a follow-up prompt.
@@ -194,13 +197,25 @@ fn reader_loop(
 ) {
     let mut parser = create_ndjson_parser(tool);
     let mut parser_emitted_session_end = false;
+    let deadline = Instant::now() + Duration::from_secs(PIPE_TIMEOUT_SECONDS);
 
     loop {
-        let line = {
+        if Instant::now() >= deadline {
+            terminate_pipe(
+                &pipe,
+                &tx,
+                &mut parser_emitted_session_end,
+                "pipe process timed out",
+                124,
+            );
+            break;
+        }
+
+        let output = {
             match pipe.lock() {
                 Ok(guard) => {
                     if let Some(ref p) = *guard {
-                        p.try_recv()
+                        p.try_recv_output()
                     } else {
                         break;
                     }
@@ -209,8 +224,28 @@ fn reader_loop(
             }
         };
 
-        let line = match line {
-            Some(l) => l,
+        let line = match output {
+            Some(PipeOutput::Stdout(line)) => line,
+            Some(PipeOutput::LimitExceeded) => {
+                terminate_pipe(
+                    &pipe,
+                    &tx,
+                    &mut parser_emitted_session_end,
+                    "pipe output limit exceeded",
+                    125,
+                );
+                break;
+            }
+            Some(PipeOutput::ReadFailed) => {
+                terminate_pipe(
+                    &pipe,
+                    &tx,
+                    &mut parser_emitted_session_end,
+                    "pipe output read failed",
+                    1,
+                );
+                break;
+            }
             None => {
                 let still_running = pipe
                     .lock()
@@ -243,6 +278,32 @@ fn reader_loop(
             let _ = tx.send(agent_event);
         }
     }
+}
+
+fn terminate_pipe(
+    pipe: &Arc<Mutex<Option<PipeProcess>>>,
+    tx: &broadcast::Sender<AgentEvent>,
+    parser_emitted_session_end: &mut bool,
+    message: &str,
+    exit_code: i32,
+) {
+    if let Ok(mut guard) = pipe.lock() {
+        if let Some(process) = guard.as_mut() {
+            let _ = process.kill_tree();
+        }
+    }
+    let _ = tx.send(AgentEvent::Error {
+        message: message.to_owned(),
+    });
+    if !*parser_emitted_session_end {
+        let _ = tx.send(AgentEvent::SessionEnd {
+            result: message.to_owned(),
+            cost_usd: None,
+            is_error: true,
+        });
+        *parser_emitted_session_end = true;
+    }
+    let _ = tx.send(AgentEvent::Exited { code: exit_code });
 }
 
 /// Attempt to collect the child process exit code.
@@ -428,7 +489,12 @@ mod tests {
             .iter()
             .find(|e| matches!(e, AgentEvent::SessionEnd { .. }))
             .unwrap();
-        if let AgentEvent::SessionEnd { result, is_error, cost_usd } = session_end {
+        if let AgentEvent::SessionEnd {
+            result,
+            is_error,
+            cost_usd,
+        } = session_end
+        {
             assert_eq!(result, "exit_code=0");
             assert!(!is_error);
             assert!(cost_usd.is_none());
@@ -444,7 +510,10 @@ mod tests {
             .iter()
             .find(|e| matches!(e, AgentEvent::SessionEnd { .. }))
             .unwrap();
-        if let AgentEvent::SessionEnd { result, is_error, .. } = session_end {
+        if let AgentEvent::SessionEnd {
+            result, is_error, ..
+        } = session_end
+        {
             assert_eq!(result, "exit_code=1");
             assert!(is_error);
         }
@@ -469,7 +538,10 @@ mod tests {
             .find(|e| matches!(e, AgentEvent::SessionEnd { .. }))
             .unwrap();
         if let AgentEvent::SessionEnd { result, .. } = session_end {
-            assert_eq!(result, "parser_emitted", "should be parser's SessionEnd, not synthetic");
+            assert_eq!(
+                result, "parser_emitted",
+                "should be parser's SessionEnd, not synthetic"
+            );
         }
     }
 

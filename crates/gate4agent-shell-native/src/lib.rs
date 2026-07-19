@@ -15,12 +15,13 @@ use gate4agent_adapters::{
     build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
 };
 use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
+use gate4agent_shell_one_shot::NativeOneShotSession;
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect,
     ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
-    ForegroundRequirement, ObservationEnvelope, OperationId, PreparedInputKind, ProviderEvent,
-    ProviderInteractionKind, ProviderSource, ResumeLaunchRequest, SessionGeneration, StartRequest,
-    TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ForegroundRequirement, ObservationEnvelope, OperationId, PipeProtocol, PreparedInputKind,
+    ProviderEvent, ProviderInteractionKind, ProviderSource, ResumeLaunchRequest, SessionGeneration,
+    StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
     WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -78,6 +79,7 @@ pub struct NativeEffectShell {
     legacy_adapters: AdapterRuntimeRegistry<CliTool>,
     pty_sessions: BTreeMap<NativeSessionKey, OwnedPtySession>,
     pipe_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<PipeSession>>,
+    one_shot_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<NativeOneShotSession>>,
     acp_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<AcpSession>>,
 }
 
@@ -100,12 +102,16 @@ impl NativeEffectShell {
             legacy_adapters,
             pty_sessions: BTreeMap::new(),
             pipe_sessions: BTreeMap::new(),
+            one_shot_sessions: BTreeMap::new(),
             acp_sessions: BTreeMap::new(),
         }
     }
 
     pub fn active_session_count(&self) -> usize {
-        self.pty_sessions.len() + self.pipe_sessions.len() + self.acp_sessions.len()
+        self.pty_sessions.len()
+            + self.pipe_sessions.len()
+            + self.one_shot_sessions.len()
+            + self.acp_sessions.len()
     }
 
     pub fn spawn_operation_id(&self, key: NativeSessionKey) -> Option<OperationId> {
@@ -485,11 +491,60 @@ impl NativeEffectShell {
                 },
             },
             TransportKind::Pipe => {
-                let Some(pipe_spec) = spec.capabilities.transports.pipe else {
+                let Some(pipe_spec) = spec.capabilities.transports.pipe.as_ref() else {
                     return ControlObservation::SpawnFailed {
                         message: format!("agent '{agent_id}' does not support Pipe transport"),
                     };
                 };
+                let prompt = request.initial_prompt.unwrap_or_default();
+                if pipe_spec.protocol == PipeProtocol::OneShotText {
+                    let Some(binding) = spec.capabilities.adapters.one_shot.as_ref() else {
+                        return ControlObservation::SpawnFailed {
+                            message: format!(
+                                "agent '{agent_id}' does not declare OneShot capability"
+                            ),
+                        };
+                    };
+                    if binding != &pipe_spec.adapter {
+                        return ControlObservation::SpawnFailed {
+                            message: format!(
+                                "agent '{agent_id}' has mismatched OneShot transport bindings"
+                            ),
+                        };
+                    }
+                    return match NativeOneShotSession::spawn(
+                        &spec,
+                        binding,
+                        &prompt,
+                        request.session_options.as_ref(),
+                        &working_dir,
+                    )
+                    .await
+                    {
+                        Ok(session) => {
+                            let process_id = session.process_id();
+                            let events = session.subscribe();
+                            self.one_shot_sessions.insert(
+                                key,
+                                OwnedProviderSession {
+                                    source: ProviderSource {
+                                        family: AdapterFamily::OneShot,
+                                        binding: binding.clone(),
+                                    },
+                                    session,
+                                    events,
+                                    pending_events: VecDeque::new(),
+                                    next_provider_sequence: 1,
+                                    observed_exit_code: None,
+                                },
+                            );
+                            ControlObservation::Spawned { process_id }
+                        }
+                        Err(error) => ControlObservation::SpawnFailed {
+                            message: error.to_string(),
+                        },
+                    };
+                }
                 let tool = match self
                     .legacy_adapters
                     .resolve(AdapterFamily::Pipe, &pipe_spec.adapter)
@@ -505,7 +560,6 @@ impl NativeEffectShell {
                     family: AdapterFamily::Pipe,
                     binding: pipe_spec.adapter.clone(),
                 };
-                let prompt = request.initial_prompt.unwrap_or_default();
                 let config = SessionConfig {
                     tool,
                     working_dir,
@@ -717,6 +771,23 @@ impl NativeEffectShell {
                 },
             };
         }
+        if let Some(mut owned) = self.one_shot_sessions.remove(&key) {
+            return match owned.session.kill().await {
+                Ok(()) => ControlObservation::StopCompleted {
+                    forced: true,
+                    exit_code: owned.observed_exit_code,
+                    final_terminal: None,
+                },
+                Err(_) if owned.session.reader_finished() => ControlObservation::StopCompleted {
+                    forced: false,
+                    exit_code: owned.observed_exit_code,
+                    final_terminal: None,
+                },
+                Err(error) => ControlObservation::StopFailed {
+                    message: error.to_string(),
+                },
+            };
+        }
         if let Some(owned) = self.acp_sessions.remove(&key) {
             if !force {
                 let _ = owned.session.cancel().await;
@@ -745,6 +816,7 @@ impl NativeEffectShell {
     fn session_exists(&self, key: NativeSessionKey) -> bool {
         self.pty_sessions.contains_key(&key)
             || self.pipe_sessions.contains_key(&key)
+            || self.one_shot_sessions.contains_key(&key)
             || self.acp_sessions.contains_key(&key)
     }
 
@@ -780,6 +852,9 @@ impl NativeEffectShell {
         collect_provider_exits(&mut self.pipe_sessions, &mut observations, |session| {
             session.reader_finished()
         });
+        collect_provider_exits(&mut self.one_shot_sessions, &mut observations, |session| {
+            session.reader_finished()
+        });
         collect_provider_exits(&mut self.acp_sessions, &mut observations, |session| {
             session.reader_finished()
         });
@@ -796,6 +871,7 @@ impl NativeEffectShell {
             }
         }
         collect_provider_map(&mut self.pipe_sessions, &mut observations);
+        collect_provider_map(&mut self.one_shot_sessions, &mut observations);
         collect_provider_map(&mut self.acp_sessions, &mut observations);
         observations
     }

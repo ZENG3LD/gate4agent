@@ -1,14 +1,14 @@
 //! Synchronous host kernel for gate4agent engines.
 
 use gate4agent_catalog::{
-    builtin_registry, resolve_capability_probe_for, resolve_session_option_launch_for,
-    AgentRegistry,
+    builtin_registry, resolve_capability_probe_for, resolve_one_shot_plan,
+    resolve_session_option_launch_for, AgentRegistry,
 };
 use gate4agent_engine::Gate4AgentEngine;
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, CommandEnvelope, CommandId, ControlCommand,
     ControlError, ControlEvent, ControlSnapshot, EffectEnvelope, InputAction, ObservationEnvelope,
-    ProviderSource, TransportKind, CONTROL_PROTOCOL_VERSION,
+    PipeProtocol, ProviderSource, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -224,12 +224,39 @@ impl Gate4AgentKernel {
             request,
         } = &mut command.command
         {
-            if let Some(session_options) = &request.session_options {
-                if let Some(session) = self.engine.session_snapshot(*instance_id) {
-                    let spec = self
-                        .catalog
-                        .get(&session.agent_id)
-                        .expect("registered agent must remain in kernel catalog");
+            if let Some(session) = self.engine.session_snapshot(*instance_id) {
+                let spec = self
+                    .catalog
+                    .get(&session.agent_id)
+                    .expect("registered agent must remain in kernel catalog");
+                let one_shot = spec
+                    .capabilities
+                    .transports
+                    .pipe
+                    .as_ref()
+                    .filter(|transport| transport.protocol == PipeProtocol::OneShotText);
+                if session.transport == TransportKind::Pipe && one_shot.is_some() {
+                    let prompt = request.initial_prompt.as_deref().unwrap_or_default();
+                    let binding = spec
+                        .capabilities
+                        .adapters
+                        .one_shot
+                        .as_ref()
+                        .expect("validated one-shot transport binding");
+                    let resolved = resolve_one_shot_plan(
+                        &binding.id,
+                        &spec.launch,
+                        prompt,
+                        request.session_options.as_ref(),
+                    )
+                    .map_err(|error| {
+                        KernelCommandError::InvalidSessionOptions {
+                            agent_id: session.agent_id.clone(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                    request.session_options = Some(resolved.applied);
+                } else if let Some(session_options) = &request.session_options {
                     if session.transport != TransportKind::Pty
                         || spec.capabilities.adapters.session_options.is_none()
                     {
@@ -290,6 +317,7 @@ fn declared_provider_binding<'a>(
             .acp
             .as_ref()
             .map(|transport| &transport.adapter),
+        AdapterFamily::OneShot => spec.capabilities.adapters.one_shot.as_ref(),
         AdapterFamily::Hook => spec.capabilities.adapters.hook.as_ref(),
         AdapterFamily::History
         | AdapterFamily::Resume
@@ -484,6 +512,125 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn one_shot_pipe_defaults_and_validates_options_before_effect_creation() {
+        let mut claude = Gate4AgentKernel::default();
+        claude.step(
+            [command(
+                1,
+                ControlCommand::Register {
+                    instance_id: instance(),
+                    agent_id: AgentId::new("claude").unwrap(),
+                    transport: TransportKind::Pipe,
+                },
+            )],
+            [],
+        );
+        let started = claude.step(
+            [command(
+                2,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: Some("summarize".to_owned()),
+                        session_options: None,
+                    },
+                },
+            )],
+            [],
+        );
+        let expected = SessionOptionSelection::new("sonnet").with_value("thinking-level", "low");
+        assert_eq!(
+            started.snapshot.sessions[0].session_options.as_ref(),
+            Some(&expected)
+        );
+        assert!(matches!(
+            &started.effects[0].effect,
+            gate4agent_types::ControlEffect::Spawn {
+                transport: TransportKind::Pipe,
+                request,
+                ..
+            } if request.session_options.as_ref() == Some(&expected)
+        ));
+
+        let mut amp = Gate4AgentKernel::default();
+        amp.step(
+            [command(
+                3,
+                ControlCommand::Register {
+                    instance_id: instance(),
+                    agent_id: AgentId::new("amp").unwrap(),
+                    transport: TransportKind::Pipe,
+                },
+            )],
+            [],
+        );
+        let rejected = amp.step(
+            [command(
+                4,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: Some("summarize".to_owned()),
+                        session_options: Some(SessionOptionSelection::new("unknown-model")),
+                    },
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::InvalidSessionOptions { .. })
+        ));
+        assert!(rejected.effects.is_empty());
+
+        let mut missing_prompt = Gate4AgentKernel::default();
+        missing_prompt.step(
+            [command(
+                5,
+                ControlCommand::Register {
+                    instance_id: instance(),
+                    agent_id: AgentId::new("codex").unwrap(),
+                    transport: TransportKind::Pipe,
+                },
+            )],
+            [],
+        );
+        let rejected = missing_prompt.step(
+            [command(
+                6,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                        session_options: None,
+                    },
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::InvalidSessionOptions { .. })
+        ));
+        assert!(rejected.effects.is_empty());
     }
 
     #[test]

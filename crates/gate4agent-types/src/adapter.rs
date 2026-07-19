@@ -111,6 +111,7 @@ pub enum AdapterIdError {
 pub enum AdapterFamily {
     PtySemantic,
     Pipe,
+    OneShot,
     Acp,
     Hook,
     ManagedHook,

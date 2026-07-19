@@ -1,6 +1,6 @@
 use crate::{
     builtin_adapter_registry, AdapterBinding, AdapterFamily, AdapterRegistry, AgentId, AgentSpec,
-    InitialPromptMode, ProcessMatcher, RuntimePlatform,
+    InitialPromptMode, PipeProtocol, ProcessMatcher, RuntimePlatform,
 };
 use gate4agent_types::normalize_executable_name;
 use std::collections::{HashMap, HashSet};
@@ -193,10 +193,17 @@ fn validate_adapter_bindings(
     adapters: &AdapterRegistry,
 ) -> Result<(), RegistryError> {
     let transports = &spec.capabilities.transports;
+    let pipe_family = transports
+        .pipe
+        .as_ref()
+        .map(|transport| match transport.protocol {
+            PipeProtocol::SemanticNdjson => AdapterFamily::Pipe,
+            PipeProtocol::OneShotText => AdapterFamily::OneShot,
+        });
     for (family, binding) in [
         (AdapterFamily::PtySemantic, transports.pty_adapter.as_ref()),
         (
-            AdapterFamily::Pipe,
+            pipe_family.unwrap_or(AdapterFamily::Pipe),
             transports.pipe.as_ref().map(|value| &value.adapter),
         ),
         (
@@ -210,6 +217,10 @@ fn validate_adapter_bindings(
         (
             AdapterFamily::ManagedHook,
             spec.capabilities.adapters.managed_hook.as_ref(),
+        ),
+        (
+            AdapterFamily::OneShot,
+            spec.capabilities.adapters.one_shot.as_ref(),
         ),
         (
             AdapterFamily::History,

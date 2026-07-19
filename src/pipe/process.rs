@@ -3,15 +3,21 @@
 //! Unlike PtyWrapper (which uses a PTY for interactive TUI tools),
 //! PipeProcess uses stdin/stdout pipes for headless NDJSON-streaming tools.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread;
 
+use crate::core::types::CliTool;
 use crate::pipe::cli::cli_builder;
 use crate::transport::SpawnOptions;
-use crate::core::types::CliTool;
 use gate4agent_types::{LaunchSpec, PipePromptDelivery};
+
+pub const PIPE_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const PIPE_TIMEOUT_SECONDS: u64 = 60;
+const PIPE_OUTPUT_QUEUE_CAPACITY: usize = 256;
 
 /// Claude Code-specific options for pipe mode spawning.
 #[derive(Debug, Clone, Default)]
@@ -41,8 +47,14 @@ pub struct PipeProcessOptions {
 pub struct PipeProcess {
     child: Child,
     stdin: Option<std::process::ChildStdin>,
-    output_rx: Receiver<String>,
+    output_rx: Receiver<PipeOutput>,
     tool: CliTool,
+}
+
+pub(crate) enum PipeOutput {
+    Stdout(String),
+    LimitExceeded,
+    ReadFailed,
 }
 
 impl PipeProcess {
@@ -78,7 +90,8 @@ impl PipeProcess {
         initial_prompt: &str,
         options: PipeProcessOptions,
     ) -> Result<Self, std::io::Error> {
-        let spawn_opts = Self::pipe_options_to_spawn_opts(tool, initial_prompt, &options, working_dir);
+        let spawn_opts =
+            Self::pipe_options_to_spawn_opts(tool, initial_prompt, &options, working_dir);
         let mut cmd = Self::build_command_with_options(tool, &spawn_opts);
         for (key, value) in &spawn_opts.env_vars {
             cmd.env(key, value);
@@ -120,11 +133,11 @@ impl PipeProcess {
         mut cmd: Command,
         stdin_prompt: Option<&str>,
     ) -> Result<Self, std::io::Error> {
-
         cmd.current_dir(working_dir);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        Self::configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn()?;
 
@@ -147,12 +160,18 @@ impl PipeProcess {
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout"))?;
+            .ok_or_else(|| std::io::Error::other("no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stderr"))?;
 
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            Self::reader_thread(stdout, tx);
-        });
+        let (tx, rx) = mpsc::sync_channel(PIPE_OUTPUT_QUEUE_CAPACITY);
+        let total = Arc::new(AtomicUsize::new(0));
+        let stdout_total = Arc::clone(&total);
+        let stdout_tx = tx.clone();
+        thread::spawn(move || Self::reader_thread(stdout, stdout_tx, stdout_total, true));
+        thread::spawn(move || Self::reader_thread(stderr, tx, total, false));
 
         Ok(Self {
             child,
@@ -222,8 +241,7 @@ impl PipeProcess {
                 let cmd_name = format!("{}.cmd", program);
                 let has_cmd = std::env::var_os("PATH")
                     .map(|path| {
-                        std::env::split_paths(&path)
-                            .any(|dir| dir.join(&cmd_name).is_file())
+                        std::env::split_paths(&path).any(|dir| dir.join(&cmd_name).is_file())
                     })
                     .unwrap_or(false);
 
@@ -262,7 +280,9 @@ impl PipeProcess {
             return "''".to_string();
         }
         // If it contains no special chars, return as-is.
-        if s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/') {
+        if s.chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+        {
             return s.to_string();
         }
         // Wrap in single quotes, escaping embedded single quotes.
@@ -275,24 +295,64 @@ impl PipeProcess {
         Self::build_command_with_options(tool, opts)
     }
 
-    fn reader_thread(stdout: std::process::ChildStdout, tx: Sender<String>) {
-        use std::io::{BufRead, BufReader};
-
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    if tx.send(format!("{}\n", line)).is_err() {
-                        break;
-                    }
+    fn reader_thread(
+        mut reader: impl Read,
+        tx: SyncSender<PipeOutput>,
+        total: Arc<AtomicUsize>,
+        publish: bool,
+    ) {
+        let mut pending = Vec::new();
+        let mut chunk = [0_u8; 8 * 1024];
+        loop {
+            let read = match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => {
+                    let _ = tx.send(PipeOutput::ReadFailed);
+                    return;
                 }
-                Err(_) => break,
+            };
+            let previous = total.fetch_add(read, Ordering::AcqRel);
+            if previous > PIPE_OUTPUT_MAX_BYTES
+                || read > PIPE_OUTPUT_MAX_BYTES.saturating_sub(previous)
+            {
+                let _ = tx.send(PipeOutput::LimitExceeded);
+                return;
             }
+            if !publish {
+                continue;
+            }
+            pending.extend_from_slice(&chunk[..read]);
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let line = pending.drain(..=newline).collect::<Vec<_>>();
+                if tx
+                    .send(PipeOutput::Stdout(
+                        String::from_utf8_lossy(&line).into_owned(),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        if publish && !pending.is_empty() {
+            let _ = tx.send(PipeOutput::Stdout(
+                String::from_utf8_lossy(&pending).into_owned(),
+            ));
         }
     }
 
     /// Try to receive output (non-blocking).
     pub fn try_recv(&self) -> Option<String> {
+        loop {
+            match self.output_rx.try_recv().ok()? {
+                PipeOutput::Stdout(line) => return Some(line),
+                PipeOutput::LimitExceeded | PipeOutput::ReadFailed => continue,
+            }
+        }
+    }
+
+    pub(crate) fn try_recv_output(&self) -> Option<PipeOutput> {
         self.output_rx.try_recv().ok()
     }
 
@@ -322,7 +382,7 @@ impl PipeProcess {
 
     /// Kill the process.
     pub fn kill(&mut self) -> Result<(), std::io::Error> {
-        self.child.kill()
+        self.kill_tree()
     }
 
     /// Wait for the process to exit and return its exit status.
@@ -341,6 +401,44 @@ impl PipeProcess {
     pub fn process_id(&self) -> u32 {
         self.child.id()
     }
+
+    pub(crate) fn kill_tree(&mut self) -> Result<(), std::io::Error> {
+        let process_id = self.child.id();
+        #[cfg(windows)]
+        let result = Command::new("taskkill.exe")
+            .args(["/PID", &process_id.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        #[cfg(unix)]
+        let result = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{process_id}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match result {
+            Ok(status) if status.success() => Ok(()),
+            Ok(_) => self.child.kill(),
+            Err(error) => self.child.kill().map_err(|_| error),
+        }
+    }
+
+    fn configure_process_group(command: &mut Command) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -350,6 +448,17 @@ impl PipeProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_thread_rejects_combined_output_above_limit() {
+        let (tx, rx) = mpsc::sync_channel(PIPE_OUTPUT_QUEUE_CAPACITY);
+        let total = Arc::new(AtomicUsize::new(0));
+        let output = vec![b'x'; PIPE_OUTPUT_MAX_BYTES + 1];
+
+        PipeProcess::reader_thread(std::io::Cursor::new(output), tx, total, false);
+
+        assert!(matches!(rx.try_recv(), Ok(PipeOutput::LimitExceeded)));
+    }
 
     // ── shell_quote ──────────────────────────────────────────────────────────
 
@@ -363,7 +472,10 @@ mod tests {
         // Pure alphanumeric + allowed symbols — no quoting needed.
         assert_eq!(PipeProcess::shell_quote("hello"), "hello");
         assert_eq!(PipeProcess::shell_quote("my-flag"), "my-flag");
-        assert_eq!(PipeProcess::shell_quote("path/to/file.json"), "path/to/file.json");
+        assert_eq!(
+            PipeProcess::shell_quote("path/to/file.json"),
+            "path/to/file.json"
+        );
         assert_eq!(PipeProcess::shell_quote("arg_name"), "arg_name");
     }
 
@@ -433,8 +545,14 @@ mod tests {
         let q = PipeProcess::shell_quote("hello world");
         // The result must not contain an unquoted space (every space is inside quotes).
         // In our single-quote scheme, the result starts and ends with `'`.
-        assert!(q.starts_with('\''), "quoted string must start with single-quote");
-        assert!(q.ends_with('\''), "quoted string must end with single-quote");
+        assert!(
+            q.starts_with('\''),
+            "quoted string must start with single-quote"
+        );
+        assert!(
+            q.ends_with('\''),
+            "quoted string must end with single-quote"
+        );
     }
 
     /// Empty-string produces `''` — the shell empty-string literal.

@@ -67,6 +67,6 @@ pub use session_options::{
 pub use spec::{
     AcpTransportSpec, AgentAdapterCapabilities, AgentCapabilities, AgentCommandMode, AgentSpec,
     AgentTransportCapabilities, DetectionSpec, InitialPromptMode, LaunchSpec, NativeDraftMode,
-    PipePromptDelivery, PipeTransportSpec, ProcessMatcher, PromptSpec, RuntimePlatform,
-    SpecVerification,
+    PipePromptDelivery, PipeProtocol, PipeTransportSpec, ProcessMatcher, PromptSpec,
+    RuntimePlatform, SpecVerification,
 };

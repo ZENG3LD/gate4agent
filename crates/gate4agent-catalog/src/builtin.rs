@@ -2,8 +2,8 @@ use crate::{
     builtin_adapter_registry, AcpTransportSpec, AdapterBinding, AdapterFamily,
     AgentAdapterCapabilities, AgentCapabilities, AgentCommandMode, AgentId, AgentReadinessSpec,
     AgentRegistry, AgentSpec, AgentTransportCapabilities, DetectionSpec, DraftReadySignal,
-    InitialPromptMode, LaunchSpec, NativeDraftMode, PipePromptDelivery, PipeTransportSpec,
-    ProcessMatcher, PromptSpec, SpecVerification,
+    InitialPromptMode, LaunchSpec, NativeDraftMode, PipePromptDelivery, PipeProtocol,
+    PipeTransportSpec, ProcessMatcher, PromptSpec, SpecVerification,
 };
 use std::sync::OnceLock;
 
@@ -298,6 +298,37 @@ fn capabilities(id: &str) -> AgentCapabilities {
         "claude" | "codex" | "gemini" | "opencode" => Some(adapter_id),
         _ => None,
     };
+    let one_shot_adapter_id = matches!(
+        id,
+        "claude"
+            | "codex"
+            | "opencode"
+            | "pi"
+            | "amp"
+            | "cursor"
+            | "kimi"
+            | "copilot"
+            | "antigravity"
+    )
+    .then_some(id);
+    let pipe = one_shot_adapter_id
+        .and_then(|adapter| binding(AdapterFamily::OneShot, adapter))
+        .map(|adapter| PipeTransportSpec {
+            adapter,
+            protocol: PipeProtocol::OneShotText,
+            launch_override: None,
+            prompt_delivery: PipePromptDelivery::None,
+        })
+        .or_else(|| {
+            transport_adapter_id
+                .and_then(|adapter| binding(AdapterFamily::Pipe, adapter))
+                .map(|adapter| PipeTransportSpec {
+                    adapter,
+                    protocol: PipeProtocol::SemanticNdjson,
+                    launch_override: None,
+                    prompt_delivery: PipePromptDelivery::None,
+                })
+        });
     AgentCapabilities {
         agent_commands: matches!(id, "claude" | "codex" | "gemini" | "cursor")
             .then_some(AgentCommandMode::SlashLine),
@@ -305,13 +336,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
             pty: true,
             pty_adapter: transport_adapter_id
                 .and_then(|adapter| binding(AdapterFamily::PtySemantic, adapter)),
-            pipe: transport_adapter_id
-                .and_then(|adapter| binding(AdapterFamily::Pipe, adapter))
-                .map(|adapter| PipeTransportSpec {
-                    adapter,
-                    launch_override: None,
-                    prompt_delivery: PipePromptDelivery::None,
-                }),
+            pipe,
             // The legacy Claude/Codex ACP adapters use npm packages that may
             // be downloaded at launch. They are deliberately not enabled by
             // the catalog-backed control plane.
@@ -325,6 +350,8 @@ fn capabilities(id: &str) -> AgentCapabilities {
         adapters: AgentAdapterCapabilities {
             hook: binding(AdapterFamily::Hook, adapter_id),
             managed_hook: binding(AdapterFamily::ManagedHook, id),
+            one_shot: one_shot_adapter_id
+                .and_then(|adapter| binding(AdapterFamily::OneShot, adapter)),
             history: binding(AdapterFamily::History, adapter_id),
             resume: binding(AdapterFamily::Resume, adapter_id),
             session_options: binding(AdapterFamily::SessionOptions, adapter_id),
@@ -378,6 +405,56 @@ mod tests {
             let transports = &registry.get_by_id(id).unwrap().capabilities.transports;
             assert!(transports.pty_adapter.is_some());
             assert!(transports.pipe.is_some());
+        }
+        assert_eq!(
+            registry
+                .get_by_id("gemini")
+                .unwrap()
+                .capabilities
+                .transports
+                .pipe
+                .as_ref()
+                .unwrap()
+                .protocol,
+            PipeProtocol::SemanticNdjson
+        );
+        for id in [
+            "claude",
+            "codex",
+            "opencode",
+            "pi",
+            "amp",
+            "cursor",
+            "kimi",
+            "copilot",
+            "antigravity",
+        ] {
+            let spec = registry.get_by_id(id).unwrap();
+            let pipe = spec.capabilities.transports.pipe.as_ref().unwrap();
+            assert_eq!(pipe.protocol, PipeProtocol::OneShotText, "{id}");
+            assert_eq!(pipe.adapter.id.as_str(), id);
+        }
+        for id in [
+            "claude",
+            "codex",
+            "opencode",
+            "pi",
+            "amp",
+            "cursor",
+            "kimi",
+            "copilot",
+            "antigravity",
+        ] {
+            let binding = registry
+                .get_by_id(id)
+                .unwrap()
+                .capabilities
+                .adapters
+                .one_shot
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing OneShot adapter for {id}"));
+            assert_eq!(binding.id.as_str(), id);
+            assert_eq!(binding.revision, gate4agent_adapters::ONE_SHOT_REVISION);
         }
         for id in ["gemini", "opencode"] {
             assert!(registry

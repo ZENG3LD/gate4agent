@@ -12,22 +12,25 @@ pub use capability::{
     ResolvedCapabilityProbePlan,
 };
 pub use gate4agent_adapters::{
-    builtin_adapter_registry, merge_session_option_models, AdapterDescriptor, AdapterRegistry,
-    AdapterRegistryError, AgentSessionOptionCatalog, ResolvedSessionOptionLaunch, SessionOption,
-    SessionOptionAdapterError, SessionOptionApply, SessionOptionArgumentOverride,
-    SessionOptionCategory, SessionOptionChoice, SessionOptionInteractionDetection,
-    SessionOptionKind, SessionOptionLaunchApplication, SessionOptionMidSessionApplication,
-    SessionOptionMidSessionPlan, SessionOptionModel, SessionOptionModelListSpec,
-    BUILTIN_ADAPTER_REVISION, CAPABILITY_PROBE_OUTPUT_MAX_BYTES, CAPABILITY_PROBE_REVISION,
-    MANAGED_HOOK_REVISION, SESSION_OPTION_CATALOG_REVISION,
+    builtin_adapter_registry, merge_session_option_models, one_shot_spec, one_shot_specs,
+    resolve_one_shot_plan, AdapterDescriptor, AdapterRegistry, AdapterRegistryError,
+    AgentSessionOptionCatalog, OneShotAdapterError, OneShotAdapterSpec, OneShotModelSource,
+    OneShotModelSpec, OneShotPlan, OneShotPromptDelivery, OneShotThinkingLevel,
+    ResolvedSessionOptionLaunch, SessionOption, SessionOptionAdapterError, SessionOptionApply,
+    SessionOptionArgumentOverride, SessionOptionCategory, SessionOptionChoice,
+    SessionOptionInteractionDetection, SessionOptionKind, SessionOptionLaunchApplication,
+    SessionOptionMidSessionApplication, SessionOptionMidSessionPlan, SessionOptionModel,
+    SessionOptionModelListSpec, BUILTIN_ADAPTER_REVISION, CAPABILITY_PROBE_OUTPUT_MAX_BYTES,
+    CAPABILITY_PROBE_REVISION, MANAGED_HOOK_REVISION, ONE_SHOT_OUTPUT_MAX_BYTES, ONE_SHOT_REVISION,
+    ONE_SHOT_THINKING_OPTION_ID, ONE_SHOT_TIMEOUT_SECONDS, SESSION_OPTION_CATALOG_REVISION,
 };
 pub use gate4agent_types::{
     AcpTransportSpec, AdapterBinding, AdapterBindingError, AdapterFamily, AdapterId,
     AdapterIdError, AdapterVerification, AgentAdapterCapabilities, AgentCapabilities,
     AgentCommandMode, AgentId, AgentIdError, AgentReadinessSpec, AgentSpec,
     AgentTransportCapabilities, DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec,
-    NativeDraftMode, PipePromptDelivery, PipeTransportSpec, ProcessMatcher, PromptSpec,
-    RuntimePlatform, SessionOptionSelection, SessionOptionValue, SpecVerification,
+    NativeDraftMode, PipePromptDelivery, PipeProtocol, PipeTransportSpec, ProcessMatcher,
+    PromptSpec, RuntimePlatform, SessionOptionSelection, SessionOptionValue, SpecVerification,
 };
 pub use launch::{
     plan_draft_launch, plan_launch, EnvMutation, LaunchPlan, LaunchPlanError, LaunchRequest,

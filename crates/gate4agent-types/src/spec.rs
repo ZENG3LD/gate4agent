@@ -117,6 +117,10 @@ pub struct AgentAdapterCapabilities {
     /// configuration. This authority is separate from raw Hook normalization.
     #[serde(default)]
     pub managed_hook: Option<AdapterBinding>,
+    /// Pure provider-owned non-interactive invocation planning. Native process
+    /// ownership remains in a dedicated shell even when delivered as Pipe.
+    #[serde(default)]
+    pub one_shot: Option<AdapterBinding>,
     #[serde(default)]
     pub history: Option<AdapterBinding>,
     #[serde(default)]
@@ -135,11 +139,21 @@ pub enum PipePromptDelivery {
     Positional,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PipeProtocol {
+    #[default]
+    SemanticNdjson,
+    OneShotText,
+}
+
 /// Optional catalog override used by controlled fixtures and providers whose
 /// headless executable differs from their interactive PTY executable.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PipeTransportSpec {
     pub adapter: AdapterBinding,
+    #[serde(default)]
+    pub protocol: PipeProtocol,
     #[serde(default)]
     pub launch_override: Option<LaunchSpec>,
     #[serde(default = "default_pipe_prompt_delivery")]

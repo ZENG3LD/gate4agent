@@ -11,6 +11,7 @@ mod history;
 mod hook;
 mod hook_session;
 mod managed_hook;
+mod one_shot;
 mod resume;
 mod session_options;
 
@@ -42,6 +43,12 @@ pub use managed_hook::{
     managed_hook_spec, managed_hook_specs, ManagedHookAdapterError, ManagedHookAdapterSpec,
     ManagedHookConfigKind, ManagedHookConfigLocation, ManagedHookEventShape, ManagedHookEventSpec,
     MANAGED_HOOK_TIMEOUT_MILLISECONDS, MANAGED_HOOK_TIMEOUT_SECONDS,
+};
+pub use one_shot::{
+    one_shot_spec, one_shot_specs, resolve_one_shot_plan, OneShotAdapterError, OneShotAdapterSpec,
+    OneShotModelSource, OneShotModelSpec, OneShotPlan, OneShotPromptDelivery, OneShotThinkingLevel,
+    ONE_SHOT_OUTPUT_MAX_BYTES, ONE_SHOT_REVISION, ONE_SHOT_THINKING_OPTION_ID,
+    ONE_SHOT_TIMEOUT_SECONDS,
 };
 pub use resume::{
     build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,
@@ -279,6 +286,23 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     for id in ["claude-code", "codex", "gemini", "opencode"] {
         descriptors.push(descriptor(AdapterFamily::PtySemantic, id));
         descriptors.push(descriptor(AdapterFamily::Pipe, id));
+    }
+    for id in [
+        "claude",
+        "codex",
+        "opencode",
+        "pi",
+        "amp",
+        "cursor",
+        "kimi",
+        "copilot",
+        "antigravity",
+    ] {
+        descriptors.push(descriptor_with_revision(
+            AdapterFamily::OneShot,
+            id,
+            ONE_SHOT_REVISION,
+        ));
     }
     for id in ["gemini", "opencode"] {
         descriptors.push(descriptor(AdapterFamily::Acp, id));
@@ -522,6 +546,35 @@ mod tests {
         ]
         .into_iter()
         .map(|id| (id, MANAGED_HOOK_REVISION))
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn one_shot_registry_matches_the_pinned_orca_execution_inventory() {
+        let actual = builtin_adapter_registry()
+            .iter()
+            .filter(|descriptor| descriptor.family == AdapterFamily::OneShot)
+            .map(|descriptor| {
+                (
+                    descriptor.binding.id.as_str(),
+                    descriptor.binding.revision.as_str(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "amp",
+            "antigravity",
+            "claude",
+            "codex",
+            "copilot",
+            "cursor",
+            "kimi",
+            "opencode",
+            "pi",
+        ]
+        .into_iter()
+        .map(|id| (id, ONE_SHOT_REVISION))
         .collect();
         assert_eq!(actual, expected);
     }

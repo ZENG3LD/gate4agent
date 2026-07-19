@@ -5,11 +5,12 @@ use gate4agent_types::{
     AcpTransportSpec, AdapterBinding, AdapterFamily, AgentAdapterCapabilities, AgentCapabilities,
     AgentCommandMode, AgentId, AgentReadinessSpec, AgentSpec, AgentTransportCapabilities,
     DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, PipePromptDelivery,
-    PipeTransportSpec, ProcessMatcher, PromptSpec, SpecVerification,
+    PipeProtocol, PipeTransportSpec, ProcessMatcher, PromptSpec, SpecVerification,
 };
 
 pub const CONTROL_FIXTURE_ID: &str = "control-fixture";
 pub const PIPE_FIXTURE_ID: &str = "pipe-fixture";
+pub const ONE_SHOT_FIXTURE_ID: &str = "one-shot-fixture";
 pub const ACP_FIXTURE_ID: &str = "acp-fixture";
 pub const PTY_PROVIDER_FIXTURE_ID: &str = "pty-provider-fixture";
 pub const HOOK_POSTING_FIXTURE_ID: &str = "hook-posting-fixture";
@@ -46,12 +47,41 @@ pub fn pipe_agent_spec() -> AgentSpec {
             pty_adapter: None,
             pipe: Some(PipeTransportSpec {
                 adapter: adapter(AdapterFamily::Pipe, "codex"),
+                protocol: PipeProtocol::SemanticNdjson,
                 launch_override: Some(launch),
                 prompt_delivery: PipePromptDelivery::None,
             }),
             acp: None,
         },
     )
+}
+
+pub fn one_shot_agent_spec() -> AgentSpec {
+    #[cfg(windows)]
+    let script =
+        "$prompt=[Console]::In.ReadToEnd(); [Console]::Write('fixture-one-shot:' + $prompt)";
+    #[cfg(not(windows))]
+    let script = "prompt=$(cat); printf 'fixture-one-shot:%s' \"$prompt\"";
+    let launch = provider_launch(script);
+    let binding = adapter(AdapterFamily::OneShot, "claude");
+    let mut spec = provider_spec(
+        ONE_SHOT_FIXTURE_ID,
+        "Control-plane one-shot fixture",
+        launch.clone(),
+        AgentTransportCapabilities {
+            pty: false,
+            pty_adapter: None,
+            pipe: Some(PipeTransportSpec {
+                adapter: binding.clone(),
+                protocol: PipeProtocol::OneShotText,
+                launch_override: Some(launch),
+                prompt_delivery: PipePromptDelivery::None,
+            }),
+            acp: None,
+        },
+    );
+    spec.capabilities.adapters.one_shot = Some(binding);
+    spec
 }
 
 pub fn acp_agent_spec() -> AgentSpec {

@@ -113,6 +113,7 @@ pub enum AdapterFamily {
     Pipe,
     Acp,
     Hook,
+    ManagedHook,
     History,
     Resume,
     SessionOptions,

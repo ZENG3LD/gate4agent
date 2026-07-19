@@ -1,0 +1,12 @@
+[package]
+name = "gate4agent-shell-managed-hooks"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[dependencies]
+gate4agent-adapters = { path = "../gate4agent-adapters" }
+gate4agent-shell-hooks = { path = "../gate4agent-shell-hooks" }
+gate4agent-types = { path = "../gate4agent-types" }
+serde_json = "1"
+thiserror = "2"

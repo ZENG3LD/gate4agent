@@ -19,5 +19,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+gate4agent-shell-managed-hooks = { path = "../gate4agent-shell-managed-hooks" }
 gate4agent-testkit = { path = "../gate4agent-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

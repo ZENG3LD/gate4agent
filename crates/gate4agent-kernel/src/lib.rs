@@ -294,7 +294,8 @@ fn declared_provider_binding<'a>(
         AdapterFamily::History
         | AdapterFamily::Resume
         | AdapterFamily::SessionOptions
-        | AdapterFamily::CapabilityProbe => None,
+        | AdapterFamily::CapabilityProbe
+        | AdapterFamily::ManagedHook => None,
     }
 }
 

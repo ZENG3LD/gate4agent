@@ -208,6 +208,10 @@ fn validate_adapter_bindings(
             spec.capabilities.adapters.hook.as_ref(),
         ),
         (
+            AdapterFamily::ManagedHook,
+            spec.capabilities.adapters.managed_hook.as_ref(),
+        ),
+        (
             AdapterFamily::History,
             spec.capabilities.adapters.history.as_ref(),
         ),

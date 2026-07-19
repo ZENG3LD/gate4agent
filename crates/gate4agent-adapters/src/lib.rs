@@ -10,6 +10,7 @@ mod capability;
 mod history;
 mod hook;
 mod hook_session;
+mod managed_hook;
 mod resume;
 mod session_options;
 
@@ -37,6 +38,11 @@ pub use hook_session::{
     HookEventDisposition, HookEventEnvelope, HookReduction, HookSessionReducer,
     HookSessionReducerError, HookSubagentSeed, HOOK_EVENT_ID_MAX_BYTES, HOOK_SEEN_EVENT_IDS_MAX,
 };
+pub use managed_hook::{
+    managed_hook_spec, managed_hook_specs, ManagedHookAdapterError, ManagedHookAdapterSpec,
+    ManagedHookConfigKind, ManagedHookConfigLocation, ManagedHookEventShape, ManagedHookEventSpec,
+    MANAGED_HOOK_TIMEOUT_MILLISECONDS, MANAGED_HOOK_TIMEOUT_SECONDS,
+};
 pub use resume::{
     build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,
     RESUME_SESSION_ID_MAX_BYTES,
@@ -54,6 +60,7 @@ pub use session_options::{
 };
 
 pub const BUILTIN_ADAPTER_REVISION: &str = "gate4agent-adapter/v1";
+pub const MANAGED_HOOK_REVISION: &str = "gate4agent-managed-hooks/orca-d8629c4/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterDescriptor {
@@ -293,6 +300,28 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         descriptors.push(descriptor(AdapterFamily::History, id));
     }
     for id in [
+        "claude",
+        "openclaude",
+        "codex",
+        "gemini",
+        "antigravity",
+        "amp",
+        "cursor",
+        "droid",
+        "command-code",
+        "grok",
+        "copilot",
+        "hermes",
+        "devin",
+        "kimi",
+    ] {
+        descriptors.push(descriptor_with_revision(
+            AdapterFamily::ManagedHook,
+            id,
+            MANAGED_HOOK_REVISION,
+        ));
+    }
+    for id in [
         "claude-code",
         "codex",
         "gemini",
@@ -341,7 +370,11 @@ fn descriptor(family: AdapterFamily, id: &str) -> AdapterDescriptor {
 }
 
 fn descriptor_with_revision(family: AdapterFamily, id: &str, revision: &str) -> AdapterDescriptor {
-    let agent_id = if id == "claude-code" { "claude" } else { id };
+    let agent_ids = if family == AdapterFamily::Hook && id == "claude-code" {
+        vec!["claude", "openclaude"]
+    } else {
+        vec![if id == "claude-code" { "claude" } else { id }]
+    };
     AdapterDescriptor {
         family,
         binding: AdapterBinding::new(
@@ -350,7 +383,10 @@ fn descriptor_with_revision(family: AdapterFamily, id: &str, revision: &str) -> 
             AdapterVerification::SyntheticFixture,
         )
         .expect("hardcoded adapter binding"),
-        agents: vec![AgentId::new(agent_id).expect("hardcoded agent ID")],
+        agents: agent_ids
+            .into_iter()
+            .map(|agent_id| AgentId::new(agent_id).expect("hardcoded agent ID"))
+            .collect(),
     }
 }
 
@@ -452,6 +488,40 @@ mod tests {
             "pi",
         ]
         .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn managed_hook_registry_matches_the_pinned_orca_control_inventory() {
+        let actual = builtin_adapter_registry()
+            .iter()
+            .filter(|descriptor| descriptor.family == AdapterFamily::ManagedHook)
+            .map(|descriptor| {
+                (
+                    descriptor.binding.id.as_str(),
+                    descriptor.binding.revision.as_str(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "amp",
+            "antigravity",
+            "claude",
+            "codex",
+            "command-code",
+            "copilot",
+            "cursor",
+            "devin",
+            "droid",
+            "gemini",
+            "grok",
+            "hermes",
+            "kimi",
+            "openclaude",
+        ]
+        .into_iter()
+        .map(|id| (id, MANAGED_HOOK_REVISION))
         .collect();
         assert_eq!(actual, expected);
     }

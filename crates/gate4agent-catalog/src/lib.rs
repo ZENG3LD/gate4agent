@@ -19,7 +19,7 @@ pub use gate4agent_adapters::{
     SessionOptionKind, SessionOptionLaunchApplication, SessionOptionMidSessionApplication,
     SessionOptionMidSessionPlan, SessionOptionModel, SessionOptionModelListSpec,
     BUILTIN_ADAPTER_REVISION, CAPABILITY_PROBE_OUTPUT_MAX_BYTES, CAPABILITY_PROBE_REVISION,
-    SESSION_OPTION_CATALOG_REVISION,
+    MANAGED_HOOK_REVISION, SESSION_OPTION_CATALOG_REVISION,
 };
 pub use gate4agent_types::{
     AcpTransportSpec, AdapterBinding, AdapterBindingError, AdapterFamily, AdapterId,

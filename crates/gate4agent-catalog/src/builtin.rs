@@ -289,7 +289,11 @@ fn spec(
 }
 
 fn capabilities(id: &str) -> AgentCapabilities {
-    let adapter_id = if id == "claude" { "claude-code" } else { id };
+    let adapter_id = if matches!(id, "claude" | "openclaude") {
+        "claude-code"
+    } else {
+        id
+    };
     let transport_adapter_id = match id {
         "claude" | "codex" | "gemini" | "opencode" => Some(adapter_id),
         _ => None,
@@ -320,6 +324,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
         },
         adapters: AgentAdapterCapabilities {
             hook: binding(AdapterFamily::Hook, adapter_id),
+            managed_hook: binding(AdapterFamily::ManagedHook, id),
             history: binding(AdapterFamily::History, adapter_id),
             resume: binding(AdapterFamily::Resume, adapter_id),
             session_options: binding(AdapterFamily::SessionOptions, adapter_id),
@@ -408,6 +413,39 @@ mod tests {
                 "missing history adapter for {id}"
             );
         }
+        for id in [
+            "claude",
+            "openclaude",
+            "codex",
+            "gemini",
+            "antigravity",
+            "amp",
+            "cursor",
+            "droid",
+            "command-code",
+            "grok",
+            "copilot",
+            "hermes",
+            "devin",
+            "kimi",
+        ] {
+            let binding = registry
+                .get_by_id(id)
+                .unwrap()
+                .capabilities
+                .adapters
+                .managed_hook
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing managed Hook adapter for {id}"));
+            assert_eq!(binding.id.as_str(), id);
+            assert_eq!(binding.revision, gate4agent_adapters::MANAGED_HOOK_REVISION);
+        }
+        let openclaude = &registry
+            .get_by_id("openclaude")
+            .unwrap()
+            .capabilities
+            .adapters;
+        assert_eq!(openclaude.hook.as_ref().unwrap().id.as_str(), "claude-code");
         for id in [
             "claude",
             "codex",

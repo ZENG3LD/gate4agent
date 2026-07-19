@@ -113,6 +113,10 @@ pub struct AgentCapabilities {
 pub struct AgentAdapterCapabilities {
     #[serde(default)]
     pub hook: Option<AdapterBinding>,
+    /// Explicit host-level install/status/remove support for provider Hook
+    /// configuration. This authority is separate from raw Hook normalization.
+    #[serde(default)]
+    pub managed_hook: Option<AdapterBinding>,
     #[serde(default)]
     pub history: Option<AdapterBinding>,
     #[serde(default)]

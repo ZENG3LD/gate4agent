@@ -380,6 +380,7 @@ dependencies = [
  "gate4agent-shell-capabilities",
  "gate4agent-shell-history",
  "gate4agent-shell-hooks",
+ "gate4agent-shell-managed-hooks",
  "gate4agent-shell-native",
  "gate4agent-testkit",
  "gate4agent-types",
@@ -421,6 +422,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "gate4agent-shell-managed-hooks"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-adapters",
+ "gate4agent-shell-hooks",
+ "gate4agent-types",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

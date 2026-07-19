@@ -23,7 +23,7 @@ pub use history::{
 };
 pub use hook::{
     normalize_hook_event, HookAdapterError, HOOK_EVENT_NAME_MAX_BYTES, HOOK_PAYLOAD_MAX_BYTES,
-    HOOK_TEXT_MAX_CHARS,
+    HOOK_TEXT_MAX_CHARS, OPENCODE_HOOK_TEXT_MAX_CHARS,
 };
 pub use hook_session::{
     HookEventDisposition, HookEventEnvelope, HookReduction, HookSessionReducer,
@@ -257,6 +257,8 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     descriptors.push(descriptor(AdapterFamily::Hook, "claude-code"));
     descriptors.push(descriptor(AdapterFamily::Hook, "codex"));
     descriptors.push(descriptor(AdapterFamily::Hook, "gemini"));
+    descriptors.push(descriptor(AdapterFamily::Hook, "opencode"));
+    descriptors.push(descriptor(AdapterFamily::Hook, "mimo-code"));
     for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
         descriptors.push(descriptor(AdapterFamily::Hook, id));
         descriptors.push(descriptor(AdapterFamily::History, id));
@@ -304,7 +306,7 @@ mod tests {
         let claude = AdapterId::new("claude-code").unwrap();
         assert!(registry.get(AdapterFamily::Hook, &claude).is_some());
         assert!(registry.get(AdapterFamily::History, &claude).is_none());
-        for id in ["codex", "gemini"] {
+        for id in ["codex", "gemini", "opencode", "mimo-code"] {
             let id = AdapterId::new(id).unwrap();
             assert!(registry.get(AdapterFamily::Hook, &id).is_some());
             assert!(registry.get(AdapterFamily::History, &id).is_none());

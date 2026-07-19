@@ -407,6 +407,7 @@ impl HookSessionReducer {
                 }
                 ProviderEvent::Text { .. }
                 | ProviderEvent::SessionIdentityObserved { .. }
+                | ProviderEvent::WorkingObserved
                 | ProviderEvent::Thinking { .. }
                 | ProviderEvent::Error { .. }
                 | ProviderEvent::Ready

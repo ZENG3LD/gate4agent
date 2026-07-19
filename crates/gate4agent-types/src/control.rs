@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 15;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 16;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -385,6 +385,7 @@ pub enum ProviderEvent {
     TurnStarted {
         prompt: Option<String>,
     },
+    WorkingObserved,
     Text {
         text: String,
         is_delta: bool,
@@ -571,7 +572,7 @@ impl ProviderEvent {
                     PROVIDER_EVENT_TEXT_MAX_BYTES,
                 )?;
             }
-            Self::TurnCompleted { .. } | Self::Ready => {}
+            Self::WorkingObserved | Self::TurnCompleted { .. } | Self::Ready => {}
         }
         Ok(())
     }

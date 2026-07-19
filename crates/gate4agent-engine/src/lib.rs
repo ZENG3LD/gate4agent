@@ -1360,6 +1360,12 @@ fn reduce_provider_event(
             snapshot.current_prompt = prompt.clone();
             snapshot.active_tools.clear();
         }
+        ProviderEvent::WorkingObserved => {
+            interaction_transitions.extend(resolve_source_pending_interactions_by_kind(
+                snapshot, source,
+            ));
+            snapshot.lead_activity = ProviderActivity::Working;
+        }
         ProviderEvent::ToolStarted {
             id,
             name,
@@ -1650,6 +1656,28 @@ fn resolve_source_pending_interactions(
         })
         .map(|interaction| (interaction.id, outcome))
         .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_source_pending_interactions_by_kind(
+    snapshot: &mut ProviderSnapshot,
+    source: &ProviderSource,
+) -> Vec<ProviderInteractionTransition> {
+    let matching = snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.source == *source
+                && matches!(interaction.status, ProviderInteractionStatus::Pending)
+        })
+        .map(|interaction| {
+            let outcome = match interaction.interaction_kind {
+                ProviderInteractionKind::Approval => ProviderInteractionOutcome::Approved,
+                ProviderInteractionKind::Question => ProviderInteractionOutcome::Answered,
+            };
+            (interaction.id, outcome)
+        })
+        .collect::<Vec<_>>();
     resolve_interaction_ids(snapshot, matching)
 }
 
@@ -2485,6 +2513,69 @@ mod tests {
         assert_eq!(
             provider.interactions[0].status,
             ProviderInteractionStatus::Pending
+        );
+    }
+
+    #[test]
+    fn working_observation_resolves_input_and_preserves_live_turn_context() {
+        let (mut engine, spawn) = running_engine();
+        for (sequence, event) in [
+            ProviderEvent::TurnStarted {
+                prompt: Some("ship the fix".to_owned()),
+            },
+            ProviderEvent::ToolStarted {
+                id: "tool-1".to_owned(),
+                name: "bash".to_owned(),
+                input_json: "{\"command\":\"cargo check\"}".to_owned(),
+                agent_id: None,
+            },
+            ProviderEvent::InteractionRequested {
+                request_id: Some("approval-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "bash".to_owned(),
+                prompt: "approve cargo check".to_owned(),
+                agent_id: None,
+            },
+            ProviderEvent::InteractionRequested {
+                request_id: Some("question-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Question,
+                tool_name: "AskUserQuestion".to_owned(),
+                prompt: "continue?".to_owned(),
+                agent_id: None,
+            },
+            ProviderEvent::WorkingObserved,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: provider_source(),
+                    sequence: u64::try_from(sequence + 1).unwrap(),
+                    event,
+                },
+            });
+        }
+
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(provider.activity, ProviderActivity::Working);
+        assert_eq!(provider.current_prompt.as_deref(), Some("ship the fix"));
+        assert_eq!(provider.active_tools.len(), 1);
+        assert_eq!(
+            provider.interactions[0].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Approved
+            }
+        );
+        assert_eq!(
+            provider.interactions[1].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Answered
+            }
         );
     }
 

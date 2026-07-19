@@ -7,6 +7,7 @@ use thiserror::Error;
 pub const HOOK_EVENT_NAME_MAX_BYTES: usize = 128;
 pub const HOOK_PAYLOAD_MAX_BYTES: usize = 1_048_576;
 pub const HOOK_TEXT_MAX_CHARS: usize = 65_536;
+pub const OPENCODE_HOOK_TEXT_MAX_CHARS: usize = 8_000;
 
 /// Converts a provider hook payload into transport-neutral provider events.
 ///
@@ -38,6 +39,7 @@ pub fn normalize_hook_event(
         "claude-code" => normalize_claude(event_name, record),
         "codex" => normalize_codex(event_name, record),
         "gemini" => normalize_gemini(event_name, record),
+        "opencode" | "mimo-code" => normalize_opencode_family(event_name, record),
         "grok" => normalize_grok(event_name, record),
         "kimi" => normalize_kimi(event_name, record),
         "copilot" => normalize_copilot(event_name, record),
@@ -64,10 +66,73 @@ pub fn normalize_hook_event(
 fn provider_session_id(adapter_id: &AdapterId, payload: &Map<String, Value>) -> Option<String> {
     let keys: &[&str] = match adapter_id.as_str() {
         "claude-code" | "codex" | "gemini" | "droid" | "kimi" => &["session_id"],
+        "opencode" | "mimo-code" => &["sessionID"],
         "grok" => &["sessionId", "session_id"],
         _ => return None,
     };
     string(payload, keys).and_then(normalize_provider_session_id)
+}
+
+fn normalize_opencode_family(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "SessionBusy" => Ok(vec![ProviderEvent::WorkingObserved]),
+        "SessionIdle" => Ok(vec![ProviderEvent::TurnCompleted {
+            usage: TokenUsage::default(),
+            is_cumulative: false,
+        }]),
+        "MessagePart" => {
+            let role = string(payload, &["role"]);
+            let text = string(payload, &["text"]).map(bounded_opencode_text);
+            match (role.as_deref(), text) {
+                (Some("user"), Some(prompt)) => Ok(vec![ProviderEvent::TurnStarted {
+                    prompt: Some(prompt),
+                }]),
+                (Some("assistant"), Some(text)) => Ok(vec![
+                    ProviderEvent::WorkingObserved,
+                    ProviderEvent::Text {
+                        text,
+                        is_delta: false,
+                    },
+                ]),
+                _ => Ok(vec![ProviderEvent::WorkingObserved]),
+            }
+        }
+        "PermissionRequest" => Ok(vec![opencode_interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
+        "AskUserQuestion" => Ok(vec![opencode_interaction_event(
+            payload,
+            ProviderInteractionKind::Question,
+        )]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn opencode_interaction_event(
+    payload: &Map<String, Value>,
+    interaction_kind: ProviderInteractionKind,
+) -> ProviderEvent {
+    let prompt_source = first_value(payload, &["tool_input", "toolInput"])
+        .cloned()
+        .unwrap_or_else(|| Value::Object(payload.clone()));
+    let tool_name = match interaction_kind {
+        ProviderInteractionKind::Approval => {
+            string(payload, &["permission", "tool_name", "toolName"])
+                .unwrap_or_else(|| "approval".to_owned())
+        }
+        ProviderInteractionKind::Question => "AskUserQuestion".to_owned(),
+    };
+    ProviderEvent::InteractionRequested {
+        request_id: explicit_tool_id(payload).map(bounded_string),
+        interaction_kind,
+        tool_name: bounded_string(tool_name),
+        prompt: input_json(Some(&prompt_source)),
+        agent_id: None,
+    }
 }
 
 fn normalize_codex(
@@ -658,6 +723,10 @@ fn bounded_string(value: String) -> String {
     value.chars().take(HOOK_TEXT_MAX_CHARS).collect()
 }
 
+fn bounded_opencode_text(value: String) -> String {
+    value.chars().take(OPENCODE_HOOK_TEXT_MAX_CHARS).collect()
+}
+
 fn normalize_provider_session_id(value: String) -> Option<String> {
     let value = value.trim();
     if value.is_empty()
@@ -975,6 +1044,132 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn opencode_maps_status_messages_and_human_boundaries() {
+        let adapter = id("opencode");
+        let user = normalize_hook_event(
+            &adapter,
+            "MessagePart",
+            &json!({
+                "sessionID": "opencode-session-1",
+                "messageID": "message-user-1",
+                "role": "user",
+                "text": "ship the fix"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            user.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::TurnStarted { prompt }
+            ] if session_id == "opencode-session-1"
+                && prompt.as_deref() == Some("ship the fix")
+        ));
+
+        let assistant = normalize_hook_event(
+            &adapter,
+            "MessagePart",
+            &json!({
+                "sessionID": "opencode-session-1",
+                "messageID": "message-assistant-1",
+                "role": "assistant",
+                "text": "x".repeat(OPENCODE_HOOK_TEXT_MAX_CHARS + 100)
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            assistant.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { .. },
+                ProviderEvent::WorkingObserved,
+                ProviderEvent::Text { text, is_delta: false }
+            ] if text.chars().count() == OPENCODE_HOOK_TEXT_MAX_CHARS
+        ));
+
+        let approval = normalize_hook_event(
+            &adapter,
+            "PermissionRequest",
+            &json!({
+                "id": "permission-1",
+                "sessionID": "opencode-session-1",
+                "permission": "bash",
+                "patterns": ["git push"]
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            approval.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { .. },
+                ProviderEvent::InteractionRequested {
+                    request_id: Some(request_id),
+                    interaction_kind: ProviderInteractionKind::Approval,
+                    tool_name,
+                    prompt,
+                    ..
+                }
+            ] if request_id == "permission-1"
+                && tool_name == "bash"
+                && prompt.contains("git push")
+        ));
+
+        let question = normalize_hook_event(
+            &adapter,
+            "AskUserQuestion",
+            &json!({
+                "id": "question-1",
+                "sessionID": "opencode-session-1",
+                "questions": [{"question": "Deploy?", "options": ["yes", "no"]}]
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            question.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { .. },
+                ProviderEvent::InteractionRequested {
+                    interaction_kind: ProviderInteractionKind::Question,
+                    tool_name,
+                    prompt,
+                    ..
+                }
+            ] if tool_name == "AskUserQuestion" && prompt.contains("Deploy?")
+        ));
+    }
+
+    #[test]
+    fn mimo_code_keeps_an_independent_opencode_family_contract() {
+        let adapter = id("mimo-code");
+        let busy = normalize_hook_event(
+            &adapter,
+            "SessionBusy",
+            &json!({"sessionID": "mimo-session-1"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            busy.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::WorkingObserved
+            ] if session_id == "mimo-session-1"
+        ));
+
+        let idle = normalize_hook_event(
+            &adapter,
+            "SessionIdle",
+            &json!({"sessionID": "mimo-session-1"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            idle.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { .. },
+                ProviderEvent::TurnCompleted { .. }
+            ]
+        ));
     }
 
     #[test]

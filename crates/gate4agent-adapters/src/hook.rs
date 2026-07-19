@@ -34,8 +34,10 @@ pub fn normalize_hook_event(
         return Err(HookAdapterError::PayloadTooLarge);
     }
 
-    let events = match adapter_id.as_str() {
+    let mut events = match adapter_id.as_str() {
         "claude-code" => normalize_claude(event_name, record),
+        "codex" => normalize_codex(event_name, record),
+        "gemini" => normalize_gemini(event_name, record),
         "grok" => normalize_grok(event_name, record),
         "kimi" => normalize_kimi(event_name, record),
         "copilot" => normalize_copilot(event_name, record),
@@ -43,10 +45,84 @@ pub fn normalize_hook_event(
         "cursor" => normalize_cursor(event_name, record),
         id => Err(HookAdapterError::UnsupportedAdapter(id.to_owned())),
     }?;
+    if !events.iter().any(|event| {
+        matches!(
+            event,
+            ProviderEvent::SessionStarted { .. } | ProviderEvent::SessionIdentityObserved { .. }
+        )
+    }) {
+        if let Some(session_id) = provider_session_id(adapter_id, record) {
+            events.insert(0, ProviderEvent::SessionIdentityObserved { session_id });
+        }
+    }
     for event in &events {
         event.validate_ingress()?;
     }
     Ok(events)
+}
+
+fn provider_session_id(adapter_id: &AdapterId, payload: &Map<String, Value>) -> Option<String> {
+    let keys: &[&str] = match adapter_id.as_str() {
+        "claude-code" | "codex" | "gemini" | "droid" | "kimi" => &["session_id"],
+        "grok" => &["sessionId", "session_id"],
+        _ => return None,
+    };
+    string(payload, keys).and_then(normalize_provider_session_id)
+}
+
+fn normalize_codex(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "SessionStart" => {
+            let mut events = session_started(payload, &["session_id"]);
+            events.push(turn_started(payload));
+            Ok(events)
+        }
+        "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
+        "PreToolUse" => Ok(vec![tool_started(payload)]),
+        "PermissionRequest" if is_ask_user_question(tool_name(payload).as_deref()) => {
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Question,
+            )])
+        }
+        "PermissionRequest" => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
+        "PostToolUse" => Ok(vec![tool_completed(payload, false)]),
+        "Stop" => Ok(turn_completed(payload)),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn normalize_gemini(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "BeforeAgent" => Ok(vec![turn_started(payload)]),
+        "BeforeTool" | "PreToolUse" => Ok(vec![tool_started(payload)]),
+        "AfterTool" | "PostToolUse" => Ok(vec![tool_completed(payload, false)]),
+        "AfterAgent" => {
+            let mut events = string(payload, &["prompt_response"])
+                .map(|text| {
+                    vec![ProviderEvent::Text {
+                        text: bounded_string(text),
+                        is_delta: false,
+                    }]
+                })
+                .unwrap_or_default();
+            events.push(ProviderEvent::TurnCompleted {
+                usage: TokenUsage::default(),
+                is_cumulative: false,
+            });
+            Ok(events)
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn normalize_claude(
@@ -314,7 +390,14 @@ fn tool_started(payload: &Map<String, Value>) -> ProviderEvent {
         name,
         input_json: input_json(first_value(
             payload,
-            &["toolInput", "tool_input", "toolArgs", "input", "arguments"],
+            &[
+                "toolInput",
+                "tool_input",
+                "toolArgs",
+                "args",
+                "input",
+                "arguments",
+            ],
         )),
         agent_id: provider_agent_id(payload),
     }
@@ -774,6 +857,124 @@ mod tests {
             stopped.as_slice(),
             [ProviderEvent::SubagentStopped { agent_id }] if agent_id == "child-c1"
         ));
+    }
+
+    #[test]
+    fn codex_has_independent_session_permission_and_stop_contracts() {
+        let adapter = id("codex");
+        let started = normalize_hook_event(
+            &adapter,
+            "SessionStart",
+            &json!({"session_id": "codex-session-1", "prompt": "resume work"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [
+                ProviderEvent::SessionStarted { session_id, .. },
+                ProviderEvent::TurnStarted { prompt }
+            ] if session_id == "codex-session-1" && prompt.as_deref() == Some("resume work")
+        ));
+
+        let approval = normalize_hook_event(
+            &adapter,
+            "PermissionRequest",
+            &json!({
+                "tool_name": "shell",
+                "tool_use_id": "codex-tool-1",
+                "input": {"command": "git push --force"}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            approval.as_slice(),
+            [ProviderEvent::InteractionRequested {
+                request_id: Some(request_id),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name,
+                ..
+            }] if request_id == "codex-tool-1" && tool_name == "shell"
+        ));
+
+        let question = normalize_hook_event(
+            &adapter,
+            "PermissionRequest",
+            &json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "codex-question-1",
+                "input": {"questions": [{"question": "Choose", "options": ["a", "b"]}]}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            question.as_slice(),
+            [ProviderEvent::InteractionRequested {
+                interaction_kind: ProviderInteractionKind::Question,
+                prompt,
+                ..
+            }] if prompt.contains("Choose")
+        ));
+
+        let stopped =
+            normalize_hook_event(&adapter, "Stop", &json!({"last_assistant_message": "done"}))
+                .unwrap();
+        assert!(matches!(
+            stopped.as_slice(),
+            [ProviderEvent::Text { text, .. }, ProviderEvent::TurnCompleted { .. }]
+                if text == "done"
+        ));
+    }
+
+    #[test]
+    fn gemini_uses_native_before_after_agent_and_tool_events() {
+        let adapter = id("gemini");
+        let started = normalize_hook_event(
+            &adapter,
+            "BeforeAgent",
+            &json!({"session_id": "gemini-session-1", "prompt": "inspect repository"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [
+                ProviderEvent::SessionIdentityObserved { session_id },
+                ProviderEvent::TurnStarted { prompt }
+            ] if session_id == "gemini-session-1"
+                && prompt.as_deref() == Some("inspect repository")
+        ));
+
+        let tool = normalize_hook_event(
+            &adapter,
+            "BeforeTool",
+            &json!({
+                "tool_name": "read_file",
+                "tool_call_id": "g-tool-1",
+                "args": {"path": "Cargo.toml"}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            tool.as_slice(),
+            [ProviderEvent::ToolStarted { id, name, input_json, .. }]
+                if id == "g-tool-1" && name == "read_file" && input_json.contains("Cargo.toml")
+        ));
+
+        let completed = normalize_hook_event(
+            &adapter,
+            "AfterAgent",
+            &json!({"prompt_response": "Repository inspected"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            completed.as_slice(),
+            [ProviderEvent::Text { text, .. }, ProviderEvent::TurnCompleted { .. }]
+                if text == "Repository inspected"
+        ));
+        assert!(
+            normalize_hook_event(&adapter, "PermissionRequest", &json!({}))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 14;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 15;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -379,6 +379,9 @@ pub enum ProviderEvent {
         model: String,
         tools: Vec<String>,
     },
+    SessionIdentityObserved {
+        session_id: String,
+    },
     TurnStarted {
         prompt: Option<String>,
     },
@@ -457,6 +460,9 @@ impl ProviderEvent {
                 for tool in tools {
                     validate_required("tool", tool, PROVIDER_EVENT_ID_MAX_BYTES)?;
                 }
+            }
+            Self::SessionIdentityObserved { session_id } => {
+                validate_required("session_id", session_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
             }
             Self::TurnStarted { prompt } => {
                 if let Some(prompt) = prompt {

@@ -255,6 +255,8 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         descriptors.push(descriptor(AdapterFamily::Acp, id));
     }
     descriptors.push(descriptor(AdapterFamily::Hook, "claude-code"));
+    descriptors.push(descriptor(AdapterFamily::Hook, "codex"));
+    descriptors.push(descriptor(AdapterFamily::Hook, "gemini"));
     for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
         descriptors.push(descriptor(AdapterFamily::Hook, id));
         descriptors.push(descriptor(AdapterFamily::History, id));
@@ -297,10 +299,16 @@ mod tests {
         assert!(registry.get(AdapterFamily::PtySemantic, &id).is_some());
         assert!(registry.get(AdapterFamily::Pipe, &id).is_some());
         assert!(registry.get(AdapterFamily::Acp, &id).is_some());
-        assert!(registry.get(AdapterFamily::Hook, &id).is_none());
+        assert!(registry.get(AdapterFamily::Hook, &id).is_some());
+        assert!(registry.get(AdapterFamily::History, &id).is_none());
         let claude = AdapterId::new("claude-code").unwrap();
         assert!(registry.get(AdapterFamily::Hook, &claude).is_some());
         assert!(registry.get(AdapterFamily::History, &claude).is_none());
+        for id in ["codex", "gemini"] {
+            let id = AdapterId::new(id).unwrap();
+            assert!(registry.get(AdapterFamily::Hook, &id).is_some());
+            assert!(registry.get(AdapterFamily::History, &id).is_none());
+        }
     }
 
     #[test]

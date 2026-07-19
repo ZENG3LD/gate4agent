@@ -406,6 +406,7 @@ impl HookSessionReducer {
                     self.tool_correlations.clear();
                 }
                 ProviderEvent::Text { .. }
+                | ProviderEvent::SessionIdentityObserved { .. }
                 | ProviderEvent::Thinking { .. }
                 | ProviderEvent::Error { .. }
                 | ProviderEvent::Ready

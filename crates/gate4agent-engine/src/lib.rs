@@ -1347,6 +1347,9 @@ fn reduce_provider_event(
                 ProviderInteractionOutcome::TurnEnded,
             ));
         }
+        ProviderEvent::SessionIdentityObserved { session_id } => {
+            snapshot.session_id = Some(session_id.clone());
+        }
         ProviderEvent::TurnStarted { prompt } => {
             interaction_transitions.extend(resolve_source_pending_interactions(
                 snapshot,
@@ -2436,6 +2439,52 @@ mod tests {
             ProviderInteractionStatus::Resolved {
                 outcome: ProviderInteractionOutcome::TurnEnded
             }
+        );
+    }
+
+    #[test]
+    fn provider_session_identity_observation_does_not_reset_live_turn_state() {
+        let (mut engine, spawn) = running_engine();
+        for (sequence, event) in [
+            ProviderEvent::SubagentStarted {
+                agent_id: "child-1".to_owned(),
+                agent_type: None,
+                description: None,
+            },
+            ProviderEvent::InteractionRequested {
+                request_id: Some("approval-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "shell".to_owned(),
+                prompt: "approve".to_owned(),
+                agent_id: Some("child-1".to_owned()),
+            },
+            ProviderEvent::SessionIdentityObserved {
+                session_id: "provider-session-1".to_owned(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: provider_source(),
+                    sequence: u64::try_from(sequence + 1).unwrap(),
+                    event,
+                },
+            });
+        }
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(provider.session_id.as_deref(), Some("provider-session-1"));
+        assert_eq!(provider.activity, ProviderActivity::WaitingForInput);
+        assert_eq!(provider.subagents.len(), 1);
+        assert_eq!(provider.interactions.len(), 1);
+        assert_eq!(
+            provider.interactions[0].status,
+            ProviderInteractionStatus::Pending
         );
     }
 

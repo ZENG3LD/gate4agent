@@ -42,7 +42,7 @@ pub enum HistoryRole {
     Assistant,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum HistorySourceLayout {
     SingleNdjson,
     SingleJson,
@@ -446,6 +446,7 @@ fn parse_kimi(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapt
     let metadata = metadata_object(document)?;
     let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
     session.title = string(&metadata, &["title"]).and_then(normalize_title);
+    session.cwd = string(&metadata, &["cwd", "workDir"]);
     let fallback_title = string(&metadata, &["lastPrompt"]).and_then(normalize_title);
     let mut assistant_parts = Vec::new();
 

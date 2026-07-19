@@ -1,0 +1,19 @@
+[package]
+name = "gate4agent-shell-history"
+version = "0.2.37"
+edition = "2021"
+description = "Bounded native filesystem and SQLite authority for gate4agent history"
+license = "MIT"
+publish = false
+
+[dependencies]
+gate4agent-adapters = { path = "../gate4agent-adapters" }
+gate4agent-provider-ports = { path = "../gate4agent-provider-ports" }
+gate4agent-types = { path = "../gate4agent-types" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+gate4agent-catalog = { path = "../gate4agent-catalog" }

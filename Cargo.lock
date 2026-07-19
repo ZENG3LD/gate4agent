@@ -384,6 +384,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-shell-history"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-adapters",
+ "gate4agent-catalog",
+ "gate4agent-provider-ports",
+ "gate4agent-types",
+ "rusqlite",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "gate4agent-shell-hooks"
 version = "0.2.37"
 dependencies = [

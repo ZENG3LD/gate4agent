@@ -69,6 +69,7 @@ members = [
     "crates/gate4agent-engine",
     "crates/gate4agent-kernel",
     "crates/gate4agent-handle",
+    "crates/gate4agent-shell-history",
     "crates/gate4agent-shell-hooks",
     "crates/gate4agent-shell-native",
     "crates/gate4agent-runtime-native",

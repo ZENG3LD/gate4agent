@@ -1,17 +1,20 @@
 //! Tick-driven native runtime for embedding gate4agent in an owning app core.
 
-use gate4agent_catalog::AgentRegistry;
+use gate4agent_catalog::{AgentRegistry, EnvMutation};
 use gate4agent_handle::{bounded_port, Gate4AgentHandle, KernelPort, PublishReport};
 use gate4agent_kernel::{CommandOutcome, Gate4AgentKernel};
+pub use gate4agent_shell_hooks::{HookIngressConfig, HookIngressEndpoint};
+use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
 use gate4agent_shell_native::NativeEffectShell;
 use gate4agent_types::{
     AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope, ObservationEnvelope,
-    SessionGeneration, CONTROL_PROTOCOL_VERSION,
+    SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
 use tokio::time::MissedTickBehavior;
 
@@ -57,8 +60,10 @@ pub struct NativeRuntimeTick {
 pub struct NativeRuntime {
     config: NativeRuntimeConfig,
     kernel: Gate4AgentKernel,
+    handle: Gate4AgentHandle,
     port: KernelPort,
     effects: NativeEffectDispatcher,
+    hook_ingress: Option<HookIngressServer>,
 }
 
 impl NativeRuntime {
@@ -67,8 +72,10 @@ impl NativeRuntime {
         let runtime = Self {
             config,
             kernel: Gate4AgentKernel::new(catalog.clone()),
+            handle: handle.clone(),
             port,
             effects: NativeEffectDispatcher::new(catalog, config),
+            hook_ingress: None,
         };
         (handle, runtime)
     }
@@ -106,10 +113,82 @@ impl NativeRuntime {
     pub fn active_native_sessions(&self) -> usize {
         self.effects.active_sessions.load(Ordering::Acquire)
     }
+
+    /// Start the process-global loopback Hook listener. Call this before
+    /// starting agent sessions so their PTY environments receive route-scoped
+    /// endpoint coordinates.
+    pub async fn start_hook_ingress(
+        &mut self,
+        config: HookIngressConfig,
+    ) -> Result<HookIngressEndpoint, NativeHookIngressError> {
+        if let Some(server) = &self.hook_ingress {
+            if server.is_running() {
+                return Ok(server.endpoint().clone());
+            }
+        }
+        let has_started_session = self.handle.snapshot().sessions.iter().any(|session| {
+            matches!(
+                session.status,
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping
+            )
+        });
+        if self.active_native_sessions() != 0 || has_started_session {
+            return Err(NativeHookIngressError::ActiveSessions);
+        }
+        self.hook_ingress = None;
+        let server = HookIngressServer::start(self.handle.clone(), config).await?;
+        let endpoint = server.endpoint().clone();
+        self.effects.set_hook_ingress(Some(server.control()));
+        self.hook_ingress = Some(server);
+        Ok(endpoint)
+    }
+
+    pub async fn stop_hook_ingress(&mut self) {
+        self.effects.set_hook_ingress(None);
+        if let Some(server) = self.hook_ingress.take() {
+            server.stop().await;
+        }
+    }
+
+    pub fn hook_ingress_endpoint(&self) -> Option<&HookIngressEndpoint> {
+        self.hook_ingress
+            .as_ref()
+            .filter(|server| server.is_running())
+            .map(HookIngressServer::endpoint)
+    }
+
+    pub fn active_hook_routes(&self) -> usize {
+        self.hook_ingress
+            .as_ref()
+            .map_or(0, |server| server.control().active_route_count())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NativeHookIngressError {
+    #[error("hook ingress must start before native agent sessions")]
+    ActiveSessions,
+    #[error(transparent)]
+    Start(#[from] HookIngressStartError),
 }
 
 struct EffectWorker {
-    sender: Sender<EffectEnvelope>,
+    sender: Sender<NativeEffectRequest>,
+}
+
+struct NativeEffectRequest {
+    effect: EffectEnvelope,
+    pty_env: Vec<EnvMutation>,
+}
+
+#[derive(Clone)]
+struct NativeWorkerContext {
+    control_tx: Sender<ObservationEnvelope>,
+    terminal_frames: Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
+    active_sessions: Arc<AtomicUsize>,
+    hook_ingress: Arc<RwLock<Option<HookIngressControl>>>,
+    poll_interval: Duration,
+    idle_timeout: Duration,
 }
 
 struct NativeEffectDispatcher {
@@ -121,6 +200,7 @@ struct NativeEffectDispatcher {
     pending_failures: VecDeque<ObservationEnvelope>,
     terminal_frames: Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
     active_sessions: Arc<AtomicUsize>,
+    hook_ingress: Arc<RwLock<Option<HookIngressControl>>>,
 }
 
 impl NativeEffectDispatcher {
@@ -135,37 +215,106 @@ impl NativeEffectDispatcher {
             pending_failures: VecDeque::new(),
             terminal_frames: Arc::new(Mutex::new(BTreeMap::new())),
             active_sessions: Arc::new(AtomicUsize::new(0)),
+            hook_ingress: Arc::new(RwLock::new(None)),
         }
+    }
+
+    fn set_hook_ingress(&self, control: Option<HookIngressControl>) {
+        *self
+            .hook_ingress
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = control;
     }
 
     fn dispatch(&mut self, effect: EffectEnvelope) {
         self.workers.retain(|_, worker| !worker.sender.is_closed());
         let instance_id = effect.instance_id;
-        let mut pending = effect;
+        let pty_env = match self.hook_pty_env(&effect) {
+            Ok(environment) => environment,
+            Err(message) => {
+                self.pending_failures
+                    .push_back(effect_failure(effect, message));
+                return;
+            }
+        };
+        let mut pending = NativeEffectRequest { effect, pty_env };
         for _ in 0..2 {
             let sender = self.worker_sender(instance_id);
             match sender.try_send(pending) {
                 Ok(()) => return,
-                Err(TrySendError::Closed(effect)) => {
+                Err(TrySendError::Closed(request)) => {
                     self.workers.remove(&instance_id);
-                    pending = effect;
+                    pending = request;
                 }
-                Err(TrySendError::Full(effect)) => {
+                Err(TrySendError::Full(request)) => {
+                    self.remove_hook_route(&request.effect);
                     self.pending_failures.push_back(effect_failure(
-                        effect,
+                        request.effect,
                         "native session effect queue is full".to_owned(),
                     ));
                     return;
                 }
             }
         }
+        self.remove_hook_route(&pending.effect);
         self.pending_failures.push_back(effect_failure(
-            pending,
+            pending.effect,
             "native session effect worker is unavailable".to_owned(),
         ));
     }
 
-    fn worker_sender(&mut self, instance_id: AgentInstanceId) -> Sender<EffectEnvelope> {
+    fn hook_pty_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
+        let ControlEffect::Spawn {
+            agent_id,
+            transport: gate4agent_types::TransportKind::Pty,
+            ..
+        } = &effect.effect
+        else {
+            return Ok(Vec::new());
+        };
+        let control = self
+            .hook_ingress
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(control) = control else {
+            return Ok(Vec::new());
+        };
+        let binding = self
+            .catalog
+            .get(agent_id)
+            .and_then(|spec| spec.capabilities.adapters.hook.clone());
+        let Some(binding) = binding else {
+            return Ok(Vec::new());
+        };
+        let route = control
+            .register_route(effect.instance_id, effect.generation, binding)
+            .map_err(|error| error.to_string())?;
+        Ok(route
+            .environment()
+            .into_iter()
+            .map(|(key, value)| EnvMutation {
+                key: key.into(),
+                value: Some(value.into()),
+            })
+            .collect())
+    }
+
+    fn remove_hook_route(&self, effect: &EffectEnvelope) {
+        if !matches!(effect.effect, ControlEffect::Spawn { .. }) {
+            return;
+        }
+        if let Some(control) = self
+            .hook_ingress
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            control.remove_route(effect.instance_id, effect.generation);
+        }
+    }
+
+    fn worker_sender(&mut self, instance_id: AgentInstanceId) -> Sender<NativeEffectRequest> {
         if let Some(worker) = self.workers.get(&instance_id) {
             return worker.sender.clone();
         }
@@ -173,11 +322,14 @@ impl NativeEffectDispatcher {
         tokio::spawn(run_effect_worker(
             self.catalog.clone(),
             receiver,
-            self.control_tx.clone(),
-            Arc::clone(&self.terminal_frames),
-            Arc::clone(&self.active_sessions),
-            Duration::from_millis(self.config.worker_poll_interval_ms.max(1)),
-            Duration::from_millis(self.config.worker_idle_timeout_ms.max(1)),
+            NativeWorkerContext {
+                control_tx: self.control_tx.clone(),
+                terminal_frames: Arc::clone(&self.terminal_frames),
+                active_sessions: Arc::clone(&self.active_sessions),
+                hook_ingress: Arc::clone(&self.hook_ingress),
+                poll_interval: Duration::from_millis(self.config.worker_poll_interval_ms.max(1)),
+                idle_timeout: Duration::from_millis(self.config.worker_idle_timeout_ms.max(1)),
+            },
         ));
         self.workers.insert(
             instance_id,
@@ -222,60 +374,48 @@ impl NativeEffectDispatcher {
 
 async fn run_effect_worker(
     catalog: AgentRegistry,
-    mut effects: Receiver<EffectEnvelope>,
-    control_tx: Sender<ObservationEnvelope>,
-    terminal_frames: Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
-    active_sessions: Arc<AtomicUsize>,
-    poll_interval: Duration,
-    idle_timeout: Duration,
+    mut effects: Receiver<NativeEffectRequest>,
+    context: NativeWorkerContext,
 ) {
     let mut shell = NativeEffectShell::new(catalog);
-    let mut interval = tokio::time::interval(poll_interval);
+    let mut interval = tokio::time::interval(context.poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_effect = Instant::now();
 
     loop {
         tokio::select! {
-            effect = effects.recv() => {
-                let Some(effect) = effect else {
+            request = effects.recv() => {
+                let Some(request) = request else {
                     break;
                 };
                 last_effect = Instant::now();
                 let before = shell.active_session_count();
-                let completion = shell.execute(effect).await;
-                update_active_count(&active_sessions, before, shell.active_session_count());
+                let completion = shell
+                    .execute_with_pty_env(request.effect, request.pty_env)
+                    .await;
+                update_active_count(&context.active_sessions, before, shell.active_session_count());
+                remove_hook_route_for_observation(&context.hook_ingress, &completion);
                 if closes_terminal_session(&completion.observation) {
-                    terminal_frames
+                    context
+                        .terminal_frames
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&(completion.instance_id, completion.generation));
                 }
-                if control_tx.send(completion).await.is_err() {
+                if context.control_tx.send(completion).await.is_err() {
                     break;
                 }
-                if !publish_shell_observations(
-                    &mut shell,
-                    &control_tx,
-                    &terminal_frames,
-                    &active_sessions,
-                )
-                .await
-                {
+                if !publish_shell_observations(&mut shell, &context).await {
                     break;
                 }
             }
             _ = interval.tick() => {
-                if !publish_shell_observations(
-                    &mut shell,
-                    &control_tx,
-                    &terminal_frames,
-                    &active_sessions,
-                )
-                .await
-                {
+                if !publish_shell_observations(&mut shell, &context).await {
                     break;
                 }
-                if shell.active_session_count() == 0 && last_effect.elapsed() >= idle_timeout {
+                if shell.active_session_count() == 0
+                    && last_effect.elapsed() >= context.idle_timeout
+                {
                     break;
                 }
             }
@@ -284,18 +424,18 @@ async fn run_effect_worker(
 
     let remaining = shell.active_session_count();
     if remaining > 0 {
-        active_sessions.fetch_sub(remaining, Ordering::AcqRel);
+        context
+            .active_sessions
+            .fetch_sub(remaining, Ordering::AcqRel);
     }
 }
 
 async fn publish_shell_observations(
     shell: &mut NativeEffectShell,
-    control_tx: &Sender<ObservationEnvelope>,
-    terminal_frames: &Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
-    active_sessions: &Arc<AtomicUsize>,
+    context: &NativeWorkerContext,
 ) -> bool {
     for observation in shell.collect_provider_events() {
-        if control_tx.send(observation).await.is_err() {
+        if context.control_tx.send(observation).await.is_err() {
             return false;
         }
     }
@@ -306,27 +446,55 @@ async fn publish_shell_observations(
             ControlObservation::TerminalFrame { .. }
         ) {
             let key = (observation.instance_id, observation.generation);
-            terminal_frames
+            context
+                .terminal_frames
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(key, observation);
-        } else if control_tx.send(observation).await.is_err() {
+        } else if context.control_tx.send(observation).await.is_err() {
             return false;
         }
     }
 
     let before = shell.active_session_count();
     for observation in shell.collect_exits().await {
-        terminal_frames
+        remove_hook_route_for_observation(&context.hook_ingress, &observation);
+        context
+            .terminal_frames
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&(observation.instance_id, observation.generation));
-        if control_tx.send(observation).await.is_err() {
+        if context.control_tx.send(observation).await.is_err() {
             return false;
         }
     }
-    update_active_count(active_sessions, before, shell.active_session_count());
+    update_active_count(
+        &context.active_sessions,
+        before,
+        shell.active_session_count(),
+    );
     true
+}
+
+fn remove_hook_route_for_observation(
+    hook_ingress: &Arc<RwLock<Option<HookIngressControl>>>,
+    observation: &ObservationEnvelope,
+) {
+    if !matches!(
+        observation.observation,
+        ControlObservation::SpawnFailed { .. }
+            | ControlObservation::StopCompleted { .. }
+            | ControlObservation::ProcessExited { .. }
+    ) {
+        return;
+    }
+    if let Some(control) = hook_ingress
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        control.remove_route(observation.instance_id, observation.generation);
+    }
 }
 
 fn closes_terminal_session(observation: &ControlObservation) -> bool {

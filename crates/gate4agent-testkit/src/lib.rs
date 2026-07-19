@@ -12,6 +12,7 @@ pub const CONTROL_FIXTURE_ID: &str = "control-fixture";
 pub const PIPE_FIXTURE_ID: &str = "pipe-fixture";
 pub const ACP_FIXTURE_ID: &str = "acp-fixture";
 pub const PTY_PROVIDER_FIXTURE_ID: &str = "pty-provider-fixture";
+pub const HOOK_POSTING_FIXTURE_ID: &str = "hook-posting-fixture";
 
 pub fn interactive_agent_spec() -> AgentSpec {
     #[cfg(windows)]
@@ -107,6 +108,27 @@ pub fn pty_provider_agent_spec() -> AgentSpec {
             acp: None,
         },
     )
+}
+
+pub fn hook_posting_agent_spec() -> AgentSpec {
+    #[cfg(windows)]
+    let script = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8; $headers=@{'X-Gate4Agent-Hook-Token'=$env:GATE4AGENT_HOOK_TOKEN;'X-Gate4Agent-Hook-Route'=$env:GATE4AGENT_HOOK_ROUTE}; $body='{"hook_event_name":"UserPromptSubmit","event_id":"fixture-hook-1","payload":{"hook_event_name":"UserPromptSubmit","prompt":"fixture hook prompt"}}'; Invoke-WebRequest -UseBasicParsing -Method Post -Uri $env:GATE4AGENT_HOOK_URL -Headers $headers -ContentType 'application/json' -Body $body | Out-Null; [Console]::Write('fixture-hook-posted'); Start-Sleep -Seconds 60"#;
+    #[cfg(not(windows))]
+    let script = r#"python3 -c 'import json,os,urllib.request; body=json.dumps({"hook_event_name":"UserPromptSubmit","event_id":"fixture-hook-1","payload":{"hook_event_name":"UserPromptSubmit","prompt":"fixture hook prompt"}}).encode(); request=urllib.request.Request(os.environ["GATE4AGENT_HOOK_URL"],data=body,headers={"Content-Type":"application/json","X-Gate4Agent-Hook-Token":os.environ["GATE4AGENT_HOOK_TOKEN"],"X-Gate4Agent-Hook-Route":os.environ["GATE4AGENT_HOOK_ROUTE"]},method="POST"); urllib.request.urlopen(request,timeout=2).read()'; printf 'fixture-hook-posted'; sleep 60"#;
+    let launch = provider_launch(script);
+    let mut spec = provider_spec(
+        HOOK_POSTING_FIXTURE_ID,
+        "Control-plane Hook posting fixture",
+        launch,
+        AgentTransportCapabilities {
+            pty: true,
+            pty_adapter: None,
+            pipe: None,
+            acp: None,
+        },
+    );
+    spec.capabilities.adapters.hook = Some(adapter(AdapterFamily::Hook, "grok"));
+    spec
 }
 
 fn provider_launch(script: &str) -> LaunchSpec {

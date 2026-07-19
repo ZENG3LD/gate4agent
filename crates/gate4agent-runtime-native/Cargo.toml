@@ -8,8 +8,10 @@ publish = false
 gate4agent-catalog = { path = "../gate4agent-catalog" }
 gate4agent-handle = { path = "../gate4agent-handle" }
 gate4agent-kernel = { path = "../gate4agent-kernel" }
+gate4agent-shell-hooks = { path = "../gate4agent-shell-hooks" }
 gate4agent-shell-native = { path = "../gate4agent-shell-native" }
 gate4agent-types = { path = "../gate4agent-types" }
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]

@@ -1,10 +1,13 @@
 use std::time::Duration;
 
 use gate4agent_catalog::{builtin_adapter_registry, AgentRegistry};
-use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
+use gate4agent_runtime_native::{
+    HookIngressConfig, NativeHookIngressError, NativeRuntime, NativeRuntimeConfig,
+};
 use gate4agent_testkit::{
-    acp_agent_spec, interactive_agent_spec, pipe_agent_spec, pty_provider_agent_spec,
-    ACP_FIXTURE_ID, CONTROL_FIXTURE_ID, PIPE_FIXTURE_ID, PTY_PROVIDER_FIXTURE_ID,
+    acp_agent_spec, hook_posting_agent_spec, interactive_agent_spec, pipe_agent_spec,
+    pty_provider_agent_spec, ACP_FIXTURE_ID, CONTROL_FIXTURE_ID, HOOK_POSTING_FIXTURE_ID,
+    PIPE_FIXTURE_ID, PTY_PROVIDER_FIXTURE_ID,
 };
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
@@ -106,7 +109,11 @@ async fn pipe_one_shot_reaches_public_snapshot_with_semantic_events() {
     let snapshot = handle.snapshot();
     let session = snapshot.sessions.first().expect("pipe session snapshot");
     assert_eq!(
-        session.provider.session_id.as_deref(),
+        session
+            .provider
+            .session
+            .as_ref()
+            .map(|identity| identity.id.as_str()),
         Some("fixture-thread")
     );
     assert_eq!(session.provider.completed_turns, 1);
@@ -191,7 +198,11 @@ async fn acp_multi_turn_prompt_streams_and_stops_through_public_handle() {
     let snapshot = handle.snapshot();
     let session = snapshot.sessions.first().expect("ACP session snapshot");
     assert_eq!(
-        session.provider.session_id.as_deref(),
+        session
+            .provider
+            .session
+            .as_ref()
+            .map(|identity| identity.id.as_str()),
         Some("fixture-acp-session")
     );
     assert_eq!(session.provider.usage.input_tokens, 7);
@@ -623,6 +634,150 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
             },
         ))
         .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| matches!(session.status, SessionStatus::Exited { .. }))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn loopback_hook_listener_injects_a_route_and_reaches_the_public_snapshot() {
+    let (handle, mut runtime) = runtime(hook_posting_agent_spec());
+    let endpoint = runtime
+        .start_hook_ingress(HookIngressConfig::default())
+        .await
+        .unwrap();
+    assert!(endpoint.address().ip().is_loopback());
+    let subscription = handle.subscribe(64);
+    let instance_id = AgentInstanceId(45);
+    handle
+        .dispatch(command(
+            60,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(HOOK_POSTING_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            61,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ))
+        .unwrap();
+
+    let mut events = Vec::new();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle.snapshot().sessions.first().is_some_and(|session| {
+            session.provider.current_prompt.as_deref() == Some("fixture hook prompt")
+                && session.provider.activity == ProviderActivity::Working
+        })
+    })
+    .await;
+    assert_eq!(runtime.active_hook_routes(), 1);
+    assert_eq!(
+        handle.snapshot().sessions[0].provider.sources[0].sequence,
+        1
+    );
+
+    handle
+        .dispatch(command(
+            62,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |runtime, _| {
+        runtime.active_hook_routes() == 0
+            && handle
+                .snapshot()
+                .sessions
+                .first()
+                .is_some_and(|session| matches!(session.status, SessionStatus::Exited { .. }))
+    })
+    .await;
+    runtime.stop_hook_ingress().await;
+    assert!(runtime.hook_ingress_endpoint().is_none());
+}
+
+#[tokio::test]
+async fn hook_listener_rejects_a_late_start_after_spawn_dispatch() {
+    let (handle, mut runtime) = runtime(interactive_agent_spec());
+    let subscription = handle.subscribe(32);
+    let instance_id = AgentInstanceId(46);
+    handle
+        .dispatch(command(
+            70,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            71,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ))
+        .unwrap();
+    runtime.tick().await;
+    assert!(matches!(
+        handle.snapshot().sessions[0].status,
+        SessionStatus::Starting
+    ));
+    assert!(matches!(
+        runtime
+            .start_hook_ingress(HookIngressConfig::default())
+            .await,
+        Err(NativeHookIngressError::ActiveSessions)
+    ));
+
+    handle
+        .dispatch(command(
+            72,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ))
+        .unwrap();
+    let mut events = Vec::new();
     drive_until(&mut runtime, &subscription, &mut events, |_, _| {
         handle
             .snapshot()

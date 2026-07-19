@@ -12,7 +12,7 @@ use gate4agent::{
     SessionConfig,
 };
 use gate4agent_adapters::{builtin_adapter_registry, AdapterRuntimeRegistry};
-use gate4agent_catalog::{AgentRegistry, AgentSpec};
+use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
     ForegroundProcess, ForegroundProcessKind, ForegroundRequirement, ObservationEnvelope,
@@ -112,6 +112,17 @@ impl NativeEffectShell {
     }
 
     pub async fn execute(&mut self, envelope: EffectEnvelope) -> ObservationEnvelope {
+        self.execute_with_pty_env(envelope, Vec::new()).await
+    }
+
+    /// Execute an effect with shell-owned environment injected only into a
+    /// newly spawned PTY process. The canonical start request cannot set these
+    /// authority variables itself.
+    pub async fn execute_with_pty_env(
+        &mut self,
+        envelope: EffectEnvelope,
+        pty_env: Vec<EnvMutation>,
+    ) -> ObservationEnvelope {
         let EffectEnvelope {
             protocol_version,
             operation_id,
@@ -138,7 +149,7 @@ impl NativeEffectShell {
                     transport,
                     request,
                 } => {
-                    self.spawn_native(key, operation_id, agent_id, transport, request)
+                    self.spawn_native(key, operation_id, agent_id, transport, request, pty_env)
                         .await
                 }
                 ControlEffect::Stop { force } => self.stop_native(key, force).await,
@@ -295,6 +306,7 @@ impl NativeEffectShell {
         agent_id: AgentId,
         transport: TransportKind,
         request: StartRequest,
+        pty_env: Vec<EnvMutation>,
     ) -> ControlObservation {
         if self.session_exists(key) {
             return ControlObservation::SpawnFailed {
@@ -334,6 +346,7 @@ impl NativeEffectShell {
                 &spec,
                 LaunchRequest {
                     working_dir,
+                    env: pty_env,
                     platform: RuntimePlatform::current(),
                     prompt: request.initial_prompt,
                     session_options: request.session_options,

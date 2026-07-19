@@ -49,6 +49,8 @@ fn normalize_grok(
     let event = snake_event_name(event_name);
     match event.as_str() {
         "session_start" => Ok(session_started(payload, &["sessionId", "session_id"])),
+        "subagent_start" => Ok(subagent_started(payload)),
+        "subagent_stop" => Ok(subagent_stopped(payload)),
         "user_prompt_submit" => Ok(vec![turn_started(payload)]),
         "pre_tool_use" if is_ask_user_question(tool_name(payload).as_deref()) => {
             Ok(vec![interaction_event(
@@ -79,6 +81,8 @@ fn normalize_kimi(
 ) -> Result<Vec<ProviderEvent>, HookAdapterError> {
     match event_name {
         "SessionStart" => Ok(session_started(payload, &["session_id"])),
+        "SubagentStart" => Ok(subagent_started(payload)),
+        "SubagentStop" => Ok(subagent_stopped(payload)),
         "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" if is_ask_user_question(tool_name(payload).as_deref()) => {
             Ok(vec![interaction_event(
@@ -105,6 +109,8 @@ fn normalize_copilot(
     let event = copilot_event_name(event_name);
     match event.as_str() {
         "SessionStart" => Ok(session_started_from_copilot(payload)),
+        "SubagentStart" => Ok(subagent_started(payload)),
+        "SubagentStop" => Ok(subagent_stopped(payload)),
         "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" | "PermissionRequest" if is_ask_user(tool_name(payload).as_deref()) => {
             Ok(vec![interaction_event(
@@ -141,6 +147,8 @@ fn normalize_droid(
 ) -> Result<Vec<ProviderEvent>, HookAdapterError> {
     match event_name {
         "SessionStart" => Ok(session_started(payload, &["session_id"])),
+        "SubagentStart" => Ok(subagent_started(payload)),
+        "SubagentStop" => Ok(subagent_stopped(payload)),
         "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
         "PreToolUse" if is_ask_user(tool_name(payload).as_deref()) => Ok(vec![interaction_event(
             payload,
@@ -176,6 +184,8 @@ fn normalize_cursor(
 ) -> Result<Vec<ProviderEvent>, HookAdapterError> {
     match event_name {
         "sessionStart" => Ok(session_started(payload, &["session_id", "sessionId"])),
+        "subagentStart" => Ok(subagent_started(payload)),
+        "subagentStop" => Ok(subagent_stopped(payload)),
         "beforeSubmitPrompt" => Ok(vec![turn_started(payload)]),
         "preToolUse" => Ok(vec![tool_started(payload)]),
         "postToolUse" => Ok(vec![tool_completed(payload, false)]),
@@ -233,6 +243,28 @@ fn session_started_from_copilot(payload: &Map<String, Value>) -> Vec<ProviderEve
                 session_id,
                 model: String::new(),
                 tools: Vec::new(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn subagent_started(payload: &Map<String, Value>) -> Vec<ProviderEvent> {
+    string(payload, &["agent_id", "agentId"])
+        .map(|agent_id| {
+            vec![ProviderEvent::SubagentStarted {
+                agent_id: bounded_string(agent_id),
+                agent_type: string(payload, &["agent_type", "agentType"]).map(bounded_string),
+                description: string(payload, &["description", "prompt"]).map(bounded_string),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn subagent_stopped(payload: &Map<String, Value>) -> Vec<ProviderEvent> {
+    string(payload, &["agent_id", "agentId"])
+        .map(|agent_id| {
+            vec![ProviderEvent::SubagentStopped {
+                agent_id: bounded_string(agent_id),
             }]
         })
         .unwrap_or_default()
@@ -433,6 +465,8 @@ fn copilot_event_name(value: &str) -> String {
         "preToolUse" => "PreToolUse",
         "postToolUse" => "PostToolUse",
         "postToolUseFailure" => "PostToolUseFailure",
+        "subagentStart" => "SubagentStart",
+        "subagentStop" => "SubagentStop",
         "agentStop" | "stop" => "Stop",
         "errorOccurred" => "ErrorOccurred",
         "permissionRequest" => "PermissionRequest",
@@ -659,6 +693,40 @@ mod tests {
         assert!(matches!(
             normalize_hook_event(&id("future-provider"), "Stop", &json!({})),
             Err(HookAdapterError::UnsupportedAdapter(_))
+        ));
+    }
+
+    #[test]
+    fn copilot_normalizes_subagent_lifecycle_identity() {
+        let adapter = AdapterId::new("copilot").unwrap();
+        let started = normalize_hook_event(
+            &adapter,
+            "subagentStart",
+            &serde_json::json!({
+                "agentId": "child-c1",
+                "agentType": "reviewer",
+                "description": "review changes"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [ProviderEvent::SubagentStarted {
+                agent_id,
+                agent_type: Some(agent_type),
+                description: Some(description),
+            }] if agent_id == "child-c1" && agent_type == "reviewer" && description == "review changes"
+        ));
+
+        let stopped = normalize_hook_event(
+            &adapter,
+            "SubagentStop",
+            &serde_json::json!({"agent_id": "child-c1"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            stopped.as_slice(),
+            [ProviderEvent::SubagentStopped { agent_id }] if agent_id == "child-c1"
         ));
     }
 

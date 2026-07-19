@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 12;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 13;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -14,6 +14,7 @@ pub const PROVIDER_EVENT_TEXT_MAX_BYTES: usize = 262_144;
 pub const PROVIDER_EVENT_ID_MAX_BYTES: usize = 512;
 pub const PROVIDER_EVENT_TOOLS_MAX: usize = 256;
 pub const PROVIDER_INTERACTIONS_MAX: usize = 64;
+pub const PROVIDER_SUBAGENTS_MAX: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -363,6 +364,14 @@ pub enum ProviderInteractionOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSubagent {
+    pub source: ProviderSource,
+    pub provider_agent_id: String,
+    pub agent_type: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderEvent {
     SessionStarted {
@@ -409,6 +418,14 @@ pub enum ProviderEvent {
         interaction_kind: ProviderInteractionKind,
         tool_name: String,
         prompt: String,
+    },
+    SubagentStarted {
+        agent_id: String,
+        agent_type: Option<String>,
+        description: Option<String>,
+    },
+    SubagentStopped {
+        agent_id: String,
     },
     RateLimited {
         limit_type: String,
@@ -493,6 +510,26 @@ impl ProviderEvent {
                 } else {
                     validate_text("interaction prompt", prompt, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
                 }
+            }
+            Self::SubagentStarted {
+                agent_id,
+                agent_type,
+                description,
+            } => {
+                validate_required("subagent id", agent_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                if let Some(agent_type) = agent_type {
+                    validate_identifier("subagent type", agent_type, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                }
+                if let Some(description) = description {
+                    validate_text(
+                        "subagent description",
+                        description,
+                        PROVIDER_EVENT_TEXT_MAX_BYTES,
+                    )?;
+                }
+            }
+            Self::SubagentStopped { agent_id } => {
+                validate_required("subagent id", agent_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
             }
             Self::RateLimited {
                 limit_type,
@@ -639,10 +676,12 @@ pub struct ProviderSnapshot {
     pub tools: Vec<String>,
     pub completed_turns: u64,
     pub usage: TokenUsage,
+    pub lead_activity: ProviderActivity,
     pub activity: ProviderActivity,
     pub current_prompt: Option<String>,
     pub active_tools: Vec<ActiveProviderTool>,
     pub interactions: Vec<ProviderInteraction>,
+    pub subagents: Vec<ProviderSubagent>,
     pub sources: Vec<ProviderSourceCursor>,
     pub last_event: Option<ProviderEvent>,
     pub gap_count: u64,

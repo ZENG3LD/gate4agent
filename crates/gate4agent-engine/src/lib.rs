@@ -8,10 +8,10 @@ use gate4agent_types::{
     ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind,
     ProviderActivity, ProviderEvent, ProviderInteraction, ProviderInteractionId,
     ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
-    ProviderSnapshot, ProviderSource, ProviderSourceCursor, SessionGeneration, SessionSnapshot,
-    SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX,
-    WORKING_DIRECTORY_MAX_BYTES,
+    ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent, SessionGeneration,
+    SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage,
+    TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
+    PROVIDER_INTERACTIONS_MAX, PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -516,7 +516,8 @@ impl Gate4AgentEngine {
                         &mut session.provider,
                         ProviderInteractionOutcome::Interrupted,
                     );
-                    session.provider.activity = ProviderActivity::Idle;
+                    session.provider.lead_activity = ProviderActivity::Idle;
+                    refresh_provider_activity(&mut session.provider);
                     session.provider.current_prompt = None;
                     session.provider.active_tools.clear();
                 } else if pending_question_answer {
@@ -526,7 +527,7 @@ impl Gate4AgentEngine {
                         ProviderInteractionOutcome::Answered,
                     );
                     if !interaction_transitions.is_empty() {
-                        session.provider.activity =
+                        session.provider.lead_activity =
                             if session.provider.interactions.iter().any(|interaction| {
                                 matches!(interaction.status, ProviderInteractionStatus::Pending)
                             }) {
@@ -534,6 +535,7 @@ impl Gate4AgentEngine {
                             } else {
                                 ProviderActivity::Working
                             };
+                        refresh_provider_activity(&mut session.provider);
                     }
                 }
                 ControlEventKind::InputCompleted { input_kind }
@@ -1331,9 +1333,10 @@ fn reduce_provider_event(
             snapshot.session_id = Some(session_id.clone());
             snapshot.model = (!model.is_empty()).then(|| model.clone());
             snapshot.tools = tools.clone();
-            snapshot.activity = ProviderActivity::Idle;
+            snapshot.lead_activity = ProviderActivity::Idle;
             snapshot.current_prompt = None;
             snapshot.active_tools.clear();
+            remove_source_subagents(snapshot, source);
             interaction_transitions.extend(resolve_source_pending_interactions(
                 snapshot,
                 source,
@@ -1346,7 +1349,7 @@ fn reduce_provider_event(
                 source,
                 ProviderInteractionOutcome::Superseded,
             ));
-            snapshot.activity = ProviderActivity::Working;
+            snapshot.lead_activity = ProviderActivity::Working;
             snapshot.current_prompt = prompt.clone();
             snapshot.active_tools.clear();
         }
@@ -1357,7 +1360,7 @@ fn reduce_provider_event(
         } => {
             interaction_transitions
                 .extend(resolve_matching_provider_interactions(snapshot, source, id));
-            snapshot.activity = ProviderActivity::Working;
+            snapshot.lead_activity = ProviderActivity::Working;
             if let Some(active) = snapshot.active_tools.iter_mut().find(|tool| tool.id == *id) {
                 active.name = name.clone();
                 active.input_json = input_json.clone();
@@ -1372,7 +1375,7 @@ fn reduce_provider_event(
         ProviderEvent::ToolCompleted { id, .. } => {
             let resolved = resolve_matching_provider_interactions(snapshot, source, id);
             if !resolved.is_empty() {
-                snapshot.activity = ProviderActivity::Working;
+                snapshot.lead_activity = ProviderActivity::Working;
             }
             interaction_transitions.extend(resolved);
             snapshot.active_tools.retain(|tool| tool.id != *id);
@@ -1387,7 +1390,7 @@ fn reduce_provider_event(
             } else {
                 add_token_usage(&mut snapshot.usage, usage);
             }
-            snapshot.activity = ProviderActivity::Idle;
+            snapshot.lead_activity = ProviderActivity::Idle;
             snapshot.current_prompt = None;
             snapshot.active_tools.clear();
             interaction_transitions.extend(resolve_source_pending_interactions(
@@ -1421,13 +1424,13 @@ fn reduce_provider_event(
             };
             push_provider_interaction(snapshot, interaction.clone(), &mut interaction_transitions);
             interaction_transitions.push(ProviderInteractionTransition::Requested(interaction));
-            snapshot.activity = ProviderActivity::WaitingForInput;
+            snapshot.lead_activity = ProviderActivity::WaitingForInput;
         }
         ProviderEvent::RateLimited { .. } | ProviderEvent::Error { .. } => {
-            snapshot.activity = ProviderActivity::Blocked;
+            snapshot.lead_activity = ProviderActivity::Blocked;
         }
         ProviderEvent::Ready => {
-            snapshot.activity =
+            snapshot.lead_activity =
                 if snapshot.interactions.iter().any(|interaction| {
                     matches!(interaction.status, ProviderInteractionStatus::Pending)
                 }) {
@@ -1437,17 +1440,43 @@ fn reduce_provider_event(
                 };
         }
         ProviderEvent::SessionEnded { .. } => {
-            snapshot.activity = ProviderActivity::Idle;
+            snapshot.lead_activity = ProviderActivity::Idle;
             snapshot.current_prompt = None;
             snapshot.active_tools.clear();
+            remove_source_subagents(snapshot, source);
             interaction_transitions.extend(resolve_source_pending_interactions(
                 snapshot,
                 source,
                 ProviderInteractionOutcome::TurnEnded,
             ));
         }
+        ProviderEvent::SubagentStarted {
+            agent_id,
+            agent_type,
+            description,
+        } => {
+            if let Some(existing) = snapshot.subagents.iter_mut().find(|subagent| {
+                subagent.source == *source && subagent.provider_agent_id == *agent_id
+            }) {
+                existing.agent_type = agent_type.clone().or(existing.agent_type.take());
+                existing.description = description.clone().or(existing.description.take());
+            } else if snapshot.subagents.len() < PROVIDER_SUBAGENTS_MAX {
+                snapshot.subagents.push(ProviderSubagent {
+                    source: source.clone(),
+                    provider_agent_id: agent_id.clone(),
+                    agent_type: agent_type.clone(),
+                    description: description.clone(),
+                });
+            }
+        }
+        ProviderEvent::SubagentStopped { agent_id } => {
+            snapshot.subagents.retain(|subagent| {
+                subagent.source != *source || subagent.provider_agent_id != *agent_id
+            });
+        }
         ProviderEvent::Text { .. } | ProviderEvent::Thinking { .. } => {}
     }
+    refresh_provider_activity(snapshot);
     provider_source_cursor_mut(snapshot, source).sequence = source_sequence;
     provider_source_cursor_mut(snapshot, source).stale = false;
     snapshot.sequence = canonical_sequence;
@@ -1457,6 +1486,21 @@ fn reduce_provider_event(
         sequence: canonical_sequence,
         interaction_transitions,
     }
+}
+
+fn refresh_provider_activity(snapshot: &mut ProviderSnapshot) {
+    snapshot.activity =
+        if snapshot.lead_activity == ProviderActivity::Idle && !snapshot.subagents.is_empty() {
+            ProviderActivity::Working
+        } else {
+            snapshot.lead_activity
+        };
+}
+
+fn remove_source_subagents(snapshot: &mut ProviderSnapshot, source: &ProviderSource) {
+    snapshot
+        .subagents
+        .retain(|subagent| subagent.source != *source);
 }
 
 fn push_provider_interaction(
@@ -2111,6 +2155,58 @@ mod tests {
             snapshot.sessions[0].provider.activity,
             ProviderActivity::WaitingForInput
         );
+    }
+
+    #[test]
+    fn live_subagent_gates_lead_completion_until_exact_stop() {
+        let (mut engine, spawn) = running_engine();
+        for (sequence, event) in [
+            ProviderEvent::SubagentStarted {
+                agent_id: "child-1".to_owned(),
+                agent_type: Some("reviewer".to_owned()),
+                description: Some("review the reducer".to_owned()),
+            },
+            ProviderEvent::TurnCompleted {
+                usage: TokenUsage::default(),
+                is_cumulative: false,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: provider_source(),
+                    sequence: u64::try_from(sequence + 1).unwrap(),
+                    event,
+                },
+            });
+        }
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(provider.lead_activity, ProviderActivity::Idle);
+        assert_eq!(provider.activity, ProviderActivity::Working);
+        assert_eq!(provider.subagents.len(), 1);
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 3,
+                event: ProviderEvent::SubagentStopped {
+                    agent_id: "child-1".to_owned(),
+                },
+            },
+        });
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert!(provider.subagents.is_empty());
+        assert_eq!(provider.activity, ProviderActivity::Idle);
     }
 
     #[test]

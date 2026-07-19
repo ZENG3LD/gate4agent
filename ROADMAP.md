@@ -4,6 +4,14 @@ Living document. Current state + what's next. Updated per release.
 
 ## Current — 0.2.37 (April 2026)
 
+### Current ACP authority boundary
+
+`AcpSession` currently provides process lifecycle, multi-turn prompts, and
+structured events. It advertises host filesystem and terminal capabilities as
+disabled, denies agent-to-host filesystem, terminal, and permission callbacks,
+and always sends an empty MCP server list. Those authorities stay unavailable
+until they are routed through the canonical control plane.
+
 ### Shipped in 0.2.37
 
 - **feat: full OpenCode model catalog**: All 49 OpenCode built-in models listed — 12 free-tier first (GPT-5 Nano, GLM, Kimi, Mimo, MiniMax, Nemotron, Qwen, Trinity), then 37 paid. Removed old cross-provider entries (`anthropic/`, `openai/`, `google/`); all use `opencode/` prefix. Own-key users configure `opencode.json` → `discover_capabilities()`.

@@ -470,6 +470,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-tool-engine"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gate4agent-types"
 version = "0.2.37"
 dependencies = [

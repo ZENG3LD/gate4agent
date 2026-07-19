@@ -67,6 +67,7 @@ members = [
     "crates/gate4agent-provider-ports",
     "crates/gate4agent-catalog",
     "crates/gate4agent-engine",
+    "crates/gate4agent-tool-engine",
     "crates/gate4agent-kernel",
     "crates/gate4agent-handle",
     "crates/gate4agent-shell-history",

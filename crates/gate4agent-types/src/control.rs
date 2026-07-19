@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 23;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 24;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -17,6 +17,8 @@ pub const PROVIDER_EVENT_TEXT_MAX_BYTES: usize = 262_144;
 pub const PROVIDER_EVENT_ID_MAX_BYTES: usize = 512;
 pub const PROVIDER_EVENT_TOOLS_MAX: usize = 256;
 pub const PROVIDER_INTERACTIONS_MAX: usize = 64;
+pub const PROVIDER_INTERACTION_RESPONSE_MAX_BYTES: usize = 32_768;
+pub const PROVIDER_INTERACTION_FAILURE_MAX_BYTES: usize = 4_096;
 pub const PROVIDER_SUBAGENTS_MAX: usize = 64;
 pub const PROVIDER_SESSION_LOCATOR_MAX_BYTES: usize = 32_768;
 
@@ -178,6 +180,12 @@ pub enum ControlCommand {
         target: ResumeTarget,
         request: ResumeLaunchRequest,
     },
+    ResolveInteraction {
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+        interaction_id: ProviderInteractionId,
+        response: ProviderInteractionResponse,
+    },
     IngestProvider {
         instance_id: AgentInstanceId,
         generation: SessionGeneration,
@@ -203,6 +211,7 @@ impl ControlCommand {
             | Self::DiscoverHistory { instance_id, .. }
             | Self::LoadHistory { instance_id, .. }
             | Self::Resume { instance_id, .. }
+            | Self::ResolveInteraction { instance_id, .. }
             | Self::IngestProvider { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
@@ -278,6 +287,10 @@ pub enum ControlEffect {
         provider_session: ProviderSessionIdentity,
         request: ResumeLaunchRequest,
     },
+    ResolveInteraction {
+        target: ProviderInteractionTarget,
+        response: ProviderInteractionResponse,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -348,6 +361,13 @@ pub enum ControlObservation {
         reason: String,
     },
     ResumeFailed {
+        message: String,
+    },
+    InteractionResolutionCompleted {
+        interaction_id: ProviderInteractionId,
+    },
+    InteractionResolutionFailed {
+        interaction_id: ProviderInteractionId,
         message: String,
     },
     TerminalFrame {
@@ -438,6 +458,83 @@ pub enum ProviderInteractionOutcome {
     Interrupted,
     TurnEnded,
     Superseded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderInteractionResponseKind {
+    ApproveOnce,
+    Deny,
+    Answer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ProviderInteractionResponse {
+    ApproveOnce,
+    Deny,
+    Answer { text: String },
+}
+
+impl ProviderInteractionResponse {
+    pub fn kind(&self) -> ProviderInteractionResponseKind {
+        match self {
+            Self::ApproveOnce => ProviderInteractionResponseKind::ApproveOnce,
+            Self::Deny => ProviderInteractionResponseKind::Deny,
+            Self::Answer { .. } => ProviderInteractionResponseKind::Answer,
+        }
+    }
+
+    pub fn outcome(&self) -> ProviderInteractionOutcome {
+        match self {
+            Self::ApproveOnce => ProviderInteractionOutcome::Approved,
+            Self::Deny => ProviderInteractionOutcome::Denied,
+            Self::Answer { .. } => ProviderInteractionOutcome::Answered,
+        }
+    }
+
+    pub fn validate_for(
+        &self,
+        interaction_kind: ProviderInteractionKind,
+    ) -> Result<(), ProviderInteractionResponseError> {
+        match (interaction_kind, self) {
+            (ProviderInteractionKind::Approval, Self::ApproveOnce)
+            | (ProviderInteractionKind::Approval, Self::Deny)
+            | (ProviderInteractionKind::Question, Self::Deny) => Ok(()),
+            (ProviderInteractionKind::Question, Self::Answer { text }) => {
+                if text.trim().is_empty() {
+                    return Err(ProviderInteractionResponseError::EmptyAnswer);
+                }
+                let has_unsafe_control = text.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                });
+                if text.len() > PROVIDER_INTERACTION_RESPONSE_MAX_BYTES || has_unsafe_control {
+                    return Err(ProviderInteractionResponseError::InvalidAnswer {
+                        max: PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
+                    });
+                }
+                Ok(())
+            }
+            (ProviderInteractionKind::Approval, Self::Answer { .. }) => {
+                Err(ProviderInteractionResponseError::AnswerRequiresQuestion)
+            }
+            (ProviderInteractionKind::Question, Self::ApproveOnce) => {
+                Err(ProviderInteractionResponseError::ApprovalRequiresApproval)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ProviderInteractionResponseError {
+    #[error("interaction answer is required")]
+    EmptyAnswer,
+    #[error("interaction answer contains controls or exceeds {max} bytes")]
+    InvalidAnswer { max: usize },
+    #[error("an answer response requires a question interaction")]
+    AnswerRequiresQuestion,
+    #[error("an approve-once response requires an approval interaction")]
+    ApprovalRequiresApproval,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -778,10 +875,26 @@ pub struct ProviderSourceCursor {
 pub struct ProviderInteractionId(pub u64);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderInteractionTarget {
+    pub interaction_id: ProviderInteractionId,
+    pub source: ProviderSource,
+    pub provider_request_id: Option<String>,
+    pub interaction_kind: ProviderInteractionKind,
+    pub tool_name: String,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderInteractionStatus {
     Pending,
-    Resolved { outcome: ProviderInteractionOutcome },
+    Resolving {
+        operation_id: OperationId,
+        response_kind: ProviderInteractionResponseKind,
+    },
+    Resolved {
+        outcome: ProviderInteractionOutcome,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -954,6 +1067,15 @@ pub enum ControlEventKind {
     InteractionRequested {
         interaction: ProviderInteraction,
     },
+    InteractionResolutionRequested {
+        operation_id: OperationId,
+        interaction_id: ProviderInteractionId,
+        response_kind: ProviderInteractionResponseKind,
+    },
+    InteractionResolutionFailed {
+        interaction_id: ProviderInteractionId,
+        message: String,
+    },
     InteractionResolved {
         interaction_id: ProviderInteractionId,
         outcome: ProviderInteractionOutcome,
@@ -986,6 +1108,7 @@ pub enum ObservationIgnoredReason {
     InvalidCapabilityObservation,
     InvalidHistoryObservation,
     InvalidResumeObservation,
+    InvalidInteractionObservation,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
@@ -1052,6 +1175,21 @@ pub enum ControlError {
     InvalidProviderBatch { max: usize },
     #[error("invalid provider ingress event: {message}")]
     InvalidProviderEvent { message: String },
+    #[error("provider interaction generation {actual:?} is stale; expected {expected:?}")]
+    StaleProviderInteractionGeneration {
+        expected: SessionGeneration,
+        actual: SessionGeneration,
+    },
+    #[error("provider interaction {interaction_id:?} is unknown")]
+    UnknownProviderInteraction {
+        interaction_id: ProviderInteractionId,
+    },
+    #[error("provider interaction {interaction_id:?} is not pending")]
+    ProviderInteractionNotPending {
+        interaction_id: ProviderInteractionId,
+    },
+    #[error("provider interaction response is invalid: {message}")]
+    InvalidProviderInteractionResponse { message: String },
 }
 
 impl Default for ControlSnapshot {
@@ -1068,8 +1206,9 @@ impl Default for ControlSnapshot {
 mod tests {
     use super::{
         ForegroundProcess, ForegroundProcessKind, ProviderEvent, ProviderEventValidationError,
-        ProviderInteractionKind, ProviderSessionIdentity, ProviderSessionKey,
-        FOREGROUND_PROCESS_NAME_MAX_BYTES,
+        ProviderInteractionKind, ProviderInteractionResponse, ProviderInteractionResponseError,
+        ProviderSessionIdentity, ProviderSessionKey, FOREGROUND_PROCESS_NAME_MAX_BYTES,
+        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
     };
     use crate::AgentId;
 
@@ -1131,6 +1270,47 @@ mod tests {
                 field: "interaction prompt"
             })
         ));
+    }
+
+    #[test]
+    fn provider_interaction_responses_are_kind_checked_and_bounded() {
+        assert_eq!(
+            ProviderInteractionResponse::ApproveOnce
+                .validate_for(ProviderInteractionKind::Approval),
+            Ok(())
+        );
+        assert_eq!(
+            ProviderInteractionResponse::Deny.validate_for(ProviderInteractionKind::Question),
+            Ok(())
+        );
+        assert_eq!(
+            ProviderInteractionResponse::Answer {
+                text: "continue".to_owned(),
+            }
+            .validate_for(ProviderInteractionKind::Question),
+            Ok(())
+        );
+        assert_eq!(
+            ProviderInteractionResponse::ApproveOnce
+                .validate_for(ProviderInteractionKind::Question),
+            Err(ProviderInteractionResponseError::ApprovalRequiresApproval)
+        );
+        assert_eq!(
+            ProviderInteractionResponse::Answer {
+                text: String::new(),
+            }
+            .validate_for(ProviderInteractionKind::Question),
+            Err(ProviderInteractionResponseError::EmptyAnswer)
+        );
+        assert_eq!(
+            ProviderInteractionResponse::Answer {
+                text: "x".repeat(PROVIDER_INTERACTION_RESPONSE_MAX_BYTES + 1),
+            }
+            .validate_for(ProviderInteractionKind::Question),
+            Err(ProviderInteractionResponseError::InvalidAnswer {
+                max: PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
+            })
+        );
     }
 
     #[test]

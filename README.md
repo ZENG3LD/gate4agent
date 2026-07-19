@@ -100,7 +100,7 @@ menus. Those remain visible for operator input.
 Transport classes:
 - **Pipe**: spawn the CLI directly, read NDJSON over stdout
 - **PTY**: spawn inside a pseudo-terminal, scrape the screen with vt100 (for agents without structured output)
-- **ACP** (Agent Client Protocol): spawn the CLI in ACP mode, communicate via bidirectional JSON-RPC 2.0 over stdio. Multi-turn sessions, structured events, agent→host callbacks (fs, terminal, permissions).
+- **ACP** (Agent Client Protocol): spawn the CLI in ACP mode and communicate via bidirectional JSON-RPC 2.0 over stdio. Multi-turn sessions and structured events remain available; host filesystem, terminal, permission, and MCP authority is fail-closed until it is routed through the canonical control plane.
 
 ## Quick start
 
@@ -189,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-ACP provides multi-turn sessions — call `prompt()` repeatedly without respawning the agent process. The agent can also call back to the host for file access, terminal execution, and permission requests.
+ACP provides multi-turn sessions — call `prompt()` repeatedly without respawning the agent process. Agent-to-host filesystem, terminal, and permission requests are advertised as unavailable and denied by default; raw MCP server injection is not exposed by `AcpSessionOptions`.
 
 ### Daemon Transport (skeleton)
 
@@ -203,7 +203,7 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 - **Transport-neutral events** — `AgentEvent::{Text, ToolStart, ToolResult, Thinking, TurnComplete, SessionStart, SessionEnd}`
 - **Cross-platform** — Windows (ConPTY + `cmd /C` argv wrapping) and Unix (POSIX PTY + bare exec)
 - **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
-- **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio, multi-turn sessions, agent→host callbacks
+- **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio and multi-turn sessions, with agent-to-host and MCP authority fail-closed
 - **4 CLI agents** — Claude Code, Codex, Gemini, OpenCode
 - **Extensible grounding registry** — 33 portable agent IDs and shell-free interactive launch plans; deep transport support remains capability-specific
 - **Typed terminal input** — bounded prompt/draft framing with UTF-8-safe chunks and explicit command/control variants
@@ -231,7 +231,7 @@ gate4agent/
 │   │   ├── session.rs   — AcpSession::spawn(), prompt(), cancel(), kill()
 │   │   ├── protocol.rs  — ACP wire types (InitializeParams, SessionUpdate, ContentBlock)
 │   │   ├── reader.rs    — Blocking JSON-RPC reader loop
-│   │   ├── host.rs      — AcpHostHandler trait, FilesystemAcpHandler, TerminalAcpHandler
+│   │   ├── host.rs      — Private fail-closed ACP host adapter and test-only legacy fixtures
 │   │   └── spawn.rs     — AcpProcess + per-CLI spawn specs
 │   ├── rpc/             — Shared JSON-RPC 2.0 primitives (message, pending, handler, id)
 │   │                      Used internally by acp/. Not a standalone transport.

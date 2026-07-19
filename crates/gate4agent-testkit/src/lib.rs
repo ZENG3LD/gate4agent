@@ -86,18 +86,102 @@ pub fn one_shot_agent_spec() -> AgentSpec {
 
 pub fn acp_agent_spec() -> AgentSpec {
     #[cfg(windows)]
-    let script = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8; while ($true) { $line=[Console]::ReadLine(); if ($null -eq $line) { break }; $request=$line | ConvertFrom-Json; if ($request.method -eq 'initialize') { $result=@{protocolVersion=1;agentCapabilities=@{loadSession=$false};agentInfo=@{name='fixture';title='Fixture ACP';version='1'}}; [Console]::WriteLine((@{jsonrpc='2.0';id=$request.id;result=$result} | ConvertTo-Json -Compress -Depth 8)) } elseif ($request.method -eq 'session/new') { [Console]::WriteLine((@{jsonrpc='2.0';id=$request.id;result=@{sessionId='fixture-acp-session'}} | ConvertTo-Json -Compress -Depth 8)) } elseif ($request.method -eq 'session/prompt') { $update=@{jsonrpc='2.0';method='session/update';params=@{sessionId='fixture-acp-session';update=@{sessionUpdate='agent_message_chunk';content=@{type='text';text='fixture-acp-response'}}}}; [Console]::WriteLine(($update | ConvertTo-Json -Compress -Depth 10)); [Console]::WriteLine((@{jsonrpc='2.0';id=$request.id;result=@{stopReason='end_turn';inputTokens=7;outputTokens=11}} | ConvertTo-Json -Compress -Depth 8)) } }"#;
+    let script = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
+function Write-JsonLine($value) {
+    [Console]::WriteLine(($value | ConvertTo-Json -Compress -Depth 12))
+}
+
+$initialize = [Console]::ReadLine() | ConvertFrom-Json
+$fsCapabilities = $initialize.params.clientCapabilities.fs
+$initializeOk = ($initialize.method -eq 'initialize') -and
+    ($fsCapabilities.PSObject.Properties.Name -contains 'readTextFile') -and
+    ($fsCapabilities.readTextFile -eq $false) -and
+    ($initialize.params.clientCapabilities.PSObject.Properties.Name -contains 'terminal') -and
+    ($initialize.params.clientCapabilities.terminal -eq $false)
+if (-not $initializeOk) {
+    Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;error=@{code=-32003;message='fixture expected fail-closed client capabilities'}}
+    exit 41
+}
+Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;result=@{protocolVersion=1;agentCapabilities=@{loadSession=$false};agentInfo=@{name='fixture';title='Fixture ACP';version='1'}}}
+
+$newSession = [Console]::ReadLine() | ConvertFrom-Json
+$newSessionOk = ($newSession.method -eq 'session/new') -and
+    ($newSession.params.PSObject.Properties.Name -contains 'mcpServers') -and
+    (@($newSession.params.mcpServers).Count -eq 0)
+if (-not $newSessionOk) {
+    Write-JsonLine @{jsonrpc='2.0';id=$newSession.id;error=@{code=-32003;message='fixture expected an empty MCP server list'}}
+    exit 42
+}
+Write-JsonLine @{jsonrpc='2.0';id=$newSession.id;result=@{sessionId='fixture-acp-session'}}
+
+while ($true) {
+    $line = [Console]::ReadLine()
+    if ($null -eq $line) { break }
+    $request = $line | ConvertFrom-Json
+    if ($request.method -ne 'session/prompt') { continue }
+
+    Write-JsonLine @{jsonrpc='2.0';id=9101;method='fs/read_text_file';params=@{path='fixture-forbidden.txt'}}
+    $fsResponse = [Console]::ReadLine() | ConvertFrom-Json
+    Write-JsonLine @{jsonrpc='2.0';id=9102;method='terminal/create';params=@{cwd='.';env=@{}}}
+    $terminalResponse = [Console]::ReadLine() | ConvertFrom-Json
+    Write-JsonLine @{jsonrpc='2.0';id=9103;method='session/request_permission';params=@{toolName='fixture-tool';description='fixture permission';sessionId='fixture-acp-session'}}
+    $permissionResponse = [Console]::ReadLine() | ConvertFrom-Json
+
+    $callbacksDenied = ($fsResponse.id -eq 9101) -and
+        ($fsResponse.error.code -eq -32002) -and
+        ($terminalResponse.id -eq 9102) -and
+        ($terminalResponse.error.code -eq -32004) -and
+        ($permissionResponse.id -eq 9103) -and
+        ($null -eq $permissionResponse.error) -and
+        ($permissionResponse.result.allowed -eq $false)
+    if (-not $callbacksDenied) {
+        Write-JsonLine @{jsonrpc='2.0';id=$request.id;error=@{code=-32003;message='fixture observed ACP host authority'}}
+        continue
+    }
+
+    Write-JsonLine @{jsonrpc='2.0';method='session/update';params=@{sessionId='fixture-acp-session';update=@{sessionUpdate='agent_message_chunk';content=@{type='text';text='fixture-acp-response'}}}}
+    Write-JsonLine @{jsonrpc='2.0';id=$request.id;result=@{stopReason='end_turn';inputTokens=7;outputTokens=11}}
+}"#;
     #[cfg(not(windows))]
     let script = r#"import json,sys
-for line in sys.stdin:
- r=json.loads(line); m=r.get('method'); i=r.get('id')
- if m=='initialize': out={'jsonrpc':'2.0','id':i,'result':{'protocolVersion':1,'agentCapabilities':{'loadSession':False},'agentInfo':{'name':'fixture','title':'Fixture ACP','version':'1'}}}
- elif m=='session/new': out={'jsonrpc':'2.0','id':i,'result':{'sessionId':'fixture-acp-session'}}
- elif m=='session/prompt':
-  print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-acp-session','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'fixture-acp-response'}}}}),flush=True)
-  out={'jsonrpc':'2.0','id':i,'result':{'stopReason':'end_turn','inputTokens':7,'outputTokens':11}}
- else: continue
- print(json.dumps(out),flush=True)"#;
+def read_message():
+ message=sys.stdin.readline()
+ if not message: sys.exit(0)
+ return json.loads(message)
+def write_message(message):
+ print(json.dumps(message),flush=True)
+def fail(request,message,code):
+ write_message({'jsonrpc':'2.0','id':request.get('id'),'error':{'code':-32003,'message':message}})
+ sys.exit(code)
+
+initialize=read_message()
+client=initialize.get('params',{}).get('clientCapabilities',{})
+fs=client.get('fs',{})
+if initialize.get('method')!='initialize' or fs.get('readTextFile') is not False or client.get('terminal') is not False:
+ fail(initialize,'fixture expected fail-closed client capabilities',41)
+write_message({'jsonrpc':'2.0','id':initialize.get('id'),'result':{'protocolVersion':1,'agentCapabilities':{'loadSession':False},'agentInfo':{'name':'fixture','title':'Fixture ACP','version':'1'}}})
+
+new_session=read_message()
+new_params=new_session.get('params',{})
+if new_session.get('method')!='session/new' or new_params.get('mcpServers')!=[]:
+ fail(new_session,'fixture expected an empty MCP server list',42)
+write_message({'jsonrpc':'2.0','id':new_session.get('id'),'result':{'sessionId':'fixture-acp-session'}})
+
+while True:
+ request=read_message()
+ if request.get('method')!='session/prompt': continue
+ write_message({'jsonrpc':'2.0','id':9101,'method':'fs/read_text_file','params':{'path':'fixture-forbidden.txt'}})
+ fs_response=read_message()
+ write_message({'jsonrpc':'2.0','id':9102,'method':'terminal/create','params':{'cwd':'.','env':{}}})
+ terminal_response=read_message()
+ write_message({'jsonrpc':'2.0','id':9103,'method':'session/request_permission','params':{'toolName':'fixture-tool','description':'fixture permission','sessionId':'fixture-acp-session'}})
+ permission_response=read_message()
+ callbacks_denied=(fs_response.get('id')==9101 and fs_response.get('error',{}).get('code')==-32002 and terminal_response.get('id')==9102 and terminal_response.get('error',{}).get('code')==-32004 and permission_response.get('id')==9103 and permission_response.get('error') is None and permission_response.get('result',{}).get('allowed') is False)
+ if not callbacks_denied:
+  write_message({'jsonrpc':'2.0','id':request.get('id'),'error':{'code':-32003,'message':'fixture observed ACP host authority'}})
+  continue
+ write_message({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-acp-session','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'fixture-acp-response'}}}})
+ write_message({'jsonrpc':'2.0','id':request.get('id'),'result':{'stopReason':'end_turn','inputTokens':7,'outputTokens':11}})"#;
     #[cfg(windows)]
     let launch = provider_launch(script);
     #[cfg(not(windows))]

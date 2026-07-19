@@ -1068,6 +1068,12 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
         ControlEffect::SubmitPrompt { .. } | ControlEffect::Interrupt => {
             ControlObservation::InputFailed { message }
         }
+        ControlEffect::ResolveInteraction { target, .. } => {
+            ControlObservation::InteractionResolutionFailed {
+                interaction_id: target.interaction_id,
+                message,
+            }
+        }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
         ControlEffect::ProbeCapabilities { .. } => ControlObservation::CapabilityProbeFailed {

@@ -25,10 +25,10 @@ use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcNotification, RpcRequest};
 use crate::rpc::pending::PendingRequests;
 
-use super::host::{AcpHostAdapter, AcpHostHandler, DefaultAcpHandler};
+use super::host::{AcpHostAdapter, DefaultAcpHandler};
 use super::protocol::{
     extract_token_usage, AgentCapabilities, ClientCapabilities, ClientInfo, ContentBlock,
-    FsCapabilities, InitializeParams, McpServerConfig, SessionCancelParams, SessionLoadParams,
+    FsCapabilities, InitializeParams, SessionCancelParams, SessionLoadParams,
     SessionLoadResult, SessionNewParams, SessionPromptParams,
 };
 use super::reader::acp_reader_loop;
@@ -85,10 +85,6 @@ pub enum AcpError {
 
 /// Options for constructing an [`AcpSession`].
 pub struct AcpSessionOptions {
-    /// Handler for agent-to-host requests. Default: [`DefaultAcpHandler`],
-    /// which denies filesystem, terminal, and permission requests.
-    pub host_handler: Option<Box<dyn AcpHostHandler>>,
-
     /// Broadcast channel capacity. Default: 256.
     pub channel_capacity: usize,
 
@@ -97,19 +93,14 @@ pub struct AcpSessionOptions {
 
     /// Timeout for `session/prompt` calls. Default: 120 s.
     pub prompt_timeout: Duration,
-
-    /// MCP servers to pass to the agent on session creation. Default: empty.
-    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 impl Default for AcpSessionOptions {
     fn default() -> Self {
         Self {
-            host_handler: None,
             channel_capacity: 256,
             handshake_timeout: Duration::from_secs(30),
             prompt_timeout: Duration::from_secs(120),
-            mcp_servers: vec![],
         }
     }
 }
@@ -180,11 +171,6 @@ impl AcpSession {
         options: AcpSessionOptions,
         proc: AcpProcess,
     ) -> Result<Self, AcpError> {
-        let host_capabilities_enabled = options.host_handler.is_some();
-        // Extract mcp_servers before options fields are partially consumed below.
-        let mcp_servers = options.mcp_servers;
-        let options = AcpSessionOptions { mcp_servers: vec![], ..options };
-
         let local_session_id = generate_session_id();
         let (tx, _) = broadcast::channel::<AgentEvent>(options.channel_capacity);
 
@@ -195,11 +181,10 @@ impl AcpSession {
 
         let process = Arc::new(Mutex::new(proc));
 
-        // Build the HostHandler for the reader loop.
-        let handler: Arc<dyn crate::rpc::handler::HostHandler> = match options.host_handler {
-            Some(h) => Arc::new(AcpHostAdapter(Arc::from(h))),
-            None => Arc::new(AcpHostAdapter(Arc::new(DefaultAcpHandler))),
-        };
+        // ACP host authority remains fail-closed until requests flow through
+        // the canonical control-plane authority path.
+        let handler: Arc<dyn crate::rpc::handler::HostHandler> =
+            Arc::new(AcpHostAdapter(Arc::new(DefaultAcpHandler)));
 
         let pending = PendingRequests::new();
         let id_gen = Arc::new(IdGen::new());
@@ -233,10 +218,10 @@ impl AcpSession {
             protocol_version: 1,
             client_capabilities: ClientCapabilities {
                 fs: FsCapabilities {
-                    read_text_file: host_capabilities_enabled,
+                    read_text_file: false,
                     write_text_file: false,
                 },
-                terminal: host_capabilities_enabled,
+                terminal: false,
             },
             client_info: ClientInfo {
                 name: "gate4agent",
@@ -259,7 +244,7 @@ impl AcpSession {
         // --- Handshake step 2: session/new ---
         let new_params = SessionNewParams {
             cwd: working_dir.to_str().unwrap_or(".").to_string(),
-            mcp_servers,
+            mcp_servers: vec![],
         };
         let new_result = session
             .rpc_call("session/new", Some(json!(new_params)), options.handshake_timeout)
@@ -605,7 +590,5 @@ mod tests {
         assert_eq!(opts.channel_capacity, 256);
         assert_eq!(opts.handshake_timeout, Duration::from_secs(30));
         assert_eq!(opts.prompt_timeout, Duration::from_secs(120));
-        assert!(opts.host_handler.is_none());
-        assert!(opts.mcp_servers.is_empty(), "default mcp_servers must be empty");
     }
 }

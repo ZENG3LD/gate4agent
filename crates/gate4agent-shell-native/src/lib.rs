@@ -305,6 +305,13 @@ impl NativeEffectShell {
                         message: "semantic interrupt requires an ACP session".to_owned(),
                     },
                 },
+                ControlEffect::ResolveInteraction { target, .. } => {
+                    ControlObservation::InteractionResolutionFailed {
+                        interaction_id: target.interaction_id,
+                        message: "native interaction resolution authority is not configured"
+                            .to_owned(),
+                    }
+                }
                 ControlEffect::Resize { size } if !size.is_valid() => {
                     ControlObservation::ResizeFailed {
                         message: "terminal size is outside the supported range".to_owned(),
@@ -1305,6 +1312,12 @@ fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation
         ControlEffect::WriteInput { .. } => ControlObservation::InputFailed { message },
         ControlEffect::SubmitPrompt { .. } | ControlEffect::Interrupt => {
             ControlObservation::InputFailed { message }
+        }
+        ControlEffect::ResolveInteraction { target, .. } => {
+            ControlObservation::InteractionResolutionFailed {
+                interaction_id: target.interaction_id,
+                message,
+            }
         }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },

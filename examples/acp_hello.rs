@@ -2,7 +2,7 @@
 //!
 //! AcpSession provides bidirectional JSON-RPC 2.0 over stdio with:
 //! - Multi-turn sessions (call prompt() repeatedly without respawning)
-//! - Host handler for agent → host requests (fs, terminal, permissions)
+//! - Fail-closed agent → host requests (fs, terminal, permissions)
 //! - Structured session/update streaming
 //!
 //! Run: cargo run --example acp_hello
@@ -11,32 +11,14 @@
 //!   npx @agentclientprotocol/claude-agent-acp
 
 use gate4agent::acp::{AcpSession, AcpSessionOptions};
-use gate4agent::{AcpHostHandler, CliTool, AgentEvent};
-
-/// Minimal host handler: auto-allows all permission requests, denies fs reads.
-struct ExampleHandler;
-
-impl AcpHostHandler for ExampleHandler {
-    fn request_permission(
-        &self,
-        tool_name: &str,
-        _description: &str,
-        _session_id: &str,
-    ) -> Result<bool, String> {
-        println!("[host] permission request for tool: {}", tool_name);
-        Ok(true)
-    }
-}
+use gate4agent::{AgentEvent, CliTool};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = AcpSession::spawn(
         CliTool::ClaudeCode,
         &std::env::current_dir()?,
-        AcpSessionOptions {
-            host_handler: Some(Box::new(ExampleHandler)),
-            ..Default::default()
-        },
+        AcpSessionOptions::default(),
     )
     .await?;
 

@@ -27,7 +27,7 @@ use super::protocol::{FsReadParams, PermissionRequestParams, TerminalCreateParam
 ///
 /// Implementations must be `Send + Sync` because the handler is called from
 /// the reader loop's blocking thread.
-pub trait AcpHostHandler: Send + Sync {
+pub(crate) trait AcpHostHandler: Send + Sync {
     /// Agent wants to read a file from the host filesystem.
     ///
     /// Return `Ok(content)` or `Err(human-readable message)`.
@@ -78,7 +78,7 @@ pub trait AcpHostHandler: Send + Sync {
 /// - `terminal/create` → `Err("not supported")`
 /// - `terminal/write` → `Err("not supported")`
 /// - `session/request_permission` → `Ok(false)` (deny)
-pub struct DefaultAcpHandler;
+pub(crate) struct DefaultAcpHandler;
 
 impl AcpHostHandler for DefaultAcpHandler {}
 
@@ -89,11 +89,13 @@ impl AcpHostHandler for DefaultAcpHandler {}
 /// ACP host handler that serves real filesystem reads and auto-allows
 /// permissions. Matches Pipe transport's `--dangerously-skip-permissions`
 /// behavior.
-pub struct FilesystemAcpHandler {
+#[cfg(test)]
+struct FilesystemAcpHandler {
     /// Optional path prefix whitelist. `None` = allow all absolute paths.
     pub allowed_roots: Option<Vec<std::path::PathBuf>>,
 }
 
+#[cfg(test)]
 impl FilesystemAcpHandler {
     /// Check that `path` is within the whitelist (if any), then read it.
     fn checked_read(&self, path: &str) -> Result<String, String> {
@@ -113,6 +115,7 @@ impl FilesystemAcpHandler {
     }
 }
 
+#[cfg(test)]
 impl AcpHostHandler for FilesystemAcpHandler {
     fn fs_read_text_file(&self, path: &str) -> Result<String, String> {
         self.checked_read(path)
@@ -132,6 +135,7 @@ impl AcpHostHandler for FilesystemAcpHandler {
 // TerminalAcpHandler
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 struct TerminalSession {
     cwd: std::path::PathBuf,
     env: HashMap<String, String>,
@@ -140,12 +144,14 @@ struct TerminalSession {
 /// ACP host handler with real filesystem reads and terminal execution.
 ///
 /// WARNING: No sandboxing. Use only with trusted agents.
-pub struct TerminalAcpHandler {
+#[cfg(test)]
+struct TerminalAcpHandler {
     /// Optional path prefix whitelist. `None` = allow all absolute paths.
     pub allowed_roots: Option<Vec<std::path::PathBuf>>,
     sessions: std::sync::Mutex<HashMap<String, TerminalSession>>,
 }
 
+#[cfg(test)]
 impl TerminalAcpHandler {
     /// Create a new handler. Pass `None` for `allowed_roots` to allow all paths.
     pub fn new(allowed_roots: Option<Vec<std::path::PathBuf>>) -> Self {
@@ -172,6 +178,7 @@ impl TerminalAcpHandler {
     }
 }
 
+#[cfg(test)]
 impl AcpHostHandler for TerminalAcpHandler {
     fn fs_read_text_file(&self, path: &str) -> Result<String, String> {
         self.checked_read(path)

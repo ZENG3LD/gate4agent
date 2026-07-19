@@ -2,18 +2,20 @@
 
 use gate4agent_types::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_shell_command,
-    validate_candidate_id, validate_history_error, validate_resume_error, ActiveProviderTool,
-    AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
+    validate_candidate_id, validate_capability_models, validate_history_error,
+    validate_resume_error, ActiveProviderTool, AgentInstanceId, CapabilityProbeRequest,
+    CapabilitySnapshot, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
     ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
     ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot, HistoryOperation, HistoryQuery,
     HistorySnapshot, InputAction, ObservationEnvelope, ObservationIgnoredReason, OperationId,
-    PendingHistoryOperation, PendingResumeOperation, PreparedInputKind, ProviderActivity,
-    ProviderEvent, ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
-    ProviderInteractionOutcome, ProviderInteractionStatus, ProviderSessionIdentity,
-    ProviderSessionKey, ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent,
-    ResumeAuthorityTarget, ResumeLaunchRequest, ResumePhase, ResumeSessionSummary, ResumeSnapshot,
-    ResumeTarget, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl,
-    TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
+    PendingCapabilityProbe, PendingHistoryOperation, PendingResumeOperation, PreparedInputKind,
+    ProviderActivity, ProviderEvent, ProviderInteraction, ProviderInteractionId,
+    ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
+    ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
+    ProviderSourceCursor, ProviderSubagent, ResumeAuthorityTarget, ResumeLaunchRequest,
+    ResumePhase, ResumeSessionSummary, ResumeSnapshot, ResumeTarget, SessionGeneration,
+    SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage,
+    TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
     PROVIDER_INTERACTIONS_MAX, PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,6 +87,7 @@ impl Gate4AgentEngine {
                             terminal_frame: None,
                             terminal_stale: None,
                             session_options: None,
+                            capabilities: CapabilitySnapshot::default(),
                             history: HistorySnapshot::default(),
                             resume: ResumeSnapshot::default(),
                             foreground: ForegroundSnapshot::default(),
@@ -122,6 +125,10 @@ impl Gate4AgentEngine {
             ControlCommand::RefreshForeground { instance_id } => {
                 self.refresh_foreground(command_id, instance_id)
             }
+            ControlCommand::ProbeCapabilities {
+                instance_id,
+                request,
+            } => self.probe_capabilities(command_id, instance_id, request),
             ControlCommand::DiscoverHistory { instance_id, query } => {
                 self.discover_history(command_id, instance_id, query)
             }
@@ -172,7 +179,13 @@ impl Gate4AgentEngine {
             return;
         };
 
-        if current.generation != generation {
+        let capability_generation_matches = is_capability_observation(&envelope.observation)
+            && current
+                .capabilities
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.generation == generation);
+        if current.generation != generation && !capability_generation_matches {
             self.emit_ignored(
                 instance_id,
                 generation,
@@ -190,7 +203,13 @@ impl Gate4AgentEngine {
                 );
                 return;
             };
-            let expected_operation = if is_history_observation(&envelope.observation) {
+            let expected_operation = if is_capability_observation(&envelope.observation) {
+                current
+                    .capabilities
+                    .pending
+                    .as_ref()
+                    .map(|pending| pending.operation_id)
+            } else if is_history_observation(&envelope.observation) {
                 current
                     .history
                     .pending
@@ -273,6 +292,11 @@ impl Gate4AgentEngine {
                 )
                 | (
                     _,
+                    ControlObservation::CapabilitiesProbed { .. }
+                        | ControlObservation::CapabilityProbeFailed { .. },
+                )
+                | (
+                    _,
                     ControlObservation::HistoryDiscovered { .. }
                         | ControlObservation::HistoryLoaded { .. }
                         | ControlObservation::HistoryFailed { .. },
@@ -290,6 +314,64 @@ impl Gate4AgentEngine {
                 generation,
                 ObservationIgnoredReason::InvalidState,
             );
+            return;
+        }
+
+        if is_capability_observation(&envelope.observation) {
+            let pending = current
+                .capabilities
+                .pending
+                .as_ref()
+                .expect("capability operation correlation was validated")
+                .clone();
+            let event = match &envelope.observation {
+                ControlObservation::CapabilitiesProbed {
+                    session_option_models,
+                } if validate_capability_models(session_option_models).is_ok() => {
+                    ControlEventKind::CapabilitiesProbed {
+                        count: session_option_models.len(),
+                    }
+                }
+                ControlObservation::CapabilityProbeFailed { failure } => {
+                    ControlEventKind::CapabilityProbeFailed { failure: *failure }
+                }
+                _ => {
+                    self.emit_ignored(
+                        instance_id,
+                        generation,
+                        ObservationIgnoredReason::InvalidCapabilityObservation,
+                    );
+                    return;
+                }
+            };
+            let event_generation = self
+                .sessions
+                .get(&instance_id)
+                .expect("validated session")
+                .snapshot
+                .generation;
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            debug_assert_eq!(state.snapshot.capabilities.pending.as_ref(), Some(&pending));
+            state.snapshot.capabilities.pending = None;
+            state.snapshot.capabilities.settled = true;
+            match envelope.observation {
+                ControlObservation::CapabilitiesProbed {
+                    session_option_models,
+                } => {
+                    state.snapshot.capabilities.session_option_models = session_option_models;
+                    state.snapshot.capabilities.last_failure = None;
+                }
+                ControlObservation::CapabilityProbeFailed { failure } => {
+                    state.snapshot.capabilities.session_option_models.clear();
+                    state.snapshot.capabilities.last_failure = Some(failure);
+                }
+                _ => unreachable!("capability observation was matched above"),
+            }
+            self.bump_revision();
+            self.emit_event(None, instance_id, event_generation, event);
             return;
         }
 
@@ -882,6 +964,8 @@ impl Gate4AgentEngine {
             | ControlObservation::TerminalStale { .. }
             | ControlObservation::ProviderEvent { .. }
             | ControlObservation::ProviderGap { .. }
+            | ControlObservation::CapabilitiesProbed { .. }
+            | ControlObservation::CapabilityProbeFailed { .. }
             | ControlObservation::HistoryDiscovered { .. }
             | ControlObservation::HistoryLoaded { .. }
             | ControlObservation::HistoryFailed { .. }
@@ -1411,6 +1495,60 @@ impl Gate4AgentEngine {
         Ok(())
     }
 
+    fn probe_capabilities(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        request: CapabilityProbeRequest,
+    ) -> Result<(), ControlError> {
+        request
+            .validate()
+            .map_err(|error| ControlError::InvalidCapabilityProbeRequest {
+                message: error.to_string(),
+            })?;
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if let Some(pending) = &state.snapshot.capabilities.pending {
+            return Err(ControlError::CapabilityProbeOperationPending {
+                operation_id: pending.operation_id,
+            });
+        }
+        if state.snapshot.capabilities.settled {
+            return Err(ControlError::CapabilityProbeSettled);
+        }
+
+        let operation_id = self.allocate_operation();
+        let (generation, agent_id) = {
+            let session = self.session_mut(instance_id);
+            let generation = session.generation;
+            session.capabilities.pending = Some(PendingCapabilityProbe {
+                operation_id,
+                generation,
+                request: request.clone(),
+            });
+            session.capabilities.session_option_models.clear();
+            session.capabilities.last_failure = None;
+            (generation, session.agent_id.clone())
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::ProbeCapabilities { agent_id, request },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::CapabilityProbeRequested { operation_id },
+        );
+        Ok(())
+    }
+
     fn load_history(
         &mut self,
         command_id: CommandId,
@@ -1823,6 +1961,14 @@ fn is_history_observation(observation: &ControlObservation) -> bool {
         ControlObservation::HistoryDiscovered { .. }
             | ControlObservation::HistoryLoaded { .. }
             | ControlObservation::HistoryFailed { .. }
+    )
+}
+
+fn is_capability_observation(observation: &ControlObservation) -> bool {
+    matches!(
+        observation,
+        ControlObservation::CapabilitiesProbed { .. }
+            | ControlObservation::CapabilityProbeFailed { .. }
     )
 }
 
@@ -2432,10 +2578,10 @@ mod tests {
     use super::*;
     use gate4agent_types::{
         AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId,
-        ForegroundAuthority, ForegroundProcess, ForegroundProcessKind, HistoryCandidateSummary,
-        HistoryMessageRecord, HistoryMessageRole, HistoryQuery, HistorySessionRecord, InputAction,
-        PreparedInputKind, PromptFraming, PromptPayload, SessionOptionSelection, ShellCommand,
-        TerminalFrame, TransportKind,
+        CapabilityModelSummary, ForegroundAuthority, ForegroundProcess, ForegroundProcessKind,
+        HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole, HistoryQuery,
+        HistorySessionRecord, InputAction, PreparedInputKind, PromptFraming, PromptPayload,
+        SessionOptionSelection, ShellCommand, TerminalFrame, TransportKind,
     };
 
     fn instance() -> AgentInstanceId {
@@ -2559,6 +2705,92 @@ mod tests {
         assert_eq!(snapshot.sessions[0].status, SessionStatus::Starting);
         assert_eq!(snapshot.sessions[0].process_id, None);
         assert_eq!(engine.drain_effects().len(), 1);
+    }
+
+    #[test]
+    fn capability_probe_settles_across_session_generation_without_blocking_start() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::ProbeCapabilities {
+                    instance_id: instance(),
+                    request: CapabilityProbeRequest {
+                        working_directory: ".".to_owned(),
+                    },
+                },
+            })
+            .unwrap();
+        let probe = engine.drain_effects().pop().unwrap();
+
+        engine.apply_command(start(3)).unwrap();
+        let spawn = engine.drain_effects().pop().unwrap();
+        assert_ne!(probe.generation, spawn.generation);
+        assert_eq!(
+            engine.snapshot().sessions[0].status,
+            SessionStatus::Starting
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(probe.operation_id),
+            instance_id: probe.instance_id,
+            generation: probe.generation,
+            observation: ControlObservation::CapabilitiesProbed {
+                session_option_models: vec![
+                    CapabilityModelSummary {
+                        id: "duplicate".to_owned(),
+                        label: "Duplicate".to_owned(),
+                    },
+                    CapabilityModelSummary {
+                        id: "duplicate".to_owned(),
+                        label: "Duplicate again".to_owned(),
+                    },
+                ],
+            },
+        });
+        assert!(engine.snapshot().sessions[0].capabilities.pending.is_some());
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(probe.operation_id),
+            instance_id: probe.instance_id,
+            generation: probe.generation,
+            observation: ControlObservation::CapabilitiesProbed {
+                session_option_models: vec![CapabilityModelSummary {
+                    id: "account-model".to_owned(),
+                    label: "Account model".to_owned(),
+                }],
+            },
+        });
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.sessions[0].status, SessionStatus::Starting);
+        assert_eq!(
+            snapshot.sessions[0].pending_operation,
+            Some(spawn.operation_id)
+        );
+        assert!(snapshot.sessions[0].capabilities.settled);
+        assert_eq!(
+            snapshot.sessions[0].capabilities.session_option_models[0].id,
+            "account-model"
+        );
+        assert_eq!(
+            engine
+                .apply_command(CommandEnvelope {
+                    protocol_version: CONTROL_PROTOCOL_VERSION,
+                    id: CommandId(4),
+                    command: ControlCommand::ProbeCapabilities {
+                        instance_id: instance(),
+                        request: CapabilityProbeRequest {
+                            working_directory: ".".to_owned(),
+                        },
+                    },
+                })
+                .unwrap_err(),
+            ControlError::CapabilityProbeSettled
+        );
     }
 
     #[test]

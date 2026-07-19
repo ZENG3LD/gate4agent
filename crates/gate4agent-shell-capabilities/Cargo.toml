@@ -1,0 +1,13 @@
+[package]
+name = "gate4agent-shell-capabilities"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[dependencies]
+gate4agent-catalog = { path = "../gate4agent-catalog" }
+gate4agent-types = { path = "../gate4agent-types" }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

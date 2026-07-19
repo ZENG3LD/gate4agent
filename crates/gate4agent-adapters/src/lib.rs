@@ -6,6 +6,7 @@
 //! Forbidden: async, locks, channels, process, filesystem, database, network,
 //! credentials, and product presentation policy.
 
+mod capability;
 mod history;
 mod hook;
 mod hook_session;
@@ -16,6 +17,11 @@ use gate4agent_types::{AdapterBinding, AdapterFamily, AdapterId, AdapterVerifica
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use thiserror::Error;
+
+pub use capability::{
+    capability_probe_plan, parse_capability_models, CapabilityProbeAdapterError,
+    CapabilityProbePlan, CAPABILITY_PROBE_OUTPUT_MAX_BYTES, CAPABILITY_PROBE_REVISION,
+};
 
 pub use history::{
     history_source_variants, parse_history, HistoryAdapterError, HistoryDocument, HistoryMessage,
@@ -322,6 +328,11 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
             SESSION_OPTION_CATALOG_REVISION,
         ));
     }
+    descriptors.push(descriptor_with_revision(
+        AdapterFamily::CapabilityProbe,
+        "cursor",
+        CAPABILITY_PROBE_REVISION,
+    ));
     descriptors
 }
 
@@ -486,6 +497,26 @@ mod tests {
             .map(|id| (id, SESSION_OPTION_CATALOG_REVISION))
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn capability_probe_registry_matches_the_pinned_orca_executed_inventory() {
+        let actual = builtin_adapter_registry()
+            .iter()
+            .filter(|descriptor| descriptor.family == AdapterFamily::CapabilityProbe)
+            .map(|descriptor| {
+                (
+                    descriptor.binding.id.as_str(),
+                    descriptor.binding.revision.as_str(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            [("cursor", CAPABILITY_PROBE_REVISION)]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

@@ -1,11 +1,16 @@
 //! Provider knowledge and shell-free launch planning for gate4agent.
 
 mod builtin;
+mod capability;
 mod launch;
 mod registry;
 mod session_options;
 
 pub use builtin::{builtin_registry, builtin_specs, ORCA_REFERENCE_REVISION};
+pub use capability::{
+    parse_capability_models_for, resolve_capability_probe_for, CapabilityProbeCatalogError,
+    ResolvedCapabilityProbePlan,
+};
 pub use gate4agent_adapters::{
     builtin_adapter_registry, merge_session_option_models, AdapterDescriptor, AdapterRegistry,
     AdapterRegistryError, AgentSessionOptionCatalog, ResolvedSessionOptionLaunch, SessionOption,
@@ -13,7 +18,8 @@ pub use gate4agent_adapters::{
     SessionOptionCategory, SessionOptionChoice, SessionOptionInteractionDetection,
     SessionOptionKind, SessionOptionLaunchApplication, SessionOptionMidSessionApplication,
     SessionOptionMidSessionPlan, SessionOptionModel, SessionOptionModelListSpec,
-    BUILTIN_ADAPTER_REVISION, SESSION_OPTION_CATALOG_REVISION,
+    BUILTIN_ADAPTER_REVISION, CAPABILITY_PROBE_OUTPUT_MAX_BYTES, CAPABILITY_PROBE_REVISION,
+    SESSION_OPTION_CATALOG_REVISION,
 };
 pub use gate4agent_types::{
     AcpTransportSpec, AdapterBinding, AdapterBindingError, AdapterFamily, AdapterId,

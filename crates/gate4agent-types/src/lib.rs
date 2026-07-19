@@ -1,6 +1,7 @@
 //! Pure data contracts shared by gate4agent engines and shells.
 
 mod adapter;
+mod capability;
 mod control;
 mod executable;
 mod history;
@@ -14,6 +15,11 @@ mod spec;
 pub use adapter::{
     AdapterBinding, AdapterBindingError, AdapterFamily, AdapterId, AdapterIdError,
     AdapterVerification, MAX_ADAPTER_REVISION_LEN,
+};
+pub use capability::{
+    validate_capability_models, CapabilityModelSummary, CapabilityProbeFailure,
+    CapabilityProbeRequest, CapabilitySnapshot, CapabilityValidationError, PendingCapabilityProbe,
+    CAPABILITY_MODELS_MAX, CAPABILITY_MODEL_ID_MAX_BYTES, CAPABILITY_MODEL_LABEL_MAX_BYTES,
 };
 pub use control::{
     ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,

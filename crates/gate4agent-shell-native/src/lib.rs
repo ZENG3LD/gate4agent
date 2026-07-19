@@ -16,11 +16,12 @@ use gate4agent_adapters::{
 };
 use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
 use gate4agent_types::{
-    AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-    ForegroundProcess, ForegroundProcessKind, ForegroundRequirement, ObservationEnvelope,
-    OperationId, PreparedInputKind, ProviderEvent, ProviderInteractionKind, ProviderSource,
-    ResumeLaunchRequest, SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage,
-    TransportKind, CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    AdapterFamily, AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect,
+    ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
+    ForegroundRequirement, ObservationEnvelope, OperationId, PreparedInputKind, ProviderEvent,
+    ProviderInteractionKind, ProviderSource, ResumeLaunchRequest, SessionGeneration, StartRequest,
+    TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
+    WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
@@ -330,6 +331,11 @@ impl NativeEffectShell {
                         message: "foreground observation requires a PTY session".to_owned(),
                     },
                 },
+                ControlEffect::ProbeCapabilities { .. } => {
+                    ControlObservation::CapabilityProbeFailed {
+                        failure: CapabilityProbeFailure::ExecutorUnavailable,
+                    }
+                }
                 ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
                     ControlObservation::HistoryFailed {
                         message: "history effects require the dedicated native history authority"
@@ -1226,6 +1232,9 @@ fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation
         }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
+        ControlEffect::ProbeCapabilities { .. } => ControlObservation::CapabilityProbeFailed {
+            failure: CapabilityProbeFailure::ExecutorUnavailable,
+        },
         ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
             ControlObservation::HistoryFailed { message }
         }

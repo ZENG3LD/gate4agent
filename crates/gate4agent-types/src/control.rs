@@ -1,5 +1,6 @@
 use crate::{
-    AdapterBinding, AdapterFamily, AgentId, HistoryCandidateSummary, HistoryOperation,
+    AdapterBinding, AdapterFamily, AgentId, CapabilityModelSummary, CapabilityProbeFailure,
+    CapabilityProbeRequest, CapabilitySnapshot, HistoryCandidateSummary, HistoryOperation,
     HistoryQuery, HistorySessionRecord, HistorySnapshot, InputAction, InputPrepareError,
     PreparedInput, PreparedInputKind, ResumeAuthorityTarget, ResumeLaunchRequest,
     ResumeSessionSummary, ResumeSnapshot, ResumeTarget, SessionOptionSelection,
@@ -7,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 21;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 22;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -160,6 +161,10 @@ pub enum ControlCommand {
     RefreshForeground {
         instance_id: AgentInstanceId,
     },
+    ProbeCapabilities {
+        instance_id: AgentInstanceId,
+        request: CapabilityProbeRequest,
+    },
     DiscoverHistory {
         instance_id: AgentInstanceId,
         query: HistoryQuery,
@@ -194,6 +199,7 @@ impl ControlCommand {
             | Self::SendInput { instance_id, .. }
             | Self::Resize { instance_id, .. }
             | Self::RefreshForeground { instance_id }
+            | Self::ProbeCapabilities { instance_id, .. }
             | Self::DiscoverHistory { instance_id, .. }
             | Self::LoadHistory { instance_id, .. }
             | Self::Resume { instance_id, .. }
@@ -250,6 +256,10 @@ pub enum ControlEffect {
         size: TerminalSize,
     },
     ObserveForeground,
+    ProbeCapabilities {
+        agent_id: AgentId,
+        request: CapabilityProbeRequest,
+    },
     DiscoverHistory {
         agent_id: AgentId,
         query: HistoryQuery,
@@ -315,6 +325,12 @@ pub enum ControlObservation {
     },
     ForegroundFailed {
         message: String,
+    },
+    CapabilitiesProbed {
+        session_option_models: Vec<CapabilityModelSummary>,
+    },
+    CapabilityProbeFailed {
+        failure: CapabilityProbeFailure,
     },
     HistoryDiscovered {
         candidates: Vec<HistoryCandidateSummary>,
@@ -389,6 +405,7 @@ pub struct SessionSnapshot {
     pub terminal_frame: Option<TerminalFrame>,
     pub terminal_stale: Option<String>,
     pub session_options: Option<SessionOptionSelection>,
+    pub capabilities: CapabilitySnapshot,
     pub history: HistorySnapshot,
     pub resume: ResumeSnapshot,
     pub foreground: ForegroundSnapshot,
@@ -881,6 +898,15 @@ pub enum ControlEventKind {
     ForegroundFailed {
         message: String,
     },
+    CapabilityProbeRequested {
+        operation_id: OperationId,
+    },
+    CapabilitiesProbed {
+        count: usize,
+    },
+    CapabilityProbeFailed {
+        failure: CapabilityProbeFailure,
+    },
     HistoryRequested {
         operation_id: OperationId,
         operation: HistoryOperation,
@@ -957,6 +983,7 @@ pub enum ObservationIgnoredReason {
     StaleTerminalFrame,
     StaleProviderEvent,
     InvalidForegroundObservation,
+    InvalidCapabilityObservation,
     InvalidHistoryObservation,
     InvalidResumeObservation,
 }
@@ -985,6 +1012,12 @@ pub enum ControlError {
     MissingInitialPrompt,
     #[error("session options are invalid: {message}")]
     InvalidSessionOptions { message: String },
+    #[error("capability probe request is invalid: {message}")]
+    InvalidCapabilityProbeRequest { message: String },
+    #[error("capability probe operation {operation_id:?} is already pending")]
+    CapabilityProbeOperationPending { operation_id: OperationId },
+    #[error("capability probe already settled for this agent instance")]
+    CapabilityProbeSettled,
     #[error("history request is invalid: {message}")]
     InvalidHistoryRequest { message: String },
     #[error("history operation {operation_id:?} is already pending")]

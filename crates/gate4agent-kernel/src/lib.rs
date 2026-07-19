@@ -1,6 +1,9 @@
 //! Synchronous host kernel for gate4agent engines.
 
-use gate4agent_catalog::{builtin_registry, resolve_session_option_launch_for, AgentRegistry};
+use gate4agent_catalog::{
+    builtin_registry, resolve_capability_probe_for, resolve_session_option_launch_for,
+    AgentRegistry,
+};
 use gate4agent_engine::Gate4AgentEngine;
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, CommandEnvelope, CommandId, ControlCommand,
@@ -40,6 +43,8 @@ pub enum KernelCommandError {
     },
     #[error("agent '{agent_id}' session options are invalid: {message}")]
     InvalidSessionOptions { agent_id: AgentId, message: String },
+    #[error("agent '{agent_id}' capability probe is invalid: {message}")]
+    InvalidCapabilityProbe { agent_id: AgentId, message: String },
     #[error(transparent)]
     Control(#[from] ControlError),
 }
@@ -180,6 +185,26 @@ impl Gate4AgentKernel {
                 }
             }
         }
+        if let ControlCommand::ProbeCapabilities { instance_id, .. } = &command.command {
+            if let Some(session) = self.engine.session_snapshot(*instance_id) {
+                let spec = self
+                    .catalog
+                    .get(&session.agent_id)
+                    .expect("registered agent must remain in kernel catalog");
+                if spec.capabilities.adapters.capability_probe.is_none() {
+                    return Err(KernelCommandError::UnsupportedCapability {
+                        agent_id: session.agent_id.clone(),
+                        capability: "capability-probe",
+                    });
+                }
+                resolve_capability_probe_for(spec).map_err(|error| {
+                    KernelCommandError::InvalidCapabilityProbe {
+                        agent_id: session.agent_id.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+            }
+        }
         if let ControlCommand::Resume { instance_id, .. } = &command.command {
             if let Some(session) = self.engine.session_snapshot(*instance_id) {
                 let supports_resume = self
@@ -283,9 +308,10 @@ impl Default for Gate4AgentKernel {
 mod tests {
     use super::*;
     use gate4agent_types::{
-        AgentInstanceId, ControlObservation, HistoryQuery, ObservationEnvelope, ProviderActivity,
-        ProviderEvent, ProviderSource, ResumeLaunchRequest, ResumeTarget, SessionOptionSelection,
-        SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+        AgentInstanceId, CapabilityProbeRequest, ControlObservation, HistoryQuery,
+        ObservationEnvelope, ProviderActivity, ProviderEvent, ProviderSource, ResumeLaunchRequest,
+        ResumeTarget, SessionOptionSelection, SessionStatus, StartRequest, TerminalSize,
+        TransportKind, CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
@@ -457,6 +483,53 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn capability_probe_requires_the_declared_cursor_adapter_before_effect_creation() {
+        let mut cursor = Gate4AgentKernel::default();
+        cursor.step([register(1, "cursor")], []);
+        let accepted = cursor.step(
+            [command(
+                2,
+                ControlCommand::ProbeCapabilities {
+                    instance_id: instance(),
+                    request: CapabilityProbeRequest {
+                        working_directory: ".".to_owned(),
+                    },
+                },
+            )],
+            [],
+        );
+        assert!(accepted.command_outcomes[0].result.is_ok());
+        assert!(matches!(
+            accepted.effects[0].effect,
+            gate4agent_types::ControlEffect::ProbeCapabilities { ref agent_id, .. }
+                if agent_id.as_str() == "cursor"
+        ));
+
+        let mut kimi = Gate4AgentKernel::default();
+        kimi.step([register(3, "kimi")], []);
+        let rejected = kimi.step(
+            [command(
+                4,
+                ControlCommand::ProbeCapabilities {
+                    instance_id: instance(),
+                    request: CapabilityProbeRequest {
+                        working_directory: ".".to_owned(),
+                    },
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedCapability {
+                capability: "capability-probe",
+                ..
+            })
+        ));
+        assert!(rejected.effects.is_empty());
     }
 
     #[test]

@@ -8,16 +8,17 @@ use gate4agent_provider_ports::{
     HistoryDiscoveryRequest, HistoryLoadRequest, PreparedResume, ResumeAuthority,
     ResumeAuthorityDecision, ResumeOutcome, ResumeRequest,
 };
+use gate4agent_shell_capabilities::NativeCapabilityProbeAuthority;
 use gate4agent_shell_history::NativeHistoryAuthority;
 pub use gate4agent_shell_history::{NativeHistoryConfig, NativeHistoryRoot};
 pub use gate4agent_shell_hooks::{HookIngressConfig, HookIngressEndpoint};
 use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
 use gate4agent_shell_native::NativeEffectShell;
 use gate4agent_types::{
-    AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-    HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole, HistorySessionRecord,
-    ObservationEnvelope, ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration,
-    SessionStatus, CONTROL_PROTOCOL_VERSION,
+    AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect, ControlObservation,
+    EffectEnvelope, HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole,
+    HistorySessionRecord, ObservationEnvelope, ResumeAuthorityTarget, ResumeLaunchRequest,
+    SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
@@ -226,6 +227,7 @@ struct NativeEffectDispatcher {
     config: NativeRuntimeConfig,
     workers: HashMap<AgentInstanceId, EffectWorker>,
     authority_worker: Option<EffectWorker>,
+    capability_worker: Option<EffectWorker>,
     history_config: Option<NativeHistoryConfig>,
     control_tx: Sender<ObservationEnvelope>,
     control_rx: Receiver<ObservationEnvelope>,
@@ -247,6 +249,7 @@ impl NativeEffectDispatcher {
             config,
             workers: HashMap::new(),
             authority_worker: None,
+            capability_worker: None,
             history_config,
             control_tx,
             control_rx,
@@ -265,6 +268,10 @@ impl NativeEffectDispatcher {
     }
 
     fn dispatch(&mut self, effect: EffectEnvelope) {
+        if matches!(effect.effect, ControlEffect::ProbeCapabilities { .. }) {
+            self.dispatch_capability(effect);
+            return;
+        }
         if matches!(
             effect.effect,
             ControlEffect::DiscoverHistory { .. }
@@ -308,6 +315,52 @@ impl NativeEffectDispatcher {
             pending.effect,
             "native session effect worker is unavailable".to_owned(),
         ));
+    }
+
+    fn dispatch_capability(&mut self, effect: EffectEnvelope) {
+        let mut pending = NativeEffectRequest {
+            effect,
+            pty_env: Vec::new(),
+        };
+        for _ in 0..2 {
+            let sender = self.capability_sender();
+            match sender.try_send(pending) {
+                Ok(()) => return,
+                Err(TrySendError::Closed(request)) => {
+                    self.capability_worker = None;
+                    pending = request;
+                }
+                Err(TrySendError::Full(request)) => {
+                    self.pending_failures.push_back(effect_failure(
+                        request.effect,
+                        "native capability effect queue is full".to_owned(),
+                    ));
+                    return;
+                }
+            }
+        }
+        self.pending_failures.push_back(effect_failure(
+            pending.effect,
+            "native capability effect worker is unavailable".to_owned(),
+        ));
+    }
+
+    fn capability_sender(&mut self) -> Sender<NativeEffectRequest> {
+        if let Some(worker) = &self.capability_worker {
+            if !worker.sender.is_closed() {
+                return worker.sender.clone();
+            }
+        }
+        let (sender, receiver) = mpsc::channel(self.config.effect_capacity_per_session.max(1));
+        tokio::spawn(run_capability_worker(
+            self.catalog.clone(),
+            receiver,
+            self.control_tx.clone(),
+        ));
+        self.capability_worker = Some(EffectWorker {
+            sender: sender.clone(),
+        });
+        sender
     }
 
     fn dispatch_authority(&mut self, effect: EffectEnvelope) {
@@ -756,6 +809,62 @@ async fn run_authority_worker(
     }
 }
 
+async fn run_capability_worker(
+    catalog: AgentRegistry,
+    mut effects: Receiver<NativeEffectRequest>,
+    control_tx: Sender<ObservationEnvelope>,
+) {
+    let mut authority = NativeCapabilityProbeAuthority::default();
+    while let Some(request) = effects.recv().await {
+        let EffectEnvelope {
+            protocol_version,
+            operation_id,
+            instance_id,
+            generation,
+            effect,
+        } = request.effect;
+        let observation = if protocol_version != CONTROL_PROTOCOL_VERSION {
+            ControlObservation::CapabilityProbeFailed {
+                failure: CapabilityProbeFailure::AuthorityRejected,
+            }
+        } else if let ControlEffect::ProbeCapabilities { agent_id, request } = effect {
+            if request.validate().is_err() {
+                ControlObservation::CapabilityProbeFailed {
+                    failure: CapabilityProbeFailure::AuthorityRejected,
+                }
+            } else if let Some(spec) = catalog.get(&agent_id) {
+                match authority.probe(spec, &request.working_directory).await {
+                    Ok(session_option_models) => ControlObservation::CapabilitiesProbed {
+                        session_option_models,
+                    },
+                    Err(failure) => ControlObservation::CapabilityProbeFailed { failure },
+                }
+            } else {
+                ControlObservation::CapabilityProbeFailed {
+                    failure: CapabilityProbeFailure::AuthorityRejected,
+                }
+            }
+        } else {
+            ControlObservation::CapabilityProbeFailed {
+                failure: CapabilityProbeFailure::AuthorityRejected,
+            }
+        };
+        if control_tx
+            .send(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: Some(operation_id),
+                instance_id,
+                generation,
+                observation,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 fn history_failure(message: String) -> ControlObservation {
     ControlObservation::HistoryFailed { message }
 }
@@ -961,6 +1070,9 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
         }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
+        ControlEffect::ProbeCapabilities { .. } => ControlObservation::CapabilityProbeFailed {
+            failure: CapabilityProbeFailure::ExecutorUnavailable,
+        },
         ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
             ControlObservation::HistoryFailed { message }
         }

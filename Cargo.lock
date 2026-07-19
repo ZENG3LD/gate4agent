@@ -377,12 +377,22 @@ dependencies = [
  "gate4agent-handle",
  "gate4agent-kernel",
  "gate4agent-provider-ports",
+ "gate4agent-shell-capabilities",
  "gate4agent-shell-history",
  "gate4agent-shell-hooks",
  "gate4agent-shell-native",
  "gate4agent-testkit",
  "gate4agent-types",
  "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "gate4agent-shell-capabilities"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-catalog",
+ "gate4agent-types",
  "tokio",
 ]
 

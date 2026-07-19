@@ -1,4 +1,6 @@
-use gate4agent_types::{AdapterId, ProviderEvent, ProviderInteractionKind, TokenUsage};
+use gate4agent_types::{
+    AdapterId, ProviderEvent, ProviderEventValidationError, ProviderInteractionKind, TokenUsage,
+};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
@@ -32,13 +34,46 @@ pub fn normalize_hook_event(
         return Err(HookAdapterError::PayloadTooLarge);
     }
 
-    match adapter_id.as_str() {
+    let events = match adapter_id.as_str() {
+        "claude-code" => normalize_claude(event_name, record),
         "grok" => normalize_grok(event_name, record),
         "kimi" => normalize_kimi(event_name, record),
         "copilot" => normalize_copilot(event_name, record),
         "droid" => normalize_droid(event_name, record),
         "cursor" => normalize_cursor(event_name, record),
         id => Err(HookAdapterError::UnsupportedAdapter(id.to_owned())),
+    }?;
+    for event in &events {
+        event.validate_ingress()?;
+    }
+    Ok(events)
+}
+
+fn normalize_claude(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "SessionStart" => Ok(session_started(payload, &["session_id"])),
+        "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
+        "PreToolUse" if is_ask_user_question(tool_name(payload).as_deref()) => {
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Question,
+            )])
+        }
+        "PreToolUse" => Ok(vec![tool_started(payload)]),
+        "PostToolUse" => Ok(vec![tool_completed(payload, false)]),
+        "PostToolUseFailure" => Ok(vec![tool_completed(payload, true)]),
+        "PermissionRequest" => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
+        "Stop" | "StopFailure" => Ok(turn_completed(payload)),
+        "SubagentStart" => Ok(subagent_started(payload)),
+        "SubagentStop" => Ok(subagent_stopped(payload)),
+        "TeammateIdle" => Ok(Vec::new()),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -194,6 +229,7 @@ fn normalize_cursor(
             id: tool_id(payload, "Shell"),
             name: "Shell".to_owned(),
             input_json: input_json(payload.get("command")),
+            agent_id: provider_agent_id(payload),
         }]),
         "beforeMCPExecution" => {
             let name = tool_name(payload).unwrap_or_else(|| "MCP".to_owned());
@@ -201,6 +237,7 @@ fn normalize_cursor(
                 id: tool_id(payload, &name),
                 name,
                 input_json: input_json(first_value(payload, &["tool_input", "command", "url"])),
+                agent_id: provider_agent_id(payload),
             }])
         }
         "afterAgentResponse" => Ok(string(payload, &["text"])
@@ -279,6 +316,7 @@ fn tool_started(payload: &Map<String, Value>) -> ProviderEvent {
             payload,
             &["toolInput", "tool_input", "toolArgs", "input", "arguments"],
         )),
+        agent_id: provider_agent_id(payload),
     }
 }
 
@@ -321,6 +359,7 @@ fn tool_completed(payload: &Map<String, Value>, is_error: bool) -> ProviderEvent
         output: bounded_string(output),
         is_error,
         duration_ms: first_value(payload, &["duration_ms", "durationMs"]).and_then(Value::as_u64),
+        agent_id: provider_agent_id(payload),
     }
 }
 
@@ -355,7 +394,12 @@ fn interaction_event(
         interaction_kind,
         tool_name,
         prompt,
+        agent_id: provider_agent_id(payload),
     }
+}
+
+fn provider_agent_id(payload: &Map<String, Value>) -> Option<String> {
+    string(payload, &["agent_id", "agentId"]).map(bounded_string)
 }
 
 fn turn_completed(payload: &Map<String, Value>) -> Vec<ProviderEvent> {
@@ -553,6 +597,8 @@ pub enum HookAdapterError {
     PayloadTooLarge,
     #[error("hook adapter is unavailable for {0}")]
     UnsupportedAdapter(String),
+    #[error(transparent)]
+    InvalidCanonicalEvent(#[from] ProviderEventValidationError),
 }
 
 #[cfg(test)]
@@ -727,6 +773,41 @@ mod tests {
         assert!(matches!(
             stopped.as_slice(),
             [ProviderEvent::SubagentStopped { agent_id }] if agent_id == "child-c1"
+        ));
+    }
+
+    #[test]
+    fn claude_question_and_lifecycle_are_independent_canonical_events() {
+        let adapter = id("claude-code");
+        let question = normalize_hook_event(
+            &adapter,
+            "PreToolUse",
+            &json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "q1",
+                "tool_input": {"question": "Continue?"},
+                "agent_id": "a1"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            question.as_slice(),
+            [ProviderEvent::InteractionRequested {
+                request_id: Some(request_id),
+                interaction_kind: ProviderInteractionKind::Question,
+                agent_id: Some(agent_id),
+                ..
+            }] if request_id == "q1" && agent_id == "a1"
+        ));
+        let started = normalize_hook_event(
+            &adapter,
+            "SubagentStart",
+            &json!({"agent_id": "a1", "agent_type": "reviewer"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [ProviderEvent::SubagentStarted { agent_id, .. }] if agent_id == "a1"
         ));
     }
 

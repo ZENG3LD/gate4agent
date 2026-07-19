@@ -27,7 +27,7 @@ pub use hook::{
 };
 pub use hook_session::{
     HookEventDisposition, HookEventEnvelope, HookReduction, HookSessionReducer,
-    HookSessionReducerError, HOOK_EVENT_ID_MAX_BYTES, HOOK_SEEN_EVENT_IDS_MAX,
+    HookSessionReducerError, HookSubagentSeed, HOOK_EVENT_ID_MAX_BYTES, HOOK_SEEN_EVENT_IDS_MAX,
 };
 pub use resume::{build_resume_plan, ResumeAdapterError, ResumePlan, RESUME_SESSION_ID_MAX_BYTES};
 
@@ -254,6 +254,7 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     for id in ["gemini", "opencode"] {
         descriptors.push(descriptor(AdapterFamily::Acp, id));
     }
+    descriptors.push(descriptor(AdapterFamily::Hook, "claude-code"));
     for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
         descriptors.push(descriptor(AdapterFamily::Hook, id));
         descriptors.push(descriptor(AdapterFamily::History, id));
@@ -297,6 +298,9 @@ mod tests {
         assert!(registry.get(AdapterFamily::Pipe, &id).is_some());
         assert!(registry.get(AdapterFamily::Acp, &id).is_some());
         assert!(registry.get(AdapterFamily::Hook, &id).is_none());
+        let claude = AdapterId::new("claude-code").unwrap();
+        assert!(registry.get(AdapterFamily::Hook, &claude).is_some());
+        assert!(registry.get(AdapterFamily::History, &claude).is_none());
     }
 
     #[test]

@@ -823,6 +823,7 @@ fn parsed_provider_event(message: ParsedMessage) -> Option<ProviderEvent> {
                 .tool_name
                 .unwrap_or_else(|| "unknown".to_owned()),
             prompt: message.content,
+            agent_id: None,
         }),
         MessageClass::InfoMessage
         | MessageClass::UiElement
@@ -960,6 +961,7 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
             id,
             name,
             input_json: input.to_string(),
+            agent_id: None,
         }),
         AgentEvent::ToolResult {
             id,
@@ -971,6 +973,7 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
             output,
             is_error,
             duration_ms,
+            agent_id: None,
         }),
         AgentEvent::TurnComplete {
             input_tokens,
@@ -1011,6 +1014,7 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
             interaction_kind: ProviderInteractionKind::Approval,
             tool_name,
             prompt: description.unwrap_or_default(),
+            agent_id: None,
         }),
         AgentEvent::RateLimit(info) => Some(rate_limit_event(info)),
         AgentEvent::Started { .. }

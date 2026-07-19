@@ -487,6 +487,7 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
                         interaction_kind: ProviderInteractionKind::Question,
                         tool_name: "ask_user_question".to_owned(),
                         prompt: "{\"question\":\"choose\"}".to_owned(),
+                        agent_id: None,
                     },
                 ],
             },

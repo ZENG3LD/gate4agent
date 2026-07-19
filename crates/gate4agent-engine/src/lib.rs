@@ -521,6 +521,10 @@ impl Gate4AgentEngine {
                     session.provider.current_prompt = None;
                     session.provider.active_tools.clear();
                 } else if pending_question_answer {
+                    let resume_activity = latest_pending_interaction_resume_activity_by_kind(
+                        &session.provider,
+                        ProviderInteractionKind::Question,
+                    );
                     interaction_transitions = resolve_latest_pending_interaction_by_kind(
                         &mut session.provider,
                         ProviderInteractionKind::Question,
@@ -533,7 +537,7 @@ impl Gate4AgentEngine {
                             }) {
                                 ProviderActivity::WaitingForInput
                             } else {
-                                ProviderActivity::Working
+                                resume_activity.unwrap_or(ProviderActivity::Working)
                             };
                         refresh_provider_activity(&mut session.provider);
                     }
@@ -1357,28 +1361,43 @@ fn reduce_provider_event(
             id,
             name,
             input_json,
+            agent_id,
         } => {
-            interaction_transitions
-                .extend(resolve_matching_provider_interactions(snapshot, source, id));
-            snapshot.lead_activity = ProviderActivity::Working;
-            if let Some(active) = snapshot.active_tools.iter_mut().find(|tool| tool.id == *id) {
-                active.name = name.clone();
-                active.input_json = input_json.clone();
-            } else {
-                snapshot.active_tools.push(ActiveProviderTool {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input_json: input_json.clone(),
-                });
-            }
-        }
-        ProviderEvent::ToolCompleted { id, .. } => {
-            let resolved = resolve_matching_provider_interactions(snapshot, source, id);
+            let resume_activity =
+                matching_interaction_resume_activity(snapshot, source, id, agent_id.as_deref());
+            let resolved =
+                resolve_matching_provider_interactions(snapshot, source, id, agent_id.as_deref());
             if !resolved.is_empty() {
+                snapshot.lead_activity = resume_activity.unwrap_or(ProviderActivity::Working);
+            } else if agent_id.is_none() {
                 snapshot.lead_activity = ProviderActivity::Working;
             }
             interaction_transitions.extend(resolved);
-            snapshot.active_tools.retain(|tool| tool.id != *id);
+            if agent_id.is_none() {
+                if let Some(active) = snapshot.active_tools.iter_mut().find(|tool| tool.id == *id) {
+                    active.name = name.clone();
+                    active.input_json = input_json.clone();
+                } else {
+                    snapshot.active_tools.push(ActiveProviderTool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input_json: input_json.clone(),
+                    });
+                }
+            }
+        }
+        ProviderEvent::ToolCompleted { id, agent_id, .. } => {
+            let resume_activity =
+                matching_interaction_resume_activity(snapshot, source, id, agent_id.as_deref());
+            let resolved =
+                resolve_matching_provider_interactions(snapshot, source, id, agent_id.as_deref());
+            if !resolved.is_empty() {
+                snapshot.lead_activity = resume_activity.unwrap_or(ProviderActivity::Working);
+            }
+            interaction_transitions.extend(resolved);
+            if agent_id.is_none() {
+                snapshot.active_tools.retain(|tool| tool.id != *id);
+            }
         }
         ProviderEvent::TurnCompleted {
             usage,
@@ -1404,12 +1423,22 @@ fn reduce_provider_event(
             interaction_kind,
             tool_name,
             prompt,
+            agent_id,
         } => {
+            let inherited_resume_activity = request_id.as_deref().and_then(|request_id| {
+                matching_interaction_resume_activity(
+                    snapshot,
+                    source,
+                    request_id,
+                    agent_id.as_deref(),
+                )
+            });
             if let Some(request_id) = request_id {
                 interaction_transitions.extend(resolve_provider_request_interactions(
                     snapshot,
                     source,
                     request_id,
+                    agent_id.as_deref(),
                     ProviderInteractionOutcome::Superseded,
                 ));
             }
@@ -1420,6 +1449,10 @@ fn reduce_provider_event(
                 interaction_kind: *interaction_kind,
                 tool_name: tool_name.clone(),
                 prompt: prompt.clone(),
+                agent_id: agent_id.clone(),
+                resume_lead_activity: agent_id
+                    .is_some()
+                    .then_some(inherited_resume_activity.unwrap_or(snapshot.lead_activity)),
                 status: ProviderInteractionStatus::Pending,
             };
             push_provider_interaction(snapshot, interaction.clone(), &mut interaction_transitions);
@@ -1470,6 +1503,16 @@ fn reduce_provider_event(
             }
         }
         ProviderEvent::SubagentStopped { agent_id } => {
+            let resume_activity = subagent_interaction_resume_activity(snapshot, source, agent_id);
+            interaction_transitions.extend(resolve_subagent_pending_interactions(
+                snapshot,
+                source,
+                agent_id,
+                ProviderInteractionOutcome::TurnEnded,
+            ));
+            if let Some(resume_activity) = resume_activity {
+                snapshot.lead_activity = resume_activity;
+            }
             snapshot.subagents.retain(|subagent| {
                 subagent.source != *source || subagent.provider_agent_id != *agent_id
             });
@@ -1531,6 +1574,7 @@ fn resolve_matching_provider_interactions(
     snapshot: &mut ProviderSnapshot,
     source: &ProviderSource,
     provider_request_id: &str,
+    agent_id: Option<&str>,
 ) -> Vec<ProviderInteractionTransition> {
     let matching: Vec<_> = snapshot
         .interactions
@@ -1538,6 +1582,7 @@ fn resolve_matching_provider_interactions(
         .filter(|interaction| {
             interaction.source == *source
                 && interaction.provider_request_id.as_deref() == Some(provider_request_id)
+                && interaction.agent_id.as_deref() == agent_id
                 && matches!(interaction.status, ProviderInteractionStatus::Pending)
         })
         .map(|interaction| {
@@ -1551,10 +1596,27 @@ fn resolve_matching_provider_interactions(
     resolve_interaction_ids(snapshot, matching)
 }
 
+fn matching_interaction_resume_activity(
+    snapshot: &ProviderSnapshot,
+    source: &ProviderSource,
+    provider_request_id: &str,
+    agent_id: Option<&str>,
+) -> Option<ProviderActivity> {
+    snapshot.interactions.iter().rev().find_map(|interaction| {
+        (interaction.source == *source
+            && interaction.provider_request_id.as_deref() == Some(provider_request_id)
+            && interaction.agent_id.as_deref() == agent_id
+            && matches!(interaction.status, ProviderInteractionStatus::Pending))
+        .then_some(interaction.resume_lead_activity)
+        .flatten()
+    })
+}
+
 fn resolve_provider_request_interactions(
     snapshot: &mut ProviderSnapshot,
     source: &ProviderSource,
     provider_request_id: &str,
+    agent_id: Option<&str>,
     outcome: ProviderInteractionOutcome,
 ) -> Vec<ProviderInteractionTransition> {
     let matching = snapshot
@@ -1563,6 +1625,7 @@ fn resolve_provider_request_interactions(
         .filter(|interaction| {
             interaction.source == *source
                 && interaction.provider_request_id.as_deref() == Some(provider_request_id)
+                && interaction.agent_id.as_deref() == agent_id
                 && matches!(interaction.status, ProviderInteractionStatus::Pending)
         })
         .map(|interaction| (interaction.id, outcome))
@@ -1585,6 +1648,39 @@ fn resolve_source_pending_interactions(
         .map(|interaction| (interaction.id, outcome))
         .collect();
     resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_subagent_pending_interactions(
+    snapshot: &mut ProviderSnapshot,
+    source: &ProviderSource,
+    agent_id: &str,
+    outcome: ProviderInteractionOutcome,
+) -> Vec<ProviderInteractionTransition> {
+    let matching = snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.source == *source
+                && interaction.agent_id.as_deref() == Some(agent_id)
+                && matches!(interaction.status, ProviderInteractionStatus::Pending)
+        })
+        .map(|interaction| (interaction.id, outcome))
+        .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn subagent_interaction_resume_activity(
+    snapshot: &ProviderSnapshot,
+    source: &ProviderSource,
+    agent_id: &str,
+) -> Option<ProviderActivity> {
+    snapshot.interactions.iter().find_map(|interaction| {
+        (interaction.source == *source
+            && interaction.agent_id.as_deref() == Some(agent_id)
+            && matches!(interaction.status, ProviderInteractionStatus::Pending))
+        .then_some(interaction.resume_lead_activity)
+        .flatten()
+    })
 }
 
 fn resolve_all_pending_interactions(
@@ -1617,6 +1713,18 @@ fn resolve_latest_pending_interaction_by_kind(
         .into_iter()
         .collect();
     resolve_interaction_ids(snapshot, matching)
+}
+
+fn latest_pending_interaction_resume_activity_by_kind(
+    snapshot: &ProviderSnapshot,
+    interaction_kind: ProviderInteractionKind,
+) -> Option<ProviderActivity> {
+    snapshot.interactions.iter().rev().find_map(|interaction| {
+        (interaction.interaction_kind == interaction_kind
+            && matches!(interaction.status, ProviderInteractionStatus::Pending))
+        .then_some(interaction.resume_lead_activity)
+        .flatten()
+    })
 }
 
 fn resolve_interaction_ids(
@@ -1876,18 +1984,21 @@ mod tests {
                 id: "tool-1".to_owned(),
                 name: "shell".to_owned(),
                 input_json: "{\"command\":\"cargo test\"}".to_owned(),
+                agent_id: None,
             },
             ProviderEvent::InteractionRequested {
                 request_id: Some("tool-1".to_owned()),
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "shell".to_owned(),
                 prompt: "approve".to_owned(),
+                agent_id: None,
             },
             ProviderEvent::ToolCompleted {
                 id: "tool-1".to_owned(),
                 output: "ok".to_owned(),
                 is_error: false,
                 duration_ms: None,
+                agent_id: None,
             },
             ProviderEvent::TurnCompleted {
                 usage: TokenUsage::default(),
@@ -1953,6 +2064,7 @@ mod tests {
                     interaction_kind: ProviderInteractionKind::Question,
                     tool_name: "AskUserQuestion".to_owned(),
                     prompt: "{\"question\":\"Continue?\"}".to_owned(),
+                    agent_id: None,
                 },
             },
         });
@@ -1979,6 +2091,7 @@ mod tests {
                     id: "question-7".to_owned(),
                     name: "AskUserQuestion".to_owned(),
                     input_json: "{}".to_owned(),
+                    agent_id: None,
                 },
             },
         });
@@ -2015,6 +2128,7 @@ mod tests {
                     interaction_kind: ProviderInteractionKind::Approval,
                     tool_name: "shell".to_owned(),
                     prompt: "cargo test".to_owned(),
+                    agent_id: None,
                 },
             },
         });
@@ -2077,18 +2191,21 @@ mod tests {
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "shell".to_owned(),
                 prompt: "cargo test".to_owned(),
+                agent_id: None,
             },
             ProviderEvent::InteractionRequested {
                 request_id: Some("question-1".to_owned()),
                 interaction_kind: ProviderInteractionKind::Question,
                 tool_name: "AskUserQuestion".to_owned(),
                 prompt: "{\"question\":\"Continue?\"}".to_owned(),
+                agent_id: None,
             },
             ProviderEvent::InteractionRequested {
                 request_id: Some("question-2".to_owned()),
                 interaction_kind: ProviderInteractionKind::Question,
                 tool_name: "AskUserQuestion".to_owned(),
                 prompt: "{\"question\":\"Use the latest answer?\"}".to_owned(),
+                agent_id: None,
             },
         ]
         .into_iter()
@@ -2154,6 +2271,171 @@ mod tests {
         assert_eq!(
             snapshot.sessions[0].provider.activity,
             ProviderActivity::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn child_owned_interaction_restores_lead_state_without_adopting_child_activity() {
+        let (mut engine, spawn) = running_engine();
+        let source = provider_source();
+        let events = [
+            ProviderEvent::TurnCompleted {
+                usage: TokenUsage::default(),
+                is_cumulative: false,
+            },
+            ProviderEvent::SubagentStarted {
+                agent_id: "child-1".to_owned(),
+                agent_type: Some("reviewer".to_owned()),
+                description: None,
+            },
+            ProviderEvent::InteractionRequested {
+                request_id: Some("question-1".to_owned()),
+                interaction_kind: ProviderInteractionKind::Question,
+                tool_name: "AskUserQuestion".to_owned(),
+                prompt: "{\"question\":\"Continue?\"}".to_owned(),
+                agent_id: Some("child-1".to_owned()),
+            },
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: source.clone(),
+                    sequence: u64::try_from(index + 1).unwrap(),
+                    event,
+                },
+            });
+        }
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(provider.lead_activity, ProviderActivity::WaitingForInput);
+        assert_eq!(
+            provider.interactions[0].resume_lead_activity,
+            Some(ProviderActivity::Idle)
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: source.clone(),
+                sequence: 4,
+                event: ProviderEvent::InteractionRequested {
+                    request_id: Some("question-1".to_owned()),
+                    interaction_kind: ProviderInteractionKind::Question,
+                    tool_name: "AskUserQuestion".to_owned(),
+                    prompt: "{\"question\":\"Continue?\"}".to_owned(),
+                    agent_id: Some("child-1".to_owned()),
+                },
+            },
+        });
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(
+            provider.interactions[0].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Superseded
+            }
+        );
+        assert_eq!(
+            provider.interactions[1].resume_lead_activity,
+            Some(ProviderActivity::Idle)
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: source.clone(),
+                sequence: 5,
+                event: ProviderEvent::ToolStarted {
+                    id: "question-1".to_owned(),
+                    name: "AskUserQuestion".to_owned(),
+                    input_json: "{}".to_owned(),
+                    agent_id: Some("child-1".to_owned()),
+                },
+            },
+        });
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(provider.lead_activity, ProviderActivity::Idle);
+        assert_eq!(provider.activity, ProviderActivity::Working);
+        assert!(provider.active_tools.is_empty());
+        assert_eq!(
+            provider.interactions[1].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Answered
+            }
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: source.clone(),
+                sequence: 6,
+                event: ProviderEvent::InteractionRequested {
+                    request_id: Some("approval-2".to_owned()),
+                    interaction_kind: ProviderInteractionKind::Approval,
+                    tool_name: "shell".to_owned(),
+                    prompt: "approve".to_owned(),
+                    agent_id: Some("child-1".to_owned()),
+                },
+            },
+        });
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: source.clone(),
+                sequence: 7,
+                event: ProviderEvent::InteractionRequested {
+                    request_id: Some("question-3".to_owned()),
+                    interaction_kind: ProviderInteractionKind::Question,
+                    tool_name: "AskUserQuestion".to_owned(),
+                    prompt: "{\"question\":\"Another?\"}".to_owned(),
+                    agent_id: Some("child-1".to_owned()),
+                },
+            },
+        });
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source,
+                sequence: 8,
+                event: ProviderEvent::SubagentStopped {
+                    agent_id: "child-1".to_owned(),
+                },
+            },
+        });
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.activity,
+            ProviderActivity::Idle
+        );
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.interactions[2].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::TurnEnded
+            }
+        );
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.interactions[3].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::TurnEnded
+            }
         );
     }
 
@@ -2227,6 +2509,7 @@ mod tests {
                         interaction_kind: ProviderInteractionKind::Approval,
                         tool_name: "shell".to_owned(),
                         prompt: String::new(),
+                        agent_id: None,
                     },
                 },
             });
@@ -2282,6 +2565,7 @@ mod tests {
                             id: "tool-1".to_owned(),
                             name: "shell".to_owned(),
                             input_json: "{}".to_owned(),
+                            agent_id: None,
                         },
                     ],
                 },

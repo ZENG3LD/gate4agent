@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 13;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 14;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -393,12 +393,14 @@ pub enum ProviderEvent {
         id: String,
         name: String,
         input_json: String,
+        agent_id: Option<String>,
     },
     ToolCompleted {
         id: String,
         output: String,
         is_error: bool,
         duration_ms: Option<u64>,
+        agent_id: Option<String>,
     },
     TurnCompleted {
         usage: TokenUsage,
@@ -418,6 +420,7 @@ pub enum ProviderEvent {
         interaction_kind: ProviderInteractionKind,
         tool_name: String,
         prompt: String,
+        agent_id: Option<String>,
     },
     SubagentStarted {
         agent_id: String,
@@ -467,14 +470,22 @@ impl ProviderEvent {
                 id,
                 name,
                 input_json,
+                agent_id,
             } => {
                 validate_required("tool id", id, PROVIDER_EVENT_ID_MAX_BYTES)?;
                 validate_required("tool name", name, PROVIDER_EVENT_ID_MAX_BYTES)?;
                 validate_text("tool input", input_json, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                validate_optional_agent_id(agent_id)?;
             }
-            Self::ToolCompleted { id, output, .. } => {
+            Self::ToolCompleted {
+                id,
+                output,
+                agent_id,
+                ..
+            } => {
                 validate_required("tool id", id, PROVIDER_EVENT_ID_MAX_BYTES)?;
                 validate_text("tool output", output, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                validate_optional_agent_id(agent_id)?;
             }
             Self::SessionEnded {
                 result, cost_usd, ..
@@ -492,6 +503,7 @@ impl ProviderEvent {
                 interaction_kind,
                 tool_name,
                 prompt,
+                agent_id,
             } => {
                 if let Some(request_id) = request_id {
                     validate_required(
@@ -510,6 +522,7 @@ impl ProviderEvent {
                 } else {
                     validate_text("interaction prompt", prompt, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
                 }
+                validate_optional_agent_id(agent_id)?;
             }
             Self::SubagentStarted {
                 agent_id,
@@ -591,6 +604,15 @@ fn validate_identifier(
     Ok(())
 }
 
+fn validate_optional_agent_id(
+    agent_id: &Option<String>,
+) -> Result<(), ProviderEventValidationError> {
+    if let Some(agent_id) = agent_id {
+        validate_required("provider agent id", agent_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+    }
+    Ok(())
+}
+
 fn validate_text(
     field: &'static str,
     value: &str,
@@ -648,6 +670,8 @@ pub struct ProviderInteraction {
     pub interaction_kind: ProviderInteractionKind,
     pub tool_name: String,
     pub prompt: String,
+    pub agent_id: Option<String>,
+    pub resume_lead_activity: Option<ProviderActivity>,
     pub status: ProviderInteractionStatus,
 }
 
@@ -891,6 +915,7 @@ mod tests {
             interaction_kind: ProviderInteractionKind::Question,
             tool_name: "AskUserQuestion".to_owned(),
             prompt: "{\"question\":\"Continue?\"}".to_owned(),
+            agent_id: Some("child-1".to_owned()),
         };
         assert_eq!(question.validate_ingress(), Ok(()));
 
@@ -900,6 +925,7 @@ mod tests {
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "shell".to_owned(),
                 prompt: String::new(),
+                agent_id: None,
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::InvalidField {
@@ -913,6 +939,7 @@ mod tests {
                 interaction_kind: ProviderInteractionKind::Question,
                 tool_name: "AskUserQuestion".to_owned(),
                 prompt: String::new(),
+                agent_id: None,
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::Empty {

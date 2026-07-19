@@ -263,6 +263,9 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     descriptors.push(descriptor(AdapterFamily::Hook, "omp"));
     descriptors.push(descriptor(AdapterFamily::Hook, "antigravity"));
     descriptors.push(descriptor(AdapterFamily::Hook, "amp"));
+    descriptors.push(descriptor(AdapterFamily::Hook, "command-code"));
+    descriptors.push(descriptor(AdapterFamily::Hook, "hermes"));
+    descriptors.push(descriptor(AdapterFamily::Hook, "devin"));
     for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
         descriptors.push(descriptor(AdapterFamily::Hook, id));
         descriptors.push(descriptor(AdapterFamily::History, id));
@@ -319,11 +322,45 @@ mod tests {
             "omp",
             "antigravity",
             "amp",
+            "command-code",
+            "hermes",
+            "devin",
         ] {
             let id = AdapterId::new(id).unwrap();
             assert!(registry.get(AdapterFamily::Hook, &id).is_some());
             assert!(registry.get(AdapterFamily::History, &id).is_none());
         }
+    }
+
+    #[test]
+    fn hook_registry_matches_the_pinned_orca_source_inventory() {
+        let actual = builtin_adapter_registry()
+            .iter()
+            .filter(|descriptor| descriptor.family == AdapterFamily::Hook)
+            .map(|descriptor| descriptor.binding.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "amp",
+            "antigravity",
+            "claude-code",
+            "codex",
+            "command-code",
+            "copilot",
+            "cursor",
+            "devin",
+            "droid",
+            "gemini",
+            "grok",
+            "hermes",
+            "kimi",
+            "mimo-code",
+            "omp",
+            "opencode",
+            "pi",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

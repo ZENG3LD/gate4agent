@@ -43,6 +43,9 @@ pub fn normalize_hook_event(
         "pi" | "omp" => normalize_pi_family(event_name, record),
         "antigravity" => normalize_antigravity(event_name, record),
         "amp" => normalize_amp(event_name, record),
+        "command-code" => normalize_command_code(event_name, record),
+        "hermes" => normalize_hermes(event_name, record),
+        "devin" => normalize_devin(event_name, record),
         "grok" => normalize_grok(event_name, record),
         "kimi" => normalize_kimi(event_name, record),
         "copilot" => normalize_copilot(event_name, record),
@@ -69,6 +72,7 @@ pub fn normalize_hook_event(
 fn provider_session_id(adapter_id: &AdapterId, payload: &Map<String, Value>) -> Option<String> {
     let keys: &[&str] = match adapter_id.as_str() {
         "claude-code" | "codex" | "gemini" | "droid" | "kimi" => &["session_id"],
+        "devin" => &["session_id", "sessionId"],
         "opencode" | "mimo-code" => &["sessionID"],
         "antigravity" => &["conversationId"],
         "grok" => &["sessionId", "session_id"],
@@ -294,6 +298,75 @@ fn normalize_amp(
             usage: TokenUsage::default(),
             is_cumulative: false,
         }]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn normalize_command_code(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "PreToolUse" => Ok(vec![tool_started(payload)]),
+        "PostToolUse" => Ok(vec![
+            tool_completed(payload, false),
+            ProviderEvent::WorkingObserved,
+        ]),
+        "Stop" => Ok(turn_completed(payload)),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn normalize_hermes(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "on_session_start" => Ok(vec![ProviderEvent::WorkingObserved]),
+        "pre_llm_call" => Ok(vec![turn_started(payload)]),
+        "post_llm_call" => Ok(turn_completed(payload)),
+        "pre_tool_call" => Ok(vec![tool_started(payload)]),
+        "post_tool_call" => Ok(vec![
+            tool_completed(payload, false),
+            ProviderEvent::WorkingObserved,
+        ]),
+        "pre_approval_request" => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
+        "post_approval_response" => Ok(vec![ProviderEvent::WorkingObserved]),
+        "on_session_end" | "on_session_finalize" | "on_session_reset" => {
+            Ok(vec![session_ended(payload)])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn normalize_devin(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "SessionStart" => Ok(Vec::new()),
+        "UserPromptSubmit" => Ok(vec![turn_started(payload)]),
+        "PreToolUse" => Ok(vec![tool_started(payload)]),
+        "PostToolUse" => Ok(vec![tool_completed(payload, false)]),
+        "PostCompaction" => Ok(vec![ProviderEvent::WorkingObserved]),
+        "PermissionRequest" if is_ask_user_question(tool_name(payload).as_deref()) => {
+            Ok(vec![interaction_event(
+                payload,
+                ProviderInteractionKind::Question,
+            )])
+        }
+        "PermissionRequest" => Ok(vec![interaction_event(
+            payload,
+            ProviderInteractionKind::Approval,
+        )]),
+        "Stop" if bool_value(payload, &["is_interrupt"]) == Some(true) => {
+            Ok(turn_interrupted(payload))
+        }
+        "Stop" => Ok(turn_completed(payload)),
+        "SessionEnd" => Ok(vec![session_ended(payload)]),
         _ => Ok(Vec::new()),
     }
 }
@@ -721,6 +794,8 @@ fn turn_completed(payload: &Map<String, Value>) -> Vec<ProviderEvent> {
         &[
             "lastAssistantMessage",
             "last_assistant_message",
+            "assistant_response",
+            "response_text",
             "finalText",
             "message",
         ],
@@ -737,8 +812,28 @@ fn turn_completed(payload: &Map<String, Value>) -> Vec<ProviderEvent> {
     events
 }
 
+fn turn_interrupted(payload: &Map<String, Value>) -> Vec<ProviderEvent> {
+    let mut events = turn_completed(payload);
+    if let Some(last) = events.last_mut() {
+        *last = ProviderEvent::TurnInterrupted;
+    }
+    events
+}
+
+fn session_ended(payload: &Map<String, Value>) -> ProviderEvent {
+    ProviderEvent::SessionEnded {
+        result: string(payload, &["reason", "status", "result"]).unwrap_or_default(),
+        cost_usd: string(payload, &["cost_usd", "costUsd"]),
+        is_error: bool_value(payload, &["is_error", "isError"]).unwrap_or(false),
+    }
+}
+
 fn tool_name(payload: &Map<String, Value>) -> Option<String> {
-    string(payload, &["toolName", "tool_name", "tool", "name"]).or_else(|| {
+    string(
+        payload,
+        &["toolName", "tool_name", "tool", "name", "tool_display_name"],
+    )
+    .or_else(|| {
         payload
             .get("toolCall")
             .and_then(Value::as_object)
@@ -1575,6 +1670,198 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn command_code_maps_its_three_event_contract_without_session_claims() {
+        let adapter = id("command-code");
+        let tool = normalize_hook_event(
+            &adapter,
+            "PreToolUse",
+            &json!({
+                "transcript_path": "C:/tmp/command-code.jsonl",
+                "tool_name": "shell_command",
+                "tool_input": {"command": "pwd"}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            tool.as_slice(),
+            [ProviderEvent::ToolStarted { name, input_json, .. }]
+                if name == "shell_command" && input_json.contains("pwd")
+        ));
+
+        let result = normalize_hook_event(
+            &adapter,
+            "PostToolUse",
+            &json!({
+                "tool_display_name": "shell_command",
+                "tool_response": {"output": "/tmp/project"}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.as_slice(),
+            [
+                ProviderEvent::ToolCompleted { output, .. },
+                ProviderEvent::WorkingObserved
+            ] if output.contains("/tmp/project")
+        ));
+
+        let stopped = normalize_hook_event(
+            &adapter,
+            "Stop",
+            &json!({"last_assistant_message": "The output is /tmp/project."}),
+        )
+        .unwrap();
+        assert!(matches!(
+            stopped.as_slice(),
+            [ProviderEvent::Text { text, .. }, ProviderEvent::TurnCompleted { .. }]
+                if text == "The output is /tmp/project."
+        ));
+    }
+
+    #[test]
+    fn hermes_maps_llm_tools_approval_and_session_lifecycle() {
+        let adapter = id("hermes");
+        let turn = normalize_hook_event(
+            &adapter,
+            "pre_llm_call",
+            &json!({"session_id": "hermes-session-1", "user_message": "ship support"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            turn.as_slice(),
+            [ProviderEvent::TurnStarted { prompt }]
+                if prompt.as_deref() == Some("ship support")
+        ));
+
+        let tool = normalize_hook_event(
+            &adapter,
+            "pre_tool_call",
+            &json!({
+                "tool_call_id": "hermes-tool-1",
+                "tool_name": "terminal",
+                "args": {"command": "cargo test"}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            tool.as_slice(),
+            [ProviderEvent::ToolStarted { id, name, input_json, .. }]
+                if id == "hermes-tool-1" && name == "terminal" && input_json.contains("cargo test")
+        ));
+
+        let approval = normalize_hook_event(
+            &adapter,
+            "pre_approval_request",
+            &json!({
+                "tool_name": "approval",
+                "tool_input": {"command": "rm -rf build", "description": "remove build"}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            approval.as_slice(),
+            [ProviderEvent::InteractionRequested {
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name,
+                prompt,
+                ..
+            }] if tool_name == "approval" && prompt.contains("rm -rf build")
+        ));
+        assert_eq!(
+            normalize_hook_event(&adapter, "post_approval_response", &json!({})).unwrap(),
+            vec![ProviderEvent::WorkingObserved]
+        );
+
+        let done = normalize_hook_event(
+            &adapter,
+            "post_llm_call",
+            &json!({"assistant_response": "Hermes is wired up."}),
+        )
+        .unwrap();
+        assert!(matches!(
+            done.as_slice(),
+            [ProviderEvent::Text { text, .. }, ProviderEvent::TurnCompleted { .. }]
+                if text == "Hermes is wired up."
+        ));
+        assert!(matches!(
+            normalize_hook_event(&adapter, "on_session_finalize", &json!({}))
+                .unwrap()
+                .as_slice(),
+            [ProviderEvent::SessionEnded { .. }]
+        ));
+    }
+
+    #[test]
+    fn devin_maps_documented_lifecycle_identity_questions_and_interrupts() {
+        let adapter = id("devin");
+        let session = normalize_hook_event(
+            &adapter,
+            "SessionStart",
+            &json!({"session_id": "devin-session-1", "source": "resume"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            session.as_slice(),
+            [ProviderEvent::SessionIdentityObserved { session_id }]
+                if session_id == "devin-session-1"
+        ));
+
+        let prompt = normalize_hook_event(
+            &adapter,
+            "UserPromptSubmit",
+            &json!({"prompt": "inspect repository"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            prompt.as_slice(),
+            [ProviderEvent::TurnStarted { prompt }]
+                if prompt.as_deref() == Some("inspect repository")
+        ));
+
+        let question = normalize_hook_event(
+            &adapter,
+            "PermissionRequest",
+            &json!({
+                "tool_use_id": "question-1",
+                "tool_name": "AskUserQuestion",
+                "tool_input": {"questions": [{"question": "Continue?"}]}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            question.as_slice(),
+            [ProviderEvent::InteractionRequested {
+                interaction_kind: ProviderInteractionKind::Question,
+                prompt,
+                ..
+            }] if prompt.contains("Continue?")
+        ));
+
+        assert_eq!(
+            normalize_hook_event(&adapter, "PostCompaction", &json!({"summary": "trimmed"}))
+                .unwrap(),
+            vec![ProviderEvent::WorkingObserved]
+        );
+        assert!(matches!(
+            normalize_hook_event(
+                &adapter,
+                "Stop",
+                &json!({"is_interrupt": true, "last_assistant_message": "cancelled"})
+            )
+            .unwrap()
+            .as_slice(),
+            [ProviderEvent::Text { text, .. }, ProviderEvent::TurnInterrupted]
+                if text == "cancelled"
+        ));
+        assert!(matches!(
+            normalize_hook_event(&adapter, "SessionEnd", &json!({"reason": "complete"}))
+                .unwrap()
+                .as_slice(),
+            [ProviderEvent::SessionEnded { result, .. }] if result == "complete"
+        ));
     }
 
     #[test]

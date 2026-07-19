@@ -3,12 +3,19 @@
 use gate4agent_catalog::{AgentRegistry, EnvMutation};
 use gate4agent_handle::{bounded_port, Gate4AgentHandle, KernelPort, PublishReport};
 use gate4agent_kernel::{CommandOutcome, Gate4AgentKernel};
+use gate4agent_provider_ports::{
+    discover_history, load_history_session, HistoryCandidate, HistoryDiscoveryRequest,
+    HistoryLoadRequest,
+};
+use gate4agent_shell_history::NativeHistoryAuthority;
+pub use gate4agent_shell_history::{NativeHistoryConfig, NativeHistoryRoot};
 pub use gate4agent_shell_hooks::{HookIngressConfig, HookIngressEndpoint};
 use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
 use gate4agent_shell_native::NativeEffectShell;
 use gate4agent_types::{
-    AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope, ObservationEnvelope,
-    SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
+    AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
+    HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole, HistorySessionRecord,
+    ObservationEnvelope, SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,16 +75,36 @@ pub struct NativeRuntime {
 
 impl NativeRuntime {
     pub fn new(catalog: AgentRegistry, config: NativeRuntimeConfig) -> (Gate4AgentHandle, Self) {
+        Self::new_with_optional_history(catalog, config, None)
+    }
+
+    pub fn new_with_history(
+        catalog: AgentRegistry,
+        config: NativeRuntimeConfig,
+        history: NativeHistoryConfig,
+    ) -> (Gate4AgentHandle, Self) {
+        Self::new_with_optional_history(catalog, config, Some(history))
+    }
+
+    fn new_with_optional_history(
+        catalog: AgentRegistry,
+        config: NativeRuntimeConfig,
+        history: Option<NativeHistoryConfig>,
+    ) -> (Gate4AgentHandle, Self) {
         let (handle, port) = bounded_port(config.command_capacity);
         let runtime = Self {
             config,
             kernel: Gate4AgentKernel::new(catalog.clone()),
             handle: handle.clone(),
             port,
-            effects: NativeEffectDispatcher::new(catalog, config),
+            effects: NativeEffectDispatcher::new(catalog, config, history),
             hook_ingress: None,
         };
         (handle, runtime)
+    }
+
+    pub fn history_enabled(&self) -> bool {
+        self.effects.history_config.is_some()
     }
 
     /// Run one non-blocking host tick. Effects are dispatched in session order
@@ -195,6 +222,8 @@ struct NativeEffectDispatcher {
     catalog: AgentRegistry,
     config: NativeRuntimeConfig,
     workers: HashMap<AgentInstanceId, EffectWorker>,
+    history_worker: Option<EffectWorker>,
+    history_config: Option<NativeHistoryConfig>,
     control_tx: Sender<ObservationEnvelope>,
     control_rx: Receiver<ObservationEnvelope>,
     pending_failures: VecDeque<ObservationEnvelope>,
@@ -204,12 +233,18 @@ struct NativeEffectDispatcher {
 }
 
 impl NativeEffectDispatcher {
-    fn new(catalog: AgentRegistry, config: NativeRuntimeConfig) -> Self {
+    fn new(
+        catalog: AgentRegistry,
+        config: NativeRuntimeConfig,
+        history_config: Option<NativeHistoryConfig>,
+    ) -> Self {
         let (control_tx, control_rx) = mpsc::channel(config.observation_capacity.max(1));
         Self {
             catalog,
             config,
             workers: HashMap::new(),
+            history_worker: None,
+            history_config,
             control_tx,
             control_rx,
             pending_failures: VecDeque::new(),
@@ -227,6 +262,13 @@ impl NativeEffectDispatcher {
     }
 
     fn dispatch(&mut self, effect: EffectEnvelope) {
+        if matches!(
+            effect.effect,
+            ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. }
+        ) {
+            self.dispatch_history(effect);
+            return;
+        }
         self.workers.retain(|_, worker| !worker.sender.is_closed());
         let instance_id = effect.instance_id;
         let pty_env = match self.hook_pty_env(&effect) {
@@ -261,6 +303,60 @@ impl NativeEffectDispatcher {
             pending.effect,
             "native session effect worker is unavailable".to_owned(),
         ));
+    }
+
+    fn dispatch_history(&mut self, effect: EffectEnvelope) {
+        let Some(history_config) = self.history_config.clone() else {
+            self.pending_failures.push_back(effect_failure(
+                effect,
+                "native history authority is not configured".to_owned(),
+            ));
+            return;
+        };
+        let mut pending = NativeEffectRequest {
+            effect,
+            pty_env: Vec::new(),
+        };
+        for _ in 0..2 {
+            let sender = self.history_sender(history_config.clone());
+            match sender.try_send(pending) {
+                Ok(()) => return,
+                Err(TrySendError::Closed(request)) => {
+                    self.history_worker = None;
+                    pending = request;
+                }
+                Err(TrySendError::Full(request)) => {
+                    self.pending_failures.push_back(effect_failure(
+                        request.effect,
+                        "native history effect queue is full".to_owned(),
+                    ));
+                    return;
+                }
+            }
+        }
+        self.pending_failures.push_back(effect_failure(
+            pending.effect,
+            "native history effect worker is unavailable".to_owned(),
+        ));
+    }
+
+    fn history_sender(&mut self, config: NativeHistoryConfig) -> Sender<NativeEffectRequest> {
+        if let Some(worker) = &self.history_worker {
+            if !worker.sender.is_closed() {
+                return worker.sender.clone();
+            }
+        }
+        let (sender, receiver) = mpsc::channel(self.config.effect_capacity_per_session.max(1));
+        tokio::spawn(run_history_worker(
+            self.catalog.clone(),
+            config,
+            receiver,
+            self.control_tx.clone(),
+        ));
+        self.history_worker = Some(EffectWorker {
+            sender: sender.clone(),
+        });
+        sender
     }
 
     fn hook_pty_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
@@ -369,6 +465,223 @@ impl NativeEffectDispatcher {
             }
         }
         (observations, terminal_frames_collected)
+    }
+}
+
+const HISTORY_INSTANCE_DISCOVERIES_MAX: usize = 1_024;
+
+struct InstanceHistoryDiscovery {
+    generation: SessionGeneration,
+    agent_id: AgentId,
+    request: HistoryDiscoveryRequest,
+    candidates: HashMap<String, HistoryCandidate>,
+}
+
+struct NativeHistoryWorkerState {
+    catalog: AgentRegistry,
+    authority: NativeHistoryAuthority,
+    discoveries: HashMap<AgentInstanceId, InstanceHistoryDiscovery>,
+    discovery_order: VecDeque<AgentInstanceId>,
+}
+
+impl NativeHistoryWorkerState {
+    fn new(catalog: AgentRegistry, config: NativeHistoryConfig) -> Self {
+        Self {
+            catalog,
+            authority: NativeHistoryAuthority::new(config),
+            discoveries: HashMap::new(),
+            discovery_order: VecDeque::new(),
+        }
+    }
+
+    fn execute(&mut self, envelope: EffectEnvelope) -> ObservationEnvelope {
+        let EffectEnvelope {
+            protocol_version,
+            operation_id,
+            instance_id,
+            generation,
+            effect,
+        } = envelope;
+        let observation = if protocol_version != CONTROL_PROTOCOL_VERSION {
+            ControlObservation::HistoryFailed {
+                message: format!(
+                    "history effect protocol version {protocol_version} is unsupported; expected {CONTROL_PROTOCOL_VERSION}"
+                ),
+            }
+        } else {
+            match effect {
+                ControlEffect::DiscoverHistory { agent_id, query } => {
+                    self.discover(instance_id, generation, agent_id, query)
+                }
+                ControlEffect::LoadHistory {
+                    agent_id,
+                    candidate_id,
+                } => self.load(instance_id, generation, agent_id, candidate_id),
+                _ => ControlObservation::HistoryFailed {
+                    message: "native history worker received a non-history effect".to_owned(),
+                },
+            }
+        };
+        ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(operation_id),
+            instance_id,
+            generation,
+            observation,
+        }
+    }
+
+    fn discover(
+        &mut self,
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+        agent_id: AgentId,
+        query: gate4agent_types::HistoryQuery,
+    ) -> ControlObservation {
+        let Some(spec) = self.catalog.get(&agent_id) else {
+            return history_failure(format!("agent '{agent_id}' is absent from native catalog"));
+        };
+        let request =
+            match HistoryDiscoveryRequest::from_spec(spec, query.working_directory, query.limit) {
+                Ok(request) => request,
+                Err(error) => return history_failure(error.to_string()),
+            };
+        let candidates = match discover_history(&mut self.authority, &request) {
+            Ok(candidates) => candidates,
+            Err(error) => return history_failure(error.to_string()),
+        };
+        let summaries = candidates
+            .iter()
+            .map(|candidate| HistoryCandidateSummary {
+                id: candidate.id().as_str().to_owned(),
+                session_id_hint: candidate.session_id_hint().to_owned(),
+                modified_at_unix_ms: candidate.modified_at_unix_ms(),
+            })
+            .collect::<Vec<_>>();
+        if summaries
+            .iter()
+            .any(|candidate| candidate.validate().is_err())
+        {
+            return history_failure(
+                "native history authority returned an invalid candidate".to_owned(),
+            );
+        }
+        let candidates = candidates
+            .into_iter()
+            .map(|candidate| (candidate.id().as_str().to_owned(), candidate))
+            .collect();
+        self.discoveries.insert(
+            instance_id,
+            InstanceHistoryDiscovery {
+                generation,
+                agent_id,
+                request,
+                candidates,
+            },
+        );
+        self.touch_discovery(instance_id);
+        ControlObservation::HistoryDiscovered {
+            candidates: summaries,
+        }
+    }
+
+    fn load(
+        &mut self,
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+        agent_id: AgentId,
+        candidate_id: String,
+    ) -> ControlObservation {
+        let Some(discovery) = self.discoveries.get(&instance_id) else {
+            return history_failure("history candidate discovery is expired".to_owned());
+        };
+        if discovery.generation != generation || discovery.agent_id != agent_id {
+            return history_failure("history candidate generation is stale".to_owned());
+        }
+        let Some(candidate) = discovery.candidates.get(&candidate_id).cloned() else {
+            return history_failure("history candidate is expired or unknown".to_owned());
+        };
+        let request = discovery.request.clone();
+        self.touch_discovery(instance_id);
+        let load = match HistoryLoadRequest::new(&request, candidate) {
+            Ok(load) => load,
+            Err(error) => return history_failure(error.to_string()),
+        };
+        match load_history_session(&mut self.authority, &load) {
+            Ok(session) => {
+                let session = history_session_record(session);
+                if let Err(error) = session.validate() {
+                    history_failure(error.to_string())
+                } else {
+                    ControlObservation::HistoryLoaded { session }
+                }
+            }
+            Err(error) => history_failure(error.to_string()),
+        }
+    }
+
+    fn touch_discovery(&mut self, instance_id: AgentInstanceId) {
+        self.discovery_order
+            .retain(|candidate| *candidate != instance_id);
+        self.discovery_order.push_back(instance_id);
+        while self.discoveries.len() > HISTORY_INSTANCE_DISCOVERIES_MAX {
+            if let Some(expired) = self.discovery_order.pop_front() {
+                self.discoveries.remove(&expired);
+            }
+        }
+    }
+}
+
+async fn run_history_worker(
+    catalog: AgentRegistry,
+    config: NativeHistoryConfig,
+    mut effects: Receiver<NativeEffectRequest>,
+    control_tx: Sender<ObservationEnvelope>,
+) {
+    let state = Arc::new(Mutex::new(NativeHistoryWorkerState::new(catalog, config)));
+    while let Some(request) = effects.recv().await {
+        let fallback = request.effect.clone();
+        let worker_state = Arc::clone(&state);
+        let completion = match tokio::task::spawn_blocking(move || {
+            worker_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .execute(request.effect)
+        })
+        .await
+        {
+            Ok(completion) => completion,
+            Err(_) => effect_failure(fallback, "native history worker task failed".to_owned()),
+        };
+        if control_tx.send(completion).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn history_failure(message: String) -> ControlObservation {
+    ControlObservation::HistoryFailed { message }
+}
+
+fn history_session_record(session: gate4agent_adapters::HistorySession) -> HistorySessionRecord {
+    HistorySessionRecord {
+        session_id: session.session_id,
+        title: session.title,
+        cwd: session.cwd,
+        model: session.model,
+        message_count: session.message_count,
+        total_tokens: session.total_tokens,
+        messages: session
+            .messages
+            .into_iter()
+            .map(|message| HistoryMessageRecord {
+                role: match message.role {
+                    gate4agent_adapters::HistoryRole::User => HistoryMessageRole::User,
+                    gate4agent_adapters::HistoryRole::Assistant => HistoryMessageRole::Assistant,
+                },
+                text: message.text,
+            })
+            .collect(),
     }
 }
 
@@ -524,6 +837,9 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
         }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
+        ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
+            ControlObservation::HistoryFailed { message }
+        }
     };
     ObservationEnvelope {
         protocol_version: CONTROL_PROTOCOL_VERSION,

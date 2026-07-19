@@ -164,6 +164,22 @@ impl Gate4AgentKernel {
                 }
             }
         }
+        if let ControlCommand::DiscoverHistory { instance_id, .. }
+        | ControlCommand::LoadHistory { instance_id, .. } = &command.command
+        {
+            if let Some(session) = self.engine.session_snapshot(*instance_id) {
+                let supports_history = self
+                    .catalog
+                    .get(&session.agent_id)
+                    .is_some_and(|spec| spec.capabilities.adapters.history.is_some());
+                if !supports_history {
+                    return Err(KernelCommandError::UnsupportedCapability {
+                        agent_id: session.agent_id.clone(),
+                        capability: "history",
+                    });
+                }
+            }
+        }
         if let ControlCommand::Start {
             instance_id,
             request,
@@ -253,9 +269,9 @@ impl Default for Gate4AgentKernel {
 mod tests {
     use super::*;
     use gate4agent_types::{
-        AgentInstanceId, ControlObservation, ObservationEnvelope, ProviderActivity, ProviderEvent,
-        ProviderSource, SessionOptionSelection, SessionStatus, StartRequest, TerminalSize,
-        TransportKind, CONTROL_PROTOCOL_VERSION,
+        AgentInstanceId, ControlObservation, HistoryQuery, ObservationEnvelope, ProviderActivity,
+        ProviderEvent, ProviderSource, SessionOptionSelection, SessionStatus, StartRequest,
+        TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
@@ -538,6 +554,54 @@ mod tests {
             })
         ));
         assert!(outcome.snapshot.sessions.is_empty());
+    }
+
+    #[test]
+    fn history_commands_require_a_declared_adapter_before_effect_creation() {
+        let mut supported = Gate4AgentKernel::default();
+        supported.step([register(1, "grok")], []);
+        let accepted = supported.step(
+            [command(
+                2,
+                ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: None,
+                        limit: 8,
+                    },
+                },
+            )],
+            [],
+        );
+        assert_eq!(accepted.command_outcomes[0].result, Ok(()));
+        assert!(matches!(
+            accepted.effects[0].effect,
+            gate4agent_types::ControlEffect::DiscoverHistory { .. }
+        ));
+
+        let mut unsupported = Gate4AgentKernel::default();
+        unsupported.step([register(1, "qwen-code")], []);
+        let rejected = unsupported.step(
+            [command(
+                2,
+                ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: None,
+                        limit: 8,
+                    },
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedCapability {
+                capability: "history",
+                ..
+            })
+        ));
+        assert!(rejected.effects.is_empty());
     }
 
     #[test]

@@ -293,6 +293,12 @@ impl NativeEffectShell {
                         message: "foreground observation requires a PTY session".to_owned(),
                     },
                 },
+                ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
+                    ControlObservation::HistoryFailed {
+                        message: "history effects require the dedicated native history authority"
+                            .to_owned(),
+                    }
+                }
             }
         };
 
@@ -1109,6 +1115,9 @@ fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation
         }
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
+        ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
+            ControlObservation::HistoryFailed { message }
+        }
     }
 }
 

@@ -2,19 +2,20 @@
 
 use gate4agent_types::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_shell_command,
-    ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
-    ControlError, ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot,
-    EffectEnvelope, ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot, InputAction,
-    ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind,
-    ProviderActivity, ProviderEvent, ProviderInteraction, ProviderInteractionId,
-    ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
-    ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
-    ProviderSourceCursor, ProviderSubagent, SessionGeneration, SessionSnapshot, SessionStatus,
-    StartRequest, TerminalControl, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX,
-    PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
+    validate_candidate_id, validate_history_error, ActiveProviderTool, AgentInstanceId,
+    CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError, ControlEvent,
+    ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope, ForegroundAuthority,
+    ForegroundRequirement, ForegroundSnapshot, HistoryOperation, HistoryQuery, HistorySnapshot,
+    InputAction, ObservationEnvelope, ObservationIgnoredReason, OperationId,
+    PendingHistoryOperation, PreparedInputKind, ProviderActivity, ProviderEvent,
+    ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
+    ProviderInteractionOutcome, ProviderInteractionStatus, ProviderSessionIdentity,
+    ProviderSessionKey, ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent,
+    SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize,
+    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
+    PROVIDER_INTERACTIONS_MAX, PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionState {
@@ -82,6 +83,7 @@ impl Gate4AgentEngine {
                             terminal_frame: None,
                             terminal_stale: None,
                             session_options: None,
+                            history: HistorySnapshot::default(),
                             foreground: ForegroundSnapshot::default(),
                             provider: ProviderSnapshot::default(),
                         },
@@ -116,6 +118,13 @@ impl Gate4AgentEngine {
             ControlCommand::RefreshForeground { instance_id } => {
                 self.refresh_foreground(command_id, instance_id)
             }
+            ControlCommand::DiscoverHistory { instance_id, query } => {
+                self.discover_history(command_id, instance_id, query)
+            }
+            ControlCommand::LoadHistory {
+                instance_id,
+                candidate_id,
+            } => self.load_history(command_id, instance_id, candidate_id),
             ControlCommand::IngestProvider {
                 instance_id,
                 generation,
@@ -172,7 +181,16 @@ impl Gate4AgentEngine {
                 );
                 return;
             };
-            if current.pending_operation != Some(operation_id) {
+            let expected_operation = if is_history_observation(&envelope.observation) {
+                current
+                    .history
+                    .pending
+                    .as_ref()
+                    .map(|pending| pending.operation_id)
+            } else {
+                current.pending_operation
+            };
+            if expected_operation != Some(operation_id) {
                 self.emit_ignored(
                     instance_id,
                     generation,
@@ -244,6 +262,12 @@ impl Gate4AgentEngine {
                     SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping,
                     ControlObservation::ProcessExited { .. },
                 )
+                | (
+                    _,
+                    ControlObservation::HistoryDiscovered { .. }
+                        | ControlObservation::HistoryLoaded { .. }
+                        | ControlObservation::HistoryFailed { .. },
+                )
         );
         if !valid {
             self.emit_ignored(
@@ -251,6 +275,70 @@ impl Gate4AgentEngine {
                 generation,
                 ObservationIgnoredReason::InvalidState,
             );
+            return;
+        }
+
+        if is_history_observation(&envelope.observation) {
+            let pending = current
+                .history
+                .pending
+                .as_ref()
+                .expect("history operation correlation was validated")
+                .clone();
+            let event = match (&envelope.observation, &pending.operation) {
+                (
+                    ControlObservation::HistoryDiscovered { candidates },
+                    HistoryOperation::Discover { query },
+                ) if history_candidates_are_valid(candidates, query.limit) => {
+                    ControlEventKind::HistoryDiscovered {
+                        count: candidates.len(),
+                    }
+                }
+                (ControlObservation::HistoryLoaded { session }, HistoryOperation::Load { .. })
+                    if session.validate().is_ok() =>
+                {
+                    ControlEventKind::HistoryLoaded {
+                        session_id: session.session_id.clone(),
+                    }
+                }
+                (ControlObservation::HistoryFailed { message }, _)
+                    if validate_history_error(message).is_ok() =>
+                {
+                    ControlEventKind::HistoryFailed {
+                        message: message.clone(),
+                    }
+                }
+                _ => {
+                    self.emit_ignored(
+                        instance_id,
+                        generation,
+                        ObservationIgnoredReason::InvalidHistoryObservation,
+                    );
+                    return;
+                }
+            };
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.snapshot.history.pending = None;
+            match envelope.observation {
+                ControlObservation::HistoryDiscovered { candidates } => {
+                    state.snapshot.history.candidates = candidates;
+                    state.snapshot.history.loaded = None;
+                    state.snapshot.history.last_error = None;
+                }
+                ControlObservation::HistoryLoaded { session } => {
+                    state.snapshot.history.loaded = Some(session);
+                    state.snapshot.history.last_error = None;
+                }
+                ControlObservation::HistoryFailed { message } => {
+                    state.snapshot.history.last_error = Some(message);
+                }
+                _ => unreachable!("history observation was matched above"),
+            }
+            self.bump_revision();
+            self.emit_event(None, instance_id, generation, event);
             return;
         }
 
@@ -602,8 +690,11 @@ impl Gate4AgentEngine {
             ControlObservation::TerminalFrame { .. }
             | ControlObservation::TerminalStale { .. }
             | ControlObservation::ProviderEvent { .. }
-            | ControlObservation::ProviderGap { .. } => {
-                unreachable!("terminal observations return before lifecycle event reduction")
+            | ControlObservation::ProviderGap { .. }
+            | ControlObservation::HistoryDiscovered { .. }
+            | ControlObservation::HistoryLoaded { .. }
+            | ControlObservation::HistoryFailed { .. } => {
+                unreachable!("stream observations return before lifecycle event reduction")
             }
         };
         self.sessions
@@ -719,6 +810,7 @@ impl Gate4AgentEngine {
             state.pending_interrupt = false;
             state.pending_question_answer = false;
             let session = &mut state.snapshot;
+            session.history = HistorySnapshot::default();
             session.generation = SessionGeneration(session.generation.0.saturating_add(1));
             session.status = SessionStatus::Starting;
             session.pending_operation = Some(operation_id);
@@ -1061,6 +1153,121 @@ impl Gate4AgentEngine {
         Ok(())
     }
 
+    fn discover_history(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        query: HistoryQuery,
+    ) -> Result<(), ControlError> {
+        query
+            .validate()
+            .map_err(|error| ControlError::InvalidHistoryRequest {
+                message: error.to_string(),
+            })?;
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if let Some(pending) = &state.snapshot.history.pending {
+            return Err(ControlError::HistoryOperationPending {
+                operation_id: pending.operation_id,
+            });
+        }
+        let operation_id = self.allocate_operation();
+        let (generation, agent_id, operation) = {
+            let session = self.session_mut(instance_id);
+            let operation = HistoryOperation::Discover {
+                query: query.clone(),
+            };
+            session.history.pending = Some(PendingHistoryOperation {
+                operation_id,
+                operation: operation.clone(),
+            });
+            session.history.candidates.clear();
+            session.history.loaded = None;
+            session.history.last_error = None;
+            (session.generation, session.agent_id.clone(), operation)
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::DiscoverHistory { agent_id, query },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::HistoryRequested {
+                operation_id,
+                operation,
+            },
+        );
+        Ok(())
+    }
+
+    fn load_history(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        candidate_id: String,
+    ) -> Result<(), ControlError> {
+        validate_candidate_id(&candidate_id).map_err(|error| {
+            ControlError::InvalidHistoryRequest {
+                message: error.to_string(),
+            }
+        })?;
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if let Some(pending) = &state.snapshot.history.pending {
+            return Err(ControlError::HistoryOperationPending {
+                operation_id: pending.operation_id,
+            });
+        }
+        if state.snapshot.history.candidate(&candidate_id).is_none() {
+            return Err(ControlError::UnknownHistoryCandidate);
+        }
+        let operation_id = self.allocate_operation();
+        let (generation, agent_id, operation) = {
+            let session = self.session_mut(instance_id);
+            let operation = HistoryOperation::Load {
+                candidate_id: candidate_id.clone(),
+            };
+            session.history.pending = Some(PendingHistoryOperation {
+                operation_id,
+                operation: operation.clone(),
+            });
+            session.history.loaded = None;
+            session.history.last_error = None;
+            (session.generation, session.agent_id.clone(), operation)
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::LoadHistory {
+                agent_id,
+                candidate_id,
+            },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::HistoryRequested {
+                operation_id,
+                operation,
+            },
+        );
+        Ok(())
+    }
+
     fn ingest_provider(
         &mut self,
         command_id: CommandId,
@@ -1282,6 +1489,33 @@ impl Gate4AgentEngine {
 fn invalidate_foreground(snapshot: &mut SessionSnapshot, reason: String) {
     snapshot.foreground.authority = ForegroundAuthority::Stale;
     snapshot.foreground.stale_reason = Some(reason);
+}
+
+fn is_history_observation(observation: &ControlObservation) -> bool {
+    matches!(
+        observation,
+        ControlObservation::HistoryDiscovered { .. }
+            | ControlObservation::HistoryLoaded { .. }
+            | ControlObservation::HistoryFailed { .. }
+    )
+}
+
+fn history_candidates_are_valid(
+    candidates: &[gate4agent_types::HistoryCandidateSummary],
+    limit: u16,
+) -> bool {
+    if candidates.len() > usize::from(limit)
+        || candidates
+            .iter()
+            .any(|candidate| candidate.validate().is_err())
+    {
+        return false;
+    }
+    let unique = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    unique.len() == candidates.len()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1845,7 +2079,8 @@ mod tests {
     use super::*;
     use gate4agent_types::{
         AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId,
-        ForegroundAuthority, ForegroundProcess, ForegroundProcessKind, InputAction,
+        ForegroundAuthority, ForegroundProcess, ForegroundProcessKind, HistoryCandidateSummary,
+        HistoryMessageRecord, HistoryMessageRole, HistoryQuery, HistorySessionRecord, InputAction,
         PreparedInputKind, PromptFraming, PromptPayload, SessionOptionSelection, ShellCommand,
         TerminalFrame, TransportKind,
     };
@@ -3399,6 +3634,189 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ControlError::InvalidTransition { .. }));
         assert_eq!(engine.snapshot().sessions.len(), 1);
+    }
+
+    #[test]
+    fn history_has_independent_correlation_and_full_snapshot_results() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine.drain_events();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: Some("/repo".to_owned()),
+                        limit: 4,
+                    },
+                },
+            })
+            .unwrap();
+        let discovery = engine.drain_effects().pop().unwrap();
+        let session = &engine.snapshot().sessions[0];
+        assert_eq!(session.pending_operation, None);
+        assert_eq!(
+            session
+                .history
+                .pending
+                .as_ref()
+                .map(|pending| pending.operation_id),
+            Some(discovery.operation_id)
+        );
+
+        let candidate = HistoryCandidateSummary {
+            id: "hist_fixture_1".to_owned(),
+            session_id_hint: "session-1".to_owned(),
+            modified_at_unix_ms: Some(42),
+        };
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(discovery.operation_id),
+            instance_id: instance(),
+            generation: discovery.generation,
+            observation: ControlObservation::HistoryDiscovered {
+                candidates: vec![candidate.clone()],
+            },
+        });
+        assert_eq!(
+            engine.snapshot().sessions[0].history.candidates,
+            vec![candidate]
+        );
+
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::LoadHistory {
+                    instance_id: instance(),
+                    candidate_id: "hist_fixture_1".to_owned(),
+                },
+            })
+            .unwrap();
+        let load = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(load.operation_id),
+            instance_id: instance(),
+            generation: load.generation,
+            observation: ControlObservation::HistoryLoaded {
+                session: HistorySessionRecord {
+                    session_id: "session-1".to_owned(),
+                    title: Some("title".to_owned()),
+                    cwd: Some("/repo".to_owned()),
+                    model: Some("model".to_owned()),
+                    message_count: 1,
+                    total_tokens: 7,
+                    messages: vec![HistoryMessageRecord {
+                        role: HistoryMessageRole::User,
+                        text: "hello".to_owned(),
+                    }],
+                },
+            },
+        });
+        let history = &engine.snapshot().sessions[0].history;
+        assert!(history.pending.is_none());
+        assert_eq!(history.loaded.as_ref().unwrap().session_id, "session-1");
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            &event.event,
+            ControlEventKind::HistoryLoaded { session_id } if session_id == "session-1"
+        )));
+    }
+
+    #[test]
+    fn session_start_supersedes_generation_bound_history_work() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: None,
+                        limit: 4,
+                    },
+                },
+            })
+            .unwrap();
+        let history = engine.drain_effects().pop().unwrap();
+        engine.apply_command(start(3)).unwrap();
+        let snapshot = engine.snapshot();
+        assert!(snapshot.sessions[0].history.pending.is_none());
+        assert!(snapshot.sessions[0].history.candidates.is_empty());
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(history.operation_id),
+            instance_id: instance(),
+            generation: history.generation,
+            observation: ControlObservation::HistoryDiscovered {
+                candidates: Vec::new(),
+            },
+        });
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::StaleGeneration
+            }
+        )));
+    }
+
+    #[test]
+    fn invalid_history_result_cannot_clear_the_correlated_operation() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: None,
+                        limit: 1,
+                    },
+                },
+            })
+            .unwrap();
+        let discovery = engine.drain_effects().pop().unwrap();
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(discovery.operation_id),
+            instance_id: instance(),
+            generation: discovery.generation,
+            observation: ControlObservation::HistoryDiscovered {
+                candidates: vec![
+                    HistoryCandidateSummary {
+                        id: "hist_duplicate".to_owned(),
+                        session_id_hint: "session-1".to_owned(),
+                        modified_at_unix_ms: None,
+                    };
+                    2
+                ],
+            },
+        });
+
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.sessions[0]
+                .history
+                .pending
+                .as_ref()
+                .map(|pending| pending.operation_id),
+            Some(discovery.operation_id)
+        );
+        assert!(snapshot.sessions[0].history.candidates.is_empty());
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::InvalidHistoryObservation
+            }
+        )));
     }
 
     #[test]

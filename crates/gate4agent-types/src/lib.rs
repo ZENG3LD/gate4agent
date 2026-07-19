@@ -3,6 +3,7 @@
 mod adapter;
 mod control;
 mod executable;
+mod history;
 mod id;
 mod input;
 mod readiness;
@@ -29,6 +30,14 @@ pub use control::{
     PROVIDER_SUBAGENTS_MAX, TERMINAL_COLUMNS_MAX, TERMINAL_ROWS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 pub use executable::normalize_executable_name;
+pub use history::{
+    validate_candidate_id, validate_history_error, HistoryCandidateSummary, HistoryMessageRecord,
+    HistoryMessageRole, HistoryOperation, HistoryQuery, HistorySessionRecord, HistorySnapshot,
+    HistoryValidationError, PendingHistoryOperation, HISTORY_CANDIDATE_ID_MAX_BYTES,
+    HISTORY_DISCOVERY_LIMIT_MAX, HISTORY_ERROR_MAX_BYTES, HISTORY_MESSAGES_MAX,
+    HISTORY_MESSAGE_MAX_BYTES, HISTORY_MODEL_MAX_BYTES, HISTORY_SESSION_ID_MAX_BYTES,
+    HISTORY_TITLE_MAX_BYTES,
+};
 pub use id::{AgentId, AgentIdError};
 pub use input::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_input_with_limits,

@@ -370,6 +370,7 @@ pub struct NativeHistoryAuthority {
     config: NativeHistoryConfig,
     candidates: HashMap<String, CandidateRecord>,
     ids_by_key: HashMap<CandidateKey, String>,
+    source_order: VecDeque<SourceIdentity>,
     cache: HashMap<String, CacheEntry>,
     cache_order: VecDeque<String>,
     cache_hits: u64,
@@ -383,6 +384,7 @@ impl NativeHistoryAuthority {
             config,
             candidates: HashMap::new(),
             ids_by_key: HashMap::new(),
+            source_order: VecDeque::new(),
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_hits: 0,
@@ -433,17 +435,7 @@ impl NativeHistoryAuthority {
             self.issues.extend(result.issues);
         }
         discovery::dedupe_and_sort(&request.binding().id, &mut discovered);
-        discovered.truncate(usize::from(request.limit()));
-
-        let old_source_count = self
-            .candidates
-            .values()
-            .filter(|record| record.key.source == source)
-            .count();
-        let retained = self.candidates.len().saturating_sub(old_source_count);
-        if retained.saturating_add(discovered.len()) > self.config.limits.max_candidates {
-            return Err(NativeHistoryError::CandidateCapacity);
-        }
+        discovered.truncate(usize::from(request.limit()).min(self.config.limits.max_candidates));
 
         let current_locators = discovered
             .iter()
@@ -460,6 +452,7 @@ impl NativeHistoryAuthority {
         for id in stale_ids {
             self.remove_candidate(&id);
         }
+        self.evict_sources_for(&source, discovered.len())?;
 
         let mut candidates = Vec::with_capacity(discovered.len());
         for discovered in discovered {
@@ -490,6 +483,11 @@ impl NativeHistoryAuthority {
             self.candidates.insert(id, record);
             candidates.push(candidate);
         }
+        if candidates.is_empty() {
+            self.source_order.retain(|candidate| candidate != &source);
+        } else {
+            self.touch_source(&source);
+        }
         Ok(candidates)
     }
 
@@ -508,6 +506,7 @@ impl NativeHistoryAuthority {
         {
             return Err(NativeHistoryError::CandidateSourceMismatch);
         }
+        self.touch_source(&record.key.source);
 
         if let Some(entry) = self.cache.get(id).cloned() {
             if load::signatures_are_current(&entry.loaded.signatures) {
@@ -534,6 +533,54 @@ impl NativeHistoryAuthority {
     fn touch_cache(&mut self, id: &str) {
         self.cache_order.retain(|candidate| candidate != id);
         self.cache_order.push_back(id.to_owned());
+    }
+
+    fn touch_source(&mut self, source: &SourceIdentity) {
+        self.source_order.retain(|candidate| candidate != source);
+        self.source_order.push_back(source.clone());
+    }
+
+    fn evict_sources_for(
+        &mut self,
+        current: &SourceIdentity,
+        current_count: usize,
+    ) -> Result<(), NativeHistoryError> {
+        while self
+            .candidates
+            .values()
+            .filter(|record| record.key.source != *current)
+            .count()
+            .saturating_add(current_count)
+            > self.config.limits.max_candidates
+        {
+            let evicted = self
+                .source_order
+                .iter()
+                .find(|source| *source != current)
+                .cloned()
+                .or_else(|| {
+                    self.candidates
+                        .values()
+                        .find(|record| record.key.source != *current)
+                        .map(|record| record.key.source.clone())
+                })
+                .ok_or(NativeHistoryError::CandidateCapacity)?;
+            self.remove_source(&evicted);
+        }
+        Ok(())
+    }
+
+    fn remove_source(&mut self, source: &SourceIdentity) {
+        let ids = self
+            .candidates
+            .iter()
+            .filter(|(_, record)| record.key.source == *source)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.remove_candidate(&id);
+        }
+        self.source_order.retain(|candidate| candidate != source);
     }
 
     fn fresh_candidate_id(&self) -> String {

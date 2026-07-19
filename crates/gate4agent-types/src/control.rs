@@ -1,11 +1,12 @@
 use crate::{
-    AdapterBinding, AdapterFamily, AgentId, InputAction, InputPrepareError, PreparedInput,
-    PreparedInputKind, SessionOptionSelection,
+    AdapterBinding, AdapterFamily, AgentId, HistoryCandidateSummary, HistoryOperation,
+    HistoryQuery, HistorySessionRecord, HistorySnapshot, InputAction, InputPrepareError,
+    PreparedInput, PreparedInputKind, SessionOptionSelection,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 19;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 20;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -158,6 +159,14 @@ pub enum ControlCommand {
     RefreshForeground {
         instance_id: AgentInstanceId,
     },
+    DiscoverHistory {
+        instance_id: AgentInstanceId,
+        query: HistoryQuery,
+    },
+    LoadHistory {
+        instance_id: AgentInstanceId,
+        candidate_id: String,
+    },
     IngestProvider {
         instance_id: AgentInstanceId,
         generation: SessionGeneration,
@@ -179,6 +188,8 @@ impl ControlCommand {
             | Self::SendInput { instance_id, .. }
             | Self::Resize { instance_id, .. }
             | Self::RefreshForeground { instance_id }
+            | Self::DiscoverHistory { instance_id, .. }
+            | Self::LoadHistory { instance_id, .. }
             | Self::IngestProvider { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
@@ -232,6 +243,14 @@ pub enum ControlEffect {
         size: TerminalSize,
     },
     ObserveForeground,
+    DiscoverHistory {
+        agent_id: AgentId,
+        query: HistoryQuery,
+    },
+    LoadHistory {
+        agent_id: AgentId,
+        candidate_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -278,6 +297,15 @@ pub enum ControlObservation {
         process: ForegroundProcess,
     },
     ForegroundFailed {
+        message: String,
+    },
+    HistoryDiscovered {
+        candidates: Vec<HistoryCandidateSummary>,
+    },
+    HistoryLoaded {
+        session: HistorySessionRecord,
+    },
+    HistoryFailed {
         message: String,
     },
     TerminalFrame {
@@ -335,6 +363,7 @@ pub struct SessionSnapshot {
     pub terminal_frame: Option<TerminalFrame>,
     pub terminal_stale: Option<String>,
     pub session_options: Option<SessionOptionSelection>,
+    pub history: HistorySnapshot,
     pub foreground: ForegroundSnapshot,
     pub provider: ProviderSnapshot,
 }
@@ -822,6 +851,19 @@ pub enum ControlEventKind {
     ForegroundFailed {
         message: String,
     },
+    HistoryRequested {
+        operation_id: OperationId,
+        operation: HistoryOperation,
+    },
+    HistoryDiscovered {
+        count: usize,
+    },
+    HistoryLoaded {
+        session_id: String,
+    },
+    HistoryFailed {
+        message: String,
+    },
     TerminalStale {
         message: String,
     },
@@ -868,6 +910,7 @@ pub enum ObservationIgnoredReason {
     StaleTerminalFrame,
     StaleProviderEvent,
     InvalidForegroundObservation,
+    InvalidHistoryObservation,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
@@ -894,6 +937,12 @@ pub enum ControlError {
     MissingInitialPrompt,
     #[error("session options are invalid: {message}")]
     InvalidSessionOptions { message: String },
+    #[error("history request is invalid: {message}")]
+    InvalidHistoryRequest { message: String },
+    #[error("history operation {operation_id:?} is already pending")]
+    HistoryOperationPending { operation_id: OperationId },
+    #[error("history candidate is not present in the current discovery snapshot")]
+    UnknownHistoryCandidate,
     #[error("transport {transport:?} does not support {action}")]
     UnsupportedTransportOperation {
         transport: TransportKind,

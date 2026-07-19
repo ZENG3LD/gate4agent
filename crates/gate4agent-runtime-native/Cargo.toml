@@ -5,9 +5,12 @@ edition = "2021"
 publish = false
 
 [dependencies]
+gate4agent-adapters = { path = "../gate4agent-adapters" }
 gate4agent-catalog = { path = "../gate4agent-catalog" }
 gate4agent-handle = { path = "../gate4agent-handle" }
 gate4agent-kernel = { path = "../gate4agent-kernel" }
+gate4agent-provider-ports = { path = "../gate4agent-provider-ports" }
+gate4agent-shell-history = { path = "../gate4agent-shell-history" }
 gate4agent-shell-hooks = { path = "../gate4agent-shell-hooks" }
 gate4agent-shell-native = { path = "../gate4agent-shell-native" }
 gate4agent-types = { path = "../gate4agent-types" }

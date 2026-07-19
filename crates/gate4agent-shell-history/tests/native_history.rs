@@ -368,3 +368,43 @@ fn traversal_reports_the_hard_entry_boundary_without_leaking_paths() {
     );
     assert!(!format!("{issues:?}").contains(&fixture.path().display().to_string()));
 }
+
+#[test]
+fn candidate_capacity_evicts_the_least_recent_source_instead_of_deadlocking() {
+    let fixture = FixtureDir::new("source-lru");
+    let grok = fixture.path().join("grok");
+    write(
+        &grok.join("repo").join("grok-1").join("summary.json"),
+        r#"{"info":{"id":"grok-1"}}"#,
+    );
+    let pi = fixture.path().join("pi");
+    write(&pi.join("pi-1.jsonl"), r#"{"type":"session","id":"pi-1"}"#);
+    let limits = NativeHistoryLimits {
+        max_candidates: 1,
+        ..NativeHistoryLimits::default()
+    };
+    let config = NativeHistoryConfig::with_limits(
+        vec![
+            root(
+                "grok",
+                HistorySourceLayout::SummaryJsonWithSiblingNdjson,
+                &grok,
+            ),
+            root("pi", HistorySourceLayout::SingleNdjson, &pi),
+        ],
+        limits,
+    )
+    .unwrap();
+    let mut authority = NativeHistoryAuthority::new(config);
+    let grok_request = request("grok", 8);
+    let grok_candidate = authority.discover(&grok_request).unwrap().remove(0);
+    let pi_request = request("pi", 8);
+    assert_eq!(authority.discover(&pi_request).unwrap().len(), 1);
+    assert_eq!(authority.active_candidate_count(), 1);
+
+    let stale_load = HistoryLoadRequest::new(&grok_request, grok_candidate).unwrap();
+    assert_eq!(
+        authority.load(&stale_load),
+        Err(NativeHistoryError::CandidateExpired)
+    );
+}

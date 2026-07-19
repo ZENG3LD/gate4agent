@@ -161,7 +161,7 @@ impl HookSessionReducer {
         if self.adapter_id.as_str() == "claude-code" {
             self.reconcile_claude_subagents(&envelope.event_name, &envelope.payload, &mut events);
         }
-        self.correlate_tools(&mut events);
+        self.correlate_tools(&envelope.event_name, &mut events);
         for event in &events {
             event.validate_ingress()?;
         }
@@ -367,7 +367,7 @@ impl HookSessionReducer {
         }
     }
 
-    fn correlate_tools(&mut self, events: &mut [ProviderEvent]) {
+    fn correlate_tools(&mut self, event_name: &str, events: &mut [ProviderEvent]) {
         for event in events {
             match event {
                 ProviderEvent::SessionStarted { .. } | ProviderEvent::TurnStarted { .. } => {
@@ -377,6 +377,20 @@ impl HookSessionReducer {
                     id, name, agent_id, ..
                 } => {
                     let raw_id = id.clone();
+                    let correlation_key = tool_correlation_key(agent_id.as_deref(), &raw_id);
+                    let coalesced_id = (matches!(self.adapter_id.as_str(), "pi" | "omp")
+                        && event_name == "tool_execution_start")
+                        .then(|| {
+                            self.tool_correlations
+                                .get(&correlation_key)
+                                .and_then(|correlations| correlations.front())
+                                .cloned()
+                        })
+                        .flatten();
+                    if let Some(coalesced_id) = coalesced_id {
+                        *id = coalesced_id;
+                        continue;
+                    }
                     let correlated_id = if raw_id.is_empty() || raw_id == *name {
                         let value = format!("hook-tool-{}", self.next_tool_id);
                         self.next_tool_id = self.next_tool_id.saturating_add(1);
@@ -385,7 +399,7 @@ impl HookSessionReducer {
                         raw_id.clone()
                     };
                     self.tool_correlations
-                        .entry(tool_correlation_key(agent_id.as_deref(), &raw_id))
+                        .entry(correlation_key)
                         .or_default()
                         .push_back(correlated_id.clone());
                     *id = correlated_id;
@@ -557,6 +571,57 @@ mod tests {
             panic!("expected tool completion");
         };
         assert_eq!(id, "hook-tool-1");
+    }
+
+    #[test]
+    fn pi_coalesces_call_and_execution_start_before_exact_completion() {
+        for adapter_id in ["pi", "omp"] {
+            let mut reducer = HookSessionReducer::new(AdapterId::new(adapter_id).unwrap());
+            let called = reducer
+                .reduce(envelope(
+                    1,
+                    "e1",
+                    "tool_call",
+                    json!({"tool_name": "bash", "tool_input": {"command": "cargo check"}}),
+                ))
+                .unwrap();
+            let [ProviderEvent::ToolStarted { id: called_id, .. }] = called.events.as_slice()
+            else {
+                panic!("expected tool call");
+            };
+
+            let executing = reducer
+                .reduce(envelope(
+                    2,
+                    "e2",
+                    "tool_execution_start",
+                    json!({"tool_name": "bash", "tool_input": {"command": "cargo check"}}),
+                ))
+                .unwrap();
+            let [ProviderEvent::ToolStarted {
+                id: executing_id, ..
+            }] = executing.events.as_slice()
+            else {
+                panic!("expected execution start");
+            };
+            assert_eq!(executing_id, called_id);
+
+            let completed = reducer
+                .reduce(envelope(
+                    3,
+                    "e3",
+                    "tool_execution_end",
+                    json!({"tool_name": "bash"}),
+                ))
+                .unwrap();
+            let [ProviderEvent::ToolCompleted {
+                id: completed_id, ..
+            }] = completed.events.as_slice()
+            else {
+                panic!("expected execution completion");
+            };
+            assert_eq!(completed_id, called_id);
+        }
     }
 
     #[test]

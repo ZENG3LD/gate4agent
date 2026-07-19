@@ -40,6 +40,7 @@ pub fn normalize_hook_event(
         "codex" => normalize_codex(event_name, record),
         "gemini" => normalize_gemini(event_name, record),
         "opencode" | "mimo-code" => normalize_opencode_family(event_name, record),
+        "pi" | "omp" => normalize_pi_family(event_name, record),
         "grok" => normalize_grok(event_name, record),
         "kimi" => normalize_kimi(event_name, record),
         "copilot" => normalize_copilot(event_name, record),
@@ -132,6 +133,36 @@ fn opencode_interaction_event(
         tool_name: bounded_string(tool_name),
         prompt: input_json(Some(&prompt_source)),
         agent_id: None,
+    }
+}
+
+fn normalize_pi_family(
+    event_name: &str,
+    payload: &Map<String, Value>,
+) -> Result<Vec<ProviderEvent>, HookAdapterError> {
+    match event_name {
+        "session_start" => Ok(Vec::new()),
+        "before_agent_start" => Ok(vec![turn_started(payload)]),
+        "agent_start" => Ok(vec![ProviderEvent::WorkingObserved]),
+        "tool_call" | "tool_execution_start" => Ok(vec![tool_started(payload)]),
+        "tool_execution_end" => Ok(vec![tool_completed(payload, false)]),
+        "message_end" => {
+            let mut events = vec![ProviderEvent::WorkingObserved];
+            if string(payload, &["role"]).as_deref() == Some("assistant") {
+                if let Some(text) = string(payload, &["text"]) {
+                    events.push(ProviderEvent::Text {
+                        text: bounded_string(text),
+                        is_delta: false,
+                    });
+                }
+            }
+            Ok(events)
+        }
+        "agent_end" => Ok(vec![ProviderEvent::TurnCompleted {
+            usage: TokenUsage::default(),
+            is_cumulative: false,
+        }]),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -1170,6 +1201,102 @@ mod tests {
                 ProviderEvent::TurnCompleted { .. }
             ]
         ));
+    }
+
+    #[test]
+    fn pi_maps_native_turn_tool_message_and_completion_events() {
+        let adapter = id("pi");
+        let session_start = normalize_hook_event(
+            &adapter,
+            "session_start",
+            &json!({
+                "session_id": "pi-session-1",
+                "session_file": "/tmp/pi-session-1.jsonl"
+            }),
+        )
+        .unwrap();
+        assert!(session_start.is_empty());
+
+        let started = normalize_hook_event(
+            &adapter,
+            "before_agent_start",
+            &json!({"prompt": "resume this task"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [ProviderEvent::TurnStarted { prompt }]
+                if prompt.as_deref() == Some("resume this task")
+        ));
+
+        for event_name in ["tool_call", "tool_execution_start"] {
+            let tool = normalize_hook_event(
+                &adapter,
+                event_name,
+                &json!({"tool_name": "bash", "tool_input": {"command": "cargo test"}}),
+            )
+            .unwrap();
+            assert!(matches!(
+                tool.as_slice(),
+                [ProviderEvent::ToolStarted { name, input_json, .. }]
+                    if name == "bash" && input_json.contains("cargo test")
+            ));
+        }
+
+        let completed = normalize_hook_event(
+            &adapter,
+            "tool_execution_end",
+            &json!({"tool_name": "bash"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            completed.as_slice(),
+            [ProviderEvent::ToolCompleted { id, is_error: false, .. }] if id == "bash"
+        ));
+
+        let message = normalize_hook_event(
+            &adapter,
+            "message_end",
+            &json!({"role": "assistant", "text": "Done"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            message.as_slice(),
+            [
+                ProviderEvent::WorkingObserved,
+                ProviderEvent::Text { text, is_delta: false }
+            ] if text == "Done"
+        ));
+
+        let ended = normalize_hook_event(&adapter, "agent_end", &json!({})).unwrap();
+        assert!(matches!(
+            ended.as_slice(),
+            [ProviderEvent::TurnCompleted { .. }]
+        ));
+        assert!(
+            normalize_hook_event(&adapter, "session_shutdown", &json!({}))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn omp_keeps_an_independent_pi_family_contract_without_resume_identity() {
+        let adapter = id("omp");
+        let started = normalize_hook_event(
+            &adapter,
+            "before_agent_start",
+            &json!({"prompt": "wire omp status", "session_id": "not-owned-by-omp"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.as_slice(),
+            [ProviderEvent::TurnStarted { prompt }]
+                if prompt.as_deref() == Some("wire omp status")
+        ));
+
+        let progress = normalize_hook_event(&adapter, "agent_start", &json!({})).unwrap();
+        assert_eq!(progress, vec![ProviderEvent::WorkingObserved]);
     }
 
     #[test]

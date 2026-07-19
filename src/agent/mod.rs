@@ -19,11 +19,12 @@ pub use gate4agent_types::{
     ProcessMatcher, PromptSpec, RuntimePlatform, SpecVerification,
 };
 pub use gate4agent_types::{
-    prepare_agent_command, prepare_input, prepare_input_with_limits, sanitize_prompt_text,
-    AgentCommand, InputAction, InputPrepareError, PreparedInput, PreparedInputKind, PreparedWrite,
-    PreparedWriteKind, PromptFraming, PromptPayload, ShellCommand, TerminalControl, TerminalText,
-    BRACKETED_PASTE_END, BRACKETED_PASTE_START, TERMINAL_INPUT_CHUNK_MAX_BYTES,
-    TERMINAL_INPUT_MAX_BYTES, TERMINAL_SUBMIT_DELAY_MS, TERMINAL_WRITE_DELAY_MAX_MS,
+    prepare_agent_command, prepare_input, prepare_input_with_limits, prepare_shell_command,
+    sanitize_prompt_text, AgentCommand, InputAction, InputPrepareError, PreparedInput,
+    PreparedInputKind, PreparedWrite, PreparedWriteKind, PromptFraming, PromptPayload,
+    ShellCommand, TerminalControl, TerminalText, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
+    TERMINAL_INPUT_CHUNK_MAX_BYTES, TERMINAL_INPUT_MAX_BYTES, TERMINAL_SUBMIT_DELAY_MS,
+    TERMINAL_WRITE_DELAY_MAX_MS,
 };
 pub use process::{
     is_agent_foreground_wrapper, is_expected_agent_command_line, is_expected_agent_process,

@@ -1,14 +1,15 @@
 //! Deterministic single-writer lifecycle engine for gate4agent sessions.
 
 use gate4agent_types::{
-    normalize_semantic_prompt, prepare_agent_command, prepare_input, ActiveProviderTool,
-    AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
-    ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
-    ForegroundAuthority, ForegroundSnapshot, InputAction, ObservationEnvelope,
-    ObservationIgnoredReason, OperationId, PreparedInputKind, ProviderActivity, ProviderEvent,
-    ProviderSnapshot, ProviderSource, ProviderSourceCursor, SessionGeneration, SessionSnapshot,
-    SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
+    normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_shell_command,
+    ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
+    ControlError, ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot,
+    EffectEnvelope, ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot, InputAction,
+    ObservationEnvelope, ObservationIgnoredReason, OperationId, PreparedInputKind,
+    ProviderActivity, ProviderEvent, ProviderSnapshot, ProviderSource, ProviderSourceCursor,
+    SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize,
+    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
+    WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -735,13 +736,48 @@ impl Gate4AgentEngine {
                 let input = prepare_agent_command(command, &agent_id)
                     .map_err(|error| ControlError::InputRejected { error })?;
                 let input_kind = input.kind();
-                (ControlEffect::WriteInput { input }, input_kind)
+                (
+                    ControlEffect::WriteInput {
+                        input,
+                        required_foreground: ForegroundRequirement::Agent { agent_id },
+                    },
+                    input_kind,
+                )
+            }
+            (TransportKind::Pty, InputAction::ShellCommand(command)) => {
+                let input = prepare_shell_command(command)
+                    .map_err(|error| ControlError::InputRejected { error })?;
+                let input_kind = input.kind();
+                (
+                    ControlEffect::WriteInput {
+                        input,
+                        required_foreground: ForegroundRequirement::Shell,
+                    },
+                    input_kind,
+                )
             }
             (TransportKind::Pty, action) => {
                 let input =
                     prepare_input(action).map_err(|error| ControlError::InputRejected { error })?;
                 let input_kind = input.kind();
-                (ControlEffect::WriteInput { input }, input_kind)
+                let required_foreground = match input_kind {
+                    PreparedInputKind::InsertDraft | PreparedInputKind::SubmitPrompt => {
+                        ForegroundRequirement::Agent { agent_id }
+                    }
+                    PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl => {
+                        ForegroundRequirement::Any
+                    }
+                    PreparedInputKind::AgentCommand | PreparedInputKind::ShellCommand => {
+                        unreachable!("dispatcher-only input cannot be prepared generically")
+                    }
+                };
+                (
+                    ControlEffect::WriteInput {
+                        input,
+                        required_foreground,
+                    },
+                    input_kind,
+                )
             }
             (TransportKind::Acp, InputAction::SubmitPrompt(prompt)) => {
                 let prompt = normalize_semantic_prompt(&prompt.text)
@@ -1252,7 +1288,8 @@ mod tests {
     use gate4agent_types::{
         AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId,
         ForegroundAuthority, ForegroundProcess, ForegroundProcessKind, InputAction,
-        PreparedInputKind, PromptFraming, PromptPayload, TerminalFrame, TransportKind,
+        PreparedInputKind, PromptFraming, PromptPayload, ShellCommand, TerminalFrame,
+        TransportKind,
     };
 
     fn instance() -> AgentInstanceId {
@@ -1946,7 +1983,13 @@ mod tests {
             })
             .unwrap();
         let effect = engine.drain_effects().pop().unwrap();
-        assert!(matches!(effect.effect, ControlEffect::WriteInput { .. }));
+        assert!(matches!(
+            &effect.effect,
+            ControlEffect::WriteInput {
+                required_foreground: ForegroundRequirement::Agent { agent_id },
+                ..
+            } if agent_id.as_str() == "claude"
+        ));
         assert_eq!(
             engine.snapshot().sessions[0].pending_input,
             Some(PreparedInputKind::SubmitPrompt)
@@ -1973,6 +2016,64 @@ mod tests {
                 input_kind: PreparedInputKind::SubmitPrompt
             }
         )));
+    }
+
+    #[test]
+    fn shell_command_effect_requires_fresh_shell_routing() {
+        let (mut engine, _) = running_engine();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(70),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::ShellCommand(ShellCommand {
+                        text: "git status --short".to_owned(),
+                    }),
+                },
+            })
+            .unwrap();
+
+        let effect = engine.drain_effects().pop().unwrap();
+        assert!(matches!(
+            effect.effect,
+            ControlEffect::WriteInput {
+                input,
+                required_foreground: ForegroundRequirement::Shell,
+            } if input.kind() == PreparedInputKind::ShellCommand
+        ));
+        assert_eq!(
+            engine.snapshot().sessions[0].pending_input,
+            Some(PreparedInputKind::ShellCommand)
+        );
+    }
+
+    #[test]
+    fn agent_command_effect_is_bound_to_the_session_agent_route() {
+        let (mut engine, _) = running_engine();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(71),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::AgentCommand(gate4agent_types::AgentCommand {
+                        agent_id: AgentId::new("claude").unwrap(),
+                        name: "review".to_owned(),
+                        arguments: vec!["routing".to_owned()],
+                    }),
+                },
+            })
+            .unwrap();
+
+        let effect = engine.drain_effects().pop().unwrap();
+        assert!(matches!(
+            effect.effect,
+            ControlEffect::WriteInput {
+                input,
+                required_foreground: ForegroundRequirement::Agent { agent_id },
+            } if input.kind() == PreparedInputKind::AgentCommand && agent_id.as_str() == "claude"
+        ));
     }
 
     #[test]

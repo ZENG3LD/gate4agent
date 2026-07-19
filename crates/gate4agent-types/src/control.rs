@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 10;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 11;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -189,6 +189,21 @@ pub struct EffectEnvelope {
     pub effect: ControlEffect,
 }
 
+/// Route proof an effect executor must obtain immediately before a PTY write.
+///
+/// This is carried by the effect rather than inferred by a product shell so
+/// local, hosted, and future browser-facing executors enforce the same rule.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ForegroundRequirement {
+    /// Explicit terminal text and controls are direct user terminal input.
+    Any,
+    /// Semantic input must target the session's configured agent.
+    Agent { agent_id: AgentId },
+    /// Intentional shell syntax may be written only while a shell owns the PTY.
+    Shell,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlEffect {
@@ -202,6 +217,7 @@ pub enum ControlEffect {
     },
     WriteInput {
         input: PreparedInput,
+        required_foreground: ForegroundRequirement,
     },
     SubmitPrompt {
         prompt: String,

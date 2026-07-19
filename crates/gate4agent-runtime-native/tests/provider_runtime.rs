@@ -3,14 +3,15 @@ use std::time::Duration;
 use gate4agent_catalog::{builtin_adapter_registry, AgentRegistry};
 use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_testkit::{
-    acp_agent_spec, pipe_agent_spec, pty_provider_agent_spec, ACP_FIXTURE_ID, PIPE_FIXTURE_ID,
-    PTY_PROVIDER_FIXTURE_ID,
+    acp_agent_spec, interactive_agent_spec, pipe_agent_spec, pty_provider_agent_spec,
+    ACP_FIXTURE_ID, CONTROL_FIXTURE_ID, PIPE_FIXTURE_ID, PTY_PROVIDER_FIXTURE_ID,
 };
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEvent, ControlEventKind, ForegroundAuthority, ForegroundProcessKind, InputAction,
-    PromptFraming, PromptPayload, ProviderActivity, ProviderEvent, ProviderSource, SessionStatus,
-    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    PreparedInputKind, PromptFraming, PromptPayload, ProviderActivity, ProviderEvent,
+    ProviderSource, SessionStatus, ShellCommand, StartRequest, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
@@ -300,6 +301,104 @@ async fn pty_classification_uses_the_same_provider_event_contract() {
     handle
         .dispatch(command(
             23,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| matches!(session.status, SessionStatus::Exited { .. }))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn public_handle_shell_command_requires_and_uses_live_shell_route() {
+    let mut spec = interactive_agent_spec();
+    spec.detection.command = CONTROL_FIXTURE_ID.to_owned();
+    let (handle, mut runtime) = runtime(spec);
+    let subscription = handle.subscribe(64);
+    let instance_id = AgentInstanceId(45);
+    handle
+        .dispatch(command(
+            40,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            41,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                },
+            },
+        ))
+        .unwrap();
+
+    let mut events = Vec::new();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle.snapshot().sessions.first().is_some_and(|session| {
+            session.status == SessionStatus::Running
+                && session
+                    .terminal_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.contents.contains("fixture-ready>"))
+        })
+    })
+    .await;
+
+    handle
+        .dispatch(command(
+            42,
+            ControlCommand::SendInput {
+                instance_id,
+                action: InputAction::ShellCommand(ShellCommand {
+                    text: "printf public-shell-route".to_owned(),
+                }),
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, events| {
+        events.iter().any(|event| {
+            matches!(
+                event.event,
+                ControlEventKind::InputCompleted {
+                    input_kind: PreparedInputKind::ShellCommand
+                }
+            )
+        }) && handle.snapshot().sessions[0]
+            .terminal_frame
+            .as_ref()
+            .is_some_and(|frame| {
+                frame
+                    .contents
+                    .contains("fixture-echo:printf public-shell-route")
+            })
+    })
+    .await;
+
+    handle
+        .dispatch(command(
+            43,
             ControlCommand::Stop {
                 instance_id,
                 force: true,

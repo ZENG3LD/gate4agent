@@ -15,9 +15,10 @@ use gate4agent_adapters::{builtin_adapter_registry, AdapterRuntimeRegistry};
 use gate4agent_catalog::{AgentRegistry, AgentSpec};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-    ForegroundProcess, ForegroundProcessKind, ObservationEnvelope, OperationId, PreparedInputKind,
-    ProviderEvent, ProviderSource, SessionGeneration, StartRequest, TerminalFrame, TerminalSize,
-    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    ForegroundProcess, ForegroundProcessKind, ForegroundRequirement, ObservationEnvelope,
+    OperationId, PreparedInputKind, ProviderEvent, ProviderSource, SessionGeneration, StartRequest,
+    TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
+    WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -141,52 +142,88 @@ impl NativeEffectShell {
                         .await
                 }
                 ControlEffect::Stop { force } => self.stop_native(key, force).await,
-                ControlEffect::WriteInput { input } => match self.pty_sessions.get(&key) {
-                    Some(owned)
-                        if matches!(
-                            input.kind(),
-                            PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl
-                        ) =>
-                    {
-                        match owned.session.send_terminal_input(input).await {
-                            Ok(()) => ControlObservation::InputCompleted,
-                            Err(error) => ControlObservation::InputFailed {
-                                message: error.to_string(),
-                            },
-                        }
-                    }
-                    Some(owned) => {
-                        let intent = match input.kind() {
-                            PreparedInputKind::InsertDraft | PreparedInputKind::AgentCommand => {
-                                ReadinessIntent::DraftPaste
-                            }
-                            PreparedInputKind::SubmitPrompt => ReadinessIntent::FollowupPrompt,
-                            PreparedInputKind::TerminalText
-                            | PreparedInputKind::TerminalControl => unreachable!(),
-                        };
-                        let Some(spec) = self.catalog.get(owned.session.agent_id()).cloned() else {
-                            return completion_observation(
-                                operation_id,
-                                instance_id,
-                                generation,
-                                ControlObservation::InputFailed {
-                                    message: "session agent disappeared from native catalog"
-                                        .to_owned(),
+                ControlEffect::WriteInput {
+                    input,
+                    required_foreground,
+                } => match self.pty_sessions.get(&key) {
+                    Some(owned) => match required_foreground {
+                        ForegroundRequirement::Any
+                            if matches!(
+                                input.kind(),
+                                PreparedInputKind::TerminalText
+                                    | PreparedInputKind::TerminalControl
+                            ) =>
+                        {
+                            match owned.session.send_terminal_input(input).await {
+                                Ok(()) => ControlObservation::InputCompleted,
+                                Err(error) => ControlObservation::InputFailed {
+                                    message: error.to_string(),
                                 },
-                            );
-                        };
-                        match wait_for_readiness(&owned.session, &spec, intent).await {
-                            Ok(permit) => {
-                                match owned.session.send_prepared_input(input, permit).await {
-                                    Ok(()) => ControlObservation::InputCompleted,
-                                    Err(error) => ControlObservation::InputFailed {
-                                        message: error.to_string(),
-                                    },
-                                }
                             }
-                            Err(message) => ControlObservation::InputFailed { message },
                         }
-                    }
+                        ForegroundRequirement::Shell
+                            if input.kind() == PreparedInputKind::ShellCommand =>
+                        {
+                            match owned.session.send_shell_input(input).await {
+                                Ok(()) => ControlObservation::InputCompleted,
+                                Err(error) => ControlObservation::InputFailed {
+                                    message: error.to_string(),
+                                },
+                            }
+                        }
+                        ForegroundRequirement::Agent { agent_id }
+                            if matches!(
+                                input.kind(),
+                                PreparedInputKind::InsertDraft
+                                    | PreparedInputKind::SubmitPrompt
+                                    | PreparedInputKind::AgentCommand
+                            ) && &agent_id == owned.session.agent_id() =>
+                        {
+                            let intent = match input.kind() {
+                                PreparedInputKind::InsertDraft
+                                | PreparedInputKind::AgentCommand => ReadinessIntent::DraftPaste,
+                                PreparedInputKind::SubmitPrompt => ReadinessIntent::FollowupPrompt,
+                                PreparedInputKind::ShellCommand
+                                | PreparedInputKind::TerminalText
+                                | PreparedInputKind::TerminalControl => unreachable!(),
+                            };
+                            let Some(spec) = self.catalog.get(&agent_id).cloned() else {
+                                return completion_observation(
+                                    operation_id,
+                                    instance_id,
+                                    generation,
+                                    ControlObservation::InputFailed {
+                                        message: "session agent disappeared from native catalog"
+                                            .to_owned(),
+                                    },
+                                );
+                            };
+                            match wait_for_readiness(&owned.session, &spec, intent).await {
+                                Ok(permit) => {
+                                    let result = if input.kind() == PreparedInputKind::AgentCommand
+                                    {
+                                        owned.session.send_agent_command_input(input, permit).await
+                                    } else {
+                                        owned.session.send_prepared_input(input, permit).await
+                                    };
+                                    match result {
+                                        Ok(()) => ControlObservation::InputCompleted,
+                                        Err(error) => ControlObservation::InputFailed {
+                                            message: error.to_string(),
+                                        },
+                                    }
+                                }
+                                Err(message) => ControlObservation::InputFailed { message },
+                            }
+                        }
+                        required_foreground => ControlObservation::InputFailed {
+                            message: format!(
+                                "prepared input kind {:?} does not satisfy route {:?}",
+                                input.kind(),
+                                required_foreground
+                            ),
+                        },
+                    },
                     None => ControlObservation::InputFailed {
                         message: "typed PTY input requires a PTY session".to_owned(),
                     },

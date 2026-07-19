@@ -10,9 +10,9 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{
     builtin_registry, plan_draft_launch, plan_launch, prepare_agent_command, prepare_input,
-    AgentCommandMode, AgentId, AgentSpec, InputAction, LaunchPlan, LaunchRequest, PreparedInput,
-    PreparedInputKind, PromptFraming, PromptPayload, ReadinessIntent, ReadinessPermit,
-    TERMINAL_WRITE_DELAY_MAX_MS,
+    prepare_shell_command, AgentCommandMode, AgentId, AgentSpec, InputAction, LaunchPlan,
+    LaunchRequest, PreparedInput, PreparedInputKind, PromptFraming, PromptPayload, ReadinessIntent,
+    ReadinessPermit, ShellCommand, TERMINAL_WRITE_DELAY_MAX_MS,
 };
 use crate::core::error::AgentError;
 use crate::core::types::{AgentEvent, CliTool, SessionConfig};
@@ -410,6 +410,11 @@ impl PtySession {
                 Some(ReadinessIntent::DraftPaste)
             }
             PreparedInputKind::SubmitPrompt => Some(ReadinessIntent::FollowupPrompt),
+            PreparedInputKind::ShellCommand => {
+                return Err(AgentError::Pty(
+                    "shell input requires fresh foreground-shell proof".to_owned(),
+                ));
+            }
             PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl => None,
         };
         self.validate_permit(&permit, required_intent)?;
@@ -430,8 +435,61 @@ impl PtySession {
         self.write_prepared_input(input).await
     }
 
+    /// Confirm that a shell currently owns this PTY, then write one bounded
+    /// command while holding the typed-input serialization guard.
+    pub async fn send_shell_input(&self, input: PreparedInput) -> Result<(), AgentError> {
+        if input.kind() != PreparedInputKind::ShellCommand {
+            return Err(AgentError::Pty(
+                "foreground-shell dispatch requires a prepared shell command".to_owned(),
+            ));
+        }
+        let _serialized = self.typed_input_lock.lock().await;
+        let foreground = self.observe_foreground().await?;
+        if !foreground.readiness.is_shell {
+            return Err(AgentError::Pty(format!(
+                "refusing shell command: PTY foreground '{}' is not a shell",
+                foreground.observed_process
+            )));
+        }
+        self.write_prepared_input_locked(input).await
+    }
+
+    /// Reconfirm that this session's configured agent still owns the PTY
+    /// before sending a provider-native inline command.
+    pub async fn send_agent_command_input(
+        &self,
+        input: PreparedInput,
+        permit: ReadinessPermit,
+    ) -> Result<(), AgentError> {
+        if input.kind() != PreparedInputKind::AgentCommand {
+            return Err(AgentError::Pty(
+                "agent-command dispatch requires a prepared agent command".to_owned(),
+            ));
+        }
+        self.validate_permit(&permit, Some(ReadinessIntent::DraftPaste))?;
+        let _serialized = self.typed_input_lock.lock().await;
+        let foreground = self.observe_foreground().await?;
+        if foreground.readiness.process_name.as_deref() != Some(self.agent_id.as_str()) {
+            return Err(AgentError::Pty(format!(
+                "refusing agent command: PTY foreground '{}' is not agent '{}'",
+                foreground.observed_process, self.agent_id
+            )));
+        }
+        self.write_prepared_input_locked(input).await
+    }
+
+    /// Prepare and send an intentional shell command through the same fresh
+    /// foreground-proof path used by canonical effect executors.
+    pub async fn send_shell_command(&self, command: ShellCommand) -> Result<(), AgentError> {
+        self.send_shell_input(prepare_shell_command(command)?).await
+    }
+
     async fn write_prepared_input(&self, input: PreparedInput) -> Result<(), AgentError> {
         let _serialized = self.typed_input_lock.lock().await;
+        self.write_prepared_input_locked(input).await
+    }
+
+    async fn write_prepared_input_locked(&self, input: PreparedInput) -> Result<(), AgentError> {
         for write in input.into_writes() {
             if write.delay_before_ms > TERMINAL_WRITE_DELAY_MAX_MS {
                 return Err(AgentError::Pty(format!(

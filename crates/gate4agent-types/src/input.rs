@@ -101,6 +101,7 @@ pub enum PreparedInputKind {
     InsertDraft,
     SubmitPrompt,
     AgentCommand,
+    ShellCommand,
     TerminalText,
     TerminalControl,
 }
@@ -259,6 +260,51 @@ pub fn prepare_agent_command(
     })
 }
 
+/// Prepare an intentional command line for a dispatcher that has just
+/// confirmed a shell owns the PTY foreground.
+///
+/// Shell syntax is preserved. Control characters are rejected so one action
+/// cannot smuggle extra terminal writes or framing sequences past the typed
+/// protocol. Submission remains a separate delayed write.
+pub fn prepare_shell_command(command: ShellCommand) -> Result<PreparedInput, InputPrepareError> {
+    if command.text.trim().is_empty() {
+        return Err(InputPrepareError::EmptyShellCommand);
+    }
+    if let Some((index, character)) = command
+        .text
+        .char_indices()
+        .find(|(_, character)| character.is_control())
+    {
+        return Err(InputPrepareError::ControlCharacterInShellCommand {
+            index,
+            codepoint: character as u32,
+        });
+    }
+
+    let chunks = bounded_chunks(
+        &command.text,
+        TERMINAL_INPUT_CHUNK_MAX_BYTES,
+        TERMINAL_INPUT_MAX_BYTES,
+    )?;
+    let mut writes: Vec<_> = chunks
+        .into_iter()
+        .map(|bytes| PreparedWrite {
+            kind: PreparedWriteKind::Data,
+            bytes,
+            delay_before_ms: 0,
+        })
+        .collect();
+    writes.push(PreparedWrite {
+        kind: PreparedWriteKind::Submit,
+        bytes: TerminalControl::Enter.bytes().to_vec(),
+        delay_before_ms: TERMINAL_SUBMIT_DELAY_MS,
+    });
+    Ok(PreparedInput {
+        kind: PreparedInputKind::ShellCommand,
+        writes,
+    })
+}
+
 fn prepare_prompt(
     payload: PromptPayload,
     submit: bool,
@@ -393,6 +439,10 @@ pub enum InputPrepareError {
     InvalidAgentCommandArgument { argument_index: usize },
     #[error("shell commands require a confirmed foreground shell dispatcher")]
     ShellDispatcherRequired,
+    #[error("shell command cannot be empty")]
+    EmptyShellCommand,
+    #[error("shell command contains control U+{codepoint:04X} at byte {index}")]
+    ControlCharacterInShellCommand { index: usize, codepoint: u32 },
 }
 
 #[cfg(test)]
@@ -515,6 +565,46 @@ mod tests {
         assert!(matches!(
             control,
             InputPrepareError::InvalidAgentCommandArgument { .. }
+        ));
+    }
+
+    #[test]
+    fn shell_command_preserves_syntax_and_submits_separately() {
+        let prepared = prepare_shell_command(ShellCommand {
+            text: "printf '%s' \"hello world\" | sed 's/world/shell/'".to_owned(),
+        })
+        .unwrap();
+
+        assert_eq!(prepared.kind(), PreparedInputKind::ShellCommand);
+        assert_eq!(
+            prepared.writes[0].bytes,
+            b"printf '%s' \"hello world\" | sed 's/world/shell/'"
+        );
+        assert_eq!(prepared.writes.last().unwrap().bytes, b"\r");
+        assert_eq!(
+            prepared.writes.last().unwrap().delay_before_ms,
+            TERMINAL_SUBMIT_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn shell_command_rejects_empty_and_control_bearing_text() {
+        assert_eq!(
+            prepare_shell_command(ShellCommand {
+                text: "   ".to_owned(),
+            })
+            .unwrap_err(),
+            InputPrepareError::EmptyShellCommand
+        );
+        assert!(matches!(
+            prepare_shell_command(ShellCommand {
+                text: "echo first\necho second".to_owned(),
+            })
+            .unwrap_err(),
+            InputPrepareError::ControlCharacterInShellCommand {
+                index: 10,
+                codepoint: 10
+            }
         ));
     }
 }

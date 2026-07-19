@@ -16,8 +16,8 @@ pub use control::{
     ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
     ControlError, ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot,
     EffectEnvelope, ForegroundAuthority, ForegroundProcess, ForegroundProcessKind,
-    ForegroundSnapshot, ObservationEnvelope, ObservationIgnoredReason, OperationId,
-    ProviderActivity, ProviderEvent, ProviderEventValidationError, ProviderSnapshot,
+    ForegroundRequirement, ForegroundSnapshot, ObservationEnvelope, ObservationIgnoredReason,
+    OperationId, ProviderActivity, ProviderEvent, ProviderEventValidationError, ProviderSnapshot,
     ProviderSource, ProviderSourceCursor, SessionGeneration, SessionSnapshot, SessionStatus,
     StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
     FOREGROUND_PROCESS_NAME_MAX_BYTES, PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES,
@@ -28,11 +28,11 @@ pub use executable::normalize_executable_name;
 pub use id::{AgentId, AgentIdError};
 pub use input::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_input_with_limits,
-    sanitize_prompt_text, AgentCommand, InputAction, InputPrepareError, PreparedInput,
-    PreparedInputKind, PreparedWrite, PreparedWriteKind, PromptFraming, PromptPayload,
-    ShellCommand, TerminalControl, TerminalText, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
-    SEMANTIC_PROMPT_MAX_BYTES, TERMINAL_INPUT_CHUNK_MAX_BYTES, TERMINAL_INPUT_MAX_BYTES,
-    TERMINAL_SUBMIT_DELAY_MS, TERMINAL_WRITE_DELAY_MAX_MS,
+    prepare_shell_command, sanitize_prompt_text, AgentCommand, InputAction, InputPrepareError,
+    PreparedInput, PreparedInputKind, PreparedWrite, PreparedWriteKind, PromptFraming,
+    PromptPayload, ShellCommand, TerminalControl, TerminalText, BRACKETED_PASTE_END,
+    BRACKETED_PASTE_START, SEMANTIC_PROMPT_MAX_BYTES, TERMINAL_INPUT_CHUNK_MAX_BYTES,
+    TERMINAL_INPUT_MAX_BYTES, TERMINAL_SUBMIT_DELAY_MS, TERMINAL_WRITE_DELAY_MAX_MS,
 };
 pub use readiness::{AgentReadinessSpec, DraftReadySignal};
 pub use spec::{

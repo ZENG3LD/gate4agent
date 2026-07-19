@@ -1,11 +1,11 @@
 use crate::{
     AdapterBinding, AdapterFamily, AgentId, InputAction, InputPrepareError, PreparedInput,
-    PreparedInputKind,
+    PreparedInputKind, SessionOptionSelection,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 18;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 19;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -41,6 +41,8 @@ pub struct StartRequest {
     pub terminal_size: TerminalSize,
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    #[serde(default)]
+    pub session_options: Option<SessionOptionSelection>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -332,6 +334,7 @@ pub struct SessionSnapshot {
     pub terminal_size: Option<TerminalSize>,
     pub terminal_frame: Option<TerminalFrame>,
     pub terminal_stale: Option<String>,
+    pub session_options: Option<SessionOptionSelection>,
     pub foreground: ForegroundSnapshot,
     pub provider: ProviderSnapshot,
 }
@@ -889,6 +892,8 @@ pub enum ControlError {
     InvalidWorkingDirectory,
     #[error("pipe transport requires a non-empty initial prompt")]
     MissingInitialPrompt,
+    #[error("session options are invalid: {message}")]
+    InvalidSessionOptions { message: String },
     #[error("transport {transport:?} does not support {action}")]
     UnsupportedTransportOperation {
         transport: TransportKind,

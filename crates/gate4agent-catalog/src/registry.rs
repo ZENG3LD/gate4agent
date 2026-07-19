@@ -216,6 +216,10 @@ fn validate_adapter_bindings(
             spec.capabilities.adapters.resume.as_ref(),
         ),
         (
+            AdapterFamily::SessionOptions,
+            spec.capabilities.adapters.session_options.as_ref(),
+        ),
+        (
             AdapterFamily::CapabilityProbe,
             spec.capabilities.adapters.capability_probe.as_ref(),
         ),

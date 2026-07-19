@@ -295,7 +295,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
         _ => None,
     };
     AgentCapabilities {
-        agent_commands: matches!(id, "claude" | "codex" | "gemini")
+        agent_commands: matches!(id, "claude" | "codex" | "gemini" | "cursor")
             .then_some(AgentCommandMode::SlashLine),
         transports: AgentTransportCapabilities {
             pty: true,
@@ -322,6 +322,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
             hook: binding(AdapterFamily::Hook, adapter_id),
             history: binding(AdapterFamily::History, adapter_id),
             resume: binding(AdapterFamily::Resume, adapter_id),
+            session_options: binding(AdapterFamily::SessionOptions, adapter_id),
             capability_probe: binding(AdapterFamily::CapabilityProbe, adapter_id),
         },
     }
@@ -449,6 +450,33 @@ mod tests {
                     .resume
                     .is_none(),
                 "unexpected live resume adapter for {id}"
+            );
+        }
+
+        for id in ["claude", "codex", "gemini", "cursor"] {
+            let binding = registry
+                .get_by_id(id)
+                .unwrap()
+                .capabilities
+                .adapters
+                .session_options
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing session-option adapter for {id}"));
+            assert_eq!(
+                binding.revision,
+                gate4agent_adapters::SESSION_OPTION_CATALOG_REVISION
+            );
+        }
+        for id in ["opencode", "grok", "kimi", "qwen-code"] {
+            assert!(
+                registry
+                    .get_by_id(id)
+                    .unwrap()
+                    .capabilities
+                    .adapters
+                    .session_options
+                    .is_none(),
+                "unexpected session-option adapter for {id}"
             );
         }
 

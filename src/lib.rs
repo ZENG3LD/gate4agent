@@ -19,7 +19,8 @@ pub use agent::{
     builtin_registry, plan_draft_launch, plan_launch, prepare_agent_command, prepare_input,
     prepare_shell_command, AgentId, AgentRegistry, AgentSpec, InputAction, LaunchPlan,
     LaunchPlanError, LaunchRequest, PreparedInput, PreparedInputKind, PromptFraming, PromptPayload,
-    ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
+    ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform, SessionOptionSelection,
+    SessionOptionValue,
 };
 pub use core::capabilities::{CliCapabilities, CliFeatures, ModelInfo, PermissionModeInfo};
 pub use core::error::AgentError;

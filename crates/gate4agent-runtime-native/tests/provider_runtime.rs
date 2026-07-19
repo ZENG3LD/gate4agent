@@ -87,6 +87,7 @@ async fn pipe_one_shot_reaches_public_snapshot_with_semantic_events() {
                         columns: 80,
                     },
                     initial_prompt: Some("fixture prompt".to_owned()),
+                    session_options: None,
                 },
             },
         ))
@@ -150,6 +151,7 @@ async fn acp_multi_turn_prompt_streams_and_stops_through_public_handle() {
                         columns: 80,
                     },
                     initial_prompt: None,
+                    session_options: None,
                 },
             },
         ))
@@ -251,6 +253,7 @@ async fn pty_classification_uses_the_same_provider_event_contract() {
                         columns: 80,
                     },
                     initial_prompt: None,
+                    session_options: None,
                 },
             },
         ))
@@ -350,6 +353,7 @@ async fn public_handle_shell_command_requires_and_uses_live_shell_route() {
                         columns: 80,
                     },
                     initial_prompt: None,
+                    session_options: None,
                 },
             },
         ))
@@ -452,6 +456,7 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
                         columns: 80,
                     },
                     initial_prompt: None,
+                    session_options: None,
                 },
             },
         ))

@@ -1,4 +1,7 @@
-use crate::{AgentId, AgentSpec, InitialPromptMode, NativeDraftMode, RuntimePlatform};
+use crate::{
+    resolve_session_option_launch_for, AgentId, AgentSpec, InitialPromptMode, NativeDraftMode,
+    RuntimePlatform, SessionOptionCatalogError, SessionOptionSelection,
+};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -20,6 +23,7 @@ pub struct LaunchRequest {
     pub extra_args: Vec<OsString>,
     pub env: Vec<EnvMutation>,
     pub platform: RuntimePlatform,
+    pub session_options: Option<SessionOptionSelection>,
 }
 
 impl Default for LaunchRequest {
@@ -30,6 +34,7 @@ impl Default for LaunchRequest {
             extra_args: Vec::new(),
             env: Vec::new(),
             platform: RuntimePlatform::current(),
+            session_options: None,
         }
     }
 }
@@ -46,6 +51,9 @@ pub struct LaunchPlan {
     pub followup_prompt: Option<String>,
     /// Reviewable draft that must be inserted after draft readiness succeeds.
     pub followup_draft: Option<String>,
+    /// Options actually applied by generated launch arguments after accounting
+    /// for later caller-provided overrides.
+    pub applied_session_options: Option<SessionOptionSelection>,
 }
 
 pub fn plan_launch(
@@ -69,7 +77,21 @@ pub fn plan_launch(
         }
     }
 
+    let trailing_agent_args = request
+        .extra_args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let resolved_session_options = request
+        .session_options
+        .as_ref()
+        .map(|selection| resolve_session_option_launch_for(spec, selection, &trailing_agent_args))
+        .transpose()
+        .map_err(LaunchPlanError::SessionOptions)?;
     let mut args: Vec<OsString> = spec.launch.fixed_args.iter().map(OsString::from).collect();
+    if let Some(resolved) = &resolved_session_options {
+        args.extend(resolved.args.iter().map(OsString::from));
+    }
     args.extend(request.extra_args);
     let mut followup_prompt = None;
 
@@ -105,6 +127,7 @@ pub fn plan_launch(
         env: request.env,
         followup_prompt,
         followup_draft: None,
+        applied_session_options: resolved_session_options.and_then(|resolved| resolved.applied),
     };
     validate_platform_budget(&plan, request.platform)?;
     Ok(plan)
@@ -219,6 +242,8 @@ pub enum LaunchPlanError {
     ConflictingPromptAndDraft,
     #[error("Windows inline launch is {chars} characters; the safe limit is {max}")]
     WindowsInlineLaunchTooLarge { chars: usize, max: usize },
+    #[error(transparent)]
+    SessionOptions(#[from] SessionOptionCatalogError),
 }
 
 #[cfg(test)]
@@ -316,5 +341,80 @@ mod tests {
         .unwrap();
         assert!(plan.args.is_empty());
         assert_eq!(plan.followup_draft.as_deref(), Some("inspect & explain"));
+    }
+
+    #[test]
+    fn session_options_precede_user_args_and_record_only_effective_values() {
+        let spec = builtin_registry().get_by_id("claude").unwrap();
+        let plan = plan_launch(
+            spec,
+            LaunchRequest {
+                session_options: Some(
+                    SessionOptionSelection::new("opus")
+                        .with_value("effort", "xhigh")
+                        .with_value("fastMode", true),
+                ),
+                extra_args: vec!["--model".into(), "haiku".into()],
+                platform: RuntimePlatform::Linux,
+                ..LaunchRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            args_as_strings(&plan),
+            ["--model", "opus", "--effort", "xhigh", "--model", "haiku"]
+        );
+        assert!(plan.applied_session_options.is_none());
+    }
+
+    #[test]
+    fn explicit_cursor_options_are_composed_but_untouched_launches_stay_vanilla() {
+        let spec = builtin_registry().get_by_id("cursor").unwrap();
+        let vanilla = plan_launch(
+            spec,
+            LaunchRequest {
+                platform: RuntimePlatform::Linux,
+                ..LaunchRequest::default()
+            },
+        )
+        .unwrap();
+        assert!(vanilla.args.is_empty());
+        assert!(vanilla.applied_session_options.is_none());
+
+        let selected = SessionOptionSelection::new("gpt-5.3-codex")
+            .with_value("effort", "medium")
+            .with_value("fastMode", true);
+        let plan = plan_launch(
+            spec,
+            LaunchRequest {
+                session_options: Some(selected.clone()),
+                platform: RuntimePlatform::Linux,
+                ..LaunchRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            args_as_strings(&plan),
+            ["--model", "gpt-5.3-codex-medium-fast"]
+        );
+        assert_eq!(plan.applied_session_options, Some(selected));
+    }
+
+    #[test]
+    fn launch_only_agents_cannot_borrow_another_provider_option_catalog() {
+        let spec = builtin_registry().get_by_id("opencode").unwrap();
+        assert!(matches!(
+            plan_launch(
+                spec,
+                LaunchRequest {
+                    session_options: Some(SessionOptionSelection::new("opus")),
+                    platform: RuntimePlatform::Linux,
+                    ..LaunchRequest::default()
+                },
+            ),
+            Err(LaunchPlanError::SessionOptions(
+                SessionOptionCatalogError::UnsupportedAgent(_)
+            ))
+        ));
     }
 }

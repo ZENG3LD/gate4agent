@@ -118,6 +118,8 @@ pub struct AgentAdapterCapabilities {
     #[serde(default)]
     pub resume: Option<AdapterBinding>,
     #[serde(default)]
+    pub session_options: Option<AdapterBinding>,
+    #[serde(default)]
     pub capability_probe: Option<AdapterBinding>,
 }
 

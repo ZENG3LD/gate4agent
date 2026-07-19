@@ -81,6 +81,7 @@ impl Gate4AgentEngine {
                             terminal_size: None,
                             terminal_frame: None,
                             terminal_stale: None,
+                            session_options: None,
                             foreground: ForegroundSnapshot::default(),
                             provider: ProviderSnapshot::default(),
                         },
@@ -695,6 +696,13 @@ impl Gate4AgentEngine {
             .map(normalize_semantic_prompt)
             .transpose()
             .map_err(|error| ControlError::InputRejected { error })?;
+        if let Some(session_options) = &request.session_options {
+            session_options
+                .validate()
+                .map_err(|error| ControlError::InvalidSessionOptions {
+                    message: error.to_string(),
+                })?;
+        }
         if transport == TransportKind::Pipe
             && request.initial_prompt.as_deref().is_none_or(str::is_empty)
         {
@@ -719,6 +727,7 @@ impl Gate4AgentEngine {
             session.terminal_size = None;
             session.terminal_frame = None;
             session.terminal_stale = None;
+            session.session_options = request.session_options.clone();
             session.foreground = ForegroundSnapshot::default();
             session.provider = ProviderSnapshot::default();
             (
@@ -1837,8 +1846,8 @@ mod tests {
     use gate4agent_types::{
         AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId,
         ForegroundAuthority, ForegroundProcess, ForegroundProcessKind, InputAction,
-        PreparedInputKind, PromptFraming, PromptPayload, ShellCommand, TerminalFrame,
-        TransportKind,
+        PreparedInputKind, PromptFraming, PromptPayload, SessionOptionSelection, ShellCommand,
+        TerminalFrame, TransportKind,
     };
 
     fn instance() -> AgentInstanceId {
@@ -1894,6 +1903,7 @@ mod tests {
                         columns: 80,
                     },
                     initial_prompt: None,
+                    session_options: None,
                 },
             },
         }
@@ -1946,11 +1956,35 @@ mod tests {
                             columns: 80,
                         },
                         initial_prompt: None,
+                        session_options: None,
                     },
                 },
             })
             .unwrap_err();
         assert_eq!(error, ControlError::InvalidTerminalSize);
+        assert!(engine.drain_effects().is_empty());
+    }
+
+    #[test]
+    fn invalid_session_options_are_rejected_before_effect_creation() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        let mut request = match start(2).command {
+            ControlCommand::Start { request, .. } => request,
+            _ => unreachable!(),
+        };
+        request.session_options = Some(SessionOptionSelection::new("bad\nmodel"));
+        let error = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::Start {
+                    instance_id: instance(),
+                    request,
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(error, ControlError::InvalidSessionOptions { .. }));
         assert!(engine.drain_effects().is_empty());
     }
 

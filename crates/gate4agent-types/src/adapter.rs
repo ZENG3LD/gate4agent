@@ -115,6 +115,7 @@ pub enum AdapterFamily {
     Hook,
     History,
     Resume,
+    SessionOptions,
     CapabilityProbe,
 }
 

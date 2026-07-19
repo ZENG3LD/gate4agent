@@ -1,6 +1,6 @@
 //! Synchronous host kernel for gate4agent engines.
 
-use gate4agent_catalog::{builtin_registry, AgentRegistry};
+use gate4agent_catalog::{builtin_registry, resolve_session_option_launch_for, AgentRegistry};
 use gate4agent_engine::Gate4AgentEngine;
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, CommandEnvelope, CommandId, ControlCommand,
@@ -38,6 +38,8 @@ pub enum KernelCommandError {
         adapter_id: String,
         revision: String,
     },
+    #[error("agent '{agent_id}' session options are invalid: {message}")]
+    InvalidSessionOptions { agent_id: AgentId, message: String },
     #[error(transparent)]
     Control(#[from] ControlError),
 }
@@ -112,7 +114,7 @@ impl Gate4AgentKernel {
 
     fn apply_validated_command(
         &mut self,
-        command: CommandEnvelope,
+        mut command: CommandEnvelope,
     ) -> Result<(), KernelCommandError> {
         if command.protocol_version != CONTROL_PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedProtocolVersion {
@@ -162,6 +164,34 @@ impl Gate4AgentKernel {
                 }
             }
         }
+        if let ControlCommand::Start {
+            instance_id,
+            request,
+        } = &mut command.command
+        {
+            if let Some(session_options) = &request.session_options {
+                if let Some(session) = self.engine.session_snapshot(*instance_id) {
+                    let spec = self
+                        .catalog
+                        .get(&session.agent_id)
+                        .expect("registered agent must remain in kernel catalog");
+                    if session.transport != TransportKind::Pty
+                        || spec.capabilities.adapters.session_options.is_none()
+                    {
+                        return Err(KernelCommandError::UnsupportedCapability {
+                            agent_id: session.agent_id.clone(),
+                            capability: "pty-session-options",
+                        });
+                    }
+                    let resolved = resolve_session_option_launch_for(spec, session_options, &[])
+                        .map_err(|error| KernelCommandError::InvalidSessionOptions {
+                            agent_id: session.agent_id.clone(),
+                            message: error.to_string(),
+                        })?;
+                    request.session_options = resolved.applied;
+                }
+            }
+        }
         if let ControlCommand::IngestProvider {
             instance_id,
             source,
@@ -206,7 +236,10 @@ fn declared_provider_binding<'a>(
             .as_ref()
             .map(|transport| &transport.adapter),
         AdapterFamily::Hook => spec.capabilities.adapters.hook.as_ref(),
-        AdapterFamily::History | AdapterFamily::Resume | AdapterFamily::CapabilityProbe => None,
+        AdapterFamily::History
+        | AdapterFamily::Resume
+        | AdapterFamily::SessionOptions
+        | AdapterFamily::CapabilityProbe => None,
     }
 }
 
@@ -221,8 +254,8 @@ mod tests {
     use super::*;
     use gate4agent_types::{
         AgentInstanceId, ControlObservation, ObservationEnvelope, ProviderActivity, ProviderEvent,
-        ProviderSource, SessionStatus, StartRequest, TerminalSize, TransportKind,
-        CONTROL_PROTOCOL_VERSION,
+        ProviderSource, SessionOptionSelection, SessionStatus, StartRequest, TerminalSize,
+        TransportKind, CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
@@ -266,6 +299,137 @@ mod tests {
     }
 
     #[test]
+    fn session_options_require_a_declared_pty_catalog_and_cross_the_effect_boundary() {
+        let mut kernel = Gate4AgentKernel::default();
+        kernel.step([register(1, "cursor")], []);
+        let selection = SessionOptionSelection::new("gpt-5.3-codex")
+            .with_value("effort", "high")
+            .with_value("fastMode", true);
+        let accepted = kernel.step(
+            [command(
+                2,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                        session_options: Some(selection.clone()),
+                    },
+                },
+            )],
+            [],
+        );
+        assert_eq!(accepted.command_outcomes[0].result, Ok(()));
+        assert!(matches!(
+            &accepted.effects[0].effect,
+            gate4agent_types::ControlEffect::Spawn { request, .. }
+                if request.session_options.as_ref() == Some(&selection)
+        ));
+
+        let mut unsupported = Gate4AgentKernel::default();
+        unsupported.step([register(1, "opencode")], []);
+        let rejected = unsupported.step(
+            [command(
+                2,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                        session_options: Some(SessionOptionSelection::new("opus")),
+                    },
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedCapability {
+                capability: "pty-session-options",
+                ..
+            })
+        ));
+        assert!(rejected.effects.is_empty());
+
+        let mut expanded = Gate4AgentKernel::default();
+        expanded.step([register(1, "claude")], []);
+        let started = expanded.step(
+            [command(
+                2,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                        session_options: Some(SessionOptionSelection::new("opus")),
+                    },
+                },
+            )],
+            [],
+        );
+        let expected = SessionOptionSelection::new("opus").with_value("effort", "high");
+        assert_eq!(
+            started.snapshot.sessions[0].session_options.as_ref(),
+            Some(&expected)
+        );
+        assert!(matches!(
+            &started.effects[0].effect,
+            gate4agent_types::ControlEffect::Spawn { request, .. }
+                if request.session_options.as_ref() == Some(&expected)
+        ));
+
+        let mut pipe = Gate4AgentKernel::default();
+        pipe.step(
+            [command(
+                1,
+                ControlCommand::Register {
+                    instance_id: instance(),
+                    agent_id: AgentId::new("gemini").unwrap(),
+                    transport: TransportKind::Pipe,
+                },
+            )],
+            [],
+        );
+        let rejected = pipe.step(
+            [command(
+                2,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: Some("hello".to_owned()),
+                        session_options: Some(SessionOptionSelection::new("gemini-3-pro-preview")),
+                    },
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::UnsupportedCapability {
+                capability: "pty-session-options",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn external_provider_ingress_requires_the_declared_family_binding() {
         let mut kernel = Gate4AgentKernel::default();
         kernel.step([register(1, "grok")], []);
@@ -281,6 +445,7 @@ mod tests {
                             columns: 80,
                         },
                         initial_prompt: None,
+                        session_options: None,
                     },
                 },
             )],
@@ -392,6 +557,7 @@ mod tests {
                                 columns: 80,
                             },
                             initial_prompt: None,
+                            session_options: None,
                         },
                     },
                 ),
@@ -453,6 +619,7 @@ mod tests {
                                 columns: 80,
                             },
                             initial_prompt: None,
+                            session_options: None,
                         },
                     },
                 ),
@@ -520,6 +687,7 @@ mod tests {
                                     columns: 80,
                                 },
                                 initial_prompt: None,
+                                session_options: None,
                             },
                         },
                     ),

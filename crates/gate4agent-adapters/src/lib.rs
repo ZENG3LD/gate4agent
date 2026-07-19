@@ -10,6 +10,7 @@ mod history;
 mod hook;
 mod hook_session;
 mod resume;
+mod session_options;
 
 use gate4agent_types::{AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId};
 use std::collections::BTreeMap;
@@ -33,6 +34,17 @@ pub use hook_session::{
 pub use resume::{
     build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,
     RESUME_SESSION_ID_MAX_BYTES,
+};
+pub use session_options::{
+    merge_session_option_models, parse_session_option_models, plan_mid_session_action,
+    plan_mid_session_option, resolve_session_option_launch, session_option_catalog,
+    AgentSessionOptionCatalog, ResolvedSessionOptionLaunch, SessionOption,
+    SessionOptionAdapterError, SessionOptionApply, SessionOptionArgumentOverride,
+    SessionOptionCategory, SessionOptionChoice, SessionOptionInteractionDetection,
+    SessionOptionKind, SessionOptionLaunchApplication, SessionOptionMidSessionApplication,
+    SessionOptionMidSessionPlan, SessionOptionModel, SessionOptionModelListSpec,
+    SESSION_OPTION_CATALOG_REVISION, SESSION_OPTION_MODELS_MAX,
+    SESSION_OPTION_MODEL_LIST_MAX_BYTES,
 };
 
 pub const BUILTIN_ADAPTER_REVISION: &str = "gate4agent-adapter/v1";
@@ -303,16 +315,27 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     ] {
         descriptors.push(descriptor(AdapterFamily::Resume, id));
     }
+    for id in ["claude-code", "codex", "gemini", "cursor"] {
+        descriptors.push(descriptor_with_revision(
+            AdapterFamily::SessionOptions,
+            id,
+            SESSION_OPTION_CATALOG_REVISION,
+        ));
+    }
     descriptors
 }
 
 fn descriptor(family: AdapterFamily, id: &str) -> AdapterDescriptor {
+    descriptor_with_revision(family, id, BUILTIN_ADAPTER_REVISION)
+}
+
+fn descriptor_with_revision(family: AdapterFamily, id: &str, revision: &str) -> AdapterDescriptor {
     let agent_id = if id == "claude-code" { "claude" } else { id };
     AdapterDescriptor {
         family,
         binding: AdapterBinding::new(
             AdapterId::new(id).expect("hardcoded adapter ID"),
-            BUILTIN_ADAPTER_REVISION,
+            revision,
             AdapterVerification::SyntheticFixture,
         )
         .expect("hardcoded adapter binding"),
@@ -443,6 +466,25 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn session_option_registry_matches_the_pinned_orca_catalog_inventory() {
+        let actual = builtin_adapter_registry()
+            .iter()
+            .filter(|descriptor| descriptor.family == AdapterFamily::SessionOptions)
+            .map(|descriptor| {
+                (
+                    descriptor.binding.id.as_str(),
+                    descriptor.binding.revision.as_str(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = ["claude-code", "codex", "cursor", "gemini"]
+            .into_iter()
+            .map(|id| (id, SESSION_OPTION_CATALOG_REVISION))
+            .collect();
         assert_eq!(actual, expected);
     }
 

@@ -336,6 +336,7 @@ impl NativeEffectShell {
                     working_dir,
                     platform: RuntimePlatform::current(),
                     prompt: request.initial_prompt,
+                    session_options: request.session_options,
                     ..LaunchRequest::default()
                 },
                 request.terminal_size.rows,

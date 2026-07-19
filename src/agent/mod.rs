@@ -9,14 +9,14 @@ mod process;
 mod readiness;
 
 pub use gate4agent_catalog::{
-    builtin_registry, builtin_specs, plan_draft_launch, plan_launch, AgentRegistry, EnvMutation,
-    LaunchPlan, LaunchPlanError, LaunchRequest, RegistryError, ORCA_REFERENCE_REVISION,
-    MAX_LAUNCH_PROMPT_BYTES, WINDOWS_INLINE_LAUNCH_MAX_CHARS,
-};
-pub use gate4agent_types::{
-    AgentCapabilities, AgentCommandMode, AgentId, AgentIdError, AgentReadinessSpec, AgentSpec,
-    DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, NativeDraftMode,
-    ProcessMatcher, PromptSpec, RuntimePlatform, SpecVerification,
+    builtin_registry, builtin_specs, merge_session_option_models, parse_session_option_models_for,
+    plan_draft_launch, plan_launch, plan_mid_session_action_control_for,
+    plan_mid_session_control_for, resolve_session_option_launch_for, session_option_catalog_for,
+    AgentRegistry, AgentSessionOptionCatalog, EnvMutation, LaunchPlan, LaunchPlanError,
+    LaunchRequest, RegistryError, ResolvedSessionOptionLaunch, SessionOptionCatalogError,
+    SessionOptionControlPlan, SessionOptionMidSessionPlan, SessionOptionModel,
+    MAX_LAUNCH_PROMPT_BYTES, ORCA_REFERENCE_REVISION, SESSION_OPTION_CATALOG_REVISION,
+    WINDOWS_INLINE_LAUNCH_MAX_CHARS,
 };
 pub use gate4agent_types::{
     prepare_agent_command, prepare_input, prepare_input_with_limits, prepare_shell_command,
@@ -25,6 +25,12 @@ pub use gate4agent_types::{
     ShellCommand, TerminalControl, TerminalText, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
     TERMINAL_INPUT_CHUNK_MAX_BYTES, TERMINAL_INPUT_MAX_BYTES, TERMINAL_SUBMIT_DELAY_MS,
     TERMINAL_WRITE_DELAY_MAX_MS,
+};
+pub use gate4agent_types::{
+    AgentCapabilities, AgentCommandMode, AgentId, AgentIdError, AgentReadinessSpec, AgentSpec,
+    DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, NativeDraftMode,
+    ProcessMatcher, PromptSpec, RuntimePlatform, SessionOptionSelection, SessionOptionValue,
+    SpecVerification,
 };
 pub use process::{
     is_agent_foreground_wrapper, is_expected_agent_command_line, is_expected_agent_process,

@@ -13,8 +13,13 @@ Living document. Current state + what's next. Updated per release.
   and explicit queue/sequence health.
 - [x] Reduce control and capability ingress in one deterministic kernel tick and
   publish one immutable combined snapshot through trusted/scoped handles.
-- [ ] Add provider-bound runtime handles so provider identity cannot be asserted
-  by an untrusted observation producer.
+- [x] Add provider-bound runtime handles with monotonic binding identities,
+  exact request/effect/observation correlation, bounded work and receipt
+  queues, operation-scoped cancellation, teardown fencing, and atomic local
+  availability publication.
+- [ ] Add reviewed host-owned provider adapters and supervisors. Physical
+  subprocess/browser cancellation and shutdown acknowledgement remain
+  unconfirmed until those concrete executors report them.
 - [ ] Add transport admission that rejects oversized frames/bodies before serde
   allocation, plus backend boot/incarnation and connection-scoped identity.
 - [ ] Connect approved capability providers. Filesystem, shell, MCP, and browser

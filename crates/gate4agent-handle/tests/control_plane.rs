@@ -1,13 +1,14 @@
 use gate4agent_handle::{
-    bounded_control_plane, ToolAuthorityError, ToolClientDispatchError, ToolCompletionDelivery,
+    bounded_control_plane, ProviderObservationStatus, ProviderRuntimeError, ProviderRuntimeState,
+    ProviderWork, ToolAuthorityError, ToolClientDispatchError, ToolCompletionDelivery,
 };
 use gate4agent_kernel::{BackendIngress, Gate4AgentKernel};
 use gate4agent_tool_protocol::{
-    CapabilityClass, CapabilityDescriptor, CapabilityEffect, CapabilityObservation,
-    CapabilityObservationEnvelope, CapabilityOwner, CapabilityProviderDescriptor,
-    CapabilityRequestId, CapabilityRequestInput, CapabilityResult, CapabilityResultDelivery,
-    CapabilityResultMetadata, CapabilityTerminalOutcome, GrantMode, PolicyGrant, PolicyKey,
-    ResourceScopeId, ToolActorId, ToolAuthorityCommand, ToolCapabilityId, ToolProviderId,
+    CancellationDisposition, CapabilityClass, CapabilityDescriptor, CapabilityOwner,
+    CapabilityProviderDescriptor, CapabilityRequestId, CapabilityRequestInput, CapabilityResult,
+    CapabilityResultDelivery, CapabilityResultMetadata, CapabilityTerminalOutcome, GrantMode,
+    InvocationCancelReason, ObservationIgnoredReason, PolicyGrant, PolicyKey, ResourceScopeId,
+    ToolActorId, ToolAuthorityCommand, ToolCapabilityId, ToolProviderId,
     CAPABILITY_PROTOCOL_VERSION,
 };
 use gate4agent_types::{
@@ -25,6 +26,10 @@ fn provider_id() -> ToolProviderId {
     ToolProviderId::new("gate.browser.test").unwrap()
 }
 
+fn secondary_provider_id() -> ToolProviderId {
+    ToolProviderId::new("gate.browser.secondary").unwrap()
+}
+
 fn capability_id() -> ToolCapabilityId {
     ToolCapabilityId::new("browser.snapshot").unwrap()
 }
@@ -34,8 +39,16 @@ fn resource_scope() -> ResourceScopeId {
 }
 
 fn provider() -> CapabilityProviderDescriptor {
+    provider_descriptor(provider_id())
+}
+
+fn secondary_provider() -> CapabilityProviderDescriptor {
+    provider_descriptor(secondary_provider_id())
+}
+
+fn provider_descriptor(id: ToolProviderId) -> CapabilityProviderDescriptor {
     CapabilityProviderDescriptor {
-        id: provider_id(),
+        id,
         owner: CapabilityOwner::Gate,
         capabilities: vec![CapabilityDescriptor::new(
             capability_id(),
@@ -43,6 +56,20 @@ fn provider() -> CapabilityProviderDescriptor {
             "Return active page metadata",
         )
         .unwrap()],
+    }
+}
+
+fn result() -> CapabilityResult {
+    CapabilityResult {
+        metadata: CapabilityResultMetadata {
+            byte_len: 2,
+            media_type: Some("application/json".to_owned()),
+            truncated: false,
+            redacted_summary: Some("page snapshot captured".to_owned()),
+        },
+        delivery: CapabilityResultDelivery::Inline {
+            bytes: b"{}".to_vec(),
+        },
     }
 }
 
@@ -117,7 +144,7 @@ fn start_running(
         },
     ))
     .unwrap();
-    let starting = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let starting = kernel.step_control_plane(port.drain_ingress(8), []);
     let spawn = starting.effects[0].clone();
     port.publish_step(&starting);
 
@@ -132,14 +159,29 @@ fn start_running(
                 process_id: Some(9001),
             },
         }],
-        [],
     );
     port.publish_step(&running);
     running.backend_snapshot.control.sessions[0].generation
 }
 
+fn attach_provider_runtime(
+    kernel: &mut Gate4AgentKernel,
+    port: &gate4agent_handle::ControlPlaneKernelPort,
+    authority: &gate4agent_handle::ProviderRuntimeAuthorityHandle,
+    provider_id: ToolProviderId,
+    effect_capacity: usize,
+) -> gate4agent_handle::ProviderRuntimeHandle {
+    let runtime = authority
+        .bind_provider(provider_id, effect_capacity)
+        .unwrap();
+    let attached = kernel.step_control_plane(port.drain_ingress(16), []);
+    port.publish_step(&attached);
+    assert_eq!(runtime.state(), ProviderRuntimeState::Active);
+    runtime
+}
+
 #[test]
-fn control_plane_e2e_routes_fake_provider_result_only_to_exact_client() {
+fn control_plane_e2e_routes_bound_provider_result_only_to_exact_client() {
     let (gate, authority, port) = bounded_control_plane(16);
     let client = authority
         .bind_client(ToolActorId::new("agent.primary").unwrap())
@@ -153,26 +195,38 @@ fn control_plane_e2e_routes_fake_provider_result_only_to_exact_client() {
     let authority_outcomes = authority.subscribe_outcomes(4);
     let mut kernel = Gate4AgentKernel::with_tool_providers(
         gate4agent_catalog::builtin_registry().clone(),
-        [provider()],
+        [provider(), secondary_provider()],
     )
     .unwrap();
+    let provider_authority = port.provider_authority();
+    let provider_runtime = provider_authority.bind_provider(provider_id(), 4).unwrap();
+    let secondary_runtime = provider_authority
+        .bind_provider(secondary_provider_id(), 4)
+        .unwrap();
     let generation = start_running(&mut kernel, &gate, &port);
+    assert_eq!(provider_runtime.state(), ProviderRuntimeState::Active);
+    assert_eq!(secondary_runtime.state(), ProviderRuntimeState::Active);
 
     authority
         .dispatch(ToolAuthorityCommand::SetGrant {
             grant: grant(&client, generation, GrantMode::Allow),
         })
         .unwrap();
-    let granted = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let granted = kernel.step_control_plane(port.drain_ingress(8), []);
     port.publish_step(&granted);
     assert!(authority_outcomes.try_recv().unwrap().result.is_ok());
 
     let request_key = client.dispatch(request(1, generation)).unwrap();
-    let dispatched = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let dispatched = kernel.step_control_plane(port.drain_ingress(8), []);
     assert_eq!(dispatched.tool_effects.len(), 1);
-    let effect = dispatched.tool_effects[0].clone();
-    assert!(matches!(effect.effect, CapabilityEffect::Invoke { .. }));
+    assert_eq!(
+        dispatched.tool_effects[0].binding_id,
+        provider_runtime.binding_id()
+    );
     port.publish_step(&dispatched);
+    let ProviderWork::Invoke(mut invocation) = provider_runtime.try_recv().unwrap() else {
+        panic!("expected provider invocation");
+    };
     let published_snapshot = client.snapshot();
     assert_eq!(
         published_snapshot.backend_revision,
@@ -186,32 +240,21 @@ fn control_plane_e2e_routes_fake_provider_result_only_to_exact_client() {
     assert_eq!(accepted.request_key, request_key);
     let accepted_sequence = accepted.accepted_sequence.unwrap();
 
-    let completed = kernel.step_control_plane(
-        [],
-        [],
-        [CapabilityObservationEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
-            operation_id: effect.operation_id,
-            request_key: effect.request_key.clone(),
-            instance_id: effect.instance_id,
-            generation: effect.generation,
-            provider_id: effect.provider_id.clone(),
-            observation: CapabilityObservation::Succeeded {
-                result: CapabilityResult {
-                    metadata: CapabilityResultMetadata {
-                        byte_len: 2,
-                        media_type: Some("application/json".to_owned()),
-                        truncated: false,
-                        redacted_summary: Some("page snapshot captured".to_owned()),
-                    },
-                    delivery: CapabilityResultDelivery::Inline {
-                        bytes: b"{}".to_vec(),
-                    },
-                },
-            },
-        }],
+    assert_eq!(
+        secondary_runtime.try_succeed(&mut invocation, &result()),
+        Err(ProviderRuntimeError::ForeignInvocation)
     );
+    let observation_sequence = provider_runtime
+        .try_succeed(&mut invocation, &result())
+        .unwrap();
+    let completed = kernel.step_control_plane(port.drain_ingress(8), []);
     port.publish_step(&completed);
+    let observation_outcome = provider_runtime.try_recv_observation_outcome().unwrap();
+    assert_eq!(observation_outcome.sequence, observation_sequence);
+    assert_eq!(
+        observation_outcome.status,
+        ProviderObservationStatus::Applied
+    );
     let ToolCompletionDelivery::Completion(completion) = completions.try_recv().unwrap() else {
         panic!("expected exact completion");
     };
@@ -241,7 +284,7 @@ fn scoped_clients_cannot_observe_each_others_outcomes_or_snapshots() {
     let second_key = second.dispatch(request(1, SessionGeneration(0))).unwrap();
 
     let mut kernel = Gate4AgentKernel::default();
-    let step = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let step = kernel.step_control_plane(port.drain_ingress(8), []);
     port.publish_step(&step);
 
     assert_eq!(first_outcomes.try_recv().unwrap().request_key, first_key);
@@ -262,6 +305,260 @@ fn scoped_clients_cannot_observe_each_others_outcomes_or_snapshots() {
     assert_eq!(second.snapshot().requests[0].key, second_key);
     assert!(first.snapshot().grants.is_empty());
     assert!(second.snapshot().grants.is_empty());
+}
+
+#[test]
+fn detach_fences_approval_and_issued_work_then_allows_fresh_binding() {
+    let (gate, authority, port) = bounded_control_plane(16);
+    let client = authority
+        .bind_client(ToolActorId::new("agent.detach").unwrap())
+        .unwrap();
+    let completions = client.subscribe_completions(8);
+    let mut kernel = Gate4AgentKernel::with_tool_providers(
+        gate4agent_catalog::builtin_registry().clone(),
+        [provider()],
+    )
+    .unwrap();
+    let provider_authority = port.provider_authority();
+    let first_runtime = provider_authority.bind_provider(provider_id(), 4).unwrap();
+    let first_binding = first_runtime.binding_id();
+    let generation = start_running(&mut kernel, &gate, &port);
+
+    authority
+        .dispatch(ToolAuthorityCommand::SetGrant {
+            grant: grant(&client, generation, GrantMode::RequireApproval),
+        })
+        .unwrap();
+    let grant_step = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&grant_step);
+    client.dispatch(request(1, generation)).unwrap();
+    let awaiting = kernel.step_control_plane(port.drain_ingress(8), []);
+    assert!(awaiting.tool_effects.is_empty());
+    port.publish_step(&awaiting);
+
+    first_runtime.close().unwrap();
+    let detached_approval = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&detached_approval);
+    assert_eq!(first_runtime.state(), ProviderRuntimeState::Closed);
+    let ToolCompletionDelivery::Completion(approval_completion) = completions.try_recv().unwrap()
+    else {
+        panic!("expected provider-detached approval completion");
+    };
+    assert!(matches!(
+        approval_completion.outcome,
+        CapabilityTerminalOutcome::ProviderDetached {
+            cancellation: CancellationDisposition::NotRequired,
+        }
+    ));
+
+    let second_runtime =
+        attach_provider_runtime(&mut kernel, &port, &provider_authority, provider_id(), 4);
+    assert_ne!(second_runtime.binding_id(), first_binding);
+    authority
+        .dispatch(ToolAuthorityCommand::SetGrant {
+            grant: grant(&client, generation, GrantMode::Allow),
+        })
+        .unwrap();
+    let allow_step = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&allow_step);
+
+    client.dispatch(request(2, generation)).unwrap();
+    let invoked = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&invoked);
+    let ProviderWork::Invoke(mut old_invocation) = second_runtime.try_recv().unwrap() else {
+        panic!("expected issued provider invocation");
+    };
+    let old_completion = second_runtime.completion_handle();
+    let cancellation = old_invocation.cancellation_token();
+    let second_binding = second_runtime.binding_id();
+    second_runtime.close().unwrap();
+    assert!(cancellation.is_cancelled());
+    assert!(matches!(
+        second_runtime.try_recv(),
+        Err(TryRecvError::Disconnected)
+    ));
+
+    let detached_issued = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&detached_issued);
+    let ToolCompletionDelivery::Completion(issued_completion) = completions.try_recv().unwrap()
+    else {
+        panic!("expected provider-detached issued completion");
+    };
+    assert!(matches!(
+        issued_completion.outcome,
+        CapabilityTerminalOutcome::ProviderDetached {
+            cancellation: CancellationDisposition::ProviderDetachedUnconfirmed,
+        }
+    ));
+    assert_eq!(
+        old_completion.try_succeed(&mut old_invocation, &result()),
+        Err(ProviderRuntimeError::Inactive)
+    );
+
+    let third_runtime =
+        attach_provider_runtime(&mut kernel, &port, &provider_authority, provider_id(), 4);
+    assert_ne!(third_runtime.binding_id(), second_binding);
+    assert_eq!(
+        old_completion.try_succeed(&mut old_invocation, &result()),
+        Err(ProviderRuntimeError::Inactive)
+    );
+    assert_eq!(client.snapshot().available_providers, vec![provider_id()]);
+}
+
+#[test]
+fn full_provider_work_queue_fails_closed_and_hides_availability() {
+    let (gate, authority, port) = bounded_control_plane(16);
+    let client = authority
+        .bind_client(ToolActorId::new("agent.provider-full").unwrap())
+        .unwrap();
+    let completions = client.subscribe_completions(4);
+    let mut kernel = Gate4AgentKernel::with_tool_providers(
+        gate4agent_catalog::builtin_registry().clone(),
+        [provider()],
+    )
+    .unwrap();
+    let provider_authority = port.provider_authority();
+    let runtime = provider_authority.bind_provider(provider_id(), 1).unwrap();
+    let old_binding = runtime.binding_id();
+    let binding_cancellation = runtime.cancellation_token();
+    let generation = start_running(&mut kernel, &gate, &port);
+    authority
+        .dispatch(ToolAuthorityCommand::SetGrant {
+            grant: grant(&client, generation, GrantMode::Allow),
+        })
+        .unwrap();
+    let grant_step = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&grant_step);
+
+    client.dispatch(request(1, generation)).unwrap();
+    client.dispatch(request(2, generation)).unwrap();
+    let invoked = kernel.step_control_plane(port.drain_ingress(8), []);
+    assert_eq!(invoked.tool_effects.len(), 2);
+    let report = port.publish_step(&invoked);
+    assert_eq!(report.provider_effects.delivered, 1);
+    assert_eq!(report.provider_effects.queue_full, 1);
+    assert_eq!(runtime.state(), ProviderRuntimeState::Closing);
+    assert!(binding_cancellation.is_cancelled());
+    assert!(matches!(
+        runtime.try_recv(),
+        Err(TryRecvError::Disconnected)
+    ));
+    assert!(client.snapshot().available_providers.is_empty());
+
+    let detached = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&detached);
+    assert_eq!(runtime.state(), ProviderRuntimeState::Closed);
+    for _ in 0..2 {
+        let ToolCompletionDelivery::Completion(completion) = completions.try_recv().unwrap() else {
+            panic!("expected fail-closed provider completion");
+        };
+        assert!(matches!(
+            completion.outcome,
+            CapabilityTerminalOutcome::ProviderDetached {
+                cancellation: CancellationDisposition::ProviderDetachedUnconfirmed,
+            }
+        ));
+    }
+
+    let replacement =
+        attach_provider_runtime(&mut kernel, &port, &provider_authority, provider_id(), 2);
+    assert_ne!(replacement.binding_id(), old_binding);
+}
+
+#[test]
+fn earlier_revoke_is_reduced_before_later_provider_success() {
+    let (gate, authority, port) = bounded_control_plane(16);
+    let client = authority
+        .bind_client(ToolActorId::new("agent.revoke-order").unwrap())
+        .unwrap();
+    let completions = client.subscribe_completions(2);
+    let mut kernel = Gate4AgentKernel::with_tool_providers(
+        gate4agent_catalog::builtin_registry().clone(),
+        [provider()],
+    )
+    .unwrap();
+    let provider_authority = port.provider_authority();
+    let runtime = provider_authority.bind_provider(provider_id(), 4).unwrap();
+    let generation = start_running(&mut kernel, &gate, &port);
+    let policy = grant(&client, generation, GrantMode::Allow);
+    authority
+        .dispatch(ToolAuthorityCommand::SetGrant {
+            grant: policy.clone(),
+        })
+        .unwrap();
+    let grant_step = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&grant_step);
+
+    client.dispatch(request(1, generation)).unwrap();
+    let invoked = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&invoked);
+    let ProviderWork::Invoke(mut invocation) = runtime.try_recv().unwrap() else {
+        panic!("expected provider invocation");
+    };
+    let invocation_cancellation = invocation.cancellation_token();
+
+    authority
+        .dispatch(ToolAuthorityCommand::RevokeGrant { key: policy.key })
+        .unwrap();
+    runtime.try_succeed(&mut invocation, &result()).unwrap();
+    let ordered = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&ordered);
+    assert!(invocation_cancellation.is_cancelled());
+
+    let ToolCompletionDelivery::Completion(completion) = completions.try_recv().unwrap() else {
+        panic!("expected revoke completion");
+    };
+    assert!(matches!(
+        completion.outcome,
+        CapabilityTerminalOutcome::GrantRevoked { .. }
+    ));
+    assert_eq!(
+        runtime.try_recv_observation_outcome().unwrap().status,
+        ProviderObservationStatus::Ignored {
+            reason: ObservationIgnoredReason::RequestNotDispatched,
+        }
+    );
+    let ProviderWork::Cancel(cancellation) = runtime.try_recv().unwrap() else {
+        panic!("expected revoke cancellation");
+    };
+    assert_eq!(cancellation.reason(), InvocationCancelReason::GrantRevoked);
+    assert_eq!(runtime.state(), ProviderRuntimeState::Active);
+    assert!(!runtime.cancellation_token().is_cancelled());
+
+    authority
+        .dispatch(ToolAuthorityCommand::SetGrant {
+            grant: grant(&client, generation, GrantMode::Allow),
+        })
+        .unwrap();
+    let regranted = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&regranted);
+    client.dispatch(request(2, generation)).unwrap();
+    let next = kernel.step_control_plane(port.drain_ingress(8), []);
+    port.publish_step(&next);
+    assert!(matches!(runtime.try_recv(), Ok(ProviderWork::Invoke(_))));
+}
+
+#[test]
+fn dropped_attaching_runtime_is_retired_once_and_can_rebind() {
+    let (_gate, _authority, port) = bounded_control_plane(8);
+    let provider_authority = port.provider_authority();
+    let mut kernel = Gate4AgentKernel::with_tool_providers(
+        gate4agent_catalog::builtin_registry().clone(),
+        [provider()],
+    )
+    .unwrap();
+
+    let runtime = provider_authority.bind_provider(provider_id(), 2).unwrap();
+    let old_binding = runtime.binding_id();
+    drop(runtime);
+    let retired = kernel.step_control_plane(port.drain_ingress(8), []);
+    assert_eq!(retired.ingress_outcomes.len(), 2);
+    port.publish_step(&retired);
+    assert_eq!(provider_authority.active_binding_count(), 0);
+
+    let replacement =
+        attach_provider_runtime(&mut kernel, &port, &provider_authority, provider_id(), 2);
+    assert_ne!(replacement.binding_id(), old_binding);
 }
 
 #[test]
@@ -310,6 +607,29 @@ fn full_close_retry_does_not_block_authority_and_enqueues_close_once() {
 }
 
 #[test]
+fn registered_provider_without_local_runtime_is_rejected_before_ingress() {
+    let (_gate, authority, port) = bounded_control_plane(8);
+    let client = authority
+        .bind_client(ToolActorId::new("agent.no-runtime").unwrap())
+        .unwrap();
+    let mut kernel = Gate4AgentKernel::with_tool_providers(
+        gate4agent_catalog::builtin_registry().clone(),
+        [provider()],
+    )
+    .unwrap();
+    let initial = kernel.step_control_plane([], []);
+    port.publish_step(&initial);
+
+    assert_eq!(
+        client.dispatch(request(1, SessionGeneration(0))),
+        Err(ToolClientDispatchError::ProviderUnavailable {
+            provider_id: provider_id(),
+        })
+    );
+    assert!(port.drain_ingress(8).is_empty());
+}
+
+#[test]
 fn client_closed_completion_is_delivered_before_subscription_disconnect() {
     let (gate, authority, port) = bounded_control_plane(16);
     let client = authority
@@ -323,6 +643,8 @@ fn client_closed_completion_is_delivered_before_subscription_disconnect() {
         [provider()],
     )
     .unwrap();
+    let provider_authority = port.provider_authority();
+    let _provider_runtime = provider_authority.bind_provider(provider_id(), 2).unwrap();
     let generation = start_running(&mut kernel, &gate, &port);
 
     authority
@@ -330,12 +652,12 @@ fn client_closed_completion_is_delivered_before_subscription_disconnect() {
             grant: grant(&client, generation, GrantMode::RequireApproval),
         })
         .unwrap();
-    let granted = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let granted = kernel.step_control_plane(port.drain_ingress(8), []);
     port.publish_step(&granted);
     authority_subscription.try_recv().unwrap();
 
     client.dispatch(request(9, generation)).unwrap();
-    let awaiting = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let awaiting = kernel.step_control_plane(port.drain_ingress(8), []);
     assert!(awaiting.tool_effects.is_empty());
     port.publish_step(&awaiting);
 
@@ -344,7 +666,7 @@ fn client_closed_completion_is_delivered_before_subscription_disconnect() {
         clone.dispatch(request(10, generation)),
         Err(ToolClientDispatchError::Inactive)
     );
-    let closed = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let closed = kernel.step_control_plane(port.drain_ingress(8), []);
     let report = port.publish_step(&closed);
     assert_eq!(report.closed_clients, 1);
     assert!(matches!(
@@ -378,7 +700,7 @@ fn slow_scoped_subscribers_disconnect_and_exhaustion_gap_is_not_repeated() {
     client.dispatch(request(2, SessionGeneration(0))).unwrap();
 
     let mut kernel = Gate4AgentKernel::default();
-    let mut step = kernel.step_control_plane(port.drain_ingress(8), [], []);
+    let mut step = kernel.step_control_plane(port.drain_ingress(8), []);
     let report = port.publish_step(&step);
     assert_eq!(report.request_outcomes.disconnected_slow, 1);
     assert_eq!(report.completions.disconnected_slow, 1);

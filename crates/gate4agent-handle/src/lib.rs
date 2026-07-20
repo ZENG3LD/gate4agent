@@ -1,5 +1,15 @@
 //! Bounded in-process ports for the Gate4Agent backend control plane.
 
+mod provider_runtime;
+
+pub use provider_runtime::{
+    ProviderCancellation, ProviderCancellationToken, ProviderCompletionHandle,
+    ProviderEffectPublishReport, ProviderInvocation, ProviderObservationOutcome,
+    ProviderObservationStatus, ProviderRuntimeAuthorityHandle, ProviderRuntimeError,
+    ProviderRuntimeHandle, ProviderRuntimeState, ProviderWork, MAX_PROVIDER_EFFECT_CAPACITY,
+    MAX_PROVIDER_RUNTIMES,
+};
+
 use gate4agent_kernel::{
     BackendIngress, BackendIngressOutcome, BackendSnapshot, KernelStep,
     ToolAuthorityCommandOutcome, ToolRequestOutcome,
@@ -7,8 +17,9 @@ use gate4agent_kernel::{
 use gate4agent_tool_protocol::{
     CapabilityCompletionBatch, CapabilityCompletionEnvelope, CapabilityOwner,
     CapabilityProviderDescriptor, CapabilityRequestInput, CapabilityRequestSnapshot,
-    ConsumerBoundCapabilityRequest, ConsumerId, PolicyGrant, ToolActorId, ToolAuditEvent,
-    ToolAuthorityCommand, ToolAuthorityEnvelope, ToolAuthorityOutcome, ToolInstanceState,
+    ConsumerBoundCapabilityRequest, ConsumerId, PolicyGrant, ProviderBindingId,
+    ProviderBoundCapabilityRequest, ToolActorId, ToolAuditEvent, ToolAuthorityCommand,
+    ToolAuthorityEnvelope, ToolAuthorityOutcome, ToolInstanceState, ToolProviderId,
     CAPABILITY_PROTOCOL_VERSION,
 };
 use gate4agent_types::{
@@ -45,6 +56,7 @@ pub struct KernelPort {
 
 pub struct ControlPlaneKernelPort {
     ingress_rx: Receiver<BackendIngress>,
+    provider_runtime: provider_runtime::ProviderRuntimePort,
     edge: Arc<EdgeState>,
     authority: Arc<AuthorityState>,
 }
@@ -100,6 +112,7 @@ pub struct ToolClientSnapshot {
     pub generations: Vec<(AgentInstanceId, SessionGeneration)>,
     pub instance_states: Vec<(AgentInstanceId, ToolInstanceState)>,
     pub providers: Vec<CapabilityProviderDescriptor>,
+    pub available_providers: Vec<ToolProviderId>,
     pub grants: Vec<PolicyGrant>,
     pub requests: Vec<CapabilityRequestSnapshot>,
     pub audit_events: Vec<ToolAuditEvent>,
@@ -122,6 +135,7 @@ pub struct ControlPlanePublishReport {
     pub request_outcomes: PublishReport,
     pub authority_outcomes: PublishReport,
     pub completions: PublishReport,
+    pub provider_effects: ProviderEffectPublishReport,
     pub closed_clients: usize,
 }
 
@@ -133,10 +147,12 @@ pub enum PortDispatchError {
     Disconnected,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ToolClientDispatchError {
     #[error("tool client is not active")]
     Inactive,
+    #[error("tool provider '{provider_id}' has no active local runtime binding")]
+    ProviderUnavailable { provider_id: ToolProviderId },
     #[error("gate4agent backend ingress is full")]
     Full,
     #[error("gate4agent backend ingress is disconnected")]
@@ -168,9 +184,15 @@ enum GateIngressSender {
 }
 
 struct EdgeState {
-    snapshot: RwLock<Arc<BackendSnapshot>>,
+    publication: RwLock<EdgePublication>,
     control_subscribers: Mutex<Vec<SyncSender<ControlEvent>>>,
     completion_health: Mutex<CompletionPublishHealth>,
+}
+
+#[derive(Clone)]
+struct EdgePublication {
+    snapshot: Arc<BackendSnapshot>,
+    available_provider_bindings: BTreeMap<ToolProviderId, ProviderBindingId>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -234,6 +256,8 @@ pub fn bounded_control_plane(
     ControlPlaneKernelPort,
 ) {
     let (ingress_tx, ingress_rx) = sync_channel(bounded_ingress_capacity(ingress_capacity));
+    let (_provider_authority, provider_runtime) =
+        provider_runtime::provider_runtime(ingress_tx.clone());
     let edge = Arc::new(EdgeState::new());
     let authority = Arc::new(AuthorityState {
         ingress_tx: ingress_tx.clone(),
@@ -256,6 +280,7 @@ pub fn bounded_control_plane(
         },
         ControlPlaneKernelPort {
             ingress_rx,
+            provider_runtime,
             edge,
             authority,
         },
@@ -312,6 +337,7 @@ impl KernelPort {
             logical_tick: current.logical_tick,
             control: Arc::new(snapshot),
             tools: Arc::clone(&current.tools),
+            provider_runtime: current.provider_runtime.clone(),
         });
     }
 
@@ -324,11 +350,12 @@ impl KernelPort {
 
 impl ControlPlaneKernelPort {
     pub fn drain_ingress(&self, limit: usize) -> Vec<BackendIngress> {
+        self.provider_runtime.flush_closing_bindings();
         drain_receiver(&self.ingress_rx, limit)
     }
 
-    pub fn publish_backend_snapshot(&self, snapshot: BackendSnapshot) {
-        self.edge.publish_snapshot(snapshot);
+    pub fn provider_authority(&self) -> ProviderRuntimeAuthorityHandle {
+        self.provider_runtime.authority_handle()
     }
 
     pub fn publish_events(&self, events: impl IntoIterator<Item = ControlEvent>) -> PublishReport {
@@ -337,15 +364,30 @@ impl ControlPlaneKernelPort {
 
     /// Publishes one already-reduced kernel step in a fixed edge order.
     ///
-    /// The immutable combined snapshot is replaced first. Request and
-    /// authority outcomes follow in ingress order, then control events, then
-    /// exact scoped completions and their trailing source-gap marker. A
-    /// successfully closed client's subscriptions are disconnected only after
-    /// its `ClientClosed` completions have been offered.
+    /// Provider outcomes and effects first reconcile the private executor
+    /// boundary. The immutable combined snapshot is then replaced before
+    /// request/authority outcomes, control events, exact scoped completions,
+    /// and their trailing source-gap marker. A successfully closed client's
+    /// subscriptions are disconnected only after its `ClientClosed`
+    /// completions have been offered.
     pub fn publish_step(&self, step: &KernelStep) -> ControlPlanePublishReport {
-        self.publish_backend_snapshot(step.backend_snapshot.clone());
-
         let mut report = ControlPlanePublishReport::default();
+        for outcome in &step.ingress_outcomes {
+            if let BackendIngressOutcome::ToolProvider(outcome) = outcome {
+                self.provider_runtime.publish_outcome(outcome);
+            }
+        }
+        for effect in step.tool_effects.iter().cloned() {
+            report.provider_effects += self.provider_runtime.publish_effect(effect);
+        }
+        self.provider_runtime.finish_step();
+        self.provider_runtime
+            .reconcile_snapshot(&step.backend_snapshot.provider_runtime);
+        self.edge.publish_control_plane(
+            step.backend_snapshot.clone(),
+            self.provider_runtime.active_bindings(),
+        );
+
         let mut completed_closes = Vec::new();
         for outcome in &step.ingress_outcomes {
             match outcome {
@@ -361,6 +403,7 @@ impl ControlPlaneKernelPort {
                         completed_closes.push(client);
                     }
                 }
+                BackendIngressOutcome::ToolProvider(_) => {}
             }
         }
 
@@ -721,6 +764,23 @@ impl ToolClientHandle {
             inner.lifecycle = ClientLifecycle::Closed;
             return Err(ToolClientDispatchError::Disconnected);
         };
+        let publication = self.state.edge.load_publication();
+        let provider_id = &request.provider_id;
+        let provider_is_registered = publication
+            .snapshot
+            .tools
+            .providers
+            .iter()
+            .any(|provider| &provider.id == provider_id);
+        let provider_binding_id = publication
+            .available_provider_bindings
+            .get(provider_id)
+            .copied();
+        if provider_is_registered && provider_binding_id.is_none() {
+            return Err(ToolClientDispatchError::ProviderUnavailable {
+                provider_id: provider_id.clone(),
+            });
+        }
         let envelope = ConsumerBoundCapabilityRequest::new(
             self.state.consumer_id.clone(),
             self.state.actor_id.clone(),
@@ -729,7 +789,9 @@ impl ToolClientHandle {
         let request_key = envelope.key();
         authority
             .ingress_tx
-            .try_send(BackendIngress::ToolRequest(envelope))
+            .try_send(BackendIngress::ToolRequest(
+                ProviderBoundCapabilityRequest::new(provider_binding_id, envelope),
+            ))
             .map_err(|error| match error {
                 TrySendError::Full(_) => ToolClientDispatchError::Full,
                 TrySendError::Disconnected(_) => ToolClientDispatchError::Disconnected,
@@ -738,7 +800,9 @@ impl ToolClientHandle {
     }
 
     pub fn snapshot(&self) -> Arc<ToolClientSnapshot> {
-        let snapshot = self.state.edge.load_snapshot();
+        let publication = self.state.edge.load_publication();
+        let snapshot = publication.snapshot;
+        let available_provider_bindings = publication.available_provider_bindings;
         let tools = &snapshot.tools;
         let consumer_id = &self.state.consumer_id;
         let actor_id = &self.state.actor_id;
@@ -789,6 +853,19 @@ impl ToolClientHandle {
                     CapabilityOwner::Consumer(owner) => owner == consumer_id,
                 })
                 .cloned()
+                .collect(),
+            available_providers: available_provider_bindings
+                .iter()
+                .filter(|(provider_id, _)| {
+                    tools.providers.iter().any(|provider| {
+                        &provider.id == *provider_id
+                            && match &provider.owner {
+                                CapabilityOwner::Gate => true,
+                                CapabilityOwner::Consumer(owner) => owner == consumer_id,
+                            }
+                    })
+                })
+                .map(|(provider_id, _)| provider_id.clone())
                 .collect(),
             grants,
             requests,
@@ -868,24 +945,51 @@ impl ToolAuthorityOutcomeSubscription {
 impl EdgeState {
     fn new() -> Self {
         Self {
-            snapshot: RwLock::new(Arc::new(BackendSnapshot::default())),
+            publication: RwLock::new(EdgePublication {
+                snapshot: Arc::new(BackendSnapshot::default()),
+                available_provider_bindings: BTreeMap::new(),
+            }),
             control_subscribers: Mutex::new(Vec::new()),
             completion_health: Mutex::new(CompletionPublishHealth::default()),
         }
     }
 
     fn load_snapshot(&self) -> Arc<BackendSnapshot> {
-        self.snapshot
+        Arc::clone(
+            &self
+                .publication
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot,
+        )
+    }
+
+    fn load_publication(&self) -> EdgePublication {
+        self.publication
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
     fn publish_snapshot(&self, snapshot: BackendSnapshot) {
-        *self
-            .snapshot
+        self.publication
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(snapshot);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot = Arc::new(snapshot);
+    }
+
+    fn publish_control_plane(
+        &self,
+        snapshot: BackendSnapshot,
+        available_provider_bindings: BTreeMap<ToolProviderId, ProviderBindingId>,
+    ) {
+        *self
+            .publication
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = EdgePublication {
+            snapshot: Arc::new(snapshot),
+            available_provider_bindings,
+        };
     }
 }
 

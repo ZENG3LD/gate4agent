@@ -7,10 +7,12 @@ use gate4agent_catalog::{
 use gate4agent_engine::Gate4AgentEngine;
 use gate4agent_tool_engine::{ToolEngine, ToolEngineError};
 use gate4agent_tool_protocol::{
-    CapabilityCompletionBatch, CapabilityEffectEnvelope, CapabilityObservationEnvelope,
-    CapabilityProviderDescriptor, CapabilityRequestKey, ConsumerBoundCapabilityRequest,
-    PolicyDecision, ToolAuthorityEnvelope, ToolAuthorityOutcome, ToolEngineSnapshot,
-    ToolInstanceState,
+    CapabilityCompletionBatch, CapabilityObservationDisposition, CapabilityProviderDescriptor,
+    CapabilityRequestKey, ObservationIgnoredReason, PolicyDecision, ProviderBindingId,
+    ProviderBoundCapabilityEffectEnvelope, ProviderBoundCapabilityRequest,
+    ProviderRuntimeBindingSnapshot, ProviderRuntimeCommand, ProviderRuntimeEnvelope,
+    ProviderRuntimeSnapshot, ToolAuthorityEnvelope, ToolAuthorityOutcome, ToolEngineSnapshot,
+    ToolInstanceState, ToolProviderId, ToolValidationError,
 };
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId,
@@ -18,16 +20,22 @@ use gate4agent_types::{
     InputAction, ObservationEnvelope, PipeProtocol, ProviderSource, SessionStatus, TransportKind,
     CONTROL_PROTOCOL_VERSION,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Trusted in-process ingress for the single-writer backend reducer.
+///
+/// Network and IPC shells must authenticate and bind connection-owned
+/// identities before constructing these values. This enum is not itself a
+/// transport authorization boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendIngress {
     Control(CommandEnvelope),
-    ToolRequest(ConsumerBoundCapabilityRequest),
+    ToolRequest(ProviderBoundCapabilityRequest),
     ToolAuthority(ToolAuthorityEnvelope),
+    ToolProvider(ProviderRuntimeEnvelope),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,20 +56,85 @@ pub enum BackendIngressOutcome {
     Control(CommandOutcome),
     ToolRequest(ToolRequestOutcome),
     ToolAuthority(ToolAuthorityCommandOutcome),
+    ToolProvider(ProviderRuntimeCommandOutcome),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ToolObservationOutcome {
-    pub operation_id: gate4agent_tool_protocol::ToolOperationId,
-    pub request_key: CapabilityRequestKey,
-    pub result: Result<(), KernelToolError>,
+pub struct ProviderRuntimeCommandOutcome {
+    pub sequence: u64,
+    pub binding_id: ProviderBindingId,
+    pub provider_id: ToolProviderId,
+    pub result: Result<ProviderRuntimeTransition, KernelProviderError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderRuntimeTransition {
+    Attached,
+    Detached {
+        closed_request_count: usize,
+    },
+    ObservationApplied {
+        operation_id: gate4agent_tool_protocol::ToolOperationId,
+        request_key: CapabilityRequestKey,
+    },
+    ObservationIgnored {
+        operation_id: gate4agent_tool_protocol::ToolOperationId,
+        request_key: CapabilityRequestKey,
+        reason: ObservationIgnoredReason,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum KernelToolError {
     #[error(transparent)]
     Engine(#[from] ToolEngineError),
+    #[error(transparent)]
+    Validation(#[from] ToolValidationError),
+    #[error("tool provider '{provider_id}' has no active runtime binding")]
+    ProviderUnavailable { provider_id: ToolProviderId },
+    #[error(
+        "tool request targets provider '{provider_id}' binding {requested:?}, current binding is {current:?}"
+    )]
+    ProviderBindingMismatch {
+        provider_id: ToolProviderId,
+        current: ProviderBindingId,
+        requested: Option<ProviderBindingId>,
+    },
     #[error("tool lane is blocked by a control/tool integration failure")]
+    IntegrationBlocked,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum KernelProviderError {
+    #[error(transparent)]
+    Validation(#[from] gate4agent_tool_protocol::ToolValidationError),
+    #[error("tool provider runtime sequence is exhausted")]
+    SequenceExhausted,
+    #[error("tool provider runtime sequence regressed from {current} to {requested}")]
+    SequenceRegressed { current: u64, requested: u64 },
+    #[error("tool provider '{provider_id}' is not registered")]
+    UnknownProvider { provider_id: ToolProviderId },
+    #[error("attach binding {binding_id:?} must equal provider runtime sequence {sequence}")]
+    InvalidAttachBinding {
+        sequence: u64,
+        binding_id: ProviderBindingId,
+    },
+    #[error("tool provider '{provider_id}' is already attached as binding {binding_id:?}")]
+    AlreadyAttached {
+        provider_id: ToolProviderId,
+        binding_id: ProviderBindingId,
+    },
+    #[error("tool provider '{provider_id}' has no active runtime binding")]
+    NotAttached { provider_id: ToolProviderId },
+    #[error("tool provider '{provider_id}' is attached as {current:?}, not {requested:?}")]
+    BindingMismatch {
+        provider_id: ToolProviderId,
+        current: ProviderBindingId,
+        requested: ProviderBindingId,
+    },
+    #[error(transparent)]
+    Engine(#[from] ToolEngineError),
+    #[error("tool provider lane is blocked by a control/tool integration failure")]
     IntegrationBlocked,
 }
 
@@ -90,6 +163,13 @@ pub enum KernelIntegrationError {
         #[source]
         source: ToolEngineError,
     },
+    #[error(
+        "tool effect {operation_id:?} targets provider '{provider_id}' without an active runtime binding"
+    )]
+    ToolEffectProviderUnbound {
+        operation_id: gate4agent_tool_protocol::ToolOperationId,
+        provider_id: ToolProviderId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +178,7 @@ pub struct BackendSnapshot {
     pub logical_tick: u64,
     pub control: Arc<ControlSnapshot>,
     pub tools: Arc<ToolEngineSnapshot>,
+    pub provider_runtime: ProviderRuntimeSnapshot,
 }
 
 impl Default for BackendSnapshot {
@@ -112,6 +193,11 @@ impl Default for BackendSnapshot {
                 sessions: Vec::new(),
             }),
             tools: Arc::new(ToolEngine::new().snapshot()),
+            provider_runtime: ProviderRuntimeSnapshot {
+                last_sequence: 0,
+                sequence_exhausted: false,
+                bindings: Vec::new(),
+            },
         }
     }
 }
@@ -162,8 +248,7 @@ pub struct KernelStep {
     pub snapshot: ControlSnapshot,
     pub events: Vec<ControlEvent>,
     pub ingress_outcomes: Vec<BackendIngressOutcome>,
-    pub tool_observation_outcomes: Vec<ToolObservationOutcome>,
-    pub tool_effects: Vec<CapabilityEffectEnvelope>,
+    pub tool_effects: Vec<ProviderBoundCapabilityEffectEnvelope>,
     pub tool_completions: CapabilityCompletionBatch,
     pub backend_snapshot: BackendSnapshot,
     pub integration_errors: Vec<KernelIntegrationError>,
@@ -173,12 +258,16 @@ pub struct KernelStep {
 ///
 /// Phase order is fixed: clock advance, ordered ingress, control observations,
 /// tool observations, effect/completion drains, atomic snapshot, then ordered
-/// event drain. No phase awaits or performs external work.
-#[derive(Clone)]
+/// event drain. No phase awaits or performs external work. The kernel is
+/// intentionally not cloneable: cloning would fork provider binding and
+/// sequence authority while preserving otherwise valid runtime identities.
 pub struct Gate4AgentKernel {
     catalog: AgentRegistry,
     engine: Gate4AgentEngine,
     tool_engine: ToolEngine,
+    provider_bindings: BTreeMap<ToolProviderId, ProviderBindingId>,
+    last_provider_sequence: u64,
+    provider_sequence_exhausted: bool,
     logical_tick: u64,
     backend_revision: u64,
 }
@@ -190,6 +279,7 @@ impl fmt::Debug for Gate4AgentKernel {
             .field("catalog", &self.catalog)
             .field("engine", &self.engine)
             .field("tools", &self.tool_engine.snapshot())
+            .field("provider_runtime", &self.provider_runtime_snapshot())
             .field("logical_tick", &self.logical_tick)
             .field("backend_revision", &self.backend_revision)
             .finish()
@@ -202,6 +292,9 @@ impl Gate4AgentKernel {
             catalog,
             engine: Gate4AgentEngine::new(),
             tool_engine: ToolEngine::new(),
+            provider_bindings: BTreeMap::new(),
+            last_provider_sequence: 0,
+            provider_sequence_exhausted: false,
             logical_tick: 0,
             backend_revision: 0,
         }
@@ -230,7 +323,6 @@ impl Gate4AgentKernel {
         self.step_control_plane(
             commands.into_iter().map(BackendIngress::Control),
             observations,
-            std::iter::empty(),
         )
     }
 
@@ -239,26 +331,23 @@ impl Gate4AgentKernel {
     /// The phase order is fixed: advance the kernel-owned logical clock;
     /// reduce ordered control/tool ingress; reduce control observations while
     /// synchronizing the affected tool instance after every observation;
-    /// reduce tool observations; then drain effects, completions, snapshots,
-    /// and events. A tool integration failure blocks tool ingress and effect
-    /// release for the rest of the tick.
+    /// reduce provider-bound tool observations; then drain effects,
+    /// completions, snapshots, and events. A tool integration failure blocks
+    /// tool ingress and effect release for the rest of the tick.
     pub fn step_control_plane(
         &mut self,
         ingress: impl IntoIterator<Item = BackendIngress>,
         control_observations: impl IntoIterator<Item = ObservationEnvelope>,
-        tool_observations: impl IntoIterator<Item = CapabilityObservationEnvelope>,
     ) -> KernelStep {
         let ingress = ingress.into_iter().collect::<Vec<_>>();
         let control_observations = control_observations.into_iter().collect::<Vec<_>>();
-        let tool_observations = tool_observations.into_iter().collect::<Vec<_>>();
 
         if let Err(error) = self.advance_backend_clock() {
-            return self.blocked_step(ingress, tool_observations, error);
+            return self.blocked_step(ingress, error);
         }
 
         let mut command_outcomes = Vec::new();
         let mut ingress_outcomes = Vec::new();
-        let mut tool_observation_outcomes = Vec::new();
         let mut integration_errors = Vec::new();
         let mut control_lane_open = true;
         let mut tool_lane_open = true;
@@ -311,12 +400,32 @@ impl Gate4AgentKernel {
                         );
                     }
                 }
-                BackendIngress::ToolRequest(request) => {
-                    let request_key = request.key();
-                    let result = if tool_lane_open {
-                        self.tool_engine.request(request).map_err(Into::into)
-                    } else {
+                BackendIngress::ToolRequest(bound_request) => {
+                    let request_key = bound_request.key();
+                    let provider_id = bound_request.request.request.provider_id.clone();
+                    let result = if !tool_lane_open {
                         Err(KernelToolError::IntegrationBlocked)
+                    } else if let Err(error) = bound_request.validate_provider_binding() {
+                        Err(KernelToolError::Validation(error))
+                    } else if self.tool_engine.provider_exists(&provider_id) {
+                        match self.provider_bindings.get(&provider_id).copied() {
+                            None => Err(KernelToolError::ProviderUnavailable { provider_id }),
+                            Some(current) if bound_request.provider_binding_id != Some(current) => {
+                                Err(KernelToolError::ProviderBindingMismatch {
+                                    provider_id,
+                                    current,
+                                    requested: bound_request.provider_binding_id,
+                                })
+                            }
+                            Some(_) => self
+                                .tool_engine
+                                .request(bound_request.request)
+                                .map_err(Into::into),
+                        }
+                    } else {
+                        self.tool_engine
+                            .request(bound_request.request)
+                            .map_err(Into::into)
                     };
                     let accepted_sequence = result.as_ref().ok().and_then(|_| {
                         self.tool_engine
@@ -341,6 +450,10 @@ impl Gate4AgentKernel {
                     ingress_outcomes.push(BackendIngressOutcome::ToolAuthority(
                         ToolAuthorityCommandOutcome { sequence, result },
                     ));
+                }
+                BackendIngress::ToolProvider(envelope) => {
+                    let outcome = self.apply_provider_runtime(envelope, tool_lane_open);
+                    ingress_outcomes.push(BackendIngressOutcome::ToolProvider(outcome));
                 }
             }
         }
@@ -367,26 +480,15 @@ impl Gate4AgentKernel {
             );
         }
 
-        for observation in tool_observations {
-            let operation_id = observation.operation_id;
-            let request_key = observation.request_key.clone();
-            let result = if tool_lane_open {
-                self.tool_engine
-                    .apply_observation(observation)
-                    .map_err(Into::into)
-            } else {
-                Err(KernelToolError::IntegrationBlocked)
-            };
-            tool_observation_outcomes.push(ToolObservationOutcome {
-                operation_id,
-                request_key,
-                result,
-            });
-        }
-
         let effects = self.engine.drain_effects();
         let tool_effects = if tool_lane_open {
-            self.tool_engine.drain_effects()
+            match self.drain_bound_tool_effects() {
+                Ok(effects) => effects,
+                Err(error) => {
+                    integration_errors.push(error);
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -401,7 +503,6 @@ impl Gate4AgentKernel {
             snapshot,
             events,
             ingress_outcomes,
-            tool_observation_outcomes,
             tool_effects,
             tool_completions,
             backend_snapshot,
@@ -423,11 +524,186 @@ impl Gate4AgentKernel {
             logical_tick: self.logical_tick,
             control: Arc::new(self.engine.snapshot()),
             tools: Arc::new(self.tool_engine.snapshot()),
+            provider_runtime: self.provider_runtime_snapshot(),
         }
     }
 
     pub fn catalog(&self) -> &AgentRegistry {
         &self.catalog
+    }
+
+    fn provider_runtime_snapshot(&self) -> ProviderRuntimeSnapshot {
+        ProviderRuntimeSnapshot {
+            last_sequence: self.last_provider_sequence,
+            sequence_exhausted: self.provider_sequence_exhausted,
+            bindings: self
+                .provider_bindings
+                .iter()
+                .map(|(provider_id, binding_id)| ProviderRuntimeBindingSnapshot {
+                    binding_id: *binding_id,
+                    provider_id: provider_id.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn apply_provider_runtime(
+        &mut self,
+        envelope: ProviderRuntimeEnvelope,
+        tool_lane_open: bool,
+    ) -> ProviderRuntimeCommandOutcome {
+        let sequence = envelope.sequence;
+        let (binding_id, provider_id) = provider_runtime_subject(&envelope.command);
+        let mut result = self.reduce_provider_runtime(envelope, tool_lane_open);
+        if self.provider_sequence_exhausted {
+            if let Err(error) = self.retire_exhausted_provider_bindings() {
+                result = Err(KernelProviderError::Engine(error));
+            }
+        }
+        ProviderRuntimeCommandOutcome {
+            sequence,
+            binding_id,
+            provider_id,
+            result,
+        }
+    }
+
+    fn retire_exhausted_provider_bindings(&mut self) -> Result<(), ToolEngineError> {
+        let provider_ids = self.provider_bindings.keys().cloned().collect::<Vec<_>>();
+        for provider_id in provider_ids {
+            self.tool_engine.detach_provider_runtime(&provider_id)?;
+            self.provider_bindings.remove(&provider_id);
+        }
+        Ok(())
+    }
+
+    fn reduce_provider_runtime(
+        &mut self,
+        envelope: ProviderRuntimeEnvelope,
+        tool_lane_open: bool,
+    ) -> Result<ProviderRuntimeTransition, KernelProviderError> {
+        envelope.validate()?;
+        if self.provider_sequence_exhausted {
+            return Err(KernelProviderError::SequenceExhausted);
+        }
+        if envelope.sequence <= self.last_provider_sequence {
+            return Err(KernelProviderError::SequenceRegressed {
+                current: self.last_provider_sequence,
+                requested: envelope.sequence,
+            });
+        }
+
+        self.last_provider_sequence = envelope.sequence;
+        if envelope.sequence == u64::MAX {
+            self.provider_sequence_exhausted = true;
+        }
+        if !tool_lane_open {
+            return Err(KernelProviderError::IntegrationBlocked);
+        }
+
+        match envelope.command {
+            ProviderRuntimeCommand::Attach {
+                binding_id,
+                provider_id,
+            } => {
+                if binding_id.0 != envelope.sequence {
+                    return Err(KernelProviderError::InvalidAttachBinding {
+                        sequence: envelope.sequence,
+                        binding_id,
+                    });
+                }
+                if !self.tool_engine.provider_exists(&provider_id) {
+                    return Err(KernelProviderError::UnknownProvider { provider_id });
+                }
+                if let Some(current) = self.provider_bindings.get(&provider_id).copied() {
+                    return Err(KernelProviderError::AlreadyAttached {
+                        provider_id,
+                        binding_id: current,
+                    });
+                }
+                self.provider_bindings.insert(provider_id, binding_id);
+                Ok(ProviderRuntimeTransition::Attached)
+            }
+            ProviderRuntimeCommand::Detach {
+                binding_id,
+                provider_id,
+            } => {
+                if !self.tool_engine.provider_exists(&provider_id) {
+                    return Err(KernelProviderError::UnknownProvider { provider_id });
+                }
+                self.require_provider_binding(&provider_id, binding_id)?;
+                let closed_request_count =
+                    self.tool_engine.detach_provider_runtime(&provider_id)?;
+                self.provider_bindings.remove(&provider_id);
+                Ok(ProviderRuntimeTransition::Detached {
+                    closed_request_count,
+                })
+            }
+            ProviderRuntimeCommand::Observe {
+                binding_id,
+                observation,
+            } => {
+                let provider_id = observation.provider_id.clone();
+                if !self.tool_engine.provider_exists(&provider_id) {
+                    return Err(KernelProviderError::UnknownProvider { provider_id });
+                }
+                self.require_provider_binding(&provider_id, binding_id)?;
+                let operation_id = observation.operation_id;
+                let request_key = observation.request_key.clone();
+                match self.tool_engine.apply_observation(observation)? {
+                    CapabilityObservationDisposition::Applied => {
+                        Ok(ProviderRuntimeTransition::ObservationApplied {
+                            operation_id,
+                            request_key,
+                        })
+                    }
+                    CapabilityObservationDisposition::Ignored { reason } => {
+                        Ok(ProviderRuntimeTransition::ObservationIgnored {
+                            operation_id,
+                            request_key,
+                            reason,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    fn require_provider_binding(
+        &self,
+        provider_id: &ToolProviderId,
+        requested: ProviderBindingId,
+    ) -> Result<(), KernelProviderError> {
+        let Some(current) = self.provider_bindings.get(provider_id).copied() else {
+            return Err(KernelProviderError::NotAttached {
+                provider_id: provider_id.clone(),
+            });
+        };
+        if current != requested {
+            return Err(KernelProviderError::BindingMismatch {
+                provider_id: provider_id.clone(),
+                current,
+                requested,
+            });
+        }
+        Ok(())
+    }
+
+    fn drain_bound_tool_effects(
+        &mut self,
+    ) -> Result<Vec<ProviderBoundCapabilityEffectEnvelope>, KernelIntegrationError> {
+        let effects = self.tool_engine.drain_effects();
+        let mut bound = Vec::with_capacity(effects.len());
+        for effect in effects {
+            let Some(binding_id) = self.provider_bindings.get(&effect.provider_id).copied() else {
+                return Err(KernelIntegrationError::ToolEffectProviderUnbound {
+                    operation_id: effect.operation_id,
+                    provider_id: effect.provider_id,
+                });
+            };
+            bound.push(ProviderBoundCapabilityEffectEnvelope { binding_id, effect });
+        }
+        Ok(bound)
     }
 
     fn advance_backend_clock(&mut self) -> Result<(), KernelIntegrationError> {
@@ -532,7 +808,6 @@ impl Gate4AgentKernel {
     fn blocked_step(
         &self,
         ingress: Vec<BackendIngress>,
-        tool_observations: Vec<CapabilityObservationEnvelope>,
         reason: KernelIntegrationError,
     ) -> KernelStep {
         let mut command_outcomes = Vec::new();
@@ -564,16 +839,19 @@ impl Gate4AgentKernel {
                         },
                     ));
                 }
+                BackendIngress::ToolProvider(envelope) => {
+                    let (binding_id, provider_id) = provider_runtime_subject(&envelope.command);
+                    ingress_outcomes.push(BackendIngressOutcome::ToolProvider(
+                        ProviderRuntimeCommandOutcome {
+                            sequence: envelope.sequence,
+                            binding_id,
+                            provider_id,
+                            result: Err(KernelProviderError::IntegrationBlocked),
+                        },
+                    ));
+                }
             }
         }
-        let tool_observation_outcomes = tool_observations
-            .into_iter()
-            .map(|observation| ToolObservationOutcome {
-                operation_id: observation.operation_id,
-                request_key: observation.request_key,
-                result: Err(KernelToolError::IntegrationBlocked),
-            })
-            .collect();
         let backend_snapshot = self.backend_snapshot();
         let snapshot = (*backend_snapshot.control).clone();
         let tool_completions = CapabilityCompletionBatch {
@@ -590,7 +868,6 @@ impl Gate4AgentKernel {
             snapshot,
             events: Vec::new(),
             ingress_outcomes,
-            tool_observation_outcomes,
             tool_effects: Vec::new(),
             tool_completions,
             backend_snapshot,
@@ -780,6 +1057,25 @@ impl Gate4AgentKernel {
     }
 }
 
+fn provider_runtime_subject(
+    command: &ProviderRuntimeCommand,
+) -> (ProviderBindingId, ToolProviderId) {
+    match command {
+        ProviderRuntimeCommand::Attach {
+            binding_id,
+            provider_id,
+        }
+        | ProviderRuntimeCommand::Detach {
+            binding_id,
+            provider_id,
+        } => (*binding_id, provider_id.clone()),
+        ProviderRuntimeCommand::Observe {
+            binding_id,
+            observation,
+        } => (*binding_id, observation.provider_id.clone()),
+    }
+}
+
 fn terminal_control_health_error(health: ControlHealth) -> Option<KernelIntegrationError> {
     (health.operation_id_exhausted
         || health.event_sequence_exhausted
@@ -842,10 +1138,12 @@ impl Default for Gate4AgentKernel {
 mod tests {
     use super::*;
     use gate4agent_tool_protocol::{
-        CapabilityClass, CapabilityDescriptor, CapabilityOwner, CapabilityRequestId,
-        CapabilityRequestInput, CapabilityTerminalOutcome, ConsumerId, GrantMode, PolicyDenial,
-        PolicyGrant, PolicyKey, ResourceScopeId, ToolActorId, ToolAuthorityCommand,
-        ToolCapabilityId, ToolProviderId, CAPABILITY_PROTOCOL_VERSION,
+        CancellationDisposition, CapabilityClass, CapabilityDescriptor, CapabilityObservation,
+        CapabilityObservationEnvelope, CapabilityOwner, CapabilityRequestId,
+        CapabilityRequestInput, CapabilityResult, CapabilityResultDelivery,
+        CapabilityResultMetadata, CapabilityTerminalOutcome, ConsumerBoundCapabilityRequest,
+        ConsumerId, GrantMode, PolicyDenial, PolicyGrant, PolicyKey, ResourceScopeId, ToolActorId,
+        ToolAuthorityCommand, ToolCapabilityId, ToolProviderId, CAPABILITY_PROTOCOL_VERSION,
     };
     use gate4agent_types::{
         AgentInstanceId, CapabilityProbeRequest, ControlObservation, HistoryQuery,
@@ -910,6 +1208,23 @@ mod tests {
         }
     }
 
+    fn other_tool_provider_id() -> ToolProviderId {
+        ToolProviderId::new("kernel-browser-provider-secondary").unwrap()
+    }
+
+    fn other_tool_provider() -> CapabilityProviderDescriptor {
+        CapabilityProviderDescriptor {
+            id: other_tool_provider_id(),
+            owner: CapabilityOwner::Gate,
+            capabilities: vec![CapabilityDescriptor::new(
+                ToolCapabilityId::new("browser.snapshot.secondary").unwrap(),
+                CapabilityClass::Browser,
+                "Return secondary page metadata",
+            )
+            .unwrap()],
+        }
+    }
+
     fn tool_request(
         local_id: u64,
         generation: SessionGeneration,
@@ -929,6 +1244,13 @@ mod tests {
                 payload: br#"{"scope":"active-page"}"#.to_vec(),
             },
         )
+    }
+
+    fn provider_bound_tool_request(
+        binding_id: Option<ProviderBindingId>,
+        request: ConsumerBoundCapabilityRequest,
+    ) -> ProviderBoundCapabilityRequest {
+        ProviderBoundCapabilityRequest::new(binding_id, request)
     }
 
     fn tool_policy_grant(generation: SessionGeneration) -> PolicyGrant {
@@ -952,6 +1274,62 @@ mod tests {
             sequence,
             command: ToolAuthorityCommand::SetGrant {
                 grant: tool_policy_grant(generation),
+            },
+        }
+    }
+
+    fn provider_runtime(sequence: u64, command: ProviderRuntimeCommand) -> BackendIngress {
+        BackendIngress::ToolProvider(ProviderRuntimeEnvelope {
+            protocol_version: CAPABILITY_PROTOCOL_VERSION,
+            sequence,
+            command,
+        })
+    }
+
+    fn attach_tool_provider(kernel: &mut Gate4AgentKernel, sequence: u64) -> ProviderBindingId {
+        let binding_id = ProviderBindingId(sequence);
+        let step = kernel.step_control_plane(
+            [provider_runtime(
+                sequence,
+                ProviderRuntimeCommand::Attach {
+                    binding_id,
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &step.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Ok(ProviderRuntimeTransition::Attached),
+                ..
+            })
+        ));
+        binding_id
+    }
+
+    fn successful_observation(
+        effect: &ProviderBoundCapabilityEffectEnvelope,
+    ) -> CapabilityObservationEnvelope {
+        CapabilityObservationEnvelope {
+            protocol_version: CAPABILITY_PROTOCOL_VERSION,
+            operation_id: effect.effect.operation_id,
+            request_key: effect.effect.request_key.clone(),
+            instance_id: effect.effect.instance_id,
+            generation: effect.effect.generation,
+            provider_id: effect.effect.provider_id.clone(),
+            observation: CapabilityObservation::Succeeded {
+                result: CapabilityResult {
+                    metadata: CapabilityResultMetadata {
+                        byte_len: 2,
+                        media_type: Some("application/json".to_owned()),
+                        truncated: false,
+                        redacted_summary: Some("provider result".to_owned()),
+                    },
+                    delivery: CapabilityResultDelivery::Inline {
+                        bytes: b"{}".to_vec(),
+                    },
+                },
             },
         }
     }
@@ -1722,6 +2100,7 @@ mod tests {
         let mut kernel =
             Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
                 .unwrap();
+        attach_tool_provider(&mut kernel, 1);
         let starting = kernel.step(
             [
                 register(1, "claude"),
@@ -1745,9 +2124,9 @@ mod tests {
         );
         let spawn = starting.effects[0].clone();
         let step = kernel.step_control_plane(
-            [BackendIngress::ToolRequest(tool_request(
-                1,
-                spawn.generation,
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                Some(ProviderBindingId(1)),
+                tool_request(1, spawn.generation),
             ))],
             [ObservationEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -1758,7 +2137,6 @@ mod tests {
                     process_id: Some(123),
                 },
             }],
-            [],
         );
 
         let BackendIngressOutcome::ToolRequest(outcome) = &step.ingress_outcomes[0] else {
@@ -1787,15 +2165,18 @@ mod tests {
         let mut kernel =
             Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
                 .unwrap();
+        attach_tool_provider(&mut kernel, 1);
         let generation = start_running(&mut kernel);
         let request = tool_request(7, generation);
         let request_key = request.key();
         let step = kernel.step_control_plane(
             [
                 BackendIngress::ToolAuthority(tool_grant(generation, 1)),
-                BackendIngress::ToolRequest(request),
+                BackendIngress::ToolRequest(provider_bound_tool_request(
+                    Some(ProviderBindingId(1)),
+                    request,
+                )),
             ],
-            [],
             [],
         );
 
@@ -1813,11 +2194,10 @@ mod tests {
         assert!(outcome.accepted_sequence.is_some());
         assert_eq!(outcome.result, Ok(PolicyDecision::Allow));
         assert_eq!(step.tool_effects.len(), 1);
-        assert_eq!(step.tool_effects[0].request_key, request_key);
+        assert_eq!(step.tool_effects[0].effect.request_key, request_key);
 
         let regressed = kernel.step_control_plane(
             [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
-            [],
             [],
         );
         assert!(matches!(
@@ -1839,10 +2219,10 @@ mod tests {
         let mut kernel =
             Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
                 .unwrap();
+        attach_tool_provider(&mut kernel, 1);
         let generation = start_running(&mut kernel);
         let granted = kernel.step_control_plane(
             [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
-            [],
             [],
         );
         assert!(granted.integration_errors.is_empty());
@@ -1851,7 +2231,10 @@ mod tests {
 
         let stopped = kernel.step_control_plane(
             [
-                BackendIngress::ToolRequest(request),
+                BackendIngress::ToolRequest(provider_bound_tool_request(
+                    Some(ProviderBindingId(1)),
+                    request,
+                )),
                 BackendIngress::Control(command(
                     3,
                     ControlCommand::Stop {
@@ -1860,7 +2243,6 @@ mod tests {
                     },
                 )),
             ],
-            [],
             [],
         );
 
@@ -1902,7 +2284,6 @@ mod tests {
                 BackendIngress::Control(register(5, "claude")),
             ],
             [],
-            [],
         );
         assert!(step.integration_errors.is_empty());
         assert_eq!(step.snapshot.sessions.len(), 1);
@@ -1922,8 +2303,10 @@ mod tests {
         let mut kernel = Gate4AgentKernel::default();
         let generation = start_running(&mut kernel);
         let step = kernel.step_control_plane(
-            [BackendIngress::ToolRequest(tool_request(1, generation))],
-            [],
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                None,
+                tool_request(1, generation),
+            ))],
             [],
         );
         let BackendIngressOutcome::ToolRequest(outcome) = &step.ingress_outcomes[0] else {
@@ -1942,6 +2325,7 @@ mod tests {
         let mut kernel =
             Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
                 .unwrap();
+        attach_tool_provider(&mut kernel, 1);
         start_running(&mut kernel);
         let divergent_generation = SessionGeneration(99);
         kernel
@@ -1964,7 +2348,7 @@ mod tests {
             PolicyDecision::Allow
         );
 
-        let first = kernel.step_control_plane([], [], []);
+        let first = kernel.step_control_plane([], []);
         assert!(matches!(
             first.integration_errors[0],
             KernelIntegrationError::ToolInstanceSync {
@@ -1974,7 +2358,7 @@ mod tests {
         ));
         assert!(first.tool_effects.is_empty());
 
-        let second = kernel.step_control_plane([], [], []);
+        let second = kernel.step_control_plane([], []);
         assert!(matches!(
             second.integration_errors[0],
             KernelIntegrationError::ToolInstanceSync {
@@ -1983,6 +2367,625 @@ mod tests {
             }
         ));
         assert!(second.tool_effects.is_empty());
+    }
+
+    #[test]
+    fn known_unbound_provider_is_rejected_before_canonical_acceptance() {
+        let mut kernel =
+            Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
+                .unwrap();
+        let generation = start_running(&mut kernel);
+        let granted = kernel.step_control_plane(
+            [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
+            [],
+        );
+        assert!(granted.integration_errors.is_empty());
+
+        let step = kernel.step_control_plane(
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                None,
+                tool_request(1, generation),
+            ))],
+            [],
+        );
+        let BackendIngressOutcome::ToolRequest(outcome) = &step.ingress_outcomes[0] else {
+            panic!("expected tool request outcome");
+        };
+        assert_eq!(outcome.accepted_sequence, None);
+        assert!(matches!(
+            &outcome.result,
+            Err(KernelToolError::ProviderUnavailable { provider_id })
+                if provider_id == &tool_provider_id()
+        ));
+        assert!(step.backend_snapshot.tools.requests.is_empty());
+        assert!(step.tool_effects.is_empty());
+        assert!(step.tool_completions.completions.is_empty());
+    }
+
+    #[test]
+    fn attached_provider_round_trip_binds_effect_and_observation() {
+        let mut kernel =
+            Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
+                .unwrap();
+        let binding_id = attach_tool_provider(&mut kernel, 1);
+        let generation = start_running(&mut kernel);
+        kernel.step_control_plane(
+            [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
+            [],
+        );
+
+        let requested = kernel.step_control_plane(
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                Some(binding_id),
+                tool_request(1, generation),
+            ))],
+            [],
+        );
+        assert_eq!(requested.tool_effects.len(), 1);
+        let effect = requested.tool_effects[0].clone();
+        assert_eq!(effect.binding_id, binding_id);
+        effect.validate().unwrap();
+
+        let completed = kernel.step_control_plane(
+            [provider_runtime(
+                2,
+                ProviderRuntimeCommand::Observe {
+                    binding_id,
+                    observation: successful_observation(&effect),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &completed.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                sequence: 2,
+                binding_id: observed_binding,
+                provider_id,
+                result: Ok(ProviderRuntimeTransition::ObservationApplied { operation_id, request_key }),
+            }) if *observed_binding == binding_id
+                && provider_id == &tool_provider_id()
+                && *operation_id == effect.effect.operation_id
+                && request_key == &effect.effect.request_key
+        ));
+        assert!(matches!(
+            completed.tool_completions.completions[0].outcome,
+            CapabilityTerminalOutcome::Succeeded { .. }
+        ));
+        assert_eq!(completed.backend_snapshot.provider_runtime.last_sequence, 2);
+        assert_eq!(
+            completed.backend_snapshot.provider_runtime.bindings,
+            vec![ProviderRuntimeBindingSnapshot {
+                binding_id,
+                provider_id: tool_provider_id(),
+            }]
+        );
+    }
+
+    #[test]
+    fn provider_observation_cannot_cross_another_active_binding() {
+        let mut kernel = Gate4AgentKernel::with_tool_providers(
+            builtin_registry().clone(),
+            [tool_provider(), other_tool_provider()],
+        )
+        .unwrap();
+        let first_binding = attach_tool_provider(&mut kernel, 1);
+        let second_binding = ProviderBindingId(2);
+        let second_attach = kernel.step_control_plane(
+            [provider_runtime(
+                2,
+                ProviderRuntimeCommand::Attach {
+                    binding_id: second_binding,
+                    provider_id: other_tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &second_attach.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Ok(ProviderRuntimeTransition::Attached),
+                ..
+            })
+        ));
+
+        let generation = start_running(&mut kernel);
+        kernel.step_control_plane(
+            [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
+            [],
+        );
+        let requested = kernel.step_control_plane(
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                Some(first_binding),
+                tool_request(1, generation),
+            ))],
+            [],
+        );
+        let effect = requested.tool_effects[0].clone();
+
+        let rejected = kernel.step_control_plane(
+            [provider_runtime(
+                3,
+                ProviderRuntimeCommand::Observe {
+                    binding_id: second_binding,
+                    observation: successful_observation(&effect),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &rejected.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::BindingMismatch {
+                    current,
+                    requested,
+                    ..
+                }),
+                ..
+            }) if *current == first_binding && *requested == second_binding
+        ));
+        assert!(rejected.tool_completions.completions.is_empty());
+
+        let accepted = kernel.step_control_plane(
+            [provider_runtime(
+                4,
+                ProviderRuntimeCommand::Observe {
+                    binding_id: first_binding,
+                    observation: successful_observation(&effect),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &accepted.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Ok(ProviderRuntimeTransition::ObservationApplied { .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn detach_fences_late_results_and_rebinds_without_reusing_identity() {
+        let mut kernel =
+            Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
+                .unwrap();
+        let first_binding = attach_tool_provider(&mut kernel, 1);
+        let generation = start_running(&mut kernel);
+        kernel.step_control_plane(
+            [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
+            [],
+        );
+        let requested = kernel.step_control_plane(
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                Some(first_binding),
+                tool_request(1, generation),
+            ))],
+            [],
+        );
+        let old_effect = requested.tool_effects[0].clone();
+
+        let detached = kernel.step_control_plane(
+            [provider_runtime(
+                2,
+                ProviderRuntimeCommand::Detach {
+                    binding_id: first_binding,
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &detached.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Ok(ProviderRuntimeTransition::Detached {
+                    closed_request_count: 1,
+                }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            detached.tool_completions.completions[0].outcome,
+            CapabilityTerminalOutcome::ProviderDetached { .. }
+        ));
+        assert!(detached
+            .backend_snapshot
+            .provider_runtime
+            .bindings
+            .is_empty());
+        assert_eq!(detached.backend_snapshot.tools.grants.len(), 1);
+
+        let late = kernel.step_control_plane(
+            [provider_runtime(
+                3,
+                ProviderRuntimeCommand::Observe {
+                    binding_id: first_binding,
+                    observation: successful_observation(&old_effect),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &late.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::NotAttached { .. }),
+                ..
+            })
+        ));
+        assert!(late.tool_completions.completions.is_empty());
+
+        let rebound = attach_tool_provider(&mut kernel, 4);
+        assert_ne!(rebound, first_binding);
+        let old_binding_after_rebind = kernel.step_control_plane(
+            [provider_runtime(
+                5,
+                ProviderRuntimeCommand::Observe {
+                    binding_id: first_binding,
+                    observation: successful_observation(&old_effect),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &old_binding_after_rebind.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::BindingMismatch {
+                    current,
+                    requested,
+                    ..
+                }),
+                ..
+            }) if *current == rebound && *requested == first_binding
+        ));
+
+        let next = kernel.step_control_plane(
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                Some(rebound),
+                tool_request(2, generation),
+            ))],
+            [],
+        );
+        assert_eq!(next.tool_effects[0].binding_id, rebound);
+        let completed = kernel.step_control_plane(
+            [provider_runtime(
+                6,
+                ProviderRuntimeCommand::Observe {
+                    binding_id: rebound,
+                    observation: successful_observation(&next.tool_effects[0]),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            completed.tool_completions.completions[0].outcome,
+            CapabilityTerminalOutcome::Succeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn provider_request_admission_rejects_stale_missing_and_zero_bindings_without_mutation() {
+        let mut kernel =
+            Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
+                .unwrap();
+        let first_binding = attach_tool_provider(&mut kernel, 1);
+        let detached = kernel.step_control_plane(
+            [provider_runtime(
+                2,
+                ProviderRuntimeCommand::Detach {
+                    binding_id: first_binding,
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &detached.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Ok(ProviderRuntimeTransition::Detached { .. }),
+                ..
+            })
+        ));
+        let rebound = attach_tool_provider(&mut kernel, 3);
+        let generation = start_running(&mut kernel);
+        kernel.step_control_plane(
+            [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
+            [],
+        );
+
+        let cases = [
+            (Some(first_binding), 1_u64),
+            (None, 2_u64),
+            (Some(ProviderBindingId(0)), 3_u64),
+        ];
+        for (requested, local_id) in cases {
+            let step = kernel.step_control_plane(
+                [BackendIngress::ToolRequest(provider_bound_tool_request(
+                    requested,
+                    tool_request(local_id, generation),
+                ))],
+                [],
+            );
+            let BackendIngressOutcome::ToolRequest(outcome) = &step.ingress_outcomes[0] else {
+                panic!("expected tool request outcome");
+            };
+            assert_eq!(outcome.accepted_sequence, None);
+            if requested == Some(ProviderBindingId(0)) {
+                assert!(matches!(
+                    &outcome.result,
+                    Err(KernelToolError::Validation(
+                        ToolValidationError::ZeroIdentifier {
+                            field: "provider binding id"
+                        }
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    &outcome.result,
+                    Err(KernelToolError::ProviderBindingMismatch {
+                        current,
+                        requested: rejected,
+                        ..
+                    }) if *current == rebound && *rejected == requested
+                ));
+            }
+            assert!(step.backend_snapshot.tools.requests.is_empty());
+            assert!(step.tool_effects.is_empty());
+            assert!(step.tool_completions.completions.is_empty());
+        }
+    }
+
+    #[test]
+    fn same_step_revoke_then_detach_never_releases_cancel_to_removed_binding() {
+        let mut kernel =
+            Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
+                .unwrap();
+        let binding_id = attach_tool_provider(&mut kernel, 1);
+        let generation = start_running(&mut kernel);
+        kernel.step_control_plane(
+            [BackendIngress::ToolAuthority(tool_grant(generation, 1))],
+            [],
+        );
+        let requested = kernel.step_control_plane(
+            [BackendIngress::ToolRequest(provider_bound_tool_request(
+                Some(binding_id),
+                tool_request(1, generation),
+            ))],
+            [],
+        );
+        assert_eq!(requested.tool_effects.len(), 1);
+
+        let reduced = kernel.step_control_plane(
+            [
+                BackendIngress::ToolAuthority(ToolAuthorityEnvelope {
+                    protocol_version: CAPABILITY_PROTOCOL_VERSION,
+                    sequence: 2,
+                    command: ToolAuthorityCommand::RevokeGrant {
+                        key: tool_policy_grant(generation).key,
+                    },
+                }),
+                provider_runtime(
+                    2,
+                    ProviderRuntimeCommand::Detach {
+                        binding_id,
+                        provider_id: tool_provider_id(),
+                    },
+                ),
+            ],
+            [],
+        );
+
+        assert!(reduced.integration_errors.is_empty());
+        assert!(reduced.tool_effects.is_empty());
+        assert!(reduced
+            .backend_snapshot
+            .provider_runtime
+            .bindings
+            .is_empty());
+        assert!(matches!(
+            reduced.tool_completions.completions[0].outcome,
+            CapabilityTerminalOutcome::GrantRevoked {
+                cancellation: CancellationDisposition::CancelQueuedUnconfirmed,
+            }
+        ));
+        assert!(matches!(
+            &reduced.ingress_outcomes[1],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Ok(ProviderRuntimeTransition::Detached {
+                    closed_request_count: 0,
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_sequence_rejection_reuse_and_exhaustion_are_explicit() {
+        let mut kernel =
+            Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
+                .unwrap();
+        let invalid = kernel.step_control_plane(
+            [provider_runtime(
+                1,
+                ProviderRuntimeCommand::Attach {
+                    binding_id: ProviderBindingId(9),
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &invalid.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::InvalidAttachBinding { .. }),
+                ..
+            })
+        ));
+        assert_eq!(invalid.backend_snapshot.provider_runtime.last_sequence, 1);
+
+        let reused_sequence = kernel.step_control_plane(
+            [provider_runtime(
+                1,
+                ProviderRuntimeCommand::Attach {
+                    binding_id: ProviderBindingId(1),
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &reused_sequence.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::SequenceRegressed {
+                    current: 1,
+                    requested: 1,
+                }),
+                ..
+            })
+        ));
+
+        let binding_id = attach_tool_provider(&mut kernel, 2);
+        let duplicate_attach = kernel.step_control_plane(
+            [provider_runtime(
+                3,
+                ProviderRuntimeCommand::Attach {
+                    binding_id: ProviderBindingId(3),
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &duplicate_attach.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::AlreadyAttached {
+                    binding_id: current,
+                    ..
+                }),
+                ..
+            }) if *current == binding_id
+        ));
+        assert_eq!(
+            duplicate_attach
+                .backend_snapshot
+                .provider_runtime
+                .last_sequence,
+            3
+        );
+
+        kernel.step_control_plane(
+            [provider_runtime(
+                4,
+                ProviderRuntimeCommand::Detach {
+                    binding_id,
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        let reused_binding = kernel.step_control_plane(
+            [provider_runtime(
+                5,
+                ProviderRuntimeCommand::Attach {
+                    binding_id,
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &reused_binding.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::InvalidAttachBinding { .. }),
+                ..
+            })
+        ));
+
+        let exhausted_binding = attach_tool_provider(&mut kernel, 6);
+        assert_eq!(exhausted_binding, ProviderBindingId(6));
+        kernel.last_provider_sequence = u64::MAX - 1;
+        kernel.provider_sequence_exhausted = false;
+        let unknown_provider = ToolProviderId::new("kernel-unknown-provider").unwrap();
+        let exhausted_on_rejection = kernel.step_control_plane(
+            [provider_runtime(
+                u64::MAX,
+                ProviderRuntimeCommand::Attach {
+                    binding_id: ProviderBindingId(u64::MAX),
+                    provider_id: unknown_provider,
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &exhausted_on_rejection.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::UnknownProvider { .. }),
+                ..
+            })
+        ));
+        assert!(
+            exhausted_on_rejection
+                .backend_snapshot
+                .provider_runtime
+                .sequence_exhausted
+        );
+        assert_eq!(
+            exhausted_on_rejection
+                .backend_snapshot
+                .provider_runtime
+                .last_sequence,
+            u64::MAX
+        );
+        assert!(exhausted_on_rejection
+            .backend_snapshot
+            .provider_runtime
+            .bindings
+            .is_empty());
+
+        let terminal = kernel.step_control_plane(
+            [provider_runtime(
+                u64::MAX,
+                ProviderRuntimeCommand::Attach {
+                    binding_id: ProviderBindingId(u64::MAX),
+                    provider_id: tool_provider_id(),
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            &terminal.ingress_outcomes[0],
+            BackendIngressOutcome::ToolProvider(ProviderRuntimeCommandOutcome {
+                result: Err(KernelProviderError::SequenceExhausted),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_effect_binding_is_reported_and_never_released() {
+        let mut kernel =
+            Gate4AgentKernel::with_tool_providers(builtin_registry().clone(), [tool_provider()])
+                .unwrap();
+        attach_tool_provider(&mut kernel, 1);
+        let generation = start_running(&mut kernel);
+        kernel
+            .tool_engine
+            .apply_authority(tool_grant(generation, 1))
+            .unwrap();
+        assert_eq!(
+            kernel.tool_engine.request(tool_request(1, generation)),
+            Ok(PolicyDecision::Allow)
+        );
+        kernel.provider_bindings.clear();
+
+        let step = kernel.step_control_plane([], []);
+        assert!(matches!(
+            &step.integration_errors[0],
+            KernelIntegrationError::ToolEffectProviderUnbound {
+                provider_id,
+                ..
+            } if provider_id == &tool_provider_id()
+        ));
+        assert!(step.tool_effects.is_empty());
     }
 
     #[test]
@@ -2064,13 +3067,16 @@ mod tests {
                 [tool_provider()],
             )
             .unwrap();
+            attach_tool_provider(&mut kernel, 1);
             let generation = start_running(&mut kernel);
             kernel.step_control_plane(
                 [
                     BackendIngress::ToolAuthority(tool_grant(generation, 1)),
-                    BackendIngress::ToolRequest(tool_request(1, generation)),
+                    BackendIngress::ToolRequest(provider_bound_tool_request(
+                        Some(ProviderBindingId(1)),
+                        tool_request(1, generation),
+                    )),
                 ],
-                [],
                 [],
             )
         }

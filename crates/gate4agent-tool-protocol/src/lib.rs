@@ -29,7 +29,7 @@ pub const TOOL_ACTIVE_REQUESTS_PER_CLIENT_MAX: usize = 32;
 pub const TOOL_EFFECTS_MAX: usize = TOOL_REQUESTS_MAX * 2;
 pub const TOOL_COMPLETIONS_MAX: usize = 128;
 pub const TOOL_AUDIT_EVENTS_MAX: usize = 4_096;
-pub const CAPABILITY_PROTOCOL_VERSION: u16 = 1;
+pub const CAPABILITY_PROTOCOL_VERSION: u16 = 2;
 
 macro_rules! bounded_id {
     ($name:ident, $field:literal, $max:expr) => {
@@ -96,6 +96,10 @@ pub struct CapabilityRequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ToolOperationId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderBindingId(pub u64);
 
 /// Provider ownership is an admission boundary. `Consumer(owner)` can serve
 /// only requests whose exact `consumer_id` equals `owner`; `Gate` may be
@@ -339,6 +343,55 @@ impl fmt::Debug for ConsumerBoundCapabilityRequest {
             .debug_struct("ConsumerBoundCapabilityRequest")
             .field("protocol_version", &self.protocol_version)
             .field("key", &self.key())
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderBoundCapabilityRequest {
+    pub provider_binding_id: Option<ProviderBindingId>,
+    pub request: ConsumerBoundCapabilityRequest,
+}
+
+impl ProviderBoundCapabilityRequest {
+    pub fn new(
+        provider_binding_id: Option<ProviderBindingId>,
+        request: ConsumerBoundCapabilityRequest,
+    ) -> Self {
+        Self {
+            provider_binding_id,
+            request,
+        }
+    }
+
+    pub fn key(&self) -> CapabilityRequestKey {
+        self.request.key()
+    }
+
+    pub fn validate(&self, current_tick: u64) -> Result<(), ToolValidationError> {
+        self.validate_provider_binding()?;
+        self.request.validate(current_tick)
+    }
+
+    pub fn validate_provider_binding(&self) -> Result<(), ToolValidationError> {
+        if self
+            .provider_binding_id
+            .is_some_and(|binding_id| binding_id.0 == 0)
+        {
+            return Err(ToolValidationError::ZeroIdentifier {
+                field: "provider binding id",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ProviderBoundCapabilityRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderBoundCapabilityRequest")
+            .field("provider_binding_id", &self.provider_binding_id)
             .field("request", &self.request)
             .finish()
     }
@@ -654,6 +707,9 @@ pub enum CapabilityTerminalOutcome {
     ClientClosed {
         cancellation: CancellationDisposition,
     },
+    ProviderDetached {
+        cancellation: CancellationDisposition,
+    },
 }
 
 impl fmt::Debug for CapabilityTerminalOutcome {
@@ -694,6 +750,10 @@ impl fmt::Debug for CapabilityTerminalOutcome {
                 .finish(),
             Self::ClientClosed { cancellation } => formatter
                 .debug_struct("ClientClosed")
+                .field("cancellation", cancellation)
+                .finish(),
+            Self::ProviderDetached { cancellation } => formatter
+                .debug_struct("ProviderDetached")
                 .field("cancellation", cancellation)
                 .finish(),
         }
@@ -842,6 +902,138 @@ impl CapabilityObservationEnvelope {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderRuntimeEnvelope {
+    pub protocol_version: u16,
+    pub sequence: u64,
+    pub command: ProviderRuntimeCommand,
+}
+
+impl ProviderRuntimeEnvelope {
+    pub fn validate(&self) -> Result<(), ToolValidationError> {
+        validate_protocol_version(self.protocol_version)?;
+        if self.sequence == 0 {
+            return Err(ToolValidationError::ZeroIdentifier {
+                field: "provider runtime sequence",
+            });
+        }
+        if self.command.binding_id().0 == 0 {
+            return Err(ToolValidationError::ZeroIdentifier {
+                field: "provider binding id",
+            });
+        }
+        if let ProviderRuntimeCommand::Observe { observation, .. } = &self.command {
+            observation.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_observation_provider(
+        &self,
+        expected_provider_id: &ToolProviderId,
+    ) -> Result<(), ToolValidationError> {
+        self.validate()?;
+        if let ProviderRuntimeCommand::Observe { observation, .. } = &self.command {
+            if &observation.provider_id != expected_provider_id {
+                return Err(ToolValidationError::ProviderMismatch {
+                    field: "provider runtime observation provider id",
+                    expected: expected_provider_id.clone(),
+                    actual: observation.provider_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRuntimeCommand {
+    Attach {
+        binding_id: ProviderBindingId,
+        provider_id: ToolProviderId,
+    },
+    Detach {
+        binding_id: ProviderBindingId,
+        provider_id: ToolProviderId,
+    },
+    Observe {
+        binding_id: ProviderBindingId,
+        observation: CapabilityObservationEnvelope,
+    },
+}
+
+impl ProviderRuntimeCommand {
+    pub fn binding_id(&self) -> ProviderBindingId {
+        match self {
+            Self::Attach { binding_id, .. }
+            | Self::Detach { binding_id, .. }
+            | Self::Observe { binding_id, .. } => *binding_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderRuntimeBindingSnapshot {
+    pub binding_id: ProviderBindingId,
+    pub provider_id: ToolProviderId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderRuntimeSnapshot {
+    pub last_sequence: u64,
+    pub sequence_exhausted: bool,
+    pub bindings: Vec<ProviderRuntimeBindingSnapshot>,
+}
+
+impl ProviderRuntimeSnapshot {
+    pub fn validate(&self) -> Result<(), ToolValidationError> {
+        if self.bindings.len() > TOOL_PROVIDERS_MAX {
+            return Err(ToolValidationError::TooMany {
+                field: "provider runtime bindings",
+                max: TOOL_PROVIDERS_MAX,
+                actual: self.bindings.len(),
+            });
+        }
+        for binding in &self.bindings {
+            if binding.binding_id.0 == 0 {
+                return Err(ToolValidationError::ZeroIdentifier {
+                    field: "provider binding id",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderBoundCapabilityEffectEnvelope {
+    pub binding_id: ProviderBindingId,
+    pub effect: CapabilityEffectEnvelope,
+}
+
+impl ProviderBoundCapabilityEffectEnvelope {
+    pub fn validate(&self) -> Result<(), ToolValidationError> {
+        if self.binding_id.0 == 0 {
+            return Err(ToolValidationError::ZeroIdentifier {
+                field: "provider binding id",
+            });
+        }
+        validate_protocol_version(self.effect.protocol_version)?;
+        if self.effect.sequence == 0 {
+            return Err(ToolValidationError::ZeroIdentifier {
+                field: "tool effect sequence",
+            });
+        }
+        if self.effect.operation_id.0 == 0 {
+            return Err(ToolValidationError::ZeroIdentifier {
+                field: "tool operation id",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Cancellation remains unconfirmed after a cancel effect is queued. Only
 /// `QueuedInvokeRemoved` proves the invocation never left the engine.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -850,6 +1042,7 @@ pub enum CancellationDisposition {
     NotRequired,
     QueuedInvokeRemoved,
     CancelQueuedUnconfirmed,
+    ProviderDetachedUnconfirmed,
     DroppedQueueFull,
     DroppedSequenceExhausted,
 }
@@ -894,6 +1087,10 @@ pub enum CapabilityRequestStatus {
         operation_id: Option<ToolOperationId>,
         cancellation: CancellationDisposition,
     },
+    ProviderDetached {
+        operation_id: Option<ToolOperationId>,
+        cancellation: CancellationDisposition,
+    },
 }
 
 impl CapabilityRequestStatus {
@@ -909,6 +1106,7 @@ impl CapabilityRequestStatus {
                 | Self::Superseded { .. }
                 | Self::InstanceClosed { .. }
                 | Self::ClientClosed { .. }
+                | Self::ProviderDetached { .. }
         )
     }
 }
@@ -953,6 +1151,13 @@ pub enum ObservationIgnoredReason {
     RequestNotDispatched,
     OperationMismatch,
     DeadlineElapsed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityObservationDisposition {
+    Applied,
+    Ignored { reason: ObservationIgnoredReason },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1029,6 +1234,10 @@ pub enum ToolAuditEventKind {
         cancellation: CancellationDisposition,
     },
     RequestClientClosed {
+        operation_id: Option<ToolOperationId>,
+        cancellation: CancellationDisposition,
+    },
+    RequestProviderDetached {
         operation_id: Option<ToolOperationId>,
         cancellation: CancellationDisposition,
     },
@@ -1118,6 +1327,11 @@ pub enum ToolValidationError {
     ResultLengthMismatch {
         declared: u64,
         actual: usize,
+    },
+    ProviderMismatch {
+        field: &'static str,
+        expected: ToolProviderId,
+        actual: ToolProviderId,
     },
     DeadlineElapsed {
         current_tick: u64,
@@ -1296,6 +1510,167 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_wire_contract_is_versioned_bounded_and_redacted() {
+        let provider_id = ToolProviderId::new("gate.browser").unwrap();
+        for command in [
+            ProviderRuntimeCommand::Attach {
+                binding_id: ProviderBindingId(4),
+                provider_id: provider_id.clone(),
+            },
+            ProviderRuntimeCommand::Detach {
+                binding_id: ProviderBindingId(4),
+                provider_id: provider_id.clone(),
+            },
+        ] {
+            let lifecycle = ProviderRuntimeEnvelope {
+                protocol_version: CAPABILITY_PROTOCOL_VERSION,
+                sequence: 4,
+                command,
+            };
+            lifecycle.validate().unwrap();
+            let encoded = serde_json::to_string(&lifecycle).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ProviderRuntimeEnvelope>(&encoded).unwrap(),
+                lifecycle
+            );
+            assert!(!format!("{lifecycle:?}").is_empty());
+        }
+        let observation = CapabilityObservationEnvelope {
+            protocol_version: CAPABILITY_PROTOCOL_VERSION,
+            operation_id: ToolOperationId(9),
+            request_key: request().key(),
+            instance_id: AgentInstanceId(11),
+            generation: SessionGeneration(3),
+            provider_id: provider_id.clone(),
+            observation: CapabilityObservation::Succeeded {
+                result: CapabilityResult {
+                    metadata: CapabilityResultMetadata {
+                        byte_len: 6,
+                        media_type: Some("text/plain".to_owned()),
+                        truncated: false,
+                        redacted_summary: None,
+                    },
+                    delivery: CapabilityResultDelivery::Inline {
+                        bytes: b"secret".to_vec(),
+                    },
+                },
+            },
+        };
+        let envelope = ProviderRuntimeEnvelope {
+            protocol_version: CAPABILITY_PROTOCOL_VERSION,
+            sequence: 4,
+            command: ProviderRuntimeCommand::Observe {
+                binding_id: ProviderBindingId(4),
+                observation,
+            },
+        };
+
+        envelope.validate().unwrap();
+        envelope
+            .validate_observation_provider(&provider_id)
+            .unwrap();
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        let decoded: ProviderRuntimeEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, envelope);
+        let rendered = format!("{envelope:?}");
+        assert!(!rendered.contains("secret"));
+        assert!(rendered.contains("byte_len"));
+
+        let mut zero_sequence = envelope.clone();
+        zero_sequence.sequence = 0;
+        assert!(matches!(
+            zero_sequence.validate(),
+            Err(ToolValidationError::ZeroIdentifier {
+                field: "provider runtime sequence"
+            })
+        ));
+        let mut unsupported = envelope.clone();
+        unsupported.protocol_version = CAPABILITY_PROTOCOL_VERSION + 1;
+        assert!(matches!(
+            unsupported.validate(),
+            Err(ToolValidationError::UnsupportedProtocolVersion { .. })
+        ));
+        let mut zero_binding = envelope.clone();
+        if let ProviderRuntimeCommand::Observe { binding_id, .. } = &mut zero_binding.command {
+            *binding_id = ProviderBindingId(0);
+        }
+        assert!(matches!(
+            zero_binding.validate(),
+            Err(ToolValidationError::ZeroIdentifier {
+                field: "provider binding id"
+            })
+        ));
+        assert!(matches!(
+            envelope
+                .validate_observation_provider(&ToolProviderId::new("gate.browser.other").unwrap()),
+            Err(ToolValidationError::ProviderMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn provider_runtime_snapshots_and_bound_effects_are_bounded_wire_contracts() {
+        let provider_id = ToolProviderId::new("gate.browser").unwrap();
+        let snapshot = ProviderRuntimeSnapshot {
+            last_sequence: 8,
+            sequence_exhausted: false,
+            bindings: vec![ProviderRuntimeBindingSnapshot {
+                binding_id: ProviderBindingId(4),
+                provider_id: provider_id.clone(),
+            }],
+        };
+        snapshot.validate().unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProviderRuntimeSnapshot>(&encoded).unwrap(),
+            snapshot
+        );
+
+        let bound = ProviderBoundCapabilityEffectEnvelope {
+            binding_id: ProviderBindingId(4),
+            effect: CapabilityEffectEnvelope {
+                protocol_version: CAPABILITY_PROTOCOL_VERSION,
+                sequence: 1,
+                operation_id: ToolOperationId(9),
+                request_key: request().key(),
+                instance_id: AgentInstanceId(11),
+                generation: SessionGeneration(3),
+                provider_id,
+                deadline_tick: 20,
+                effect: CapabilityEffect::Invoke {
+                    consumer_id: ConsumerId::new("station.test").unwrap(),
+                    actor_id: ToolActorId::new("agent.primary").unwrap(),
+                    capability_id: ToolCapabilityId::new("browser.page.snapshot").unwrap(),
+                    resource_scope_id: ResourceScopeId::new("workspace:test/page:active").unwrap(),
+                    payload: b"secret payload".to_vec(),
+                },
+            },
+        };
+        bound.validate().unwrap();
+        let encoded = serde_json::to_string(&bound).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProviderBoundCapabilityEffectEnvelope>(&encoded).unwrap(),
+            bound
+        );
+        assert!(!format!("{bound:?}").contains("secret payload"));
+
+        let mut too_many = snapshot;
+        too_many.bindings = vec![
+            ProviderRuntimeBindingSnapshot {
+                binding_id: ProviderBindingId(1),
+                provider_id: ToolProviderId::new("gate.browser").unwrap(),
+            };
+            TOOL_PROVIDERS_MAX + 1
+        ];
+        assert!(matches!(
+            too_many.validate(),
+            Err(ToolValidationError::TooMany {
+                field: "provider runtime bindings",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn capability_admission_rejects_separator_obfuscation_without_rejecting_browser_terms() {
         for id in [
             "browser.file-system.read",
@@ -1338,6 +1713,19 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ToolAuthorityOutcome>(&encoded).unwrap(),
             outcome
+        );
+
+        let terminal = CapabilityTerminalOutcome::ProviderDetached {
+            cancellation: CancellationDisposition::ProviderDetachedUnconfirmed,
+        };
+        let encoded = serde_json::to_string(&terminal).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CapabilityTerminalOutcome>(&encoded).unwrap(),
+            terminal
+        );
+        assert_eq!(
+            format!("{terminal:?}"),
+            "ProviderDetached { cancellation: ProviderDetachedUnconfirmed }"
         );
 
         let snapshot = ToolEngineSnapshot {

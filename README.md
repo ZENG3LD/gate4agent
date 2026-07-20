@@ -205,9 +205,30 @@ slow subscribers instead of silently dropping ordered results.
 
 The capability engine is policy and lifecycle infrastructure, not a second
 agent loop. It does not execute filesystem, shell, MCP, or browser operations.
-Host-owned provider runtimes must be registered explicitly and return typed
-observations. The current ACP adapter remains fail-closed until such a runtime
-is connected through this control plane.
+Host-owned executors attach through bounded provider-runtime handles. The
+in-process handle authority reserves a monotonic binding identity; the kernel
+validates and canonicalizes it, requires every request, effect, and observation
+to match that exact binding, and fences stale work across detach and rebind. An
+executor receives opaque `ProviderInvocation` tickets and sends typed
+completion observations; a separate correlated receipt reports whether the
+canonical reducer applied, ignored, or rejected the observation.
+
+Cancellation is operation-scoped. The invocation token is switched before the
+matching `ProviderWork::Cancel` becomes observable, while provider work or
+receipt channel loss, runtime teardown, or port disconnection fences the
+entire binding. An engine-side failure to enqueue a cancel remains an explicit
+unconfirmed cancellation disposition. The token therefore proves local
+cancellation delivery only: physical subprocess or browser termination remains
+unconfirmed until a concrete provider supervisor reports it. Provider
+availability and the immutable backend snapshot are published atomically, so a
+client cannot dispatch through a restored or foreign binding with no local
+executor. The current ACP adapter remains fail-closed until a reviewed
+host-owned runtime is connected through this boundary.
+
+This is an in-process authority boundary. `BackendIngress` and `KernelStep`
+remain trusted low-level integration APIs; a future IPC/WebSocket shell must
+authenticate a connection, mint its identities, enforce frame limits before
+deserialization, and map only validated messages into these contracts.
 
 No browser or remote delivery layer is included yet. A future browser shell
 will talk to a user-approved local backend; gate4agent will not collect vendor

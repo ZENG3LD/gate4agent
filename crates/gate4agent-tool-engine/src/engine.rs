@@ -50,6 +50,9 @@ pub enum ToolEngineError {
     DuplicateProvider {
         provider_id: ToolProviderId,
     },
+    UnknownRuntimeProvider {
+        provider_id: ToolProviderId,
+    },
     DuplicateRequest {
         request_key: CapabilityRequestKey,
     },
@@ -229,6 +232,48 @@ impl ToolEngine {
             },
         );
         Ok(())
+    }
+
+    pub fn provider_exists(&self, provider_id: &ToolProviderId) -> bool {
+        self.providers.contains_key(provider_id)
+    }
+
+    pub fn provider_descriptor(
+        &self,
+        provider_id: &ToolProviderId,
+    ) -> Option<&CapabilityProviderDescriptor> {
+        self.providers.get(provider_id)
+    }
+
+    pub fn detach_provider_runtime(
+        &mut self,
+        provider_id: &ToolProviderId,
+    ) -> Result<usize, ToolEngineError> {
+        if !self.provider_exists(provider_id) {
+            return Err(ToolEngineError::UnknownRuntimeProvider {
+                provider_id: provider_id.clone(),
+            });
+        }
+        let targets = self
+            .requests
+            .iter()
+            .filter_map(|(request_key, state)| {
+                (&state.request.provider_id == provider_id && !state.snapshot.status.is_terminal())
+                    .then_some(request_key.clone())
+            })
+            .collect::<Vec<_>>();
+        let detached_count = targets.len();
+        for request_key in targets {
+            self.detach_request_from_provider(&request_key);
+        }
+        let retained_effect_count = self.effects.len();
+        self.effects
+            .retain(|effect| &effect.provider_id != provider_id);
+        let purged_effect_count = retained_effect_count - self.effects.len();
+        if detached_count > 0 || purged_effect_count > 0 {
+            self.bump_revision();
+        }
+        Ok(detached_count)
     }
 
     fn set_grant(&mut self, grant: PolicyGrant) -> Result<(), ToolEngineError> {
@@ -751,10 +796,12 @@ impl ToolEngine {
         Ok(())
     }
 
+    /// Low-level trusted reducer API. Canonical production ingress must bind
+    /// observations through the kernel/runtime handle before calling it.
     pub fn apply_observation(
         &mut self,
         envelope: CapabilityObservationEnvelope,
-    ) -> Result<(), ToolEngineError> {
+    ) -> Result<CapabilityObservationDisposition, ToolEngineError> {
         validate_protocol_version(envelope.protocol_version)?;
         if envelope.operation_id.0 == 0 {
             return Err(ToolValidationError::ZeroIdentifier {
@@ -763,55 +810,53 @@ impl ToolEngine {
             .into());
         }
         let Some(state) = self.requests.get(&envelope.request_key) else {
-            self.ignore_observation(&envelope, None, ObservationIgnoredReason::UnknownRequest);
-            return Ok(());
+            return Ok(self.ignore_observation(
+                &envelope,
+                None,
+                ObservationIgnoredReason::UnknownRequest,
+            ));
         };
         let subject = subject_for(&state.request, state.snapshot.accepted_sequence);
         let current_generation = self.generations.get(&state.request.instance_id).copied();
         if current_generation != Some(envelope.generation)
             || envelope.generation != state.request.generation
         {
-            self.ignore_observation(
+            return Ok(self.ignore_observation(
                 &envelope,
                 Some(subject),
                 ObservationIgnoredReason::StaleGeneration,
-            );
-            return Ok(());
+            ));
         }
         if envelope.instance_id != state.request.instance_id {
-            self.ignore_observation(
+            return Ok(self.ignore_observation(
                 &envelope,
                 Some(subject),
                 ObservationIgnoredReason::InstanceMismatch,
-            );
-            return Ok(());
+            ));
         }
         if envelope.provider_id != state.request.provider_id {
-            self.ignore_observation(
+            return Ok(self.ignore_observation(
                 &envelope,
                 Some(subject),
                 ObservationIgnoredReason::ProviderMismatch,
-            );
-            return Ok(());
+            ));
         }
         let operation_id = match state.snapshot.status {
             CapabilityRequestStatus::Dispatched { operation_id } => operation_id,
             _ => {
-                self.ignore_observation(
+                return Ok(self.ignore_observation(
                     &envelope,
                     Some(subject),
                     ObservationIgnoredReason::RequestNotDispatched,
-                );
-                return Ok(());
+                ));
             }
         };
         if envelope.operation_id != operation_id {
-            self.ignore_observation(
+            return Ok(self.ignore_observation(
                 &envelope,
                 Some(subject),
                 ObservationIgnoredReason::OperationMismatch,
-            );
-            return Ok(());
+            ));
         }
         if state.request.deadline_tick <= self.current_tick {
             self.timeout_request(&envelope.request_key);
@@ -823,7 +868,9 @@ impl ToolEngine {
                     reason: ObservationIgnoredReason::DeadlineElapsed,
                 },
             );
-            return Ok(());
+            return Ok(CapabilityObservationDisposition::Ignored {
+                reason: ObservationIgnoredReason::DeadlineElapsed,
+            });
         }
 
         if envelope.observation.validate().is_err() {
@@ -853,7 +900,7 @@ impl ToolEngine {
                 Some(operation_id),
                 CapabilityTerminalOutcome::Failed { failure },
             );
-            return Ok(());
+            return Ok(CapabilityObservationDisposition::Applied);
         }
 
         let event = match envelope.observation {
@@ -910,7 +957,7 @@ impl ToolEngine {
         };
         self.bump_revision();
         self.emit_audit(Some(subject), event);
-        Ok(())
+        Ok(CapabilityObservationDisposition::Applied)
     }
 
     pub fn snapshot(&self) -> ToolEngineSnapshot {
@@ -1030,6 +1077,64 @@ impl ToolEngine {
                     .then_some(request_id.clone())
             })
             .collect()
+    }
+
+    fn detach_request_from_provider(&mut self, request_key: &CapabilityRequestKey) {
+        let (request, subject, accepted_sequence, operation_id) = {
+            let state = self
+                .requests
+                .get_mut(request_key)
+                .expect("provider detach target collected from request map");
+            let request = state.request.clone();
+            let operation_id = match state.snapshot.status {
+                CapabilityRequestStatus::Dispatched { operation_id } => Some(operation_id),
+                _ => None,
+            };
+            state.request.payload.clear();
+            (
+                request,
+                subject_for(&state.request, state.snapshot.accepted_sequence),
+                state.snapshot.accepted_sequence,
+                operation_id,
+            )
+        };
+        let cancellation = match operation_id {
+            Some(operation_id) => {
+                let queued_invoke = self.effects.iter().position(|effect| {
+                    effect.request_key == request.key
+                        && effect.operation_id == operation_id
+                        && matches!(&effect.effect, CapabilityEffect::Invoke { .. })
+                });
+                if let Some(position) = queued_invoke {
+                    self.effects.remove(position);
+                    CancellationDisposition::QueuedInvokeRemoved
+                } else {
+                    CancellationDisposition::ProviderDetachedUnconfirmed
+                }
+            }
+            None => CancellationDisposition::NotRequired,
+        };
+        self.requests
+            .get_mut(request_key)
+            .expect("provider detach target remains in request map")
+            .snapshot
+            .status = CapabilityRequestStatus::ProviderDetached {
+            operation_id,
+            cancellation,
+        };
+        self.emit_audit(
+            Some(subject),
+            ToolAuditEventKind::RequestProviderDetached {
+                operation_id,
+                cancellation,
+            },
+        );
+        self.push_terminal_completion(
+            &request,
+            accepted_sequence,
+            operation_id,
+            CapabilityTerminalOutcome::ProviderDetached { cancellation },
+        );
     }
 
     fn supersede_request(
@@ -1269,7 +1374,7 @@ impl ToolEngine {
         envelope: &CapabilityObservationEnvelope,
         subject: Option<ToolAuditSubject>,
         reason: ObservationIgnoredReason,
-    ) {
+    ) -> CapabilityObservationDisposition {
         self.bump_revision();
         self.emit_audit(
             subject,
@@ -1278,6 +1383,7 @@ impl ToolEngine {
                 reason,
             },
         );
+        CapabilityObservationDisposition::Ignored { reason }
     }
 
     fn emit_invoke(&mut self, request: &AcceptedRequest, operation_id: ToolOperationId) {
@@ -1791,6 +1897,167 @@ mod tests {
                 },
             }
         }
+    }
+
+    #[test]
+    fn provider_runtime_queries_preserve_registered_descriptors() {
+        let mut engine = ToolEngine::new();
+        assert!(!engine.provider_exists(&provider_id()));
+        assert!(engine.provider_descriptor(&provider_id()).is_none());
+        assert!(matches!(
+            engine.detach_provider_runtime(&provider_id()),
+            Err(ToolEngineError::UnknownRuntimeProvider { .. })
+        ));
+
+        let descriptor = provider();
+        engine.register_provider(descriptor.clone()).unwrap();
+        assert!(engine.provider_exists(&provider_id()));
+        assert_eq!(
+            engine.provider_descriptor(&provider_id()),
+            Some(&descriptor)
+        );
+        assert_eq!(engine.detach_provider_runtime(&provider_id()).unwrap(), 0);
+        assert_eq!(
+            engine.provider_descriptor(&provider_id()),
+            Some(&descriptor)
+        );
+    }
+
+    #[test]
+    fn provider_detach_closes_pre_dispatch_request_without_removing_policy() {
+        let mut engine = configured(Some(GrantMode::RequireApproval));
+        let descriptor = engine.provider_descriptor(&provider_id()).unwrap().clone();
+        let policy = grant(GrantMode::RequireApproval).key;
+        engine.request(request(1, 1, 100)).unwrap();
+        assert!(!engine.requests[&request_key(1)].request.payload.is_empty());
+
+        assert_eq!(engine.detach_provider_runtime(&provider_id()).unwrap(), 1);
+        assert!(engine.requests[&request_key(1)].request.payload.is_empty());
+        assert!(matches!(
+            engine.requests[&request_key(1)].snapshot.status,
+            CapabilityRequestStatus::ProviderDetached {
+                operation_id: None,
+                cancellation: CancellationDisposition::NotRequired,
+            }
+        ));
+        assert_eq!(
+            engine.provider_descriptor(&provider_id()),
+            Some(&descriptor)
+        );
+        assert_eq!(
+            engine.grants.get(&policy),
+            Some(&GrantMode::RequireApproval)
+        );
+        assert!(engine.drain_effects().is_empty());
+        assert!(matches!(
+            engine.drain_completions().completions[0].outcome,
+            CapabilityTerminalOutcome::ProviderDetached {
+                cancellation: CancellationDisposition::NotRequired,
+            }
+        ));
+        assert!(engine.snapshot().audit_events.iter().any(|event| matches!(
+            event.event,
+            ToolAuditEventKind::RequestProviderDetached {
+                operation_id: None,
+                cancellation: CancellationDisposition::NotRequired,
+            }
+        )));
+    }
+
+    #[test]
+    fn provider_detach_removes_all_queued_invokes_and_fences_late_results() {
+        let mut engine = configured(Some(GrantMode::Allow));
+        engine.request(request(1, 1, 100)).unwrap();
+        engine.request(request(2, 1, 100)).unwrap();
+        let late_invoke = engine.effects[0].clone();
+
+        assert_eq!(engine.detach_provider_runtime(&provider_id()).unwrap(), 2);
+        assert!(engine.drain_effects().is_empty());
+        for request_id in [1, 2] {
+            assert!(matches!(
+                engine.requests[&request_key(request_id)].snapshot.status,
+                CapabilityRequestStatus::ProviderDetached {
+                    operation_id: Some(_),
+                    cancellation: CancellationDisposition::QueuedInvokeRemoved,
+                }
+            ));
+        }
+        let completion_batch = engine.drain_completions();
+        assert_eq!(completion_batch.completions.len(), 2);
+        assert!(completion_batch
+            .completions
+            .iter()
+            .all(|completion| matches!(
+                completion.outcome,
+                CapabilityTerminalOutcome::ProviderDetached {
+                    cancellation: CancellationDisposition::QueuedInvokeRemoved,
+                }
+            )));
+
+        engine
+            .apply_observation(FakeProvider::succeed(&late_invoke))
+            .unwrap();
+        assert!(matches!(
+            engine.requests[&request_key(1)].snapshot.status,
+            CapabilityRequestStatus::ProviderDetached {
+                cancellation: CancellationDisposition::QueuedInvokeRemoved,
+                ..
+            }
+        ));
+        assert!(matches!(
+            engine.snapshot().audit_events.last().unwrap().event,
+            ToolAuditEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::RequestNotDispatched,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_detach_marks_drained_execution_unconfirmed_without_cancel_effect() {
+        let mut engine = configured(Some(GrantMode::Allow));
+        engine.request(request(1, 1, 100)).unwrap();
+        let invoke = engine.drain_effects().pop().unwrap();
+
+        assert_eq!(engine.detach_provider_runtime(&provider_id()).unwrap(), 1);
+        assert!(engine.drain_effects().is_empty());
+        assert!(matches!(
+            engine.requests[&request_key(1)].snapshot.status,
+            CapabilityRequestStatus::ProviderDetached {
+                operation_id: Some(operation_id),
+                cancellation: CancellationDisposition::ProviderDetachedUnconfirmed,
+            } if operation_id == invoke.operation_id
+        ));
+        assert!(matches!(
+            engine.drain_completions().completions[0].outcome,
+            CapabilityTerminalOutcome::ProviderDetached {
+                cancellation: CancellationDisposition::ProviderDetachedUnconfirmed,
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_detach_purges_cancel_already_queued_for_terminal_request() {
+        let mut engine = configured(Some(GrantMode::Allow));
+        let policy_key = grant(GrantMode::Allow).key;
+        engine.request(request(1, 1, 100)).unwrap();
+        let invoke = engine.drain_effects().pop().unwrap();
+
+        assert!(engine.revoke_grant(&policy_key).unwrap());
+        assert!(matches!(
+            &engine.effects[0].effect,
+            CapabilityEffect::Cancel {
+                reason: InvocationCancelReason::GrantRevoked
+            }
+        ));
+        assert_eq!(engine.effects[0].operation_id, invoke.operation_id);
+
+        assert_eq!(engine.detach_provider_runtime(&provider_id()).unwrap(), 0);
+        assert!(engine.drain_effects().is_empty());
+        assert!(matches!(
+            engine.requests[&request_key(1)].snapshot.status,
+            CapabilityRequestStatus::GrantRevoked { .. }
+        ));
     }
 
     #[test]

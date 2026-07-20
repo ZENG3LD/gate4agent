@@ -5,22 +5,29 @@ use gate4agent_types::{
     validate_candidate_id, validate_capability_models, validate_history_error,
     validate_resume_error, ActiveProviderTool, AgentInstanceId, CapabilityProbeRequest,
     CapabilitySnapshot, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
-    ControlEvent, ControlEventKind, ControlObservation, ControlSnapshot, EffectEnvelope,
-    ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot, HistoryOperation, HistoryQuery,
-    HistorySnapshot, InputAction, ObservationEnvelope, ObservationIgnoredReason, OperationId,
-    PendingCapabilityProbe, PendingHistoryOperation, PendingResumeOperation, PreparedInputKind,
-    ProviderActivity, ProviderEvent, ProviderInteraction, ProviderInteractionId,
-    ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionResponse,
-    ProviderInteractionResponseKind, ProviderInteractionStatus, ProviderInteractionTarget,
-    ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
-    ProviderSourceCursor, ProviderSubagent, ResumeAuthorityTarget, ResumeLaunchRequest,
-    ResumePhase, ResumeSessionSummary, ResumeSnapshot, ResumeTarget, SessionGeneration,
-    SessionSnapshot, SessionStatus, StartRequest, TerminalControl, TerminalSize, TokenUsage,
-    TransportKind, CONTROL_PROTOCOL_VERSION, PROVIDER_INGRESS_EVENTS_MAX,
-    PROVIDER_INTERACTIONS_MAX, PROVIDER_INTERACTION_FAILURE_MAX_BYTES, PROVIDER_SUBAGENTS_MAX,
-    WORKING_DIRECTORY_MAX_BYTES,
+    ControlEvent, ControlEventKind, ControlHealth, ControlObservation, ControlSnapshot,
+    EffectEnvelope, ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot,
+    HistoryOperation, HistoryQuery, HistorySnapshot, InputAction, ObservationEnvelope,
+    ObservationIgnoredReason, OperationId, PendingCapabilityProbe, PendingHistoryOperation,
+    PendingResumeOperation, PreparedInputKind, ProviderActivity, ProviderEvent,
+    ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
+    ProviderInteractionOutcome, ProviderInteractionResponse, ProviderInteractionResponseKind,
+    ProviderInteractionStatus, ProviderInteractionTarget, ProviderSessionIdentity,
+    ProviderSessionKey, ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent,
+    ResumeAuthorityTarget, ResumeLaunchRequest, ResumePhase, ResumeSessionSummary, ResumeSnapshot,
+    ResumeTarget, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl,
+    TerminalSize, TokenUsage, TransportKind, CONTROL_INSTANCE_IDENTITIES_CAPACITY,
+    CONTROL_INSTANCE_IDENTITIES_MAX, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
+    PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX, PROVIDER_INTERACTION_FAILURE_MAX_BYTES,
+    PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+const CONTROL_REVISION_HEADROOM: u64 = PROVIDER_INGRESS_EVENTS_MAX as u64 + 1;
+const CONTROL_EVENT_HEADROOM: u64 = PROVIDER_INGRESS_EVENTS_MAX as u64
+    * (PROVIDER_INTERACTIONS_MAX as u64 + 1)
+    + PROVIDER_INTERACTIONS_MAX as u64
+    + 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionState {
@@ -35,9 +42,11 @@ struct SessionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Gate4AgentEngine {
     sessions: BTreeMap<AgentInstanceId, SessionState>,
-    next_operation_id: u64,
-    next_event_sequence: u64,
+    generation_watermarks: BTreeMap<AgentInstanceId, SessionGeneration>,
+    next_operation_id: Option<u64>,
+    next_event_sequence: Option<u64>,
     revision: u64,
+    counter_error: Option<ControlError>,
     effects: Vec<EffectEnvelope>,
     events: Vec<ControlEvent>,
 }
@@ -46,15 +55,36 @@ impl Gate4AgentEngine {
     pub fn new() -> Self {
         Self {
             sessions: BTreeMap::new(),
-            next_operation_id: 1,
-            next_event_sequence: 1,
+            generation_watermarks: BTreeMap::new(),
+            next_operation_id: Some(1),
+            next_event_sequence: Some(1),
             revision: 0,
+            counter_error: None,
             effects: Vec::new(),
             events: Vec::new(),
         }
     }
 
     pub fn apply_command(&mut self, envelope: CommandEnvelope) -> Result<(), ControlError> {
+        if self.has_counter_headroom() {
+            let result = self.apply_command_in_place(envelope);
+            debug_assert!(
+                self.counter_error.is_none(),
+                "bounded command exceeded reserved control counter headroom"
+            );
+            return result;
+        }
+        let mut candidate = self.clone();
+        candidate.apply_command_in_place(envelope)?;
+        if let Some(error) = candidate.counter_error.take() {
+            self.retire_exhausted_counter(&error);
+            return Err(error);
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn apply_command_in_place(&mut self, envelope: CommandEnvelope) -> Result<(), ControlError> {
         if envelope.protocol_version != CONTROL_PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedProtocolVersion {
                 expected: CONTROL_PROTOCOL_VERSION,
@@ -71,7 +101,29 @@ impl Gate4AgentEngine {
                 if self.sessions.contains_key(&instance_id) {
                     return Err(ControlError::DuplicateInstance { instance_id });
                 }
-                let generation = SessionGeneration::default();
+                if self.sessions.len() >= CONTROL_SESSIONS_MAX {
+                    return Err(ControlError::SessionCapacityExceeded {
+                        instance_id,
+                        max: CONTROL_SESSIONS_MAX,
+                    });
+                }
+                if !self.generation_watermarks.contains_key(&instance_id)
+                    && self.generation_watermarks.len() >= CONTROL_INSTANCE_IDENTITIES_MAX
+                {
+                    return Err(ControlError::InstanceIdentityCapacityExceeded {
+                        instance_id,
+                        max: CONTROL_INSTANCE_IDENTITIES_MAX,
+                    });
+                }
+                let generation = match self.generation_watermarks.get(&instance_id).copied() {
+                    Some(watermark) => checked_next_generation(watermark).ok_or(
+                        ControlError::GenerationExhausted {
+                            instance_id,
+                            generation: watermark,
+                        },
+                    )?,
+                    None => SessionGeneration::default(),
+                };
                 self.sessions.insert(
                     instance_id,
                     SessionState {
@@ -99,6 +151,7 @@ impl Gate4AgentEngine {
                         pending_resume_identity: None,
                     },
                 );
+                self.generation_watermarks.insert(instance_id, generation);
                 self.bump_revision();
                 self.emit_event(
                     Some(command_id),
@@ -172,6 +225,32 @@ impl Gate4AgentEngine {
     }
 
     pub fn apply_observation(&mut self, envelope: ObservationEnvelope) {
+        let _ = self.try_apply_observation(envelope);
+    }
+
+    pub fn try_apply_observation(
+        &mut self,
+        envelope: ObservationEnvelope,
+    ) -> Result<(), ControlError> {
+        if self.has_counter_headroom() && self.observation_has_provider_headroom(&envelope) {
+            self.apply_observation_in_place(envelope);
+            debug_assert!(
+                self.counter_error.is_none(),
+                "bounded observation exceeded reserved control counter headroom"
+            );
+            return Ok(());
+        }
+        let mut candidate = self.clone();
+        candidate.apply_observation_in_place(envelope);
+        if let Some(error) = candidate.counter_error.take() {
+            self.retire_exhausted_counter(&error);
+            return Err(error);
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn apply_observation_in_place(&mut self, envelope: ObservationEnvelope) {
         let instance_id = envelope.instance_id;
         let generation = envelope.generation;
         if envelope.protocol_version != CONTROL_PROTOCOL_VERSION {
@@ -490,8 +569,19 @@ impl Gate4AgentEngine {
                             &provider_session,
                         ) =>
                 {
+                    let generation_watermark =
+                        self.generation_watermark(instance_id, current.generation);
+                    let Some(next_generation) = checked_next_generation(generation_watermark)
+                    else {
+                        self.emit_ignored(
+                            instance_id,
+                            generation,
+                            ObservationIgnoredReason::GenerationExhausted,
+                        );
+                        return;
+                    };
                     let summary = ResumeSessionSummary::from(&provider_session);
-                    let (next_generation, agent_id) = {
+                    let agent_id = {
                         let state = self
                             .sessions
                             .get_mut(&instance_id)
@@ -500,8 +590,7 @@ impl Gate4AgentEngine {
                         state.pending_interrupt = false;
                         state.pending_resume_identity = Some(provider_session.clone());
                         let session = &mut state.snapshot;
-                        session.generation =
-                            SessionGeneration(session.generation.0.saturating_add(1));
+                        session.generation = next_generation;
                         session.status = SessionStatus::Starting;
                         session.pending_operation = Some(operation_id);
                         session.pending_input = None;
@@ -518,8 +607,10 @@ impl Gate4AgentEngine {
                             ..pending.clone()
                         });
                         session.resume.last_error = None;
-                        (session.generation, session.agent_id.clone())
+                        session.agent_id.clone()
                     };
+                    self.generation_watermarks
+                        .insert(instance_id, next_generation);
                     self.effects.push(EffectEnvelope {
                         protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id,
@@ -748,6 +839,13 @@ impl Gate4AgentEngine {
             event,
         } = &envelope.observation
         {
+            if current.provider.sequence == u64::MAX {
+                self.counter_error = Some(ControlError::ProviderSequenceExhausted {
+                    instance_id,
+                    generation,
+                });
+                return;
+            }
             if provider_source_sequence(&current.provider, source) >= *sequence {
                 self.emit_ignored(
                     instance_id,
@@ -806,6 +904,13 @@ impl Gate4AgentEngine {
             return;
         }
         if let ControlObservation::ProviderGap { source, missed } = &envelope.observation {
+            if current.provider.sequence == u64::MAX {
+                self.counter_error = Some(ControlError::ProviderSequenceExhausted {
+                    instance_id,
+                    generation,
+                });
+                return;
+            }
             let missed = *missed;
             let state = self
                 .sessions
@@ -1108,6 +1213,7 @@ impl Gate4AgentEngine {
         ControlSnapshot {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             revision: self.revision,
+            health: self.health(),
             sessions: self
                 .sessions
                 .values()
@@ -1116,8 +1222,30 @@ impl Gate4AgentEngine {
         }
     }
 
+    pub fn health(&self) -> ControlHealth {
+        ControlHealth {
+            operation_id_exhausted: self.next_operation_id.is_none(),
+            event_sequence_exhausted: self.next_event_sequence.is_none(),
+            revision_exhausted: self.revision == u64::MAX,
+            provider_sequence_exhausted_sessions: u32::try_from(
+                self.sessions
+                    .values()
+                    .filter(|state| state.snapshot.provider.sequence == u64::MAX)
+                    .count(),
+            )
+            .expect("live session map is bounded below u32::MAX"),
+            retained_instance_identities: u32::try_from(self.generation_watermarks.len())
+                .expect("retained identity map is bounded below u32::MAX"),
+            retained_instance_identity_capacity: CONTROL_INSTANCE_IDENTITIES_CAPACITY,
+        }
+    }
+
     pub fn session_snapshot(&self, instance_id: AgentInstanceId) -> Option<&SessionSnapshot> {
         self.sessions.get(&instance_id).map(|state| &state.snapshot)
+    }
+
+    pub fn session_instance_ids(&self) -> impl Iterator<Item = AgentInstanceId> + '_ {
+        self.sessions.keys().copied()
     }
 
     pub fn record_command_rejection(
@@ -1126,10 +1254,14 @@ impl Gate4AgentEngine {
         instance_id: AgentInstanceId,
         message: String,
     ) {
+        if self.next_event_sequence.is_none() {
+            return;
+        }
         let generation = self
             .sessions
             .get(&instance_id)
             .map(|state| state.snapshot.generation)
+            .or_else(|| self.generation_watermarks.get(&instance_id).copied())
             .unwrap_or_default();
         self.emit_event(
             Some(command_id),
@@ -1137,6 +1269,7 @@ impl Gate4AgentEngine {
             generation,
             ControlEventKind::CommandRejected { message },
         );
+        debug_assert!(self.counter_error.is_none());
     }
 
     pub fn drain_effects(&mut self) -> Vec<EffectEnvelope> {
@@ -1204,8 +1337,17 @@ impl Gate4AgentEngine {
             return Err(ControlError::MissingInitialPrompt);
         }
 
+        let generation_watermark =
+            self.generation_watermark(instance_id, session.snapshot.generation);
+        let generation = checked_next_generation(generation_watermark).ok_or(
+            ControlError::GenerationExhausted {
+                instance_id,
+                generation: generation_watermark,
+            },
+        )?;
+        self.purge_generation_bound_history(instance_id);
         let operation_id = self.allocate_operation();
-        let (generation, agent_id, transport) = {
+        let (agent_id, transport) = {
             let state = self
                 .sessions
                 .get_mut(&instance_id)
@@ -1216,7 +1358,7 @@ impl Gate4AgentEngine {
             let session = &mut state.snapshot;
             session.history = HistorySnapshot::default();
             session.resume = ResumeSnapshot::default();
-            session.generation = SessionGeneration(session.generation.0.saturating_add(1));
+            session.generation = generation;
             session.status = SessionStatus::Starting;
             session.pending_operation = Some(operation_id);
             session.pending_input = None;
@@ -1227,12 +1369,9 @@ impl Gate4AgentEngine {
             session.session_options = request.session_options.clone();
             session.foreground = ForegroundSnapshot::default();
             session.provider = ProviderSnapshot::default();
-            (
-                session.generation,
-                session.agent_id.clone(),
-                session.transport,
-            )
+            (session.agent_id.clone(), session.transport)
         };
+        self.generation_watermarks.insert(instance_id, generation);
         self.effects.push(EffectEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
@@ -1899,13 +2038,34 @@ impl Gate4AgentEngine {
             });
         }
         let current_source_sequence = provider_source_sequence(&state.snapshot.provider, &source);
+        if current_source_sequence == u64::MAX {
+            return Err(ControlError::ProviderSourceSequenceExhausted {
+                instance_id,
+                generation,
+                provider_source: source,
+            });
+        }
         if source_sequence <= current_source_sequence {
             return Err(ControlError::StaleProviderSequence);
         }
 
         let missed = source_sequence
-            .saturating_sub(current_source_sequence)
-            .saturating_sub(1);
+            .checked_sub(current_source_sequence)
+            .and_then(|difference| difference.checked_sub(1))
+            .expect("source sequence ordering was validated");
+        let canonical_steps = events.len() as u64 + u64::from(missed > 0);
+        if state
+            .snapshot
+            .provider
+            .sequence
+            .checked_add(canonical_steps)
+            .is_none()
+        {
+            return Err(ControlError::ProviderSequenceExhausted {
+                instance_id,
+                generation,
+            });
+        }
         if missed > 0 {
             let canonical_sequence = {
                 let snapshot = &mut self
@@ -2103,8 +2263,20 @@ impl Gate4AgentEngine {
                 operation_id,
             });
         }
+        if let Some(pending) = &state.snapshot.capabilities.pending {
+            return Err(ControlError::CapabilityProbeOperationPending {
+                operation_id: pending.operation_id,
+            });
+        }
+        if let Some(pending) = &state.snapshot.history.pending {
+            return Err(ControlError::HistoryOperationPending {
+                operation_id: pending.operation_id,
+            });
+        }
         let generation = state.snapshot.generation;
         self.sessions.remove(&instance_id);
+        self.effects
+            .retain(|effect| effect.instance_id != instance_id);
         self.bump_revision();
         self.emit_event(
             Some(command_id),
@@ -2115,10 +2287,70 @@ impl Gate4AgentEngine {
         Ok(())
     }
 
+    fn generation_watermark(
+        &self,
+        instance_id: AgentInstanceId,
+        current: SessionGeneration,
+    ) -> SessionGeneration {
+        self.generation_watermarks
+            .get(&instance_id)
+            .copied()
+            .map_or(current, |watermark| watermark.max(current))
+    }
+
+    fn has_counter_headroom(&self) -> bool {
+        self.counter_error.is_none()
+            && self.next_operation_id.is_some()
+            && self
+                .next_event_sequence
+                .is_some_and(|sequence| sequence.checked_add(CONTROL_EVENT_HEADROOM - 1).is_some())
+            && self
+                .revision
+                .checked_add(CONTROL_REVISION_HEADROOM)
+                .is_some()
+    }
+
+    fn observation_has_provider_headroom(&self, envelope: &ObservationEnvelope) -> bool {
+        !matches!(
+            envelope.observation,
+            ControlObservation::ProviderEvent { .. } | ControlObservation::ProviderGap { .. }
+        ) || self
+            .sessions
+            .get(&envelope.instance_id)
+            .is_none_or(|state| state.snapshot.provider.sequence < u64::MAX)
+    }
+
+    fn retire_exhausted_counter(&mut self, error: &ControlError) {
+        match error {
+            ControlError::OperationIdExhausted => self.next_operation_id = None,
+            ControlError::EventSequenceExhausted => self.next_event_sequence = None,
+            ControlError::RevisionExhausted => self.revision = u64::MAX,
+            _ => {}
+        }
+    }
+
+    /// Starting a new generation invalidates history work, while host-scoped
+    /// capability discovery intentionally remains valid across that boundary.
+    fn purge_generation_bound_history(&mut self, instance_id: AgentInstanceId) {
+        self.effects.retain(|effect| {
+            effect.instance_id != instance_id
+                || !matches!(
+                    effect.effect,
+                    ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. }
+                )
+        });
+    }
+
     fn allocate_operation(&mut self) -> OperationId {
-        let id = OperationId(self.next_operation_id);
-        self.next_operation_id = self.next_operation_id.saturating_add(1);
-        id
+        if self.counter_error.is_some() {
+            return OperationId(0);
+        }
+        let Some(next) = self.next_operation_id.take() else {
+            self.counter_error = Some(ControlError::OperationIdExhausted);
+            return OperationId(0);
+        };
+        self.next_operation_id = next.checked_add(1);
+        OperationId(next)
     }
 
     fn session_mut(&mut self, instance_id: AgentInstanceId) -> &mut SessionSnapshot {
@@ -2130,7 +2362,14 @@ impl Gate4AgentEngine {
     }
 
     fn bump_revision(&mut self) {
-        self.revision = self.revision.saturating_add(1);
+        if self.counter_error.is_some() {
+            return;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            self.counter_error = Some(ControlError::RevisionExhausted);
+            return;
+        };
+        self.revision = revision;
     }
 
     fn emit_ignored(
@@ -2178,8 +2417,14 @@ impl Gate4AgentEngine {
         generation: SessionGeneration,
         event: ControlEventKind,
     ) {
-        let sequence = self.next_event_sequence;
-        self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+        if self.counter_error.is_some() {
+            return;
+        }
+        let Some(sequence) = self.next_event_sequence.take() else {
+            self.counter_error = Some(ControlError::EventSequenceExhausted);
+            return;
+        };
+        self.next_event_sequence = sequence.checked_add(1);
         self.events.push(ControlEvent {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence,
@@ -2189,6 +2434,10 @@ impl Gate4AgentEngine {
             event,
         });
     }
+}
+
+fn checked_next_generation(current: SessionGeneration) -> Option<SessionGeneration> {
+    current.0.checked_add(1).map(SessionGeneration)
 }
 
 fn invalidate_foreground(snapshot: &mut SessionSnapshot, reason: String) {
@@ -2380,7 +2629,10 @@ fn reduce_provider_event(
     source_sequence: u64,
     event: ProviderEvent,
 ) -> ProviderReduction {
-    let canonical_sequence = snapshot.sequence.saturating_add(1);
+    let canonical_sequence = snapshot
+        .sequence
+        .checked_add(1)
+        .expect("provider sequence capacity must be preflighted");
     let mut interaction_transitions = Vec::new();
     match &event {
         ProviderEvent::SessionStarted {
@@ -2830,7 +3082,10 @@ fn reduce_provider_gap(
     cursor.stale = true;
     snapshot.gap_count = snapshot.gap_count.saturating_add(missed);
     snapshot.stale = true;
-    snapshot.sequence = snapshot.sequence.saturating_add(1);
+    snapshot.sequence = snapshot
+        .sequence
+        .checked_add(1)
+        .expect("provider sequence capacity must be preflighted");
     snapshot.sequence
 }
 
@@ -2865,7 +3120,7 @@ mod tests {
         CapabilityModelSummary, ForegroundAuthority, ForegroundProcess, ForegroundProcessKind,
         HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole, HistoryQuery,
         HistorySessionRecord, InputAction, PreparedInputKind, PromptFraming, PromptPayload,
-        SessionOptionSelection, ShellCommand, TerminalFrame, TransportKind,
+        SessionOptionSelection, ShellCommand, TerminalFrame, TerminalText, TransportKind,
     };
 
     fn instance() -> AgentInstanceId {
@@ -2896,16 +3151,20 @@ mod tests {
         }
     }
 
-    fn register(command_id: u64) -> CommandEnvelope {
+    fn register_instance(command_id: u64, instance_id: AgentInstanceId) -> CommandEnvelope {
         CommandEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(command_id),
             command: ControlCommand::Register {
-                instance_id: instance(),
+                instance_id,
                 agent_id: AgentId::new("claude").unwrap(),
                 transport: TransportKind::Pty,
             },
         }
+    }
+
+    fn register(command_id: u64) -> CommandEnvelope {
+        register_instance(command_id, instance())
     }
 
     fn start(command_id: u64) -> CommandEnvelope {
@@ -2923,6 +3182,19 @@ mod tests {
                     initial_prompt: None,
                     session_options: None,
                 },
+            },
+        }
+    }
+
+    fn terminal_text(command_id: u64, text: &str) -> CommandEnvelope {
+        CommandEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            id: CommandId(command_id),
+            command: ControlCommand::SendInput {
+                instance_id: instance(),
+                action: InputAction::TerminalText(TerminalText {
+                    text: text.to_owned(),
+                }),
             },
         }
     }
@@ -4979,6 +5251,541 @@ mod tests {
     }
 
     #[test]
+    fn remove_and_reregister_strictly_advance_the_generation_watermark() {
+        let (mut engine, first_spawn) = running_engine();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: first_spawn.generation,
+            observation: ControlObservation::ProcessExited {
+                exit_code: Some(0),
+                final_terminal: None,
+            },
+        });
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::Remove {
+                    instance_id: instance(),
+                },
+            })
+            .unwrap();
+        engine.apply_command(register(4)).unwrap();
+
+        let generation = engine.snapshot().sessions[0].generation;
+        assert_eq!(generation.0, first_spawn.generation.0 + 1);
+        assert_eq!(
+            engine.generation_watermarks.get(&instance()),
+            Some(&generation)
+        );
+    }
+
+    #[test]
+    fn reregister_generation_exhaustion_is_atomic() {
+        let mut engine = Gate4AgentEngine::new();
+        let exhausted = SessionGeneration(u64::MAX);
+        engine.generation_watermarks.insert(instance(), exhausted);
+        let before = engine.clone();
+
+        let error = engine.apply_command(register(1)).unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::GenerationExhausted {
+                instance_id: instance(),
+                generation: exhausted,
+            }
+        );
+        assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn live_session_capacity_rejection_is_atomic() {
+        let mut engine = Gate4AgentEngine::new();
+        let first_instance = 10_000_u64;
+        for offset in 0..CONTROL_SESSIONS_MAX {
+            engine
+                .apply_command(register_instance(
+                    offset as u64 + 1,
+                    AgentInstanceId(first_instance + offset as u64),
+                ))
+                .unwrap();
+        }
+        engine.drain_events();
+        let before = engine.clone();
+        let rejected_instance = AgentInstanceId(first_instance + CONTROL_SESSIONS_MAX as u64);
+
+        let error = engine
+            .apply_command(register_instance(10_000, rejected_instance))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::SessionCapacityExceeded {
+                instance_id: rejected_instance,
+                max: CONTROL_SESSIONS_MAX,
+            }
+        );
+        assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn retained_identity_capacity_is_bounded_without_weakening_stale_fence() {
+        let mut engine = Gate4AgentEngine::new();
+        let first_instance = 20_000_u64;
+        for offset in 0..CONTROL_INSTANCE_IDENTITIES_MAX {
+            engine.generation_watermarks.insert(
+                AgentInstanceId(first_instance + offset as u64),
+                SessionGeneration::default(),
+            );
+        }
+        let health = engine.snapshot().health;
+        assert_eq!(
+            health.retained_instance_identities,
+            u32::try_from(CONTROL_INSTANCE_IDENTITIES_MAX).unwrap()
+        );
+        assert_eq!(
+            health.retained_instance_identity_capacity,
+            u32::try_from(CONTROL_INSTANCE_IDENTITIES_MAX).unwrap()
+        );
+        let known_instance = AgentInstanceId(first_instance);
+        let rejected_instance =
+            AgentInstanceId(first_instance + CONTROL_INSTANCE_IDENTITIES_MAX as u64);
+        let before = engine.clone();
+
+        let error = engine
+            .apply_command(register_instance(1, rejected_instance))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::InstanceIdentityCapacityExceeded {
+                instance_id: rejected_instance,
+                max: CONTROL_INSTANCE_IDENTITIES_MAX,
+            }
+        );
+        assert_eq!(engine, before);
+
+        engine
+            .apply_command(register_instance(2, known_instance))
+            .unwrap();
+        let current = engine
+            .session_snapshot(known_instance)
+            .expect("known retained identity must remain reusable")
+            .clone();
+        assert_eq!(current.generation, SessionGeneration(1));
+        engine.drain_events();
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: known_instance,
+            generation: SessionGeneration::default(),
+            observation: ControlObservation::ProcessExited {
+                exit_code: Some(9),
+                final_terminal: None,
+            },
+        });
+
+        assert_eq!(engine.session_snapshot(known_instance), Some(&current));
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::StaleGeneration
+            }
+        )));
+    }
+
+    #[test]
+    fn operation_id_max_is_issued_once_and_later_commands_fail_atomically() {
+        let (mut engine, spawn) = running_engine();
+        engine.drain_events();
+        engine.next_operation_id = Some(u64::MAX);
+        engine.apply_command(terminal_text(3, "first")).unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        assert_eq!(effect.operation_id, OperationId(u64::MAX));
+        engine
+            .try_apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: Some(effect.operation_id),
+                instance_id: instance(),
+                generation: spawn.generation,
+                observation: ControlObservation::InputCompleted,
+            })
+            .unwrap();
+        let before = engine.clone();
+
+        let error = engine
+            .apply_command(terminal_text(4, "second"))
+            .unwrap_err();
+
+        assert_eq!(error, ControlError::OperationIdExhausted);
+        assert_eq!(engine, before);
+        assert!(engine.snapshot().health.operation_id_exhausted);
+    }
+
+    #[test]
+    fn event_sequence_max_is_emitted_once_and_observation_failure_is_atomic() {
+        let (mut engine, spawn) = running_engine();
+        engine.drain_events();
+        engine.next_event_sequence = Some(u64::MAX);
+        engine.apply_command(terminal_text(3, "first")).unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        let before = engine.clone();
+
+        let error = engine
+            .try_apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: Some(effect.operation_id),
+                instance_id: instance(),
+                generation: spawn.generation,
+                observation: ControlObservation::InputCompleted,
+            })
+            .unwrap_err();
+
+        assert_eq!(error, ControlError::EventSequenceExhausted);
+        assert_eq!(engine, before);
+        assert!(engine.snapshot().health.event_sequence_exhausted);
+        let events = engine.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, u64::MAX);
+    }
+
+    #[test]
+    fn revision_max_is_published_once_and_later_observation_is_atomic() {
+        let (mut engine, spawn) = running_engine();
+        engine.drain_events();
+        engine.revision = u64::MAX - 1;
+        engine.apply_command(terminal_text(3, "first")).unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        assert_eq!(engine.snapshot().revision, u64::MAX);
+        let before = engine.clone();
+
+        let error = engine
+            .try_apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: Some(effect.operation_id),
+                instance_id: instance(),
+                generation: spawn.generation,
+                observation: ControlObservation::InputCompleted,
+            })
+            .unwrap_err();
+
+        assert_eq!(error, ControlError::RevisionExhausted);
+        assert_eq!(engine, before);
+        assert!(engine.snapshot().health.revision_exhausted);
+    }
+
+    #[test]
+    fn provider_sequence_capacity_is_preflighted_for_the_whole_ingress_batch() {
+        let (mut engine, spawn) = running_engine();
+        engine.session_mut(instance()).provider.sequence = u64::MAX - 1;
+        let before = engine.clone();
+
+        let error = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation: spawn.generation,
+                    source: provider_source(),
+                    source_sequence: 2,
+                    events: vec![ProviderEvent::Text {
+                        text: "bounded".to_owned(),
+                        is_delta: false,
+                    }],
+                },
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::ProviderSequenceExhausted {
+                instance_id: instance(),
+                generation: spawn.generation,
+            }
+        );
+        assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn provider_sequence_terminal_state_is_observable_and_blocks_observations() {
+        let (mut engine, spawn) = running_engine();
+        engine.session_mut(instance()).provider.sequence = u64::MAX;
+        let before = engine.clone();
+        assert_eq!(
+            engine
+                .snapshot()
+                .health
+                .provider_sequence_exhausted_sessions,
+            1
+        );
+
+        let error = engine
+            .try_apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: instance(),
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderGap {
+                    source: provider_source(),
+                    missed: 1,
+                },
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::ProviderSequenceExhausted {
+                instance_id: instance(),
+                generation: spawn.generation,
+            }
+        );
+        assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn provider_source_sequence_exhaustion_is_typed_and_atomic() {
+        let (mut engine, spawn) = running_engine();
+        let source = provider_source();
+        engine
+            .session_mut(instance())
+            .provider
+            .sources
+            .push(ProviderSourceCursor {
+                source: source.clone(),
+                sequence: u64::MAX,
+                gap_count: 0,
+                stale: false,
+            });
+        let before = engine.clone();
+
+        let error = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation: spawn.generation,
+                    source: source.clone(),
+                    source_sequence: u64::MAX,
+                    events: vec![ProviderEvent::WorkingObserved],
+                },
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::ProviderSourceSequenceExhausted {
+                instance_id: instance(),
+                generation: spawn.generation,
+                provider_source: source,
+            }
+        );
+        assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn removed_lifecycle_observations_cannot_mutate_a_reregistered_instance() {
+        let (mut engine, first_spawn) = running_engine();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: first_spawn.generation,
+            observation: ControlObservation::ProcessExited {
+                exit_code: Some(0),
+                final_terminal: None,
+            },
+        });
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::Remove {
+                    instance_id: instance(),
+                },
+            })
+            .unwrap();
+        engine.apply_command(register(4)).unwrap();
+        engine.apply_command(start(5)).unwrap();
+        let second_spawn = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(second_spawn.operation_id),
+            instance_id: instance(),
+            generation: second_spawn.generation,
+            observation: ControlObservation::Spawned {
+                process_id: Some(84),
+            },
+        });
+        let before = engine.snapshot().sessions[0].clone();
+        engine.drain_events();
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: first_spawn.generation,
+            observation: ControlObservation::ProcessExited {
+                exit_code: Some(9),
+                final_terminal: None,
+            },
+        });
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: first_spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 1,
+                event: ProviderEvent::SessionIdentityObserved {
+                    identity: ProviderSessionIdentity {
+                        key: ProviderSessionKey::SessionId,
+                        id: "stale-provider-session".to_owned(),
+                        transcript_path: None,
+                    },
+                },
+            },
+        });
+
+        assert_eq!(engine.snapshot().sessions[0], before);
+        let ignored = engine
+            .drain_events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    ControlEventKind::ObservationIgnored {
+                        reason: ObservationIgnoredReason::StaleGeneration
+                    }
+                )
+            })
+            .count();
+        assert_eq!(ignored, 2);
+    }
+
+    #[test]
+    fn start_generation_exhaustion_is_atomic() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        let exhausted = SessionGeneration(u64::MAX);
+        engine.session_mut(instance()).generation = exhausted;
+        engine.generation_watermarks.insert(instance(), exhausted);
+        let before = engine.clone();
+
+        let error = engine.apply_command(start(2)).unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::GenerationExhausted {
+                instance_id: instance(),
+                generation: exhausted,
+            }
+        );
+        assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn start_generation_exhaustion_preserves_queued_history_effect() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: None,
+                        limit: 1,
+                    },
+                },
+            })
+            .unwrap();
+        let exhausted = SessionGeneration(u64::MAX);
+        engine.session_mut(instance()).generation = exhausted;
+        engine.generation_watermarks.insert(instance(), exhausted);
+        let before = engine.clone();
+
+        let error = engine.apply_command(start(3)).unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::GenerationExhausted {
+                instance_id: instance(),
+                generation: exhausted,
+            }
+        );
+        assert_eq!(engine, before);
+        assert!(matches!(
+            engine.drain_effects().as_slice(),
+            [EffectEnvelope {
+                effect: ControlEffect::DiscoverHistory { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn multi_event_rollback_retires_the_event_sequence_terminally() {
+        let (mut engine, spawn) = running_engine();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 1,
+                event: ProviderEvent::InteractionRequested {
+                    request_id: Some("approval-counter-boundary".to_owned()),
+                    interaction_kind: ProviderInteractionKind::Approval,
+                    tool_name: "shell".to_owned(),
+                    prompt: "approve".to_owned(),
+                    agent_id: None,
+                },
+            },
+        });
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::TerminalControl(TerminalControl::Interrupt),
+                },
+            })
+            .unwrap();
+        let interrupt = engine.drain_effects().pop().unwrap();
+        engine.drain_events();
+        engine.next_event_sequence = Some(u64::MAX);
+        let before = engine.snapshot();
+
+        let error = engine
+            .try_apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: Some(interrupt.operation_id),
+                instance_id: instance(),
+                generation: spawn.generation,
+                observation: ControlObservation::InputCompleted,
+            })
+            .unwrap_err();
+
+        assert_eq!(error, ControlError::EventSequenceExhausted);
+        let after = engine.snapshot();
+        assert_eq!(after.sessions, before.sessions);
+        assert_eq!(after.revision, before.revision);
+        assert!(!before.health.event_sequence_exhausted);
+        assert!(after.health.event_sequence_exhausted);
+        assert!(engine.drain_events().is_empty());
+    }
+
+    #[test]
     fn stale_generation_cannot_mutate_restarted_session() {
         let (mut engine, first_spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
@@ -5122,7 +5929,7 @@ mod tests {
     }
 
     #[test]
-    fn session_start_supersedes_generation_bound_history_work() {
+    fn session_start_purges_queued_generation_bound_history_work() {
         let mut engine = Gate4AgentEngine::new();
         engine.apply_command(register(1)).unwrap();
         engine
@@ -5138,17 +5945,26 @@ mod tests {
                 },
             })
             .unwrap();
-        let history = engine.drain_effects().pop().unwrap();
+        let before_start = engine.snapshot().sessions[0].clone();
+        let history_operation_id = before_start
+            .history
+            .pending
+            .as_ref()
+            .expect("history request must be pending")
+            .operation_id;
         engine.apply_command(start(3)).unwrap();
+        let effects = engine.drain_effects();
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0].effect, ControlEffect::Spawn { .. }));
         let snapshot = engine.snapshot();
         assert!(snapshot.sessions[0].history.pending.is_none());
         assert!(snapshot.sessions[0].history.candidates.is_empty());
 
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
-            operation_id: Some(history.operation_id),
+            operation_id: Some(history_operation_id),
             instance_id: instance(),
-            generation: history.generation,
+            generation: before_start.generation,
             observation: ControlObservation::HistoryDiscovered {
                 candidates: Vec::new(),
             },
@@ -5159,6 +5975,107 @@ mod tests {
                 reason: ObservationIgnoredReason::StaleGeneration
             }
         )));
+    }
+
+    #[test]
+    fn remove_rejects_pending_capability_probe_without_dropping_its_effect() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::ProbeCapabilities {
+                    instance_id: instance(),
+                    request: CapabilityProbeRequest {
+                        working_directory: ".".to_owned(),
+                    },
+                },
+            })
+            .unwrap();
+        let pending = engine.snapshot().sessions[0]
+            .capabilities
+            .pending
+            .as_ref()
+            .expect("capability probe must be pending")
+            .operation_id;
+        let before = engine.clone();
+
+        let error = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::Remove {
+                    instance_id: instance(),
+                },
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::CapabilityProbeOperationPending {
+                operation_id: pending,
+            }
+        );
+        assert_eq!(engine, before);
+        assert!(matches!(
+            engine.drain_effects().as_slice(),
+            [EffectEnvelope {
+                effect: ControlEffect::ProbeCapabilities { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn remove_rejects_pending_history_without_dropping_its_effect() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::DiscoverHistory {
+                    instance_id: instance(),
+                    query: HistoryQuery {
+                        working_directory: None,
+                        limit: 1,
+                    },
+                },
+            })
+            .unwrap();
+        let pending = engine.snapshot().sessions[0]
+            .history
+            .pending
+            .as_ref()
+            .expect("history request must be pending")
+            .operation_id;
+        let before = engine.clone();
+
+        let error = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::Remove {
+                    instance_id: instance(),
+                },
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ControlError::HistoryOperationPending {
+                operation_id: pending,
+            }
+        );
+        assert_eq!(engine, before);
+        assert!(matches!(
+            engine.drain_effects().as_slice(),
+            [EffectEnvelope {
+                effect: ControlEffect::DiscoverHistory { .. },
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -5299,6 +6216,57 @@ mod tests {
             &event.event,
             ControlEventKind::Resumed { session, process_id: Some(77) }
                 if session.id == "provider-session-1"
+        )));
+    }
+
+    #[test]
+    fn resume_authorization_generation_exhaustion_is_atomic_and_ignored() {
+        let (mut engine, identity) = inactive_engine_with_provider_session();
+        let exhausted = SessionGeneration(u64::MAX);
+        engine.session_mut(instance()).generation = exhausted;
+        engine.generation_watermarks.insert(instance(), exhausted);
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(10),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        engine.drain_events();
+        let before = engine.snapshot().sessions[0].clone();
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: identity,
+            },
+        });
+
+        assert_eq!(engine.snapshot().sessions[0], before);
+        assert_eq!(
+            engine.generation_watermarks.get(&instance()),
+            Some(&exhausted)
+        );
+        assert!(engine.drain_effects().is_empty());
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::GenerationExhausted
+            }
         )));
     }
 

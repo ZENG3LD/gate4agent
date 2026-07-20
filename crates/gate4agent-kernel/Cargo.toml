@@ -12,4 +12,6 @@ name = "gate4agent_kernel"
 gate4agent-types = { path = "../gate4agent-types" }
 gate4agent-catalog = { path = "../gate4agent-catalog" }
 gate4agent-engine = { path = "../gate4agent-engine" }
+gate4agent-tool-engine = { path = "../gate4agent-tool-engine" }
+gate4agent-tool-protocol = { path = "../gate4agent-tool-protocol" }
 thiserror = "2"

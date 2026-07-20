@@ -1,0 +1,17 @@
+[package]
+name = "gate4agent-tool-protocol"
+version = "0.2.37"
+edition = "2021"
+description = "Pure capability authority and provider contracts for gate4agent"
+license = "MIT"
+publish = false
+
+[lib]
+name = "gate4agent_tool_protocol"
+
+[dependencies]
+gate4agent-types = { path = "../gate4agent-types" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

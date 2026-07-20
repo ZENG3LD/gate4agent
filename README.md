@@ -2,7 +2,11 @@
 
 Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for four different CLI agents through one unified API.
 
-**Not a harness. Not a sandbox.** gate4agent is the thin wiring layer between your Rust app and the CLI agent's subprocess: spawn the binary, write the prompt, read structured events, resume by session id. That's it.
+**Not a harness. Not a sandbox.** The root crate remains the transport layer
+between a Rust application and CLI-agent subprocesses: spawn, write typed
+input, read structured events, and resume by session id. The workspace also
+contains an optional backend control plane for consumers that need one
+deterministic owner for session lifecycle and host-capability authority.
 
 ## Supported CLI tools
 
@@ -191,6 +195,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ACP provides multi-turn sessions — call `prompt()` repeatedly without respawning the agent process. Agent-to-host filesystem, terminal, and permission requests are advertised as unavailable and denied by default; raw MCP server injection is not exposed by `AcpSessionOptions`.
 
+### Backend control plane (workspace crates)
+
+Control protocol v25 is reduced by a single-writer kernel. It combines session
+lifecycle with a separate, bounded capability engine for exact request,
+approval, cancellation, and completion correlation. Consumer handles inject
+their private consumer/actor identity, expose scoped snapshots, and disconnect
+slow subscribers instead of silently dropping ordered results.
+
+The capability engine is policy and lifecycle infrastructure, not a second
+agent loop. It does not execute filesystem, shell, MCP, or browser operations.
+Host-owned provider runtimes must be registered explicitly and return typed
+observations. The current ACP adapter remains fail-closed until such a runtime
+is connected through this control plane.
+
+No browser or remote delivery layer is included yet. A future browser shell
+will talk to a user-approved local backend; gate4agent will not collect vendor
+API keys or proxy CLI authentication through a hosted middleware service.
+
 ### Daemon Transport (skeleton)
 
 `DaemonSession` connects to long-running HTTP/WebSocket agent daemons (OpenCode `serve`, OpenClaw). Not yet functional — API surface documented for future implementation.
@@ -204,6 +226,8 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 - **Cross-platform** — Windows (ConPTY + `cmd /C` argv wrapping) and Unix (POSIX PTY + bare exec)
 - **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
 - **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio and multi-turn sessions, with agent-to-host and MCP authority fail-closed
+- **Deterministic backend kernel** — one ordered tick for control commands, provider observations, capability requests, effects, completions, and an atomic combined snapshot
+- **Scoped capability authority** — bounded grants and approvals, lifecycle fencing, exact request correlation, and isolated consumer projections; execution providers remain host-owned
 - **4 CLI agents** — Claude Code, Codex, Gemini, OpenCode
 - **Extensible grounding registry** — 33 portable agent IDs and shell-free interactive launch plans; deep transport support remains capability-specific
 - **Typed terminal input** — bounded prompt/draft framing with UTF-8-safe chunks and explicit command/control variants
@@ -245,6 +269,14 @@ gate4agent/
 │   │   ├── gemini.rs    — JSON from ~/.gemini/tmp/{slug}/chats/
 │   │   └── opencode.rs  — SQLite from ~/.local/share/opencode/opencode.db
 │   └── utils.rs         — String utilities
+└── crates/
+    ├── gate4agent-types          — Control protocol v25 contracts
+    ├── gate4agent-engine         — Deterministic session lifecycle reducer
+    ├── gate4agent-tool-protocol  — Capability request/effect/result contracts
+    ├── gate4agent-tool-engine    — Bounded policy, approval, and correlation reducer
+    ├── gate4agent-kernel         — Unified backend tick and atomic snapshot
+    ├── gate4agent-handle         — Bounded trusted/scoped process-local ports
+    └── gate4agent-runtime-native — Native effect execution adapter
 ```
 
 ## Testing status

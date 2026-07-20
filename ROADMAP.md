@@ -2,6 +2,27 @@
 
 Living document. Current state + what's next. Updated per release.
 
+## Backend control plane (unreleased 0.3 line)
+
+- [x] Split the workspace into pure contracts, lifecycle engines, kernel,
+  bounded handles, shell adapters, native runtime, and testkit crates.
+- [x] Add control protocol v25 with persistent session generations and bounded
+  live/retained identity admission.
+- [x] Add a bounded capability protocol and engine with host-owned providers,
+  exact scoped grants/approvals, lifecycle cancellation, terminal completions,
+  and explicit queue/sequence health.
+- [x] Reduce control and capability ingress in one deterministic kernel tick and
+  publish one immutable combined snapshot through trusted/scoped handles.
+- [ ] Add provider-bound runtime handles so provider identity cannot be asserted
+  by an untrusted observation producer.
+- [ ] Add transport admission that rejects oversized frames/bodies before serde
+  allocation, plus backend boot/incarnation and connection-scoped identity.
+- [ ] Connect approved capability providers. Filesystem, shell, MCP, and browser
+  execution remain unavailable until their provider runtime is explicit.
+
+This line intentionally changes previously exhaustive internal APIs and the
+wire protocol. The next release must use the 0.3 version boundary.
+
 ## Current — 0.2.37 (April 2026)
 
 ### Current ACP authority boundary
@@ -146,12 +167,16 @@ Small, additive, non-breaking:
 - [ ] **Process supervision**: optional auto-restart on crash with backoff.
 - [ ] **Cost attribution**: surface `cost_usd` from CLIs that report it (Claude, others) through `SessionEnd`.
 
-## 0.5.0 — thin server
+## Local daemon and browser delivery (after backend readiness)
 
-- [ ] **`gate4agent-server` binary**: axum wrapper over `TransportSession` with WS/SSE fan-out.
-- [ ] **Auth**: bearer tokens for remote spawn access.
-- [ ] **Worktree sandbox profiles**: spawn each session in an ephemeral git worktree with configurable cleanup.
-- [ ] **Multi-tenant session registry**: HTTP endpoints to list/spawn/kill sessions remotely.
+- [ ] **Local daemon**: authenticated IPC or loopback WebSocket shell over the
+  canonical kernel/handle boundary, with bounded frames before deserialization.
+- [ ] **Connection authority**: backend-minted boot, connection, client, and
+  instance identities; explicit origin checks and user-visible approval.
+- [ ] **WASM client**: browser-side protocol client and projection only. PTY,
+  filesystem, credentials, and CLI processes remain owned by the local daemon.
+- [ ] **Packaging**: make installation/startup an explicit user-approved product
+  flow; a normal web page cannot silently install or launch a local service.
 
 ## Future: HTTP transport for agent daemons
 
@@ -164,6 +189,8 @@ If a real HTTP-based agent daemon API becomes available (e.g. an agent SDK that 
 - **Aider / Cline / Continue / Amp / Goose integration** — scope excluded by upstream user decision.
 - **Crush (`charmbracelet/crush`)** — no structured headless output, PTY-only, not worth the integration cost until it ships a structured mode. Track `charmbracelet/crush` issue #1030.
 - **Config-based auth / API keys** — out of scope. Each CLI handles its own auth; gate4agent just spawns.
+- **Hosted agent middleware** — out of scope. Browser delivery uses a local
+  backend gate and never uploads vendor CLI credentials to our servers.
 - **Cursor** — `cursor-agent` ships Linux/macOS only — `node_sqlite3.node` is a Linux ELF binary, crashes on Windows with "is not a valid Win32 application". No official Windows build. Community patch (gitcnd/cursor-agent-cli-windows) exists but is unofficial. Re-added in 0.2.16 for ACP, removed again in 0.2.17.
 
 ## Out-of-band projects that may feed back into gate4agent

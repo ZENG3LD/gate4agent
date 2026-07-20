@@ -8,7 +8,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 24;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 25;
+pub const CONTROL_SESSIONS_MAX: usize = 512;
+pub const CONTROL_INSTANCE_IDENTITIES_CAPACITY: u32 = 4_096;
+pub const CONTROL_INSTANCE_IDENTITIES_MAX: usize = CONTROL_INSTANCE_IDENTITIES_CAPACITY as usize;
 pub const TERMINAL_ROWS_MAX: u16 = 1_000;
 pub const TERMINAL_COLUMNS_MAX: u16 = 1_000;
 pub const WORKING_DIRECTORY_MAX_BYTES: usize = 32_768;
@@ -951,7 +954,31 @@ pub struct ProviderSnapshot {
 pub struct ControlSnapshot {
     pub protocol_version: u16,
     pub revision: u64,
+    pub health: ControlHealth,
     pub sessions: Vec<SessionSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ControlHealth {
+    pub operation_id_exhausted: bool,
+    pub event_sequence_exhausted: bool,
+    pub revision_exhausted: bool,
+    pub provider_sequence_exhausted_sessions: u32,
+    pub retained_instance_identities: u32,
+    pub retained_instance_identity_capacity: u32,
+}
+
+impl Default for ControlHealth {
+    fn default() -> Self {
+        Self {
+            operation_id_exhausted: false,
+            event_sequence_exhausted: false,
+            revision_exhausted: false,
+            provider_sequence_exhausted_sessions: 0,
+            retained_instance_identities: 0,
+            retained_instance_identity_capacity: CONTROL_INSTANCE_IDENTITIES_CAPACITY,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1099,6 +1126,7 @@ pub enum ObservationIgnoredReason {
     UnsupportedProtocolVersion,
     UnknownInstance,
     StaleGeneration,
+    GenerationExhausted,
     MissingOperation,
     OperationMismatch,
     InvalidState,
@@ -1118,8 +1146,48 @@ pub enum ControlError {
     UnsupportedProtocolVersion { expected: u16, actual: u16 },
     #[error("agent instance {instance_id:?} is already registered")]
     DuplicateInstance { instance_id: AgentInstanceId },
+    #[error(
+        "cannot register agent instance {instance_id:?}: live session capacity {max} is exhausted"
+    )]
+    SessionCapacityExceeded {
+        instance_id: AgentInstanceId,
+        max: usize,
+    },
+    #[error(
+        "cannot register agent instance {instance_id:?}: retained identity capacity {max} is exhausted"
+    )]
+    InstanceIdentityCapacityExceeded {
+        instance_id: AgentInstanceId,
+        max: usize,
+    },
     #[error("agent instance {instance_id:?} is not registered")]
     UnknownInstance { instance_id: AgentInstanceId },
+    #[error("agent instance {instance_id:?} exhausted session generation {generation:?}")]
+    GenerationExhausted {
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+    },
+    #[error("control operation identifiers are exhausted")]
+    OperationIdExhausted,
+    #[error("control event sequences are exhausted")]
+    EventSequenceExhausted,
+    #[error("control snapshot revisions are exhausted")]
+    RevisionExhausted,
+    #[error(
+        "agent instance {instance_id:?} generation {generation:?} exhausted provider event sequences"
+    )]
+    ProviderSequenceExhausted {
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+    },
+    #[error(
+        "agent instance {instance_id:?} generation {generation:?} exhausted source sequence for {provider_source:?}"
+    )]
+    ProviderSourceSequenceExhausted {
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+        provider_source: ProviderSource,
+    },
     #[error("agent instance {instance_id:?} already has pending operation {operation_id:?}")]
     OperationPending {
         instance_id: AgentInstanceId,
@@ -1197,6 +1265,7 @@ impl Default for ControlSnapshot {
         Self {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             revision: 0,
+            health: ControlHealth::default(),
             sessions: Vec::new(),
         }
     }

@@ -343,7 +343,9 @@ dependencies = [
 name = "gate4agent-handle"
 version = "0.2.37"
 dependencies = [
+ "gate4agent-catalog",
  "gate4agent-kernel",
+ "gate4agent-tool-protocol",
  "gate4agent-types",
  "thiserror 2.0.18",
 ]
@@ -354,6 +356,8 @@ version = "0.2.37"
 dependencies = [
  "gate4agent-catalog",
  "gate4agent-engine",
+ "gate4agent-tool-engine",
+ "gate4agent-tool-protocol",
  "gate4agent-types",
  "thiserror 2.0.18",
 ]
@@ -471,6 +475,15 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-tool-engine"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-tool-protocol",
+ "gate4agent-types",
+ "serde_json",
+]
+
+[[package]]
+name = "gate4agent-tool-protocol"
 version = "0.2.37"
 dependencies = [
  "gate4agent-types",

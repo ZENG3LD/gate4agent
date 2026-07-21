@@ -152,6 +152,7 @@ struct ProviderAuthorityInner {
 struct ProviderBindingState {
     provider_id: ToolProviderId,
     binding_id: ProviderBindingId,
+    effect_capacity: usize,
     authority: Weak<ProviderAuthorityState>,
     lifecycle: Mutex<ProviderBindingLifecycle>,
     work_tx: Mutex<Option<SyncSender<ProviderWork>>>,
@@ -179,6 +180,7 @@ struct PendingObservation {
 enum ProviderBindingLifecycle {
     AttachSent { sequence: u64 },
     Active,
+    Quiescing,
     ClosingRetry { attach_sequence: Option<u64> },
     DetachSent { sequence: u64 },
     Closed,
@@ -250,17 +252,13 @@ impl ProviderRuntimeAuthorityHandle {
         }
         let sequence = authority.next_sequence;
         let binding_id = ProviderBindingId(sequence);
-        let (work_tx, work_rx) = sync_channel(bounded_capacity(
-            effect_capacity,
-            MAX_PROVIDER_EFFECT_CAPACITY,
-        ));
-        let (observation_outcome_tx, observation_outcome_rx) = sync_channel(bounded_capacity(
-            effect_capacity,
-            MAX_PROVIDER_EFFECT_CAPACITY,
-        ));
+        let effect_capacity = bounded_capacity(effect_capacity, MAX_PROVIDER_EFFECT_CAPACITY);
+        let (work_tx, work_rx) = sync_channel(effect_capacity);
+        let (observation_outcome_tx, observation_outcome_rx) = sync_channel(effect_capacity);
         let state = Arc::new(ProviderBindingState {
             provider_id: provider_id.clone(),
             binding_id,
+            effect_capacity,
             authority: Arc::downgrade(&self.state),
             lifecycle: Mutex::new(ProviderBindingLifecycle::AttachSent { sequence }),
             work_tx: Mutex::new(Some(work_tx)),
@@ -319,6 +317,12 @@ impl ProviderRuntimeHandle {
         self.state.binding_id
     }
 
+    /// Maximum number of provider work items and unconsumed observation
+    /// outcomes admitted by this exact binding.
+    pub fn effect_capacity(&self) -> usize {
+        self.state.effect_capacity
+    }
+
     pub fn state(&self) -> ProviderRuntimeState {
         public_lifecycle(*lock(&self.state.lifecycle))
     }
@@ -338,7 +342,10 @@ impl ProviderRuntimeHandle {
 
     pub fn try_recv(&self) -> Result<ProviderWork, TryRecvError> {
         let lifecycle = lock(&self.state.lifecycle);
-        if !matches!(*lifecycle, ProviderBindingLifecycle::Active) {
+        if !matches!(
+            *lifecycle,
+            ProviderBindingLifecycle::Active | ProviderBindingLifecycle::Quiescing
+        ) {
             return Err(TryRecvError::Disconnected);
         }
         self.work_rx.try_recv()
@@ -346,6 +353,17 @@ impl ProviderRuntimeHandle {
 
     pub fn try_recv_observation_outcome(&self) -> Result<ProviderObservationOutcome, TryRecvError> {
         self.observation_outcome_rx.try_recv()
+    }
+
+    /// Hides this binding from new local client dispatch while preserving its
+    /// receive and completion lanes for already admitted work.
+    ///
+    /// A supervisor must retain every native owner until physical exit and
+    /// call [`ProviderRuntimeHandle::close`] only after teardown. Quiescing is
+    /// a local admission fence; canonical detach still flows through the
+    /// kernel.
+    pub fn begin_quiesce(&self) -> Result<(), ProviderRuntimeError> {
+        begin_quiesce(&self.state)
     }
 
     /// Fences work immediately and non-blockingly requests canonical detach.
@@ -686,7 +704,9 @@ impl ProviderRuntimePort {
                 ProviderBindingLifecycle::ClosingRetry { attach_sequence } => {
                     attach_sequence.is_none_or(|sequence| snapshot.last_sequence >= sequence)
                 }
-                ProviderBindingLifecycle::Active | ProviderBindingLifecycle::Closed => true,
+                ProviderBindingLifecycle::Active
+                | ProviderBindingLifecycle::Quiescing
+                | ProviderBindingLifecycle::Closed => true,
             };
             if snapshot.sequence_exhausted || (!exact && command_was_reduced) {
                 remove.push(provider_id.clone());
@@ -739,7 +759,10 @@ impl ProviderRuntimePort {
             };
         };
         let mut lifecycle = lock(&state.lifecycle);
-        if !matches!(*lifecycle, ProviderBindingLifecycle::Active) {
+        if !matches!(
+            *lifecycle,
+            ProviderBindingLifecycle::Active | ProviderBindingLifecycle::Quiescing
+        ) {
             return ProviderEffectPublishReport {
                 disconnected: 1,
                 ..ProviderEffectPublishReport::default()
@@ -966,7 +989,10 @@ fn submit_observation(
         .bindings
         .get(&state.provider_id)
         .is_some_and(|current| Arc::ptr_eq(current, state))
-        || !matches!(*lifecycle, ProviderBindingLifecycle::Active)
+        || !matches!(
+            *lifecycle,
+            ProviderBindingLifecycle::Active | ProviderBindingLifecycle::Quiescing
+        )
     {
         return Err(ProviderRuntimeError::Inactive);
     }
@@ -1053,6 +1079,7 @@ fn request_close(state: &Arc<ProviderBindingState>) -> Result<u64, ProviderRunti
         ProviderBindingLifecycle::Closed => return Err(ProviderRuntimeError::Inactive),
         ProviderBindingLifecycle::AttachSent { .. }
         | ProviderBindingLifecycle::Active
+        | ProviderBindingLifecycle::Quiescing
         | ProviderBindingLifecycle::ClosingRetry { .. } => {}
     }
     let sequence = inner.next_sequence;
@@ -1105,6 +1132,7 @@ fn fault_binding_locked(
         *lifecycle,
         ProviderBindingLifecycle::AttachSent { .. }
             | ProviderBindingLifecycle::Active
+            | ProviderBindingLifecycle::Quiescing
             | ProviderBindingLifecycle::ClosingRetry { .. }
     ) {
         *lifecycle = closing_retry(*lifecycle);
@@ -1118,6 +1146,40 @@ fn cancel_all_operations(state: &Arc<ProviderBindingState>) {
     for operation in operations.into_values() {
         operation.cancelled.store(true, Ordering::Release);
     }
+}
+
+fn begin_quiesce(state: &Arc<ProviderBindingState>) -> Result<(), ProviderRuntimeError> {
+    let Some(authority) = state.authority.upgrade() else {
+        retire_binding(state);
+        return Err(ProviderRuntimeError::Disconnected);
+    };
+    let authority = lock(&authority.inner);
+    if authority.closed
+        || !authority
+            .bindings
+            .get(&state.provider_id)
+            .is_some_and(|current| Arc::ptr_eq(current, state))
+    {
+        drop(authority);
+        retire_binding(state);
+        return Err(ProviderRuntimeError::Inactive);
+    }
+    let mut lifecycle = lock(&state.lifecycle);
+    match *lifecycle {
+        ProviderBindingLifecycle::Active => {
+            *lifecycle = ProviderBindingLifecycle::Quiescing;
+        }
+        ProviderBindingLifecycle::Quiescing => return Ok(()),
+        ProviderBindingLifecycle::AttachSent { .. }
+        | ProviderBindingLifecycle::ClosingRetry { .. }
+        | ProviderBindingLifecycle::DetachSent { .. }
+        | ProviderBindingLifecycle::Closed => return Err(ProviderRuntimeError::Inactive),
+    }
+    state.cancelled.store(true, Ordering::Release);
+    for operation in lock(&state.operations).values() {
+        operation.cancelled.store(true, Ordering::Release);
+    }
+    Ok(())
 }
 
 fn close_authority_locked(inner: &mut ProviderAuthorityInner) -> Vec<Arc<ProviderBindingState>> {
@@ -1143,6 +1205,7 @@ fn closing_retry(lifecycle: ProviderBindingLifecycle) -> ProviderBindingLifecycl
         ProviderBindingLifecycle::AttachSent { sequence } => Some(sequence),
         ProviderBindingLifecycle::ClosingRetry { attach_sequence } => attach_sequence,
         ProviderBindingLifecycle::Active
+        | ProviderBindingLifecycle::Quiescing
         | ProviderBindingLifecycle::DetachSent { .. }
         | ProviderBindingLifecycle::Closed => None,
     };
@@ -1153,6 +1216,7 @@ fn public_lifecycle(lifecycle: ProviderBindingLifecycle) -> ProviderRuntimeState
     match lifecycle {
         ProviderBindingLifecycle::AttachSent { .. } => ProviderRuntimeState::Attaching,
         ProviderBindingLifecycle::Active => ProviderRuntimeState::Active,
+        ProviderBindingLifecycle::Quiescing => ProviderRuntimeState::Closing,
         ProviderBindingLifecycle::ClosingRetry { .. }
         | ProviderBindingLifecycle::DetachSent { .. } => ProviderRuntimeState::Closing,
         ProviderBindingLifecycle::Closed => ProviderRuntimeState::Closed,
@@ -1510,6 +1574,51 @@ mod tests {
         assert_eq!(cancel.operation_id(), first.operation_id());
         assert_eq!(cancel.request_key(), first.request_key());
         assert_eq!(cancel.reason(), InvocationCancelReason::GrantRevoked);
+    }
+
+    #[test]
+    fn quiesce_hides_binding_but_preserves_admitted_work_and_receipts() {
+        let (ingress_tx, ingress_rx) = sync_channel(8);
+        let (authority, port) = provider_runtime(ingress_tx);
+        let runtime = activate(&authority, &port, &ingress_rx);
+        let effect = bound_invoke(runtime.binding_id());
+        assert_eq!(port.publish_effect(effect).delivered, 1);
+
+        runtime.begin_quiesce().unwrap();
+        assert_eq!(runtime.state(), ProviderRuntimeState::Closing);
+        assert_eq!(authority.active_binding_count(), 0);
+        assert!(port.active_bindings().is_empty());
+
+        let ProviderWork::Invoke(mut invocation) = runtime.try_recv().unwrap() else {
+            panic!("expected already admitted invocation");
+        };
+        assert!(invocation.cancellation_token().is_cancelled());
+        let sequence = runtime.try_succeed(&mut invocation, &result()).unwrap();
+        let BackendIngress::ToolProvider(observation) = ingress_rx.try_recv().unwrap() else {
+            panic!("expected provider observation ingress");
+        };
+        assert_eq!(observation.sequence, sequence);
+
+        port.publish_outcome(&ProviderRuntimeCommandOutcome {
+            sequence,
+            binding_id: runtime.binding_id(),
+            provider_id: provider_id(),
+            result: Ok(ProviderRuntimeTransition::ObservationApplied {
+                operation_id: invocation.operation_id(),
+                request_key: invocation.request_key().clone(),
+            }),
+        });
+        let receipt = runtime.try_recv_observation_outcome().unwrap();
+        assert_eq!(receipt.sequence, sequence);
+        assert_eq!(receipt.status, ProviderObservationStatus::Applied);
+        port.finish_step();
+        assert!(lock(&runtime.state.operations).is_empty());
+
+        runtime.close().unwrap();
+        assert!(matches!(
+            ingress_rx.try_recv(),
+            Ok(BackendIngress::ToolProvider(_))
+        ));
     }
 
     #[test]

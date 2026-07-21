@@ -8,7 +8,9 @@ publish = false
 gate4agent = { path = "../.." }
 gate4agent-adapters = { path = "../gate4agent-adapters" }
 gate4agent-catalog = { path = "../gate4agent-catalog" }
+gate4agent-handle = { path = "../gate4agent-handle" }
 gate4agent-shell-one-shot = { path = "../gate4agent-shell-one-shot" }
+gate4agent-tool-protocol = { path = "../gate4agent-tool-protocol" }
 gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["time"] }
 

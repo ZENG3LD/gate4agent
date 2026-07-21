@@ -1,7 +1,10 @@
 //! Tick-driven native runtime for embedding gate4agent in an owning app core.
 
 use gate4agent_catalog::{AgentRegistry, EnvMutation};
-use gate4agent_handle::{bounded_port, Gate4AgentHandle, KernelPort, PublishReport};
+use gate4agent_handle::{
+    bounded_control_plane, ControlPlaneKernelPort, Gate4AgentHandle,
+    ProviderRuntimeError, PublishReport, ToolAuthorityHandle,
+};
 use gate4agent_kernel::{CommandOutcome, Gate4AgentKernel};
 use gate4agent_provider_ports::{
     discover_history, load_history_session, prepare_resume, HistoryCandidate,
@@ -13,7 +16,20 @@ use gate4agent_shell_history::NativeHistoryAuthority;
 pub use gate4agent_shell_history::{NativeHistoryConfig, NativeHistoryRoot};
 pub use gate4agent_shell_hooks::{HookIngressConfig, HookIngressEndpoint};
 use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
-use gate4agent_shell_native::NativeEffectShell;
+pub use gate4agent_shell_native::{
+    NativeProviderExecutor, NativeProviderExit, NativeProviderOperation,
+    NativeProviderOperationError, NativeProviderResultPoll, PhysicalExitAck,
+    ProviderOperationKey, ProviderStopCause, ProviderSupervisorFault,
+    ProviderSupervisorFaultKind, ProviderSupervisorSnapshot, ProviderSupervisorState,
+};
+use gate4agent_shell_native::{
+    NativeEffectShell, ProviderSupervisor, ProviderSupervisorBuildError,
+    MAX_PROVIDER_SUPERVISOR_EVENTS,
+};
+use gate4agent_tool_engine::{
+    CapabilityOwner, CapabilityProviderDescriptor, ProviderBindingId, ToolEngineError,
+    ToolProviderId,
+};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect, ControlObservation,
     EffectEnvelope, HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole,
@@ -30,6 +46,13 @@ use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
 use tokio::time::MissedTickBehavior;
 
 type TerminalFrameKey = (AgentInstanceId, SessionGeneration);
+const PROVIDER_EVENT_DRAIN_QUANTUM: usize = 64;
+const MAX_PROVIDER_SHUTDOWN_TIMEOUT_MS: u64 = 86_400_000;
+
+fn drain_queue<T>(queue: &mut VecDeque<T>, limit: usize) -> Vec<T> {
+    let count = limit.min(queue.len());
+    queue.drain(..count).collect()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeRuntimeConfig {
@@ -38,6 +61,8 @@ pub struct NativeRuntimeConfig {
     pub effect_capacity_per_session: usize,
     pub observation_capacity: usize,
     pub max_observations_per_tick: usize,
+    pub provider_stop_grace_ms: u64,
+    pub provider_shutdown_timeout_ms: u64,
     pub worker_poll_interval_ms: u64,
     pub worker_idle_timeout_ms: u64,
 }
@@ -50,6 +75,8 @@ impl Default for NativeRuntimeConfig {
             effect_capacity_per_session: 16,
             observation_capacity: 1_024,
             max_observations_per_tick: 256,
+            provider_stop_grace_ms: 5_000,
+            provider_shutdown_timeout_ms: 15_000,
             worker_poll_interval_ms: 20,
             worker_idle_timeout_ms: 60_000,
         }
@@ -72,7 +99,14 @@ pub struct NativeRuntime {
     config: NativeRuntimeConfig,
     kernel: Gate4AgentKernel,
     handle: Gate4AgentHandle,
-    port: KernelPort,
+    tool_authority: ToolAuthorityHandle,
+    tool_providers: BTreeMap<ToolProviderId, CapabilityProviderDescriptor>,
+    provider_supervisors: BTreeMap<ToolProviderId, ProviderSupervisor>,
+    port: ControlPlaneKernelPort,
+    provider_exit_acks: VecDeque<PhysicalExitAck>,
+    provider_faults: VecDeque<ProviderSupervisorFault>,
+    provider_ack_cursor: Option<ToolProviderId>,
+    provider_fault_cursor: Option<ToolProviderId>,
     effects: NativeEffectDispatcher,
     hook_ingress: Option<HookIngressServer>,
 }
@@ -90,21 +124,226 @@ impl NativeRuntime {
         Self::new_with_optional_history(catalog, config, Some(history))
     }
 
+    pub fn new_with_tool_providers(
+        catalog: AgentRegistry,
+        config: NativeRuntimeConfig,
+        providers: impl IntoIterator<Item = CapabilityProviderDescriptor>,
+    ) -> Result<(Gate4AgentHandle, Self), ToolEngineError> {
+        let providers = providers.into_iter().collect::<Vec<_>>();
+        let kernel = Gate4AgentKernel::with_tool_providers(catalog.clone(), providers.clone())?;
+        Ok(Self::new_with_kernel_and_optional_history(
+            catalog, config, None, kernel, providers,
+        ))
+    }
+
+    pub fn new_with_history_and_tool_providers(
+        catalog: AgentRegistry,
+        config: NativeRuntimeConfig,
+        history: NativeHistoryConfig,
+        providers: impl IntoIterator<Item = CapabilityProviderDescriptor>,
+    ) -> Result<(Gate4AgentHandle, Self), ToolEngineError> {
+        let providers = providers.into_iter().collect::<Vec<_>>();
+        let kernel = Gate4AgentKernel::with_tool_providers(catalog.clone(), providers.clone())?;
+        Ok(Self::new_with_kernel_and_optional_history(
+            catalog,
+            config,
+            Some(history),
+            kernel,
+            providers,
+        ))
+    }
+
     fn new_with_optional_history(
         catalog: AgentRegistry,
         config: NativeRuntimeConfig,
         history: Option<NativeHistoryConfig>,
     ) -> (Gate4AgentHandle, Self) {
-        let (handle, port) = bounded_port(config.command_capacity);
+        let kernel = Gate4AgentKernel::new(catalog.clone());
+        Self::new_with_kernel_and_optional_history(catalog, config, history, kernel, Vec::new())
+    }
+
+    fn new_with_kernel_and_optional_history(
+        catalog: AgentRegistry,
+        config: NativeRuntimeConfig,
+        history: Option<NativeHistoryConfig>,
+        kernel: Gate4AgentKernel,
+        providers: Vec<CapabilityProviderDescriptor>,
+    ) -> (Gate4AgentHandle, Self) {
+        let (handle, tool_authority, port) = bounded_control_plane(config.command_capacity);
         let runtime = Self {
             config,
-            kernel: Gate4AgentKernel::new(catalog.clone()),
+            kernel,
             handle: handle.clone(),
+            tool_authority,
+            tool_providers: providers
+                .into_iter()
+                .map(|descriptor| (descriptor.id.clone(), descriptor))
+                .collect(),
+            provider_supervisors: BTreeMap::new(),
             port,
+            provider_exit_acks: VecDeque::new(),
+            provider_faults: VecDeque::new(),
+            provider_ack_cursor: None,
+            provider_fault_cursor: None,
             effects: NativeEffectDispatcher::new(catalog, config, history),
             hook_ingress: None,
         };
         (handle, runtime)
+    }
+
+    pub fn tool_authority(&self) -> ToolAuthorityHandle {
+        self.tool_authority.clone()
+    }
+
+    pub fn install_native_provider(
+        &mut self,
+        provider_id: &ToolProviderId,
+        work_capacity: usize,
+        executor: Box<dyn NativeProviderExecutor>,
+    ) -> Result<ProviderBindingId, NativeProviderControlError> {
+        self.collect_provider_supervisor_events();
+        if let Some(existing) = self.provider_supervisors.get(provider_id) {
+            let snapshot = existing.snapshot();
+            if snapshot.state != ProviderSupervisorState::Closed {
+                return Err(NativeProviderControlError::AlreadyInstalled {
+                    state: snapshot.state,
+                });
+            }
+            if snapshot.buffered_exit_acks != 0 || snapshot.buffered_faults != 0 {
+                return Err(NativeProviderControlError::PendingSupervisorEvents);
+            }
+        }
+        self.provider_supervisors.remove(provider_id);
+
+        let descriptor = self
+            .tool_providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| NativeProviderControlError::UnknownProvider {
+                provider_id: provider_id.clone(),
+            })?;
+        if !matches!(&descriptor.owner, CapabilityOwner::Gate) {
+            return Err(NativeProviderControlError::UnsupportedOwner {
+                provider_id: provider_id.clone(),
+            });
+        }
+        let runtime = self
+            .port
+            .provider_authority()
+            .bind_provider(provider_id.clone(), work_capacity)?;
+        let binding_id = runtime.binding_id();
+        let supervisor = ProviderSupervisor::new_with_stop_grace(
+            descriptor,
+            runtime,
+            executor,
+            Duration::from_millis(self.config.provider_stop_grace_ms.max(1)),
+        )
+        .map_err(NativeProviderControlError::Build)?;
+        self.provider_supervisors
+            .insert(provider_id.clone(), supervisor);
+        Ok(binding_id)
+    }
+
+    pub fn retire_native_provider(
+        &mut self,
+        provider_id: &ToolProviderId,
+    ) -> Result<(), NativeProviderControlError> {
+        let supervisor = self
+            .provider_supervisors
+            .get_mut(provider_id)
+            .ok_or_else(|| NativeProviderControlError::NotInstalled {
+                provider_id: provider_id.clone(),
+            })?;
+        supervisor.begin_retirement()?;
+        Ok(())
+    }
+
+    /// Begins non-blocking retirement for every installed native provider.
+    ///
+    /// The owner must keep calling [`NativeRuntime::tick`] until
+    /// [`NativeRuntime::native_provider_shutdown_complete`] returns `true`
+    /// before dropping the runtime. Dropping the runtime does not acknowledge
+    /// physical provider exit or complete coordinated shutdown.
+    pub fn retire_all_native_providers(&mut self) -> Result<(), NativeProviderControlError> {
+        let mut first_error = None;
+        for supervisor in self.provider_supervisors.values_mut() {
+            if let Err(error) = supervisor.begin_retirement() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns `true` only after every installed provider supervisor is closed.
+    pub fn native_provider_shutdown_complete(&self) -> bool {
+        self.provider_supervisors
+            .values()
+            .all(|supervisor| supervisor.state() == ProviderSupervisorState::Closed)
+    }
+
+    /// Drives the canonical runtime path until every native provider has
+    /// detached after physical teardown, or returns the still-owned snapshots
+    /// at the configured shutdown deadline. Lifecycle events remain buffered
+    /// for explicit operator drain after this method returns.
+    pub async fn shutdown_native_providers(
+        &mut self,
+    ) -> Result<(), NativeProviderShutdownError> {
+        let retirement_error = self.retire_all_native_providers().err();
+        let shutdown_timeout_ms = self
+            .config
+            .provider_shutdown_timeout_ms
+            .clamp(1, MAX_PROVIDER_SHUTDOWN_TIMEOUT_MS);
+        let deadline = Instant::now() + Duration::from_millis(shutdown_timeout_ms);
+        while !self.native_provider_shutdown_complete() {
+            self.tick().await;
+            if self.native_provider_shutdown_complete() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(NativeProviderShutdownError::TimedOut {
+                    pending: self
+                        .provider_supervisors
+                        .values()
+                        .filter(|supervisor| {
+                            supervisor.state() != ProviderSupervisorState::Closed
+                        })
+                        .map(ProviderSupervisor::snapshot)
+                        .collect(),
+                });
+            }
+            let poll_interval =
+                Duration::from_millis(self.config.worker_poll_interval_ms.max(1));
+            tokio::time::sleep(poll_interval.min(deadline.duration_since(now))).await;
+        }
+        match retirement_error {
+            Some(error) => Err(NativeProviderShutdownError::Control(error)),
+            None => Ok(()),
+        }
+    }
+
+    pub fn native_provider_snapshot(
+        &self,
+        provider_id: &ToolProviderId,
+    ) -> Option<ProviderSupervisorSnapshot> {
+        self.provider_supervisors
+            .get(provider_id)
+            .map(ProviderSupervisor::snapshot)
+    }
+
+    pub fn drain_provider_exit_acks(&mut self, limit: usize) -> Vec<PhysicalExitAck> {
+        self.collect_provider_supervisor_events();
+        drain_queue(&mut self.provider_exit_acks, limit)
+    }
+
+    pub fn drain_provider_faults(&mut self, limit: usize) -> Vec<ProviderSupervisorFault> {
+        self.collect_provider_supervisor_events();
+        drain_queue(&mut self.provider_faults, limit)
     }
 
     pub fn history_enabled(&self) -> bool {
@@ -118,18 +357,21 @@ impl NativeRuntime {
             .effects
             .drain_observations(self.config.max_observations_per_tick.max(1));
         let observations_applied = observations.len();
-        let commands = self
+        let ingress = self
             .port
-            .drain_commands(self.config.max_commands_per_tick.max(1));
-        let step = self.kernel.step(commands, observations);
+            .drain_ingress(self.config.max_commands_per_tick.max(1));
+        let step = self.kernel.step_control_plane(ingress, observations);
         let effects_dispatched = step.effects.len();
-        for effect in step.effects {
+        for effect in step.effects.iter().cloned() {
             self.effects.dispatch(effect);
         }
 
-        self.port.publish_snapshot(step.snapshot.clone());
         let snapshot_revision = step.snapshot.revision;
-        let publish_report = self.port.publish_events(step.events);
+        let publish_report = self.port.publish_step(&step).control_events;
+        for supervisor in self.provider_supervisors.values_mut() {
+            supervisor.tick();
+        }
+        self.collect_provider_supervisor_events();
 
         NativeRuntimeTick {
             command_outcomes: step.command_outcomes,
@@ -138,6 +380,67 @@ impl NativeRuntime {
             terminal_frames_collected,
             snapshot_revision,
             publish_report,
+        }
+    }
+
+    fn collect_provider_supervisor_events(&mut self) {
+        self.collect_provider_exit_acks();
+        self.collect_provider_faults();
+    }
+
+    fn collect_provider_exit_acks(&mut self) {
+        let remaining =
+            MAX_PROVIDER_SUPERVISOR_EVENTS.saturating_sub(self.provider_exit_acks.len());
+        if remaining == 0 {
+            return;
+        }
+        let provider_ids = provider_ids_after(
+            &self.provider_supervisors,
+            self.provider_ack_cursor.as_ref(),
+        );
+        let mut remaining = remaining;
+        for provider_id in provider_ids {
+            let limit = remaining.min(PROVIDER_EVENT_DRAIN_QUANTUM);
+            let drained = self
+                .provider_supervisors
+                .get_mut(&provider_id)
+                .map_or_else(Vec::new, |supervisor| supervisor.drain_exit_acks(limit));
+            if !drained.is_empty() {
+                remaining -= drained.len();
+                self.provider_exit_acks.extend(drained);
+                self.provider_ack_cursor = Some(provider_id);
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+
+    fn collect_provider_faults(&mut self) {
+        let remaining =
+            MAX_PROVIDER_SUPERVISOR_EVENTS.saturating_sub(self.provider_faults.len());
+        if remaining == 0 {
+            return;
+        }
+        let provider_ids = provider_ids_after(
+            &self.provider_supervisors,
+            self.provider_fault_cursor.as_ref(),
+        );
+        let mut remaining = remaining;
+        for provider_id in provider_ids {
+            let limit = remaining.min(PROVIDER_EVENT_DRAIN_QUANTUM);
+            let drained = self
+                .provider_supervisors
+                .get_mut(&provider_id)
+                .map_or_else(Vec::new, |supervisor| supervisor.drain_faults(limit));
+            if !drained.is_empty() {
+                remaining -= drained.len();
+                self.provider_faults.extend(drained);
+                self.provider_fault_cursor = Some(provider_id);
+            }
+            if remaining == 0 {
+                break;
+            }
         }
     }
 
@@ -193,6 +496,48 @@ impl NativeRuntime {
             .as_ref()
             .map_or(0, |server| server.control().active_route_count())
     }
+}
+
+fn provider_ids_after(
+    supervisors: &BTreeMap<ToolProviderId, ProviderSupervisor>,
+    cursor: Option<&ToolProviderId>,
+) -> Vec<ToolProviderId> {
+    let mut provider_ids = supervisors.keys().cloned().collect::<Vec<_>>();
+    let Some(cursor) = cursor else {
+        return provider_ids;
+    };
+    let start = provider_ids
+        .iter()
+        .position(|provider_id| provider_id > cursor)
+        .unwrap_or(0);
+    provider_ids.rotate_left(start);
+    provider_ids
+}
+
+#[derive(Debug, Error)]
+pub enum NativeProviderControlError {
+    #[error("tool provider '{provider_id}' is not registered in this native runtime")]
+    UnknownProvider { provider_id: ToolProviderId },
+    #[error("tool provider '{provider_id}' is not owned by gate4agent")]
+    UnsupportedOwner { provider_id: ToolProviderId },
+    #[error("native provider supervisor is already installed in state {state:?}")]
+    AlreadyInstalled { state: ProviderSupervisorState },
+    #[error("native provider supervisor is not installed for '{provider_id}'")]
+    NotInstalled { provider_id: ToolProviderId },
+    #[error("retired provider supervisor still has undelivered lifecycle events")]
+    PendingSupervisorEvents,
+    #[error("native provider runtime failed: {0}")]
+    Runtime(#[from] ProviderRuntimeError),
+    #[error("native provider supervisor build failed: {0:?}")]
+    Build(ProviderSupervisorBuildError),
+}
+
+#[derive(Debug, Error)]
+pub enum NativeProviderShutdownError {
+    #[error("native provider retirement reported an error: {0}")]
+    Control(NativeProviderControlError),
+    #[error("native provider shutdown timed out with physical owners retained")]
+    TimedOut { pending: Vec<ProviderSupervisorSnapshot> },
 }
 
 #[derive(Debug, Error)]

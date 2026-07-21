@@ -1,5 +1,20 @@
 //! Native effect execution for gate4agent control-plane sessions.
 
+mod provider_supervisor;
+
+pub use provider_supervisor::{
+    NativeProviderExecutor, NativeProviderExit, NativeProviderOperation,
+    NativeProviderOperationError, NativeProviderResultPoll, PhysicalExitAck,
+    ProviderOperationKey, ProviderOperationSnapshot, ProviderSupervisor,
+    ProviderSupervisorBuildError, ProviderSupervisorFault, ProviderSupervisorFaultKind,
+    ProviderStopCause, ProviderSupervisorSnapshot, ProviderSupervisorState,
+    ProviderSupervisorTick, DEFAULT_PROVIDER_STOP_GRACE,
+    MAX_PROVIDER_FORCE_STOP_ATTEMPTS, MAX_PROVIDER_STOP_SIGNAL_ATTEMPTS,
+    MAX_PROVIDER_SUPERVISOR_EVENTS, MAX_PROVIDER_SUPERVISOR_OPERATIONS,
+    MAX_PROVIDER_SUPERVISOR_OUTCOMES_PER_TICK, MAX_PROVIDER_SUPERVISOR_TOMBSTONES,
+    MAX_PROVIDER_SUPERVISOR_WORK_PER_TICK,
+};
+
 use gate4agent::agent::ReadinessStatus;
 use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
 use gate4agent::pty::{

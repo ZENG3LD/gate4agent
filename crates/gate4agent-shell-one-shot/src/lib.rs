@@ -421,7 +421,14 @@ fn native_command(program: &str, args: &[String]) -> Result<Command, NativeOneSh
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("cmd.exe"));
             let mut command = Command::new(command_path);
-            command.args(["/D", "/S", "/C", &resolved]).args(args);
+            // `cmd /C <absolute-batch-path> ...` truncates a separately quoted
+            // path at the first space under `/S` (for example `C:\Users\VA
+            // PC\...\codex.cmd` becomes `C:\Users\VA`). Prefixing the reviewed
+            // batch invocation with `CALL` keeps the quoted path as one command
+            // token while preserving separate CreateProcess arguments.
+            command
+                .args(["/D", "/S", "/C", "CALL", &resolved])
+                .args(args);
             return Ok(command);
         }
         let mut command = Command::new(resolved);
@@ -623,6 +630,39 @@ mod tests {
                 is_error: false,
                 ..
             }
+        )));
+        session.kill().await.unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn executes_batch_path_with_spaces() {
+        let directory = fixture_dir("batch path");
+        let script = directory.join("fixture agent.cmd");
+        fs::write(
+            &script,
+            "@echo off\r\nmore > nul\r\necho batch-path-ok\r\n",
+        )
+        .unwrap();
+        let mut spec = builtin_registry().get_by_id("claude").unwrap().clone();
+        spec.launch.program = script.to_string_lossy().into_owned();
+        spec.launch.fixed_args.clear();
+        let binding = spec.capabilities.adapters.one_shot.clone().unwrap();
+        let pipe = spec.capabilities.transports.pipe.as_mut().unwrap();
+        pipe.adapter = binding.clone();
+        pipe.protocol = PipeProtocol::OneShotText;
+        pipe.launch_override = Some(spec.launch.clone());
+        spec.verification = SpecVerification::Gate4AgentVerified;
+
+        let mut session =
+            NativeOneShotSession::spawn(&spec, &binding, "fixture prompt", None, &directory)
+                .await
+                .unwrap();
+        let events = collect(&session).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Text { text, .. } if text == "batch-path-ok"
         )));
         session.kill().await.unwrap();
         fs::remove_dir_all(directory).unwrap();

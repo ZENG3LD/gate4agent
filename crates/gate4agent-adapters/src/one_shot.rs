@@ -4,7 +4,7 @@ use gate4agent_types::{
 };
 use thiserror::Error;
 
-pub const ONE_SHOT_REVISION: &str = "gate4agent-one-shot/orca-d8629c4/v1";
+pub const ONE_SHOT_REVISION: &str = "gate4agent-one-shot/orca-d8629c4/v2";
 pub const ONE_SHOT_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const ONE_SHOT_TIMEOUT_SECONDS: u64 = 60;
 pub const ONE_SHOT_THINKING_OPTION_ID: &str = "thinking-level";
@@ -136,6 +136,7 @@ pub fn resolve_one_shot_plan(
             if let Some(thinking) = &thinking {
                 args.extend(["--variant".to_owned(), thinking.clone()]);
             }
+            args.push(prompt.to_owned());
         }
         "pi" => {
             args.extend(strings(&[
@@ -310,7 +311,11 @@ fn spec_for(id: &str) -> Result<OneShotAdapterSpec, OneShotAdapterError> {
         ),
         "opencode" => (
             "OpenCode",
-            OneShotPromptDelivery::StdinClose,
+            // OpenCode 1.4.3 documents `run [message..]` and exits with empty
+            // output when the message is supplied only through stdin. This is
+            // live-vendor evidence that intentionally supersedes the pinned
+            // Orca stdin contract at d8629c4.
+            OneShotPromptDelivery::Positional,
             OneShotModelSource::Dynamic,
             vec![
                 model(
@@ -595,6 +600,19 @@ mod tests {
         assert!(codex
             .args
             .contains(&"model_reasoning_effort=xhigh".to_owned()));
+
+        let opencode = resolve_one_shot_plan(
+            &AdapterId::new("opencode").unwrap(),
+            &launch("opencode"),
+            "prompt in argv",
+            None,
+        )
+        .unwrap();
+        assert_eq!(opencode.stdin_payload, None);
+        assert_eq!(
+            opencode.args.last().map(String::as_str),
+            Some("prompt in argv")
+        );
 
         let cursor = resolve_one_shot_plan(
             &AdapterId::new("cursor").unwrap(),

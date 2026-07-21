@@ -1,0 +1,502 @@
+use std::ffi::OsString;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use gate4agent_catalog::{AgentRegistry, EnvMutation};
+use gate4agent_runtime_native::{
+    HookIngressConfig, NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
+    NativeLaunchProfile, NativeLaunchProfileError, NativeLaunchProfileId, NativeRuntime,
+    NativeRuntimeConfig,
+};
+use gate4agent_testkit::{
+    hook_posting_agent_spec, pipe_agent_spec, HOOK_POSTING_FIXTURE_ID,
+};
+use gate4agent_types::{
+    AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, SessionStatus,
+    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+};
+
+const PROFILE_SENTINEL: &str = "GATE4AGENT_TEST_PROFILE_SENTINEL";
+const REMOVE_SENTINEL: &str = "GATE4AGENT_TEST_REMOVE_SENTINEL";
+const CHILD_SENTINEL: &str = "GATE4AGENT_TEST_CHILD_SENTINEL";
+
+struct EnvironmentGuard {
+    values: Vec<(&'static str, Option<OsString>)>,
+}
+
+struct EmptyResolver;
+
+impl NativeChildEnvironmentResolver for EmptyResolver {
+    fn resolve_child_environment(
+        &self,
+    ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+        Ok(Vec::new())
+    }
+}
+
+struct SentinelResolver {
+    generation: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
+
+struct ReservedOutputResolver;
+
+impl NativeChildEnvironmentResolver for ReservedOutputResolver {
+    fn resolve_child_environment(
+        &self,
+    ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+        Ok(vec![EnvMutation {
+            key: OsString::from("GATE4AGENT_HOOK_TOKEN"),
+            value: Some(OsString::from("sentinel-not-a-token")),
+        }])
+    }
+}
+
+impl NativeChildEnvironmentResolver for SentinelResolver {
+    fn resolve_child_environment(
+        &self,
+    ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let generation = self.generation.load(Ordering::Acquire);
+        Ok(vec![
+            EnvMutation {
+                key: OsString::from(PROFILE_SENTINEL),
+                value: Some(OsString::from(format!("profile-value-{generation}"))),
+            },
+            EnvMutation {
+                key: OsString::from(REMOVE_SENTINEL),
+                value: None,
+            },
+            EnvMutation {
+                key: OsString::from(CHILD_SENTINEL),
+                value: Some(OsString::from("child-only")),
+            },
+        ])
+    }
+}
+
+impl EnvironmentGuard {
+    fn set(values: &[(&'static str, &'static str)]) -> Self {
+        let previous = values
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (*key, previous)
+            })
+            .collect();
+        Self { values: previous }
+    }
+}
+
+impl Drop for EnvironmentGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.values.drain(..) {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
+fn profile_id() -> NativeLaunchProfileId {
+    NativeLaunchProfileId::new("isolated-sentinel").unwrap()
+}
+
+fn fixture_agent_id() -> AgentId {
+    AgentId::new(HOOK_POSTING_FIXTURE_ID).unwrap()
+}
+
+fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
+    CommandEnvelope {
+        protocol_version: CONTROL_PROTOCOL_VERSION,
+        id: CommandId(id),
+        command,
+    }
+}
+
+fn register_and_start(
+    handle: &gate4agent_handle::Gate4AgentHandle,
+    command_id: u64,
+    instance_id: AgentInstanceId,
+) {
+    handle
+        .dispatch(command(
+            command_id,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: fixture_agent_id(),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            command_id + 1,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 100,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ))
+        .unwrap();
+}
+
+async fn drive_until(
+    runtime: &mut NativeRuntime,
+    mut predicate: impl FnMut(&NativeRuntime) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            runtime.tick().await;
+            if predicate(runtime) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native launch profile fixture timeout");
+}
+
+#[test]
+fn native_launch_profile_rejects_reserved_hook_environment_collision() {
+    let error = NativeLaunchProfile::new(
+        profile_id(),
+        fixture_agent_id(),
+        TransportKind::Pty,
+        vec![OsString::from("gate4agent_hook_token")],
+        Arc::new(EmptyResolver),
+    )
+    .err()
+    .expect("reserved hook environment key must be rejected");
+
+    assert_eq!(
+        error,
+        NativeLaunchProfileError::ReservedHookEnvironmentKey { index: 0 }
+    );
+
+    let empty_error = NativeLaunchProfile::new(
+        profile_id(),
+        fixture_agent_id(),
+        TransportKind::Pty,
+        Vec::new(),
+        Arc::new(EmptyResolver),
+    )
+    .err()
+    .expect("empty environment ownership must be rejected");
+    assert_eq!(
+        empty_error,
+        NativeLaunchProfileError::EmptyEnvironmentOwnership
+    );
+}
+
+#[test]
+fn selected_native_launch_profile_requires_explicit_clear_before_removal() {
+    let registry = AgentRegistry::new([hook_posting_agent_spec()]).expect("fixture registry");
+    let (_, mut runtime) = NativeRuntime::new(registry, NativeRuntimeConfig::default());
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                profile_id(),
+                fixture_agent_id(),
+                TransportKind::Pty,
+                vec![OsString::from(PROFILE_SENTINEL)],
+                Arc::new(EmptyResolver),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let instance_id = AgentInstanceId(8199);
+    runtime
+        .select_native_launch_profile(instance_id, profile_id())
+        .unwrap();
+
+    assert_eq!(
+        runtime.remove_native_launch_profile(&profile_id()),
+        Err(NativeLaunchProfileError::ProfileInUse)
+    );
+    assert!(runtime.clear_native_launch_profile_selection(instance_id));
+    assert_eq!(runtime.remove_native_launch_profile(&profile_id()), Ok(true));
+}
+
+#[tokio::test]
+async fn native_launch_profile_revalidates_resolver_output_before_spawn() {
+    let registry = AgentRegistry::new([hook_posting_agent_spec()]).expect("fixture registry");
+    let (handle, mut runtime) = NativeRuntime::new(registry, NativeRuntimeConfig::default());
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                profile_id(),
+                fixture_agent_id(),
+                TransportKind::Pty,
+                vec![OsString::from(PROFILE_SENTINEL)],
+                Arc::new(ReservedOutputResolver),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let instance_id = AgentInstanceId(8200);
+    runtime
+        .select_native_launch_profile(instance_id, profile_id())
+        .unwrap();
+    register_and_start(&handle, 20, instance_id);
+
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == instance_id
+                && matches!(session.status, SessionStatus::Failed { .. })
+        })
+    })
+    .await;
+    let failure = handle
+        .snapshot()
+        .sessions
+        .iter()
+        .find(|session| session.instance_id == instance_id)
+        .and_then(|session| match &session.status {
+            SessionStatus::Failed { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("profile validation failure");
+    assert!(!failure.contains("sentinel-not-a-token"));
+    assert_eq!(runtime.active_native_sessions(), 0);
+    assert_eq!(runtime.active_hook_routes(), 0);
+}
+
+#[tokio::test]
+async fn selected_native_launch_profile_overlays_only_future_exact_pty_spawns() {
+    let _environment = EnvironmentGuard::set(&[
+        (PROFILE_SENTINEL, "parent-value"),
+        (REMOVE_SENTINEL, "parent-remove-value"),
+    ]);
+    let mut spec = hook_posting_agent_spec();
+    spec.capabilities.transports.pipe = pipe_agent_spec().capabilities.transports.pipe;
+    let original_script = spec
+        .launch
+        .fixed_args
+        .last_mut()
+        .expect("fixture launch script");
+    #[cfg(windows)]
+    {
+        *original_script = format!(
+            "[Console]::Write('profile=' + $env:{PROFILE_SENTINEL} + ';removed=' + [string]::IsNullOrEmpty($env:{REMOVE_SENTINEL}) + ';child=' + $env:{CHILD_SENTINEL} + ';'); {original_script}"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        *original_script = format!(
+            "printf 'profile=%s;removed=%s;child=%s;' \"${PROFILE_SENTINEL}\" \"$(if [ -z \"${REMOVE_SENTINEL}\" ]; then printf true; else printf false; fi)\" \"${CHILD_SENTINEL}\"; {original_script}"
+        );
+    }
+
+    let registry = AgentRegistry::new([spec]).expect("fixture registry");
+    let (handle, mut runtime) = NativeRuntime::new(
+        registry,
+        NativeRuntimeConfig {
+            worker_poll_interval_ms: 5,
+            ..NativeRuntimeConfig::default()
+        },
+    );
+    let resolver_generation = Arc::new(AtomicUsize::new(1));
+    let resolver_calls = Arc::new(AtomicUsize::new(0));
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                profile_id(),
+                fixture_agent_id(),
+                TransportKind::Pty,
+                vec![
+                    OsString::from(PROFILE_SENTINEL),
+                    OsString::from(REMOVE_SENTINEL),
+                    OsString::from(CHILD_SENTINEL),
+                ],
+                Arc::new(SentinelResolver {
+                    generation: Arc::clone(&resolver_generation),
+                    calls: Arc::clone(&resolver_calls),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    runtime
+        .start_hook_ingress(HookIngressConfig::default())
+        .await
+        .unwrap();
+
+    let inherited_instance = AgentInstanceId(8101);
+    runtime
+        .select_native_launch_profile(inherited_instance, profile_id())
+        .unwrap();
+    assert!(runtime.clear_native_launch_profile_selection(inherited_instance));
+    register_and_start(&handle, 1, inherited_instance);
+    #[cfg(windows)]
+    let inherited_output = "profile=parent-value;removed=False;child=;";
+    #[cfg(not(windows))]
+    let inherited_output = "profile=parent-value;removed=false;child=;";
+    drive_until(&mut runtime, |_| {
+        let snapshot = handle.snapshot();
+        snapshot.sessions.iter().any(|session| {
+            session.instance_id == inherited_instance
+                && session
+                    .terminal_frame
+                    .as_ref()
+                    .is_some_and(|frame| {
+                        frame.contents.contains(inherited_output)
+                    })
+        })
+    })
+    .await;
+
+    runtime
+        .select_native_launch_profile(
+            inherited_instance,
+            profile_id(),
+        )
+        .unwrap();
+    assert_eq!(resolver_calls.load(Ordering::Acquire), 0);
+    assert!(handle.snapshot().sessions.iter().any(|session| {
+        session.instance_id == inherited_instance
+            && session
+                .terminal_frame
+                .as_ref()
+                .is_some_and(|frame| frame.contents.contains("profile=parent-value"))
+    }));
+
+    let profiled_instance = AgentInstanceId(8102);
+    runtime
+        .select_native_launch_profile(
+            profiled_instance,
+            profile_id(),
+        )
+        .unwrap();
+    register_and_start(&handle, 3, profiled_instance);
+    runtime.tick().await;
+    assert_eq!(resolver_calls.load(Ordering::Acquire), 1);
+    resolver_generation.store(2, Ordering::Release);
+    #[cfg(windows)]
+    let first_profile_output = "profile=profile-value-1;removed=True;child=child-only;";
+    #[cfg(not(windows))]
+    let first_profile_output = "profile=profile-value-1;removed=true;child=child-only;";
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == profiled_instance
+                && session
+                    .terminal_frame
+                    .as_ref()
+                    .is_some_and(|frame| {
+                        frame.contents.contains(first_profile_output)
+                    })
+                && session.provider.current_prompt.as_deref() == Some("fixture hook prompt")
+        })
+    })
+    .await;
+
+    let future_instance = AgentInstanceId(8103);
+    runtime
+        .select_native_launch_profile(future_instance, profile_id())
+        .unwrap();
+    register_and_start(&handle, 5, future_instance);
+    #[cfg(windows)]
+    let future_profile_output = "profile=profile-value-2;removed=True;child=child-only;";
+    #[cfg(not(windows))]
+    let future_profile_output = "profile=profile-value-2;removed=true;child=child-only;";
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == future_instance
+                && session
+                    .terminal_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.contents.contains(future_profile_output))
+                && session.provider.current_prompt.as_deref() == Some("fixture hook prompt")
+        })
+    })
+    .await;
+    assert_eq!(resolver_calls.load(Ordering::Acquire), 2);
+    assert_eq!(runtime.active_hook_routes(), 3);
+
+    let mismatched_instance = AgentInstanceId(8104);
+    runtime
+        .select_native_launch_profile(mismatched_instance, profile_id())
+        .unwrap();
+    handle
+        .dispatch(command(
+            7,
+            ControlCommand::Register {
+                instance_id: mismatched_instance,
+                agent_id: fixture_agent_id(),
+                transport: TransportKind::Pipe,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            8,
+            ControlCommand::Start {
+                instance_id: mismatched_instance,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 100,
+                    },
+                    initial_prompt: Some("fixture prompt".to_owned()),
+                    session_options: None,
+                },
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == mismatched_instance
+                && matches!(session.status, SessionStatus::Failed { .. })
+        })
+    })
+    .await;
+    assert_eq!(resolver_calls.load(Ordering::Acquire), 2);
+
+    for (command_id, instance_id) in [
+        (9, inherited_instance),
+        (10, profiled_instance),
+        (11, future_instance),
+    ] {
+        handle
+            .dispatch(command(
+                command_id,
+                ControlCommand::Stop {
+                    instance_id,
+                    force: true,
+                },
+            ))
+            .unwrap();
+    }
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().all(|session| {
+            matches!(session.status, SessionStatus::Exited { .. })
+                || (session.instance_id == mismatched_instance
+                    && matches!(session.status, SessionStatus::Failed { .. }))
+        })
+    })
+    .await;
+    runtime.stop_hook_ingress().await;
+    println!(
+        "profile_resolutions={} default_inherited=true child_overlay=true hook_route_preserved=true transport_mismatch_failed=true",
+        resolver_calls.load(Ordering::Acquire)
+    );
+}

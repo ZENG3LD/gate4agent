@@ -1,5 +1,12 @@
 //! Tick-driven native runtime for embedding gate4agent in an owning app core.
 
+mod launch_profiles;
+
+pub use launch_profiles::{
+    NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
+    NativeLaunchProfileError, NativeLaunchProfileId,
+};
+
 use gate4agent_catalog::{AgentRegistry, EnvMutation};
 use gate4agent_handle::{
     bounded_control_plane, ControlPlaneKernelPort, Gate4AgentHandle,
@@ -34,8 +41,9 @@ use gate4agent_types::{
     AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect, ControlObservation,
     EffectEnvelope, HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole,
     HistorySessionRecord, ObservationEnvelope, ResumeAuthorityTarget, ResumeLaunchRequest,
-    SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
+    SessionGeneration, SessionStatus, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
+use launch_profiles::NativeLaunchProfiles;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -448,6 +456,42 @@ impl NativeRuntime {
         self.effects.active_sessions.load(Ordering::Acquire)
     }
 
+    /// Installs or replaces a bounded host-only profile for future spawns.
+    pub fn upsert_native_launch_profile(
+        &mut self,
+        profile: NativeLaunchProfile,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.effects.launch_profiles.upsert(profile)
+    }
+
+    /// Removes an unselected host-only profile.
+    pub fn remove_native_launch_profile(
+        &mut self,
+        profile_id: &NativeLaunchProfileId,
+    ) -> Result<bool, NativeLaunchProfileError> {
+        self.effects.launch_profiles.remove(profile_id)
+    }
+
+    /// Selects a profile for future spawns of one exact instance.
+    ///
+    /// Spawn dispatch is the linearization point: a selection change does not
+    /// alter a child that was already dispatched or started.
+    pub fn select_native_launch_profile(
+        &mut self,
+        instance_id: AgentInstanceId,
+        profile_id: NativeLaunchProfileId,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.effects.launch_profiles.select(instance_id, profile_id)
+    }
+
+    /// Clears one instance selection for future spawns only.
+    pub fn clear_native_launch_profile_selection(
+        &mut self,
+        instance_id: AgentInstanceId,
+    ) -> bool {
+        self.effects.launch_profiles.clear_selection(instance_id)
+    }
+
     /// Start the process-global loopback Hook listener. Call this before
     /// starting agent sessions so their PTY environments receive route-scoped
     /// endpoint coordinates.
@@ -570,6 +614,7 @@ struct NativeWorkerContext {
 struct NativeEffectDispatcher {
     catalog: AgentRegistry,
     config: NativeRuntimeConfig,
+    launch_profiles: NativeLaunchProfiles,
     workers: HashMap<AgentInstanceId, EffectWorker>,
     authority_worker: Option<EffectWorker>,
     capability_worker: Option<EffectWorker>,
@@ -592,6 +637,7 @@ impl NativeEffectDispatcher {
         Self {
             catalog,
             config,
+            launch_profiles: NativeLaunchProfiles::new(),
             workers: HashMap::new(),
             authority_worker: None,
             capability_worker: None,
@@ -628,7 +674,7 @@ impl NativeEffectDispatcher {
         }
         self.workers.retain(|_, worker| !worker.sender.is_closed());
         let instance_id = effect.instance_id;
-        let pty_env = match self.hook_pty_env(&effect) {
+        let pty_env = match self.compose_pty_spawn_environment(&effect) {
             Ok(environment) => environment,
             Err(message) => {
                 self.pending_failures
@@ -803,6 +849,30 @@ impl NativeEffectDispatcher {
                 value: Some(value.into()),
             })
             .collect())
+    }
+
+    fn compose_pty_spawn_environment(
+        &self,
+        effect: &EffectEnvelope,
+    ) -> Result<Vec<EnvMutation>, String> {
+        let mut environment = self.profile_pty_env(effect)?;
+        environment.extend(self.hook_pty_env(effect)?);
+        Ok(environment)
+    }
+
+    fn profile_pty_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
+        let (agent_id, transport) = match &effect.effect {
+            ControlEffect::Spawn {
+                agent_id,
+                transport,
+                ..
+            } => (agent_id, *transport),
+            ControlEffect::SpawnResume { agent_id, .. } => (agent_id, TransportKind::Pty),
+            _ => return Ok(Vec::new()),
+        };
+        self.launch_profiles
+            .resolve_environment(effect.instance_id, agent_id, transport)
+            .map_err(|error| error.to_string())
     }
 
     fn remove_hook_route(&self, effect: &EffectEnvelope) {

@@ -4,7 +4,10 @@ mod launch_profiles;
 
 pub use launch_profiles::{
     NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
-    NativeLaunchProfileError, NativeLaunchProfileId,
+    NativeLaunchProfileDescriptor, NativeLaunchProfileError, NativeLaunchProfileId,
+    ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
+    ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
+    ZAI_GLM_CLAUDE_PROFILE_REVISION, ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
 };
 
 use gate4agent_catalog::{AgentRegistry, EnvMutation};

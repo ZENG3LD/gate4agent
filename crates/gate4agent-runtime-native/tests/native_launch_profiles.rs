@@ -7,19 +7,22 @@ use gate4agent_catalog::{AgentRegistry, EnvMutation};
 use gate4agent_runtime_native::{
     HookIngressConfig, NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
     NativeLaunchProfile, NativeLaunchProfileError, NativeLaunchProfileId, NativeRuntime,
-    NativeRuntimeConfig,
+    NativeRuntimeConfig, ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
+    ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
+    ZAI_GLM_CLAUDE_PROFILE_REVISION, ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
 };
 use gate4agent_testkit::{
-    hook_posting_agent_spec, pipe_agent_spec, HOOK_POSTING_FIXTURE_ID,
+    hook_posting_agent_spec, interactive_agent_spec, pipe_agent_spec, HOOK_POSTING_FIXTURE_ID,
 };
 use gate4agent_types::{
-    AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, SessionStatus,
-    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId, ControlCommand,
+    SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 const PROFILE_SENTINEL: &str = "GATE4AGENT_TEST_PROFILE_SENTINEL";
 const REMOVE_SENTINEL: &str = "GATE4AGENT_TEST_REMOVE_SENTINEL";
 const CHILD_SENTINEL: &str = "GATE4AGENT_TEST_CHILD_SENTINEL";
+const ZAI_TEST_TOKEN: &str = "gate4agent-zai-fixture-token";
 
 struct EnvironmentGuard {
     values: Vec<(&'static str, Option<OsString>)>,
@@ -41,6 +44,11 @@ struct SentinelResolver {
 }
 
 struct ReservedOutputResolver;
+
+struct ZaiGlmFixtureResolver {
+    token: Option<&'static str>,
+    endpoint: Option<&'static str>,
+}
 
 impl NativeChildEnvironmentResolver for ReservedOutputResolver {
     fn resolve_child_environment(
@@ -71,6 +79,47 @@ impl NativeChildEnvironmentResolver for SentinelResolver {
             EnvMutation {
                 key: OsString::from(CHILD_SENTINEL),
                 value: Some(OsString::from("child-only")),
+            },
+        ])
+    }
+}
+
+impl NativeChildEnvironmentResolver for ZaiGlmFixtureResolver {
+    fn resolve_child_environment(
+        &self,
+    ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+        Ok(vec![
+            EnvMutation {
+                key: OsString::from("ANTHROPIC_AUTH_TOKEN"),
+                value: self.token.map(OsString::from),
+            },
+            EnvMutation {
+                key: OsString::from("ANTHROPIC_BASE_URL"),
+                value: self.endpoint.map(OsString::from),
+            },
+            EnvMutation {
+                key: OsString::from("API_TIMEOUT_MS"),
+                value: None,
+            },
+            EnvMutation {
+                key: OsString::from("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                value: None,
+            },
+            EnvMutation {
+                key: OsString::from("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                value: None,
+            },
+            EnvMutation {
+                key: OsString::from("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                value: None,
+            },
+            EnvMutation {
+                key: OsString::from("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+                value: None,
+            },
+            EnvMutation {
+                key: OsString::from("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+                value: None,
             },
         ])
     }
@@ -110,6 +159,31 @@ fn fixture_agent_id() -> AgentId {
     AgentId::new(HOOK_POSTING_FIXTURE_ID).unwrap()
 }
 
+fn zai_glm_fixture_spec(report_environment: bool) -> AgentSpec {
+    let mut spec = interactive_agent_spec();
+    spec.id = AgentId::new("claude").unwrap();
+    if report_environment {
+        let original_script = spec
+            .launch
+            .fixed_args
+            .last_mut()
+            .expect("fixture launch script");
+        #[cfg(windows)]
+        {
+            *original_script = format!(
+                "$optionalAbsent = [string]::IsNullOrEmpty($env:API_TIMEOUT_MS) -and [string]::IsNullOrEmpty($env:ANTHROPIC_DEFAULT_HAIKU_MODEL) -and [string]::IsNullOrEmpty($env:ANTHROPIC_DEFAULT_SONNET_MODEL) -and [string]::IsNullOrEmpty($env:ANTHROPIC_DEFAULT_OPUS_MODEL) -and [string]::IsNullOrEmpty($env:CLAUDE_CODE_AUTO_COMPACT_WINDOW) -and [string]::IsNullOrEmpty($env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC); [Console]::Write('zai-base=' + $env:ANTHROPIC_BASE_URL + ';token-present=' + (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN)) + ';optional-absent=' + $optionalAbsent + ';'); {original_script}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            *original_script = format!(
+                "printf 'zai-base=%s;token-present=%s;optional-absent=%s;' \"$ANTHROPIC_BASE_URL\" \"$(if [ -n \"$ANTHROPIC_AUTH_TOKEN\" ]; then printf true; else printf false; fi)\" \"$(if [ -z \"$API_TIMEOUT_MS\" ] && [ -z \"$ANTHROPIC_DEFAULT_HAIKU_MODEL\" ] && [ -z \"$ANTHROPIC_DEFAULT_SONNET_MODEL\" ] && [ -z \"$ANTHROPIC_DEFAULT_OPUS_MODEL\" ] && [ -z \"$CLAUDE_CODE_AUTO_COMPACT_WINDOW\" ] && [ -z \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\" ]; then printf true; else printf false; fi)\"; {original_script}"
+            );
+        }
+    }
+    spec
+}
+
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
         protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -123,12 +197,21 @@ fn register_and_start(
     command_id: u64,
     instance_id: AgentInstanceId,
 ) {
+    register_and_start_agent(handle, command_id, instance_id, fixture_agent_id());
+}
+
+fn register_and_start_agent(
+    handle: &gate4agent_handle::Gate4AgentHandle,
+    command_id: u64,
+    instance_id: AgentInstanceId,
+    agent_id: AgentId,
+) {
     handle
         .dispatch(command(
             command_id,
             ControlCommand::Register {
                 instance_id,
-                agent_id: fixture_agent_id(),
+                agent_id,
                 transport: TransportKind::Pty,
             },
         ))
@@ -155,6 +238,50 @@ fn register_and_start(
         .unwrap();
 }
 
+async fn rejected_zai_glm_profile_message(
+    instance_id: AgentInstanceId,
+    token: Option<&'static str>,
+    endpoint: Option<&'static str>,
+) -> String {
+    let registry = AgentRegistry::new([zai_glm_fixture_spec(false)]).expect("fixture registry");
+    let (handle, mut runtime) = NativeRuntime::new(registry, NativeRuntimeConfig::default());
+    runtime
+        .upsert_native_launch_profile(
+            ZAI_GLM_CLAUDE_PROFILE
+                .instantiate(Arc::new(ZaiGlmFixtureResolver { token, endpoint }))
+                .unwrap(),
+        )
+        .unwrap();
+    runtime
+        .select_native_launch_profile(
+            instance_id,
+            NativeLaunchProfileId::new(ZAI_GLM_CLAUDE_PROFILE_ID).unwrap(),
+        )
+        .unwrap();
+    register_and_start_agent(&handle, 40, instance_id, AgentId::new("claude").unwrap());
+
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == instance_id
+                && matches!(session.status, SessionStatus::Failed { .. })
+        })
+    })
+    .await;
+    assert_eq!(runtime.active_native_sessions(), 0);
+    let snapshot = handle.snapshot();
+    let debug_snapshot = format!("{snapshot:?}");
+    assert!(!debug_snapshot.contains(ZAI_TEST_TOKEN));
+    snapshot
+        .sessions
+        .iter()
+        .find(|session| session.instance_id == instance_id)
+        .and_then(|session| match &session.status {
+            SessionStatus::Failed { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("Z.AI profile contract failure")
+}
+
 async fn drive_until(
     runtime: &mut NativeRuntime,
     mut predicate: impl FnMut(&NativeRuntime) -> bool,
@@ -170,6 +297,157 @@ async fn drive_until(
     })
     .await
     .expect("native launch profile fixture timeout");
+}
+
+#[test]
+fn zai_glm_claude_descriptor_has_revisioned_exact_environment_contract() {
+    assert_eq!(ZAI_GLM_CLAUDE_PROFILE.id(), ZAI_GLM_CLAUDE_PROFILE_ID);
+    assert_eq!(
+        ZAI_GLM_CLAUDE_PROFILE.revision(),
+        ZAI_GLM_CLAUDE_PROFILE_REVISION
+    );
+    assert_eq!(ZAI_GLM_CLAUDE_PROFILE.agent_id(), "claude");
+    assert_eq!(ZAI_GLM_CLAUDE_PROFILE.transport(), TransportKind::Pty);
+    assert_eq!(
+        ZAI_GLM_CLAUDE_PROFILE.required_env_keys(),
+        ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS
+    );
+    assert_eq!(
+        ZAI_GLM_CLAUDE_PROFILE.optional_env_keys(),
+        ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS
+    );
+    assert_eq!(
+        ZAI_GLM_CLAUDE_PROFILE.owned_env_keys(),
+        ZAI_GLM_CLAUDE_OWNED_ENV_KEYS
+    );
+    let described_keys = ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS
+        .iter()
+        .chain(ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(described_keys, ZAI_GLM_CLAUDE_OWNED_ENV_KEYS);
+    assert!(!format!("{ZAI_GLM_CLAUDE_PROFILE:?}").contains(ZAI_TEST_TOKEN));
+}
+
+#[tokio::test]
+async fn zai_glm_claude_profile_enforces_required_values_before_spawn() {
+    let missing_token = rejected_zai_glm_profile_message(
+        AgentInstanceId(8301),
+        None,
+        Some(ZAI_GLM_ANTHROPIC_BASE_URL),
+    )
+    .await;
+    assert_eq!(
+        missing_token,
+        NativeLaunchProfileError::RequiredEnvironmentValueMissing.to_string()
+    );
+
+    let blank_token = rejected_zai_glm_profile_message(
+        AgentInstanceId(8304),
+        Some(" \t "),
+        Some(ZAI_GLM_ANTHROPIC_BASE_URL),
+    )
+    .await;
+    assert_eq!(
+        blank_token,
+        NativeLaunchProfileError::RequiredEnvironmentValueMissing.to_string()
+    );
+
+    let wrong_endpoint = rejected_zai_glm_profile_message(
+        AgentInstanceId(8302),
+        Some(ZAI_TEST_TOKEN),
+        Some("https://invalid.example.test/anthropic"),
+    )
+    .await;
+    assert_eq!(
+        wrong_endpoint,
+        NativeLaunchProfileError::FixedEnvironmentValueMismatch.to_string()
+    );
+    assert!(!wrong_endpoint.contains(ZAI_TEST_TOKEN));
+}
+
+#[tokio::test]
+async fn zai_glm_claude_profile_reaches_a_controlled_real_pty_without_global_config() {
+    let _environment = EnvironmentGuard::set(&[
+        ("API_TIMEOUT_MS", "parent-timeout"),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "parent-haiku"),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", "parent-sonnet"),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", "parent-opus"),
+        ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "parent-window"),
+        (
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "parent-traffic",
+        ),
+    ]);
+    let registry =
+        AgentRegistry::new([zai_glm_fixture_spec(true)]).expect("fixture registry");
+    let (handle, mut runtime) = NativeRuntime::new(
+        registry,
+        NativeRuntimeConfig {
+            worker_poll_interval_ms: 5,
+            ..NativeRuntimeConfig::default()
+        },
+    );
+    runtime
+        .upsert_native_launch_profile(
+            ZAI_GLM_CLAUDE_PROFILE
+                .instantiate(Arc::new(ZaiGlmFixtureResolver {
+                    token: Some(ZAI_TEST_TOKEN),
+                    endpoint: Some(ZAI_GLM_ANTHROPIC_BASE_URL),
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+    let instance_id = AgentInstanceId(8303);
+    runtime
+        .select_native_launch_profile(
+            instance_id,
+            NativeLaunchProfileId::new(ZAI_GLM_CLAUDE_PROFILE_ID).unwrap(),
+        )
+        .unwrap();
+    register_and_start_agent(&handle, 50, instance_id, AgentId::new("claude").unwrap());
+
+    #[cfg(windows)]
+    let safe_output = format!(
+        "zai-base={ZAI_GLM_ANTHROPIC_BASE_URL};token-present=True;optional-absent=True;"
+    );
+    #[cfg(not(windows))]
+    let safe_output = format!(
+        "zai-base={ZAI_GLM_ANTHROPIC_BASE_URL};token-present=true;optional-absent=true;"
+    );
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == instance_id
+                && session
+                    .terminal_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.contents.contains(&safe_output))
+        })
+    })
+    .await;
+    let snapshot = handle.snapshot();
+    assert!(!format!("{snapshot:?}").contains(ZAI_TEST_TOKEN));
+
+    handle
+        .dispatch(command(
+            52,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == instance_id
+                && matches!(session.status, SessionStatus::Exited { .. })
+        })
+    })
+    .await;
+    println!(
+        "zai_profile_id={} revision={} token_present=true child_endpoint=true optional_env_removed=true",
+        ZAI_GLM_CLAUDE_PROFILE_ID, ZAI_GLM_CLAUDE_PROFILE_REVISION
+    );
 }
 
 #[test]

@@ -15,6 +15,125 @@ const NATIVE_LAUNCH_PROFILE_ENV_VALUE_MAX_BYTES: usize = 65_536;
 const NATIVE_LAUNCH_PROFILE_ENV_TOTAL_MAX_BYTES: usize = 1_048_576;
 const RESERVED_HOOK_ENV_PREFIX: &str = "GATE4AGENT_HOOK_";
 
+pub const ZAI_GLM_CLAUDE_PROFILE_ID: &str = "zai-glm";
+pub const ZAI_GLM_CLAUDE_PROFILE_REVISION: &str = "zai-claude-env-2026-07-21";
+pub const ZAI_GLM_ANTHROPIC_BASE_URL: &str = "https://api.z.ai/api/anthropic";
+pub const ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS: &[&str] =
+    &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+pub const ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS: &[&str] = &[
+    "API_TIMEOUT_MS",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+];
+pub const ZAI_GLM_CLAUDE_OWNED_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "API_TIMEOUT_MS",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+];
+
+/// Revisioned non-secret descriptor for a built-in native launch profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeLaunchProfileDescriptor {
+    id: &'static str,
+    revision: &'static str,
+    agent_id: &'static str,
+    transport: TransportKind,
+    required_env_keys: &'static [&'static str],
+    optional_env_keys: &'static [&'static str],
+    owned_env_keys: &'static [&'static str],
+    contract: NativeLaunchProfileContract,
+}
+
+impl NativeLaunchProfileDescriptor {
+    pub const fn id(&self) -> &'static str {
+        self.id
+    }
+
+    pub const fn revision(&self) -> &'static str {
+        self.revision
+    }
+
+    pub const fn agent_id(&self) -> &'static str {
+        self.agent_id
+    }
+
+    pub const fn transport(&self) -> TransportKind {
+        self.transport
+    }
+
+    pub const fn required_env_keys(&self) -> &'static [&'static str] {
+        self.required_env_keys
+    }
+
+    pub const fn optional_env_keys(&self) -> &'static [&'static str] {
+        self.optional_env_keys
+    }
+
+    pub const fn owned_env_keys(&self) -> &'static [&'static str] {
+        self.owned_env_keys
+    }
+
+    pub fn instantiate(
+        &self,
+        resolver: Arc<dyn NativeChildEnvironmentResolver>,
+    ) -> Result<NativeLaunchProfile, NativeLaunchProfileError> {
+        let id = NativeLaunchProfileId::new(self.id)
+            .expect("built-in native launch profile ID must be valid");
+        let agent_id = AgentId::new(self.agent_id)
+            .expect("built-in native launch profile agent ID must be valid");
+        NativeLaunchProfile::new_with_contract(
+            id,
+            agent_id,
+            self.transport,
+            self.owned_env_keys.iter().map(OsString::from).collect(),
+            resolver,
+            self.contract,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeLaunchProfileContract {
+    ExactOwnership,
+    ZaiGlmClaude,
+}
+
+impl NativeLaunchProfileContract {
+    fn validate(self, environment: &[EnvMutation]) -> Result<(), NativeLaunchProfileError> {
+        match self {
+            Self::ExactOwnership => Ok(()),
+            Self::ZaiGlmClaude => validate_zai_glm_claude_environment(environment),
+        }
+    }
+}
+
+/// Z.AI GLM Coding Plan over the installed Claude Code CLI.
+///
+/// The key inventory follows the official Z.AI Claude Code environment example
+/// reviewed on 2026-07-21. Only the token and base URL are required; a resolver
+/// must still return every owned key and use `None` for optional values it does
+/// not set. No model value is embedded because the current upstream example is
+/// internally inconsistent and model selection remains host configuration.
+pub const ZAI_GLM_CLAUDE_PROFILE: NativeLaunchProfileDescriptor =
+    NativeLaunchProfileDescriptor {
+        id: ZAI_GLM_CLAUDE_PROFILE_ID,
+        revision: ZAI_GLM_CLAUDE_PROFILE_REVISION,
+        agent_id: "claude",
+        transport: TransportKind::Pty,
+        required_env_keys: ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
+        optional_env_keys: ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
+        owned_env_keys: ZAI_GLM_CLAUDE_OWNED_ENV_KEYS,
+        contract: NativeLaunchProfileContract::ZaiGlmClaude,
+    };
+
 /// Host-local identifier for a non-wire native launch profile.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NativeLaunchProfileId(String);
@@ -63,6 +182,7 @@ pub struct NativeLaunchProfile {
     transport: TransportKind,
     owned_env_keys: Vec<OsString>,
     resolver: Arc<dyn NativeChildEnvironmentResolver>,
+    contract: NativeLaunchProfileContract,
 }
 
 impl NativeLaunchProfile {
@@ -72,6 +192,24 @@ impl NativeLaunchProfile {
         transport: TransportKind,
         owned_env_keys: Vec<OsString>,
         resolver: Arc<dyn NativeChildEnvironmentResolver>,
+    ) -> Result<Self, NativeLaunchProfileError> {
+        Self::new_with_contract(
+            id,
+            agent_id,
+            transport,
+            owned_env_keys,
+            resolver,
+            NativeLaunchProfileContract::ExactOwnership,
+        )
+    }
+
+    fn new_with_contract(
+        id: NativeLaunchProfileId,
+        agent_id: AgentId,
+        transport: TransportKind,
+        owned_env_keys: Vec<OsString>,
+        resolver: Arc<dyn NativeChildEnvironmentResolver>,
+        contract: NativeLaunchProfileContract,
     ) -> Result<Self, NativeLaunchProfileError> {
         if transport != TransportKind::Pty {
             return Err(NativeLaunchProfileError::UnsupportedTransport);
@@ -83,6 +221,7 @@ impl NativeLaunchProfile {
             transport,
             owned_env_keys,
             resolver,
+            contract,
         })
     }
 
@@ -111,6 +250,7 @@ impl NativeLaunchProfile {
             .resolve_child_environment()
             .map_err(NativeLaunchProfileError::Resolve)?;
         validate_resolved_environment(&self.owned_env_keys, &environment)?;
+        self.contract.validate(&environment)?;
         Ok(environment)
     }
 }
@@ -162,6 +302,10 @@ pub enum NativeLaunchProfileError {
     EnvironmentPayloadTooLarge { max: usize },
     #[error("native launch profile resolver returned a key outside its exact ownership set")]
     EnvironmentOwnershipMismatch,
+    #[error("native launch profile resolver omitted a required environment value")]
+    RequiredEnvironmentValueMissing,
+    #[error("native launch profile resolver returned an invalid fixed environment value")]
+    FixedEnvironmentValueMismatch,
     #[error("native launch profile capacity is {max}")]
     ProfileCapacityExceeded { max: usize },
     #[error("native launch profile '{profile_id}' is not installed")]
@@ -336,6 +480,29 @@ fn validate_resolved_environment(
                 max: NATIVE_LAUNCH_PROFILE_ENV_TOTAL_MAX_BYTES,
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_zai_glm_claude_environment(
+    environment: &[EnvMutation],
+) -> Result<(), NativeLaunchProfileError> {
+    let token = environment
+        .iter()
+        .find(|mutation| mutation.key == OsStr::new("ANTHROPIC_AUTH_TOKEN"))
+        .and_then(|mutation| mutation.value.as_deref())
+        .and_then(OsStr::to_str)
+        .filter(|value| !value.trim().is_empty());
+    if token.is_none() {
+        return Err(NativeLaunchProfileError::RequiredEnvironmentValueMissing);
+    }
+
+    let endpoint = environment
+        .iter()
+        .find(|mutation| mutation.key == OsStr::new("ANTHROPIC_BASE_URL"))
+        .and_then(|mutation| mutation.value.as_deref());
+    if endpoint != Some(OsStr::new(ZAI_GLM_ANTHROPIC_BASE_URL)) {
+        return Err(NativeLaunchProfileError::FixedEnvironmentValueMismatch);
     }
     Ok(())
 }

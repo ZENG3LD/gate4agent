@@ -12,7 +12,7 @@ use crate::agent::{
     builtin_registry, plan_draft_launch, plan_launch, prepare_agent_command, prepare_input,
     prepare_shell_command, AgentCommandMode, AgentId, AgentSpec, InputAction, LaunchPlan,
     LaunchRequest, PreparedInput, PreparedInputKind, PromptFraming, PromptPayload, ReadinessIntent,
-    ReadinessPermit, ShellCommand, TERMINAL_WRITE_DELAY_MAX_MS,
+    ReadinessPermit, ShellCommand, TerminalControl, TERMINAL_WRITE_DELAY_MAX_MS,
 };
 use crate::core::error::AgentError;
 use crate::core::types::{AgentEvent, CliTool, SessionConfig};
@@ -120,6 +120,7 @@ pub struct PtySession {
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
     events: Arc<PtyEventPublisher>,
     pending_followup_prompt: Option<String>,
+    pending_followup_prompt_inserted: bool,
     pending_followup_draft: Option<String>,
     typed_input_lock: tokio::sync::Mutex<()>,
 }
@@ -297,6 +298,7 @@ impl PtySession {
             killer,
             events,
             pending_followup_prompt,
+            pending_followup_prompt_inserted: false,
             pending_followup_draft,
             typed_input_lock: tokio::sync::Mutex::new(()),
         }
@@ -518,6 +520,33 @@ impl PtySession {
         self.pending_followup_prompt.as_deref()
     }
 
+    /// Insert the launch plan's deferred prompt without submitting it.
+    ///
+    /// Startup orchestration can use the resulting terminal render as proof
+    /// that a TUI consumed the paste before sending Enter. Repeated calls do
+    /// not paste the prompt twice and return `false`. This is a startup-only
+    /// operation; callers must discard the session after any write error.
+    pub async fn insert_pending_followup_prompt(
+        &mut self,
+        framing: PromptFraming,
+        permit: &ReadinessPermit,
+    ) -> Result<bool, AgentError> {
+        self.validate_permit(permit, Some(ReadinessIntent::FollowupPrompt))?;
+        let Some(prompt) = self.pending_followup_prompt.clone() else {
+            return Ok(false);
+        };
+        if self.pending_followup_prompt_inserted {
+            return Ok(false);
+        }
+        let input = prepare_input(InputAction::InsertDraft(PromptPayload {
+            text: prompt,
+            framing,
+        }))?;
+        self.write_prepared_input(input).await?;
+        self.pending_followup_prompt_inserted = true;
+        Ok(true)
+    }
+
     /// Reviewable draft deferred by the launch plan, if any.
     pub fn pending_followup_draft(&self) -> Option<&str> {
         self.pending_followup_draft.as_deref()
@@ -555,15 +584,21 @@ impl PtySession {
         let Some(prompt) = self.pending_followup_prompt.clone() else {
             return Ok(false);
         };
-        self.send_input_action(
-            InputAction::SubmitPrompt(PromptPayload {
-                text: prompt,
-                framing,
-            }),
-            permit,
-        )
-        .await?;
+        if self.pending_followup_prompt_inserted {
+            let input = prepare_input(InputAction::TerminalControl(TerminalControl::Enter))?;
+            self.write_prepared_input(input).await?;
+        } else {
+            self.send_input_action(
+                InputAction::SubmitPrompt(PromptPayload {
+                    text: prompt,
+                    framing,
+                }),
+                permit,
+            )
+            .await?;
+        }
         self.pending_followup_prompt = None;
+        self.pending_followup_prompt_inserted = false;
         Ok(true)
     }
 

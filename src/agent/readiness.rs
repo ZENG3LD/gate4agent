@@ -4,6 +4,7 @@ pub use gate4agent_types::DraftReadySignal;
 
 const DECSET_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 const DECTCEM_SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+const CLAUDE_COMPOSER_PROMPT: &[u8] = "❯".as_bytes();
 const CODEX_COMPOSER_PROMPT: &[u8] = "›".as_bytes();
 const SCANNER_TAIL_BYTES: usize = 512;
 
@@ -155,7 +156,17 @@ impl<'a> ReadinessTracker<'a> {
             return self.status;
         }
         let ready = match self.intent {
-            ReadinessIntent::FollowupPrompt => self.foreground_reason,
+            ReadinessIntent::FollowupPrompt => {
+                if self.foreground_reason.is_some() {
+                    if self.spec.readiness.followup_requires_terminal {
+                        self.terminal_reason
+                    } else {
+                        self.foreground_reason
+                    }
+                } else {
+                    None
+                }
+            }
             ReadinessIntent::DraftPaste => {
                 if self.foreground_reason.is_some() {
                     self.terminal_reason
@@ -179,6 +190,7 @@ struct DraftReadyScanner {
     recent: Vec<u8>,
     post_handshake_recent: Vec<u8>,
     saw_bracketed_paste: bool,
+    saw_claude_composer: bool,
     quiet_deadline_ms: Option<u64>,
     ready: Option<ReadyReason>,
 }
@@ -191,6 +203,7 @@ impl DraftReadyScanner {
             recent: Vec::new(),
             post_handshake_recent: Vec::new(),
             saw_bracketed_paste: false,
+            saw_claude_composer: false,
             quiet_deadline_ms: None,
             ready: None,
         }
@@ -202,10 +215,24 @@ impl DraftReadyScanner {
         }
         let combined = concat_tail(&self.recent, data);
         self.recent = tail(&combined, SCANNER_TAIL_BYTES);
-
+        if self.signal == DraftReadySignal::ClaudeComposerPrompt
+            && find_subslice(&combined, CLAUDE_COMPOSER_PROMPT).is_some()
+        {
+            self.saw_claude_composer = true;
+        }
         if !self.saw_bracketed_paste {
             let marker_index = find_subslice(&combined, DECSET_BRACKETED_PASTE)?;
             self.saw_bracketed_paste = true;
+            if self.signal == DraftReadySignal::BracketedPaste {
+                self.ready = Some(ReadyReason::DraftSignal);
+                return self.ready;
+            }
+            if self.signal == DraftReadySignal::ClaudeComposerPrompt
+                && self.saw_claude_composer
+            {
+                self.ready = Some(ReadyReason::DraftSignal);
+                return self.ready;
+            }
             let post_handshake = &combined[marker_index + DECSET_BRACKETED_PASTE.len()..];
             if self.marker_seen(post_handshake) {
                 self.ready = Some(ReadyReason::DraftSignal);
@@ -213,6 +240,12 @@ impl DraftReadyScanner {
             }
             self.post_handshake_recent = tail(post_handshake, SCANNER_TAIL_BYTES);
         } else {
+            if self.signal == DraftReadySignal::ClaudeComposerPrompt
+                && self.saw_claude_composer
+            {
+                self.ready = Some(ReadyReason::DraftSignal);
+                return self.ready;
+            }
             let post_combined = concat_tail(&self.post_handshake_recent, data);
             if self.marker_seen(&post_combined) {
                 self.ready = Some(ReadyReason::DraftSignal);
@@ -242,6 +275,8 @@ impl DraftReadyScanner {
 
     fn marker_seen(&self, bytes: &[u8]) -> bool {
         let marker = match self.signal {
+            DraftReadySignal::BracketedPaste => return true,
+            DraftReadySignal::ClaudeComposerPrompt => CLAUDE_COMPOSER_PROMPT,
             DraftReadySignal::QuietAfterBracketedPaste => return false,
             DraftReadySignal::CodexComposerPrompt => CODEX_COMPOSER_PROMPT,
             DraftReadySignal::CursorAfterBracketedPaste => DECTCEM_SHOW_CURSOR,
@@ -285,8 +320,12 @@ mod tests {
     }
 
     #[test]
-    fn followup_requires_positive_foreground_evidence() {
+    fn followup_requires_foreground_and_terminal_readiness() {
         let mut tracker = tracker("kimi", ReadinessIntent::FollowupPrompt);
+        assert_eq!(
+            tracker.observe_output(b"\x1b[?2004h", 100),
+            ReadinessStatus::Waiting
+        );
         assert_eq!(
             tracker.observe_foreground(
                 &ForegroundObservation {
@@ -307,7 +346,7 @@ mod tests {
                 },
                 300,
             ),
-            ReadinessStatus::Ready(ReadyReason::ForegroundMatch)
+            ReadinessStatus::Ready(ReadyReason::DraftSignal)
         );
     }
 
@@ -338,7 +377,13 @@ mod tests {
 
     #[test]
     fn quiet_policy_waits_after_the_last_render() {
-        let mut tracker = tracker("kimi", ReadinessIntent::DraftPaste);
+        let mut spec = builtin_registry().get_by_id("kimi").unwrap().clone();
+        spec.readiness.draft_signal = DraftReadySignal::QuietAfterBracketedPaste;
+        let mut tracker = ReadinessTracker::new(
+            &spec,
+            RuntimePlatform::Linux,
+            ReadinessIntent::DraftPaste,
+        );
         tracker.observe_foreground(
             &ForegroundObservation {
                 process_name: Some("kimi".to_owned()),
@@ -393,9 +438,75 @@ mod tests {
             },
             100,
         );
+        tracker.observe_output(b"\x1b[?2004h", 200);
         let permit = tracker.into_permit().expect("ready permit");
         assert_eq!(permit.agent_id().as_str(), "kimi");
         assert_eq!(permit.intent(), ReadinessIntent::FollowupPrompt);
-        assert_eq!(permit.reason(), ReadyReason::ForegroundMatch);
+        assert_eq!(permit.reason(), ReadyReason::DraftSignal);
+    }
+
+    #[test]
+    fn bracketed_paste_policy_is_ready_at_the_input_handshake() {
+        let mut spec = builtin_registry().get_by_id("kimi").unwrap().clone();
+        spec.readiness.draft_signal = DraftReadySignal::BracketedPaste;
+        let mut tracker = ReadinessTracker::new(
+            &spec,
+            RuntimePlatform::Linux,
+            ReadinessIntent::FollowupPrompt,
+        );
+        tracker.observe_foreground(
+            &ForegroundObservation {
+                process_name: Some("kimi".to_owned()),
+                has_child_processes: false,
+                is_shell: false,
+            },
+            100,
+        );
+        assert_eq!(
+            tracker.observe_output(b"\x1b[?2004h", 200),
+            ReadinessStatus::Ready(ReadyReason::DraftSignal)
+        );
+    }
+
+    #[test]
+    fn claude_policy_requires_bracketed_paste_and_composer_in_either_order() {
+        for (first, second) in [
+            (b"\x1b[?2004h".as_slice(), "❯".as_bytes()),
+            ("❯".as_bytes(), b"\x1b[?2004h".as_slice()),
+        ] {
+            let mut tracker = tracker("claude", ReadinessIntent::FollowupPrompt);
+            tracker.observe_foreground(
+                &ForegroundObservation {
+                    process_name: Some("claude".to_owned()),
+                    has_child_processes: false,
+                    is_shell: false,
+                },
+                100,
+            );
+            assert_eq!(
+                tracker.observe_output(first, 200),
+                ReadinessStatus::Waiting
+            );
+            assert_eq!(
+                tracker.observe_output(second, 250),
+                ReadinessStatus::Ready(ReadyReason::DraftSignal)
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_followup_keeps_the_foreground_only_contract() {
+        let mut tracker = tracker("opencode", ReadinessIntent::FollowupPrompt);
+        assert_eq!(
+            tracker.observe_foreground(
+                &ForegroundObservation {
+                    process_name: Some("opencode".to_owned()),
+                    has_child_processes: false,
+                    is_shell: false,
+                },
+                100,
+            ),
+            ReadinessStatus::Ready(ReadyReason::ForegroundMatch)
+        );
     }
 }

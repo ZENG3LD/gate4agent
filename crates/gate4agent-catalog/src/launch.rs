@@ -2,7 +2,7 @@ use crate::{
     resolve_session_option_launch_for, AgentId, AgentSpec, InitialPromptMode, NativeDraftMode,
     RuntimePlatform, SessionOptionCatalogError, SessionOptionSelection,
 };
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -101,10 +101,22 @@ pub fn plan_launch(
                 return Err(LaunchPlanError::PromptUnsupported(spec.id.clone()));
             }
             InitialPromptMode::Positional { option_terminator } => {
+                let prompt_arg_start = args.len();
                 if *option_terminator {
                     args.push(OsString::from("--"));
                 }
-                args.push(OsString::from(prompt));
+                args.push(OsString::from(&prompt));
+                if request.platform == RuntimePlatform::Windows
+                    && (windows_wrapper_unsafe_text(&prompt)
+                        || estimated_windows_launch_chars_for(
+                            OsStr::new(&spec.launch.program),
+                            &args,
+                            &request.env,
+                        ) > WINDOWS_INLINE_LAUNCH_MAX_CHARS)
+                {
+                    args.truncate(prompt_arg_start);
+                    followup_prompt = Some(prompt);
+                }
             }
             InitialPromptMode::Flag { flag } | InitialPromptMode::InteractiveFlag { flag } => {
                 args.push(OsString::from(flag));
@@ -196,12 +208,19 @@ fn validate_platform_budget(
 }
 
 fn estimated_windows_launch_chars(plan: &LaunchPlan) -> usize {
-    let argv_chars = std::iter::once(&plan.program)
-        .chain(plan.args.iter())
+    estimated_windows_launch_chars_for(&plan.program, &plan.args, &plan.env)
+}
+
+fn estimated_windows_launch_chars_for(
+    program: &OsStr,
+    args: &[OsString],
+    env: &[EnvMutation],
+) -> usize {
+    let argv_chars = std::iter::once(program)
+        .chain(args.iter().map(OsString::as_os_str))
         .map(|value| value.to_string_lossy().chars().count().saturating_add(1))
         .sum::<usize>();
-    let env_chars = plan
-        .env
+    let env_chars = env
         .iter()
         .map(|mutation| {
             mutation.key.to_string_lossy().chars().count()
@@ -290,6 +309,42 @@ mod tests {
             plan.followup_prompt.as_deref(),
             Some("inspect the repository")
         );
+    }
+
+    #[test]
+    fn unsafe_windows_positional_initial_prompt_falls_back_to_post_ready_paste() {
+        let prompt = "quote \" percent % ampersand & pipe | caret ^ and Unicode: Привет";
+        for id in ["claude", "codex"] {
+            let spec = builtin_registry().get_by_id(id).unwrap();
+            let plan = plan_launch(
+                spec,
+                LaunchRequest {
+                    platform: RuntimePlatform::Windows,
+                    ..request(prompt)
+                },
+            )
+            .unwrap();
+            assert!(!args_as_strings(&plan).iter().any(|arg| arg == prompt), "{id}");
+            assert_eq!(plan.followup_prompt.as_deref(), Some(prompt), "{id}");
+        }
+    }
+
+    #[test]
+    fn oversized_windows_positional_initial_prompt_falls_back_to_post_ready_paste() {
+        let prompt = "x".repeat(WINDOWS_INLINE_LAUNCH_MAX_CHARS);
+        for id in ["claude", "codex"] {
+            let spec = builtin_registry().get_by_id(id).unwrap();
+            let plan = plan_launch(
+                spec,
+                LaunchRequest {
+                    platform: RuntimePlatform::Windows,
+                    ..request(&prompt)
+                },
+            )
+            .unwrap();
+            assert!(!args_as_strings(&plan).iter().any(|arg| arg == &prompt), "{id}");
+            assert_eq!(plan.followup_prompt.as_deref(), Some(prompt.as_str()), "{id}");
+        }
     }
 
     #[test]

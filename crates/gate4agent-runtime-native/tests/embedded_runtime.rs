@@ -6,7 +6,7 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_testkit::{interactive_agent_spec, CONTROL_FIXTURE_ID};
 use gate4agent_types::{
     AgentCommand, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
-    ControlEvent, InputAction, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    ControlEvent, InitialPromptMode, InputAction, SessionStatus, StartRequest, TerminalSize, TransportKind,
     CONTROL_PROTOCOL_VERSION,
 };
 
@@ -221,6 +221,94 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
         event.event,
         gate4agent_types::ControlEventKind::Resized { .. }
     )));
+}
+
+#[tokio::test]
+async fn after_ready_initial_prompt_is_delivered_before_native_session_runs() {
+    let mut spec = interactive_agent_spec();
+    spec.prompt.initial = InitialPromptMode::AfterReady;
+    let registry = AgentRegistry::new([spec]).expect("fixture registry");
+    let (handle, mut runtime) = NativeRuntime::new(registry, NativeRuntimeConfig::default());
+    let instance_id = AgentInstanceId(702);
+    let initial_prompt = "initial-deferred-prompt";
+    handle
+        .dispatch(command(
+            20,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            21,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .expect("current directory")
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 12,
+                        columns: 64,
+                    },
+                    initial_prompt: Some(initial_prompt.to_owned()),
+                    session_options: None,
+                },
+            },
+        ))
+        .unwrap();
+
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            let snapshot = handle.snapshot();
+            if snapshot.sessions[0].status == SessionStatus::Running
+                && snapshot.sessions[0]
+                    .terminal_frame
+                    .as_ref()
+                    .is_some_and(|frame| {
+                        frame
+                            .contents
+                            .contains("fixture-echo:initial-deferred-prompt")
+                    })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("deferred initial prompt delivery timeout");
+    assert_eq!(runtime.active_native_sessions(), 1);
+
+    handle
+        .dispatch(command(
+            22,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ))
+        .unwrap();
+    tokio::time::timeout(FIXTURE_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            if matches!(
+                handle.snapshot().sessions[0].status,
+                SessionStatus::Exited { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("deferred initial prompt stop timeout");
+    assert_eq!(runtime.active_native_sessions(), 0);
 }
 
 #[tokio::test]

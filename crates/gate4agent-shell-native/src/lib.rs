@@ -16,6 +16,7 @@ pub use provider_supervisor::{
 };
 
 use gate4agent::agent::ReadinessStatus;
+use gate4agent::pty::cli::codex::strip_ansi_codes;
 use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
 use gate4agent::pty::{
     PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtyForegroundObservation, PtySession,
@@ -23,7 +24,7 @@ use gate4agent::pty::{
 };
 use gate4agent::{
     AcpSession, AcpSessionOptions, AgentEvent, CliTool, LaunchRequest, PipeProcessOptions,
-    PipeSession, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
+    PipeSession, PromptFraming, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
     SessionConfig,
 };
 use gate4agent_adapters::{
@@ -268,7 +269,7 @@ impl NativeEffectShell {
                                     },
                                 );
                             };
-                            match wait_for_readiness(&owned.session, &spec, intent).await {
+                            match wait_for_readiness(&owned.session, &spec, intent, false).await {
                                 Ok(permit) => {
                                     let result = if input.kind() == PreparedInputKind::AgentCommand
                                     {
@@ -443,7 +444,16 @@ impl NativeEffectShell {
             )
             .await
             {
-                Ok(session) => {
+                Ok(mut session) => {
+                    if let Err(error) = deliver_pending_initial_prompt(&mut session, &spec).await {
+                        let message = match session.shutdown().await {
+                            Ok(_) => error,
+                            Err(shutdown_error) => {
+                                format!("{error}; PTY cleanup failed: {shutdown_error}")
+                            }
+                        };
+                        return ControlObservation::SpawnFailed { message };
+                    }
                     let process_id = session.root_pid();
                     let session_id = session.session_id().to_owned();
                     let provider = match spec.capabilities.transports.pty_adapter.as_ref() {
@@ -1366,6 +1376,7 @@ async fn wait_for_readiness(
     session: &PtySession,
     spec: &AgentSpec,
     intent: ReadinessIntent,
+    detect_startup_gates: bool,
 ) -> Result<ReadinessPermit, String> {
     let started = Instant::now();
     let attachment = session
@@ -1373,24 +1384,44 @@ async fn wait_for_readiness(
         .map_err(|error| error.to_string())?;
     let mut receiver = attachment.receiver;
     let mut tracker = ReadinessTracker::new(spec, RuntimePlatform::current(), intent);
+    let mut diagnostics = ReadinessDiagnostics {
+        draft_signal: Some(spec.readiness.draft_signal),
+        ..ReadinessDiagnostics::default()
+    };
     let interval = Duration::from_millis(spec.readiness.poll_interval_ms.max(1));
     let mut next_probe = Instant::now();
 
     for event in attachment.replay {
-        observe_readiness_event(&mut tracker, event.event, elapsed_ms(started))?;
+        observe_readiness_event(
+            &mut tracker,
+            &mut diagnostics,
+            event.event,
+            elapsed_ms(started),
+        )?;
+        if detect_startup_gates {
+            ensure_no_readiness_operator_gate(&diagnostics, spec)?;
+            ensure_no_startup_operator_gate(session, spec)?;
+        }
     }
 
     loop {
+        if detect_startup_gates {
+            ensure_no_startup_operator_gate(session, spec)?;
+        }
         if Instant::now() >= next_probe {
             let foreground = session
                 .observe_foreground()
                 .await
                 .map_err(|error| error.to_string())?;
+            diagnostics.observe_foreground(&foreground.readiness);
             tracker.observe_foreground(&foreground.readiness, elapsed_ms(started));
             next_probe = Instant::now() + interval;
         }
         tracker.poll(elapsed_ms(started));
-        if readiness_complete(tracker.status())? {
+        if readiness_complete(tracker.status(), &diagnostics)? {
+            if detect_startup_gates {
+                ensure_no_startup_operator_gate(session, spec)?;
+            }
             return tracker
                 .into_permit()
                 .ok_or_else(|| "ready tracker did not issue a permit".to_owned());
@@ -1399,14 +1430,26 @@ async fn wait_for_readiness(
         let wait = next_probe.saturating_duration_since(Instant::now());
         match tokio::time::timeout(wait, receiver.recv()).await {
             Ok(Ok(event)) => {
-                observe_readiness_event(&mut tracker, event.event, elapsed_ms(started))?;
+                observe_readiness_event(
+                    &mut tracker,
+                    &mut diagnostics,
+                    event.event,
+                    elapsed_ms(started),
+                )?;
+                if detect_startup_gates {
+                    ensure_no_readiness_operator_gate(&diagnostics, spec)?;
+                    ensure_no_startup_operator_gate(session, spec)?;
+                }
             }
             Ok(Err(error)) => return Err(error.to_string()),
             Err(_) => {
                 tracker.poll(elapsed_ms(started));
             }
         }
-        if readiness_complete(tracker.status())? {
+        if readiness_complete(tracker.status(), &diagnostics)? {
+            if detect_startup_gates {
+                ensure_no_startup_operator_gate(session, spec)?;
+            }
             return tracker
                 .into_permit()
                 .ok_or_else(|| "ready tracker did not issue a permit".to_owned());
@@ -1414,16 +1457,253 @@ async fn wait_for_readiness(
     }
 }
 
+const STARTUP_GATE_SETTLE_MS: u64 = 350;
+const STARTUP_GATE_POLL_MS: u64 = 25;
+// Codex rust-v0.144.0 keeps Enter in newline mode for 120 ms after
+// Windows paste-burst activity. Wait beyond that window only after the TUI
+// visibly incorporates the deferred initial prompt.
+const CODEX_PASTE_ENTER_SUPPRESSION_MS: u64 = 120;
+const CODEX_POST_RENDER_MARGIN_MS: u64 = 30;
+
+async fn deliver_pending_initial_prompt(
+    session: &mut PtySession,
+    spec: &AgentSpec,
+) -> Result<(), String> {
+    if session.pending_followup_prompt().is_none() {
+        return Ok(());
+    }
+    let mut permit =
+        wait_for_readiness(session, spec, ReadinessIntent::FollowupPrompt, true).await?;
+    wait_for_startup_operator_gate(session, spec).await?;
+    let render_confirmed_submit = spec.id.as_str() == "claude"
+        || (RuntimePlatform::current() == RuntimePlatform::Windows
+            && spec.id.as_str() == "codex");
+    if render_confirmed_submit {
+        let prompt = session
+            .pending_followup_prompt()
+            .ok_or_else(|| "deferred initial prompt disappeared before paste".to_owned())?
+            .to_owned();
+        let baseline = session
+            .terminal_state()
+            .map_err(|error| error.to_string())?;
+        let inserted = session
+            .insert_pending_followup_prompt(PromptFraming::BracketedPaste, &permit)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !inserted {
+            return Err("deferred initial prompt was not inserted".to_owned());
+        }
+        wait_for_prompt_render(
+            session,
+            spec,
+            &prompt,
+            &baseline,
+            spec.readiness.timeout_ms,
+        )
+        .await?;
+        if RuntimePlatform::current() == RuntimePlatform::Windows && spec.id.as_str() == "codex" {
+            tokio::time::sleep(Duration::from_millis(
+                CODEX_PASTE_ENTER_SUPPRESSION_MS + CODEX_POST_RENDER_MARGIN_MS,
+            ))
+            .await;
+        }
+        permit = wait_for_readiness(session, spec, ReadinessIntent::FollowupPrompt, true).await?;
+        wait_for_startup_operator_gate(session, spec).await?;
+    }
+    ensure_no_startup_operator_gate(session, spec)?;
+    let submitted = session
+        .submit_pending_followup(PromptFraming::BracketedPaste, permit)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !submitted {
+        return Err("deferred initial prompt disappeared before delivery".to_owned());
+    }
+    Ok(())
+}
+
+async fn wait_for_prompt_render(
+    session: &PtySession,
+    spec: &AgentSpec,
+    prompt: &str,
+    baseline: &PtyTerminalSnapshot,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let probe = prompt_render_probe(&gate4agent_types::sanitize_prompt_text(prompt));
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    loop {
+        let snapshot = session.terminal_state().map_err(|error| error.to_string())?;
+        if let Some(gate) = startup_operator_gate(&snapshot.contents) {
+            return Err(startup_operator_error(spec, gate));
+        }
+        if prompt_rendered(&snapshot, baseline, &probe) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "agent '{}' initial prompt paste was not rendered before submit; Enter was not sent",
+                spec.id
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(STARTUP_GATE_POLL_MS)).await;
+    }
+}
+
+fn prompt_rendered(
+    snapshot: &PtyTerminalSnapshot,
+    baseline: &PtyTerminalSnapshot,
+    probe: &str,
+) -> bool {
+    if snapshot.sequence <= baseline.sequence {
+        return false;
+    }
+    let tail = terminal_tail(&snapshot.contents);
+    let compact = compact_alphanumeric(&tail);
+    if !probe.is_empty() && compact.contains(probe) {
+        return true;
+    }
+    let placeholder = "[pasted content";
+    tail.to_ascii_lowercase().contains(placeholder)
+        && !terminal_tail(&baseline.contents)
+            .to_ascii_lowercase()
+            .contains(placeholder)
+}
+
+fn terminal_tail(contents: &str) -> String {
+    let mut lines = contents.lines().rev().take(12).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
+fn prompt_render_probe(prompt: &str) -> String {
+    let compact = compact_alphanumeric(prompt);
+    let chars = compact.chars().collect::<Vec<_>>();
+    chars[chars.len().saturating_sub(32)..].iter().collect()
+}
+
+fn compact_alphanumeric(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+async fn wait_for_startup_operator_gate(
+    session: &PtySession,
+    spec: &AgentSpec,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_millis(STARTUP_GATE_SETTLE_MS);
+    loop {
+        ensure_no_startup_operator_gate(session, spec)?;
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(STARTUP_GATE_POLL_MS)),
+        )
+        .await;
+    }
+}
+
+fn ensure_no_startup_operator_gate(session: &PtySession, spec: &AgentSpec) -> Result<(), String> {
+    let snapshot = session.terminal_state().map_err(|error| error.to_string())?;
+    match startup_operator_gate(&snapshot.contents) {
+        Some(gate) => Err(startup_operator_error(spec, gate)),
+        None => Ok(()),
+    }
+}
+
+fn startup_operator_error(spec: &AgentSpec, gate: &str) -> String {
+    format!(
+        "agent '{}' requires operator action at startup ({gate}); initial prompt was not submitted",
+        spec.id
+    )
+}
+
+fn ensure_no_readiness_operator_gate(
+    diagnostics: &ReadinessDiagnostics,
+    spec: &AgentSpec,
+) -> Result<(), String> {
+    match diagnostics.operator_gate {
+        Some(gate) => Err(startup_operator_error(spec, gate)),
+        None => Ok(()),
+    }
+}
+
+fn startup_operator_gate(contents: &str) -> Option<&'static str> {
+    let normalized = contents
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if [
+        "trust this folder",
+        "trust the files in this folder",
+        "trust the contents of this directory",
+        "do you trust this directory",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return Some("workspace trust");
+    }
+    if normalized.contains("quick safety check")
+        && (normalized.contains("yes, i trust this folder")
+            || normalized.contains("continue without these permissions"))
+    {
+        return Some("workspace trust");
+    }
+    if [
+        "select authentication method",
+        "choose how to authenticate",
+        "no auth type is selected",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return Some("authentication");
+    }
+    if normalized.contains("kimi code update available")
+        && normalized.contains("install update now")
+    {
+        return Some("vendor update");
+    }
+    if normalized.contains("choose the text style that looks best with your terminal") {
+        return Some("terminal appearance setup");
+    }
+    if normalized.contains("welcome to claude code for")
+        && (normalized.contains("open files") || normalized.contains("selected lines"))
+    {
+        return Some("IDE onboarding");
+    }
+    if normalized.contains("welcome to claude code")
+        && (normalized.contains("press enter") || normalized.contains("enter to continue"))
+    {
+        return Some("Claude onboarding");
+    }
+    Some("configuration migration").filter(|_| {
+        normalized.contains("migration")
+            && normalized.contains("enter confirm")
+            && normalized.contains("esc")
+    })
+}
+
 fn observe_readiness_event(
     tracker: &mut ReadinessTracker<'_>,
+    diagnostics: &mut ReadinessDiagnostics,
     event: PtyEvent,
     elapsed_ms: u64,
 ) -> Result<(), String> {
     match event {
         PtyEvent::Output(data) => {
+            diagnostics.observe_output(&data);
             tracker.observe_output(&data, elapsed_ms);
         }
         PtyEvent::ForegroundProcess(observation) => {
+            diagnostics.observe_foreground(&observation.readiness);
             tracker.observe_foreground(&observation.readiness, elapsed_ms);
         }
         PtyEvent::DataGap { .. } => {
@@ -1440,14 +1720,233 @@ fn observe_readiness_event(
     Ok(())
 }
 
-fn readiness_complete(status: ReadinessStatus) -> Result<bool, String> {
+#[derive(Default)]
+struct ReadinessDiagnostics {
+    draft_signal: Option<gate4agent_types::DraftReadySignal>,
+    output_bytes: usize,
+    output_chunks: usize,
+    tail: Vec<u8>,
+    saw_bracketed_paste: bool,
+    saw_cursor_show: bool,
+    saw_cursor_hide: bool,
+    saw_alternate_screen: bool,
+    saw_clear_screen: bool,
+    saw_claude_composer: bool,
+    saw_codex_composer: bool,
+    saw_named_foreground: bool,
+    operator_gate: Option<&'static str>,
+}
+
+impl ReadinessDiagnostics {
+    fn observe_output(&mut self, data: &[u8]) {
+        const SIGNAL_TAIL_BYTES: usize = 4_096;
+        self.output_bytes = self.output_bytes.saturating_add(data.len());
+        self.output_chunks = self.output_chunks.saturating_add(1);
+        let mut combined = Vec::with_capacity(self.tail.len().saturating_add(data.len()));
+        combined.extend_from_slice(&self.tail);
+        combined.extend_from_slice(data);
+        self.saw_bracketed_paste |= readiness_bytes_contain(&combined, b"\x1b[?2004h");
+        self.saw_cursor_show |= readiness_bytes_contain(&combined, b"\x1b[?25h");
+        self.saw_cursor_hide |= readiness_bytes_contain(&combined, b"\x1b[?25l");
+        self.saw_alternate_screen |= readiness_bytes_contain(&combined, b"\x1b[?1049h");
+        self.saw_clear_screen |= readiness_bytes_contain(&combined, b"\x1b[2J");
+        self.saw_claude_composer |= readiness_bytes_contain(&combined, "❯".as_bytes());
+        self.saw_codex_composer |= readiness_bytes_contain(&combined, "›".as_bytes());
+        let text = String::from_utf8_lossy(&combined);
+        self.operator_gate = self
+            .operator_gate
+            .or_else(|| startup_operator_gate(&strip_ansi_codes(&text)));
+        self.tail = combined[combined.len().saturating_sub(SIGNAL_TAIL_BYTES)..].to_vec();
+    }
+
+    fn observe_foreground(&mut self, foreground: &gate4agent::agent::ForegroundObservation) {
+        self.saw_named_foreground |= foreground.process_name.is_some();
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "draft_signal={:?} output_bytes={} output_chunks={} named_foreground={} bracketed_paste={} cursor_show={} cursor_hide={} alternate_screen={} clear_screen={} claude_composer={} codex_composer={}",
+            self.draft_signal,
+            self.output_bytes,
+            self.output_chunks,
+            self.saw_named_foreground,
+            self.saw_bracketed_paste,
+            self.saw_cursor_show,
+            self.saw_cursor_hide,
+            self.saw_alternate_screen,
+            self.saw_clear_screen,
+            self.saw_claude_composer,
+            self.saw_codex_composer,
+        )
+    }
+}
+
+fn readiness_bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn readiness_complete(
+    status: ReadinessStatus,
+    diagnostics: &ReadinessDiagnostics,
+) -> Result<bool, String> {
     match status {
         ReadinessStatus::Waiting => Ok(false),
         ReadinessStatus::Ready(_) => Ok(true),
-        ReadinessStatus::TimedOut => Err("PTY readiness timed out".to_owned()),
+        ReadinessStatus::TimedOut => Err(format!(
+            "PTY readiness timed out ({})",
+            diagnostics.summary()
+        )),
     }
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        prompt_render_probe, prompt_rendered, startup_operator_gate, ReadinessDiagnostics,
+    };
+
+    fn snapshot(sequence: u64, contents: &str) -> super::PtyTerminalSnapshot {
+        super::PtyTerminalSnapshot {
+            pty_id: "fixture".to_owned(),
+            provider_revision: "fixture-r1".to_owned(),
+            generation: 1,
+            sequence,
+            size: gate4agent::pty::PtySize { rows: 24, cols: 80 },
+            cursor: (0, 0),
+            contents: contents.to_owned(),
+            formatted: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn startup_operator_gates_are_classified_without_returning_terminal_text() {
+        assert_eq!(
+            startup_operator_gate(" Trust this\nfolder? "),
+            Some("workspace trust")
+        );
+        assert_eq!(
+            startup_operator_gate("No auth type is selected"),
+            Some("authentication")
+        );
+        assert_eq!(
+            startup_operator_gate(
+                "Kimi Code Update Available\nInstall update now (0.32.0)\nEnter confirm"
+            ),
+            Some("vendor update")
+        );
+        assert_eq!(
+            startup_operator_gate(
+                "Welcome to Claude Code\nChoose the text style that looks best with your terminal"
+            ),
+            Some("terminal appearance setup")
+        );
+        assert_eq!(
+            startup_operator_gate(
+                "Welcome to Claude Code for VS Code\nClaude has context of open files and selected lines"
+            ),
+            Some("IDE onboarding")
+        );
+        assert_eq!(
+            startup_operator_gate("Welcome to Claude Code\n❯ Press Enter to continue"),
+            Some("Claude onboarding")
+        );
+        assert_eq!(
+            startup_operator_gate("Welcome to Claude Code\n❯ ready\nEnter to send"),
+            None
+        );
+        assert_eq!(
+            startup_operator_gate(
+                "Quick safety check: Is this a project you trust?\nYes, I trust this folder\nNo, continue without these permissions"
+            ),
+            Some("workspace trust")
+        );
+        assert_eq!(startup_operator_gate("ready for a prompt"), None);
+    }
+
+    #[test]
+    fn readiness_diagnostics_detects_an_ansi_split_gate_without_exposing_text() {
+        let mut diagnostics = ReadinessDiagnostics::default();
+        diagnostics.observe_output(b"\x1b[31mNo auth ");
+        diagnostics.observe_output(b"\x1b[0mtype is selected");
+        assert_eq!(diagnostics.operator_gate, Some("authentication"));
+        assert!(!diagnostics.summary().contains("No auth"));
+    }
+
+    #[test]
+    fn prompt_render_probe_ignores_terminal_wrapping_and_uses_the_tail() {
+        let prompt = "prefix with spaces\nand punctuation: final-render-token-1234567890";
+        let probe = prompt_render_probe(prompt);
+        assert!("screen prefix with spaces and punctuation final render token 1234567890"
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .contains(&probe));
+        assert!(probe.chars().count() <= 32);
+    }
+
+    #[test]
+    fn prompt_render_requires_new_sequence_and_visible_tail_evidence() {
+        let probe = prompt_render_probe("final render token");
+        let baseline = snapshot(7, "old composer");
+        assert!(!prompt_rendered(
+            &snapshot(7, "final\nrender\ntoken"),
+            &baseline,
+            &probe
+        ));
+        assert!(!prompt_rendered(
+            &snapshot(8, "unrelated redraw"),
+            &baseline,
+            &probe
+        ));
+        assert!(prompt_rendered(
+            &snapshot(8, "composer\nfinal\nrender\ntoken"),
+            &baseline,
+            &probe
+        ));
+        assert!(prompt_rendered(
+            &snapshot(8, "composer [Pasted Content 4096 chars]"),
+            &baseline,
+            &probe
+        ));
+    }
+
+    #[test]
+    fn an_existing_paste_placeholder_cannot_pass_on_an_unrelated_redraw() {
+        let probe = prompt_render_probe("a new long prompt");
+        assert!(!prompt_rendered(
+            &snapshot(8, "composer [Pasted Content 4096 chars]\nunrelated redraw"),
+            &snapshot(7, "composer [Pasted Content 4096 chars]"),
+            &probe
+        ));
+    }
+
+    #[test]
+    fn punctuation_only_prompt_cannot_pass_on_an_unrelated_redraw() {
+        let probe = prompt_render_probe("!?---");
+        assert!(probe.is_empty());
+        assert!(!prompt_rendered(
+            &snapshot(2, "unrelated redraw"),
+            &snapshot(1, "old composer"),
+            &probe
+        ));
+    }
+
+    #[test]
+    fn prompt_probe_matches_the_sanitized_terminal_payload() {
+        let prompt = "payload\u{1b}tail";
+        let sanitized = gate4agent_types::sanitize_prompt_text(prompt);
+        let probe = prompt_render_probe(&sanitized);
+        assert!(prompt_rendered(
+            &snapshot(2, "composer payload<ESC>tail"),
+            &snapshot(1, "old composer"),
+            &probe
+        ));
+    }
 }

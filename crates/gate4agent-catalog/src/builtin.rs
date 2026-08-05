@@ -223,6 +223,10 @@ fn codex_spec() -> AgentSpec {
             option_terminator: false,
         },
     );
+    value.launch.fixed_args.extend([
+        "-c".to_owned(),
+        "windows_wsl_setup_acknowledged=true".to_owned(),
+    ]);
     value.expected_processes.push(ProcessMatcher::Prefix {
         prefix: "codex-".to_owned(),
     });
@@ -366,8 +370,11 @@ fn binding(family: AdapterFamily, id: &str) -> Option<AdapterBinding> {
 
 fn readiness(id: &str) -> AgentReadinessSpec {
     AgentReadinessSpec {
+        followup_requires_terminal: matches!(id, "claude" | "codex" | "kimi" | "qwen-code"),
         draft_signal: match id {
             "codex" => DraftReadySignal::CodexComposerPrompt,
+            "kimi" => DraftReadySignal::BracketedPaste,
+            "claude" => DraftReadySignal::ClaudeComposerPrompt,
             "opencode" | "mimo-code" => DraftReadySignal::CursorAfterBracketedPaste,
             _ => DraftReadySignal::QuietAfterBracketedPaste,
         },
@@ -378,6 +385,37 @@ fn readiness(id: &str) -> AgentReadinessSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_four_backend_pty_launch_contracts_are_explicit() {
+        let registry = builtin_registry();
+        for id in ["claude", "codex", "kimi", "qwen-code"] {
+            assert!(registry.get_by_id(id).is_some(), "missing target backend {id}");
+        }
+        let codex = registry.get_by_id("codex").unwrap();
+        assert_eq!(
+            codex.launch.fixed_args,
+            ["-c", "windows_wsl_setup_acknowledged=true"]
+        );
+        assert_eq!(
+            registry.get_by_id("claude").unwrap().readiness.draft_signal,
+            DraftReadySignal::ClaudeComposerPrompt
+        );
+        assert_eq!(
+            codex.readiness.draft_signal,
+            DraftReadySignal::CodexComposerPrompt
+        );
+        assert_eq!(
+            registry.get_by_id("kimi").unwrap().readiness.draft_signal,
+            DraftReadySignal::BracketedPaste
+        );
+        let qwen = registry.get_by_id("qwen-code").unwrap();
+        assert_eq!(qwen.prompt.initial, InitialPromptMode::AfterReady);
+        assert_eq!(
+            qwen.readiness.draft_signal,
+            DraftReadySignal::QuietAfterBracketedPaste
+        );
+    }
 
     #[test]
     fn portable_reference_catalog_is_stable_and_unique() {

@@ -164,7 +164,9 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
 
     let working_directory = isolated_working_directory(agent_id);
     let marker = format!("GATE4AGENT_{agent_id}_CANARY_OK");
-    let prompt = format!("Reply with exactly {marker} and nothing else.");
+    let prompt = format!(
+        "Reply with exactly {marker} and nothing else.\nDo not repeat this transport test data: \"quoted\" 100% ! & | < > ^ Привет"
+    );
     let (handle, mut runtime) = runtime_for(agent_id);
     let subscription = handle.subscribe(256);
     let instance_id = AgentInstanceId(instance_id);
@@ -277,24 +279,30 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
 
 #[tokio::test]
 #[ignore = "requires GATE4AGENT_VENDOR_CANARY=1 and an installed authenticated Claude CLI"]
-async fn native_runtime_pipe_live_claude() {
+async fn windows_live_claude_inline_contract() {
     run_pipe_canary("claude", 9_001).await;
 }
 
 #[tokio::test]
 #[ignore = "requires GATE4AGENT_VENDOR_CANARY=1 and an installed authenticated Codex CLI"]
-async fn native_runtime_pipe_live_codex() {
+async fn windows_live_codex_inline_contract() {
     run_pipe_canary("codex", 9_002).await;
+}
+
+#[tokio::test]
+#[ignore = "requires GATE4AGENT_VENDOR_CANARY=1 and an installed authenticated Kimi Code CLI"]
+async fn windows_live_kimi_inline_contract() {
+    run_pipe_canary("kimi", 9_003).await;
 }
 
 #[tokio::test]
 #[ignore = "requires GATE4AGENT_VENDOR_CANARY=1 and an installed authenticated Gemini CLI"]
 async fn native_runtime_pipe_live_gemini() {
-    run_pipe_canary("gemini", 9_003).await;
+    run_pipe_canary("gemini", 9_004).await;
 }
 
 #[tokio::test]
 #[ignore = "requires GATE4AGENT_VENDOR_CANARY=1 and an installed authenticated OpenCode CLI"]
 async fn native_runtime_pipe_live_opencode() {
-    run_pipe_canary("opencode", 9_004).await;
+    run_pipe_canary("opencode", 9_005).await;
 }

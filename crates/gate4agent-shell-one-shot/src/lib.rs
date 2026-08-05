@@ -407,6 +407,14 @@ fn native_command(program: &str, args: &[String]) -> Result<Command, NativeOneSh
     {
         let resolved = resolve_windows_command(program);
         if is_windows_batch(&resolved) {
+            if let Some(shim) = resolve_windows_npm_shim(&resolved) {
+                let mut command = Command::new(shim.program);
+                if let Some(script) = shim.script {
+                    command.arg(script);
+                }
+                command.args(args);
+                return Ok(command);
+            }
             if std::iter::once(resolved.as_str())
                 .chain(args.iter().map(String::as_str))
                 .any(has_unsafe_windows_batch_syntax)
@@ -473,6 +481,111 @@ fn is_windows_batch(program: &str) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+}
+
+#[cfg(windows)]
+struct WindowsNpmShim {
+    program: std::path::PathBuf,
+    script: Option<std::path::PathBuf>,
+}
+
+#[cfg(windows)]
+fn resolve_windows_npm_shim(program: &str) -> Option<WindowsNpmShim> {
+    const NPM_SHIM_MAX_BYTES: u64 = 64 * 1024;
+
+    let shim_path = Path::new(program);
+    if std::fs::metadata(shim_path).ok()?.len() > NPM_SHIM_MAX_BYTES {
+        return None;
+    }
+    let contents = std::fs::read_to_string(shim_path).ok()?;
+    let has_npm_preamble = contents
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("SET dp0=%~dp0"))
+        && contents
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case("CALL :find_dp0"));
+    if !has_npm_preamble {
+        return None;
+    }
+    let target = contents.lines().find_map(|line| {
+        if !line.trim_end().ends_with("%*") {
+            return None;
+        }
+        let target = quoted_windows_segments(line).into_iter().find(|segment| {
+            segment
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%dp0%\\"))
+        })?;
+        let quoted_target = format!("\"{target}\"");
+        let target_start = line.find(&quoted_target)?;
+        if line[target_start + quoted_target.len()..].trim() != "%*" {
+            return None;
+        }
+        let extension = Path::new(target)
+            .extension()
+            .and_then(|value| value.to_str())?;
+        let prefix = line[..target_start].trim();
+        let canonical = if extension.eq_ignore_ascii_case("exe") {
+            prefix.is_empty()
+        } else if matches!(extension.to_ascii_lowercase().as_str(), "js" | "cjs" | "mjs") {
+            prefix.eq_ignore_ascii_case(
+                "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"",
+            )
+        } else {
+            false
+        };
+        canonical.then(|| target.to_owned())
+    })?;
+    let relative = Path::new(&target[6..]);
+    if relative.components().any(|component| {
+        !matches!(component, std::path::Component::Normal(_))
+    }) {
+        return None;
+    }
+    let shim_directory = shim_path.parent()?;
+    let target_path = shim_directory.join(relative);
+    if !target_path.is_file() {
+        return None;
+    }
+    let extension = target_path
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "exe" => Some(WindowsNpmShim {
+            program: target_path,
+            script: None,
+        }),
+        "js" | "cjs" | "mjs" => {
+            let bundled_node = shim_directory.join("node.exe");
+            Some(WindowsNpmShim {
+                program: if bundled_node.is_file() {
+                    bundled_node
+                } else {
+                    std::path::PathBuf::from("node.exe")
+                },
+                script: Some(target_path),
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn quoted_windows_segments(line: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = None;
+    for (index, character) in line.char_indices() {
+        if character != '"' {
+            continue;
+        }
+        if let Some(opening) = start.take() {
+            segments.push(&line[opening..index]);
+        } else {
+            start = Some(index + 1);
+        }
+    }
+    segments
 }
 
 #[cfg(windows)]
@@ -665,6 +778,78 @@ mod tests {
             AgentEvent::Text { text, .. } if text == "batch-path-ok"
         )));
         session.kill().await.unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_shim_uses_direct_node_process_for_multiline_code_prompt() {
+        let directory = fixture_dir("npm shim");
+        let entrypoint = directory.join("node_modules/vendor/agent/dist/main.mjs");
+        fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        fs::write(&entrypoint, "").unwrap();
+        let shim = directory.join("agent.cmd");
+        fs::write(
+            &shim,
+            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" \"%dp0%\\node_modules\\vendor\\agent\\dist\\main.mjs\" %*\r\n",
+        )
+        .unwrap();
+        let prompt = "Review:\r\n\"quoted\" 100% ! & | < > ^ Привет";
+        let command = native_command(
+            shim.to_string_lossy().as_ref(),
+            &["-p".to_owned(), prompt.to_owned()],
+        )
+        .unwrap();
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "node.exe");
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(std::path::PathBuf::from(&args[0]), entrypoint);
+        assert_eq!(args[1], "-p");
+        assert_eq!(args[2], prompt);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_npm_batch_keeps_metacharacter_rejection() {
+        let directory = fixture_dir("plain batch");
+        let script = directory.join("agent.cmd");
+        fs::write(&script, "@ECHO off\r\necho %*\r\n").unwrap();
+        let result = native_command(
+            script.to_string_lossy().as_ref(),
+            &["unsafe & argument".to_owned()],
+        );
+        assert!(matches!(
+            result,
+            Err(NativeOneShotError::UnsafeWindowsBatchArguments)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn modified_npm_shim_with_required_args_fails_closed() {
+        let directory = fixture_dir("modified npm shim");
+        let executable = directory.join("node_modules/vendor/agent/agent.exe");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "").unwrap();
+        let shim = directory.join("agent.cmd");
+        fs::write(
+            &shim,
+            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\vendor\\agent\\agent.exe\" --sandbox %*\r\n",
+        )
+        .unwrap();
+        let result = native_command(
+            shim.to_string_lossy().as_ref(),
+            &["unsafe & argument".to_owned()],
+        );
+        assert!(matches!(
+            result,
+            Err(NativeOneShotError::UnsafeWindowsBatchArguments)
+        ));
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -63,7 +63,7 @@ pub fn builtin_specs() -> Vec<AgentSpec> {
         grok_spec(),
         spec(
             "kimi",
-            "Kimi CLI",
+            "Kimi Code",
             "kimi",
             &[],
             InitialPromptMode::AfterReady,
@@ -454,8 +454,17 @@ mod tests {
                 .as_ref()
                 .unwrap_or_else(|| panic!("missing OneShot adapter for {id}"));
             assert_eq!(binding.id.as_str(), id);
-            assert_eq!(binding.revision, gate4agent_adapters::ONE_SHOT_REVISION);
+            let expected_revision = match id {
+                "claude" => gate4agent_adapters::CLAUDE_CODE_INLINE_REVISION,
+                "codex" => gate4agent_adapters::CODEX_CLI_INLINE_REVISION,
+                "kimi" => gate4agent_adapters::KIMI_CODE_INLINE_REVISION,
+                _ => gate4agent_adapters::ONE_SHOT_REVISION,
+            };
+            assert_eq!(binding.revision, expected_revision);
         }
+        let qwen = registry.get_by_id("qwen-code").unwrap();
+        assert!(qwen.capabilities.transports.pipe.is_none());
+        assert!(qwen.capabilities.adapters.one_shot.is_none());
         for id in ["gemini", "opencode"] {
             assert!(registry
                 .get_by_id(id)

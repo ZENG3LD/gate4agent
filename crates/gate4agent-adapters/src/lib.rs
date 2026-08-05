@@ -47,8 +47,9 @@ pub use managed_hook::{
 pub use one_shot::{
     one_shot_spec, one_shot_specs, resolve_one_shot_plan, OneShotAdapterError, OneShotAdapterSpec,
     OneShotModelSource, OneShotModelSpec, OneShotPlan, OneShotPromptDelivery, OneShotThinkingLevel,
+    CLAUDE_CODE_INLINE_REVISION, CODEX_CLI_INLINE_REVISION, KIMI_CODE_INLINE_REVISION,
     ONE_SHOT_OUTPUT_MAX_BYTES, ONE_SHOT_REVISION, ONE_SHOT_THINKING_OPTION_ID,
-    ONE_SHOT_TIMEOUT_SECONDS,
+    ONE_SHOT_TIMEOUT_SECONDS, QWEN_CODE_INLINE_REVISION,
 };
 pub use resume::{
     build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,
@@ -295,13 +296,22 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         "amp",
         "cursor",
         "kimi",
+        "qwen-code",
         "copilot",
         "antigravity",
     ] {
-        descriptors.push(descriptor_with_revision(
+        let (revision, verification) = match id {
+            "claude" => (CLAUDE_CODE_INLINE_REVISION, AdapterVerification::VendorCanary),
+            "codex" => (CODEX_CLI_INLINE_REVISION, AdapterVerification::VendorCanary),
+            "kimi" => (KIMI_CODE_INLINE_REVISION, AdapterVerification::VendorCanary),
+            "qwen-code" => (QWEN_CODE_INLINE_REVISION, AdapterVerification::Reference),
+            _ => (ONE_SHOT_REVISION, AdapterVerification::SyntheticFixture),
+        };
+        descriptors.push(descriptor_with_revision_and_verification(
             AdapterFamily::OneShot,
             id,
-            ONE_SHOT_REVISION,
+            revision,
+            verification,
         ));
     }
     for id in ["gemini", "opencode"] {
@@ -394,6 +404,20 @@ fn descriptor(family: AdapterFamily, id: &str) -> AdapterDescriptor {
 }
 
 fn descriptor_with_revision(family: AdapterFamily, id: &str, revision: &str) -> AdapterDescriptor {
+    descriptor_with_revision_and_verification(
+        family,
+        id,
+        revision,
+        AdapterVerification::SyntheticFixture,
+    )
+}
+
+fn descriptor_with_revision_and_verification(
+    family: AdapterFamily,
+    id: &str,
+    revision: &str,
+    verification: AdapterVerification,
+) -> AdapterDescriptor {
     let agent_ids = if family == AdapterFamily::Hook && id == "claude-code" {
         vec!["claude", "openclaude"]
     } else {
@@ -404,7 +428,7 @@ fn descriptor_with_revision(family: AdapterFamily, id: &str, revision: &str) -> 
         binding: AdapterBinding::new(
             AdapterId::new(id).expect("hardcoded adapter ID"),
             revision,
-            AdapterVerification::SyntheticFixture,
+            verification,
         )
         .expect("hardcoded adapter binding"),
         agents: agent_ids
@@ -551,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_registry_matches_the_pinned_orca_execution_inventory() {
+    fn one_shot_registry_tracks_live_and_reference_contract_revisions() {
         let actual = builtin_adapter_registry()
             .iter()
             .filter(|descriptor| descriptor.family == AdapterFamily::OneShot)
@@ -563,20 +587,37 @@ mod tests {
             })
             .collect::<std::collections::BTreeSet<_>>();
         let expected = [
-            "amp",
-            "antigravity",
-            "claude",
-            "codex",
-            "copilot",
-            "cursor",
-            "kimi",
-            "opencode",
-            "pi",
+            ("amp", ONE_SHOT_REVISION),
+            ("antigravity", ONE_SHOT_REVISION),
+            ("claude", CLAUDE_CODE_INLINE_REVISION),
+            ("codex", CODEX_CLI_INLINE_REVISION),
+            ("copilot", ONE_SHOT_REVISION),
+            ("cursor", ONE_SHOT_REVISION),
+            ("kimi", KIMI_CODE_INLINE_REVISION),
+            ("opencode", ONE_SHOT_REVISION),
+            ("pi", ONE_SHOT_REVISION),
+            ("qwen-code", QWEN_CODE_INLINE_REVISION),
         ]
         .into_iter()
-        .map(|id| (id, ONE_SHOT_REVISION))
         .collect();
         assert_eq!(actual, expected);
+        for id in ["claude", "codex", "kimi"] {
+            assert_eq!(
+                builtin_adapter_registry()
+                    .binding(AdapterFamily::OneShot, id)
+                    .unwrap()
+                    .verification,
+                AdapterVerification::VendorCanary,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            builtin_adapter_registry()
+                .binding(AdapterFamily::OneShot, "qwen-code")
+                .unwrap()
+                .verification,
+            AdapterVerification::Reference
+        );
     }
 
     #[test]

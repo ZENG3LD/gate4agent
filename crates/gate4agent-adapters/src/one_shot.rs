@@ -5,6 +5,10 @@ use gate4agent_types::{
 use thiserror::Error;
 
 pub const ONE_SHOT_REVISION: &str = "gate4agent-one-shot/orca-d8629c4/v2";
+pub const CLAUDE_CODE_INLINE_REVISION: &str = "gate4agent-inline/claude-code-2.1/v1";
+pub const CODEX_CLI_INLINE_REVISION: &str = "gate4agent-inline/codex-cli-0.144/v1";
+pub const KIMI_CODE_INLINE_REVISION: &str = "gate4agent-inline/kimi-code-0.31/v1";
+pub const QWEN_CODE_INLINE_REVISION: &str = "gate4agent-inline/qwen-code-0.21/v1";
 pub const ONE_SHOT_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const ONE_SHOT_TIMEOUT_SECONDS: u64 = 60;
 pub const ONE_SHOT_THINKING_OPTION_ID: &str = "thinking-level";
@@ -63,6 +67,7 @@ pub fn one_shot_specs() -> Vec<OneShotAdapterSpec> {
         "amp",
         "cursor",
         "kimi",
+        "qwen-code",
         "copilot",
         "antigravity",
     ]
@@ -180,15 +185,10 @@ pub fn resolve_one_shot_plan(
             prompt,
         ])),
         "kimi" => {
-            args.extend(strings(&["--print", "--quiet"]));
-            if model != "default" {
-                args.extend(["--model".to_owned(), model.clone()]);
-            }
-            match thinking.as_deref() {
-                Some("on") => args.push("--thinking".to_owned()),
-                Some("off") => args.push("--no-thinking".to_owned()),
-                _ => {}
-            }
+            args.extend(strings(&["-p", prompt, "--output-format", "text"]));
+        }
+        "qwen-code" => {
+            args.extend(strings(&["-p", prompt, "--output-format", "text"]));
         }
         "copilot" => {
             args.extend(strings(&[
@@ -371,18 +371,17 @@ fn spec_for(id: &str) -> Result<OneShotAdapterSpec, OneShotAdapterError> {
             "auto",
         ),
         "kimi" => (
-            "Kimi",
-            OneShotPromptDelivery::StdinClose,
+            "Kimi Code",
+            OneShotPromptDelivery::Positional,
             OneShotModelSource::Static,
-            vec![
-                model("default", "Config default", &[], None),
-                model(
-                    "kimi-code/kimi-for-coding",
-                    "Kimi K2.6",
-                    &[("on", "On"), ("off", "Off")],
-                    Some("on"),
-                ),
-            ],
+            vec![model("default", "Provider default", &[], None)],
+            "default",
+        ),
+        "qwen-code" => (
+            "Qwen Code",
+            OneShotPromptDelivery::Positional,
+            OneShotModelSource::Static,
+            vec![model("default", "Provider default", &[], None)],
             "default",
         ),
         "copilot" => (
@@ -533,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_orca_inventory_and_defaults_are_exact() {
+    fn one_shot_inventory_includes_current_target_contracts() {
         let specs = one_shot_specs();
         let actual = specs
             .iter()
@@ -551,6 +550,7 @@ mod tests {
                 "kimi",
                 "opencode",
                 "pi",
+                "qwen-code",
             ]
             .into_iter()
             .collect()
@@ -627,10 +627,36 @@ mod tests {
             Some("prompt in argv")
         );
         assert!(cursor.args.contains(&"--trust".to_owned()));
+
+        let kimi = resolve_one_shot_plan(
+            &AdapterId::new("kimi").unwrap(),
+            &launch("kimi"),
+            "prompt in argv",
+            None,
+        )
+        .unwrap();
+        assert_eq!(kimi.stdin_payload, None);
+        assert_eq!(
+            kimi.args,
+            ["fixed", "-p", "prompt in argv", "--output-format", "text"]
+        );
+
+        let qwen = resolve_one_shot_plan(
+            &AdapterId::new("qwen-code").unwrap(),
+            &launch("qwen"),
+            "prompt in argv",
+            None,
+        )
+        .unwrap();
+        assert_eq!(qwen.stdin_payload, None);
+        assert_eq!(
+            qwen.args,
+            ["fixed", "-p", "prompt in argv", "--output-format", "text"]
+        );
     }
 
     #[test]
-    fn every_pinned_provider_builds_its_default_executed_path() {
+    fn every_registered_provider_builds_its_default_execution_path() {
         let expected_flag = [
             ("claude", "--permission-mode"),
             ("codex", "--ephemeral"),
@@ -638,7 +664,8 @@ mod tests {
             ("pi", "--no-tools"),
             ("amp", "--no-notifications"),
             ("cursor", "--trust"),
-            ("kimi", "--quiet"),
+            ("kimi", "-p"),
+            ("qwen-code", "-p"),
             ("copilot", "--no-custom-instructions"),
             ("antigravity", "--sandbox"),
         ];

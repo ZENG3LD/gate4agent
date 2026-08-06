@@ -144,6 +144,10 @@ pub enum PipePromptDelivery {
 pub enum PipeProtocol {
     #[default]
     SemanticNdjson,
+    /// Provider-owned structured JSONL emitted by a headless CLI invocation.
+    /// Unlike `SemanticNdjson`, this path may expose a provider session
+    /// identity and be resumed by a later child process.
+    StructuredJsonl,
     OneShotText,
 }
 

@@ -1,6 +1,6 @@
 use crate::{
-    validate_candidate_id, HistoryValidationError, OperationId, ProviderSessionIdentity,
-    ProviderSessionKey, TerminalSize, WORKING_DIRECTORY_MAX_BYTES,
+    normalize_semantic_prompt, validate_candidate_id, HistoryValidationError, OperationId,
+    ProviderSessionIdentity, ProviderSessionKey, TerminalSize, WORKING_DIRECTORY_MAX_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,6 +11,8 @@ pub const RESUME_ERROR_MAX_BYTES: usize = 4_096;
 pub struct ResumeLaunchRequest {
     pub working_directory: String,
     pub terminal_size: TerminalSize,
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
 }
 
 impl ResumeLaunchRequest {
@@ -23,6 +25,10 @@ impl ResumeLaunchRequest {
         }
         if !self.terminal_size.is_valid() {
             return Err(ResumeValidationError::InvalidTerminalSize);
+        }
+        if let Some(prompt) = &self.initial_prompt {
+            normalize_semantic_prompt(prompt)
+                .map_err(|error| ResumeValidationError::InvalidInitialPrompt(error.to_string()))?;
         }
         Ok(())
     }
@@ -95,6 +101,8 @@ pub enum ResumeValidationError {
     InvalidWorkingDirectory,
     #[error("resume terminal size is outside the supported bounded range")]
     InvalidTerminalSize,
+    #[error("resume initial prompt is invalid: {0}")]
+    InvalidInitialPrompt(String),
     #[error("resume history candidate is invalid: {0}")]
     InvalidHistoryCandidate(HistoryValidationError),
     #[error("resume error is empty, too large, or contains unsafe controls")]
@@ -126,10 +134,21 @@ mod tests {
                     rows: 24,
                     columns: 80,
                 },
+                initial_prompt: Some("continue\u{0000} safely".to_owned()),
             }
             .validate(),
             Ok(())
         );
+        assert!(ResumeLaunchRequest {
+            working_directory: "C:/repo".to_owned(),
+            terminal_size: TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            initial_prompt: Some("x".repeat(crate::SEMANTIC_PROMPT_MAX_BYTES + 1)),
+        }
+        .validate()
+        .is_err());
         assert!(ResumeTarget::HistoryCandidate {
             candidate_id: r"C:\sessions\one.jsonl".to_owned(),
         }

@@ -11,6 +11,8 @@ pub enum CliTool {
     #[default]
     ClaudeCode,
     Codex,
+    #[serde(alias = "kimi")]
+    KimiCode,
     Gemini,
     /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
     OpenCode,
@@ -21,6 +23,7 @@ impl std::fmt::Display for CliTool {
         match self {
             CliTool::ClaudeCode => write!(f, "Claude Code"),
             CliTool::Codex => write!(f, "Codex"),
+            CliTool::KimiCode => write!(f, "Kimi Code"),
             CliTool::Gemini => write!(f, "Gemini"),
             CliTool::OpenCode => write!(f, "OpenCode"),
         }
@@ -46,11 +49,13 @@ impl CliTool {
     /// ```
     pub fn capabilities(&self) -> crate::core::capabilities::CliCapabilities {
         use crate::core::capabilities::{
-            claude_capabilities, codex_capabilities, gemini_capabilities, opencode_capabilities,
+            claude_capabilities, codex_capabilities, gemini_capabilities, kimi_capabilities,
+            opencode_capabilities,
         };
         match self {
             CliTool::ClaudeCode => claude_capabilities(),
             CliTool::Codex => codex_capabilities(),
+            CliTool::KimiCode => kimi_capabilities(),
             CliTool::Gemini => gemini_capabilities(),
             CliTool::OpenCode => opencode_capabilities(),
         }

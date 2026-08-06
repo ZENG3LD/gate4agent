@@ -6,8 +6,9 @@ Living document. Current state + what's next. Updated per release.
 
 - [x] Split the workspace into pure contracts, lifecycle engines, kernel,
   bounded handles, shell adapters, native runtime, and testkit crates.
-- [x] Add control protocol v25 with persistent session generations and bounded
-  live/retained identity admission.
+- [x] Add control protocol v26 with persistent session generations, transport-
+  preserving resume, optional resume prompts, and bounded live/retained
+  identity admission.
 - [x] Add a bounded capability protocol and engine with host-owned providers,
   exact scoped grants/approvals, lifecycle cancellation, terminal completions,
   and explicit queue/sequence health.

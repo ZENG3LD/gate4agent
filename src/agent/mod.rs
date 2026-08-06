@@ -50,6 +50,7 @@ impl From<CliTool> for AgentId {
         let id = match tool {
             CliTool::ClaudeCode => "claude",
             CliTool::Codex => "codex",
+            CliTool::KimiCode => "kimi",
             CliTool::Gemini => "gemini",
             CliTool::OpenCode => "opencode",
         };
@@ -64,6 +65,7 @@ impl TryFrom<&AgentId> for CliTool {
         match id.as_str() {
             "claude" => Ok(Self::ClaudeCode),
             "codex" => Ok(Self::Codex),
+            "kimi" => Ok(Self::KimiCode),
             "gemini" => Ok(Self::Gemini),
             "opencode" => Ok(Self::OpenCode),
             _ => Err(LegacyCliToolError(id.clone())),
@@ -87,5 +89,10 @@ mod tests {
             CliTool::OpenCode
         );
         assert!(CliTool::try_from(&AgentId::new("grok").unwrap()).is_err());
+        assert_eq!(AgentId::from(CliTool::KimiCode).as_str(), "kimi");
+        assert_eq!(
+            CliTool::try_from(&AgentId::new("kimi").unwrap()).unwrap(),
+            CliTool::KimiCode
+        );
     }
 }

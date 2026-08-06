@@ -103,6 +103,8 @@ pub struct PtyTerminalSnapshot {
     pub sequence: u64,
     pub size: PtySize,
     pub cursor: (u16, u16),
+    #[serde(default)]
+    pub bracketed_paste: bool,
     pub contents: String,
     /// ANSI-formatted visible screen suitable for reconstructing decoration.
     pub formatted: Vec<u8>,
@@ -306,6 +308,41 @@ impl PtyEventPublisher {
         })
     }
 
+    pub(crate) fn retained_cursor(&self) -> Result<PtyReplayCursor, PtyAttachError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PtyAttachError::JournalPoisoned)?;
+        Ok(PtyReplayCursor {
+            provider_revision: self.provider_revision.clone(),
+            generation: self.generation,
+            next_sequence: state
+                .replay
+                .front()
+                .map_or_else(|| state.sequence.saturating_add(1), |event| event.sequence),
+        })
+    }
+
+    pub(crate) fn attach_retained(&self) -> Result<PtyAttachment, PtyAttachError> {
+        let rx = self.tx.subscribe();
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PtyAttachError::JournalPoisoned)?;
+        let snapshot_sequence = state.sequence;
+        Ok(PtyAttachment {
+            replay: state.replay.iter().cloned().collect(),
+            receiver: PtyEventReceiver {
+                rx,
+                pty_id: self.pty_id.clone(),
+                provider_revision: self.provider_revision.clone(),
+                generation: self.generation,
+                expected_sequence: snapshot_sequence.saturating_add(1),
+                pending: None,
+            },
+        })
+    }
+
     pub(crate) fn attach(&self, cursor: PtyReplayCursor) -> Result<PtyAttachment, PtyAttachError> {
         if cursor.next_sequence == 0 {
             return Err(PtyAttachError::InvalidCursor);
@@ -400,6 +437,7 @@ impl PtyEventPublisher {
             sequence: state.sequence,
             size: PtySize { rows, cols },
             cursor: screen.cursor_position(),
+            bracketed_paste: screen.bracketed_paste(),
             contents: screen.contents(),
             formatted: screen.contents_formatted(),
         })
@@ -469,6 +507,34 @@ mod tests {
         assert_eq!(attachment.replay.last().unwrap().sequence, 2);
     }
 
+    #[test]
+    fn retained_cursor_replays_the_available_tail_without_a_synthetic_gap() {
+        let publisher =
+            PtyEventPublisher::new("pty-test".to_owned(), REVISION.to_owned(), 1, 8, 3, 24, 80);
+        publisher.publish(PtyEvent::Output(vec![1, 2]));
+        publisher.publish(PtyEvent::Output(vec![3, 4]));
+
+        let cursor = publisher.retained_cursor().expect("retained cursor");
+        assert_eq!(cursor.next_sequence, 2);
+        let attachment = publisher.attach(cursor).expect("tail attach");
+        assert_eq!(attachment.replay.len(), 1);
+        assert_eq!(attachment.replay[0].sequence, 2);
+        assert!(!matches!(attachment.replay[0].event, PtyEvent::DataGap { .. }));
+    }
+
+    #[test]
+    fn retained_attachment_atomically_replays_available_events_without_a_gap() {
+        let publisher =
+            PtyEventPublisher::new("pty-test".to_owned(), REVISION.to_owned(), 1, 8, 3, 24, 80);
+        publisher.publish(PtyEvent::Output(vec![1, 2]));
+        publisher.publish(PtyEvent::Output(vec![3, 4]));
+
+        let attachment = publisher.attach_retained().expect("retained attach");
+        assert_eq!(attachment.replay.len(), 1);
+        assert_eq!(attachment.replay[0].sequence, 2);
+        assert!(!matches!(attachment.replay[0].event, PtyEvent::DataGap { .. }));
+    }
+
     #[tokio::test]
     async fn receiver_turns_broadcast_lag_into_an_exact_gap() {
         let publisher =
@@ -516,12 +582,13 @@ mod tests {
     fn snapshot_is_pinned_to_the_last_incorporated_sequence() {
         let publisher =
             PtyEventPublisher::new("pty-test".to_owned(), REVISION.to_owned(), 1, 8, 64, 2, 10);
-        publisher.publish(PtyEvent::Output(b"hello".to_vec()));
+        publisher.publish(PtyEvent::Output(b"\x1b[?2004hhello".to_vec()));
         let snapshot = publisher.snapshot().expect("snapshot");
         assert_eq!(snapshot.sequence, 1);
         assert_eq!(snapshot.contents, "hello");
         assert_eq!(snapshot.size, PtySize { rows: 2, cols: 10 });
         assert_eq!(snapshot.provider_revision, REVISION);
+        assert!(snapshot.bracketed_paste);
     }
 
     #[test]

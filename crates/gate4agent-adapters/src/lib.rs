@@ -286,6 +286,8 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     let mut descriptors = Vec::new();
     for id in ["claude-code", "codex", "gemini", "opencode"] {
         descriptors.push(descriptor(AdapterFamily::PtySemantic, id));
+    }
+    for id in ["claude-code", "codex", "gemini", "opencode", "kimi"] {
         descriptors.push(descriptor(AdapterFamily::Pipe, id));
     }
     for id in [
@@ -381,6 +383,7 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         "grok",
         "droid",
         "devin",
+        "kimi",
     ] {
         descriptors.push(descriptor(AdapterFamily::Resume, id));
     }
@@ -621,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_registry_matches_the_pinned_orca_live_inventory() {
+    fn resume_registry_matches_the_supported_live_inventory() {
         let actual = builtin_adapter_registry()
             .iter()
             .filter(|descriptor| descriptor.family == AdapterFamily::Resume)
@@ -635,6 +638,7 @@ mod tests {
             "droid",
             "gemini",
             "grok",
+            "kimi",
             "mimo-code",
             "opencode",
             "pi",

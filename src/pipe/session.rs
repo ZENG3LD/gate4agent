@@ -225,8 +225,8 @@ fn reader_loop(
         };
 
         let line = match output {
-            Some(PipeOutput::Stdout(line)) => line,
-            Some(PipeOutput::LimitExceeded) => {
+            Ok(PipeOutput::Stdout(line)) => line,
+            Ok(PipeOutput::LimitExceeded) => {
                 terminate_pipe(
                     &pipe,
                     &tx,
@@ -236,7 +236,7 @@ fn reader_loop(
                 );
                 break;
             }
-            Some(PipeOutput::ReadFailed) => {
+            Ok(PipeOutput::ReadFailed) => {
                 terminate_pipe(
                     &pipe,
                     &tx,
@@ -246,26 +246,30 @@ fn reader_loop(
                 );
                 break;
             }
-            None => {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 let still_running = pipe
                     .lock()
                     .ok()
                     .and_then(|mut g| g.as_mut().map(|p| p.is_running()))
                     .unwrap_or(false);
-                if !still_running {
-                    let exit_code = get_exit_code(&pipe);
-                    if !parser_emitted_session_end {
-                        let _ = tx.send(AgentEvent::SessionEnd {
-                            result: format!("exit_code={}", exit_code),
-                            cost_usd: None,
-                            is_error: exit_code != 0,
-                        });
-                    }
-                    let _ = tx.send(AgentEvent::Exited { code: exit_code });
-                    break;
+                if still_running {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
+                let exit_code = get_exit_code(&pipe);
+                if !parser_emitted_session_end {
+                    let _ = tx.send(AgentEvent::SessionEnd {
+                        result: format!("exit_code={}", exit_code),
+                        cost_usd: None,
+                        is_error: exit_code != 0,
+                    });
+                }
+                let _ = tx.send(AgentEvent::Exited { code: exit_code });
+                break;
             }
         };
 

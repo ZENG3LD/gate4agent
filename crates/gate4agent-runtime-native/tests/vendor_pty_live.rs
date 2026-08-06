@@ -22,6 +22,7 @@ struct TurnChallenge {
 struct CanarySuccess {
     first_frame_sequence: u64,
     second_frame_sequence: u64,
+    recovery_frame_sequence: u64,
     resized: TerminalSize,
 }
 
@@ -179,6 +180,24 @@ fn runtime_for(
         .clone();
     NativeRuntime::new(
         AgentRegistry::new([spec]).expect("single-agent live PTY registry"),
+        NativeRuntimeConfig {
+            worker_poll_interval_ms: 5,
+            ..NativeRuntimeConfig::default()
+        },
+    )
+}
+
+fn runtime_for_agents(
+    agent_ids: &[&str],
+) -> (gate4agent_handle::Gate4AgentHandle, NativeRuntime) {
+    let specs = agent_ids.iter().map(|agent_id| {
+        builtin_registry()
+            .get_by_id(agent_id)
+            .unwrap_or_else(|| panic!("missing built-in agent spec for {agent_id}"))
+            .clone()
+    });
+    NativeRuntime::new(
+        AgentRegistry::new(specs).expect("multi-agent live PTY registry"),
         NativeRuntimeConfig {
             worker_poll_interval_ms: 5,
             ..NativeRuntimeConfig::default()
@@ -479,7 +498,8 @@ async fn exercise_live_session(
         second_event_start,
         PreparedInputKind::SubmitPrompt,
     )
-    .await?;
+    .await
+    .map_err(|error| format!("second turn submission: {error}"))?;
     let second_frame_sequence = wait_for_marker(
         runtime,
         handle,
@@ -490,10 +510,39 @@ async fn exercise_live_session(
     )
     .await?;
 
+    let agent_token = agent_id.replace('-', "").to_ascii_uppercase();
+    let interrupt_marker = format!("G4A{agent_token}PTYINTERRUPTSTART");
+    let interrupt_prompt = format!(
+        "Begin your response with one string made by concatenating these tokens without spaces or punctuation: G4A {agent_token} PTY INTERRUPT START. Then write the integers from 1 through 400, one per line. Do not stop early."
+    );
+    assert!(!interrupt_prompt.contains(&interrupt_marker));
+    let interrupt_baseline = terminal_sequence(handle);
+    let interrupt_prompt_event_start = events.len();
+    submit_prompt(handle, instance_id, 5, interrupt_prompt)?;
+    wait_for_input_completion(
+        runtime,
+        handle,
+        subscription,
+        events,
+        interrupt_prompt_event_start,
+        PreparedInputKind::SubmitPrompt,
+    )
+    .await
+    .map_err(|error| format!("in-flight challenge submission: {error}"))?;
+    let interrupt_stream_sequence = wait_for_marker(
+        runtime,
+        handle,
+        subscription,
+        events,
+        &interrupt_marker,
+        interrupt_baseline,
+    )
+    .await?;
+
     let interrupt_event_start = events.len();
     handle
         .dispatch(command(
-            5,
+            6,
             ControlCommand::SendInput {
                 instance_id,
                 action: InputAction::TerminalControl(TerminalControl::Interrupt),
@@ -508,11 +557,40 @@ async fn exercise_live_session(
         interrupt_event_start,
         PreparedInputKind::TerminalControl,
     )
+    .await
+    .map_err(|error| format!("in-flight interrupt delivery: {error}"))?;
+
+    let recovery = turn_challenge(agent_id, "recovery", false);
+    let recovery_baseline = terminal_sequence(handle);
+    let recovery_event_start = events.len();
+    submit_prompt(handle, instance_id, 7, recovery.prompt)?;
+    wait_for_input_completion(
+        runtime,
+        handle,
+        subscription,
+        events,
+        recovery_event_start,
+        PreparedInputKind::SubmitPrompt,
+    )
+    .await
+    .map_err(|error| format!("post-interrupt recovery submission: {error}"))?;
+    let recovery_frame_sequence = wait_for_marker(
+        runtime,
+        handle,
+        subscription,
+        events,
+        &recovery.marker,
+        recovery_baseline,
+    )
     .await?;
+    if recovery_frame_sequence <= interrupt_stream_sequence {
+        return Err("live PTY recovery did not advance after in-flight interrupt".to_owned());
+    }
 
     Ok(CanarySuccess {
         first_frame_sequence,
         second_frame_sequence,
+        recovery_frame_sequence,
         resized,
     })
 }
@@ -530,7 +608,7 @@ async fn stop_live_session(
     }
     handle
         .dispatch(command(
-            6,
+            9,
             ControlCommand::Stop { instance_id, force },
         ))
         .map_err(|error| format!("dispatch live PTY stop: {error}"))?;
@@ -617,6 +695,7 @@ async fn run_pty_canary(agent_id: &str, instance_id: u64) {
     assert_eq!(runtime.active_native_sessions(), 0);
     assert!(success.first_frame_sequence > 0);
     assert!(success.second_frame_sequence > success.first_frame_sequence);
+    assert!(success.recovery_frame_sequence > success.second_frame_sequence);
     assert!(events
         .windows(2)
         .all(|pair| pair[0].sequence < pair[1].sequence));
@@ -629,9 +708,10 @@ async fn run_pty_canary(agent_id: &str, instance_id: u64) {
         ControlEventKind::InputFailed { .. }
     )));
     println!(
-        "vendor_pty_canary agent={agent_id} initial_prompt_response=true followup_response=true first_frame_sequence={} second_frame_sequence={} complex_multiline_prompt=true resize=true interrupt_written=true active_sessions=0",
+        "vendor_pty_canary agent={agent_id} initial_prompt_response=true followup_response=true recovery_response=true first_frame_sequence={} second_frame_sequence={} recovery_frame_sequence={} complex_multiline_prompt=true resize=true interrupt_in_flight=true active_sessions=0",
         success.first_frame_sequence,
         success.second_frame_sequence,
+        success.recovery_frame_sequence,
     );
 }
 
@@ -749,6 +829,211 @@ async fn windows_live_codex_pty_contract() {
 #[ignore = "requires GATE4AGENT_VENDOR_PTY_CANARY=1 and an installed authenticated Kimi Code CLI"]
 async fn windows_live_kimi_pty_contract() {
     run_pty_canary("kimi", 10_003).await;
+}
+
+#[tokio::test]
+#[ignore = "requires GATE4AGENT_VENDOR_PTY_CANARY=1 and authenticated Codex and Kimi Code CLIs"]
+async fn windows_live_parallel_codex_kimi_pty_process_isolation() {
+    assert_eq!(
+        std::env::var(LIVE_CANARY_ENV).as_deref(),
+        Ok("1"),
+        "set {LIVE_CANARY_ENV}=1 to opt into authenticated vendor PTY execution"
+    );
+    let working_directory = std::env::current_dir().expect("parallel PTY canary current directory");
+    let (handle, mut runtime) = runtime_for_agents(&["codex", "kimi"]);
+    let subscription = handle.subscribe(1_024);
+    let codex_id = AgentInstanceId(20_001);
+    let kimi_id = AgentInstanceId(20_002);
+    let codex_turn = turn_challenge("codex", "parallel", false);
+    let kimi_turn = turn_challenge("kimi", "parallel", false);
+
+    for (command_id, instance_id, agent_id) in [
+        (1, codex_id, "codex"),
+        (2, kimi_id, "kimi"),
+    ] {
+        handle
+            .dispatch(command(
+                command_id,
+                ControlCommand::Register {
+                    instance_id,
+                    agent_id: AgentId::new(agent_id).expect("valid parallel agent ID"),
+                    transport: TransportKind::Pty,
+                },
+            ))
+            .expect("register parallel PTY session");
+    }
+    for (command_id, instance_id, prompt) in [
+        (3, codex_id, codex_turn.prompt.clone()),
+        (4, kimi_id, kimi_turn.prompt.clone()),
+    ] {
+        handle
+            .dispatch(command(
+                command_id,
+                ControlCommand::Start {
+                    instance_id,
+                    request: StartRequest {
+                        working_directory: working_directory.to_string_lossy().into_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 32,
+                            columns: 132,
+                        },
+                        initial_prompt: Some(prompt),
+                        session_options: None,
+                    },
+                },
+            ))
+            .expect("start parallel PTY session");
+    }
+
+    let mut events = Vec::new();
+    tokio::time::timeout(TURN_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            drain_events(&subscription, &mut events);
+            let snapshot = handle.snapshot();
+            let codex = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.instance_id == codex_id)
+                .expect("parallel Codex snapshot");
+            let kimi = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.instance_id == kimi_id)
+                .expect("parallel Kimi snapshot");
+            let codex_ready = codex
+                .terminal_frame
+                .as_ref()
+                .is_some_and(|frame| frame.contents.contains(&codex_turn.marker));
+            let kimi_ready = kimi
+                .terminal_frame
+                .as_ref()
+                .is_some_and(|frame| frame.contents.contains(&kimi_turn.marker));
+            if codex_ready && kimi_ready {
+                assert!(!codex
+                    .terminal_frame
+                    .as_ref()
+                    .unwrap()
+                    .contents
+                    .contains(&kimi_turn.marker));
+                assert!(!kimi
+                    .terminal_frame
+                    .as_ref()
+                    .unwrap()
+                    .contents
+                    .contains(&codex_turn.marker));
+                break;
+            }
+            assert!(!matches!(
+                codex.status,
+                SessionStatus::Failed { .. } | SessionStatus::Exited { .. }
+            ));
+            assert!(!matches!(
+                kimi.status,
+                SessionStatus::Failed { .. } | SessionStatus::Exited { .. }
+            ));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("parallel PTY initial turns timed out");
+    assert_eq!(runtime.active_native_sessions(), 2);
+
+    handle
+        .dispatch(command(
+            5,
+            ControlCommand::Stop {
+                instance_id: codex_id,
+                force: false,
+            },
+        ))
+        .expect("stop only parallel Codex session");
+    tokio::time::timeout(STOP_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            drain_events(&subscription, &mut events);
+            let snapshot = handle.snapshot();
+            let codex = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.instance_id == codex_id)
+                .expect("stopped Codex snapshot");
+            let kimi = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.instance_id == kimi_id)
+                .expect("surviving Kimi snapshot");
+            if matches!(codex.status, SessionStatus::Exited { .. }) {
+                assert!(matches!(kimi.status, SessionStatus::Running));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stopping Codex affected parallel session lifecycle");
+    assert_eq!(runtime.active_native_sessions(), 1);
+
+    let recovery = turn_challenge("kimi", "survivor", false);
+    let recovery_boundary = events.len();
+    submit_prompt(&handle, kimi_id, 6, recovery.prompt).expect("submit surviving Kimi prompt");
+    tokio::time::timeout(TURN_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            drain_events(&subscription, &mut events);
+            if let Some(message) = events[recovery_boundary..].iter().find_map(|event| {
+                match &event.event {
+                    ControlEventKind::InputFailed { message, .. }
+                        if event.instance_id == kimi_id => Some(message.as_str()),
+                    _ => None,
+                }
+            }) {
+                panic!("surviving Kimi input failed: {message}");
+            }
+            let snapshot = handle.snapshot();
+            let kimi = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.instance_id == kimi_id)
+                .expect("surviving Kimi snapshot");
+            if kimi
+                .terminal_frame
+                .as_ref()
+                .is_some_and(|frame| frame.contents.contains(&recovery.marker))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("surviving Kimi did not answer after Codex stopped");
+
+    handle
+        .dispatch(command(
+            7,
+            ControlCommand::Stop {
+                instance_id: kimi_id,
+                force: false,
+            },
+        ))
+        .expect("stop surviving Kimi session");
+    tokio::time::timeout(STOP_TIMEOUT, async {
+        loop {
+            runtime.tick().await;
+            drain_events(&subscription, &mut events);
+            if runtime.active_native_sessions() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("parallel PTY cleanup timed out");
+
+    println!(
+        "vendor_pty_parallel agents=codex,kimi concurrent_active=2 stop_one_survivor_running=true survivor_followup=true cross_session_marker_leak=false active_sessions=0"
+    );
 }
 
 #[tokio::test]

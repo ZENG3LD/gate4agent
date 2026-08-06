@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 25;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 26;
 pub const CONTROL_SESSIONS_MAX: usize = 512;
 pub const CONTROL_INSTANCE_IDENTITIES_CAPACITY: u32 = 4_096;
 pub const CONTROL_INSTANCE_IDENTITIES_MAX: usize = CONTROL_INSTANCE_IDENTITIES_CAPACITY as usize;
@@ -287,6 +287,7 @@ pub enum ControlEffect {
     },
     SpawnResume {
         agent_id: AgentId,
+        transport: TransportKind,
         provider_session: ProviderSessionIdentity,
         request: ResumeLaunchRequest,
     },

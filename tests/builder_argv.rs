@@ -33,7 +33,7 @@ fn opts(prompt: &str) -> SpawnOptions {
 // Claude Code
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Default argv: `-p --output-format stream-json --verbose --dangerously-skip-permissions`
+/// Default argv: `-p --output-format stream-json --verbose --permission-mode plan`
 /// Prompt must NOT appear in argv — it is delivered via stdin.
 #[test]
 fn claude_default_argv() {
@@ -48,7 +48,8 @@ fn claude_default_argv() {
             "--output-format",
             "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "plan",
         ],
         "Claude default: prompt must NOT appear in argv (delivered via stdin)"
     );
@@ -215,7 +216,7 @@ fn claude_with_max_turns() {
 // Codex
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fresh session: `exec --json --full-auto <prompt>`
+/// Fresh session: `exec --json --skip-git-repo-check -s read-only <prompt>`
 #[test]
 fn codex_default_argv() {
     let builder = cli_builder(CliTool::Codex);
@@ -225,11 +226,14 @@ fn codex_default_argv() {
     let got = args(&cmd);
     assert_eq!(got.first().copied(), Some("exec"), "must start with 'exec' subcommand");
     assert!(got.contains(&"--json"), "--json must be present");
-    assert!(got.contains(&"--full-auto"), "--full-auto must be present");
+    assert!(
+        got.windows(2).any(|w| w == ["-s", "read-only"]),
+        "read-only sandbox must be present"
+    );
     assert_eq!(got.last().copied(), Some("write rust"), "prompt must be last");
 }
 
-/// `--model <m>` inserted between `--full-auto` and the prompt.
+/// `--model <m>` is inserted before the prompt.
 #[test]
 fn codex_with_model() {
     let builder = cli_builder(CliTool::Codex);
@@ -247,7 +251,7 @@ fn codex_with_model() {
     assert_eq!(got.last().copied(), Some("write rust"), "prompt must be last");
 }
 
-/// Resume by ID: `exec resume <id> --json --full-auto <prompt>`
+/// Resume by ID uses the current `exec resume` configuration override shape.
 #[test]
 fn codex_with_resume_id() {
     let builder = cli_builder(CliTool::Codex);
@@ -259,13 +263,17 @@ fn codex_with_resume_id() {
 
     assert_eq!(program(&cmd), "codex");
     let got = args(&cmd);
-    assert_eq!(&got[..3], &["exec", "resume", "rollout-abc"]);
+    assert_eq!(&got[..2], &["exec", "resume"]);
     assert!(got.contains(&"--json"));
-    assert!(got.contains(&"--full-auto"));
+    assert!(
+        got.windows(2)
+            .any(|w| w == ["-c", "sandbox_mode=\"read-only\""])
+    );
+    assert_eq!(got.get(got.len() - 2).copied(), Some("rollout-abc"));
     assert_eq!(got.last().copied(), Some("continue"));
 }
 
-/// Continue last: `exec resume --last --json --full-auto <prompt>`
+/// Continue last places `--last` immediately before the prompt.
 #[test]
 fn codex_with_continue_last() {
     let builder = cli_builder(CliTool::Codex);
@@ -277,9 +285,13 @@ fn codex_with_continue_last() {
 
     assert_eq!(program(&cmd), "codex");
     let got = args(&cmd);
-    assert_eq!(&got[..3], &["exec", "resume", "--last"]);
+    assert_eq!(&got[..2], &["exec", "resume"]);
     assert!(got.contains(&"--json"));
-    assert!(got.contains(&"--full-auto"));
+    assert!(
+        got.windows(2)
+            .any(|w| w == ["-c", "sandbox_mode=\"read-only\""])
+    );
+    assert_eq!(got.get(got.len() - 2).copied(), Some("--last"));
     assert_eq!(got.last().copied(), Some("continue"), "prompt must be last");
 }
 

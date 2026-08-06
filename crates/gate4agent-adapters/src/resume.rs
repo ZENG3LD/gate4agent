@@ -11,12 +11,10 @@ pub struct ResumePlan {
     pub args: Vec<String>,
 }
 
-/// Builds argv only for live control-plane resume contracts grounded in Orca's
-/// pinned `agent-session-resume.ts` implementation.
+/// Builds argv only for live control-plane resume contracts grounded in pinned
+/// reference implementations or verified vendor CLI contracts.
 ///
-/// `None` is a supported negative capability. In particular, Kimi history is
-/// parseable but its separate AI Vault `--session` flow is not promoted into
-/// the live hook/control-plane contract by this function.
+/// `None` is a supported negative capability.
 pub fn build_resume_plan(
     adapter_id: &AdapterId,
     session_id: &str,
@@ -50,6 +48,12 @@ pub fn build_resume_plan_for_identity(
         "codex" => Some((
             "codex",
             &["resume"][..],
+            ProviderSessionKey::SessionId,
+            false,
+        )),
+        "kimi" => Some((
+            "kimi",
+            &["-r"][..],
             ProviderSessionKey::SessionId,
             false,
         )),
@@ -101,7 +105,7 @@ pub fn build_resume_plan_for_identity(
             ProviderSessionKey::SessionId,
             false,
         )),
-        "kimi" | "copilot" | "cursor" | "qwen-code" | "omp" | "amp" | "command-code" | "hermes" => {
+        "copilot" | "cursor" | "qwen-code" | "omp" | "amp" | "command-code" | "hermes" => {
             None
         }
         id => return Err(ResumeAdapterError::UnsupportedAdapter(id.to_owned())),
@@ -190,6 +194,7 @@ mod tests {
         let cases = [
             ("claude-code", "claude", vec!["--resume", "s1"]),
             ("codex", "codex", vec!["resume", "s1"]),
+            ("kimi", "kimi", vec!["-r", "s1"]),
             ("gemini", "gemini", vec!["--resume", "s1"]),
             ("antigravity", "agy", vec!["--conversation", "s1"]),
             ("opencode", "opencode", vec!["--session", "s1"]),
@@ -262,8 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn kimi_live_resume_remains_a_negative_capability() {
-        assert_eq!(build_resume_plan(&id("kimi"), "session_1").unwrap(), None);
+    fn kimi_live_resume_uses_the_verified_short_flag() {
+        let plan = build_resume_plan(&id("kimi"), "session_1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.program, "kimi");
+        assert_eq!(plan.args, ["-r", "session_1"]);
     }
 
     #[test]

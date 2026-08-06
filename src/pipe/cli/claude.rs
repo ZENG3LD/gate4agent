@@ -44,12 +44,21 @@ impl NdjsonParser for ClaudeNdjsonParser {
         let mut events = Vec::new();
 
         match v.get("type").and_then(|t| t.as_str()) {
-            Some("system") => {
+            Some("system")
+                if v.get("subtype").and_then(|value| value.as_str()) == Some("init")
+                    || (v.get("subtype").is_none()
+                        && v.get("model").is_some()
+                        && v.get("tools").is_some()) =>
+            {
                 let sid = v
                     .get("session_id")
                     .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .unwrap_or("");
+                if sid.is_empty() {
+                    return vec![CliEvent::Error {
+                        message: "Claude init event omitted session_id".to_owned(),
+                    }];
+                }
                 let model = v
                     .get("model")
                     .and_then(|s| s.as_str())
@@ -64,9 +73,9 @@ impl NdjsonParser for ClaudeNdjsonParser {
                             .collect()
                     })
                     .unwrap_or_default();
-                self.session_id = Some(sid.clone());
+                self.session_id = Some(sid.to_owned());
                 events.push(CliEvent::SessionStart {
-                    session_id: sid,
+                    session_id: sid.to_owned(),
                     model,
                     tools,
                 });
@@ -223,13 +232,12 @@ impl NdjsonParser for ClaudeNdjsonParser {
 /// Pipe-mode spawn builder for Claude Code.
 ///
 /// Argv produced (default, no permission_mode):
-///   `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
+///   `claude -p --output-format stream-json --verbose --permission-mode plan`
 ///   `[--append-system-prompt "<text>"] [--resume <id> | --continue] [--model <m>]`
 ///   `[--allowedTools <tools>] [--permission-mode <mode>] [--mcp-config <path>]`
 ///   `[--max-turns <N>] [<extra>...]`
 ///
-/// When `permission_mode` is set, `--dangerously-skip-permissions` is omitted and
-/// `--permission-mode <value>` is added instead.
+/// An explicit `permission_mode` replaces the safe `plan` default.
 ///
 /// The initial prompt is **not** included in argv — it is written to stdin by
 /// the caller (`pipe/process.rs`) after spawn.
@@ -242,12 +250,6 @@ impl super::traits::CliCommandBuilder for ClaudePipeBuilder {
         cmd.arg("--output-format");
         cmd.arg("stream-json");
         cmd.arg("--verbose");
-
-        // --dangerously-skip-permissions is the default, but omitted when the
-        // caller explicitly sets permission_mode (they conflict).
-        if opts.permission_mode.is_none() {
-            cmd.arg("--dangerously-skip-permissions");
-        }
 
         if let Some(ref system_prompt) = opts.append_system_prompt {
             cmd.arg("--append-system-prompt");
@@ -271,10 +273,8 @@ impl super::traits::CliCommandBuilder for ClaudePipeBuilder {
             cmd.arg(opts.allowed_tools.join(","));
         }
 
-        if let Some(ref mode) = opts.permission_mode {
-            cmd.arg("--permission-mode");
-            cmd.arg(mode);
-        }
+        cmd.arg("--permission-mode");
+        cmd.arg(opts.permission_mode.as_deref().unwrap_or("plan"));
 
         if let Some(ref mcp_config) = opts.mcp_config {
             cmd.arg("--mcp-config");
@@ -312,6 +312,21 @@ mod tests {
             }
             _ => panic!("expected SessionStart"),
         }
+    }
+
+    #[test]
+    fn claude_ignores_hook_lifecycle_system_events_before_init() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let hook = r#"{"type":"system","subtype":"hook_started","session_id":"abc123","hook_name":"SessionStart:startup"}"#;
+        assert!(parser.parse_line(hook).is_empty());
+        assert!(parser.session_id().is_none());
+
+        let init = r#"{"type":"system","subtype":"init","session_id":"abc123","model":"claude-opus-5","tools":[]}"#;
+        assert!(matches!(
+            parser.parse_line(init).as_slice(),
+            [CliEvent::SessionStart { session_id, .. }] if session_id == "abc123"
+        ));
+        assert_eq!(parser.session_id(), Some("abc123"));
     }
 
     #[test]

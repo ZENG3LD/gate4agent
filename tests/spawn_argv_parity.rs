@@ -45,7 +45,8 @@ fn claude_fresh_session_argv() {
             "--output-format",
             "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "plan",
         ],
         "Claude fresh session: prompt must NOT appear in argv (delivered via stdin)"
     );
@@ -70,9 +71,10 @@ fn claude_with_resume_argv() {
             "--output-format",
             "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
             "--resume",
             "ses_abc123",
+            "--permission-mode",
+            "plan",
         ]
     );
 }
@@ -98,11 +100,12 @@ fn claude_with_model_and_append_system_prompt_argv() {
             "--output-format",
             "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
             "--append-system-prompt",
             "Be concise.",
             "--model",
             "claude-opus-4",
+            "--permission-mode",
+            "plan",
         ]
     );
 }
@@ -282,16 +285,15 @@ fn claude_max_turns_argv() {
 }
 
 #[test]
-fn claude_no_permission_mode_keeps_dangerously_skip() {
-    // Default behavior: no permission_mode set → --dangerously-skip-permissions stays.
+fn claude_no_permission_mode_defaults_to_plan() {
     let builder = cli_builder(CliTool::ClaudeCode);
     let opts = make_opts("hello");
     let cmd = builder.build_command(&opts);
 
     let got = get_args(&cmd);
     assert!(
-        got.contains(&"--dangerously-skip-permissions"),
-        "--dangerously-skip-permissions must appear when permission_mode is None"
+        got.windows(2).any(|w| w == ["--permission-mode", "plan"]),
+        "Claude must default to plan permission mode"
     );
 }
 
@@ -312,11 +314,12 @@ fn codex_fresh_session_argv() {
         &[
             "exec",
             "--json",
-            "--full-auto",
             "--skip-git-repo-check",
+            "-s",
+            "read-only",
             "write a hello world in rust",
         ],
-        "Codex fresh: exec subcommand, --json, --full-auto, then prompt as final arg"
+        "Codex fresh: current JSON and read-only sandbox contract"
     );
 }
 
@@ -332,19 +335,20 @@ fn codex_with_resume_argv() {
 
     assert_eq!(get_program(&cmd), "codex");
     let got = get_args(&cmd);
-    // Resumed shape: codex exec resume <id> --json --full-auto <prompt>
+    // Resumed shape: current flags, read-only config, ID, then prompt.
     assert_eq!(
         got,
         &[
             "exec",
             "resume",
-            "rollout-20260409-abc",
             "--json",
-            "--full-auto",
             "--skip-git-repo-check",
+            "-c",
+            "sandbox_mode=\"read-only\"",
+            "rollout-20260409-abc",
             "continue",
         ],
-        "Codex resume: exec resume <id> sub-sub-command, then flags, then prompt"
+        "Codex resume: current config override shape"
     );
 }
 
@@ -374,14 +378,19 @@ fn codex_continue_last_argv() {
 
     assert_eq!(get_program(&cmd), "codex");
     let got = get_args(&cmd);
-    // Shape: codex exec resume --last --json --full-auto <prompt>
+    // Shape: current flags and sandbox config, then --last and prompt.
     assert_eq!(
-        &got[..3],
-        &["exec", "resume", "--last"],
-        "Codex continue_last must produce: exec resume --last ..."
+        &got[..2],
+        &["exec", "resume"],
+        "Codex continue_last must use exec resume"
     );
     assert!(got.contains(&"--json"), "--json must appear in Codex continue_last argv");
-    assert!(got.contains(&"--full-auto"), "--full-auto must appear in Codex continue_last argv");
+    assert!(
+        got.windows(2)
+            .any(|w| w == ["-c", "sandbox_mode=\"read-only\""]),
+        "read-only sandbox config must appear in Codex continue_last argv"
+    );
+    assert_eq!(got.get(got.len() - 2).copied(), Some("--last"));
     assert_eq!(
         got.last().copied(),
         Some("continue"),

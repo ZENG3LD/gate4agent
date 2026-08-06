@@ -197,7 +197,7 @@ fn validate_adapter_bindings(
         .pipe
         .as_ref()
         .map(|transport| match transport.protocol {
-            PipeProtocol::SemanticNdjson => AdapterFamily::Pipe,
+            PipeProtocol::SemanticNdjson | PipeProtocol::StructuredJsonl => AdapterFamily::Pipe,
             PipeProtocol::OneShotText => AdapterFamily::OneShot,
         });
     for (family, binding) in [

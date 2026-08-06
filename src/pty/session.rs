@@ -152,7 +152,7 @@ impl PtySession {
             process_spec,
             Some(tool),
             match tool {
-                CliTool::OpenCode => None,
+                CliTool::OpenCode | CliTool::KimiCode => None,
                 CliTool::ClaudeCode | CliTool::Codex | CliTool::Gemini => {
                     Some(AgentCommandMode::SlashLine)
                 }
@@ -711,6 +711,19 @@ impl PtySession {
     /// Cursor for replay from the beginning of this generation.
     pub fn beginning_cursor(&self) -> PtyReplayCursor {
         PtyReplayCursor::beginning(self.provider_revision(), self.generation())
+    }
+
+    /// Cursor for the earliest event still retained by the bounded journal.
+    /// Long-lived readiness probes use this to build fresh positive evidence
+    /// from the available tail without treating normal eviction as corruption.
+    pub fn retained_cursor(&self) -> Result<PtyReplayCursor, PtyAttachError> {
+        self.events.retained_cursor()
+    }
+
+    /// Atomically replay the currently retained journal tail and subscribe
+    /// after its exact boundary.
+    pub fn attach_retained_events(&self) -> Result<PtyAttachment, PtyAttachError> {
+        self.events.attach_retained()
     }
 
     /// Stable agent identity associated with the session.

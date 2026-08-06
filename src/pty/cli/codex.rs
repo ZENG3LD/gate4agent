@@ -1357,17 +1357,15 @@ Context window: 100% left (7.49K used / 272K)"#;
 /// Implements `CliCommandBuilder` for use in `pipe/process.rs` dispatch.
 ///
 /// Argv produced (fresh session):
-///   `codex exec --json --full-auto --skip-git-repo-check <prompt>`
+///   `codex exec --json --skip-git-repo-check -s read-only <prompt>`
 ///
 /// Argv produced (resumed session):
-///   `codex exec resume <session_id> --json --full-auto --skip-git-repo-check <prompt>`
+///   `codex exec resume --json --skip-git-repo-check -c sandbox_mode=\"read-only\"`
+///   `<session_id> <prompt>`
 ///
 /// Note the `exec resume <id>` sub-sub-command shape — this is why per-CLI
 /// function builders are used instead of a declarative `ResumeMode` enum.
 ///
-/// `--full-auto`: non-interactive execution mode; without this, Codex blocks
-///   on interactive tool approval prompts when piped, causing the reader loop
-///   to hang forever.
 /// `--skip-git-repo-check`: allows spawning Codex in non-git directories
 ///   (chart app sessions, daemon contexts).
 pub struct CodexPipeBuilder;
@@ -1376,38 +1374,96 @@ impl CliCommandBuilder for CodexPipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut cmd = std::process::Command::new("codex");
 
-        if let Some(ref session_id) = opts.resume_session_id {
-            // Resume shape: `codex exec resume <id> --json --full-auto ...`
-            cmd.arg("exec");
+        let resumed = opts.resume_session_id.is_some() || opts.continue_last;
+        cmd.arg("exec");
+        if resumed {
             cmd.arg("resume");
-            cmd.arg(session_id);
-        } else {
-            // Fresh shape: `codex exec --json --full-auto ...`
-            cmd.arg("exec");
         }
 
         cmd.arg("--json");
-        // Codex approval mode is a positional flag, not --permission-mode.
-        // Map SpawnOptions::permission_mode to the correct Codex CLI flag.
-        match opts.permission_mode.as_deref() {
-            Some("suggest") => {
-                cmd.arg("--suggest");
-            }
-            Some("auto-edit") => {
-                cmd.arg("--auto-edit");
-            }
-            _ => {
-                cmd.arg("--full-auto");
-            }
-        }
         cmd.arg("--skip-git-repo-check");
+        let sandbox = match opts.permission_mode.as_deref() {
+            Some("workspace-write" | "auto-edit") => "workspace-write",
+            Some("danger-full-access" | "full-auto") => "danger-full-access",
+            _ => "read-only",
+        };
+        if resumed {
+            cmd.arg("-c");
+            cmd.arg(format!("sandbox_mode=\"{sandbox}\""));
+        } else {
+            cmd.arg("-s");
+            cmd.arg(sandbox);
+        }
+
+        if let Some(ref model) = opts.model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
 
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }
 
+        if let Some(ref session_id) = opts.resume_session_id {
+            cmd.arg(session_id);
+        } else if opts.continue_last {
+            cmd.arg("--last");
+        }
+
         // Prompt is the final positional argument.
         cmd.arg(&opts.prompt);
         cmd
+    }
+}
+
+#[cfg(test)]
+mod pipe_builder_tests {
+    use super::*;
+
+    fn args(options: &SpawnOptions) -> Vec<String> {
+        CodexPipeBuilder
+            .build_command(options)
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn legacy_pty_module_codex_builder_defaults_to_read_only() {
+        assert_eq!(
+            args(&SpawnOptions {
+                prompt: "fresh".to_owned(),
+                ..SpawnOptions::default()
+            }),
+            [
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-s",
+                "read-only",
+                "fresh",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_pty_module_codex_builder_uses_current_resume_shape() {
+        assert_eq!(
+            args(&SpawnOptions {
+                prompt: "follow up".to_owned(),
+                resume_session_id: Some("thread-1".to_owned()),
+                ..SpawnOptions::default()
+            }),
+            [
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "-c",
+                "sandbox_mode=\"read-only\"",
+                "thread-1",
+                "follow up",
+            ]
+        );
     }
 }

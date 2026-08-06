@@ -152,6 +152,7 @@ impl PtyColdRestoreCheckpoint {
             sequence: tail.last().expect("non-empty tail").sequence,
             size: PtySize { rows, cols },
             cursor: screen.cursor_position(),
+            bracketed_paste: screen.bracketed_paste(),
             contents: screen.contents(),
             formatted: screen.contents_formatted(),
         })
@@ -277,6 +278,7 @@ mod tests {
             sequence: 7,
             size: PtySize { rows: 4, cols: 40 },
             cursor: (0, 4),
+            bracketed_paste: false,
             contents: "base".to_owned(),
             formatted: b"base".to_vec(),
         })

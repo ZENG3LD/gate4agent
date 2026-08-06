@@ -1167,7 +1167,7 @@ impl ClaudeCommandBuilder {
 /// Implements `CliCommandBuilder` for use in `pipe/process.rs` dispatch.
 ///
 /// Argv produced (all platforms):
-///   `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
+///   `claude -p --output-format stream-json --verbose --permission-mode plan`
 ///   `[--append-system-prompt "<text>"] [--resume <id>] [--model <m>] [<extra>...]`
 ///
 /// The initial prompt is **not** included in argv — it is written to stdin by
@@ -1182,12 +1182,6 @@ impl CliCommandBuilder for ClaudePipeBuilder {
         cmd.arg("stream-json");
         cmd.arg("--verbose");
 
-        // --dangerously-skip-permissions is the default, but omitted when the
-        // caller explicitly sets permission_mode (they conflict).
-        if opts.permission_mode.is_none() {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-
         if let Some(ref system_prompt) = opts.append_system_prompt {
             cmd.arg("--append-system-prompt");
             cmd.arg(system_prompt);
@@ -1200,10 +1194,8 @@ impl CliCommandBuilder for ClaudePipeBuilder {
             cmd.arg("--model");
             cmd.arg(model);
         }
-        if let Some(ref mode) = opts.permission_mode {
-            cmd.arg("--permission-mode");
-            cmd.arg(mode);
-        }
+        cmd.arg("--permission-mode");
+        cmd.arg(opts.permission_mode.as_deref().unwrap_or("plan"));
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }
@@ -1448,25 +1440,17 @@ mod tests {
     }
 
     #[test]
-    fn claude_pty_builder_no_permission_mode_uses_dangerous_skip() {
+    fn claude_pty_builder_no_permission_mode_uses_plan() {
         let args = pipe_args(None);
         assert!(
-            args.contains(&"--dangerously-skip-permissions".to_string()),
-            "--dangerously-skip-permissions must be present when permission_mode is None, args: {args:?}"
-        );
-        assert!(
-            !args.contains(&"--permission-mode".to_string()),
-            "--permission-mode must be absent when permission_mode is None, args: {args:?}"
+            args.windows(2).any(|pair| pair == ["--permission-mode", "plan"]),
+            "plan permission mode must be the default, args: {args:?}"
         );
     }
 
     #[test]
-    fn claude_pty_builder_permission_mode_overrides_dangerous_skip() {
+    fn claude_pty_builder_permission_mode_overrides_plan() {
         let args = pipe_args(Some("acceptEdits"));
-        assert!(
-            !args.contains(&"--dangerously-skip-permissions".to_string()),
-            "--dangerously-skip-permissions must be absent when permission_mode is set, args: {args:?}"
-        );
         let idx = args.iter().position(|a| a == "--permission-mode");
         assert!(idx.is_some(), "--permission-mode must be present, args: {args:?}");
         assert_eq!(

@@ -1,6 +1,7 @@
 # gate4agent
 
-Universal Rust transport library for CLI AI agents. Spawn, stream, resume — for four different CLI agents through one unified API.
+Slim Rust transport library for Claude Code, Codex CLI, and Kimi Code. Spawn,
+stream, resume, and own interactive terminal processes through one API.
 
 **Not a harness. Not a sandbox.** The root crate remains the transport layer
 between a Rust application and CLI-agent subprocesses: spawn, write typed
@@ -12,17 +13,18 @@ deterministic owner for session lifecycle and host-capability authority.
 
 | Tool | Transport | Pipe mode | ACP | Resume | Notes |
 |---|---|---|---|---|---|
-| **Claude Code** | Pipe + PTY + ACP | ✓ stream-json | ✓ via `claude-agent-acp` | ✓ `--resume <id>` | Prompt via stdin |
-| **Codex** | Pipe + PTY + ACP | ✓ `--json` | ✓ via `codex-acp` | ✓ `exec resume <id>` | Uses `--full-auto` for non-interactive |
-| **Gemini** | Pipe + PTY + ACP | ✓ stream-json | ✓ native `--experimental-acp` | ✓ `--resume <id>` | Prompt via `-p` flag |
-| **OpenCode** (`sst/opencode`) | Pipe + ACP | ✓ `--format json` | ✓ native `opencode acp` | ✓ `--session ses_XXX` | 5-event NDJSON schema |
+| **Claude Code** | Structured inline; PTY contract present | current `stream-json` | not in default catalog | current `--resume <id>` | Inline fresh/resume verified on 2.1.222; native Windows PTY currently fails closed with zero output |
+| **Codex CLI** | Structured inline + PTY | current `exec --json` | not in default catalog | current `exec resume` | Inline and Windows PTY verified on 0.144.6; inline defaults to read-only |
+| **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | current `-r <id>` | Inline and Windows terminal fidelity verified on 0.31.1; PTY semantic events are not claimed |
 
-### Grounding registry (preview)
+### Transitional reference registry
 
-The transport table above remains the deep, structured-support matrix. The
-separate `agent` module now provides 33 extensible CLI identity and interactive
-launch specifications, including first-class Grok, Kimi, Qwen Code, Copilot,
-Cursor, Kiro, Goose, Aider, and Mistral Vibe entries.
+The table above is the active product-support matrix. The separate `agent`
+module still contains the 33-entry Orca-derived reference inventory from the
+earlier grounding cycle. Those dormant entries are transitional code debt, not
+support claims. Qwen Code is deferred until vendor-owned subscription access is
+available; Gemini, OpenCode, and the other reference entries are outside the
+current product target.
 
 The launch entries are marked `SpecVerification::Reference`: their interactive
 launch shape is pinned to a reviewed source snapshot but still requires
@@ -89,8 +91,9 @@ Consuming `shutdown()` joins both the ordered Tokio consumer and the OS reader
 thread within a bounded deadline and returns an explicit root-only degradation
 report when process inspection was unavailable.
 Generic registry sessions remain raw-only; semantic adapters are not selected
-from an `AgentId` supplied by a custom specification. The legacy four-tool
-constructor retains its existing parser behavior.
+from an `AgentId` supplied by a custom specification. The legacy `CliTool`
+constructor remains a compatibility surface and is not the active product
+support matrix.
 
 `PtyColdRestoreCheckpoint` is a bounded, serde-compatible terminal checkpoint.
 It reconstructs a checkpoint plus a contiguous event tail and rejects gaps,
@@ -101,10 +104,15 @@ shell or daemon.
 The PTY transport never auto-accepts workspace trust/safety prompts or update
 menus. Those remain visible for operator input.
 
-Transport classes:
-- **Pipe**: spawn the CLI directly, read NDJSON over stdout
-- **PTY**: spawn inside a pseudo-terminal, scrape the screen with vt100 (for agents without structured output)
-- **ACP** (Agent Client Protocol): spawn the CLI in ACP mode and communicate via bidirectional JSON-RPC 2.0 over stdio. Multi-turn sessions and structured events remain available; host filesystem, terminal, permission, and MCP authority is fail-closed until it is routed through the canonical control plane.
+Active transport classes:
+
+- **Structured inline**: spawn one owned vendor child, read JSONL, then create a
+  new child with the provider session ID to resume;
+- **PTY**: own the interactive terminal process, ordered bytes, VT state,
+  bounded replay, input, resize, interrupt, and teardown.
+
+ACP and daemon modules remain compatibility code but are not enabled by the
+default Claude/Codex/Kimi catalog or part of the current product target.
 
 ## Quick start
 
@@ -142,7 +150,9 @@ let opts = SpawnOptions {
 };
 ```
 
-Each CLI handles resume in its own way — Codex swaps `exec` → `exec resume <id>`, Claude uses `--resume <id>`, OpenCode uses `--session <ses_XXX>`. gate4agent hides the difference behind `SpawnOptions::resume_session_id`.
+Each active CLI handles resume in its own way: Codex uses the current
+`exec resume` shape, Claude uses `--resume <id>`, and Kimi uses `-r <id>`.
+Gate4Agent hides that difference behind `SpawnOptions::resume_session_id`.
 
 ### Using PipeSession directly (backwards-compatible API)
 
@@ -162,7 +172,7 @@ let opts = PipeProcessOptions {
 let session = PipeSession::spawn(config, "hello", opts).await?;
 ```
 
-### ACP Transport (Agent Client Protocol)
+### Legacy ACP compatibility surface
 
 ```rust
 use gate4agent::acp::{AcpSession, AcpSessionOptions};
@@ -197,7 +207,7 @@ ACP provides multi-turn sessions — call `prompt()` repeatedly without respawni
 
 ### Backend control plane (workspace crates)
 
-Control protocol v25 is reduced by a single-writer kernel. It combines session
+Control protocol v26 is reduced by a single-writer kernel. It combines session
 lifecycle with a separate, bounded capability engine for exact request,
 approval, cancellation, and completion correlation. Consumer handles inject
 their private consumer/actor identity, expose scoped snapshots, and disconnect
@@ -234,30 +244,28 @@ No browser or remote delivery layer is included yet. A future browser shell
 will talk to a user-approved local backend; gate4agent will not collect vendor
 API keys or proxy CLI authentication through a hosted middleware service.
 
-### Daemon Transport (skeleton)
+### Legacy daemon skeleton
 
 `DaemonSession` connects to long-running HTTP/WebSocket agent daemons (OpenCode `serve`, OpenClaw). Not yet functional — API surface documented for future implementation.
 
-## Features
+## Active backend features
 
-- **Single API for 4 CLIs** — `TransportSession::spawn(tool, cwd, prompt, options)` (Pipe) or `AcpSession::spawn(tool, cwd, options)` (ACP)
-- **Backwards-compatible `PipeSession`** — 0.1.x consumers that used `PipeSession::spawn(config, prompt, options)` compile unchanged
-- **SessionEnd synthesis** — Codex has no terminal event; gate4agent synthesizes `SessionEnd { result: "exit_code=N", is_error: N != 0 }` on child exit
-- **Transport-neutral events** — `AgentEvent::{Text, ToolStart, ToolResult, Thinking, TurnComplete, SessionStart, SessionEnd}`
-- **Cross-platform** — Windows (ConPTY + `cmd /C` argv wrapping) and Unix (POSIX PTY + bare exec)
-- **Rate-limit detection** — pattern-based session/daily/weekly limit detection per CLI
-- **ACP (Agent Client Protocol)** — bidirectional JSON-RPC 2.0 over stdio and multi-turn sessions, with agent-to-host and MCP authority fail-closed
-- **Deterministic backend kernel** — one ordered tick for control commands, provider observations, capability requests, effects, completions, and an atomic combined snapshot
-- **Scoped capability authority** — bounded grants and approvals, lifecycle fencing, exact request correlation, and isolated consumer projections; execution providers remain host-owned
-- **4 CLI agents** — Claude Code, Codex, Gemini, OpenCode
-- **Extensible grounding registry** — 33 portable agent IDs and shell-free interactive launch plans; deep transport support remains capability-specific
-- **Typed terminal input** — bounded prompt/draft framing with UTF-8-safe chunks and explicit command/control variants
-- **Reviewable draft launch** — native prefill where declared, readiness-gated fallback elsewhere, and conservative Windows inline limits
-- **Target-bound agent commands** — explicit slash-line capability, sanitized inline arguments, and delayed separate submit
-- **Observable PTY lifecycle** — generation/sequence envelopes, explicit data gaps, bounded replay, sequence-pinned snapshots, applied resize events, and output-before-exit ordering
-- **Session history** — per-CLI session listing with workdir scoping, preview extraction, and resume support (Claude JSONL, Codex JSONL, Gemini JSON, OpenCode SQLite)
-- **Probe + context tracking** — `probe_all()` discovers installed CLIs (sync, filesystem-only, cached 1h); `ContextTracker` accumulates token usage, computes remaining context window capacity
-- **Cure (model discovery)** — `cure()` populates `~/.gate4agent/models.json` with live model metadata from OpenCode cache or OpenRouter, so `discover_capabilities()` returns accurate context windows without hardcoding
+- Claude, Codex, and Kimi structured inline fresh/resume with provider-native
+  session identity;
+- one process owner per session and explicit caller-owned fan-out, without a
+  Gate4Agent swarm scheduler;
+- observable PTY lifecycle: ordered bytes, bounded replay and gaps,
+  sequence-pinned snapshots, resize, interrupt, exit ordering, and process-tree
+  teardown;
+- typed terminal input with UTF-8-safe chunks and readiness-gated submission;
+- transport-neutral structured events without inventing vendor data that is
+  absent from the current stream;
+- no Git/worktree isolation, task policy, vendor credential proxy, or
+  Gate4Agent-owned RAG/AST/tool domain.
+
+The 33-entry Orca registry, ACP, daemon, cure, broad history readers, and old
+capability/policy crates are transitional compatibility debt. They are visible
+in the source tree but are not active support claims.
 
 ## Architecture
 
@@ -291,7 +299,7 @@ gate4agent/
 │   │   └── opencode.rs  — SQLite from ~/.local/share/opencode/opencode.db
 │   └── utils.rs         — String utilities
 └── crates/
-    ├── gate4agent-types          — Control protocol v25 contracts
+    ├── gate4agent-types          — Control protocol v26 contracts
     ├── gate4agent-engine         — Deterministic session lifecycle reducer
     ├── gate4agent-tool-protocol  — Capability request/effect/result contracts
     ├── gate4agent-tool-engine    — Bounded policy, approval, and correlation reducer
@@ -300,42 +308,34 @@ gate4agent/
     └── gate4agent-runtime-native — Native effect execution adapter
 ```
 
-## Testing status
+## Current live testing status
 
 | Tool | Pipe | PTY | ACP | Notes |
 |---|---|---|---|---|
-| **Claude Code** | ✓ live | ✗ | ✓ live | Pipe: stream-json. ACP: via claude-agent-acp adapter |
-| **Codex** | ✓ live | ✗ | ✓ live | Pipe: --json. ACP: via codex-acp adapter |
-| **Gemini** | ✓ live | ✗ | ✓ live | Pipe: stream-json. ACP: native --experimental-acp |
-| **OpenCode** | ✓ live | ✗ | ✓ live | Pipe: --format json. ACP: native `opencode acp` |
+| **Claude Code 2.1.222** | ✓ fresh/resume | unverified on native Windows | not active | ConPTY currently yields zero bytes and fails closed |
+| **Codex 0.144.6** | ✓ fresh/resume | ✓ live | not active | Initial/follow-up, resize, in-flight interrupt, recovery, cleanup |
+| **Kimi Code 0.31.1** | ✓ fresh/resume | ✓ raw terminal fidelity | unsupported | PTY structured semantic events are not claimed |
 
-All Pipe and ACP transports are live-verified against real CLI output.
-PTY parsers existed in 0.1.x and are structurally simple (screen scraping) — low risk of breakage.
-
-Vendor-live Pipe and ACP cases are opt-in because they require installed,
+Vendor-live inline and PTY cases are opt-in because they require installed,
 authenticated CLIs and network access. Run them with `--ignored`; ordinary
 `cargo test` is hermetic and does not contact provider accounts.
 
 ## Windows spawn strategy
 
-On Windows, CLI tools are invoked through the appropriate shell:
-
-- **npm-installed CLIs** (claude, codex, gemini, opencode): `cmd /C program.cmd arg1 arg2` — the `.cmd` batch wrapper is detected via PATH lookup
-- **Bash scripts** (native binaries without `.cmd` wrapper): `bash -c 'program arg1 arg2'` — fallback when no `.cmd` wrapper exists
-- **Unix**: direct `Command::new("program")` — no shell wrapping needed
-
-Arguments are passed individually (not joined into a shell string) to avoid cmd.exe quote-mangling issues.
+On Windows, reviewed Claude, Codex, and Kimi npm installations are resolved to
+their direct executable or JavaScript entrypoint. Prompts therefore remain real
+argv/stdin data and are not reparsed by a `.cmd` shim. Unknown legacy wrappers
+retain a shell fallback. Unix uses direct process execution.
 
 ## Prerequisites
 
 At least one CLI agent must be installed on the host. gate4agent does not install them.
 
-| CLI | Install | ACP mode |
-|---|---|---|
-| Claude Code | `npm install -g @anthropic-ai/claude-code` | via `npx @agentclientprotocol/claude-agent-acp` |
-| Codex | `npm install -g @openai/codex` | via `npx @zed-industries/codex-acp` |
-| Gemini | `npm install -g @google/gemini-cli` | native: `gemini --experimental-acp` |
-| OpenCode | `npm install -g opencode-ai` | native: `opencode acp` |
+| CLI | Install |
+|---|---|
+| Claude Code | `npm install -g @anthropic-ai/claude-code` |
+| Codex | `npm install -g @openai/codex` |
+| Kimi Code | `npm install -g @moonshot-ai/kimi-code` |
 
 ## Versioning
 

@@ -348,6 +348,7 @@ async fn loaded_history_resume_is_authorized_then_spawned_with_exact_provider_ar
                         rows: 12,
                         columns: 80,
                     },
+                    initial_prompt: None,
                 },
             },
         ))

@@ -30,6 +30,7 @@ impl RateLimitDetector {
         let patterns = match tool {
             CliTool::ClaudeCode => Self::build_claude_patterns(),
             CliTool::Codex => Self::build_codex_patterns(),
+            CliTool::KimiCode => Self::build_kimi_patterns(),
             CliTool::Gemini => Self::build_gemini_patterns(),
             // OpenCode will get its own pattern builder once real CLI
             // output has been captured and rate-limit message formats confirmed.
@@ -73,6 +74,16 @@ impl RateLimitDetector {
         vec![RateLimitPattern {
             regex: Regex::new(r"(?i)rate\s*limit|quota\s*exceeded|resource\s*exhausted")
                 .expect("valid regex"),
+            limit_type: RateLimitType::Unknown,
+        }]
+    }
+
+    fn build_kimi_patterns() -> Vec<RateLimitPattern> {
+        vec![RateLimitPattern {
+            regex: Regex::new(
+                r"(?i)rate\s*limit|too\s*many\s*requests|quota|overload|retry-after",
+            )
+            .expect("valid regex"),
             limit_type: RateLimitType::Unknown,
         }]
     }
@@ -141,5 +152,11 @@ mod tests {
         let detector = RateLimitDetector::new_for_tool(CliTool::ClaudeCode);
         let info = detector.detect("daily limit exceeded").unwrap();
         assert_eq!(info.limit_type, RateLimitType::Daily);
+    }
+
+    #[test]
+    fn kimi_detector_recognizes_transient_provider_limits() {
+        let detector = RateLimitDetector::new_for_tool(CliTool::KimiCode);
+        assert!(detector.detect("provider overloaded; Retry-After: 10").is_some());
     }
 }

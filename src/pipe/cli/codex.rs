@@ -67,12 +67,20 @@ impl NdjsonParser for CodexNdjsonParser {
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    let cached = usage
+                        .get("cached_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let reasoning = usage
+                        .get("reasoning_output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     events.push(CliEvent::TurnComplete {
-                        input_tokens: input,
+                        input_tokens: input.saturating_sub(cached),
                         output_tokens: output,
-                        cache_read_tokens: 0,
+                        cache_read_tokens: cached,
                         cache_write_tokens: 0,
-                        reasoning_tokens: 0,
+                        reasoning_tokens: reasoning,
                         context_window: None,
                         is_cumulative: false,
                     });
@@ -327,13 +335,15 @@ impl NdjsonParser for CodexNdjsonParser {
 /// Pipe-mode spawn builder for Codex.
 ///
 /// Argv produced (fresh session):
-///   `codex exec --json --full-auto [--model <m>] <prompt>`
+///   `codex exec --json --skip-git-repo-check -s read-only [--model <m>] <prompt>`
 ///
 /// Argv produced (resumed session by ID):
-///   `codex exec resume <session_id> --json --full-auto [--model <m>] <prompt>`
+///   `codex exec resume --json --skip-git-repo-check -c sandbox_mode=\"read-only\"`
+///   `[--model <m>] <session_id> <prompt>`
 ///
 /// Argv produced (resume last session via `continue_last`):
-///   `codex exec resume --last --json --full-auto [--model <m>] <prompt>`
+///   `codex exec resume --json --skip-git-repo-check -c sandbox_mode=\"read-only\"`
+///   `[--model <m>] --last <prompt>`
 ///
 /// Available `--sandbox` policies (not added here — callers can pass via `extra_args`):
 ///   - `read-only` (default) — no file writes, no network
@@ -345,36 +355,26 @@ impl super::traits::CliCommandBuilder for CodexPipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut cmd = std::process::Command::new("codex");
 
-        if let Some(ref session_id) = opts.resume_session_id {
-            // Resume by ID: `codex exec resume <id> --json --full-auto ...`
-            cmd.arg("exec");
+        let resumed = opts.resume_session_id.is_some() || opts.continue_last;
+        cmd.arg("exec");
+        if resumed {
             cmd.arg("resume");
-            cmd.arg(session_id);
-        } else if opts.continue_last {
-            // Resume last: `codex exec resume --last --json --full-auto ...`
-            cmd.arg("exec");
-            cmd.arg("resume");
-            cmd.arg("--last");
-        } else {
-            // Fresh: `codex exec --json --full-auto ...`
-            cmd.arg("exec");
         }
 
         cmd.arg("--json");
-        // Codex approval mode is a positional flag, not --permission-mode.
-        // Map SpawnOptions::permission_mode to the correct Codex CLI flag.
-        match opts.permission_mode.as_deref() {
-            Some("suggest") => {
-                cmd.arg("--suggest");
-            }
-            Some("auto-edit") => {
-                cmd.arg("--auto-edit");
-            }
-            _ => {
-                cmd.arg("--full-auto");
-            }
-        }
         cmd.arg("--skip-git-repo-check");
+        let sandbox = match opts.permission_mode.as_deref() {
+            Some("workspace-write" | "auto-edit") => "workspace-write",
+            Some("danger-full-access" | "full-auto") => "danger-full-access",
+            _ => "read-only",
+        };
+        if resumed {
+            cmd.arg("-c");
+            cmd.arg(format!("sandbox_mode=\"{sandbox}\""));
+        } else {
+            cmd.arg("-s");
+            cmd.arg(sandbox);
+        }
 
         if let Some(ref model) = opts.model {
             cmd.arg("--model");
@@ -383,6 +383,12 @@ impl super::traits::CliCommandBuilder for CodexPipeBuilder {
 
         for arg in &opts.extra_args {
             cmd.arg(arg);
+        }
+
+        if let Some(ref session_id) = opts.resume_session_id {
+            cmd.arg(session_id);
+        } else if opts.continue_last {
+            cmd.arg("--last");
         }
 
         // Prompt is the final positional argument.
@@ -407,6 +413,22 @@ mod tests {
             }
             _ => panic!("expected SessionStart"),
         }
+    }
+
+    #[test]
+    fn codex_current_turn_usage_separates_cached_and_reasoning_tokens() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":41075,"cached_input_tokens":30208,"output_tokens":24,"reasoning_output_tokens":3}}"#;
+        assert!(matches!(
+            parser.parse_line(line).as_slice(),
+            [CliEvent::TurnComplete {
+                input_tokens: 10867,
+                output_tokens: 24,
+                cache_read_tokens: 30208,
+                reasoning_tokens: 3,
+                ..
+            }]
+        ));
     }
 
     /// Regression test: Codex emits "aggregated_output" for command_execution results,
@@ -620,41 +642,63 @@ mod tests {
     }
 
     #[test]
-    fn codex_pipe_builder_suggest_mode() {
+    fn codex_pipe_builder_legacy_suggest_maps_to_read_only_sandbox() {
         use super::super::traits::CliCommandBuilder;
         let builder = CodexPipeBuilder;
         let opts = make_opts(Some("suggest"));
         let args = args_of(builder.build_command(&opts));
-        assert!(args.contains(&"--suggest".to_string()), "--suggest must be present, args: {args:?}");
-        assert!(!args.contains(&"--full-auto".to_string()), "--full-auto must be absent, args: {args:?}");
-        assert!(!args.contains(&"--auto-edit".to_string()), "--auto-edit must be absent, args: {args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]), "read-only sandbox must be present, args: {args:?}");
     }
 
     #[test]
-    fn codex_pipe_builder_auto_edit_mode() {
+    fn codex_pipe_builder_legacy_auto_edit_maps_to_workspace_write() {
         use super::super::traits::CliCommandBuilder;
         let builder = CodexPipeBuilder;
         let opts = make_opts(Some("auto-edit"));
         let args = args_of(builder.build_command(&opts));
-        assert!(args.contains(&"--auto-edit".to_string()), "--auto-edit must be present, args: {args:?}");
-        assert!(!args.contains(&"--full-auto".to_string()), "--full-auto must be absent, args: {args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["-s", "workspace-write"]), "workspace-write sandbox must be present, args: {args:?}");
     }
 
     #[test]
-    fn codex_pipe_builder_default_is_full_auto() {
+    fn codex_pipe_builder_default_is_read_only() {
         use super::super::traits::CliCommandBuilder;
         let builder = CodexPipeBuilder;
         let opts = make_opts(None);
         let args = args_of(builder.build_command(&opts));
-        assert!(args.contains(&"--full-auto".to_string()), "--full-auto must be present by default, args: {args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]), "read-only sandbox must be the default, args: {args:?}");
     }
 
     #[test]
-    fn codex_pipe_builder_full_auto_explicit() {
+    fn codex_pipe_builder_legacy_full_auto_maps_to_danger_full_access() {
         use super::super::traits::CliCommandBuilder;
         let builder = CodexPipeBuilder;
         let opts = make_opts(Some("full-auto"));
         let args = args_of(builder.build_command(&opts));
-        assert!(args.contains(&"--full-auto".to_string()), "--full-auto must be present for explicit 'full-auto', args: {args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["-s", "danger-full-access"]), "danger-full-access sandbox must be present, args: {args:?}");
+    }
+
+    #[test]
+    fn codex_pipe_builder_resume_uses_current_config_override_shape() {
+        use super::super::traits::CliCommandBuilder;
+        let builder = CodexPipeBuilder;
+        let opts = SpawnOptions {
+            prompt: "follow up".to_owned(),
+            resume_session_id: Some("thread-1".to_owned()),
+            ..SpawnOptions::default()
+        };
+        let args = args_of(builder.build_command(&opts));
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "-c",
+                "sandbox_mode=\"read-only\"",
+                "thread-1",
+                "follow up",
+            ]
+        );
     }
 }

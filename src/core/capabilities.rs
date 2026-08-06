@@ -213,13 +213,13 @@ pub(crate) fn codex_capabilities() -> CliCapabilities {
             model("gpt-5.3-codex", "GPT-5.3 Codex", false, false, Some(272_000)),
             model("gpt-5.2", "GPT-5.2", false, false, Some(272_000)),
         ],
-        // Codex uses --full-auto / --suggest / --auto-edit as approval mode flags (not a
-        // --permission-mode string). We surface them as permission modes so the UI can offer
-        // a picker. The builder maps `permission_mode` → the correct Codex CLI flag.
+        // The current Codex headless contract accepts native sandbox names.
+        // Legacy suggest/auto-edit/full-auto values are mapped by the builder
+        // for API compatibility but are not advertised here.
         permission_modes: vec![
-            perm("suggest", "Suggest", "Read-only: proposes changes but does not apply them.", false),
-            perm("auto-edit", "Auto Edit", "Edits files automatically; asks before running commands.", false),
-            perm("full-auto", "Full Auto", "Fully autonomous: edits and runs commands without asking.", true),
+            perm("read-only", "Read Only", "No workspace writes through the inline child.", true),
+            perm("workspace-write", "Workspace Write", "Allows writes inside the selected workspace.", false),
+            perm("danger-full-access", "Danger Full Access", "Disables the Codex sandbox for this child.", false),
         ],
         features: CliFeatures {
             thinking: false,
@@ -230,11 +230,27 @@ pub(crate) fn codex_capabilities() -> CliCapabilities {
             allowed_tools_filter: false,
             system_prompt_injection: false,
             max_turns: false,
-            sandbox_mode: false,
+            sandbox_mode: true,
             ide_context: true,
             plan_mode: true,
             speed_toggle: true,
             multi_provider: false,
+        },
+    }
+}
+
+/// Returns the verified baseline capabilities for Kimi Code.
+pub(crate) fn kimi_capabilities() -> CliCapabilities {
+    CliCapabilities {
+        tool_id: "kimi".to_string(),
+        display_name: "Kimi Code".to_string(),
+        binary: "kimi".to_string(),
+        available_models: Vec::new(),
+        permission_modes: Vec::new(),
+        features: CliFeatures {
+            resume: true,
+            continue_last: true,
+            ..CliFeatures::default()
         },
     }
 }
@@ -463,6 +479,7 @@ pub(crate) fn discover(
     let mut caps = match tool {
         CliTool::ClaudeCode => claude_capabilities(),
         CliTool::Codex => codex_capabilities(),
+        CliTool::KimiCode => kimi_capabilities(),
         CliTool::Gemini => gemini_capabilities(),
         CliTool::OpenCode => opencode_capabilities(),
     };
@@ -485,8 +502,8 @@ pub(crate) fn discover(
                 update_default_model(&mut caps.available_models, &model_id);
             }
         }
-        // Claude and Gemini have no config-based model discovery.
-        CliTool::ClaudeCode | CliTool::Gemini => {}
+        // Claude, Kimi, and Gemini have no verified config-based model discovery.
+        CliTool::ClaudeCode | CliTool::KimiCode | CliTool::Gemini => {}
     }
 
     caps

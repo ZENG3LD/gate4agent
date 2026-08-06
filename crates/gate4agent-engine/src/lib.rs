@@ -581,6 +581,7 @@ impl Gate4AgentEngine {
                         return;
                     };
                     let summary = ResumeSessionSummary::from(&provider_session);
+                    let transport = current.transport;
                     let agent_id = {
                         let state = self
                             .sessions
@@ -618,6 +619,7 @@ impl Gate4AgentEngine {
                         generation: next_generation,
                         effect: ControlEffect::SpawnResume {
                             agent_id,
+                            transport,
                             provider_session,
                             request: pending.request,
                         },
@@ -1878,8 +1880,16 @@ impl Gate4AgentEngine {
         command_id: CommandId,
         instance_id: AgentInstanceId,
         target: ResumeTarget,
-        request: ResumeLaunchRequest,
+        mut request: ResumeLaunchRequest,
     ) -> Result<(), ControlError> {
+        request.initial_prompt = request
+            .initial_prompt
+            .as_deref()
+            .map(normalize_semantic_prompt)
+            .transpose()
+            .map_err(|error| ControlError::InvalidResumeRequest {
+                message: error.to_string(),
+            })?;
         request
             .validate()
             .map_err(|error| ControlError::InvalidResumeRequest {
@@ -1894,11 +1904,19 @@ impl Gate4AgentEngine {
             .sessions
             .get(&instance_id)
             .ok_or(ControlError::UnknownInstance { instance_id })?;
-        if state.snapshot.transport != TransportKind::Pty {
+        if !matches!(
+            state.snapshot.transport,
+            TransportKind::Pty | TransportKind::Pipe
+        ) {
             return Err(ControlError::UnsupportedTransportOperation {
                 transport: state.snapshot.transport,
                 action: "resume".to_owned(),
             });
+        }
+        if state.snapshot.transport == TransportKind::Pipe
+            && request.initial_prompt.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(ControlError::MissingInitialPrompt);
         }
         let status = state.snapshot.status.clone();
         if !matches!(
@@ -6149,6 +6167,7 @@ mod tests {
                             rows: 24,
                             columns: 80,
                         },
+                        initial_prompt: None,
                     },
                 },
             })
@@ -6186,6 +6205,7 @@ mod tests {
         assert!(matches!(
             &spawn.effect,
             ControlEffect::SpawnResume {
+                transport: TransportKind::Pty,
                 provider_session,
                 ..
             } if provider_session == &identity
@@ -6220,6 +6240,99 @@ mod tests {
     }
 
     #[test]
+    fn pipe_resume_requires_and_preserves_a_normalized_initial_prompt() {
+        let (mut engine, identity) = inactive_engine_with_provider_session();
+        engine.session_mut(instance()).transport = TransportKind::Pipe;
+
+        let missing_prompt = engine.apply_command(CommandEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            id: CommandId(20),
+            command: ControlCommand::Resume {
+                instance_id: instance(),
+                target: ResumeTarget::CurrentProvider,
+                request: ResumeLaunchRequest {
+                    working_directory: ".".to_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                },
+            },
+        });
+        assert_eq!(missing_prompt, Err(ControlError::MissingInitialPrompt));
+        assert!(engine.drain_effects().is_empty());
+
+        engine.session_mut(instance()).transport = TransportKind::Acp;
+        assert!(matches!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(21),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: Some("continue".to_owned()),
+                    },
+                },
+            }),
+            Err(ControlError::UnsupportedTransportOperation {
+                transport: TransportKind::Acp,
+                ..
+            })
+        ));
+        engine.session_mut(instance()).transport = TransportKind::Pipe;
+
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(22),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::CurrentProvider,
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: Some("continue\u{0000}now".to_owned()),
+                    },
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        assert!(matches!(
+            &authorize.effect,
+            ControlEffect::AuthorizeResume { request, .. }
+                if request.initial_prompt.as_deref() == Some("continue<U+0000>now")
+        ));
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: identity,
+            },
+        });
+        assert!(matches!(
+            engine.drain_effects().pop().unwrap().effect,
+            ControlEffect::SpawnResume {
+                transport: TransportKind::Pipe,
+                request,
+                ..
+            } if request.initial_prompt.as_deref() == Some("continue<U+0000>now")
+        ));
+    }
+
+    #[test]
     fn resume_authorization_generation_exhaustion_is_atomic_and_ignored() {
         let (mut engine, identity) = inactive_engine_with_provider_session();
         let exhausted = SessionGeneration(u64::MAX);
@@ -6238,6 +6351,7 @@ mod tests {
                             rows: 24,
                             columns: 80,
                         },
+                        initial_prompt: None,
                     },
                 },
             })
@@ -6286,6 +6400,7 @@ mod tests {
                             rows: 24,
                             columns: 80,
                         },
+                        initial_prompt: None,
                     },
                 },
             })
@@ -6331,6 +6446,7 @@ mod tests {
                             rows: 24,
                             columns: 80,
                         },
+                        initial_prompt: None,
                     },
                 },
             })
@@ -6358,6 +6474,7 @@ mod tests {
                             rows: 24,
                             columns: 80,
                         },
+                        initial_prompt: None,
                     },
                 },
             })
@@ -6421,6 +6538,7 @@ mod tests {
                 rows: 24,
                 columns: 80,
             },
+            initial_prompt: None,
         };
         assert_eq!(
             engine.apply_command(CommandEnvelope {

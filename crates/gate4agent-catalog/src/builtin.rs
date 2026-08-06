@@ -299,7 +299,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
         id
     };
     let transport_adapter_id = match id {
-        "claude" | "codex" | "gemini" | "opencode" => Some(adapter_id),
+        "claude" | "codex" | "gemini" | "opencode" | "kimi" => Some(adapter_id),
         _ => None,
     };
     let one_shot_adapter_id = matches!(
@@ -315,13 +315,25 @@ fn capabilities(id: &str) -> AgentCapabilities {
             | "antigravity"
     )
     .then_some(id);
-    let pipe = one_shot_adapter_id
-        .and_then(|adapter| binding(AdapterFamily::OneShot, adapter))
+    let structured_pipe_adapter_id =
+        matches!(id, "claude" | "codex" | "kimi").then_some(adapter_id);
+    let pipe = structured_pipe_adapter_id
+        .and_then(|adapter| binding(AdapterFamily::Pipe, adapter))
         .map(|adapter| PipeTransportSpec {
             adapter,
-            protocol: PipeProtocol::OneShotText,
+            protocol: PipeProtocol::StructuredJsonl,
             launch_override: None,
             prompt_delivery: PipePromptDelivery::None,
+        })
+        .or_else(|| {
+            one_shot_adapter_id
+                .and_then(|adapter| binding(AdapterFamily::OneShot, adapter))
+                .map(|adapter| PipeTransportSpec {
+                    adapter,
+                    protocol: PipeProtocol::OneShotText,
+                    launch_override: None,
+                    prompt_delivery: PipePromptDelivery::None,
+                })
         })
         .or_else(|| {
             transport_adapter_id
@@ -387,9 +399,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_four_backend_pty_launch_contracts_are_explicit() {
+    fn current_three_backend_pty_launch_contracts_are_explicit() {
         let registry = builtin_registry();
-        for id in ["claude", "codex", "kimi", "qwen-code"] {
+        for id in ["claude", "codex", "kimi"] {
             assert!(registry.get_by_id(id).is_some(), "missing target backend {id}");
         }
         let codex = registry.get_by_id("codex").unwrap();
@@ -408,12 +420,6 @@ mod tests {
         assert_eq!(
             registry.get_by_id("kimi").unwrap().readiness.draft_signal,
             DraftReadySignal::BracketedPaste
-        );
-        let qwen = registry.get_by_id("qwen-code").unwrap();
-        assert_eq!(qwen.prompt.initial, InitialPromptMode::AfterReady);
-        assert_eq!(
-            qwen.readiness.draft_signal,
-            DraftReadySignal::QuietAfterBracketedPaste
         );
     }
 
@@ -456,14 +462,20 @@ mod tests {
                 .protocol,
             PipeProtocol::SemanticNdjson
         );
+        for id in ["claude", "codex", "kimi"] {
+            let spec = registry.get_by_id(id).unwrap();
+            let pipe = spec.capabilities.transports.pipe.as_ref().unwrap();
+            assert_eq!(pipe.protocol, PipeProtocol::StructuredJsonl, "{id}");
+            assert_eq!(
+                pipe.adapter.id.as_str(),
+                if id == "claude" { "claude-code" } else { id }
+            );
+        }
         for id in [
-            "claude",
-            "codex",
             "opencode",
             "pi",
             "amp",
             "cursor",
-            "kimi",
             "copilot",
             "antigravity",
         ] {
@@ -581,6 +593,7 @@ mod tests {
             "droid",
             "grok",
             "devin",
+            "kimi",
         ] {
             assert!(
                 registry
@@ -594,7 +607,6 @@ mod tests {
             );
         }
         for id in [
-            "kimi",
             "copilot",
             "cursor",
             "qwen-code",

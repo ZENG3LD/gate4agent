@@ -969,10 +969,12 @@ impl Gate4AgentKernel {
                     .catalog
                     .get(&session.agent_id)
                     .is_some_and(|spec| spec.capabilities.adapters.resume.is_some());
-                if !supports_resume || session.transport != TransportKind::Pty {
+                if !supports_resume
+                    || !matches!(session.transport, TransportKind::Pty | TransportKind::Pipe)
+                {
                     return Err(KernelCommandError::UnsupportedCapability {
                         agent_id: session.agent_id.clone(),
-                        capability: "pty-resume",
+                        capability: "resume",
                     });
                 }
             }
@@ -1848,8 +1850,8 @@ mod tests {
     }
 
     #[test]
-    fn resume_requires_a_declared_adapter_and_pty_before_engine_mutation() {
-        let resume = || {
+    fn resume_requires_a_declared_adapter_and_supported_transport_before_engine_mutation() {
+        let resume = |initial_prompt| {
             command(
                 2,
                 ControlCommand::Resume {
@@ -1861,18 +1863,19 @@ mod tests {
                             rows: 24,
                             columns: 80,
                         },
+                        initial_prompt,
                     },
                 },
             )
         };
 
         let mut unsupported = Gate4AgentKernel::default();
-        unsupported.step([register(1, "kimi")], []);
-        let rejected = unsupported.step([resume()], []);
+        unsupported.step([register(1, "copilot")], []);
+        let rejected = unsupported.step([resume(None)], []);
         assert!(matches!(
             rejected.command_outcomes[0].result,
             Err(KernelCommandError::UnsupportedCapability {
-                capability: "pty-resume",
+                capability: "resume",
                 ..
             })
         ));
@@ -1890,13 +1893,12 @@ mod tests {
             )],
             [],
         );
-        let rejected = wrong_transport.step([resume()], []);
+        let rejected = wrong_transport.step([resume(Some("continue".to_owned()))], []);
         assert!(matches!(
             rejected.command_outcomes[0].result,
-            Err(KernelCommandError::UnsupportedCapability {
-                capability: "pty-resume",
-                ..
-            })
+            Err(KernelCommandError::Control(
+                ControlError::MissingProviderSession
+            ))
         ));
         assert!(rejected.effects.is_empty());
     }

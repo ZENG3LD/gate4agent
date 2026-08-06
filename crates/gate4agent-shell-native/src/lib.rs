@@ -74,9 +74,51 @@ struct OwnedPtyProvider {
     receiver: PtyEventReceiver,
     replay: VecDeque<PtyEventEnvelope>,
     pending_events: VecDeque<ProviderEvent>,
+    utf8: Utf8ChunkDecoder,
     pipeline: Mutex<ClassificationPipeline>,
     rate_limits: RateLimitDetector,
     next_provider_sequence: u64,
+}
+
+#[derive(Default)]
+struct Utf8ChunkDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8ChunkDecoder {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut decoded = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    decoded.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        let text = std::str::from_utf8(&self.pending[..valid])
+                            .expect("validated UTF-8 prefix");
+                        decoded.push_str(text);
+                        self.pending.drain(..valid);
+                        continue;
+                    }
+                    let Some(invalid) = error.error_len() else {
+                        break;
+                    };
+                    decoded.push('\u{fffd}');
+                    self.pending.drain(..invalid.min(self.pending.len()));
+                }
+            }
+        }
+        decoded
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
 }
 
 struct OwnedProviderSession<S> {
@@ -199,6 +241,7 @@ impl NativeEffectShell {
                 }
                 ControlEffect::SpawnResume {
                     agent_id,
+                    transport,
                     provider_session,
                     request,
                 } => {
@@ -206,6 +249,7 @@ impl NativeEffectShell {
                         key,
                         operation_id,
                         agent_id,
+                        transport,
                         provider_session,
                         request,
                         pty_env,
@@ -491,6 +535,7 @@ impl NativeEffectShell {
                                         receiver: attachment.receiver,
                                         replay: attachment.replay.into(),
                                         pending_events,
+                                        utf8: Utf8ChunkDecoder::default(),
                                         pipeline: Mutex::new(create_pipeline(tool)),
                                         rate_limits: RateLimitDetector::new_for_tool(tool),
                                         next_provider_sequence: 1,
@@ -598,6 +643,17 @@ impl NativeEffectShell {
                     env_vars: Vec::new(),
                     name: None,
                 };
+                if resumed_provider_session.is_some() && pipe_spec.launch_override.is_some() {
+                    return ControlObservation::SpawnFailed {
+                        message: format!(
+                            "agent '{agent_id}' cannot resume through a catalog launch override"
+                        ),
+                    };
+                }
+                let mut options = PipeProcessOptions::default();
+                if let Some(identity) = resumed_provider_session.as_ref() {
+                    options.claude.resume_session_id = Some(identity.id.clone());
+                }
                 let spawned = match pipe_spec.launch_override.as_ref() {
                     Some(launch) => {
                         PipeSession::spawn_with_launch(
@@ -609,25 +665,29 @@ impl NativeEffectShell {
                         .await
                     }
                     None => {
-                        PipeSession::spawn(config, &prompt, PipeProcessOptions::default()).await
+                        PipeSession::spawn(config, &prompt, options).await
                     }
                 };
                 match spawned {
                     Ok(session) => {
                         let process_id = session.process_id();
-                        let session_id = session.session_id().to_owned();
                         let events = session.subscribe();
+                        let pending_events = if pipe_spec.protocol == PipeProtocol::SemanticNdjson {
+                            VecDeque::from([AgentEvent::SessionStart {
+                                session_id: session.session_id().to_owned(),
+                                model: String::new(),
+                                tools: Vec::new(),
+                            }])
+                        } else {
+                            VecDeque::new()
+                        };
                         self.pipe_sessions.insert(
                             key,
                             OwnedProviderSession {
                                 source,
                                 session,
                                 events,
-                                pending_events: VecDeque::from([AgentEvent::SessionStart {
-                                    session_id,
-                                    model: String::new(),
-                                    tools: Vec::new(),
-                                }]),
+                                pending_events,
                                 next_provider_sequence: 1,
                                 observed_exit_code: None,
                             },
@@ -720,6 +780,7 @@ impl NativeEffectShell {
         key: NativeSessionKey,
         operation_id: OperationId,
         agent_id: AgentId,
+        transport: TransportKind,
         provider_session: gate4agent_types::ProviderSessionIdentity,
         request: ResumeLaunchRequest,
         pty_env: Vec<EnvMutation>,
@@ -752,10 +813,24 @@ impl NativeEffectShell {
                 }
             }
         };
+        if transport == TransportKind::Pipe {
+            let Some(pipe) = spec.capabilities.transports.pipe.as_ref() else {
+                return ControlObservation::SpawnFailed {
+                    message: format!("agent '{agent_id}' does not support Pipe transport"),
+                };
+            };
+            if pipe.protocol != PipeProtocol::StructuredJsonl {
+                return ControlObservation::SpawnFailed {
+                    message: format!(
+                        "agent '{agent_id}' does not expose a resumable structured Pipe contract"
+                    ),
+                };
+            }
+        }
         let start = StartRequest {
             working_directory: request.working_directory,
             terminal_size: request.terminal_size,
-            initial_prompt: None,
+            initial_prompt: request.initial_prompt,
             session_options: None,
         };
         self.spawn_native(
@@ -763,9 +838,13 @@ impl NativeEffectShell {
             operation_id,
             NativeSpawnRequest {
                 agent_id,
-                transport: TransportKind::Pty,
+                transport,
                 request: start,
-                launch_extra_args: plan.args.into_iter().map(OsString::from).collect(),
+                launch_extra_args: if transport == TransportKind::Pty {
+                    plan.args.into_iter().map(OsString::from).collect()
+                } else {
+                    Vec::new()
+                },
                 resumed_provider_session: Some(provider_session),
             },
             pty_env,
@@ -973,7 +1052,10 @@ fn drain_pty_provider(
         };
         match envelope.event {
             PtyEvent::Output(data) => {
-                let raw = String::from_utf8_lossy(&data);
+                let raw = provider.utf8.push(&data);
+                if raw.is_empty() {
+                    continue;
+                }
                 if let Some(info) = provider.rate_limits.detect(&raw) {
                     push_provider_observation(key, provider, rate_limit_event(info), observations);
                 }
@@ -993,6 +1075,7 @@ fn drain_pty_provider(
                 to_sequence,
                 ..
             } => {
+                provider.utf8.clear();
                 provider
                     .pipeline
                     .get_mut()
@@ -1294,6 +1377,13 @@ fn builtin_legacy_adapter_runtimes() -> AdapterRuntimeRegistry<CliTool> {
                 .expect("built-in native ACP adapter runtime must be unique");
         }
     }
+    let kimi_pipe = builtin_adapter_registry()
+        .binding(AdapterFamily::Pipe, "kimi")
+        .expect("missing built-in Pipe adapter kimi")
+        .clone();
+    runtimes
+        .insert(AdapterFamily::Pipe, kimi_pipe, CliTool::KimiCode)
+        .expect("built-in Kimi Pipe adapter runtime must be unique");
     runtimes
 }
 
@@ -1380,7 +1470,7 @@ async fn wait_for_readiness(
 ) -> Result<ReadinessPermit, String> {
     let started = Instant::now();
     let attachment = session
-        .attach_events(session.beginning_cursor())
+        .attach_retained_events()
         .map_err(|error| error.to_string())?;
     let mut receiver = attachment.receiver;
     let mut tracker = ReadinessTracker::new(spec, RuntimePlatform::current(), intent);
@@ -1388,6 +1478,12 @@ async fn wait_for_readiness(
         draft_signal: Some(spec.readiness.draft_signal),
         ..ReadinessDiagnostics::default()
     };
+    seed_readiness_from_terminal(
+        session,
+        &mut tracker,
+        &mut diagnostics,
+        elapsed_ms(started),
+    )?;
     let interval = Duration::from_millis(spec.readiness.poll_interval_ms.max(1));
     let mut next_probe = Instant::now();
 
@@ -1430,12 +1526,42 @@ async fn wait_for_readiness(
         let wait = next_probe.saturating_duration_since(Instant::now());
         match tokio::time::timeout(wait, receiver.recv()).await {
             Ok(Ok(event)) => {
-                observe_readiness_event(
-                    &mut tracker,
-                    &mut diagnostics,
-                    event.event,
-                    elapsed_ms(started),
-                )?;
+                if matches!(&event.event, PtyEvent::DataGap { .. }) {
+                    let attachment = session
+                        .attach_retained_events()
+                        .map_err(|error| error.to_string())?;
+                    receiver = attachment.receiver;
+                    tracker = ReadinessTracker::new(
+                        spec,
+                        RuntimePlatform::current(),
+                        intent,
+                    );
+                    diagnostics = ReadinessDiagnostics {
+                        draft_signal: Some(spec.readiness.draft_signal),
+                        ..ReadinessDiagnostics::default()
+                    };
+                    seed_readiness_from_terminal(
+                        session,
+                        &mut tracker,
+                        &mut diagnostics,
+                        elapsed_ms(started),
+                    )?;
+                    for retained in attachment.replay {
+                        observe_readiness_event(
+                            &mut tracker,
+                            &mut diagnostics,
+                            retained.event,
+                            elapsed_ms(started),
+                        )?;
+                    }
+                } else {
+                    observe_readiness_event(
+                        &mut tracker,
+                        &mut diagnostics,
+                        event.event,
+                        elapsed_ms(started),
+                    )?;
+                }
                 if detect_startup_gates {
                     ensure_no_readiness_operator_gate(&diagnostics, spec)?;
                     ensure_no_startup_operator_gate(session, spec)?;
@@ -1455,6 +1581,26 @@ async fn wait_for_readiness(
                 .ok_or_else(|| "ready tracker did not issue a permit".to_owned());
         }
     }
+}
+
+fn seed_readiness_from_terminal(
+    session: &PtySession,
+    tracker: &mut ReadinessTracker<'_>,
+    diagnostics: &mut ReadinessDiagnostics,
+    elapsed_ms: u64,
+) -> Result<(), String> {
+    const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+    let terminal = session.terminal_state().map_err(|error| error.to_string())?;
+    if terminal.bracketed_paste {
+        diagnostics.observe_output(ENABLE_BRACKETED_PASTE);
+        tracker.observe_output(ENABLE_BRACKETED_PASTE, elapsed_ms);
+    }
+    let contents = terminal.contents.as_bytes();
+    if !contents.is_empty() {
+        diagnostics.observe_output(contents);
+        tracker.observe_output(contents, elapsed_ms);
+    }
+    Ok(())
 }
 
 const STARTUP_GATE_SETTLE_MS: u64 = 350;
@@ -1809,6 +1955,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 mod tests {
     use super::{
         prompt_render_probe, prompt_rendered, startup_operator_gate, ReadinessDiagnostics,
+        Utf8ChunkDecoder,
     };
 
     fn snapshot(sequence: u64, contents: &str) -> super::PtyTerminalSnapshot {
@@ -1819,6 +1966,7 @@ mod tests {
             sequence,
             size: gate4agent::pty::PtySize { rows: 24, cols: 80 },
             cursor: (0, 0),
+            bracketed_paste: false,
             contents: contents.to_owned(),
             formatted: Vec::new(),
         }
@@ -1876,6 +2024,29 @@ mod tests {
         diagnostics.observe_output(b"\x1b[0mtype is selected");
         assert_eq!(diagnostics.operator_gate, Some("authentication"));
         assert!(!diagnostics.summary().contains("No auth"));
+    }
+
+    #[test]
+    fn semantic_utf8_decoder_preserves_codepoints_split_across_pty_reads() {
+        let mut decoder = Utf8ChunkDecoder::default();
+        let bytes = "ready Привет".as_bytes();
+        let split = bytes
+            .windows(2)
+            .position(|window| window[0] >= 0x80 && window[1] >= 0x80)
+            .expect("Cyrillic text contains adjacent UTF-8 bytes")
+            + 1;
+        let first = decoder.push(&bytes[..split]);
+        let second = decoder.push(&bytes[split..]);
+        assert_eq!(format!("{first}{second}"), "ready Привет");
+        assert!(!first.contains('\u{fffd}'));
+        assert!(!second.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn semantic_utf8_decoder_replaces_invalid_bytes_without_stalling() {
+        let mut decoder = Utf8ChunkDecoder::default();
+        assert_eq!(decoder.push(b"ok\xfftail"), "ok\u{fffd}tail");
+        assert_eq!(decoder.push(" Привет".as_bytes()), " Привет");
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub struct CliProbe {
     pub capabilities: CliCapabilities,
 }
 
-/// Result of probing all four CLI tools.
+/// Result of probing all supported CLI tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResult {
     /// One entry per CLI tool, in stable order.
@@ -46,12 +46,12 @@ impl ProbeResult {
 
 const DEFAULT_MAX_AGE_SECS: i64 = 3600;
 
-/// Probe all four CLIs. Uses cache if fresh (< 1 hour).
+/// Probe all supported CLIs. Uses cache if fresh (< 1 hour).
 pub fn probe_all() -> ProbeResult {
     probe_with_max_age(DEFAULT_MAX_AGE_SECS)
 }
 
-/// Probe all four CLIs, ignoring cache.
+/// Probe all supported CLIs, ignoring cache.
 pub fn probe_force() -> ProbeResult {
     let result = do_probe();
     let _ = write_cache(&result);
@@ -81,6 +81,7 @@ fn do_probe() -> ProbeResult {
     let tools = [
         CliTool::ClaudeCode,
         CliTool::Codex,
+        CliTool::KimiCode,
         CliTool::Gemini,
         CliTool::OpenCode,
     ];
@@ -192,9 +193,9 @@ mod tests {
     }
 
     #[test]
-    fn do_probe_returns_four_entries() {
+    fn do_probe_returns_five_entries() {
         let result = do_probe();
-        assert_eq!(result.probes.len(), 4);
+        assert_eq!(result.probes.len(), 5);
         assert!(result.probed_at > 0);
     }
 }

@@ -294,6 +294,7 @@ impl PtyWrapper {
             let tool_name = match tool {
                 CliTool::ClaudeCode => "claude",
                 CliTool::Codex => "codex",
+                CliTool::KimiCode => "kimi",
                 CliTool::Gemini => "gemini",
                 // OpenCode PTY integration will be added once
                 // its invocation shape is confirmed via live capture.
@@ -307,6 +308,7 @@ impl PtyWrapper {
             match tool {
                 CliTool::ClaudeCode => CommandBuilder::new("claude"),
                 CliTool::Codex => CommandBuilder::new("codex"),
+                CliTool::KimiCode => CommandBuilder::new("kimi"),
                 CliTool::Gemini => CommandBuilder::new("gemini"),
                 // OpenCode PTY integration will be added once
                 // its invocation shape is confirmed via live capture.

@@ -44,7 +44,7 @@ use gate4agent_types::{
     AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect, ControlObservation,
     EffectEnvelope, HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole,
     HistorySessionRecord, ObservationEnvelope, ResumeAuthorityTarget, ResumeLaunchRequest,
-    SessionGeneration, SessionStatus, TransportKind, CONTROL_PROTOCOL_VERSION,
+    SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
 };
 use launch_profiles::NativeLaunchProfiles;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -823,7 +823,11 @@ impl NativeEffectDispatcher {
                 transport: gate4agent_types::TransportKind::Pty,
                 ..
             }
-            | ControlEffect::SpawnResume { agent_id, .. } => agent_id,
+            | ControlEffect::SpawnResume {
+                agent_id,
+                transport: gate4agent_types::TransportKind::Pty,
+                ..
+            } => agent_id,
             _ => return Ok(Vec::new()),
         };
         let control = self
@@ -870,7 +874,11 @@ impl NativeEffectDispatcher {
                 transport,
                 ..
             } => (agent_id, *transport),
-            ControlEffect::SpawnResume { agent_id, .. } => (agent_id, TransportKind::Pty),
+            ControlEffect::SpawnResume {
+                agent_id,
+                transport,
+                ..
+            } => (agent_id, *transport),
             _ => return Ok(Vec::new()),
         };
         self.launch_profiles

@@ -4,6 +4,7 @@ pub mod traits;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod kimi;
 pub mod opencode;
 
 pub use traits::{CliCommandBuilder, CliEvent, NdjsonParser};
@@ -13,6 +14,7 @@ use crate::core::types::CliTool;
 use self::claude::{ClaudeNdjsonParser, ClaudePipeBuilder};
 use self::codex::{CodexNdjsonParser, CodexPipeBuilder};
 use self::gemini::{GeminiNdjsonParser, GeminiPipeBuilder};
+use self::kimi::{KimiNdjsonParser, KimiPipeBuilder};
 use self::opencode::{OpenCodeNdjsonParser, OpenCodePipeBuilder};
 
 /// Create an NDJSON parser for the given CLI tool.
@@ -20,6 +22,7 @@ pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
     match tool {
         CliTool::ClaudeCode => Box::new(ClaudeNdjsonParser::new()),
         CliTool::Codex => Box::new(CodexNdjsonParser::new()),
+        CliTool::KimiCode => Box::new(KimiNdjsonParser::new()),
         CliTool::Gemini => Box::new(GeminiNdjsonParser::new()),
         CliTool::OpenCode => Box::new(OpenCodeNdjsonParser::new()),
     }
@@ -33,6 +36,7 @@ pub fn cli_builder(tool: CliTool) -> Box<dyn CliCommandBuilder> {
     match tool {
         CliTool::ClaudeCode => Box::new(ClaudePipeBuilder),
         CliTool::Codex => Box::new(CodexPipeBuilder),
+        CliTool::KimiCode => Box::new(KimiPipeBuilder),
         CliTool::Gemini => Box::new(GeminiPipeBuilder),
         CliTool::OpenCode => Box::new(OpenCodePipeBuilder),
     }

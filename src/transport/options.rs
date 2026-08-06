@@ -57,10 +57,9 @@ pub struct SpawnOptions {
 
     /// Permission mode for tool execution.
     ///
-    /// - Claude: `--permission-mode accept-all` or `--permission-mode default`
+    /// - Claude: a provider-native `--permission-mode` value; defaults to `plan`.
+    /// - Codex: `read-only`, `workspace-write`, or `danger-full-access`.
     /// - Others: ignored.
-    ///
-    /// When set, overrides the default `--dangerously-skip-permissions` flag.
     pub permission_mode: Option<String>,
 
     /// Path to MCP server configuration file.

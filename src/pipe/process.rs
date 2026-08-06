@@ -19,27 +19,29 @@ pub const PIPE_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const PIPE_TIMEOUT_SECONDS: u64 = 60;
 const PIPE_OUTPUT_QUEUE_CAPACITY: usize = 256;
 
-/// Claude Code-specific options for pipe mode spawning.
+/// Provider options retained under the legacy name for API compatibility.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeOptions {
     /// Content to append to the system prompt via --append-system-prompt.
     /// Goes into the system prompt and is NEVER compressed or ignored — highest priority.
     pub append_system_prompt: Option<String>,
-    /// Resume an existing session via --resume <session-id>.
+    /// Resume an existing provider-native session.
     pub resume_session_id: Option<String>,
-    /// Model override via --model.
+    /// Provider-native model override.
     pub model: Option<String>,
 }
 
 /// Options for PipeProcess spawning.
 ///
 /// Extra args are passed directly to the CLI command after the standard flags.
-/// Claude-specific options live in the `claude` sub-struct to make them self-documenting.
+/// Resume and model fields in the legacy `claude` sub-struct are also consumed
+/// by providers with the same generic operation, including Kimi Code.
 #[derive(Debug, Clone, Default)]
 pub struct PipeProcessOptions {
     /// Extra CLI arguments appended after standard flags.
     pub extra_args: Vec<String>,
-    /// Claude Code-specific options (ignored for Codex/Gemini).
+    /// Legacy provider options. Resume/model are transport-generic; the
+    /// appended system prompt remains Claude-only.
     pub claude: ClaudeOptions,
 }
 
@@ -64,6 +66,7 @@ impl PipeProcess {
     /// - Claude: `claude -p --output-format stream-json --verbose`
     /// - Codex: `codex exec --json`
     /// - Gemini: `gemini --output-format stream-json -p`
+    /// - Kimi Code: `kimi -p <prompt> --output-format stream-json`
     pub fn new(
         tool: CliTool,
         working_dir: &std::path::Path,
@@ -79,11 +82,10 @@ impl PipeProcess {
 
     /// Spawn a headless CLI process with stdin/stdout pipes and custom options.
     ///
-    /// The initial prompt is written to stdin (not as a CLI argument) to avoid
-    /// Windows `cmd /C` mangling of Unicode, spaces, and special characters.
-    /// Note: Codex and Gemini receive the prompt as a CLI argument because they
-    /// do not read stdin; for those tools the `cmd /C` shell string includes the
-    /// properly-escaped prompt.
+    /// Claude receives the initial prompt through stdin. Codex, Gemini, and
+    /// Kimi receive it as an argv element. Reviewed npm installations are
+    /// launched through their direct entrypoint on Windows so prompt bytes are
+    /// not reparsed by `cmd.exe`.
     pub fn new_with_options(
         tool: CliTool,
         working_dir: &std::path::Path,
@@ -92,16 +94,27 @@ impl PipeProcess {
     ) -> Result<Self, std::io::Error> {
         let spawn_opts =
             Self::pipe_options_to_spawn_opts(tool, initial_prompt, &options, working_dir);
-        let mut cmd = Self::build_command_with_options(tool, &spawn_opts);
-        for (key, value) in &spawn_opts.env_vars {
+        Self::new_with_spawn_options(tool, spawn_opts)
+    }
+
+    /// Spawn directly from the transport-generic option carrier.
+    ///
+    /// This path preserves provider-native resume/model selection and the
+    /// caller-owned child environment for every structured provider.
+    pub fn new_with_spawn_options(
+        tool: CliTool,
+        options: SpawnOptions,
+    ) -> Result<Self, std::io::Error> {
+        let mut cmd = Self::build_command_with_options(tool, &options);
+        for (key, value) in &options.env_vars {
             cmd.env(key, value);
         }
 
         Self::spawn_command(
             tool,
-            working_dir,
+            &options.working_dir,
             cmd,
-            (tool == CliTool::ClaudeCode).then_some(initial_prompt),
+            (tool == CliTool::ClaudeCode).then_some(options.prompt.as_str()),
         )
     }
 
@@ -204,11 +217,8 @@ impl PipeProcess {
     ///
     /// On Unix: returns the `Command` from the per-CLI builder directly.
     ///
-    /// On Windows: npm-installed CLIs get `cmd /C <program>.cmd <args...>`.
-    /// Non-npm tools (bash scripts, native binaries) get `bash -c '...'`.
-    /// Each arg is passed individually (not joined into a shell string)
-    /// so Windows CreateProcess handles quoting correctly for prompts
-    /// that contain spaces and special characters.
+    /// On Windows, reviewed npm installations use their direct executable or
+    /// JavaScript entrypoint. Unknown wrappers retain the legacy shell fallback.
     fn build_command_with_options(tool: CliTool, opts: &SpawnOptions) -> Command {
         let builder = cli_builder(tool);
         let inner_cmd = builder.build_command(opts);
@@ -239,13 +249,18 @@ impl PipeProcess {
             } else {
                 // Check if a .cmd wrapper exists on PATH.
                 let cmd_name = format!("{}.cmd", program);
-                let has_cmd = std::env::var_os("PATH")
-                    .map(|path| {
-                        std::env::split_paths(&path).any(|dir| dir.join(&cmd_name).is_file())
-                    })
-                    .unwrap_or(false);
+                let cmd_dir = std::env::var_os("PATH").and_then(|path| {
+                    std::env::split_paths(&path)
+                        .find(|dir| dir.join(&cmd_name).is_file())
+                });
 
-                if has_cmd {
+                if let Some(cmd_dir) = cmd_dir {
+                    if let Some(mut cmd) = Self::windows_direct_npm_command(tool, &cmd_dir) {
+                        for arg in inner_cmd.get_args() {
+                            cmd.arg(arg);
+                        }
+                        return cmd;
+                    }
                     let mut cmd = Command::new("cmd");
                     cmd.arg("/C");
                     cmd.arg(&cmd_name);
@@ -271,6 +286,63 @@ impl PipeProcess {
             }
         } else {
             inner_cmd
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_direct_npm_command(
+        tool: CliTool,
+        shim_dir: &std::path::Path,
+    ) -> Option<Command> {
+        let (program, entrypoint) = match tool {
+            CliTool::ClaudeCode => (
+                shim_dir
+                    .join("node_modules")
+                    .join("@anthropic-ai")
+                    .join("claude-code")
+                    .join("bin")
+                    .join("claude.exe"),
+                None,
+            ),
+            CliTool::Codex => (
+                shim_dir.join("node.exe"),
+                Some(
+                    shim_dir
+                        .join("node_modules")
+                        .join("@openai")
+                        .join("codex")
+                        .join("bin")
+                        .join("codex.js"),
+                ),
+            ),
+            CliTool::KimiCode => (
+                shim_dir.join("node.exe"),
+                Some(
+                    shim_dir
+                        .join("node_modules")
+                        .join("@moonshot-ai")
+                        .join("kimi-code")
+                        .join("dist")
+                        .join("main.mjs"),
+                ),
+            ),
+            CliTool::Gemini | CliTool::OpenCode => return None,
+        };
+        if let Some(entrypoint) = entrypoint {
+            if !entrypoint.is_file() {
+                return None;
+            }
+            let mut command = if program.is_file() {
+                Command::new(program)
+            } else {
+                Command::new("node")
+            };
+            command.arg(entrypoint);
+            Some(command)
+        } else if program.is_file() {
+            Some(Command::new(program))
+        } else {
+            None
         }
     }
 
@@ -352,8 +424,8 @@ impl PipeProcess {
         }
     }
 
-    pub(crate) fn try_recv_output(&self) -> Option<PipeOutput> {
-        self.output_rx.try_recv().ok()
+    pub(crate) fn try_recv_output(&self) -> Result<PipeOutput, mpsc::TryRecvError> {
+        self.output_rx.try_recv()
     }
 
     /// Write input to the process stdin.
@@ -507,11 +579,11 @@ mod tests {
 
     // ── Windows cmd /C wrapping (build_command_with_options) ─────────────────
 
-    /// On Windows, a program that already ends with `.cmd` must be wrapped as
-    /// `cmd /C <program>.cmd <args...>`.
+    /// Windows uses the vendor entrypoint directly when its npm package layout
+    /// is known, falling back to the legacy shell wrapper otherwise.
     #[test]
     #[cfg(windows)]
-    fn windows_cmd_extension_wraps_with_cmd_c() {
+    fn windows_vendor_command_has_a_supported_outer_program() {
         // We cannot reach build_command_with_options directly from a test file
         // because it is private. These tests live inside the module so they can.
         use crate::transport::SpawnOptions;
@@ -529,10 +601,10 @@ mod tests {
         let cmd = PipeProcess::build_for_test(CliTool::ClaudeCode, &opts);
         let prog = cmd.get_program().to_string_lossy();
 
-        // On Windows we always get either "cmd" or "bash" as the outer wrapper.
+        let direct_claude = prog.to_ascii_lowercase().ends_with("claude.exe");
         assert!(
-            prog == "cmd" || prog == "bash",
-            "On Windows, outer program must be 'cmd' or 'bash', got '{}'",
+            direct_claude || prog == "cmd" || prog == "bash",
+            "unsupported Windows outer program '{}'",
             prog
         );
     }

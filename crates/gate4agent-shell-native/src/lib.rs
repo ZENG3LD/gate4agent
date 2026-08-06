@@ -1707,11 +1707,18 @@ fn prompt_rendered(
     if !probe.is_empty() && compact.contains(probe) {
         return true;
     }
-    let placeholder = "[pasted content";
-    tail.to_ascii_lowercase().contains(placeholder)
-        && !terminal_tail(&baseline.contents)
-            .to_ascii_lowercase()
-            .contains(placeholder)
+    let normalized_tail = tail.to_ascii_lowercase();
+    let normalized_baseline = terminal_tail(&baseline.contents).to_ascii_lowercase();
+    paste_placeholder_visible(&normalized_tail)
+        && !paste_placeholder_visible(&normalized_baseline)
+}
+
+fn paste_placeholder_visible(normalized_tail: &str) -> bool {
+    // Codex collapses larger pastes as `[Pasted Content ...]`; Claude 2.1.223
+    // uses `[Pasted text #N ...]`. Treat only those vendor-owned render
+    // markers as proof that the TUI consumed the bracketed paste.
+    normalized_tail.contains("[pasted content")
+        || normalized_tail.contains("[pasted text #")
 }
 
 fn terminal_tail(contents: &str) -> String {
@@ -2086,6 +2093,11 @@ mod tests {
             &baseline,
             &probe
         ));
+        assert!(prompt_rendered(
+            &snapshot(8, "composer [Pasted text #1 +6 lines]"),
+            &baseline,
+            &probe
+        ));
     }
 
     #[test]
@@ -2094,6 +2106,11 @@ mod tests {
         assert!(!prompt_rendered(
             &snapshot(8, "composer [Pasted Content 4096 chars]\nunrelated redraw"),
             &snapshot(7, "composer [Pasted Content 4096 chars]"),
+            &probe
+        ));
+        assert!(!prompt_rendered(
+            &snapshot(8, "composer [Pasted text #1 +6 lines]\nunrelated redraw"),
+            &snapshot(7, "composer [Pasted text #1 +6 lines]"),
             &probe
         ));
     }

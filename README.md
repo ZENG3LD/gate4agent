@@ -13,7 +13,7 @@ deterministic owner for session lifecycle and host-capability authority.
 
 | Tool | Transport | Pipe mode | ACP | Resume | Notes |
 |---|---|---|---|---|---|
-| **Claude Code** | Structured inline; PTY contract present | current `stream-json` | not in default catalog | current `--resume <id>` | Inline fresh/resume verified on 2.1.222; native Windows PTY currently fails closed with zero output |
+| **Claude Code** | Structured inline + PTY | current `stream-json` | not in default catalog | current `--resume <id>` | Inline fresh/resume and full native Windows PTY lifecycle verified on 2.1.223 |
 | **Codex CLI** | Structured inline + PTY | current `exec --json` | not in default catalog | current `exec resume` | Inline and Windows PTY verified on 0.144.6; inline defaults to read-only |
 | **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | current `-r <id>` | Inline and Windows terminal fidelity verified on 0.31.1; PTY semantic events are not claimed |
 
@@ -312,7 +312,7 @@ gate4agent/
 
 | Tool | Pipe | PTY | ACP | Notes |
 |---|---|---|---|---|
-| **Claude Code 2.1.222** | ✓ fresh/resume | unverified on native Windows | not active | ConPTY currently yields zero bytes and fails closed |
+| **Claude Code 2.1.223** | ✓ fresh/resume | ✓ full lifecycle | not active | Initial/follow-up prompt, resize, in-flight interrupt, recovery, and teardown live-verified |
 | **Codex 0.144.6** | ✓ fresh/resume | ✓ live | not active | Initial/follow-up, resize, in-flight interrupt, recovery, cleanup |
 | **Kimi Code 0.31.1** | ✓ fresh/resume | ✓ raw terminal fidelity | unsupported | PTY structured semantic events are not claimed |
 

@@ -386,8 +386,12 @@ fn readiness(id: &str) -> AgentReadinessSpec {
         draft_signal: match id {
             "codex" => DraftReadySignal::CodexComposerPrompt,
             "kimi" => DraftReadySignal::BracketedPaste,
-            "claude" => DraftReadySignal::ClaudeComposerPrompt,
-            "opencode" | "mimo-code" => DraftReadySignal::CursorAfterBracketedPaste,
+            // Claude 2.1.223 renders an ASCII `>` composer instead of the
+            // older `❯` glyph. Cursor visibility after the bracketed-paste
+            // handshake is the stable terminal-level readiness signal.
+            "claude" | "opencode" | "mimo-code" => {
+                DraftReadySignal::CursorAfterBracketedPaste
+            }
             _ => DraftReadySignal::QuietAfterBracketedPaste,
         },
         ..AgentReadinessSpec::default()
@@ -411,7 +415,7 @@ mod tests {
         );
         assert_eq!(
             registry.get_by_id("claude").unwrap().readiness.draft_signal,
-            DraftReadySignal::ClaudeComposerPrompt
+            DraftReadySignal::CursorAfterBracketedPaste
         );
         assert_eq!(
             codex.readiness.draft_signal,

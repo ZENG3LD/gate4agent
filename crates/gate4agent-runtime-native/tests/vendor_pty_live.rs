@@ -110,6 +110,13 @@ fn sanitized_diagnostics(
                 ("login", "login"),
                 ("auth", "auth"),
                 ("error", "error"),
+                ("api-error", "api error"),
+                ("usage-limit", "usage limit"),
+                ("rate-limit", "rate limit"),
+                ("output-limit", "output limit"),
+                ("too-long", "too long"),
+                ("overloaded", "overloaded"),
+                ("retry", "try again"),
                 ("permission", "permission"),
                 ("update", "update"),
                 ("welcome", "welcome to claude code"),
@@ -154,8 +161,16 @@ fn sanitized_diagnostics(
         .iter()
         .filter(|event| matches!(event.event, ControlEventKind::TerminalStale { .. }))
         .count();
+    let startup_detail = match &session.status {
+        SessionStatus::Failed { message }
+            if message.starts_with("PTY readiness timed out (")
+                || message.contains("initial prompt")
+                || message.contains("deferred initial prompt")
+                || message.contains("requires operator action") => message.as_str(),
+        _ => "none",
+    };
     format!(
-        "status={} failure_category={} frame_sequence={frame_sequence} frame_advanced={} frame_chars={frame_chars} terminal_stale={} terminal_stale_events={terminal_stale_events} input_completed={input_completed} input_failed={input_failed} frame_flags={flags}",
+        "status={} failure_category={} frame_sequence={frame_sequence} frame_advanced={} frame_chars={frame_chars} terminal_stale={} terminal_stale_events={terminal_stale_events} input_completed={input_completed} input_failed={input_failed} frame_flags={flags} startup_detail={startup_detail}",
         session_status_label(&session.status),
         session_failure_category(&session.status),
         frame_sequence > baseline_sequence,
@@ -513,7 +528,7 @@ async fn exercise_live_session(
     let agent_token = agent_id.replace('-', "").to_ascii_uppercase();
     let interrupt_marker = format!("G4A{agent_token}PTYINTERRUPTSTART");
     let interrupt_prompt = format!(
-        "Begin your response with one string made by concatenating these tokens without spaces or punctuation: G4A {agent_token} PTY INTERRUPT START. Then write the integers from 1 through 400, one per line. Do not stop early."
+        "Write the integers from 1 through 200, one per line. Prefix every line with one string made by concatenating these tokens without spaces or punctuation: G4A {agent_token} PTY INTERRUPT START. Do not use formatting and do not stop early."
     );
     assert!(!interrupt_prompt.contains(&interrupt_marker));
     let interrupt_baseline = terminal_sequence(handle);

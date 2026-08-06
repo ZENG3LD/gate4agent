@@ -192,6 +192,15 @@ impl NdjsonParser for ClaudeNdjsonParser {
                 }
             }
             Some("result") => {
+                if let Some(errors) = v.get("errors").and_then(|value| value.as_array()) {
+                    for message in errors.iter().filter_map(|value| value.as_str()) {
+                        if !message.is_empty() {
+                            events.push(CliEvent::Error {
+                                message: truncate_str(message, 4096).to_owned(),
+                            });
+                        }
+                    }
+                }
                 let result_text = v
                     .get("result")
                     .and_then(|s| s.as_str())
@@ -450,6 +459,24 @@ mod tests {
             }
             other => panic!("expected SessionEnd, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn claude_result_errors_are_not_lost() {
+        let mut parser = ClaudeNdjsonParser::new();
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":null,"errors":["No conversation found with session ID: missing"]}"#;
+        let events = parser.parse_line(line);
+        assert!(matches!(
+            &events[..],
+            [
+                CliEvent::Error { message },
+                CliEvent::SessionEnd {
+                    result,
+                    is_error: true,
+                    ..
+                }
+            ] if message == "No conversation found with session ID: missing" && result.is_empty()
+        ));
     }
 
     #[test]

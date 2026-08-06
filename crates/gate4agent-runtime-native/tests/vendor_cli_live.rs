@@ -283,6 +283,19 @@ fn provider_errors(events: &[ControlEvent]) -> Vec<&str> {
         .collect()
 }
 
+fn provider_session_results(events: &[ControlEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            ControlEventKind::ProviderEvent {
+                event: ProviderEvent::SessionEnded { result, .. },
+                ..
+            } => Some(result.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
     assert_eq!(
         std::env::var(LIVE_CANARY_ENV).as_deref(),
@@ -471,10 +484,18 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
         Some(&first_identity),
         "{agent_id} resume changed provider session identity"
     );
-    assert!(matches!(
+    assert!(
+        matches!(
+            resumed.status,
+            SessionStatus::Exited { exit_code: Some(0) }
+        ),
+        "{agent_id} resumed child exited unsuccessfully; status={:?}; failure_kind={:?}; provider_errors={:?}; session_results={:?}; response_bytes={}",
         resumed.status,
-        SessionStatus::Exited { exit_code: Some(0) }
-    ));
+        provider_failure_kind(&events[event_boundary..]),
+        provider_errors(&events[event_boundary..]),
+        provider_session_results(&events[event_boundary..]),
+        provider_text(&events[event_boundary..]).len(),
+    );
     assert!(
         provider_failure_kind(&events[event_boundary..]).is_none(),
         "{agent_id} resumed turn emitted a provider failure"

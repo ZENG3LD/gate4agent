@@ -469,29 +469,28 @@ mod tests {
     }
 
     #[test]
-    fn claude_policy_requires_bracketed_paste_and_composer_in_either_order() {
-        for (first, second) in [
-            (b"\x1b[?2004h".as_slice(), "❯".as_bytes()),
-            ("❯".as_bytes(), b"\x1b[?2004h".as_slice()),
-        ] {
-            let mut tracker = tracker("claude", ReadinessIntent::FollowupPrompt);
-            tracker.observe_foreground(
-                &ForegroundObservation {
-                    process_name: Some("claude".to_owned()),
-                    has_child_processes: false,
-                    is_shell: false,
-                },
-                100,
-            );
-            assert_eq!(
-                tracker.observe_output(first, 200),
-                ReadinessStatus::Waiting
-            );
-            assert_eq!(
-                tracker.observe_output(second, 250),
-                ReadinessStatus::Ready(ReadyReason::DraftSignal)
-            );
-        }
+    fn claude_policy_requires_cursor_visibility_after_bracketed_paste() {
+        let mut tracker = tracker("claude", ReadinessIntent::FollowupPrompt);
+        tracker.observe_foreground(
+            &ForegroundObservation {
+                process_name: Some("claude".to_owned()),
+                has_child_processes: false,
+                is_shell: false,
+            },
+            100,
+        );
+        assert_eq!(
+            tracker.observe_output(b"\x1b[?25h", 150),
+            ReadinessStatus::Waiting
+        );
+        assert_eq!(
+            tracker.observe_output(b"\x1b[?2004h", 200),
+            ReadinessStatus::Waiting
+        );
+        assert_eq!(
+            tracker.observe_output(b"\x1b[?25h", 250),
+            ReadinessStatus::Ready(ReadyReason::DraftSignal)
+        );
     }
 
     #[test]

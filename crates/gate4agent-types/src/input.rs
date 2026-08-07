@@ -4,6 +4,7 @@ use thiserror::Error;
 
 pub const TERMINAL_INPUT_CHUNK_MAX_BYTES: usize = 16 * 1024;
 pub const TERMINAL_INPUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const TERMINAL_BYTES_MAX_BYTES: usize = 64;
 pub const TERMINAL_SUBMIT_DELAY_MS: u64 = 500;
 pub const TERMINAL_WRITE_DELAY_MAX_MS: u64 = 5_000;
 pub const SEMANTIC_PROMPT_MAX_BYTES: usize = TERMINAL_INPUT_MAX_BYTES;
@@ -43,11 +44,58 @@ pub struct TerminalText {
 pub enum TerminalControl {
     Interrupt,
     EndOfFile,
+    ControlA,
+    ControlB,
+    ControlE,
+    ControlF,
+    ControlG,
+    ControlH,
+    ControlI,
+    ControlJ,
+    ControlK,
+    ControlL,
+    ControlM,
+    ControlN,
+    ControlO,
+    ControlP,
+    ControlQ,
+    ControlR,
+    ControlS,
+    ControlT,
+    ControlU,
+    ControlV,
+    ControlW,
+    ControlX,
+    ControlY,
+    ControlZ,
     Enter,
     LineFeed,
     Escape,
     Backspace,
     Tab,
+    BackTab,
+    Insert,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    ArrowUp,
+    ArrowDown,
+    ArrowRight,
+    ArrowLeft,
+    Function1,
+    Function2,
+    Function3,
+    Function4,
+    Function5,
+    Function6,
+    Function7,
+    Function8,
+    Function9,
+    Function10,
+    Function11,
+    Function12,
 }
 
 impl TerminalControl {
@@ -55,11 +103,58 @@ impl TerminalControl {
         match self {
             Self::Interrupt => b"\x03",
             Self::EndOfFile => b"\x04",
+            Self::ControlA => b"\x01",
+            Self::ControlB => b"\x02",
+            Self::ControlE => b"\x05",
+            Self::ControlF => b"\x06",
+            Self::ControlG => b"\x07",
+            Self::ControlH => b"\x08",
+            Self::ControlI => b"\x09",
+            Self::ControlJ => b"\x0a",
+            Self::ControlK => b"\x0b",
+            Self::ControlL => b"\x0c",
+            Self::ControlM => b"\x0d",
+            Self::ControlN => b"\x0e",
+            Self::ControlO => b"\x0f",
+            Self::ControlP => b"\x10",
+            Self::ControlQ => b"\x11",
+            Self::ControlR => b"\x12",
+            Self::ControlS => b"\x13",
+            Self::ControlT => b"\x14",
+            Self::ControlU => b"\x15",
+            Self::ControlV => b"\x16",
+            Self::ControlW => b"\x17",
+            Self::ControlX => b"\x18",
+            Self::ControlY => b"\x19",
+            Self::ControlZ => b"\x1a",
             Self::Enter => b"\r",
             Self::LineFeed => b"\n",
             Self::Escape => b"\x1b",
             Self::Backspace => b"\x08",
             Self::Tab => b"\t",
+            Self::BackTab => b"\x1b[Z",
+            Self::Insert => b"\x1b[2~",
+            Self::Delete => b"\x1b[3~",
+            Self::Home => b"\x1b[H",
+            Self::End => b"\x1b[F",
+            Self::PageUp => b"\x1b[5~",
+            Self::PageDown => b"\x1b[6~",
+            Self::ArrowUp => b"\x1b[A",
+            Self::ArrowDown => b"\x1b[B",
+            Self::ArrowRight => b"\x1b[C",
+            Self::ArrowLeft => b"\x1b[D",
+            Self::Function1 => b"\x1bOP",
+            Self::Function2 => b"\x1bOQ",
+            Self::Function3 => b"\x1bOR",
+            Self::Function4 => b"\x1bOS",
+            Self::Function5 => b"\x1b[15~",
+            Self::Function6 => b"\x1b[17~",
+            Self::Function7 => b"\x1b[18~",
+            Self::Function8 => b"\x1b[19~",
+            Self::Function9 => b"\x1b[20~",
+            Self::Function10 => b"\x1b[21~",
+            Self::Function11 => b"\x1b[23~",
+            Self::Function12 => b"\x1b[24~",
         }
     }
 }
@@ -71,6 +166,7 @@ pub enum InputAction {
     AgentCommand(AgentCommand),
     ShellCommand(ShellCommand),
     TerminalText(TerminalText),
+    TerminalBytes(Vec<u8>),
     TerminalControl(TerminalControl),
 }
 
@@ -103,6 +199,7 @@ pub enum PreparedInputKind {
     AgentCommand,
     ShellCommand,
     TerminalText,
+    TerminalBytes,
     TerminalControl,
 }
 
@@ -185,6 +282,28 @@ pub fn prepare_input_with_limits(
                         })
                         .collect(),
                 }
+            })
+        }
+        InputAction::TerminalBytes(bytes) => {
+            if bytes.is_empty() {
+                return Err(InputPrepareError::EmptyTerminalBytes);
+            }
+            let max_bytes = TERMINAL_BYTES_MAX_BYTES
+                .min(max_chunk_bytes)
+                .min(max_total_bytes);
+            if bytes.len() > max_bytes {
+                return Err(InputPrepareError::InputTooLarge {
+                    bytes: bytes.len(),
+                    max: max_bytes,
+                });
+            }
+            Ok(PreparedInput {
+                kind: PreparedInputKind::TerminalBytes,
+                writes: vec![PreparedWrite {
+                    kind: PreparedWriteKind::Control,
+                    bytes,
+                    delay_before_ms: 0,
+                }],
             })
         }
         InputAction::TerminalControl(control) => Ok(PreparedInput {
@@ -422,6 +541,8 @@ pub enum InputPrepareError {
     InputTooLarge { bytes: usize, max: usize },
     #[error("a {bytes}-byte UTF-8 code point does not fit the {max}-byte chunk limit")]
     ChunkLimitTooSmall { bytes: usize, max: usize },
+    #[error("terminal byte sequence cannot be empty")]
+    EmptyTerminalBytes,
     #[error(
         "terminal text contains control U+{codepoint:04X} at byte {index}; use TerminalControl"
     )]
@@ -514,6 +635,60 @@ mod tests {
             error,
             InputPrepareError::ControlCharacterInTerminalText { .. }
         ));
+    }
+
+    #[test]
+    fn terminal_bytes_preserve_one_bounded_sequence_without_framing() {
+        let sequence = b"\x1b[1;5D".to_vec();
+        let prepared = prepare_input(InputAction::TerminalBytes(sequence.clone())).unwrap();
+        assert_eq!(prepared.kind(), PreparedInputKind::TerminalBytes);
+        assert_eq!(
+            prepared.writes(),
+            &[PreparedWrite {
+                kind: PreparedWriteKind::Control,
+                bytes: sequence,
+                delay_before_ms: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn terminal_bytes_reject_empty_and_oversized_sequences() {
+        assert_eq!(
+            prepare_input(InputAction::TerminalBytes(Vec::new())).unwrap_err(),
+            InputPrepareError::EmptyTerminalBytes,
+        );
+        assert_eq!(
+            prepare_input(InputAction::TerminalBytes(vec![0; TERMINAL_BYTES_MAX_BYTES + 1]))
+                .unwrap_err(),
+            InputPrepareError::InputTooLarge {
+                bytes: TERMINAL_BYTES_MAX_BYTES + 1,
+                max: TERMINAL_BYTES_MAX_BYTES,
+            },
+        );
+    }
+
+    #[test]
+    fn arrow_controls_preserve_terminal_escape_sequences() {
+        assert_eq!(TerminalControl::ArrowUp.bytes(), b"\x1b[A");
+        assert_eq!(TerminalControl::ArrowDown.bytes(), b"\x1b[B");
+        assert_eq!(TerminalControl::ArrowRight.bytes(), b"\x1b[C");
+        assert_eq!(TerminalControl::ArrowLeft.bytes(), b"\x1b[D");
+    }
+
+    #[test]
+    fn interactive_terminal_controls_preserve_xterm_sequences() {
+        assert_eq!(TerminalControl::BackTab.bytes(), b"\x1b[Z");
+        assert_eq!(TerminalControl::Insert.bytes(), b"\x1b[2~");
+        assert_eq!(TerminalControl::Delete.bytes(), b"\x1b[3~");
+        assert_eq!(TerminalControl::Home.bytes(), b"\x1b[H");
+        assert_eq!(TerminalControl::End.bytes(), b"\x1b[F");
+        assert_eq!(TerminalControl::PageUp.bytes(), b"\x1b[5~");
+        assert_eq!(TerminalControl::PageDown.bytes(), b"\x1b[6~");
+        assert_eq!(TerminalControl::Function1.bytes(), b"\x1bOP");
+        assert_eq!(TerminalControl::Function12.bytes(), b"\x1b[24~");
+        assert_eq!(TerminalControl::ControlA.bytes(), b"\x01");
+        assert_eq!(TerminalControl::ControlZ.bytes(), b"\x1a");
     }
 
     #[test]

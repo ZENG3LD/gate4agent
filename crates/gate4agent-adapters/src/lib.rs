@@ -12,6 +12,7 @@ mod hook;
 mod hook_session;
 mod managed_hook;
 mod one_shot;
+mod pty_identity;
 mod resume;
 mod session_options;
 
@@ -50,6 +51,10 @@ pub use one_shot::{
     CLAUDE_CODE_INLINE_REVISION, CODEX_CLI_INLINE_REVISION, KIMI_CODE_INLINE_REVISION,
     ONE_SHOT_OUTPUT_MAX_BYTES, ONE_SHOT_REVISION, ONE_SHOT_THINKING_OPTION_ID,
     ONE_SHOT_TIMEOUT_SECONDS, QWEN_CODE_INLINE_REVISION,
+};
+pub use pty_identity::{
+    CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor,
+    KIMI_PTY_SESSION_ID_MAX_BYTES,
 };
 pub use resume::{
     build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,
@@ -284,7 +289,7 @@ pub fn builtin_adapter_registry() -> &'static AdapterRegistry {
 
 fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     let mut descriptors = Vec::new();
-    for id in ["claude-code", "codex", "gemini", "opencode"] {
+    for id in ["claude-code", "codex", "gemini", "opencode", "kimi"] {
         descriptors.push(descriptor(AdapterFamily::PtySemantic, id));
     }
     for id in ["claude-code", "codex", "gemini", "opencode", "kimi"] {

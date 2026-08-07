@@ -33,6 +33,8 @@ pub enum PtyError {
     Pty(String),
     #[error("Windows command wrapper argument {index} contains shell metacharacters")]
     UnsafeWindowsCommandArgument { index: usize },
+    #[error("Windows PTY working directory cannot be a UNC path: {path}")]
+    UnsupportedWindowsUncWorkingDirectory { path: String },
     #[error("PTY OS reader thread did not join within {timeout_ms}ms")]
     ReaderJoinTimedOut { timeout_ms: u64 },
     #[error("PTY OS reader thread panicked")]
@@ -213,7 +215,7 @@ impl PtyWrapper {
         rows: u16,
         cols: u16,
     ) -> Result<Self, PtyError> {
-        let cmd = Self::build_command(tool, working_dir, env_vars);
+        let cmd = Self::build_command(tool, working_dir, env_vars)?;
         Self::spawn_command(AgentId::from(tool), Some(tool), cmd, rows, cols)
     }
 
@@ -289,7 +291,7 @@ impl PtyWrapper {
         tool: CliTool,
         working_dir: &std::path::Path,
         env_vars: &[(String, String)],
-    ) -> CommandBuilder {
+    ) -> Result<CommandBuilder, PtyError> {
         let mut cmd = if cfg!(windows) {
             let tool_name = match tool {
                 CliTool::ClaudeCode => "claude",
@@ -316,7 +318,7 @@ impl PtyWrapper {
             }
         };
 
-        cmd.cwd(working_dir);
+        cmd.cwd(validated_windows_child_working_directory(working_dir)?);
 
         // Note: CommandBuilder::new() already inherits ALL current process
         // environment variables via get_base_env(), so we don't need to
@@ -327,7 +329,7 @@ impl PtyWrapper {
             cmd.env(key, value);
         }
 
-        cmd
+        Ok(cmd)
     }
 
     fn build_launch_plan_command(plan: &LaunchPlan) -> Result<CommandBuilder, PtyError> {
@@ -339,7 +341,7 @@ impl PtyWrapper {
                     }
                 }
                 let mut command = CommandBuilder::new("cmd.exe");
-                command.args(["/D", "/Q", "/C"]);
+                command.args(["/D", "/Q", windows_wrapper_mode(&plan.agent_id)]);
                 command.arg(wrapper);
                 command.args(&plan.args);
                 command
@@ -356,7 +358,7 @@ impl PtyWrapper {
             CommandBuilder::from_argv(argv)
         };
 
-        command.cwd(&plan.working_dir);
+        command.cwd(validated_windows_child_working_directory(&plan.working_dir)?);
         for mutation in &plan.env {
             if let Some(value) = &mutation.value {
                 command.env(&mutation.key, value);
@@ -581,6 +583,45 @@ fn windows_command_wrapper(program: &OsStr) -> Option<OsString> {
     })
 }
 
+fn windows_wrapper_mode(agent_id: &AgentId) -> &'static str {
+    if agent_id.as_str() == "kimi" {
+        "/K"
+    } else {
+        "/C"
+    }
+}
+
+fn windows_child_working_directory(path: &Path) -> PathBuf {
+    if !cfg!(windows) {
+        return path.to_owned();
+    }
+    let value = path.as_os_str().to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_owned()
+}
+
+fn validated_windows_child_working_directory(path: &Path) -> Result<PathBuf, PtyError> {
+    let normalized = windows_child_working_directory(path);
+    if cfg!(windows) && normalized.as_os_str().to_string_lossy().starts_with(r"\\") {
+        return Err(PtyError::UnsupportedWindowsUncWorkingDirectory {
+            path: normalized.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
 fn is_safe_windows_wrapper_argument(argument: &OsStr) -> bool {
     let value = argument.to_string_lossy();
     !value.chars().any(|character| {
@@ -594,6 +635,45 @@ fn is_safe_windows_wrapper_argument(argument: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_keeps_the_windows_command_wrapper_as_the_process_tree_anchor() {
+        assert_eq!(windows_wrapper_mode(&AgentId::new("kimi").unwrap()), "/K");
+        assert_eq!(windows_wrapper_mode(&AgentId::new("claude").unwrap()), "/C");
+        assert_eq!(windows_wrapper_mode(&AgentId::new("codex").unwrap()), "/C");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_working_directory_removes_cmd_incompatible_verbatim_prefixes() {
+        assert_eq!(
+            windows_child_working_directory(Path::new(r"\\?\C:\repo\workspace")),
+            PathBuf::from(r"C:\repo\workspace")
+        );
+        assert_eq!(
+            windows_child_working_directory(Path::new(r"\\?\UNC\server\share\workspace")),
+            PathBuf::from(r"\\server\share\workspace")
+        );
+        assert_eq!(
+            windows_child_working_directory(Path::new(r"C:\repo\workspace")),
+            PathBuf::from(r"C:\repo\workspace")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_working_directory_rejects_unc_before_spawn() {
+        assert!(matches!(
+            validated_windows_child_working_directory(Path::new(
+                r"\\?\UNC\server\share\workspace"
+            )),
+            Err(PtyError::UnsupportedWindowsUncWorkingDirectory { .. })
+        ));
+        assert!(matches!(
+            validated_windows_child_working_directory(Path::new(r"\\server\share\workspace")),
+            Err(PtyError::UnsupportedWindowsUncWorkingDirectory { .. })
+        ));
+    }
 
     #[test]
     fn output_queue_resumes_only_after_low_water() {

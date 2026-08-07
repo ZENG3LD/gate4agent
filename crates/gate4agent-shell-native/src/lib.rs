@@ -19,8 +19,8 @@ use gate4agent::agent::ReadinessStatus;
 use gate4agent::pty::cli::codex::strip_ansi_codes;
 use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
 use gate4agent::pty::{
-    PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtyForegroundObservation, PtySession,
-    PtyTerminalSnapshot, RateLimitDetector,
+    PtyAttachment, PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtyForegroundObservation,
+    PtyReplayCursor, PtySession, PtyTerminalSnapshot, RateLimitDetector,
 };
 use gate4agent::{
     AcpSession, AcpSessionOptions, AgentEvent, CliTool, LaunchRequest, PipeProcessOptions,
@@ -29,16 +29,18 @@ use gate4agent::{
 };
 use gate4agent_adapters::{
     build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
+    CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor,
 };
 use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
 use gate4agent_shell_one_shot::NativeOneShotSession;
 use gate4agent_types::{
-    AdapterFamily, AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect,
+    AdapterFamily, AgentCommand, AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect,
     ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
-    ForegroundRequirement, ObservationEnvelope, OperationId, PipeProtocol, PreparedInputKind,
-    ProviderEvent, ProviderInteractionKind, ProviderSource, ResumeLaunchRequest, SessionGeneration,
-    StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION,
-    WORKING_DIRECTORY_MAX_BYTES,
+    ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, PipeProtocol,
+    PreparedInputKind, PromptPayload, ProviderEvent, ProviderInteractionKind,
+    ProviderSessionIdentity, ProviderSessionKey, ProviderSource, ResumeLaunchRequest,
+    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
@@ -46,6 +48,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct NativeSessionKey {
@@ -77,6 +80,8 @@ struct OwnedPtyProvider {
     utf8: Utf8ChunkDecoder,
     pipeline: Mutex<ClassificationPipeline>,
     rate_limits: RateLimitDetector,
+    kimi_identity: Option<KimiPtySessionIdentityExtractor>,
+    provider_session_started: bool,
     next_provider_sequence: u64,
 }
 
@@ -266,6 +271,7 @@ impl NativeEffectShell {
                             if matches!(
                                 input.kind(),
                                 PreparedInputKind::TerminalText
+                                    | PreparedInputKind::TerminalBytes
                                     | PreparedInputKind::TerminalControl
                             ) =>
                         {
@@ -300,6 +306,7 @@ impl NativeEffectShell {
                                 PreparedInputKind::SubmitPrompt => ReadinessIntent::FollowupPrompt,
                                 PreparedInputKind::ShellCommand
                                 | PreparedInputKind::TerminalText
+                                | PreparedInputKind::TerminalBytes
                                 | PreparedInputKind::TerminalControl => unreachable!(),
                             };
                             let Some(spec) = self.catalog.get(&agent_id).cloned() else {
@@ -436,7 +443,7 @@ impl NativeEffectShell {
             agent_id,
             transport,
             request,
-            launch_extra_args,
+            mut launch_extra_args,
             resumed_provider_session,
         } = spawn;
         if self.session_exists(key) {
@@ -473,22 +480,75 @@ impl NativeEffectShell {
                     message: format!("agent '{agent_id}' does not support PTY transport"),
                 }
             }
-            TransportKind::Pty => match PtySession::spawn_agent_with_size(
-                &spec,
-                LaunchRequest {
-                    working_dir,
-                    env: pty_env,
-                    platform: RuntimePlatform::current(),
-                    prompt: request.initial_prompt,
-                    session_options: request.session_options,
-                    extra_args: launch_extra_args,
-                },
-                request.terminal_size.rows,
-                request.terminal_size.columns,
-            )
-            .await
-            {
+            TransportKind::Pty => {
+                let fresh_provider_session = prepare_fresh_pty_provider_session(
+                    spec.capabilities.transports.pty_adapter.as_ref(),
+                    resumed_provider_session.is_some(),
+                    &mut launch_extra_args,
+                );
+                let mut authoritative_provider_session = resumed_provider_session
+                    .clone()
+                    .or(fresh_provider_session);
+                let probe_kimi_identity = authoritative_provider_session.is_none()
+                    && spec
+                        .capabilities
+                        .transports
+                        .pty_adapter
+                        .as_ref()
+                        .is_some_and(|adapter| adapter.id.as_str() == "kimi");
+                let probe_codex_identity = authoritative_provider_session.is_none()
+                    && spec
+                        .capabilities
+                        .transports
+                        .pty_adapter
+                        .as_ref()
+                        .is_some_and(|adapter| adapter.id.as_str() == "codex");
+                match PtySession::spawn_agent_with_size(
+                    &spec,
+                    LaunchRequest {
+                        working_dir,
+                        env: pty_env,
+                        platform: RuntimePlatform::current(),
+                        prompt: request.initial_prompt,
+                        session_options: request.session_options,
+                        extra_args: launch_extra_args,
+                    },
+                    request.terminal_size.rows,
+                    request.terminal_size.columns,
+                )
+                .await
+                {
                 Ok(mut session) => {
+                    if probe_kimi_identity {
+                        match probe_fresh_kimi_session_identity(&session, &spec).await {
+                            Ok(Some(identity)) => authoritative_provider_session = Some(identity),
+                            Ok(None) => {}
+                            Err(error) => {
+                                let message = match session.shutdown().await {
+                                    Ok(_) => error,
+                                    Err(shutdown_error) => {
+                                        format!("{error}; PTY cleanup failed: {shutdown_error}")
+                                    }
+                                };
+                                return ControlObservation::SpawnFailed { message };
+                            }
+                        }
+                    }
+                    if probe_codex_identity {
+                        match probe_fresh_codex_session_identity(&session, &spec).await {
+                            Ok(Some(identity)) => authoritative_provider_session = Some(identity),
+                            Ok(None) => {}
+                            Err(error) => {
+                                let message = match session.shutdown().await {
+                                    Ok(_) => error,
+                                    Err(shutdown_error) => {
+                                        format!("{error}; PTY cleanup failed: {shutdown_error}")
+                                    }
+                                };
+                                return ControlObservation::SpawnFailed { message };
+                            }
+                        }
+                    }
                     if let Err(error) = deliver_pending_initial_prompt(&mut session, &spec).await {
                         let message = match session.shutdown().await {
                             Ok(_) => error,
@@ -499,7 +559,6 @@ impl NativeEffectShell {
                         return ControlObservation::SpawnFailed { message };
                     }
                     let process_id = session.root_pid();
-                    let session_id = session.session_id().to_owned();
                     let provider = match spec.capabilities.transports.pty_adapter.as_ref() {
                         Some(adapter) => {
                             let tool = match self
@@ -516,17 +575,20 @@ impl NativeEffectShell {
                             };
                             match session.attach_events(session.beginning_cursor()) {
                                 Ok(attachment) => {
-                                    let mut pending_events =
-                                        VecDeque::from([ProviderEvent::SessionStarted {
-                                            session_id,
+                                    let mut pending_events = VecDeque::new();
+                                    let mut provider_session_started = false;
+                                    if let Some(identity) = authoritative_provider_session {
+                                        pending_events.push_back(ProviderEvent::SessionStarted {
+                                            session_id: identity.id.clone(),
                                             model: String::new(),
                                             tools: Vec::new(),
-                                        }]);
-                                    if let Some(identity) = resumed_provider_session {
+                                        });
                                         pending_events.push_back(
                                             ProviderEvent::SessionIdentityObserved { identity },
                                         );
+                                        provider_session_started = true;
                                     }
+                                    let is_kimi = tool == CliTool::KimiCode;
                                     Some(OwnedPtyProvider {
                                         source: ProviderSource {
                                             family: AdapterFamily::PtySemantic,
@@ -538,6 +600,9 @@ impl NativeEffectShell {
                                         utf8: Utf8ChunkDecoder::default(),
                                         pipeline: Mutex::new(create_pipeline(tool)),
                                         rate_limits: RateLimitDetector::new_for_tool(tool),
+                                        kimi_identity: (is_kimi && !provider_session_started)
+                                            .then(KimiPtySessionIdentityExtractor::default),
+                                        provider_session_started,
                                         next_provider_sequence: 1,
                                     })
                                 }
@@ -563,10 +628,11 @@ impl NativeEffectShell {
                     );
                     ControlObservation::Spawned { process_id }
                 }
-                Err(error) => ControlObservation::SpawnFailed {
-                    message: error.to_string(),
-                },
-            },
+                    Err(error) => ControlObservation::SpawnFailed {
+                        message: error.to_string(),
+                    },
+                }
+            }
             TransportKind::Pipe => {
                 let Some(pipe_spec) = spec.capabilities.transports.pipe.as_ref() else {
                     return ControlObservation::SpawnFailed {
@@ -1033,6 +1099,25 @@ fn missing_session_message(key: NativeSessionKey) -> String {
     )
 }
 
+fn prepare_fresh_pty_provider_session(
+    adapter: Option<&gate4agent_types::AdapterBinding>,
+    is_resume: bool,
+    launch_extra_args: &mut Vec<OsString>,
+) -> Option<ProviderSessionIdentity> {
+    let adapter = adapter?;
+    if is_resume || adapter.id.as_str() != "claude-code" {
+        return None;
+    }
+    let identity = ProviderSessionIdentity {
+        key: ProviderSessionKey::SessionId,
+        id: Uuid::new_v4().to_string(),
+        transcript_path: None,
+    };
+    launch_extra_args.push(OsString::from("--session-id"));
+    launch_extra_args.push(OsString::from(&identity.id));
+    Some(identity)
+}
+
 fn drain_pty_provider(
     key: NativeSessionKey,
     provider: &mut OwnedPtyProvider,
@@ -1059,6 +1144,31 @@ fn drain_pty_provider(
                 if let Some(info) = provider.rate_limits.detect(&raw) {
                     push_provider_observation(key, provider, rate_limit_event(info), observations);
                 }
+                let identity = provider
+                    .kimi_identity
+                    .as_mut()
+                    .and_then(|extractor| extractor.push(&raw));
+                if let Some(identity) = identity {
+                    if !provider.provider_session_started {
+                        push_provider_observation(
+                            key,
+                            provider,
+                            ProviderEvent::SessionStarted {
+                                session_id: identity.id.clone(),
+                                model: String::new(),
+                                tools: Vec::new(),
+                            },
+                            observations,
+                        );
+                        provider.provider_session_started = true;
+                    }
+                    push_provider_observation(
+                        key,
+                        provider,
+                        ProviderEvent::SessionIdentityObserved { identity },
+                        observations,
+                    );
+                }
                 let messages = provider
                     .pipeline
                     .get_mut()
@@ -1076,6 +1186,9 @@ fn drain_pty_provider(
                 ..
             } => {
                 provider.utf8.clear();
+                if let Some(extractor) = &mut provider.kimi_identity {
+                    extractor.reset_stream();
+                }
                 provider
                     .pipeline
                     .get_mut()
@@ -1359,6 +1472,7 @@ fn builtin_legacy_adapter_runtimes() -> AdapterRuntimeRegistry<CliTool> {
         ("codex", CliTool::Codex),
         ("gemini", CliTool::Gemini),
         ("opencode", CliTool::OpenCode),
+        ("kimi", CliTool::KimiCode),
     ];
     let mut runtimes = AdapterRuntimeRegistry::default();
     for (id, tool) in definitions {
@@ -1377,13 +1491,6 @@ fn builtin_legacy_adapter_runtimes() -> AdapterRuntimeRegistry<CliTool> {
                 .expect("built-in native ACP adapter runtime must be unique");
         }
     }
-    let kimi_pipe = builtin_adapter_registry()
-        .binding(AdapterFamily::Pipe, "kimi")
-        .expect("missing built-in Pipe adapter kimi")
-        .clone();
-    runtimes
-        .insert(AdapterFamily::Pipe, kimi_pipe, CliTool::KimiCode)
-        .expect("built-in Kimi Pipe adapter runtime must be unique");
     runtimes
 }
 
@@ -1469,9 +1576,7 @@ async fn wait_for_readiness(
     detect_startup_gates: bool,
 ) -> Result<ReadinessPermit, String> {
     let started = Instant::now();
-    let attachment = session
-        .attach_retained_events()
-        .map_err(|error| error.to_string())?;
+    let (terminal, attachment) = attach_readiness_boundary(session)?;
     let mut receiver = attachment.receiver;
     let mut tracker = ReadinessTracker::new(spec, RuntimePlatform::current(), intent);
     let mut diagnostics = ReadinessDiagnostics {
@@ -1479,7 +1584,7 @@ async fn wait_for_readiness(
         ..ReadinessDiagnostics::default()
     };
     seed_readiness_from_terminal(
-        session,
+        &terminal,
         &mut tracker,
         &mut diagnostics,
         elapsed_ms(started),
@@ -1527,9 +1632,7 @@ async fn wait_for_readiness(
         match tokio::time::timeout(wait, receiver.recv()).await {
             Ok(Ok(event)) => {
                 if matches!(&event.event, PtyEvent::DataGap { .. }) {
-                    let attachment = session
-                        .attach_retained_events()
-                        .map_err(|error| error.to_string())?;
+                    let (terminal, attachment) = attach_readiness_boundary(session)?;
                     receiver = attachment.receiver;
                     tracker = ReadinessTracker::new(
                         spec,
@@ -1541,7 +1644,7 @@ async fn wait_for_readiness(
                         ..ReadinessDiagnostics::default()
                     };
                     seed_readiness_from_terminal(
-                        session,
+                        &terminal,
                         &mut tracker,
                         &mut diagnostics,
                         elapsed_ms(started),
@@ -1583,22 +1686,35 @@ async fn wait_for_readiness(
     }
 }
 
-fn seed_readiness_from_terminal(
+fn attach_readiness_boundary(
     session: &PtySession,
+) -> Result<(PtyTerminalSnapshot, PtyAttachment), String> {
+    let terminal = session.terminal_state().map_err(|error| error.to_string())?;
+    let cursor = PtyReplayCursor {
+        provider_revision: terminal.provider_revision.clone(),
+        generation: terminal.generation,
+        next_sequence: terminal.sequence.saturating_add(1).max(1),
+    };
+    let attachment = session
+        .attach_events(cursor)
+        .map_err(|error| error.to_string())?;
+    Ok((terminal, attachment))
+}
+
+fn seed_readiness_from_terminal(
+    terminal: &PtyTerminalSnapshot,
     tracker: &mut ReadinessTracker<'_>,
     diagnostics: &mut ReadinessDiagnostics,
     elapsed_ms: u64,
 ) -> Result<(), String> {
     const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
-    let terminal = session.terminal_state().map_err(|error| error.to_string())?;
     if terminal.bracketed_paste {
         diagnostics.observe_output(ENABLE_BRACKETED_PASTE);
         tracker.observe_output(ENABLE_BRACKETED_PASTE, elapsed_ms);
     }
-    let contents = terminal.contents.as_bytes();
-    if !contents.is_empty() {
-        diagnostics.observe_output(contents);
-        tracker.observe_output(contents, elapsed_ms);
+    if !terminal.formatted.is_empty() {
+        diagnostics.observe_output(&terminal.formatted);
+        tracker.observe_output(&terminal.formatted, elapsed_ms);
     }
     Ok(())
 }
@@ -1610,6 +1726,117 @@ const STARTUP_GATE_POLL_MS: u64 = 25;
 // visibly incorporates the deferred initial prompt.
 const CODEX_PASTE_ENTER_SUPPRESSION_MS: u64 = 120;
 const CODEX_POST_RENDER_MARGIN_MS: u64 = 30;
+const CODEX_SESSION_STATUS_PROBE_TIMEOUT_MS: u64 = 5_000;
+const KIMI_SESSION_STATUS_PROBE_TIMEOUT_MS: u64 = 5_000;
+
+async fn probe_fresh_codex_session_identity(
+    session: &PtySession,
+    spec: &AgentSpec,
+) -> Result<Option<ProviderSessionIdentity>, String> {
+    let permit = match wait_for_readiness(session, spec, ReadinessIntent::DraftPaste, true).await {
+        Ok(permit) => permit,
+        Err(_) => return Ok(None),
+    };
+    if wait_for_startup_operator_gate(session, spec).await.is_err() {
+        return Ok(None);
+    }
+    let baseline = session
+        .terminal_state()
+        .map_err(|error| error.to_string())?;
+    let mut extractor = CodexPtySessionIdentityExtractor::default();
+    session
+        .send_input_action(
+            InputAction::AgentCommand(AgentCommand {
+                agent_id: spec.id.clone(),
+                name: "status".to_owned(),
+                arguments: Vec::new(),
+            }),
+            permit,
+        )
+        .await
+        .map_err(|error| format!("Codex /status identity probe failed: {error}"))?;
+
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            spec.readiness
+                .timeout_ms
+                .min(CODEX_SESSION_STATUS_PROBE_TIMEOUT_MS)
+                .max(1),
+        );
+    loop {
+        let snapshot = session
+            .terminal_state()
+            .map_err(|error| error.to_string())?;
+        if snapshot.sequence > baseline.sequence {
+            if let Some(identity) = extractor.observe_screen(&snapshot.contents) {
+                return Ok(Some(identity));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(STARTUP_GATE_POLL_MS)).await;
+    }
+}
+
+async fn probe_fresh_kimi_session_identity(
+    session: &PtySession,
+    spec: &AgentSpec,
+) -> Result<Option<ProviderSessionIdentity>, String> {
+    let permit = match wait_for_readiness(
+        session,
+        spec,
+        ReadinessIntent::FollowupPrompt,
+        true,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(_) => return Ok(None),
+    };
+    if wait_for_startup_operator_gate(session, spec).await.is_err() {
+        return Ok(None);
+    }
+    let baseline = session
+        .terminal_state()
+        .map_err(|error| error.to_string())?;
+    let mut extractor = KimiPtySessionIdentityExtractor::default();
+    if let Some(identity) = extractor.observe_screen(&baseline.contents) {
+        return Ok(Some(identity));
+    }
+    session
+        .send_input_action(
+            InputAction::SubmitPrompt(PromptPayload {
+                text: "/status".to_owned(),
+                framing: PromptFraming::BracketedPaste,
+            }),
+            permit,
+        )
+        .await
+        .map_err(|error| format!("Kimi /status identity probe failed: {error}"))?;
+
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            spec.readiness
+                .timeout_ms
+                .min(KIMI_SESSION_STATUS_PROBE_TIMEOUT_MS)
+                .max(1),
+        );
+    loop {
+        let snapshot = session
+            .terminal_state()
+            .map_err(|error| error.to_string())?;
+        if snapshot.sequence > baseline.sequence {
+            if let Some(identity) = extractor.observe_screen(&snapshot.contents) {
+                return Ok(Some(identity));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(STARTUP_GATE_POLL_MS)).await;
+    }
+}
 
 async fn deliver_pending_initial_prompt(
     session: &mut PtySession,
@@ -1685,13 +1912,141 @@ async fn wait_for_prompt_render(
             return Ok(());
         }
         if Instant::now() >= deadline {
+            let tail = terminal_tail(&snapshot.contents);
+            let compact_tail = compact_alphanumeric(&tail);
+            let baseline_tail = terminal_tail(&baseline.contents).to_ascii_lowercase();
+            let normalized_tail = tail.to_ascii_lowercase();
+            let retained = render_ack_event_summary(session, baseline.sequence);
+            let foreground = session.observe_foreground().await.ok();
+            let foreground_name = foreground
+                .as_ref()
+                .and_then(|observation| observation.readiness.process_name.as_deref())
+                .map(safe_process_label)
+                .unwrap_or_else(|| "none".to_owned());
+            let child_live = retained.exit_code.is_none() && foreground.is_some();
             return Err(format!(
-                "agent '{}' initial prompt paste was not rendered before submit; Enter was not sent",
-                spec.id
+                "agent '{}' initial prompt paste was not rendered before submit; Enter was not sent (baseline_sequence={} current_sequence={} sequence_delta={} cursor_changed={} bracketed_baseline={} bracketed_current={} tail_chars={} probe_chars={} probe_match={} placeholder_baseline={} placeholder_current={} child_live={} foreground={} retained_output={} retained_foreground={} retained_snapshots={} retained_resized={} retained_gaps={} retained_reader_errors={} retained_operator_actions={} retained_exit_code={} output_flags={})",
+                spec.id,
+                baseline.sequence,
+                snapshot.sequence,
+                snapshot.sequence.saturating_sub(baseline.sequence),
+                snapshot.cursor != baseline.cursor,
+                baseline.bracketed_paste,
+                snapshot.bracketed_paste,
+                tail.chars().count(),
+                probe.chars().count(),
+                !probe.is_empty() && compact_tail.contains(&probe),
+                paste_placeholder_visible(&baseline_tail),
+                paste_placeholder_visible(&normalized_tail),
+                child_live,
+                foreground_name,
+                retained.output,
+                retained.foreground,
+                retained.snapshots,
+                retained.resized,
+                retained.gaps,
+                retained.reader_errors,
+                retained.operator_actions,
+                retained
+                    .exit_code
+                    .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+                if retained.output_flags.is_empty() {
+                    "none".to_owned()
+                } else {
+                    retained.output_flags.join(",")
+                },
             ));
         }
         tokio::time::sleep(Duration::from_millis(STARTUP_GATE_POLL_MS)).await;
     }
+}
+
+#[derive(Default)]
+struct RenderAckEventSummary {
+    output: usize,
+    foreground: usize,
+    snapshots: usize,
+    resized: usize,
+    gaps: usize,
+    reader_errors: usize,
+    operator_actions: usize,
+    exit_code: Option<i32>,
+    output_flags: Vec<&'static str>,
+}
+
+fn render_ack_event_summary(session: &PtySession, baseline_sequence: u64) -> RenderAckEventSummary {
+    let mut summary = RenderAckEventSummary::default();
+    let Ok(attachment) = session.attach_retained_events() else {
+        return summary;
+    };
+    for envelope in attachment
+        .replay
+        .into_iter()
+        .filter(|envelope| envelope.sequence > baseline_sequence)
+    {
+        match envelope.event {
+            PtyEvent::Output(bytes) => {
+                summary.output = summary.output.saturating_add(1);
+                observe_render_ack_output_flags(&mut summary.output_flags, &bytes);
+            }
+            PtyEvent::ForegroundProcess(_) => {
+                summary.foreground = summary.foreground.saturating_add(1);
+            }
+            PtyEvent::SnapshotAvailable { .. } => {
+                summary.snapshots = summary.snapshots.saturating_add(1);
+            }
+            PtyEvent::Resized(_) => {
+                summary.resized = summary.resized.saturating_add(1);
+            }
+            PtyEvent::DataGap { .. } => {
+                summary.gaps = summary.gaps.saturating_add(1);
+            }
+            PtyEvent::ReaderError { .. } => {
+                summary.reader_errors = summary.reader_errors.saturating_add(1);
+            }
+            PtyEvent::OperatorActionRequired { .. } => {
+                summary.operator_actions = summary.operator_actions.saturating_add(1);
+            }
+            PtyEvent::Exited { code } => summary.exit_code = Some(code),
+            PtyEvent::Started => {}
+        }
+    }
+    summary
+}
+
+fn observe_render_ack_output_flags(flags: &mut Vec<&'static str>, bytes: &[u8]) {
+    let normalized = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    for (label, marker) in [
+        ("error", "error"),
+        ("panic", "panic"),
+        ("fatal", "fatal"),
+        ("login", "login"),
+        ("auth", "auth"),
+        ("permission", "permission"),
+        ("rate-limit", "rate limit"),
+        ("usage-limit", "usage limit"),
+        ("update", "update"),
+        ("working", "working"),
+        ("thinking", "thinking"),
+    ] {
+        if normalized.contains(marker) && !flags.contains(&label) {
+            flags.push(label);
+        }
+    }
+}
+
+fn safe_process_label(process_name: &str) -> String {
+    process_name
+        .chars()
+        .take(64)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 fn prompt_rendered(
@@ -1819,6 +2174,13 @@ fn startup_operator_gate(contents: &str) -> Option<&'static str> {
     {
         return Some("authentication");
     }
+    if normalized.contains("sign in")
+        && (normalized.contains("openai")
+            || normalized.contains("chatgpt")
+            || normalized.contains("codex"))
+    {
+        return Some("authentication");
+    }
     if normalized.contains("kimi code update available")
         && normalized.contains("install update now")
     {
@@ -1918,7 +2280,7 @@ impl ReadinessDiagnostics {
 
     fn summary(&self) -> String {
         format!(
-            "draft_signal={:?} output_bytes={} output_chunks={} named_foreground={} bracketed_paste={} cursor_show={} cursor_hide={} alternate_screen={} clear_screen={} claude_composer={} codex_composer={}",
+            "draft_signal={:?} output_bytes={} output_chunks={} named_foreground={} bracketed_paste={} cursor_show={} cursor_hide={} alternate_screen={} clear_screen={} claude_composer={} codex_composer={} csi={}",
             self.draft_signal,
             self.output_bytes,
             self.output_chunks,
@@ -1930,7 +2292,41 @@ impl ReadinessDiagnostics {
             self.saw_clear_screen,
             self.saw_claude_composer,
             self.saw_codex_composer,
+            readiness_csi_signatures(&self.tail),
         )
+    }
+}
+
+fn readiness_csi_signatures(bytes: &[u8]) -> String {
+    let mut signatures = Vec::new();
+    let mut index = 0;
+    while index + 2 < bytes.len() && signatures.len() < 32 {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 2;
+        while end < bytes.len() && end.saturating_sub(index) <= 24 {
+            let byte = bytes[end];
+            if (0x40..=0x7e).contains(&byte) {
+                let signature = String::from_utf8_lossy(&bytes[index + 2..=end]).into_owned();
+                if !signatures.iter().any(|existing| existing == &signature) {
+                    signatures.push(signature);
+                }
+                index = end;
+                break;
+            }
+            if !(0x20..=0x3f).contains(&byte) {
+                break;
+            }
+            end += 1;
+        }
+        index += 1;
+    }
+    if signatures.is_empty() {
+        "none".to_owned()
+    } else {
+        signatures.join("|")
     }
 }
 
@@ -1961,9 +2357,12 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        prompt_render_probe, prompt_rendered, startup_operator_gate, ReadinessDiagnostics,
-        Utf8ChunkDecoder,
+        prepare_fresh_pty_provider_session, prompt_render_probe, prompt_rendered,
+        startup_operator_gate, ReadinessDiagnostics, Utf8ChunkDecoder,
     };
+    use gate4agent_adapters::builtin_adapter_registry;
+    use gate4agent_types::AdapterFamily;
+    use std::ffi::OsString;
 
     fn snapshot(sequence: u64, contents: &str) -> super::PtyTerminalSnapshot {
         super::PtyTerminalSnapshot {
@@ -1987,6 +2386,10 @@ mod tests {
         );
         assert_eq!(
             startup_operator_gate("No auth type is selected"),
+            Some("authentication")
+        );
+        assert_eq!(
+            startup_operator_gate("Sign in with OpenAI to use Codex"),
             Some("authentication")
         );
         assert_eq!(
@@ -2054,6 +2457,42 @@ mod tests {
         let mut decoder = Utf8ChunkDecoder::default();
         assert_eq!(decoder.push(b"ok\xfftail"), "ok\u{fffd}tail");
         assert_eq!(decoder.push(" Привет".as_bytes()), " Привет");
+    }
+
+    #[test]
+    fn fresh_claude_pty_preassigns_the_exact_vendor_session_id_argv() {
+        let claude = builtin_adapter_registry()
+            .binding(AdapterFamily::PtySemantic, "claude-code")
+            .expect("Claude PTY binding");
+        let mut args = Vec::new();
+        let identity = prepare_fresh_pty_provider_session(Some(claude), false, &mut args)
+            .expect("fresh Claude provider identity");
+        let parsed = uuid::Uuid::parse_str(&identity.id).expect("valid Claude UUID");
+        assert_eq!(parsed.get_version_num(), 4);
+        assert_eq!(identity.key, gate4agent_types::ProviderSessionKey::SessionId);
+        assert!(identity.transcript_path.is_none());
+        assert_eq!(args, [OsString::from("--session-id"), OsString::from(identity.id)]);
+    }
+
+    #[test]
+    fn fresh_codex_and_resumed_claude_do_not_preassign_a_second_identity() {
+        let adapters = builtin_adapter_registry();
+        let codex = adapters
+            .binding(AdapterFamily::PtySemantic, "codex")
+            .expect("Codex PTY binding");
+        let claude = adapters
+            .binding(AdapterFamily::PtySemantic, "claude-code")
+            .expect("Claude PTY binding");
+        let mut codex_args = Vec::new();
+        assert!(prepare_fresh_pty_provider_session(Some(codex), false, &mut codex_args).is_none());
+        assert!(codex_args.is_empty());
+
+        let mut resume_args = vec![OsString::from("--resume"), OsString::from("vendor-id")];
+        assert!(prepare_fresh_pty_provider_session(Some(claude), true, &mut resume_args).is_none());
+        assert_eq!(
+            resume_args,
+            [OsString::from("--resume"), OsString::from("vendor-id")]
+        );
     }
 
     #[test]

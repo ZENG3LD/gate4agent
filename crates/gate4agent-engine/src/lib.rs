@@ -1524,7 +1524,9 @@ impl Gate4AgentEngine {
                     PreparedInputKind::InsertDraft | PreparedInputKind::SubmitPrompt => {
                         ForegroundRequirement::Agent { agent_id }
                     }
-                    PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl => {
+                    PreparedInputKind::TerminalText
+                    | PreparedInputKind::TerminalBytes
+                    | PreparedInputKind::TerminalControl => {
                         ForegroundRequirement::Any
                     }
                     PreparedInputKind::AgentCommand | PreparedInputKind::ShellCommand => {

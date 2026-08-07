@@ -55,6 +55,96 @@ async fn wait_for_contents(shell: &NativeEffectShell, key: NativeSessionKey, exp
     .expect("fixture output timeout");
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn pty_child_normalizes_a_verbatim_requested_workspace() {
+    let workspace = std::env::temp_dir().join(format!(
+        "gate4agent-pty-cwd-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workspace).expect("create PTY cwd fixture workspace");
+    let workspace = workspace
+        .canonicalize()
+        .expect("canonicalize PTY cwd fixture workspace");
+    let workspace_text = workspace.to_string_lossy();
+    let expected_workspace = workspace_text
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&workspace_text)
+        .to_owned();
+
+    let mut spec = interactive_agent_spec();
+    *spec
+        .launch
+        .fixed_args
+        .last_mut()
+        .expect("fixture script argument") =
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::WriteLine('fixture-cwd:' + [Environment]::CurrentDirectory); [Console]::Write([char]27 + '[?2004h' + [char]27 + '[?25hfixture-ready>'); Start-Sleep -Seconds 60".to_owned();
+    let registry = AgentRegistry::new([spec]).expect("fixture registry");
+    let mut kernel = Gate4AgentKernel::new(registry.clone());
+    let mut shell = NativeEffectShell::new(registry);
+    let instance_id = AgentInstanceId(500);
+
+    let registered = kernel.step(
+        [command(
+            1,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        )],
+        [],
+    );
+    assert!(registered.command_outcomes[0].result.is_ok());
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            2,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: workspace.to_string_lossy().into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 12,
+                        columns: 160,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ),
+    )
+    .await;
+    let running = kernel.snapshot().sessions[0].clone();
+    let key = NativeSessionKey {
+        instance_id,
+        generation: running.generation,
+    };
+    wait_for_contents(
+        &shell,
+        key,
+        &format!("fixture-cwd:{expected_workspace}"),
+    )
+    .await;
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            3,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(shell.active_session_count(), 0);
+    std::fs::remove_dir(&workspace).expect("remove PTY cwd fixture workspace");
+}
+
 #[tokio::test]
 async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
     let mut spec = interactive_agent_spec();
@@ -220,6 +310,221 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
             .contents
             .contains("fixture-echo:followup-after-gate-like-history")));
     assert_eq!(shell.active_session_count(), 0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn terminal_bytes_reach_real_conpty_as_alt_key() {
+    let mut spec = interactive_agent_spec();
+    *spec
+        .launch
+        .fixed_args
+        .last_mut()
+        .expect("fixture script argument") =
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write('fixture-key-ready>'); $key=[Console]::ReadKey($true); [Console]::WriteLine('fixture-key:' + [int]$key.KeyChar + ',' + $key.Modifiers); Start-Sleep -Seconds 60".to_owned();
+    let registry = AgentRegistry::new([spec]).expect("fixture registry");
+    let mut kernel = Gate4AgentKernel::new(registry.clone());
+    let mut shell = NativeEffectShell::new(registry);
+    let instance_id = AgentInstanceId(502);
+
+    let registered = kernel.step(
+        [command(
+            8,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        )],
+        [],
+    );
+    assert!(registered.command_outcomes[0].result.is_ok());
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            9,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .expect("current directory")
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 10,
+                        columns: 40,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ),
+    )
+    .await;
+    let running = kernel.snapshot().sessions[0].clone();
+    let key = NativeSessionKey {
+        instance_id,
+        generation: running.generation,
+    };
+    wait_for_contents(&shell, key, "fixture-key-ready>").await;
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            10,
+            ControlCommand::SendInput {
+                instance_id,
+                action: InputAction::TerminalBytes(b"\x1bp".to_vec()),
+            },
+        ),
+    )
+    .await;
+    wait_for_contents(&shell, key, "fixture-key:112,Alt").await;
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            11,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(shell.active_session_count(), 0);
+}
+
+#[tokio::test]
+async fn followup_prompt_waits_for_a_fresh_composer_after_the_turn_becomes_busy() {
+    let mut spec = interactive_agent_spec();
+    spec.readiness.followup_requires_terminal = true;
+    spec.readiness.draft_signal = DraftReadySignal::CodexComposerPrompt;
+    spec.readiness.timeout_ms = 2_000;
+    spec.readiness.poll_interval_ms = 20;
+    #[cfg(windows)]
+    let script = "$esc=[char]27; [Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write($esc + '[?2004h' + [char]0x276F); $first=[Console]::ReadLine(); [Console]::Write($esc + '[2J' + $esc + '[Hturn-busy'); Start-Sleep -Milliseconds 500; [Console]::Write($esc + '[2J' + $esc + '[H' + [char]0x276F); $second=[Console]::ReadLine(); [Console]::Write('fixture-second:' + $second); Start-Sleep -Seconds 60";
+    #[cfg(not(windows))]
+    let script = "printf '\\033[?2004h\\342\\235\\257'; IFS= read -r first; printf '\\033[2J\\033[Hturn-busy'; sleep 0.5; printf '\\033[2J\\033[H\\342\\235\\257'; IFS= read -r second; printf 'fixture-second:%s' \"$second\"; sleep 60";
+    *spec
+        .launch
+        .fixed_args
+        .last_mut()
+        .expect("fixture script argument") = script.to_owned();
+    let registry = AgentRegistry::new([spec]).expect("fixture registry");
+    let mut kernel = Gate4AgentKernel::new(registry.clone());
+    let mut shell = NativeEffectShell::new(registry);
+    let instance_id = AgentInstanceId(510);
+
+    kernel.step(
+        [command(
+            70,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        )],
+        [],
+    );
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            71,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .expect("current directory")
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 12,
+                        columns: 64,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ),
+    )
+    .await;
+    let generation = kernel.snapshot().sessions[0].generation;
+    let key = NativeSessionKey {
+        instance_id,
+        generation,
+    };
+    wait_for_contents(&shell, key, "❯").await;
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            72,
+            ControlCommand::SendInput {
+                instance_id,
+                action: InputAction::SubmitPrompt(PromptPayload {
+                    text: "first-turn".to_owned(),
+                    framing: PromptFraming::BracketedPaste,
+                }),
+            },
+        ),
+    )
+    .await;
+    wait_for_contents(&shell, key, "turn-busy").await;
+
+    let step = kernel.step(
+        [command(
+            73,
+            ControlCommand::SendInput {
+                instance_id,
+                action: InputAction::SubmitPrompt(PromptPayload {
+                    text: "second-turn".to_owned(),
+                    framing: PromptFraming::BracketedPaste,
+                }),
+            },
+        )],
+        [],
+    );
+    assert!(step.command_outcomes[0].result.is_ok());
+    assert_eq!(step.effects.len(), 1);
+    let observation = {
+        let execution = shell.execute(step.effects[0].clone());
+        tokio::pin!(execution);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut execution)
+                .await
+                .is_err(),
+            "second prompt reused stale bootstrap readiness while the turn was busy"
+        );
+        tokio::time::timeout(FIXTURE_TIMEOUT, &mut execution)
+            .await
+            .expect("fresh composer readiness timeout")
+    };
+    assert!(matches!(
+        observation.observation,
+        ControlObservation::InputCompleted
+    ));
+    kernel.step([], [observation]);
+    wait_for_contents(&shell, key, "fixture-second:second-turn").await;
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            74,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ),
+    )
+    .await;
 }
 
 #[tokio::test]

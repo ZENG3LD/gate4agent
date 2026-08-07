@@ -13,6 +13,7 @@ gate4agent-shell-one-shot = { path = "../gate4agent-shell-one-shot" }
 gate4agent-tool-protocol = { path = "../gate4agent-tool-protocol" }
 gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["time"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 gate4agent-kernel = { path = "../gate4agent-kernel" }

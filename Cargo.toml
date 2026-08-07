@@ -78,6 +78,9 @@ members = [
     "crates/gate4agent-shell-one-shot",
     "crates/gate4agent-shell-native",
     "crates/gate4agent-runtime-native",
+    "crates/gate4agent-node-protocol",
+    "crates/gate4agent-node",
+    "crates/gate4agent-tui",
     "crates/gate4agent-testkit",
 ]
 resolver = "2"

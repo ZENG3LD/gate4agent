@@ -1,12 +1,14 @@
 use std::sync::mpsc::TryRecvError;
-use std::time::Duration;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, InputAction, PreparedInputKind, PromptFraming, PromptPayload, SessionStatus,
-    StartRequest, TerminalControl, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    StartRequest, TerminalControl, TerminalSize, TerminalText, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 const LIVE_CANARY_ENV: &str = "GATE4AGENT_VENDOR_PTY_CANARY";
@@ -108,7 +110,12 @@ fn sanitized_diagnostics(
             for (name, needle) in [
                 ("agent-name", session.agent_id.as_str()),
                 ("login", "login"),
+                ("logged-out", "not logged in"),
+                ("sign-in", "sign in"),
+                ("authenticated", "authenticated"),
+                ("authentication", "authentication"),
                 ("auth", "auth"),
+                ("api-key", "api key"),
                 ("error", "error"),
                 ("api-error", "api error"),
                 ("usage-limit", "usage limit"),
@@ -118,6 +125,9 @@ fn sanitized_diagnostics(
                 ("overloaded", "overloaded"),
                 ("retry", "try again"),
                 ("permission", "permission"),
+                ("approval", "approval"),
+                ("trust", "trust"),
+                ("workspace", "workspace"),
                 ("update", "update"),
                 ("welcome", "welcome to claude code"),
                 (
@@ -128,6 +138,11 @@ fn sanitized_diagnostics(
                 ("safety-check", "quick safety check"),
                 ("enter", "enter"),
                 ("escape", "esc"),
+                ("press", "press"),
+                ("shortcut", "shortcut"),
+                ("model", "model"),
+                ("sandbox", "sandbox"),
+                ("openai", "openai"),
                 ("working", "working"),
                 ("thinking", "thinking"),
                 ("prompt-visible", "reply with one string only"),
@@ -166,6 +181,7 @@ fn sanitized_diagnostics(
             if message.starts_with("PTY readiness timed out (")
                 || message.contains("initial prompt")
                 || message.contains("deferred initial prompt")
+                || message.contains("identity probe")
                 || message.contains("requires operator action") => message.as_str(),
         _ => "none",
     };
@@ -295,6 +311,75 @@ async fn wait_for_running(
             sanitized_diagnostics(handle, events, 0)
         )),
     }
+}
+
+async fn wait_for_stable_codex_composer(
+    runtime: &mut NativeRuntime,
+    handle: &gate4agent_handle::Gate4AgentHandle,
+    events: &mut Vec<ControlEvent>,
+    subscription: &gate4agent_handle::EventSubscription,
+) -> Result<u64, String> {
+    match tokio::time::timeout(START_TIMEOUT, async {
+        let mut candidate: Option<(String, Instant, u64)> = None;
+        loop {
+            runtime.tick().await;
+            drain_events(subscription, events);
+            let snapshot = handle.snapshot();
+            let Some(session) = snapshot.sessions.first() else {
+                return Err("Codex PTY session snapshot is missing while waiting for composer".to_owned());
+            };
+            if !matches!(session.status, SessionStatus::Running) {
+                return Err(format!(
+                    "Codex PTY left running state before composer stabilized; {}",
+                    sanitized_diagnostics(handle, events, 0)
+                ));
+            }
+            if let Some(frame) = &session.terminal_frame {
+                let composer_visible = frame.contents.contains('›') || frame.contents.contains('❯');
+                if composer_visible {
+                    match &candidate {
+                        Some((contents, since, _))
+                            if contents == &frame.contents
+                                && since.elapsed() >= Duration::from_millis(500) =>
+                        {
+                            return Ok(frame.sequence);
+                        }
+                        Some((contents, _, _)) if contents == &frame.contents => {}
+                        _ => {
+                            candidate = Some((frame.contents.clone(), Instant::now(), frame.sequence));
+                        }
+                    }
+                } else {
+                    candidate = None;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Codex PTY composer did not become visibly stable; {}",
+            sanitized_diagnostics(handle, events, 0)
+        )),
+    }
+}
+
+fn windows_process_is_running(process_id: u32) -> Result<bool, String> {
+    let filter = format!("PID eq {process_id}");
+    let output = Command::new("tasklist")
+        .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
+        .output()
+        .map_err(|error| format!("query Codex PTY process teardown: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tasklist failed while verifying Codex PTY process teardown: {:?}",
+            output.status.code()
+        ));
+    }
+    let needle = format!("\",\"{process_id}\",");
+    Ok(String::from_utf8_lossy(&output.stdout).contains(&needle))
 }
 
 async fn wait_for_input_completion(
@@ -730,6 +815,136 @@ async fn run_pty_canary(agent_id: &str, instance_id: u64) {
     );
 }
 
+async fn run_codex_whole_chunk_transport_canary(instance_id: u64) {
+    assert_eq!(
+        std::env::var(LIVE_CANARY_ENV).as_deref(),
+        Ok("1"),
+        "set {LIVE_CANARY_ENV}=1 to opt into authenticated vendor PTY execution"
+    );
+
+    let working_directory = std::env::current_dir().expect("Codex transport PTY current directory");
+    let (handle, mut runtime) = runtime_for("codex");
+    let subscription = handle.subscribe(256);
+    let instance_id = AgentInstanceId(instance_id);
+    let probe = "G4A_TRANSPORT_CHUNK_8F3C29";
+    handle
+        .dispatch(command(
+            1,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new("codex").expect("valid Codex agent ID"),
+                transport: TransportKind::Pty,
+            },
+        ))
+        .expect("register Codex whole-chunk transport PTY session");
+    handle
+        .dispatch(command(
+            2,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: working_directory.to_string_lossy().into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 32,
+                        columns: 132,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ))
+        .expect("start Codex whole-chunk transport PTY session without an initial prompt");
+
+    let mut events = Vec::new();
+    let result: Result<(u64, u64, u32), String> = async {
+        wait_for_running(&mut runtime, &handle, &mut events, &subscription).await?;
+        let composer_frame_sequence = wait_for_stable_codex_composer(
+            &mut runtime,
+            &handle,
+            &mut events,
+            &subscription,
+        )
+        .await?;
+        let process_id = handle
+            .snapshot()
+            .sessions
+            .first()
+            .and_then(|session| session.process_id)
+            .ok_or_else(|| "Codex whole-chunk transport PTY has no physical process ID".to_owned())?;
+        let baseline_sequence = terminal_sequence(&handle);
+        if handle
+            .snapshot()
+            .sessions
+            .first()
+            .and_then(|session| session.terminal_frame.as_ref())
+            .is_some_and(|frame| frame.contents.contains(probe))
+        {
+            return Err("Codex transport probe unexpectedly existed before input".to_owned());
+        }
+        let event_start = events.len();
+        handle
+            .dispatch(command(
+                3,
+                ControlCommand::SendInput {
+                    instance_id,
+                    action: InputAction::TerminalText(TerminalText {
+                        text: probe.to_owned(),
+                    }),
+                },
+            ))
+            .map_err(|error| format!("dispatch Codex whole-chunk terminal text: {error}"))?;
+        wait_for_input_completion(
+            &mut runtime,
+            &handle,
+            &subscription,
+            &mut events,
+            event_start,
+            PreparedInputKind::TerminalText,
+        )
+        .await?;
+        let probe_frame_sequence = wait_for_marker(
+            &mut runtime,
+            &handle,
+            &subscription,
+            &mut events,
+            probe,
+            baseline_sequence,
+        )
+        .await?;
+        Ok((composer_frame_sequence, probe_frame_sequence, process_id))
+    }
+    .await;
+
+    let cleanup = stop_live_session(
+        &mut runtime,
+        &handle,
+        &subscription,
+        &mut events,
+        instance_id,
+        true,
+    )
+    .await;
+    let (composer_frame_sequence, probe_frame_sequence, process_id) = match result {
+        Ok(success) => success,
+        Err(error) => panic!(
+            "{error}; cleanup={}",
+            cleanup.as_ref().map_or_else(|failure| failure.as_str(), |_| "ok")
+        ),
+    };
+    cleanup.expect("Codex whole-chunk transport PTY force cleanup");
+    assert_eq!(runtime.active_native_sessions(), 0);
+    assert!(probe_frame_sequence > composer_frame_sequence);
+    assert!(
+        !windows_process_is_running(process_id)
+            .expect("verify Codex whole-chunk transport PTY process teardown"),
+        "Codex whole-chunk transport PTY process {process_id} remained running after force stop"
+    );
+    println!(
+        "vendor_pty_whole_chunk_transport agent=codex initial_prompt=false composer_stable=true composer_frame_sequence={composer_frame_sequence} terminal_text_dispatches=1 terminal_text_bytes={} terminal_text_completed=1 enter_sent=false probe_visible=true probe_frame_sequence={probe_frame_sequence} force_stop=true pid_reaped=true active_sessions=0",
+        probe.len(),
+    );
+}
+
 async fn run_expected_startup_block_canary(
     agent_id: &str,
     instance_id: u64,
@@ -838,6 +1053,18 @@ async fn windows_live_claude_pty_contract() {
 #[ignore = "requires GATE4AGENT_VENDOR_PTY_CANARY=1 and an installed authenticated Codex CLI"]
 async fn windows_live_codex_pty_contract() {
     run_pty_canary("codex", 10_002).await;
+}
+
+#[tokio::test]
+#[ignore = "requires GATE4AGENT_VENDOR_PTY_CANARY=1 and an installed authenticated Codex CLI"]
+async fn windows_live_codex_whole_chunk_transport_contract() {
+    run_codex_whole_chunk_transport_canary(10_032).await;
+}
+
+#[tokio::test]
+#[ignore = "requires GATE4AGENT_VENDOR_PTY_CANARY=1 and an installed Codex CLI without completed login"]
+async fn windows_live_codex_without_login_fails_closed() {
+    run_expected_startup_block_canary("codex", 10_033, "readiness-timeout").await;
 }
 
 #[tokio::test]

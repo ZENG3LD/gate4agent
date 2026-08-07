@@ -1,0 +1,21 @@
+[package]
+name = "gate4agent-tui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+crossterm = "0.28"
+gate4agent-node = { path = "../gate4agent-node" }
+gate4agent-types = { path = "../gate4agent-types" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uzor-tui = { path = "../../../uzor/uzor-tui" }
+vt100 = "0.16"
+
+[lib]
+name = "gate4agent_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gate4agent-tui"
+path = "src/main.rs"

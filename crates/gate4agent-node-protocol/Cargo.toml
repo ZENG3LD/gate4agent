@@ -1,0 +1,18 @@
+[package]
+name = "gate4agent-node-protocol"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_node_protocol"
+
+[dependencies]
+gate4agent-types = { path = "../gate4agent-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }

@@ -1,0 +1,29 @@
+[package]
+name = "gate4agent-node"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_node"
+
+[[bin]]
+name = "gate4agent-node"
+path = "src/main.rs"
+
+[dependencies]
+gate4agent-catalog = { path = "../gate4agent-catalog" }
+gate4agent-handle = { path = "../gate4agent-handle" }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-runtime-native = { path = "../gate4agent-runtime-native" }
+gate4agent-testkit = { path = "../gate4agent-testkit", optional = true }
+gate4agent-types = { path = "../gate4agent-types" }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+
+[features]
+default = []
+fixture = ["dep:gate4agent-testkit"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

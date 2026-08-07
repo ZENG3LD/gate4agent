@@ -52,6 +52,9 @@ impl From<PtyError> for AgentError {
             PtyError::UnsafeWindowsCommandArgument { index } => AgentError::PtySpawn(format!(
                 "Windows command wrapper argument {index} contains shell metacharacters"
             )),
+            PtyError::UnsupportedWindowsUncWorkingDirectory { path } => AgentError::PtySpawn(
+                format!("Windows PTY working directory cannot be a UNC path: {path}"),
+            ),
             PtyError::ReaderJoinTimedOut { timeout_ms } => {
                 AgentError::PtyShutdownTimedOut { timeout_ms }
             }
@@ -417,7 +420,9 @@ impl PtySession {
                     "shell input requires fresh foreground-shell proof".to_owned(),
                 ));
             }
-            PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl => None,
+            PreparedInputKind::TerminalText
+            | PreparedInputKind::TerminalBytes
+            | PreparedInputKind::TerminalControl => None,
         };
         self.validate_permit(&permit, required_intent)?;
         self.write_prepared_input(input).await
@@ -428,7 +433,9 @@ impl PtySession {
     pub async fn send_terminal_input(&self, input: PreparedInput) -> Result<(), AgentError> {
         if !matches!(
             input.kind(),
-            PreparedInputKind::TerminalText | PreparedInputKind::TerminalControl
+            PreparedInputKind::TerminalText
+                | PreparedInputKind::TerminalBytes
+                | PreparedInputKind::TerminalControl
         ) {
             return Err(AgentError::Pty(
                 "semantic input requires a readiness permit".to_owned(),

@@ -53,7 +53,7 @@ pub fn build_resume_plan_for_identity(
         )),
         "kimi" => Some((
             "kimi",
-            &["-r"][..],
+            &["--session"][..],
             ProviderSessionKey::SessionId,
             false,
         )),
@@ -194,7 +194,7 @@ mod tests {
         let cases = [
             ("claude-code", "claude", vec!["--resume", "s1"]),
             ("codex", "codex", vec!["resume", "s1"]),
-            ("kimi", "kimi", vec!["-r", "s1"]),
+            ("kimi", "kimi", vec!["--session", "s1"]),
             ("gemini", "gemini", vec!["--resume", "s1"]),
             ("antigravity", "agy", vec!["--conversation", "s1"]),
             ("opencode", "opencode", vec!["--session", "s1"]),
@@ -267,12 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn kimi_live_resume_uses_the_verified_short_flag() {
+    fn kimi_live_resume_uses_the_v0_31_session_flag() {
         let plan = build_resume_plan(&id("kimi"), "session_1")
             .unwrap()
             .unwrap();
         assert_eq!(plan.program, "kimi");
-        assert_eq!(plan.args, ["-r", "session_1"]);
+        assert_eq!(plan.args, ["--session", "session_1"]);
     }
 
     #[test]

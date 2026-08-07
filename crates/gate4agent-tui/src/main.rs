@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use gate4agent_node_protocol::{NodeId, WorkspaceId};
-use gate4agent_tui::{NodeEndpoint, Provider, PtyColorMode, RunOptions, StartupRequest};
+use gate4agent_tui::{C2Endpoint, NodeEndpoint, Provider, PtyColorMode, RunOptions, StartupRequest};
 
 const TOKEN_ENV_PREFIX: &str = "GATE4AGENT_NODE_TOKEN_";
+const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
 
 fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
     *index += 1;
@@ -36,6 +37,7 @@ fn parse_args_from(
     mut read_secret: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<RunOptions, String> {
     let mut node_specs = Vec::new();
+    let mut c2_control = None;
     let mut startup_node = None;
     let mut workspace = None;
     let mut provider = None;
@@ -45,6 +47,12 @@ fn parse_args_from(
     while index < args.len() {
         match args[index].as_str() {
             "--node" => node_specs.push(parse_node(&value(args, &mut index, "--node")?)?),
+            "--c2-control" => {
+                if c2_control.is_some() {
+                    return Err("--c2-control can be specified only once".to_owned());
+                }
+                c2_control = Some(value(args, &mut index, "--c2-control")?);
+            }
             "--startup-node" => {
                 startup_node = Some(
                     NodeId::new(value(args, &mut index, "--startup-node")?)
@@ -65,8 +73,9 @@ fn parse_args_from(
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: gate4agent-tui --node NODE_ID=PIPE [--node NODE_ID=PIPE ...]\n\
+                    "usage: gate4agent-tui (--node NODE_ID=PIPE [--node NODE_ID=PIPE ...] | --c2-control PIPE)\n\
                      token env: GATE4AGENT_NODE_TOKEN_<NORMALIZED_NODE_ID>\n\
+                     C2 token env: GATE4AGENT_C2_TOKEN\n\
                      optional startup: --startup-node NODE_ID --workspace WORKSPACE_ID \
                      --agent claude|codex|kimi [--style inherit|gate]"
                         .to_owned(),
@@ -76,8 +85,8 @@ fn parse_args_from(
         }
         index += 1;
     }
-    if node_specs.is_empty() {
-        return Err("at least one explicit --node NODE_ID=PIPE is required".to_owned());
+    if node_specs.is_empty() == c2_control.is_none() {
+        return Err("configure exactly one --node set or one --c2-control PIPE".to_owned());
     }
     let mut unique = BTreeSet::new();
     let mut nodes = Vec::new();
@@ -96,6 +105,15 @@ fn parse_args_from(
             token,
         });
     }
+    let c2 = if let Some(endpoint) = c2_control {
+        let token = read_secret(C2_TOKEN_ENV)?;
+        if token.is_empty() {
+            return Err(format!("{C2_TOKEN_ENV} must not be empty"));
+        }
+        Some(C2Endpoint { endpoint, token })
+    } else {
+        None
+    };
 
     let startup_requested = startup_node.is_some() || workspace.is_some() || provider.is_some();
     let startup = if startup_requested {
@@ -104,7 +122,7 @@ fn parse_args_from(
         let workspace_id = workspace
             .ok_or_else(|| "startup requires --workspace".to_owned())?;
         let provider = provider.ok_or_else(|| "startup requires --agent".to_owned())?;
-        if !nodes.iter().any(|node| node.expected_node_id == node_id) {
+        if c2.is_none() && !nodes.iter().any(|node| node.expected_node_id == node_id) {
             return Err(format!("startup node {node_id} is not configured by --node"));
         }
         Some(StartupRequest {
@@ -115,7 +133,7 @@ fn parse_args_from(
     } else {
         None
     };
-    Ok(RunOptions { nodes, startup, color_mode_override })
+    Ok(RunOptions { nodes, c2, startup, color_mode_override })
 }
 
 fn parse_args() -> Result<RunOptions, String> {
@@ -130,6 +148,7 @@ fn parse_args() -> Result<RunOptions, String> {
 
 #[tokio::main]
 async fn main() {
+    gate4agent_tui::diagnostics::install_panic_hook();
     let options = match parse_args() {
         Ok(options) => options,
         Err(message) => {
@@ -138,6 +157,9 @@ async fn main() {
         }
     };
     if let Err(error) = gate4agent_tui::run(options).await {
+        gate4agent_tui::diagnostics::record_runtime(
+            gate4agent_tui::diagnostics::RuntimeDiagnostic::Fatal,
+        );
         eprintln!("gate4agent-tui: {error}");
         std::process::exit(1);
     }
@@ -234,6 +256,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gate.color_mode_override, Some(PtyColorMode::GateOverride));
+    }
+
+    #[test]
+    fn c2_control_is_authenticated_and_mutually_exclusive_with_direct_nodes() {
+        let c2 = parse(
+            &[
+                "gate4agent-tui",
+                "--c2-control",
+                r"\\.\pipe\gate4agent-c2",
+                "--startup-node",
+                "desk-a",
+                "--workspace",
+                "nemo",
+                "--agent",
+                "claude",
+            ],
+            &[("GATE4AGENT_C2_TOKEN", "c2-token")],
+        )
+        .unwrap();
+        assert!(c2.nodes.is_empty());
+        assert_eq!(c2.c2.as_ref().unwrap().endpoint, r"\\.\pipe\gate4agent-c2");
+        assert_eq!(c2.startup.as_ref().unwrap().node_id.as_str(), "desk-a");
+
+        let mixed = parse(
+            &[
+                "gate4agent-tui",
+                "--node",
+                r"desk-a=\\.\pipe\desk-a",
+                "--c2-control",
+                r"\\.\pipe\gate4agent-c2",
+            ],
+            &[],
+        )
+        .err()
+        .unwrap();
+        assert_eq!(mixed, "configure exactly one --node set or one --c2-control PIPE");
     }
 
 }

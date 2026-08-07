@@ -1,5 +1,5 @@
 use crate::protocol::{
-    C2ErrorCategory, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
+    C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
     NodeIncarnationId, NodeRequest, RoutedNodeEvent, RoutedNodeResponse,
     NodeTransportState, ObservedNode, ReadyResponse, SanitizedError, SlimNodeInventory,
     StatusResponse, C2_API_VERSION, DEFAULT_C2_CONTROL_ENDPOINT, MAX_C2_ENDPOINT_BYTES, MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
@@ -17,7 +17,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, Instant};
+
+const MANAGED_RESUME_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+const NODE_REQUEST_IO_HEADROOM: Duration = Duration::from_secs(5);
 
 const HEADER_LIMIT_BYTES: usize = 16 * 1024;
 const MAX_HTTP_CONNECTIONS: usize = 16;
@@ -398,7 +401,7 @@ async fn node_relay_worker(
                             hub.publish(RoutedNodeEvent {
                                 node_id: node.node_id.clone(),
                                 cursor: NodeCursor { incarnation_id, sequence: event_sequence },
-                                event: gate4agent_node_protocol::NodeEvent::ResyncRequired {
+                                event: C2NodeEvent::ResyncRequired {
                                     oldest_available_sequence: events.first().map_or(event_sequence, |event| event.sequence),
                                 },
                             });
@@ -418,7 +421,7 @@ async fn node_relay_worker(
             }
         }
         ingress_attempt(&ingress, &node.node_id, AttemptResult::Success { cursor, snapshot, gaps }).await?;
-        if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, did_resync).await {
+        if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, did_resync, None).await {
             ingress_attempt(&ingress, &node.node_id, relay_failure_attempt(&error)).await?;
             reject_disconnected_commands(&mut commands, Some(cursor));
             continue;
@@ -460,7 +463,7 @@ async fn node_relay_worker(
                 _ = snapshot_tick.tick() => {
                     match bounded_node_request(&mut client, NodeRequest::Snapshot).await {
                         Ok(NodeResponse::Snapshot { event_sequence, snapshot, .. }) => {
-                            if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, false).await { break error; }
+                            if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, false, None).await { break error; }
                             if event_sequence >= cursor.sequence {
                                 cursor.sequence = event_sequence;
                                 ingress_attempt(&ingress, &node.node_id, AttemptResult::Success { cursor, snapshot, gaps: Vec::new() }).await?;
@@ -480,7 +483,7 @@ async fn node_relay_worker(
                         } else if let Err(error) = release_controller(&mut client, &mut controller_owned).await {
                             break error;
                         }
-                        if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, false).await { break error; }
+                        if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, false, None).await { break error; }
                     }
                 }
                 changed = shutdown.changed() => {
@@ -507,22 +510,52 @@ async fn bounded_node_request(
     client: &mut NamedPipeNodeClient,
     request: NodeRequest,
 ) -> Result<NodeResponse, NodeClientError> {
-    let deadline = match &request {
+    bounded_node_request_with_deadline(client, request, None).await
+}
+
+async fn bounded_node_request_with_deadline(
+    client: &mut NamedPipeNodeClient,
+    request: NodeRequest,
+    relay_deadline: Option<Instant>,
+) -> Result<NodeResponse, NodeClientError> {
+    let deadline = request_budget(&request, relay_deadline, Instant::now());
+    if deadline.is_zero() {
+        return Err(NodeClientError::Frame(FrameError::PrefixTimedOut));
+    }
+    match timeout(deadline, client.request(request)).await {
+        Ok(result) => result,
+        Err(_) => Err(NodeClientError::Frame(FrameError::PrefixTimedOut)),
+    }
+}
+
+fn relay_request_deadline(request: &NodeRequest, now: Instant) -> Option<Instant> {
+    matches!(request, NodeRequest::ResumeSessionRecord { .. })
+        .then(|| now + node_request_deadline(request))
+}
+
+fn request_budget(request: &NodeRequest, relay_deadline: Option<Instant>, now: Instant) -> Duration {
+    relay_deadline
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or_else(|| node_request_deadline(request))
+}
+
+fn node_request_deadline(request: &NodeRequest) -> Duration {
+    match request {
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::AcquireController { .. }
-        | NodeRequest::ReleaseController => Duration::from_secs(5),
+        | NodeRequest::ReleaseController
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. } => Duration::from_secs(5),
         NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. } => Duration::from_secs(240),
         NodeRequest::Spawn { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::Stop { .. } => Duration::from_secs(15),
+        NodeRequest::ResumeSessionRecord { .. } =>
+            MANAGED_RESUME_SETTLE_DEADLINE + NODE_REQUEST_IO_HEADROOM,
         _ => Duration::from_secs(10),
-    };
-    match timeout(deadline, client.request(request)).await {
-        Ok(result) => result,
-        Err(_) => Err(NodeClientError::Frame(FrameError::PrefixTimedOut)),
     }
 }
 
@@ -580,6 +613,7 @@ async fn handle_relay_command(
 ) -> Result<(), NodeClientError> {
     match command {
         RelayCommand::Request { operator_connection_id, expected_incarnation_id, request, reply } => {
+            let relay_deadline = relay_request_deadline(&request, Instant::now());
             if !hub.is_active(operator_connection_id) {
                 let _ = reply.send(Err(relay_failure(C2RelayFailureCode::ClientLagged, "C2 operator connection is no longer active", Some(incarnation_id))));
                 return Ok(());
@@ -589,14 +623,18 @@ async fn handle_relay_command(
                 return Ok(());
             }
             if !is_read_only_request(&request) && !*controller_owned {
-                match acquire_controller(client, connection_id).await {
+                match acquire_controller_with_deadline(client, connection_id, relay_deadline).await {
                     Ok(owned) if owned => *controller_owned = true,
                     Ok(_) => {
                         let _ = reply.send(Err(relay_failure(C2RelayFailureCode::RelayBusy, "node controller lease is unavailable", Some(incarnation_id))));
                         return Ok(());
                     }
                     Err(NodeClientError::Node(failure)) => {
-                        let _ = reply.send(Ok(RoutedNodeResponse { node_id: node_id.clone(), incarnation_id, response: Err(failure) }));
+                        let _ = reply.send(Ok(RoutedNodeResponse {
+                            node_id: node_id.clone(),
+                            incarnation_id,
+                            response: Err(C2NodeFailure::from(&failure)),
+                        }));
                         return Ok(());
                     }
                     Err(error) => {
@@ -605,7 +643,7 @@ async fn handle_relay_command(
                     }
                 }
             }
-            let response = match bounded_node_request(client, request).await {
+            let response = match bounded_node_request_with_deadline(client, request, relay_deadline).await {
                 Ok(response) => Ok(response),
                 Err(NodeClientError::Node(failure)) => Err(failure),
                 Err(error) => {
@@ -613,9 +651,12 @@ async fn handle_relay_command(
                     return Err(error);
                 }
             };
-            drain_pending_events(client, node_id, cursor, hub, ingress, false).await?;
+            drain_pending_events(client, node_id, cursor, hub, ingress, false, relay_deadline).await?;
             update_inventory_from_response(node_id, cursor, &response, ingress).await
                 .map_err(NodeClientError::Io)?;
+            let response = response
+                .map(|response| C2NodeResponse::from(&response))
+                .map_err(|failure| C2NodeFailure::from(&failure));
             let _ = reply.send(Ok(RoutedNodeResponse { node_id: node_id.clone(), incarnation_id, response }));
         }
     }
@@ -630,7 +671,19 @@ async fn acquire_controller(
     client: &mut NamedPipeNodeClient,
     connection_id: u64,
 ) -> Result<bool, NodeClientError> {
-    match bounded_node_request(client, NodeRequest::AcquireController { lease_ms: gate4agent_node_protocol::MAX_CONTROLLER_LEASE_MS }).await? {
+    acquire_controller_with_deadline(client, connection_id, None).await
+}
+
+async fn acquire_controller_with_deadline(
+    client: &mut NamedPipeNodeClient,
+    connection_id: u64,
+    relay_deadline: Option<Instant>,
+) -> Result<bool, NodeClientError> {
+    match bounded_node_request_with_deadline(
+        client,
+        NodeRequest::AcquireController { lease_ms: gate4agent_node_protocol::MAX_CONTROLLER_LEASE_MS },
+        relay_deadline,
+    ).await? {
         NodeResponse::Controller { controller } => Ok(controller.as_ref().is_some_and(|state| state.connection_id == connection_id)),
         _ => Err(NodeClientError::Protocol("controller acquisition returned a different response".to_owned())),
     }
@@ -674,7 +727,7 @@ fn publish_recovered_events(
         hub.publish(RoutedNodeEvent {
             node_id: node_id.clone(),
             cursor: NodeCursor { incarnation_id, sequence: envelope.sequence },
-            event: envelope.event.clone(),
+            event: C2NodeEvent::from(&envelope.event),
         });
     }
 }
@@ -686,6 +739,7 @@ async fn drain_pending_events(
     hub: &OperatorHub,
     ingress: &mpsc::Sender<Attempt>,
     skip_replayed: bool,
+    relay_deadline: Option<Instant>,
 ) -> Result<(), NodeClientError> {
     let mut skip_replayed = skip_replayed;
     for repair_pass in 0..=1 {
@@ -707,7 +761,11 @@ async fn drain_pending_events(
                 continue;
             }
             let event_cursor = NodeCursor { incarnation_id: cursor.incarnation_id, sequence: envelope.sequence };
-            hub.publish(RoutedNodeEvent { node_id: node_id.clone(), cursor: event_cursor, event: envelope.event });
+            hub.publish(RoutedNodeEvent {
+                node_id: node_id.clone(),
+                cursor: event_cursor,
+                event: C2NodeEvent::from(&envelope.event),
+            });
             cursor.sequence = envelope.sequence;
             changed = true;
         }
@@ -724,7 +782,11 @@ async fn drain_pending_events(
             return Err(NodeClientError::Protocol("node event stream remained noncontiguous after resync".to_owned()));
         }
         let after_sequence = cursor.sequence;
-        let response = bounded_node_request(client, NodeRequest::Resync { after_sequence }).await?;
+        let response = bounded_node_request_with_deadline(
+            client,
+            NodeRequest::Resync { after_sequence },
+            relay_deadline,
+        ).await?;
         let NodeResponse::Resync { event_sequence, snapshot, events } = response else {
             return Err(NodeClientError::Protocol("event repair resync returned a different response".to_owned()));
         };
@@ -736,14 +798,14 @@ async fn drain_pending_events(
                 hub.publish(RoutedNodeEvent {
                     node_id: node_id.clone(),
                     cursor: NodeCursor { incarnation_id: cursor.incarnation_id, sequence: envelope.sequence },
-                    event: envelope.event.clone(),
+                    event: C2NodeEvent::from(&envelope.event),
                 });
             }
         } else {
             hub.publish(RoutedNodeEvent {
                 node_id: node_id.clone(),
                 cursor: NodeCursor { incarnation_id: cursor.incarnation_id, sequence: event_sequence },
-                event: gate4agent_node_protocol::NodeEvent::ResyncRequired {
+                event: C2NodeEvent::ResyncRequired {
                     oldest_available_sequence: events.first().map_or(event_sequence, |event| event.sequence),
                 },
             });
@@ -1009,6 +1071,8 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_node_protocol::SessionRecordId;
+    use gate4agent_types::TerminalSize;
     use std::collections::BTreeMap;
 
     #[test]
@@ -1034,6 +1098,55 @@ mod tests {
         assert!(matches!(C2Config::new("127.0.0.1:0".parse().unwrap(), "safe", vec![first, second]), Err(C2ConfigError::DuplicateEndpoint)));
         let oversized = format!(r"\\.\pipe\{}", "x".repeat(MAX_C2_ENDPOINT_BYTES));
         assert!(matches!(C2NodeConfig::new(NodeId::new("node-c").unwrap(), oversized, "safe"), Err(C2ConfigError::InvalidEndpoint(_))));
+    }
+
+    #[test]
+    fn durable_session_mutations_require_controller_and_use_bounded_deadlines() {
+        let record_id = SessionRecordId::new("session-001").unwrap();
+        let rename = NodeRequest::RenameSessionRecord {
+            record_id: record_id.clone(),
+            display_name: "release shepherd".to_owned(),
+        };
+        let resume = NodeRequest::ResumeSessionRecord {
+            record_id: record_id.clone(),
+            terminal_size: TerminalSize { rows: 40, columns: 120 },
+            initial_prompt: None,
+        };
+        let forget = NodeRequest::ForgetSessionRecord { record_id };
+
+        assert!(!is_read_only_request(&rename));
+        assert!(!is_read_only_request(&resume));
+        assert!(!is_read_only_request(&forget));
+        assert_eq!(node_request_deadline(&rename), Duration::from_secs(5));
+        assert_eq!(node_request_deadline(&resume), Duration::from_secs(35));
+        assert!(node_request_deadline(&resume) > MANAGED_RESUME_SETTLE_DEADLINE);
+        assert_eq!(
+            node_request_deadline(&resume) - MANAGED_RESUME_SETTLE_DEADLINE,
+            NODE_REQUEST_IO_HEADROOM,
+        );
+        let started = Instant::now();
+        let relay_deadline = relay_request_deadline(&resume, started).unwrap();
+        assert_eq!(
+            request_budget(&resume, Some(relay_deadline), started),
+            Duration::from_secs(35),
+        );
+        assert_eq!(
+            request_budget(
+                &resume,
+                Some(relay_deadline),
+                started + Duration::from_secs(5),
+            ),
+            MANAGED_RESUME_SETTLE_DEADLINE,
+        );
+        assert_eq!(
+            request_budget(
+                &resume,
+                Some(relay_deadline),
+                started + Duration::from_secs(35),
+            ),
+            Duration::ZERO,
+        );
+        assert_eq!(node_request_deadline(&forget), Duration::from_secs(5));
     }
 
     async fn raw_request(request: Vec<u8>, status: StatusResponse) -> Vec<u8> {
@@ -1091,7 +1204,12 @@ mod tests {
         let (ingress_tx, ingress_rx) = mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let owner = tokio::spawn(inventory_owner(1, Duration::from_millis(10), ingress_rx, status_tx, shutdown_rx));
-        let snapshot = NodeSnapshot { node_id: node_id.clone(), enabled_providers: Vec::new(), workspaces: Vec::new() };
+        let snapshot = NodeSnapshot {
+            node_id: node_id.clone(),
+            enabled_providers: Vec::new(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+        };
         let cursor = NodeCursor { incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([1; 16]), sequence: 0 };
         ingress_tx.send(Attempt { node_id: node_id.clone(), at_unix_ms: unix_ms(), result: AttemptResult::Success { cursor, snapshot: snapshot.clone(), gaps: Vec::new() } }).await.unwrap();
         status_rx.changed().await.unwrap();

@@ -3,15 +3,21 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::app::{App, GridPreset, MenuPlacement, PtyColorMode};
+use crate::app::{
+    App, ControlSection, GridPreset, MenuPlacement, PtyColorMode, RosterMode, SidebarMode,
+    SidebarPresentation,
+};
 
-const CONFIG_VERSION: u16 = 1;
+const CONFIG_VERSION: u16 = 2;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UiPreferences {
     pub color_mode: PtyColorMode,
     pub menu_placement: MenuPlacement,
+    pub sidebar_presentation: SidebarPresentation,
+    pub sidebar_collapsed: bool,
+    pub control_section: ControlSection,
     pub sidebar_width: u16,
     pub sidebar_split_percent: u16,
     pub control_modal_position: Option<(u16, u16)>,
@@ -26,6 +32,9 @@ impl Default for UiPreferences {
         Self {
             color_mode: PtyColorMode::Inherited,
             menu_placement: MenuPlacement::Sidebar,
+            sidebar_presentation: SidebarPresentation::Split,
+            sidebar_collapsed: false,
+            control_section: ControlSection::Files,
             sidebar_width: 26,
             sidebar_split_percent: 50,
             control_modal_position: None,
@@ -39,9 +48,16 @@ impl Default for UiPreferences {
 
 impl UiPreferences {
     pub fn from_app(app: &App) -> Self {
+        let control_section = match app.control_section {
+            ControlSection::Settings => ControlSection::Files,
+            section => section,
+        };
         Self {
             color_mode: app.color_mode,
             menu_placement: app.menu_placement,
+            sidebar_presentation: app.sidebar_presentation,
+            sidebar_collapsed: app.sidebar_collapsed,
+            control_section,
             sidebar_width: app.sidebar_width,
             sidebar_split_percent: app.sidebar_split_percent,
             control_modal_position: app.control_modal_position,
@@ -55,6 +71,19 @@ impl UiPreferences {
     pub fn apply_to(&self, app: &mut App) {
         app.color_mode = self.color_mode;
         app.menu_placement = self.menu_placement;
+        app.sidebar_presentation = self.sidebar_presentation;
+        app.sidebar_collapsed = self.sidebar_collapsed;
+        app.control_section = match self.control_section {
+            ControlSection::Settings => ControlSection::Files,
+            section => section,
+        };
+        match app.control_section {
+            ControlSection::Files => app.sidebar_mode = SidebarMode::Files,
+            ControlSection::Git => app.sidebar_mode = SidebarMode::Git,
+            ControlSection::Agents => app.roster_mode = RosterMode::Agents,
+            ControlSection::Workspaces => app.roster_mode = RosterMode::Workspaces,
+            ControlSection::Settings => unreachable!("settings is normalized above"),
+        }
         app.sidebar_width = self.sidebar_width.clamp(18, 60);
         app.sidebar_split_percent = self.sidebar_split_percent.clamp(25, 75);
         app.control_modal_position = self.control_modal_position;
@@ -128,9 +157,12 @@ impl UiPreferences {
 
     fn encode(&self) -> String {
         format!(
-            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\ngrid_preset={}\ngrid_column_cuts={}\ngrid_row_cuts={}\n",
+            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\ncontrol_section={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\ngrid_preset={}\ngrid_column_cuts={}\ngrid_row_cuts={}\n",
             self.color_mode.id(),
             self.menu_placement.id(),
+            self.sidebar_presentation.id(),
+            self.sidebar_collapsed,
+            self.control_section.id(),
             self.sidebar_width,
             self.sidebar_split_percent,
             encode_pair(self.control_modal_position),
@@ -186,6 +218,30 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
                     _ => preferences.menu_placement,
                 }
             }
+            "sidebar_presentation" => {
+                preferences.sidebar_presentation = match value.trim() {
+                    "split" => SidebarPresentation::Split,
+                    "activity" => SidebarPresentation::Activity,
+                    _ => preferences.sidebar_presentation,
+                }
+            }
+            "sidebar_collapsed" => {
+                preferences.sidebar_collapsed = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => preferences.sidebar_collapsed,
+                }
+            }
+            "control_section" => {
+                preferences.control_section = match value.trim() {
+                    "files" => ControlSection::Files,
+                    "git" => ControlSection::Git,
+                    "agents" => ControlSection::Agents,
+                    "workspaces" => ControlSection::Workspaces,
+                    "settings" => ControlSection::Settings,
+                    _ => preferences.control_section,
+                }
+            }
             "sidebar_width" => {
                 if let Ok(width) = value.trim().parse::<u16>() {
                     preferences.sidebar_width = width.clamp(18, 60);
@@ -224,7 +280,7 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
         }
     }
     match version {
-        Some(CONFIG_VERSION) => Ok(preferences),
+        Some(1) | Some(CONFIG_VERSION) => Ok(preferences),
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
         None => Err(invalid_data("preferences version is missing")),
     }
@@ -300,6 +356,9 @@ mod tests {
         let preferences = UiPreferences {
             color_mode: PtyColorMode::GateOverride,
             menu_placement: MenuPlacement::Modal,
+            sidebar_presentation: SidebarPresentation::Activity,
+            sidebar_collapsed: true,
+            control_section: ControlSection::Agents,
             sidebar_width: 41,
             sidebar_split_percent: 63,
             control_modal_position: Some((17, 9)),
@@ -346,6 +405,9 @@ mod tests {
         let preferences = UiPreferences {
             color_mode: PtyColorMode::GateOverride,
             menu_placement: MenuPlacement::Modal,
+            sidebar_presentation: SidebarPresentation::Activity,
+            sidebar_collapsed: true,
+            control_section: ControlSection::Workspaces,
             sidebar_width: 38,
             sidebar_split_percent: 61,
             control_modal_position: Some((12, 8)),
@@ -361,5 +423,26 @@ mod tests {
         assert_eq!(UiPreferences::from_app(&app), preferences);
         assert!(app.nodes.is_empty());
         assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn preferences_apply_synchronizes_selected_section_with_panel_mode() {
+        let mut app = App::default();
+        let mut preferences = UiPreferences::default();
+
+        preferences.control_section = ControlSection::Git;
+        preferences.apply_to(&mut app);
+        assert_eq!(app.control_section, ControlSection::Git);
+        assert_eq!(app.sidebar_mode, SidebarMode::Git);
+
+        preferences.control_section = ControlSection::Workspaces;
+        preferences.apply_to(&mut app);
+        assert_eq!(app.control_section, ControlSection::Workspaces);
+        assert_eq!(app.roster_mode, RosterMode::Workspaces);
+
+        preferences.control_section = ControlSection::Settings;
+        preferences.apply_to(&mut app);
+        assert_eq!(app.control_section, ControlSection::Files);
+        assert_eq!(app.sidebar_mode, SidebarMode::Files);
     }
 }

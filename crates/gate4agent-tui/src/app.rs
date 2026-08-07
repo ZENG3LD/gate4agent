@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use gate4agent_node_protocol::{
-    GitWorktreeSnapshot, WorkspaceEntryKind, WorkspaceId, WorkspaceInspection,
+    GitWorktreeSnapshot, ManagedSessionState, SessionMode, WorkspaceEntryKind, WorkspaceId,
+    WorkspaceInspection, MAX_SESSION_DISPLAY_NAME_BYTES,
     MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
 };
 use gate4agent_types::{
@@ -128,6 +129,33 @@ pub struct SessionView {
     pub terminal_cursor: Option<(u16, u16)>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedSessionView {
+    pub node_id: String,
+    pub record_id: String,
+    pub display_name: String,
+    pub provider: Provider,
+    pub mode: SessionMode,
+    pub state: ManagedSessionState,
+    pub workspace_id: String,
+    pub canonical_root: String,
+    pub has_provider_session_identity: bool,
+    pub active_session: Option<SessionAddress>,
+    pub last_error: Option<String>,
+}
+
+impl ManagedSessionView {
+    pub fn short_title(&self) -> &str {
+        &self.display_name
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AgentRowKey {
+    Managed { node_id: String, record_id: String },
+    Legacy(SessionAddress),
+}
+
 impl SessionView {
     pub fn short_title(&self) -> String {
         format!("{} #{}", self.provider, self.address.instance_id)
@@ -157,6 +185,7 @@ pub struct NodeView {
     pub controller_owned: bool,
     pub event_sequence: u64,
     pub workspaces: Vec<WorkspaceView>,
+    pub session_records: Vec<ManagedSessionView>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +271,8 @@ pub enum Focus {
     AddSpace,
     CreateWorktree,
     RemoveWorktree,
+    RenameSession,
+    ForgetSession,
     Settings,
 }
 
@@ -282,6 +313,22 @@ pub enum MenuPlacement {
     #[default]
     Sidebar,
     Modal,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SidebarPresentation {
+    #[default]
+    Split,
+    Activity,
+}
+
+impl SidebarPresentation {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Activity => "activity",
+        }
+    }
 }
 
 impl MenuPlacement {
@@ -348,6 +395,12 @@ pub enum DragState {
         current_row: u16,
         moved: bool,
     },
+    AgentSelection {
+        key: AgentRowKey,
+        start_column: u16,
+        start_row: u16,
+        moved: bool,
+    },
     GridDivider {
         axis: GridAxisKind,
         index: usize,
@@ -403,6 +456,21 @@ pub struct RemoveWorktreeDialog {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenameSessionDialog {
+    pub node_id: String,
+    pub record_id: String,
+    pub original_name: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForgetSessionDialog {
+    pub node_id: String,
+    pub record_id: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiKey {
     Char(char),
     Ctrl(char),
@@ -442,6 +510,21 @@ pub enum AppAction {
         address: SessionAddress,
         rows: u16,
         cols: u16,
+    },
+    ResumeSessionRecord {
+        node_id: String,
+        record_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    RenameSessionRecord {
+        node_id: String,
+        record_id: String,
+        display_name: String,
+    },
+    ForgetSessionRecord {
+        node_id: String,
+        record_id: String,
     },
     Input { address: SessionAddress, text: String },
     Paste { address: SessionAddress, text: String },
@@ -498,6 +581,10 @@ pub enum HitTarget {
     ControlSection(ControlSection),
     SettingsStyle,
     SettingsPlacement,
+    SettingsPresentation,
+    SettingsSidebarCollapsed,
+    ActivitySection(ControlSection),
+    SidebarCollapse,
     ControlDrag,
     ControlResize,
     SidebarWidthDrag,
@@ -521,6 +608,7 @@ pub struct GridPaneLayout {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LayoutRects {
+    pub activity_rail: Rect,
     pub spaces: Rect,
     pub agents: Rect,
     pub tabs: Rect,
@@ -555,6 +643,8 @@ pub struct App {
     pub terminal_scroll_offsets: BTreeMap<SessionAddress, usize>,
     pub collapsed_directories: BTreeSet<(String, String, String)>,
     pub menu_placement: MenuPlacement,
+    pub sidebar_presentation: SidebarPresentation,
+    pub sidebar_collapsed: bool,
     pub control_section: ControlSection,
     pub settings_return_focus: Focus,
     pub control_modal_position: Option<(u16, u16)>,
@@ -569,6 +659,8 @@ pub struct App {
     pub add_space: Option<AddSpaceDialog>,
     pub create_worktree: Option<CreateWorktreeDialog>,
     pub remove_worktree: Option<RemoveWorktreeDialog>,
+    pub rename_session: Option<RenameSessionDialog>,
+    pub forget_session: Option<ForgetSessionDialog>,
     pub color_mode: PtyColorMode,
     pub notice: Option<String>,
     pub terminal_rows: u16,
@@ -600,6 +692,8 @@ impl Default for App {
             terminal_scroll_offsets: BTreeMap::new(),
             collapsed_directories: BTreeSet::new(),
             menu_placement: MenuPlacement::Sidebar,
+            sidebar_presentation: SidebarPresentation::Split,
+            sidebar_collapsed: false,
             control_section: ControlSection::Files,
             settings_return_focus: Focus::Tabs,
             control_modal_position: None,
@@ -614,6 +708,8 @@ impl Default for App {
             add_space: None,
             create_worktree: None,
             remove_worktree: None,
+            rename_session: None,
+            forget_session: None,
             color_mode: PtyColorMode::Inherited,
             notice: None,
             terminal_rows: 24,
@@ -768,8 +864,14 @@ impl App {
     }
 
     pub fn selected_agent_session(&self) -> Option<&SessionView> {
-        let address = self.agent_addresses().get(self.selected_agent)?.clone();
+        let key = self.agent_rows().get(self.selected_agent)?.clone();
+        let address = self.agent_row_active_address(&key)?;
         self.find_session(&address)
+    }
+
+    pub fn selected_managed_session(&self) -> Option<&ManagedSessionView> {
+        let key = self.agent_rows().get(self.selected_agent)?.clone();
+        self.find_managed_session(&key)
     }
 
     pub fn selected_tab_session(&self) -> Option<&SessionView> {
@@ -844,6 +946,38 @@ impl App {
             .find(|session| session.address == *address)
     }
 
+    pub fn session_title(&self, address: &SessionAddress) -> Option<String> {
+        if let Some(record) = self
+            .nodes
+            .iter()
+            .filter(|node| node.node_id == address.node_id)
+            .flat_map(|node| node.session_records.iter())
+            .find(|record| record.active_session.as_ref() == Some(address))
+        {
+            return Some(record.display_name.clone());
+        }
+        self.find_session(address).map(SessionView::short_title)
+    }
+
+    pub fn find_managed_session(&self, key: &AgentRowKey) -> Option<&ManagedSessionView> {
+        let AgentRowKey::Managed { node_id, record_id } = key else {
+            return None;
+        };
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == *node_id)?
+            .session_records
+            .iter()
+            .find(|record| record.record_id == *record_id)
+    }
+
+    pub fn agent_row_active_address(&self, key: &AgentRowKey) -> Option<SessionAddress> {
+        match key {
+            AgentRowKey::Managed { .. } => self.find_managed_session(key)?.active_session.clone(),
+            AgentRowKey::Legacy(address) => Some(address.clone()),
+        }
+    }
+
     fn node_is_connected(&self, node_id: &str) -> bool {
         self.nodes
             .iter()
@@ -883,6 +1017,67 @@ impl App {
         sessions.into_iter().map(|session| session.address.clone()).collect()
     }
 
+    pub fn agent_rows(&self) -> Vec<AgentRowKey> {
+        let managed_addresses = self
+            .nodes
+            .iter()
+            .flat_map(|node| node.session_records.iter())
+            .filter_map(|record| record.active_session.clone())
+            .collect::<BTreeSet<_>>();
+        let mut rows = self
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                node.session_records.iter().map(|record| AgentRowKey::Managed {
+                    node_id: node.node_id.clone(),
+                    record_id: record.record_id.clone(),
+                })
+            })
+            .chain(
+                self.agent_addresses()
+                    .into_iter()
+                    .filter(|address| !managed_addresses.contains(address))
+                    .map(AgentRowKey::Legacy),
+            )
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| self.agent_row_sort_key(left).cmp(&self.agent_row_sort_key(right)));
+        rows
+    }
+
+    fn agent_row_sort_key(&self, key: &AgentRowKey) -> (bool, u8, String, String, String) {
+        if let Some(record) = self.find_managed_session(key) {
+            let attention = record
+                .active_session
+                .as_ref()
+                .and_then(|address| self.find_session(address))
+                .is_some_and(|session| session.attention);
+            let state = match record.state {
+                ManagedSessionState::Live => 0,
+                ManagedSessionState::IdentityPending => 1,
+                ManagedSessionState::Dormant => 2,
+                ManagedSessionState::Unavailable => 3,
+            };
+            return (
+                !attention,
+                state,
+                record.provider.id().to_owned(),
+                record.display_name.to_ascii_lowercase(),
+                record.record_id.clone(),
+            );
+        }
+        let AgentRowKey::Legacy(address) = key else {
+            unreachable!("managed row must resolve")
+        };
+        let session = self.find_session(address);
+        (
+            !session.is_some_and(|session| session.attention),
+            if session.is_some_and(|session| session.running) { 0 } else { 3 },
+            session.map(|session| session.provider.id()).unwrap_or("unknown").to_owned(),
+            format!("{:020}", address.instance_id),
+            format!("{}:{}", address.node_id, address.workspace_id),
+        )
+    }
+
     pub fn upsert_node(&mut self, node: NodeView) {
         let previous_scrollback = self
             .terminal_scroll_offsets
@@ -896,9 +1091,7 @@ impl App {
         let selected_space = self.selected_workspace().map(|(node, workspace)| {
             (node.node_id.clone(), workspace.workspace_id.clone())
         });
-        let selected_agent = self
-            .selected_agent_session()
-            .map(|session| session.address.clone());
+        let selected_agent = self.agent_rows().get(self.selected_agent).cloned();
         for tab in self.tabs.iter_mut().filter(|tab| tab.address.node_id == node.node_id) {
             let Some(workspace) = node
                 .workspaces
@@ -983,7 +1176,7 @@ impl App {
                 && self.focus == Focus::Viewport
             {
                 self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
-                    Focus::Agents
+                    self.sidebar_focus()
                 } else {
                     Focus::Tabs
                 };
@@ -1009,7 +1202,7 @@ impl App {
                     self.focus = if self.tabs.is_empty()
                         && self.menu_placement == MenuPlacement::Sidebar
                     {
-                        Focus::Agents
+                        self.sidebar_focus()
                     } else {
                         Focus::Tabs
                     };
@@ -1031,12 +1224,21 @@ impl App {
         } else {
             self.selected_space = self.selected_space.min(self.space_rows().len().saturating_sub(1));
         }
-        if let Some(address) = selected_agent.and_then(|address| self.rebound_address(&address)) {
-            if let Some(index) = self.agent_addresses().iter().position(|candidate| *candidate == address) {
+        if let Some(key) = selected_agent {
+            let key = match key {
+                AgentRowKey::Managed { node_id, record_id } => {
+                    AgentRowKey::Managed { node_id, record_id }
+                }
+                AgentRowKey::Legacy(address) => self
+                    .rebound_address(&address)
+                    .map(AgentRowKey::Legacy)
+                    .unwrap_or(AgentRowKey::Legacy(address)),
+            };
+            if let Some(index) = self.agent_rows().iter().position(|candidate| *candidate == key) {
                 self.selected_agent = index;
             }
         } else {
-            self.selected_agent = self.selected_agent.min(self.agent_addresses().len().saturating_sub(1));
+            self.selected_agent = self.selected_agent.min(self.agent_rows().len().saturating_sub(1));
         }
         self.reconcile_pending_space();
         self.reconcile_pending_open();
@@ -1085,53 +1287,10 @@ impl App {
         endpoint: &str,
         state: ConnectionState,
     ) {
-        if matches!(&state, ConnectionState::Disconnected(_)) {
-            let selected_was_removed = self
-                .tabs
-                .get(self.selected_tab)
-                .is_some_and(|tab| tab.address.node_id == expected_node_id);
-            let focused_grid_was_removed = self
-                .grid
-                .panes
-                .get(self.grid.focused)
-                .is_some_and(|pane| pane.address.node_id == expected_node_id);
-            self.tabs.retain(|tab| tab.address.node_id != expected_node_id);
-            self.grid
-                .panes
-                .retain(|pane| pane.address.node_id != expected_node_id);
-            self.pending_open.retain(|address| address.node_id != expected_node_id);
-            self.terminal_scroll_offsets
-                .retain(|address, _| address.node_id != expected_node_id);
-            if self.pending_space.as_ref().is_some_and(|(node_id, _)| node_id == expected_node_id) {
-                self.pending_space = None;
-            }
-            self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
-            self.grid.focused = self.grid.focused.min(self.grid.panes.len().saturating_sub(1));
-            let active_was_removed = match self.surface_mode {
-                SurfaceMode::Tab => selected_was_removed,
-                SurfaceMode::Grid => focused_grid_was_removed,
-            };
-            if active_was_removed && self.focus == Focus::Viewport {
-                if self.surface_mode == SurfaceMode::Grid && !self.grid.panes.is_empty() {
-                    self.notice = Some(format!(
-                        "{expected_node_id} disconnected; nearest grid pane focused"
-                    ));
-                } else {
-                    self.surface_mode = SurfaceMode::Tab;
-                    self.focus = if self.tabs.is_empty()
-                        && self.menu_placement == MenuPlacement::Sidebar
-                    {
-                        Focus::Agents
-                    } else {
-                        Focus::Tabs
-                    };
-                    self.notice = Some(format!(
-                        "{expected_node_id} disconnected; active PTY input target cleared"
-                    ));
-                }
-            }
-        }
         if let Some(node) = self.nodes.iter_mut().find(|node| node.node_id == expected_node_id) {
+            if !endpoint.is_empty() {
+                node.endpoint = endpoint.to_owned();
+            }
             node.connection = state;
         } else {
             self.nodes.push(NodeView {
@@ -1141,9 +1300,236 @@ impl App {
                 controller_owned: false,
                 event_sequence: 0,
                 workspaces: Vec::new(),
+                session_records: Vec::new(),
             });
         }
         self.reconcile_session_drag();
+    }
+
+    pub fn remove_topology_node(&mut self, node_id: &str) {
+        let selected_space = self.selected_workspace_route();
+        let selected_agent = self.agent_rows().get(self.selected_agent).cloned();
+        let selected_tab = self.tabs.get(self.selected_tab).map(|tab| tab.address.clone());
+        let focused_pane = self
+            .grid
+            .panes
+            .get(self.grid.focused)
+            .map(|pane| pane.address.clone());
+        let selected_space_removed = selected_space
+            .as_ref()
+            .is_some_and(|(selected_node_id, _)| selected_node_id == node_id);
+        let selected_agent_removed = selected_agent.as_ref().is_some_and(|key| match key {
+            AgentRowKey::Managed { node_id: selected_node_id, .. } => selected_node_id == node_id,
+            AgentRowKey::Legacy(address) => address.node_id == node_id,
+        });
+        let selected_tab_removed = selected_tab
+            .as_ref()
+            .is_some_and(|address| address.node_id == node_id);
+        let focused_pane_removed = focused_pane
+            .as_ref()
+            .is_some_and(|address| address.node_id == node_id);
+
+        self.nodes.retain(|node| node.node_id != node_id);
+        self.tabs.retain(|tab| tab.address.node_id != node_id);
+        self.grid.panes.retain(|pane| pane.address.node_id != node_id);
+        self.pending_open.retain(|address| address.node_id != node_id);
+        self.terminal_scroll_offsets
+            .retain(|address, _| address.node_id != node_id);
+        self.workspace_inspections
+            .retain(|(inspection_node_id, _), _| inspection_node_id != node_id);
+        self.collapsed_directories
+            .retain(|(directory_node_id, _, _)| directory_node_id != node_id);
+        if self.pending_space.as_ref().is_some_and(|(pending_node_id, _)| pending_node_id == node_id) {
+            self.pending_space = None;
+        }
+        if self
+            .inspection_pending
+            .as_ref()
+            .is_some_and(|(pending_node_id, _)| pending_node_id == node_id)
+        {
+            self.inspection_pending = None;
+        }
+
+        let removed_modal_focus = match self.focus {
+            Focus::Spawn => self.spawn.as_ref().is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::AddSpace => self.add_space.as_ref().is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::CreateWorktree => self
+                .create_worktree
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::RemoveWorktree => self
+                .remove_worktree
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::RenameSession => self
+                .rename_session
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::ForgetSession => self
+                .forget_session
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
+            _ => false,
+        };
+        if self.spawn.as_ref().is_some_and(|dialog| dialog.node_id == node_id) {
+            self.spawn = None;
+        }
+        if self.add_space.as_ref().is_some_and(|dialog| dialog.node_id == node_id) {
+            self.add_space = None;
+        }
+        if self
+            .create_worktree
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.create_worktree = None;
+        }
+        if self
+            .remove_worktree
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.remove_worktree = None;
+        }
+        if self
+            .rename_session
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.rename_session = None;
+        }
+        if self
+            .forget_session
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.forget_session = None;
+        }
+
+        self.selected_tab = selected_tab
+            .as_ref()
+            .filter(|address| address.node_id != node_id)
+            .and_then(|address| self.tabs.iter().position(|tab| &tab.address == address))
+            .unwrap_or_else(|| self.selected_tab.min(self.tabs.len().saturating_sub(1)));
+        self.grid.focused = focused_pane
+            .as_ref()
+            .filter(|address| address.node_id != node_id)
+            .and_then(|address| self.grid.panes.iter().position(|pane| &pane.address == address))
+            .unwrap_or_else(|| self.grid.focused.min(self.grid.panes.len().saturating_sub(1)));
+        self.selected_space = selected_space
+            .as_ref()
+            .filter(|(selected_node_id, _)| selected_node_id != node_id)
+            .and_then(|(selected_node_id, workspace_id)| {
+                self.space_rows().iter().position(|(node_index, workspace_index)| {
+                    self.nodes[*node_index].node_id == *selected_node_id
+                        && self.nodes[*node_index].workspaces[*workspace_index].workspace_id
+                            == *workspace_id
+                })
+            })
+            .unwrap_or_else(|| self.selected_space.min(self.space_rows().len().saturating_sub(1)));
+        self.selected_agent = selected_agent
+            .as_ref()
+            .filter(|key| match key {
+                AgentRowKey::Managed { node_id: selected_node_id, .. } => selected_node_id != node_id,
+                AgentRowKey::Legacy(address) => address.node_id != node_id,
+            })
+            .and_then(|key| self.agent_rows().iter().position(|candidate| candidate == key))
+            .unwrap_or_else(|| self.selected_agent.min(self.agent_rows().len().saturating_sub(1)));
+
+        if selected_space_removed {
+            self.files_cursor = 0;
+            self.git_cursor = 0;
+            self.files_scroll = 0;
+            self.git_scroll = 0;
+            self.workspaces_scroll = 0;
+        } else {
+            self.files_cursor = self
+                .files_cursor
+                .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
+            self.git_cursor = self.git_cursor.min(self.git_item_count().saturating_sub(1));
+        }
+        if selected_agent_removed {
+            self.agents_scroll = 0;
+        }
+
+        self.reconcile_session_drag();
+        let active_target_removed = match self.surface_mode {
+            SurfaceMode::Tab => selected_tab_removed,
+            SurfaceMode::Grid => focused_pane_removed,
+        };
+        if self.focus == Focus::Viewport && active_target_removed {
+            if self.surface_mode == SurfaceMode::Grid && !self.grid.panes.is_empty() {
+                self.notice = Some(format!(
+                    "{node_id} removed from C2 topology; nearest grid pane focused"
+                ));
+            } else {
+                self.surface_mode = SurfaceMode::Tab;
+                self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
+                    self.sidebar_focus()
+                } else {
+                    Focus::Tabs
+                };
+                self.notice = Some(format!(
+                    "{node_id} removed from C2 topology; active PTY input target cleared"
+                ));
+            }
+        } else if removed_modal_focus {
+            self.surface_mode = SurfaceMode::Tab;
+            self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
+                self.sidebar_focus()
+            } else {
+                Focus::Tabs
+            };
+            self.notice = Some(format!("{node_id} removed from C2 topology; dialog closed"));
+        }
+    }
+
+    pub fn upsert_managed_session(&mut self, record: ManagedSessionView) {
+        let key = AgentRowKey::Managed {
+            node_id: record.node_id.clone(),
+            record_id: record.record_id.clone(),
+        };
+        let selected = self.agent_rows().get(self.selected_agent).cloned();
+        let Some(node) = self.nodes.iter_mut().find(|node| node.node_id == record.node_id) else {
+            return;
+        };
+        if let Some(existing) = node
+            .session_records
+            .iter_mut()
+            .find(|existing| existing.record_id == record.record_id)
+        {
+            *existing = record;
+        } else {
+            node.session_records.push(record);
+        }
+        if let Some(selected) = selected {
+            if let Some(index) = self.agent_rows().iter().position(|candidate| *candidate == selected) {
+                self.selected_agent = index;
+            }
+        } else if let Some(index) = self.agent_rows().iter().position(|candidate| *candidate == key) {
+            self.selected_agent = index;
+        }
+    }
+
+    pub fn remove_managed_session(&mut self, node_id: &str, record_id: &str) {
+        let selected = self.agent_rows().get(self.selected_agent).cloned();
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.node_id == node_id) {
+            node.session_records.retain(|record| record.record_id != record_id);
+        }
+        let removed = AgentRowKey::Managed {
+            node_id: node_id.to_owned(),
+            record_id: record_id.to_owned(),
+        };
+        if selected.as_ref() != Some(&removed) {
+            if let Some(index) = selected
+                .as_ref()
+                .and_then(|selected| self.agent_rows().iter().position(|candidate| candidate == selected))
+            {
+                self.selected_agent = index;
+                return;
+            }
+        }
+        self.selected_agent = self.selected_agent.min(self.agent_rows().len().saturating_sub(1));
     }
 
     pub fn request_open(&mut self, address: SessionAddress) {
@@ -1160,8 +1546,15 @@ impl App {
     }
 
     pub fn open_selected_agent(&mut self) {
-        if let Some(address) = self.agent_addresses().get(self.selected_agent).cloned() {
+        let key = self.agent_rows().get(self.selected_agent).cloned();
+        if let Some(address) = key.as_ref().and_then(|key| self.agent_row_active_address(key)) {
             self.open_address(address);
+        } else if let Some(record) = key.as_ref().and_then(|key| self.find_managed_session(key)) {
+            self.notice = Some(format!(
+                "{} is {}; press r to resume",
+                record.display_name,
+                managed_state_label(record.state)
+            ));
         }
     }
 
@@ -1181,9 +1574,9 @@ impl App {
             self.select_workspace_without_inspection(space_index);
         }
         if let Some(agent_index) = self
-            .agent_addresses()
+            .agent_rows()
             .iter()
-            .position(|candidate| *candidate == address)
+            .position(|candidate| self.agent_row_active_address(candidate).as_ref() == Some(&address))
         {
             self.selected_agent = agent_index;
         }
@@ -1344,6 +1737,20 @@ impl App {
                 current_row,
                 moved,
             }),
+            DragState::AgentSelection {
+                key,
+                start_column,
+                start_row,
+                moved,
+            } => self
+                .agent_rows()
+                .contains(&key)
+                .then_some(DragState::AgentSelection {
+                    key,
+                    start_column,
+                    start_row,
+                    moved,
+                }),
             other => Some(other),
         };
     }
@@ -1386,7 +1793,7 @@ impl App {
                 && self.tabs.is_empty()
                 && self.menu_placement == MenuPlacement::Sidebar
             {
-                Focus::Agents
+                self.sidebar_focus()
             } else {
                 Focus::Tabs
             };
@@ -1399,7 +1806,7 @@ impl App {
         self.tabs.remove(self.selected_tab);
         self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
         self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
-            Focus::Agents
+            self.sidebar_focus()
         } else {
             Focus::Tabs
         };
@@ -1445,6 +1852,12 @@ impl App {
         if self.focus == Focus::RemoveWorktree {
             return self.reduce_remove_worktree(key);
         }
+        if self.focus == Focus::RenameSession {
+            return self.reduce_rename_session(key);
+        }
+        if self.focus == Focus::ForgetSession {
+            return self.reduce_forget_session(key);
+        }
         if self.focus == Focus::Settings {
             return self.reduce_settings(key);
         }
@@ -1482,6 +1895,8 @@ impl App {
                 | Focus::AddSpace
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::ForgetSession
                 | Focus::Settings => {
                     AppAction::None
                 }
@@ -1492,7 +1907,12 @@ impl App {
     pub fn click(&mut self, column: u16, row: u16) -> AppAction {
         if matches!(
             self.focus,
-            Focus::Spawn | Focus::AddSpace | Focus::CreateWorktree | Focus::RemoveWorktree
+            Focus::Spawn
+                | Focus::AddSpace
+                | Focus::CreateWorktree
+                | Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::ForgetSession
         ) {
             return AppAction::None;
         }
@@ -1516,6 +1936,8 @@ impl App {
                 }
                 Some(HitTarget::SettingsStyle) => self.cycle_color_mode(),
                 Some(HitTarget::SettingsPlacement) => self.toggle_menu_placement(),
+                Some(HitTarget::SettingsPresentation) => self.toggle_sidebar_presentation(),
+                Some(HitTarget::SettingsSidebarCollapsed) => self.toggle_sidebar_collapsed(),
                 Some(HitTarget::SidebarItem(index)) => {
                     let mode = match self.control_section {
                         ControlSection::Files => SidebarMode::Files,
@@ -1527,14 +1949,7 @@ impl App {
                     return self.select_inspector_item(mode, index);
                 }
                 Some(HitTarget::Agent(index)) => {
-                    if let Some(address) = self.agent_addresses().get(index).cloned() {
-                        self.begin_session_drag(
-                            DragSource::Agent(index),
-                            address,
-                            column,
-                            row,
-                        );
-                    }
+                    self.select_or_begin_agent_drag(index, column, row);
                 }
                 Some(HitTarget::Space(index)) => {
                     self.select_workspace_without_inspection(index);
@@ -1565,16 +1980,26 @@ impl App {
             Some(HitTarget::SidebarMode(mode)) => {
                 return self.select_sidebar_mode(mode);
             }
+            Some(HitTarget::ActivitySection(section)) => {
+                return self.activate_activity_section(section);
+            }
+            Some(HitTarget::SidebarCollapse) => self.toggle_sidebar_collapsed(),
             Some(HitTarget::SidebarWidthDrag) => self.drag_state = Some(DragState::SidebarWidth),
             Some(HitTarget::SidebarSplitDrag) => self.drag_state = Some(DragState::SidebarSplit),
             Some(HitTarget::RosterMode(mode)) => {
                 self.roster_mode = mode;
+                self.control_section = match mode {
+                    RosterMode::Agents => ControlSection::Agents,
+                    RosterMode::Workspaces => ControlSection::Workspaces,
+                };
                 self.focus = Focus::Agents;
             }
             Some(HitTarget::Space(index)) => {
+                self.control_section = ControlSection::Workspaces;
                 return self.select_workspace(index);
             }
             Some(HitTarget::SpawnSpace(index)) => {
+                self.control_section = ControlSection::Workspaces;
                 self.select_workspace_without_inspection(index);
                 return self.begin_spawn();
             }
@@ -1588,18 +2013,16 @@ impl App {
             }
             Some(HitTarget::RemoveWorktree(index)) => return self.begin_remove_worktree(index),
             Some(HitTarget::SidebarItem(index)) => {
+                self.control_section = match self.sidebar_mode {
+                    SidebarMode::Files => ControlSection::Files,
+                    SidebarMode::Git => ControlSection::Git,
+                };
                 self.focus = Focus::Spaces;
                 return self.select_inspector_item(self.sidebar_mode, index);
             }
             Some(HitTarget::Agent(index)) => {
-                if let Some(address) = self.agent_addresses().get(index).cloned() {
-                    self.begin_session_drag(
-                        DragSource::Agent(index),
-                        address,
-                        column,
-                        row,
-                    );
-                }
+                self.control_section = ControlSection::Agents;
+                self.select_or_begin_agent_drag(index, column, row);
             }
             Some(HitTarget::AddAgent) => return self.begin_spawn(),
             Some(HitTarget::Tab(index)) => {
@@ -1637,6 +2060,8 @@ impl App {
                 HitTarget::ControlSection(_)
                 | HitTarget::SettingsStyle
                 | HitTarget::SettingsPlacement
+                | HitTarget::SettingsPresentation
+                | HitTarget::SettingsSidebarCollapsed
                 | HitTarget::ControlDrag
                 | HitTarget::ControlResize,
             ) => {}
@@ -1649,7 +2074,12 @@ impl App {
     pub fn scroll(&mut self, column: u16, row: u16, up: bool) -> AppAction {
         if matches!(
             self.focus,
-            Focus::Spawn | Focus::AddSpace | Focus::CreateWorktree | Focus::RemoveWorktree
+            Focus::Spawn
+                | Focus::AddSpace
+                | Focus::CreateWorktree
+                | Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::ForgetSession
         ) {
             return AppAction::None;
         }
@@ -1735,7 +2165,12 @@ impl App {
             }
             DragState::SidebarWidth => {
                 let maximum = self.terminal_cols.saturating_sub(24).min(60).max(18);
-                self.sidebar_width = column.saturating_add(1).clamp(18, maximum);
+                let content_column = if self.sidebar_presentation == SidebarPresentation::Activity {
+                    column.saturating_sub(self.layout.activity_rail.width)
+                } else {
+                    column
+                };
+                self.sidebar_width = content_column.saturating_add(1).clamp(18, maximum);
             }
             DragState::SidebarSplit => {
                 let height = self.terminal_rows.max(1);
@@ -1761,6 +2196,17 @@ impl App {
                     }
                 }
             }
+            DragState::AgentSelection {
+                start_column,
+                start_row,
+                ..
+            } => {
+                if let Some(DragState::AgentSelection { moved, .. }) = self.drag_state.as_mut() {
+                    if column != start_column || row != start_row {
+                        *moved = true;
+                    }
+                }
+            }
             DragState::GridDivider { axis, index } => {
                 self.update_grid_divider(axis, index, column, row);
             }
@@ -1772,8 +2218,26 @@ impl App {
         let Some(drag) = self.drag_state.take() else {
             return AppAction::None;
         };
-        let DragState::SessionChip { address, moved, .. } = drag else {
-            return AppAction::None;
+        let (address, moved) = match drag {
+            DragState::SessionChip { address, moved, .. } => (address, moved),
+            DragState::AgentSelection { key, moved, .. } => {
+                if !moved {
+                    let Some(index) = self
+                        .agent_rows()
+                        .iter()
+                        .position(|candidate| candidate == &key)
+                    else {
+                        return AppAction::None;
+                    };
+                    self.selected_agent = index;
+                    if self.focus != Focus::Settings {
+                        self.focus = Focus::Agents;
+                    }
+                    self.open_selected_agent();
+                }
+                return AppAction::None;
+            }
+            _ => return AppAction::None,
         };
         if !moved {
             self.open_address(address);
@@ -1860,6 +2324,22 @@ impl App {
             current_row: row,
             moved: false,
         });
+    }
+
+    fn select_or_begin_agent_drag(&mut self, index: usize, column: u16, row: u16) {
+        let Some(key) = self.agent_rows().get(index).cloned() else {
+            return;
+        };
+        if let Some(address) = self.agent_row_active_address(&key) {
+            self.begin_session_drag(DragSource::Agent(index), address, column, row);
+        } else {
+            self.drag_state = Some(DragState::AgentSelection {
+                key,
+                start_column: column,
+                start_row: row,
+                moved: false,
+            });
+        }
     }
 
     fn update_grid_divider(
@@ -1966,6 +2446,9 @@ impl App {
         }
         if self.focus == Focus::CreateWorktree {
             return self.paste_create_worktree(text);
+        }
+        if self.focus == Focus::RenameSession {
+            return self.paste_rename_session(text);
         }
         if self.focus != Focus::Viewport {
             return AppAction::None;
@@ -2131,6 +2614,39 @@ impl App {
         AppAction::None
     }
 
+    fn begin_rename_selected_agent(&mut self) -> AppAction {
+        let Some(record) = self.selected_managed_session() else {
+            self.notice = Some("rename requires a node-owned session record".to_owned());
+            return AppAction::None;
+        };
+        self.rename_session = Some(RenameSessionDialog {
+            node_id: record.node_id.clone(),
+            record_id: record.record_id.clone(),
+            original_name: record.display_name.clone(),
+            display_name: record.display_name.clone(),
+        });
+        self.focus = Focus::RenameSession;
+        AppAction::None
+    }
+
+    fn begin_forget_selected_agent(&mut self) -> AppAction {
+        let Some(record) = self.selected_managed_session() else {
+            self.notice = Some("forget requires a node-owned session record".to_owned());
+            return AppAction::None;
+        };
+        if record.active_session.is_some() || matches!(record.state, ManagedSessionState::Live) {
+            self.notice = Some("stop the live PTY before forgetting its session record".to_owned());
+            return AppAction::None;
+        }
+        self.forget_session = Some(ForgetSessionDialog {
+            node_id: record.node_id.clone(),
+            record_id: record.record_id.clone(),
+            display_name: record.display_name.clone(),
+        });
+        self.focus = Focus::ForgetSession;
+        AppAction::None
+    }
+
     fn connected_node_ids(&self) -> Vec<String> {
         self.nodes
             .iter()
@@ -2141,6 +2657,10 @@ impl App {
 
     fn select_sidebar_mode(&mut self, mode: SidebarMode) -> AppAction {
         self.sidebar_mode = mode;
+        self.control_section = match mode {
+            SidebarMode::Files => ControlSection::Files,
+            SidebarMode::Git => ControlSection::Git,
+        };
         self.focus = Focus::Spaces;
         self.inspect_selected_workspace()
     }
@@ -2153,6 +2673,42 @@ impl App {
             ControlSection::Agents
             | ControlSection::Workspaces
             | ControlSection::Settings => AppAction::None,
+        }
+    }
+
+    fn activate_activity_section(&mut self, section: ControlSection) -> AppAction {
+        if section == ControlSection::Settings {
+            self.begin_settings();
+            return AppAction::None;
+        }
+        if self.control_section == section && !self.sidebar_collapsed {
+            self.sidebar_collapsed = true;
+            return AppAction::None;
+        }
+        self.control_section = section;
+        self.sidebar_collapsed = false;
+        match section {
+            ControlSection::Files => {
+                self.sidebar_mode = SidebarMode::Files;
+                self.focus = Focus::Spaces;
+                self.inspect_selected_workspace()
+            }
+            ControlSection::Git => {
+                self.sidebar_mode = SidebarMode::Git;
+                self.focus = Focus::Spaces;
+                self.inspect_selected_workspace()
+            }
+            ControlSection::Agents => {
+                self.roster_mode = RosterMode::Agents;
+                self.focus = Focus::Agents;
+                AppAction::None
+            }
+            ControlSection::Workspaces => {
+                self.roster_mode = RosterMode::Workspaces;
+                self.focus = Focus::Agents;
+                AppAction::None
+            }
+            ControlSection::Settings => AppAction::None,
         }
     }
 
@@ -2198,7 +2754,7 @@ impl App {
             ControlSection::Agents => {
                 self.selected_agent = moved_index(
                     self.selected_agent,
-                    self.agent_addresses().len(),
+                    self.agent_rows().len(),
                     up,
                 );
             }
@@ -2334,7 +2890,7 @@ impl App {
     fn scroll_roster(&mut self, mode: RosterMode, up: bool, visible_rows: u16) {
         let capacity = visible_rows as usize / 2;
         let count = match mode {
-            RosterMode::Agents => self.agent_addresses().len(),
+            RosterMode::Agents => self.agent_rows().len(),
             RosterMode::Workspaces => self.space_rows().len(),
         };
         let maximum = count.saturating_sub(capacity);
@@ -2363,7 +2919,7 @@ impl App {
     fn reveal_roster_selection(&mut self, mode: RosterMode, visible_rows: u16) {
         let capacity = visible_rows as usize / 2;
         let (selected, count) = match mode {
-            RosterMode::Agents => (self.selected_agent, self.agent_addresses().len()),
+            RosterMode::Agents => (self.selected_agent, self.agent_rows().len()),
             RosterMode::Workspaces => (self.selected_space, self.space_rows().len()),
         };
         let offset = match mode {
@@ -2482,6 +3038,10 @@ impl App {
     }
 
     fn reduce_spaces(&mut self, key: UiKey) -> AppAction {
+        self.control_section = match self.sidebar_mode {
+            SidebarMode::Files => ControlSection::Files,
+            SidebarMode::Git => ControlSection::Git,
+        };
         let count = self.sidebar_item_count();
         let navigated = matches!(&key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
         match key {
@@ -2581,14 +3141,20 @@ impl App {
         match key {
             UiKey::Char('a') => {
                 self.roster_mode = RosterMode::Agents;
+                self.control_section = ControlSection::Agents;
                 return AppAction::None;
             }
             UiKey::Char('w') => {
                 self.roster_mode = RosterMode::Workspaces;
+                self.control_section = ControlSection::Workspaces;
                 return AppAction::None;
             }
             _ => {}
         }
+        self.control_section = match self.roster_mode {
+            RosterMode::Agents => ControlSection::Agents,
+            RosterMode::Workspaces => ControlSection::Workspaces,
+        };
         if self.roster_mode == RosterMode::Workspaces {
             let count = self.space_rows().len();
             let navigated = matches!(&key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
@@ -2618,34 +3184,37 @@ impl App {
             }
             return action;
         }
-        let count = self.agent_addresses().len();
+        let count = self.agent_rows().len();
         let navigated = matches!(&key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
         match key {
             UiKey::Up => self.selected_agent = self.selected_agent.saturating_sub(1),
             UiKey::Down if count > 0 => self.selected_agent = (self.selected_agent + 1).min(count - 1),
             UiKey::Enter => self.open_selected_agent(),
             UiKey::Delete => {
-                let Some(address) = self.agent_addresses().get(self.selected_agent).cloned() else {
+                let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
                     self.notice = Some("no managed session selected".to_owned());
                     return AppAction::None;
                 };
-                if !self.address_is_connected(&address) {
-                    self.notice = Some(format!("{} is disconnected; lifecycle action unavailable", address.node_id));
-                    return AppAction::None;
+                if let Some(address) = self.agent_row_active_address(&key) {
+                    if !self.address_is_connected(&address) {
+                        self.notice = Some(format!("{} is disconnected; lifecycle action unavailable", address.node_id));
+                        return AppAction::None;
+                    }
+                    let Some(session) = self.find_session(&address) else {
+                        return AppAction::None;
+                    };
+                    if session.stoppable {
+                        return AppAction::Stop { address: session.address.clone(), force: false };
+                    }
+                    if session.removable && self.find_managed_session(&key).is_none() {
+                        return AppAction::Remove { address: session.address.clone() };
+                    }
                 }
-                let Some(session) = self.find_session(&address) else {
-                    return AppAction::None;
-                };
-                if session.stoppable {
-                    return AppAction::Stop { address: session.address.clone(), force: false };
-                }
-                if session.removable {
-                    return AppAction::Remove { address: session.address.clone() };
-                }
-                self.notice = Some("selected PTY cannot be removed in its current state".to_owned());
+                return self.begin_forget_selected_agent();
             }
             UiKey::Char('+') | UiKey::Insert => return self.begin_spawn(),
             UiKey::Char('r') => return self.restart_selected_agent(),
+            UiKey::Char('n') => return self.begin_rename_selected_agent(),
             _ => {}
         }
         if navigated {
@@ -2658,8 +3227,40 @@ impl App {
     }
 
     fn restart_selected_agent(&mut self) -> AppAction {
-        let Some(address) = self.agent_addresses().get(self.selected_agent).cloned() else {
+        let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
             self.notice = Some("no managed session selected".to_owned());
+            return AppAction::None;
+        };
+        if let Some(record) = self.find_managed_session(&key) {
+            let node_id = record.node_id.clone();
+            let record_id = record.record_id.clone();
+            let display_name = record.display_name.clone();
+            let state = record.state;
+            let resumable = record.has_provider_session_identity;
+            let active = record.active_session.clone();
+            if !self.node_is_connected(&node_id) {
+                self.notice = Some(format!("{node_id} is disconnected; resume unavailable"));
+                return AppAction::None;
+            }
+            if state == ManagedSessionState::Live || active.is_some() {
+                self.notice = Some(format!("{display_name} is already live"));
+                return AppAction::None;
+            }
+            if state != ManagedSessionState::Dormant || !resumable {
+                self.notice = Some(format!(
+                    "{display_name} cannot resume: {}",
+                    managed_state_label(state)
+                ));
+                return AppAction::None;
+            }
+            return AppAction::ResumeSessionRecord {
+                node_id,
+                record_id,
+                rows: self.content_rows(),
+                cols: self.content_cols(),
+            };
+        }
+        let Some(address) = self.agent_row_active_address(&key) else {
             return AppAction::None;
         };
         if !self.address_is_connected(&address) {
@@ -2978,6 +3579,86 @@ impl App {
         }
     }
 
+    fn reduce_rename_session(&mut self, key: UiKey) -> AppAction {
+        let Some(mut dialog) = self.rename_session.take() else {
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        };
+        match key {
+            UiKey::Escape => {
+                self.focus = Focus::Agents;
+                AppAction::None
+            }
+            UiKey::Backspace => {
+                dialog.display_name.pop();
+                self.rename_session = Some(dialog);
+                AppAction::None
+            }
+            UiKey::Char(ch) => {
+                if let Err(message) = append_session_name(&mut dialog.display_name, ch.to_string()) {
+                    self.notice = Some(message);
+                }
+                self.rename_session = Some(dialog);
+                AppAction::None
+            }
+            UiKey::Enter => {
+                let name = dialog.display_name.trim().to_owned();
+                if let Err(message) = validate_session_name(&name) {
+                    self.notice = Some(message);
+                    self.rename_session = Some(dialog);
+                    return AppAction::None;
+                }
+                self.focus = Focus::Agents;
+                if name == dialog.original_name {
+                    return AppAction::None;
+                }
+                AppAction::RenameSessionRecord {
+                    node_id: dialog.node_id,
+                    record_id: dialog.record_id,
+                    display_name: name,
+                }
+            }
+            _ => {
+                self.rename_session = Some(dialog);
+                AppAction::None
+            }
+        }
+    }
+
+    fn paste_rename_session(&mut self, text: String) -> AppAction {
+        let Some(dialog) = self.rename_session.as_mut() else {
+            return AppAction::None;
+        };
+        if let Err(message) = append_session_name(&mut dialog.display_name, text) {
+            self.notice = Some(message);
+        }
+        AppAction::None
+    }
+
+    fn reduce_forget_session(&mut self, key: UiKey) -> AppAction {
+        let Some(dialog) = self.forget_session.take() else {
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        };
+        match key {
+            UiKey::Char('y') | UiKey::Char('Y') | UiKey::Enter => {
+                self.focus = Focus::Agents;
+                AppAction::ForgetSessionRecord {
+                    node_id: dialog.node_id,
+                    record_id: dialog.record_id,
+                }
+            }
+            UiKey::Escape | UiKey::Char('n') | UiKey::Char('N') => {
+                self.focus = Focus::Agents;
+                AppAction::None
+            }
+            _ => {
+                self.forget_session = Some(dialog);
+                AppAction::None
+            }
+        }
+    }
+
     fn cycle_color_mode(&mut self) {
         self.color_mode = self.color_mode.cycle();
         self.notice = Some(format!("terminal style: {}", self.color_mode));
@@ -2985,9 +3666,6 @@ impl App {
 
     fn begin_settings(&mut self) {
         self.settings_return_focus = self.focus;
-        if self.menu_placement == MenuPlacement::Sidebar {
-            self.control_section = ControlSection::Settings;
-        }
         self.focus = Focus::Settings;
     }
 
@@ -3006,6 +3684,44 @@ impl App {
             MenuPlacement::Sidebar => MenuPlacement::Modal,
             MenuPlacement::Modal => MenuPlacement::Sidebar,
         };
+        if self.menu_placement == MenuPlacement::Sidebar
+            && self.sidebar_presentation == SidebarPresentation::Activity
+        {
+            self.synchronize_activity_section();
+        }
+    }
+
+    fn toggle_sidebar_presentation(&mut self) {
+        self.sidebar_presentation = match self.sidebar_presentation {
+            SidebarPresentation::Split => SidebarPresentation::Activity,
+            SidebarPresentation::Activity => SidebarPresentation::Split,
+        };
+        if self.sidebar_presentation == SidebarPresentation::Activity {
+            self.synchronize_activity_section();
+        }
+        self.sidebar_collapsed = false;
+    }
+
+    fn synchronize_activity_section(&mut self) {
+        if self.control_section == ControlSection::Settings {
+            self.control_section = ControlSection::Files;
+        }
+        match self.control_section {
+            ControlSection::Files => self.sidebar_mode = SidebarMode::Files,
+            ControlSection::Git => self.sidebar_mode = SidebarMode::Git,
+            ControlSection::Agents => self.roster_mode = RosterMode::Agents,
+            ControlSection::Workspaces => self.roster_mode = RosterMode::Workspaces,
+            ControlSection::Settings => unreachable!("settings is normalized above"),
+        }
+    }
+
+    fn toggle_sidebar_collapsed(&mut self) {
+        if self.menu_placement == MenuPlacement::Modal
+            || self.sidebar_presentation != SidebarPresentation::Activity
+        {
+            return;
+        }
+        self.sidebar_collapsed = !self.sidebar_collapsed;
     }
 
     fn reduce_settings(&mut self, key: UiKey) -> AppAction {
@@ -3016,6 +3732,8 @@ impl App {
                 UiKey::Char('m') | UiKey::Left | UiKey::Right => {
                     self.toggle_menu_placement()
                 }
+                UiKey::Char('p') => self.toggle_sidebar_presentation(),
+                UiKey::Char('b') => self.toggle_sidebar_collapsed(),
                 _ => {}
             }
             return AppAction::None;
@@ -3071,6 +3789,15 @@ impl App {
             },
             UiKey::Char('s') => self.cycle_color_mode(),
             UiKey::Char('m') => self.toggle_menu_placement(),
+            UiKey::Char('p') if self.control_section == ControlSection::Settings => {
+                self.toggle_sidebar_presentation()
+            }
+            UiKey::Char('b') if self.control_section == ControlSection::Settings => {
+                self.toggle_sidebar_collapsed()
+            }
+            UiKey::Char('n') if self.control_section == ControlSection::Agents => {
+                return self.begin_rename_selected_agent();
+            }
             UiKey::Home => match self.control_section {
                 ControlSection::Files => self.files_cursor = 0,
                 ControlSection::Git => self.git_cursor = 0,
@@ -3084,7 +3811,7 @@ impl App {
                 }
                 ControlSection::Git => self.git_cursor = self.git_item_count().saturating_sub(1),
                 ControlSection::Agents => {
-                    self.selected_agent = self.agent_addresses().len().saturating_sub(1)
+                    self.selected_agent = self.agent_rows().len().saturating_sub(1)
                 }
                 ControlSection::Workspaces => {
                     self.selected_space = self.space_rows().len().saturating_sub(1)
@@ -3106,6 +3833,25 @@ impl App {
                 | Focus::AddSpace
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::ForgetSession
+                | Focus::Settings => self.focus,
+            };
+        }
+        if self.sidebar_presentation == SidebarPresentation::Activity {
+            let sidebar = self.sidebar_focus();
+            return match self.focus {
+                Focus::Tabs => Focus::Viewport,
+                Focus::Viewport => sidebar,
+                Focus::Spaces | Focus::Agents => {
+                    if self.focus == sidebar { Focus::Tabs } else { sidebar }
+                }
+                Focus::Spawn
+                | Focus::AddSpace
+                | Focus::CreateWorktree
+                | Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::ForgetSession
                 | Focus::Settings => self.focus,
             };
         }
@@ -3118,6 +3864,8 @@ impl App {
             | Focus::AddSpace
             | Focus::CreateWorktree
             | Focus::RemoveWorktree
+            | Focus::RenameSession
+            | Focus::ForgetSession
             | Focus::Settings => self.focus,
         }
     }
@@ -3132,6 +3880,25 @@ impl App {
                 | Focus::AddSpace
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::ForgetSession
+                | Focus::Settings => self.focus,
+            };
+        }
+        if self.sidebar_presentation == SidebarPresentation::Activity {
+            let sidebar = self.sidebar_focus();
+            return match self.focus {
+                Focus::Tabs => sidebar,
+                Focus::Viewport => Focus::Tabs,
+                Focus::Spaces | Focus::Agents => {
+                    if self.focus == sidebar { Focus::Viewport } else { sidebar }
+                }
+                Focus::Spawn
+                | Focus::AddSpace
+                | Focus::CreateWorktree
+                | Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::ForgetSession
                 | Focus::Settings => self.focus,
             };
         }
@@ -3144,7 +3911,20 @@ impl App {
             | Focus::AddSpace
             | Focus::CreateWorktree
             | Focus::RemoveWorktree
+            | Focus::RenameSession
+            | Focus::ForgetSession
             | Focus::Settings => self.focus,
+        }
+    }
+
+    fn sidebar_focus(&self) -> Focus {
+        if self.sidebar_presentation != SidebarPresentation::Activity {
+            return Focus::Agents;
+        }
+        match self.control_section {
+            ControlSection::Files | ControlSection::Git => Focus::Spaces,
+            ControlSection::Agents | ControlSection::Workspaces => Focus::Agents,
+            ControlSection::Settings => Focus::Tabs,
         }
     }
 
@@ -3473,6 +4253,36 @@ fn cycle_provider(enabled: &[Provider], current: Provider, forward: bool) -> Pro
     enabled[index]
 }
 
+pub fn managed_state_label(state: ManagedSessionState) -> &'static str {
+    match state {
+        ManagedSessionState::IdentityPending => "identity pending",
+        ManagedSessionState::Live => "live",
+        ManagedSessionState::Dormant => "dormant",
+        ManagedSessionState::Unavailable => "unavailable",
+    }
+}
+
+fn append_session_name(target: &mut String, text: String) -> Result<(), String> {
+    if text.chars().any(char::is_control) {
+        return Err("session name cannot contain control characters".to_owned());
+    }
+    if target.len().saturating_add(text.len()) > MAX_SESSION_DISPLAY_NAME_BYTES {
+        return Err("session name exceeds protocol limit".to_owned());
+    }
+    target.push_str(&text);
+    Ok(())
+}
+
+fn validate_session_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("session name cannot be empty".to_owned());
+    }
+    if name.len() > MAX_SESSION_DISPLAY_NAME_BYTES || name.chars().any(char::is_control) {
+        return Err("session name is invalid".to_owned());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3494,6 +4304,7 @@ mod tests {
             connection: ConnectionState::Connected,
             controller_owned: true,
             event_sequence: 10,
+            session_records: Vec::new(),
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
@@ -3533,6 +4344,33 @@ mod tests {
         let address = session.address.clone();
         app.nodes[0].workspaces[0].sessions.push(session);
         address
+    }
+
+    fn add_managed_record(
+        app: &mut App,
+        record_id: &str,
+        display_name: &str,
+        state: ManagedSessionState,
+        active_session: Option<SessionAddress>,
+        has_identity: bool,
+    ) -> AgentRowKey {
+        app.nodes[0].session_records.push(ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: record_id.to_owned(),
+            display_name: display_name.to_owned(),
+            provider: Provider::Codex,
+            mode: SessionMode::Pty,
+            state,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: r"C:\work\nemo".to_owned(),
+            has_provider_session_identity: has_identity,
+            active_session,
+            last_error: None,
+        });
+        AgentRowKey::Managed {
+            node_id: "node-a".to_owned(),
+            record_id: record_id.to_owned(),
+        }
     }
 
     fn workspace_inspection() -> WorkspaceInspection {
@@ -3604,6 +4442,26 @@ mod tests {
             assert_eq!(app.paste("paste".to_owned()), AppAction::None);
             assert_eq!(app.focus, focus);
         }
+    }
+
+    #[test]
+    fn activity_focus_cycle_visits_only_the_selected_sidebar_surface() {
+        let mut app = fixture();
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.control_section = ControlSection::Files;
+        app.focus = Focus::Spaces;
+        assert_eq!(app.next_focus(), Focus::Tabs);
+        app.focus = Focus::Tabs;
+        assert_eq!(app.next_focus(), Focus::Viewport);
+        app.focus = Focus::Viewport;
+        assert_eq!(app.next_focus(), Focus::Spaces);
+        assert_eq!(app.previous_focus(), Focus::Tabs);
+
+        app.control_section = ControlSection::Agents;
+        app.focus = Focus::Agents;
+        assert_eq!(app.next_focus(), Focus::Tabs);
+        app.focus = Focus::Tabs;
+        assert_eq!(app.previous_focus(), Focus::Agents);
     }
 
     #[test]
@@ -3956,18 +4814,9 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_clears_active_pty_instead_of_retargeting_input() {
+    fn disconnected_node_retains_authoritative_inventory_and_terminal_state() {
         let mut app = fixture();
-        let mut other_node = app.nodes[0].clone();
-        other_node.node_id = "node-b".to_owned();
-        other_node.workspaces[0].workspace_id = "workspace-b".to_owned();
-        other_node.workspaces[0].sessions[0].address.node_id = "node-b".to_owned();
-        other_node.workspaces[0].sessions[0].address.workspace_id = "workspace-b".to_owned();
-        let other_address = other_node.workspaces[0].sessions[0].address.clone();
-        app.nodes.push(other_node);
-        app.tabs.push(SessionTab { address: other_address.clone() });
-        app.selected_tab = 0;
-        app.focus = Focus::Viewport;
+        let address = app.tabs[0].address.clone();
 
         app.set_node_connection(
             "node-a",
@@ -3975,10 +4824,124 @@ mod tests {
             ConnectionState::Disconnected("lost".to_owned()),
         );
 
-        assert_eq!(app.tabs, vec![SessionTab { address: other_address }]);
-        assert_eq!(app.focus, Focus::Tabs);
-        assert_eq!(app.reduce(UiKey::Char('x')), AppAction::None);
-        assert!(app.notice.as_deref().unwrap().contains("input target cleared"));
+        assert_eq!(app.nodes.len(), 1);
+        assert_eq!(app.tabs, vec![SessionTab { address: address.clone() }]);
+        assert_eq!(app.focused_session().unwrap().terminal_formatted, b"codex");
+        assert!(matches!(
+            app.nodes[0].connection,
+            ConnectionState::Disconnected(_)
+        ));
+    }
+
+    #[test]
+    fn authoritative_topology_removal_purges_node_owned_state_and_keeps_survivor_usable() {
+        let mut app = fixture();
+        let removed_address = app.tabs[0].address.clone();
+        add_managed_record(
+            &mut app,
+            "removed-record",
+            "removed session",
+            ManagedSessionState::Live,
+            Some(removed_address.clone()),
+            true,
+        );
+
+        let mut surviving_node = app.nodes[0].clone();
+        surviving_node.node_id = "node-b".to_owned();
+        surviving_node.endpoint = r"\\.\pipe\node-b".to_owned();
+        surviving_node.workspaces[0].workspace_id = "workspace-b".to_owned();
+        surviving_node.workspaces[0].label = "survivor".to_owned();
+        surviving_node.workspaces[0].sessions[0].address.node_id = "node-b".to_owned();
+        surviving_node.workspaces[0].sessions[0].address.workspace_id = "workspace-b".to_owned();
+        surviving_node.workspaces[0].sessions[0].terminal_formatted = b"surviving terminal".to_vec();
+        surviving_node.session_records.clear();
+        let surviving_address = surviving_node.workspaces[0].sessions[0].address.clone();
+        app.nodes.push(surviving_node);
+        app.tabs.push(SessionTab { address: surviving_address.clone() });
+        app.grid.panes = vec![
+            GridPane { address: removed_address.clone() },
+            GridPane { address: surviving_address.clone() },
+        ];
+        app.grid.focused = 0;
+        app.pending_open = vec![removed_address.clone(), surviving_address.clone()];
+        app.pending_space = Some(("node-a".to_owned(), "workspace-a".to_owned()));
+        app.terminal_scroll_offsets.insert(removed_address.clone(), 7);
+        app.terminal_scroll_offsets.insert(surviving_address.clone(), 3);
+        app.apply_workspace_inspection("node-a".to_owned(), workspace_inspection());
+        let mut surviving_inspection = workspace_inspection();
+        surviving_inspection.workspace_id = WorkspaceId::new("workspace-b").unwrap();
+        app.apply_workspace_inspection("node-b".to_owned(), surviving_inspection);
+        app.inspection_pending = Some(("node-a".to_owned(), "workspace-a".to_owned()));
+        app.collapsed_directories.insert((
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            "src".to_owned(),
+        ));
+        app.collapsed_directories.insert((
+            "node-b".to_owned(),
+            "workspace-b".to_owned(),
+            "src".to_owned(),
+        ));
+        app.files_cursor = 2;
+        app.git_cursor = 2;
+        app.files_scroll = 2;
+        app.git_scroll = 2;
+        app.agents_scroll = 2;
+        app.workspaces_scroll = 2;
+        app.selected_space = 0;
+        app.selected_agent = app
+            .agent_rows()
+            .iter()
+            .position(|row| app.agent_row_active_address(row).as_ref() == Some(&removed_address))
+            .unwrap();
+        app.selected_tab = 0;
+        app.surface_mode = SurfaceMode::Tab;
+        app.focus = Focus::Viewport;
+
+        app.remove_topology_node("node-a");
+
+        assert_eq!(app.nodes.len(), 1);
+        assert_eq!(app.nodes[0].node_id, "node-b");
+        assert_eq!(app.nodes[0].workspaces[0].sessions[0].terminal_formatted, b"surviving terminal");
+        assert!(app.find_session(&removed_address).is_none());
+        assert_eq!(app.tabs, vec![SessionTab { address: surviving_address.clone() }]);
+        assert_eq!(app.grid.panes, vec![GridPane { address: surviving_address.clone() }]);
+        assert_eq!(app.pending_open, vec![surviving_address.clone()]);
+        assert!(app.pending_space.is_none());
+        assert_eq!(app.terminal_scroll_offsets.len(), 1);
+        assert_eq!(app.terminal_scroll_offset(&surviving_address), 3);
+        assert!(!app.workspace_inspections.contains_key(&(
+            "node-a".to_owned(),
+            "workspace-a".to_owned()
+        )));
+        assert!(app.workspace_inspections.contains_key(&(
+            "node-b".to_owned(),
+            "workspace-b".to_owned()
+        )));
+        assert!(app.inspection_pending.is_none());
+        assert!(!app
+            .collapsed_directories
+            .iter()
+            .any(|(node_id, _, _)| node_id == "node-a"));
+        assert!(app
+            .collapsed_directories
+            .iter()
+            .any(|(node_id, _, _)| node_id == "node-b"));
+        assert_eq!((app.files_cursor, app.git_cursor), (0, 0));
+        assert_eq!(
+            (app.files_scroll, app.git_scroll, app.agents_scroll, app.workspaces_scroll),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(app.selected_workspace_route(), Some(("node-b".to_owned(), "workspace-b".to_owned())));
+        assert_eq!(app.selected_agent_session().unwrap().address, surviving_address);
+        assert_eq!((app.selected_tab, app.grid.focused), (0, 0));
+        assert_eq!((app.surface_mode, app.focus), (SurfaceMode::Tab, Focus::Tabs));
+
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(matches!(
+            app.reduce(UiKey::Char('x')),
+            AppAction::Input { address, text } if address == surviving_address && text == "x"
+        ));
     }
 
     #[test]
@@ -4033,13 +4996,11 @@ mod tests {
 
         assert_eq!(app.click(95, 0), AppAction::None);
         assert_eq!(app.focus, Focus::Settings);
-        assert_eq!(app.control_section, ControlSection::Settings);
+        assert_eq!(app.control_section, ControlSection::Files);
         assert_eq!(app.reduce(UiKey::Char('s')), AppAction::None);
         assert_eq!(app.color_mode, PtyColorMode::GateOverride);
         assert_eq!(app.reduce(UiKey::Char('m')), AppAction::None);
         assert_eq!(app.menu_placement, MenuPlacement::Modal);
-        assert!(matches!(app.reduce(UiKey::Right), AppAction::InspectWorkspace { .. }));
-        assert_eq!(app.control_section, ControlSection::Files);
         assert!(matches!(app.reduce(UiKey::Right), AppAction::InspectWorkspace { .. }));
         assert_eq!(app.control_section, ControlSection::Git);
         assert_eq!(app.reduce(UiKey::Right), AppAction::None);
@@ -4048,12 +5009,34 @@ mod tests {
         assert_eq!(app.control_section, ControlSection::Workspaces);
         assert_eq!(app.reduce(UiKey::Right), AppAction::None);
         assert_eq!(app.control_section, ControlSection::Settings);
+        assert!(matches!(app.reduce(UiKey::Right), AppAction::InspectWorkspace { .. }));
+        assert_eq!(app.control_section, ControlSection::Files);
         assert_eq!(app.reduce(UiKey::Escape), AppAction::None);
         assert_eq!(app.focus, Focus::Viewport);
         assert_eq!(app.reduce(UiKey::OperatorEscape), AppAction::None);
         assert_eq!(app.focus, Focus::Tabs);
         assert_eq!(app.reduce(UiKey::Tab), AppAction::None);
         assert_eq!(app.focus, Focus::Viewport);
+    }
+
+    #[test]
+    fn split_to_activity_preserves_operational_section_and_normalizes_settings() {
+        let mut app = fixture();
+        assert!(matches!(
+            app.select_sidebar_mode(SidebarMode::Git),
+            AppAction::InspectWorkspace { .. }
+        ));
+        app.begin_settings();
+        app.toggle_sidebar_presentation();
+        assert_eq!(app.sidebar_presentation, SidebarPresentation::Activity);
+        assert_eq!(app.control_section, ControlSection::Git);
+        assert_eq!(app.sidebar_mode, SidebarMode::Git);
+
+        app.sidebar_presentation = SidebarPresentation::Split;
+        app.control_section = ControlSection::Settings;
+        app.toggle_sidebar_presentation();
+        assert_eq!(app.control_section, ControlSection::Files);
+        assert_eq!(app.sidebar_mode, SidebarMode::Files);
     }
 
     #[test]
@@ -4245,6 +5228,7 @@ mod tests {
             connection: ConnectionState::Connected,
             controller_owned: true,
             event_sequence: 1,
+            session_records: Vec::new(),
             workspaces: Vec::new(),
         });
         app.focus = Focus::Agents;
@@ -4710,5 +5694,176 @@ mod tests {
         app.upsert_node(update);
 
         assert_eq!(app.terminal_scroll_offset(&address), 2);
+    }
+
+    #[test]
+    fn dormant_record_click_selects_only_on_release_and_routes_resume_rename_forget() {
+        let mut app = fixture();
+        let dormant = add_managed_record(
+            &mut app,
+            "record-dormant",
+            "nightly review",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let index = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
+        let previous = app.selected_agent;
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(0, 6, 24, 2),
+            target: HitTarget::Agent(index),
+        });
+
+        assert_eq!(app.click(4, 6), AppAction::None);
+        assert_eq!(app.selected_agent, previous);
+        assert!(matches!(app.drag_state, Some(DragState::AgentSelection { .. })));
+        assert_eq!(app.drop_at(4, 6), AppAction::None);
+        assert_eq!(app.selected_agent, index);
+        assert_eq!(app.tabs.len(), 1);
+
+        assert!(matches!(
+            app.reduce(UiKey::Char('r')),
+            AppAction::ResumeSessionRecord { ref node_id, ref record_id, .. }
+                if node_id == "node-a" && record_id == "record-dormant"
+        ));
+        assert_eq!(app.reduce(UiKey::Char('n')), AppAction::None);
+        assert_eq!(app.focus, Focus::RenameSession);
+        app.rename_session.as_mut().unwrap().display_name.clear();
+        app.paste("renamed session".to_owned());
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::RenameSessionRecord { ref display_name, .. }
+                if display_name == "renamed session"
+        ));
+
+        app.focus = Focus::Agents;
+        app.selected_agent = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
+        assert_eq!(app.reduce(UiKey::Delete), AppAction::None);
+        assert_eq!(app.focus, Focus::ForgetSession);
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::ForgetSessionRecord { ref record_id, .. }
+                if record_id == "record-dormant"
+        ));
+    }
+
+    #[test]
+    fn dormant_record_drag_does_not_activate_or_open_a_terminal() {
+        let mut app = fixture();
+        let dormant = add_managed_record(
+            &mut app,
+            "record-dormant",
+            "cold session",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let index = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
+        let selected = app.selected_agent;
+        let tabs = app.tabs.clone();
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(0, 6, 24, 2),
+            target: HitTarget::Agent(index),
+        });
+
+        app.click(4, 6);
+        app.drag(35, 10);
+        app.drop_at(35, 10);
+
+        assert_eq!(app.selected_agent, selected);
+        assert_eq!(app.tabs, tabs);
+    }
+
+    #[test]
+    fn dormant_record_release_tracks_identity_across_roster_reorder() {
+        let mut app = fixture();
+        let dormant = add_managed_record(
+            &mut app,
+            "record-dormant",
+            "nightly review",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let original_index = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(0, 6, 24, 2),
+            target: HitTarget::Agent(original_index),
+        });
+
+        app.click(4, 6);
+        add_managed_record(
+            &mut app,
+            "record-pending",
+            "pending identity",
+            ManagedSessionState::IdentityPending,
+            None,
+            false,
+        );
+        let reordered_index = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
+        assert_ne!(original_index, reordered_index);
+
+        app.drop_at(4, 6);
+
+        assert_eq!(app.selected_agent, reordered_index);
+        assert_eq!(app.selected_managed_session().unwrap().record_id, "record-dormant");
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn live_managed_display_name_is_the_terminal_surface_title() {
+        let mut app = fixture();
+        let address = app.tabs[0].address.clone();
+        add_managed_record(
+            &mut app,
+            "record-live",
+            "release shepherd",
+            ManagedSessionState::Live,
+            Some(address.clone()),
+            true,
+        );
+
+        assert_eq!(app.session_title(&address).as_deref(), Some("release shepherd"));
+    }
+
+    #[test]
+    fn wheel_scrolls_real_viewports_in_split_activity_and_modal_presentations() {
+        let mut app = fixture();
+        app.apply_workspace_inspection("node-a".to_owned(), workspace_inspection());
+        for instance in 8..13 {
+            add_session(&mut app, instance, Provider::Claude);
+        }
+        for index in 1..5 {
+            let mut workspace = app.nodes[0].workspaces[0].clone();
+            workspace.workspace_id = format!("workspace-{index}");
+            workspace.sessions.clear();
+            app.nodes[0].workspaces.push(workspace);
+        }
+
+        app.layout.spaces = Rect::new(3, 1, 24, 3);
+        app.sidebar_mode = SidebarMode::Files;
+        app.scroll(8, 2, false);
+        assert!(app.files_scroll > 0);
+
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.sidebar_mode = SidebarMode::Git;
+        app.layout.spaces = Rect::new(3, 1, 24, 3);
+        app.scroll(8, 2, false);
+        assert!(app.git_scroll > 0);
+
+        app.menu_placement = MenuPlacement::Modal;
+        app.focus = Focus::Settings;
+        app.control_section = ControlSection::Agents;
+        app.layout.control_modal = Rect::new(10, 2, 40, 8);
+        app.layout.control_content = Rect::new(11, 4, 38, 3);
+        app.scroll(20, 5, false);
+        assert!(app.agents_scroll > 0);
+
+        app.control_section = ControlSection::Workspaces;
+        app.scroll(20, 5, false);
+        assert!(app.workspaces_scroll > 0);
+
+        app.layout.control_content = Rect::default();
+        assert_eq!(app.scroll(0, 0, false), AppAction::None);
     }
 }

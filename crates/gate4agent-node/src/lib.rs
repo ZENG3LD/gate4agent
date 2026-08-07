@@ -4,11 +4,15 @@
 mod git_worktree;
 
 #[cfg(windows)]
+mod session_registry;
+
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    NodeServer, NodeServerConfig, NodeServerError, NodeShutdownHandle, WorkspaceConfig,
+    default_state_path, NodeServer, NodeServerConfig, NodeServerError, NodeShutdownHandle,
+    WorkspaceConfig,
 };
 
 pub use gate4agent_node_protocol as protocol;

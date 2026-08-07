@@ -1,6 +1,6 @@
 use gate4agent_c2_protocol::{
     c2_auth_transcript, C2AuthDirection, C2ClientAuthentication, C2ClientFrame, C2ClientHello,
-    C2Hello, C2RelayFailure, C2RequestEnvelope, C2RequestId, C2ServerFrame, NodeRequest,
+    C2Hello, C2RelayFailure, C2RequestEnvelope, C2RequestId, C2ServerFrame, C2Topology, NodeRequest,
     NodeRoute, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse, C2_CONTROL_PROTOCOL_VERSION,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES, MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 
 const CONNECT_RETRIES: usize = 100;
@@ -22,6 +22,7 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
 const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(5);
+const RELAY_REPLY_HEADROOM: Duration = Duration::from_secs(5);
 const COMMAND_CAPACITY: usize = 64;
 const INBOUND_CAPACITY: usize = 2;
 const WRITER_CAPACITY: usize = 64;
@@ -31,21 +32,51 @@ const EVENT_CAPACITY: usize = 2;
 pub struct C2ControlHandle {
     commands: mpsc::Sender<ControlCommand>,
     hello: Arc<C2Hello>,
+    topology: watch::Receiver<Arc<C2Topology>>,
 }
 
 impl C2ControlHandle {
     pub fn hello(&self) -> &C2Hello { &self.hello }
+
+    pub fn current_topology(&self) -> Arc<C2Topology> { Arc::clone(&*self.topology.borrow()) }
+
+    pub fn subscribe_topology(&self) -> watch::Receiver<Arc<C2Topology>> {
+        self.topology.clone()
+    }
 
     pub async fn request(
         &self,
         route: NodeRoute,
         request: NodeRequest,
     ) -> Result<RoutedNodeResponse, C2ControlError> {
+        let deadline = control_request_deadline(&request);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands.send(ControlCommand { route, request, reply: reply_tx })
-            .await.map_err(|_| C2ControlError::Closed)?;
-        reply_rx.await.map_err(|_| C2ControlError::Closed)?
+        timeout(deadline, async {
+            self.commands.send(ControlCommand { route, request, reply: reply_tx })
+                .await.map_err(|_| C2ControlError::Closed)?;
+            reply_rx.await.map_err(|_| C2ControlError::Closed)?
+        }).await.map_err(|_| C2ControlError::Closed)?
     }
+}
+
+fn control_request_deadline(request: &NodeRequest) -> Duration {
+    let relay_deadline = match request {
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. } => Duration::from_secs(5),
+        NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. } => Duration::from_secs(240),
+        NodeRequest::Spawn { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::Stop { .. } => Duration::from_secs(15),
+        NodeRequest::ResumeSessionRecord { .. } => Duration::from_secs(35),
+        _ => Duration::from_secs(10),
+    };
+    relay_deadline + RELAY_REPLY_HEADROOM
 }
 
 pub struct C2EventReceiver {
@@ -112,16 +143,22 @@ pub async fn connect_local(
     let (reader, writer) = tokio::io::split(pipe);
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
+    let initial_topology = Arc::new(C2Topology::from_status(&hello.status));
+    let (topology_tx, topology_rx) = watch::channel(initial_topology);
     let (writer_tx, writer_rx) = mpsc::channel(WRITER_CAPACITY);
     let (owner_tx, owner_rx) = mpsc::channel(INBOUND_CAPACITY);
     let reader_task = tokio::spawn(control_reader(reader, owner_tx.clone()));
     let writer_task = tokio::spawn(control_writer(writer, writer_rx, owner_tx));
     tokio::spawn(async move {
-        control_owner(commands_rx, events_tx, writer_tx, owner_rx).await;
+        control_owner(commands_rx, events_tx, topology_tx, writer_tx, owner_rx).await;
         reader_task.abort();
         writer_task.abort();
     });
-    Ok((C2ControlHandle { commands: commands_tx, hello: Arc::new(hello) }, C2EventReceiver { events: events_rx }))
+    Ok((C2ControlHandle {
+        commands: commands_tx,
+        hello: Arc::new(hello),
+        topology: topology_rx,
+    }, C2EventReceiver { events: events_rx }))
 }
 
 async fn read_server_frame(
@@ -169,6 +206,7 @@ async fn control_writer<W>(
 async fn control_owner(
     mut commands: mpsc::Receiver<ControlCommand>,
     events: mpsc::Sender<RoutedNodeEvent>,
+    topology: watch::Sender<Arc<C2Topology>>,
     writer: mpsc::Sender<C2ClientFrame>,
     mut incoming: mpsc::Receiver<OwnerInput>,
 ) {
@@ -199,6 +237,11 @@ async fn control_owner(
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
                         if events.try_send(event).is_err() { break; }
+                    }
+                    Some(OwnerInput::Frame(C2ServerFrame::Topology(next))) => {
+                        if topology.borrow().as_ref() != &next {
+                            topology.send_replace(Arc::new(next));
+                        }
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Challenge(_) | C2ServerFrame::Hello(_) | C2ServerFrame::Rejected(_)))
                         | Some(OwnerInput::Closed) | None => break,
@@ -275,7 +318,7 @@ pub enum C2ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_c2_protocol::{NodeCursor, NodeEvent, NodeId};
+    use gate4agent_c2_protocol::{NodeCursor, NodeId};
     use gate4agent_node_protocol::NodeIncarnationId;
 
     fn event(sequence: u64) -> OwnerInput {
@@ -285,8 +328,66 @@ mod tests {
                 incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
                 sequence,
             },
-            event: NodeEvent::ResyncRequired { oldest_available_sequence: sequence },
+            event: gate4agent_c2_protocol::C2NodeEvent::ResyncRequired {
+                oldest_available_sequence: sequence,
+            },
         }))
+    }
+
+    fn route() -> NodeRoute {
+        NodeRoute {
+            node_id: NodeId::new("node-a").unwrap(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+        }
+    }
+
+    fn reply(request_id: u64) -> OwnerInput {
+        OwnerInput::Frame(C2ServerFrame::Reply(gate4agent_c2_protocol::C2ReplyEnvelope {
+            request_id: C2RequestId(request_id),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Ok(gate4agent_c2_protocol::C2NodeResponse::Accepted),
+            }),
+        }))
+    }
+
+    #[tokio::test]
+    async fn late_reply_after_timed_waiter_does_not_desynchronize_following_request() {
+        let (commands_tx, commands_rx) = mpsc::channel(2);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(2);
+        let (incoming_tx, incoming_rx) = mpsc::channel(2);
+        let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx,
+        ));
+
+        let (expired_tx, expired_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: expired_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        drop(expired_rx);
+        incoming_tx.send(reply(1)).await.unwrap();
+
+        let (live_tx, live_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: live_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(reply(2)).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), live_rx).await.unwrap().unwrap(),
+            Ok(RoutedNodeResponse { response: Ok(gate4agent_c2_protocol::C2NodeResponse::Accepted), .. })
+        ));
+
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -295,11 +396,48 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
         let (writer_tx, _writer_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(4);
-        let owner = tokio::spawn(control_owner(commands_rx, events_tx, writer_tx, incoming_rx));
+        let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(commands_rx, events_tx, topology_tx, writer_tx, incoming_rx));
 
         incoming_tx.send(event(1)).await.unwrap();
         incoming_tx.send(event(2)).await.unwrap();
         incoming_tx.send(event(3)).await.unwrap();
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+        assert!(commands_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn topology_frame_updates_watch_without_entering_event_stream() {
+        use gate4agent_c2_protocol::{C2TopologyNode, NodeTransportState};
+
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let offline = Arc::new(C2Topology { nodes: vec![C2TopologyNode {
+            node_id: NodeId::new("node-a").unwrap(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            transport: NodeTransportState::Offline,
+            current_incarnation_id: None,
+        }] });
+        let (topology_tx, mut topology_rx) = watch::channel(offline);
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx,
+        ));
+        let incarnation_id = NodeIncarnationId::from_bytes([9; 16]);
+        incoming_tx.send(OwnerInput::Frame(C2ServerFrame::Topology(C2Topology {
+            nodes: vec![C2TopologyNode {
+                node_id: NodeId::new("node-a").unwrap(),
+                endpoint: r"\\.\pipe\node-a".to_owned(),
+                transport: NodeTransportState::Online,
+                current_incarnation_id: Some(incarnation_id),
+            }],
+        }))).await.unwrap();
+
+        timeout(Duration::from_secs(1), topology_rx.changed()).await.unwrap().unwrap();
+        assert_eq!(topology_rx.borrow().nodes[0].current_incarnation_id, Some(incarnation_id));
+        assert!(events_rx.try_recv().is_err());
+        drop(incoming_tx);
         timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
         assert!(commands_tx.is_closed());
     }

@@ -460,6 +460,7 @@ dependencies = [
  "gate4agent-runtime-native",
  "gate4agent-testkit",
  "gate4agent-types",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -623,6 +624,8 @@ name = "gate4agent-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "gate4agent-c2-client",
+ "gate4agent-c2-protocol",
  "gate4agent-node-protocol",
  "gate4agent-node-wire",
  "gate4agent-types",

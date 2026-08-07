@@ -4,6 +4,9 @@ use crate::git_worktree::{
     removal_lookup_path as normalize_worktree_removal_target, run_git_read_bounded,
     GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind,
 };
+use crate::session_registry::{
+    self, validate_display_name, LoadedNodeState, MAX_MANAGED_SESSION_RECORDS,
+};
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     AgentProvider, ClientFrame, ClientRole,
@@ -13,7 +16,8 @@ use crate::protocol::{
     NodeRequest,
     NodeResponse, NodeSnapshot, RequestEnvelope,
     ResponseEnvelope, ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
+    ManagedSessionRecord, ManagedSessionState, SessionRecordId, WorkspaceEntry,
+    WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     DEFAULT_CONTROLLER_LEASE_MS, MAX_CONTROLLER_LEASE_MS,
     MIN_CONTROLLER_LEASE_MS,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES,
@@ -34,7 +38,7 @@ use gate4agent_types::{
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -56,6 +60,8 @@ const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 const CONNECTION_SHUTDOWN_GRACE_MS: u64 = 250;
 const SPAWN_DISPATCH_TIMEOUT_MS: u64 = 2_000;
 const MUTATION_SETTLE_TIMEOUT_MS: u64 = 5_000;
+const READINESS_SETTLE_HEADROOM_MS: u64 = 2_000;
+const MANAGED_RESUME_SETTLE_TIMEOUT_MS: u64 = 30_000;
 const WORKSPACE_INSPECTION_MAX_CONCURRENCY: usize = 4;
 const WORKSPACE_TREE_MAX_DEPTH: usize = 6;
 const WORKSPACE_TREE_MAX_ENTRIES: usize = 512;
@@ -65,6 +71,17 @@ const GIT_COMMIT_MAX_ENTRIES: usize = 12;
 const GIT_OUTPUT_MAX_BYTES: usize = 64 * 1_024;
 const GIT_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
 const GIT_COMMAND_TIMEOUT_MS: u64 = 1_500;
+const WORKSPACE_UNAVAILABLE_ERROR: &str = "workspace-unavailable";
+const PROVIDER_SESSION_SCOPE_CONFLICT_ERROR: &str = "provider-session-scope-conflict";
+const PROVIDER_SESSION_LIVE_CONFLICT_ERROR: &str = "provider-session-live-conflict";
+const MANAGED_SESSION_CAPACITY_ERROR: &str = "managed-session-capacity";
+const PROVIDER_IDENTITY_ALLOCATION_ERROR: &str =
+    "provider-session-identity-allocation-failed";
+const PROVIDER_RESUME_REJECTED_ERROR: &str = "provider-resume-rejected";
+const DURABLE_STATE_COMMIT_FAILED_ERROR: &str = "durable-state-commit-failed";
+const DURABLE_STATE_LOCK_FAILED_ERROR: &str = "durable-state-lock-failed";
+const DURABLE_STATE_LOAD_FAILED_ERROR: &str = "durable-state-load-failed";
+const DURABLE_STATE_CONFLICT_ERROR: &str = "durable-state-conflict";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceConfig {
@@ -131,6 +148,7 @@ pub struct NodeServerConfig {
     pub workspaces: Vec<WorkspaceConfig>,
     access_token: String,
     pub runtime: NativeRuntimeConfig,
+    state_path: Option<PathBuf>,
 }
 
 impl NodeServerConfig {
@@ -182,6 +200,7 @@ impl NodeServerConfig {
             workspaces,
             access_token,
             runtime: NativeRuntimeConfig::default(),
+            state_path: None,
         })
     }
 
@@ -195,6 +214,32 @@ impl NodeServerConfig {
         self.api_listen = Some(api_listen);
         Ok(self)
     }
+
+    pub fn with_state_path(
+        mut self,
+        state_path: impl Into<PathBuf>,
+    ) -> Result<Self, NodeServerError> {
+        let state_path = state_path.into();
+        if !state_path.is_absolute() || state_path.file_name().is_none() {
+            return Err(NodeServerError::InvalidStatePath(
+                state_path.to_string_lossy().into_owned(),
+            ));
+        }
+        self.state_path = Some(state_path);
+        Ok(self)
+    }
+}
+
+pub fn default_state_path(node_id: &NodeId) -> Result<PathBuf, NodeServerError> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or(NodeServerError::LocalAppDataUnavailable)?;
+    Ok(root
+        .join("Gate4Agent")
+        .join("nodes")
+        .join(node_id.as_str())
+        .join("state-v1.json"))
 }
 
 pub struct NodeServer {
@@ -202,6 +247,7 @@ pub struct NodeServer {
     runtime: NativeRuntime,
     shared: Arc<NodeShared>,
     events: EventSubscription,
+    state_path_lock: Option<session_registry::StatePathLock>,
 }
 
 impl NodeServer {
@@ -228,6 +274,9 @@ impl NodeServer {
             .ok_or_else(|| NodeServerError::Registry("Claude fixture adapter is unavailable".to_owned()))?;
         spec.id = claude_id;
         spec.display_name = "Resumable Claude PTY fixture".to_owned();
+        spec.expected_processes = vec![gate4agent_types::ProcessMatcher::Exact {
+            name: "claude".to_owned(),
+        }];
         spec.capabilities.transports.pty_adapter = claude
             .capabilities
             .transports
@@ -274,7 +323,17 @@ impl NodeServer {
         Self::new_with_registry(config, catalog)
     }
 
-    fn new_with_registry(config: NodeServerConfig, catalog: AgentRegistry) -> Result<Self, NodeServerError> {
+    fn new_with_registry(
+        config: NodeServerConfig,
+        catalog: AgentRegistry,
+    ) -> Result<Self, NodeServerError> {
+        let input_settle_timeout_ms = catalog
+            .iter()
+            .map(|spec| spec.readiness.timeout_ms)
+            .max()
+            .unwrap_or(MUTATION_SETTLE_TIMEOUT_MS)
+            .saturating_add(READINESS_SETTLE_HEADROOM_MS)
+            .max(MUTATION_SETTLE_TIMEOUT_MS);
         let enabled_providers = catalog
             .iter()
             .filter_map(|spec| match spec.id.as_str() {
@@ -284,23 +343,44 @@ impl NodeServer {
                 _ => None,
             })
             .collect();
+        let state_path_lock =
+            session_registry::StatePathLock::acquire(config.state_path.as_deref())
+                .map_err(|error| {
+                    durable_state_server_error(error, DURABLE_STATE_LOCK_FAILED_ERROR)
+                })?;
         let (handle, runtime) = NativeRuntime::new(catalog, config.runtime);
         let events = handle.subscribe(CONTROL_EVENT_SUBSCRIPTION_CAPACITY);
         let incarnation_id = random_incarnation_id()
             .map_err(NodeServerError::IncarnationIdentity)?;
+        let loaded = session_registry::load(config.state_path.as_deref(), &config.node_id)
+            .map_err(|error| {
+                durable_state_server_error(error, DURABLE_STATE_LOAD_FAILED_ERROR)
+            })?;
+        let (workspaces, records, persistence_warning) =
+            merge_durable_state(&config.workspaces, loaded)?;
         let shared = Arc::new(NodeShared::new_with_incarnation(
             handle,
             config.access_token.clone(),
             config.node_id.clone(),
             incarnation_id,
-            config.workspaces.clone(),
+            workspaces,
             enabled_providers,
+            config.state_path.clone(),
+            records,
+            persistence_warning,
+            input_settle_timeout_ms,
         ));
+        if shared.persistence_error().is_none() {
+            shared.persist_state().map_err(|error| {
+                durable_state_server_error(error, DURABLE_STATE_COMMIT_FAILED_ERROR)
+            })?;
+        }
         Ok(Self {
             config,
             runtime,
             shared,
             events,
+            state_path_lock,
         })
     }
 
@@ -331,6 +411,7 @@ impl NodeServer {
             mut runtime,
             shared,
             events,
+            state_path_lock: _state_path_lock,
         } = self;
         runtime
             .start_hook_ingress(HookIngressConfig::default())
@@ -471,6 +552,86 @@ fn active_registry() -> Result<AgentRegistry, NodeServerError> {
     AgentRegistry::new(specs).map_err(|error| NodeServerError::Registry(error.to_string()))
 }
 
+fn merge_durable_state(
+    configured: &[WorkspaceConfig],
+    mut loaded: LoadedNodeState,
+) -> Result<(Vec<WorkspaceConfig>, Vec<ManagedSessionRecord>, Option<String>), NodeServerError> {
+    let mut workspaces = configured
+        .iter()
+        .cloned()
+        .map(|workspace| (workspace.workspace_id.clone(), workspace))
+        .collect::<BTreeMap<_, _>>();
+    let mut roots = workspaces
+        .values()
+        .map(|workspace| {
+            (
+                workspace.canonical_root.to_lowercase(),
+                workspace.workspace_id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut warning = loaded
+        .warning
+        .take()
+        .map(|message| session_registry::sanitized_persistence_summary(&message));
+
+    for (workspace_id, canonical_root) in loaded.workspaces {
+        if let Some(existing) = workspaces.get(&workspace_id) {
+            if !existing.canonical_root.eq_ignore_ascii_case(&canonical_root) {
+                return Err(NodeServerError::DurableState(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    DURABLE_STATE_CONFLICT_ERROR,
+                )));
+            }
+            continue;
+        }
+        if roots.get(&canonical_root.to_lowercase()).is_some() {
+            return Err(NodeServerError::DurableState(io::Error::new(
+                io::ErrorKind::InvalidData,
+                DURABLE_STATE_CONFLICT_ERROR,
+            )));
+        }
+        if !Path::new(&canonical_root).is_dir() {
+            warning.get_or_insert_with(|| {
+                session_registry::DURABLE_STATE_WORKSPACE_WARNING.to_owned()
+            });
+            continue;
+        }
+        let workspace = WorkspaceConfig::new(workspace_id.clone(), &canonical_root).map_err(|_| {
+            NodeServerError::DurableState(io::Error::new(
+                io::ErrorKind::InvalidData,
+                DURABLE_STATE_CONFLICT_ERROR,
+            ))
+        })?;
+        roots.insert(
+            workspace.canonical_root.to_lowercase(),
+            workspace.workspace_id.clone(),
+        );
+        workspaces.insert(workspace_id, workspace);
+    }
+
+    for record in &mut loaded.records {
+        match workspaces.get(&record.workspace_id) {
+            Some(workspace)
+                if workspace
+                    .canonical_root
+                    .eq_ignore_ascii_case(&record.canonical_root) => {}
+            Some(_) => {
+                return Err(NodeServerError::DurableState(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    DURABLE_STATE_CONFLICT_ERROR,
+                )));
+            }
+            None => {
+                record.state = ManagedSessionState::Unavailable;
+                record.active_session = None;
+                record.last_error = Some(WORKSPACE_UNAVAILABLE_ERROR.to_owned());
+            }
+        }
+    }
+    Ok((workspaces.into_values().collect(), loaded.records, warning))
+}
+
 struct NodeShared {
     handle: Gate4AgentHandle,
     access_token: String,
@@ -492,6 +653,11 @@ struct NodeShared {
     inspection_slots: Arc<Semaphore>,
     mutation_gate: AsyncMutex<()>,
     session_bindings: Mutex<BTreeMap<AgentInstanceId, SessionBinding>>,
+    session_records: Mutex<SessionRecords>,
+    state_path: Option<PathBuf>,
+    persistence_error: RwLock<Option<String>>,
+    state_transaction: Mutex<()>,
+    input_settle_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -499,6 +665,11 @@ struct SessionBinding {
     workspace_id: WorkspaceId,
     generation: SessionGeneration,
     pending_resume: Option<(SessionGeneration, CommandId)>,
+    record_id: Option<SessionRecordId>,
+}
+
+struct SessionRecords {
+    records: BTreeMap<SessionRecordId, ManagedSessionRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -529,6 +700,10 @@ impl NodeShared {
         incarnation_id: NodeIncarnationId,
         workspaces: Vec<WorkspaceConfig>,
         enabled_providers: Vec<AgentProvider>,
+        state_path: Option<PathBuf>,
+        records: Vec<ManagedSessionRecord>,
+        persistence_warning: Option<String>,
+        input_settle_timeout_ms: u64,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(NODE_BROADCAST_CAPACITY);
         Self {
@@ -561,6 +736,19 @@ impl NodeShared {
             inspection_slots: Arc::new(Semaphore::new(WORKSPACE_INSPECTION_MAX_CONCURRENCY)),
             mutation_gate: AsyncMutex::new(()),
             session_bindings: Mutex::new(BTreeMap::new()),
+            session_records: Mutex::new(SessionRecords {
+                records: records
+                    .into_iter()
+                    .map(|record| (record.record_id.clone(), record))
+                    .collect(),
+            }),
+            state_path,
+            persistence_error: RwLock::new(
+                persistence_warning
+                    .map(|message| session_registry::sanitized_persistence_summary(&message)),
+            ),
+            state_transaction: Mutex::new(()),
+            input_settle_timeout_ms,
         }
     }
 
@@ -579,7 +767,61 @@ impl NodeShared {
             NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
             workspaces,
             enabled_providers,
+            None,
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
         )
+    }
+
+    fn persistence_error(&self) -> Option<String> {
+        self.persistence_error
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_persistence_error(&self, error: Option<String>) {
+        *self
+            .persistence_error
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = error
+            .map(|message| session_registry::sanitized_persistence_summary(&message));
+    }
+
+    fn persist_state(&self) -> io::Result<()> {
+        let _transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.persist_state_locked()
+    }
+
+    fn persist_state_locked(&self) -> io::Result<()> {
+        let workspaces = self
+            .workspaces
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let records = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = session_registry::save(
+            self.state_path.as_deref(),
+            &self.node_id,
+            &workspaces,
+            &records,
+        );
+        match &result {
+            Ok(warning) => self.set_persistence_error(warning.clone()),
+            Err(_) => self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned())),
+        }
+        result.map(|_| ())
     }
 
     async fn begin_shutdown(&self) -> Result<(), NodeFailure> {
@@ -636,6 +878,7 @@ impl NodeShared {
         }
     }
 
+    #[cfg(test)]
     fn bind_session(
         &self,
         instance_id: AgentInstanceId,
@@ -652,7 +895,535 @@ impl NodeShared {
             workspace_id,
             generation,
             pending_resume: None,
+            record_id: None,
         });
+    }
+
+    fn bind_managed_session(
+        &self,
+        address: &SessionAddress,
+        record_id: SessionRecordId,
+    ) {
+        let mut bindings = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(bindings.len() < CONTROL_SESSIONS_MAX);
+        debug_assert!(!bindings.contains_key(&address.session.instance_id));
+        bindings.insert(
+            address.session.instance_id,
+            SessionBinding {
+                workspace_id: address.workspace_id.clone(),
+                generation: address.session.generation,
+                pending_resume: None,
+                record_id: Some(record_id),
+            },
+        );
+    }
+
+    fn allocate_record_id(&self) -> Result<SessionRecordId, NodeFailure> {
+        for _ in 0..8 {
+            let bytes = random_nonce().map_err(|error| {
+                failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    &format!("session record identity generation failed: {error}"),
+                )
+            })?;
+            let mut value = String::with_capacity(27);
+            value.push_str("sr-");
+            for byte in &bytes[..12] {
+                use std::fmt::Write as _;
+                let _ = write!(&mut value, "{byte:02x}");
+            }
+            let record_id = SessionRecordId::new(value).map_err(|error| {
+                failure(NodeFailureCode::BackendOperationFailed, &error.to_string())
+            })?;
+            let records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !records.records.contains_key(&record_id) {
+                return Ok(record_id);
+            }
+        }
+        Err(failure(
+            NodeFailureCode::BackendBusy,
+            "could not allocate a unique session record ID",
+        ))
+    }
+
+    fn default_record_name(&self, provider: AgentProvider) -> String {
+        let records = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ordinal = records
+            .records
+            .values()
+            .filter(|record| record.provider == provider)
+            .count()
+            .saturating_add(1);
+        let provider_name = match provider {
+            AgentProvider::Claude => "claude",
+            AgentProvider::Codex => "codex",
+            AgentProvider::Kimi => "kimi",
+        };
+        format!("{provider_name} #{ordinal}")
+    }
+
+    fn new_record(
+        &self,
+        address: &SessionAddress,
+        provider: AgentProvider,
+        mode: SessionMode,
+        state: ManagedSessionState,
+        provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
+    ) -> Result<ManagedSessionRecord, NodeFailure> {
+        let canonical_root = self.workspace_root(&address.workspace_id)?;
+        let now = unix_time_ms();
+        Ok(ManagedSessionRecord {
+            record_id: self.allocate_record_id()?,
+            display_name: self.default_record_name(provider),
+            provider,
+            mode,
+            state,
+            workspace_id: address.workspace_id.clone(),
+            canonical_root,
+            provider_session,
+            active_session: Some(address.clone()),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            last_error: None,
+        })
+    }
+
+    fn insert_record(&self, record: ManagedSessionRecord) -> Result<(), NodeFailure> {
+        let mut records = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if records.records.len() >= MAX_MANAGED_SESSION_RECORDS {
+            return Err(failure(
+                NodeFailureCode::BackendBusy,
+                "managed session record capacity is full; forget an inactive record first",
+            ));
+        }
+        if let Some(identity) = record.provider_session.as_ref() {
+            if records.records.values().any(|candidate| {
+                candidate.provider_session.as_ref().is_some_and(|candidate_identity| {
+                    session_registry::same_provider_session(
+                        candidate.provider,
+                        candidate_identity,
+                        record.provider,
+                        identity,
+                    )
+                })
+            }) {
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "provider session is already represented by another managed record",
+                ));
+            }
+        }
+        match records.records.entry(record.record_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "session record ID collision",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn record(&self, record_id: &SessionRecordId) -> Result<ManagedSessionRecord, NodeFailure> {
+        self.session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .get(record_id)
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    NodeFailureCode::UnknownSessionRecord,
+                    "managed session record does not exist",
+                )
+            })
+    }
+
+    fn remove_record_memory(&self, record_id: &SessionRecordId) -> Option<ManagedSessionRecord> {
+        self.session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .remove(record_id)
+    }
+
+    fn discard_record(&self, record_id: &SessionRecordId) -> Result<(), NodeFailure> {
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(removed) = self.remove_record_memory(record_id) else {
+            return Ok(());
+        };
+        if let Err(error) = self.persist_state_locked() {
+            let _ = self.insert_record(removed);
+            return Err(persistence_failure(error));
+        }
+        drop(transaction);
+        self.publish(NodeEvent::SessionRecordRemoved {
+            record_id: record_id.clone(),
+        });
+        Ok(())
+    }
+
+    fn publish_record(&self, record: ManagedSessionRecord) {
+        self.publish(NodeEvent::SessionRecordUpserted { record });
+    }
+
+    fn mark_record_error(
+        &self,
+        record_id: &SessionRecordId,
+        message: &str,
+    ) -> Result<(), NodeFailure> {
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = {
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = records.records.get_mut(record_id) else {
+                return Ok(());
+            };
+            let previous = record.clone();
+            record.state = ManagedSessionState::Unavailable;
+            record.last_error = Some(session_registry::sanitized_record_error_summary(message));
+            record.updated_at_unix_ms = unix_time_ms();
+            previous
+        };
+        if let Err(error) = self.persist_state_locked() {
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .insert(record_id.clone(), previous);
+            return Err(persistence_failure(error));
+        }
+        let record = self.record(record_id)?;
+        drop(transaction);
+        self.publish_record(record);
+        Ok(())
+    }
+
+    fn rename_session_record(
+        &self,
+        record_id: &SessionRecordId,
+        display_name: String,
+    ) -> Result<ManagedSessionRecord, NodeFailure> {
+        validate_display_name(&display_name)
+            .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        let _transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = {
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let record = records.records.get_mut(record_id).ok_or_else(|| {
+                failure(
+                    NodeFailureCode::UnknownSessionRecord,
+                    "managed session record does not exist",
+                )
+            })?;
+            let previous = record.clone();
+            record.display_name = display_name;
+            record.updated_at_unix_ms = unix_time_ms();
+            previous
+        };
+        if let Err(error) = self.persist_state_locked() {
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .insert(record_id.clone(), previous);
+            return Err(persistence_failure(error));
+        }
+        let updated = self.record(record_id)?;
+        self.publish_record(updated.clone());
+        Ok(updated)
+    }
+
+    fn bound_address_for_record(&self, record_id: &SessionRecordId) -> Option<SessionAddress> {
+        self.session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find_map(|(instance_id, binding)| {
+                (binding.record_id.as_ref() == Some(record_id)).then(|| SessionAddress {
+                    workspace_id: binding.workspace_id.clone(),
+                    session: SessionKey {
+                        instance_id: *instance_id,
+                        generation: binding.generation,
+                    },
+                })
+            })
+    }
+
+    async fn forget_session_record(
+        &self,
+        record_id: &SessionRecordId,
+    ) -> Result<(), NodeFailure> {
+        let record = self.record(record_id)?;
+        if record.active_session.is_some()
+            || matches!(
+                record.state,
+                ManagedSessionState::Live | ManagedSessionState::IdentityPending
+            )
+        {
+            return Err(failure(
+                NodeFailureCode::SessionRecordBusy,
+                "stop the managed session before forgetting it",
+            ));
+        }
+        if let Some(address) = self.bound_address_for_record(record_id) {
+            self.remove_session(&address).await?;
+        }
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = self.remove_record_memory(record_id).ok_or_else(|| {
+            failure(
+                NodeFailureCode::UnknownSessionRecord,
+                "managed session record does not exist",
+            )
+        })?;
+        if let Err(error) = self.persist_state_locked() {
+            let _ = self.insert_record(removed);
+            return Err(persistence_failure(error));
+        }
+        drop(transaction);
+        self.publish(NodeEvent::SessionRecordRemoved {
+            record_id: record_id.clone(),
+        });
+        Ok(())
+    }
+
+    async fn resume_session_record(
+        &self,
+        record_id: &SessionRecordId,
+        terminal_size: gate4agent_types::TerminalSize,
+        initial_prompt: Option<String>,
+    ) -> Result<(ManagedSessionRecord, SessionAddress), NodeFailure> {
+        let record = self.record(record_id)?;
+        if record.active_session.is_some()
+            || matches!(
+                record.state,
+                ManagedSessionState::Live | ManagedSessionState::IdentityPending
+            )
+        {
+            return Err(failure(
+                NodeFailureCode::SessionRecordBusy,
+                "managed session already has a live runtime binding",
+            ));
+        }
+        let identity = record.provider_session.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::SessionRecordNotResumable,
+                "managed session has no verified provider session identity",
+            )
+        })?;
+        let working_directory = self.workspace_root(&record.workspace_id)?;
+        if !working_directory.eq_ignore_ascii_case(&record.canonical_root) {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session workspace root changed; refusing to resume in another directory",
+            ));
+        }
+        {
+            let records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if records.records.values().any(|candidate| {
+                candidate.record_id != *record_id
+                    && candidate.provider_session.as_ref().is_some_and(|candidate_identity| {
+                        session_registry::same_provider_session(
+                            candidate.provider,
+                            candidate_identity,
+                            record.provider,
+                            &identity,
+                        )
+                    })
+                    && (candidate.active_session.is_some()
+                        || matches!(
+                            candidate.state,
+                            ManagedSessionState::Live | ManagedSessionState::IdentityPending
+                        ))
+            }) {
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "provider session is already active through another managed record",
+                ));
+            }
+        }
+        if let Some(stale_address) = self.bound_address_for_record(record_id) {
+            self.remove_session(&stale_address).await?;
+        }
+        self.ensure_binding_capacity()?;
+
+        let request = ResumeLaunchRequest {
+            working_directory,
+            terminal_size,
+            initial_prompt,
+        };
+        request
+            .validate()
+            .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
+        let address = SessionAddress {
+            workspace_id: record.workspace_id.clone(),
+            session: SessionKey {
+                instance_id,
+                generation: SessionGeneration(1),
+            },
+        };
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.record(record_id)?;
+        if current.active_session.is_some()
+            || matches!(
+                current.state,
+                ManagedSessionState::Live | ManagedSessionState::IdentityPending
+            )
+        {
+            return Err(failure(
+                NodeFailureCode::SessionRecordBusy,
+                "managed session became active while resume was being prepared",
+            ));
+        }
+        self.bind_managed_session(&address, record_id.clone());
+        drop(transaction);
+
+        let transport = match record.mode {
+            SessionMode::Pty => TransportKind::Pty,
+            SessionMode::Inline => TransportKind::Pipe,
+        };
+        let agent_id = AgentId::new(record.provider.agent_id())
+            .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        let dispatch_timeout = Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
+        if let Err(error) = self
+            .dispatch_bounded(
+                ControlCommand::Register {
+                    instance_id,
+                    agent_id,
+                    transport,
+                },
+                dispatch_timeout,
+            )
+            .await
+        {
+            self.remove_binding(&address);
+            return Err(error);
+        }
+        let command = self.prepare_command(ControlCommand::Resume {
+            instance_id,
+            target: ResumeTarget::ProviderSession { identity },
+            request,
+        });
+        let started_after = self.current_sequence();
+        if let Err(error) = self.arm_resume(&address, command.id) {
+            self.rollback_spawn(&address, dispatch_timeout).await?;
+            return Err(error);
+        }
+        if let Err(error) = self.dispatch_envelope(command) {
+            self.clear_armed_resume(&address);
+            self.rollback_spawn(&address, dispatch_timeout).await?;
+            return Err(error);
+        }
+        match self
+            .wait_for_record_resume(&address, started_after)
+            .await
+        {
+            Ok(settled_address) => Ok((self.record(record_id)?, settled_address)),
+            Err(error) => {
+                if matches!(
+                    error.code,
+                    NodeFailureCode::SessionRecordNotResumable
+                        | NodeFailureCode::BackendOperationFailed
+                ) {
+                    if let Some(bound) = self.bound_address_for_record(record_id) {
+                        let _ = self.remove_session(&bound).await;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn wait_for_record_resume(
+        &self,
+        initial_address: &SessionAddress,
+        after_sequence: u64,
+    ) -> Result<SessionAddress, NodeFailure> {
+        let deadline = Instant::now()
+            + Duration::from_millis(MANAGED_RESUME_SETTLE_TIMEOUT_MS);
+        let mut scan_after = after_sequence;
+        loop {
+            let events = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .events
+                .iter()
+                .filter(|event| event.sequence > scan_after)
+                .cloned()
+                .collect::<Vec<_>>();
+            for envelope in events {
+                scan_after = scan_after.max(envelope.sequence);
+                let NodeEvent::Control { address, event } = envelope.event else {
+                    continue;
+                };
+                if address.session.instance_id != initial_address.session.instance_id {
+                    continue;
+                }
+                match event.event {
+                    ControlEventKind::Resumed { .. } => return Ok(address),
+                    ControlEventKind::ResumeDenied { reason } => {
+                        return Err(failure(
+                            NodeFailureCode::SessionRecordNotResumable,
+                            &reason,
+                        ));
+                    }
+                    ControlEventKind::ResumeFailed { message }
+                    | ControlEventKind::CommandRejected { message } => {
+                        return Err(failure(
+                            NodeFailureCode::BackendOperationFailed,
+                            &message,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(failure(
+                    NodeFailureCode::BackendBusy,
+                    "managed resume did not settle before the bounded deadline",
+                ));
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
     }
 
     fn workspace_root(&self, workspace_id: &WorkspaceId) -> Result<String, NodeFailure> {
@@ -732,6 +1503,10 @@ impl NodeShared {
             )
         })?
         .map_err(|error| failure(NodeFailureCode::InvalidWorkspaceRoot, &error.to_string()))?;
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut workspaces = self
             .workspaces
             .write()
@@ -750,16 +1525,82 @@ impl NodeShared {
                 &format!("workspace root is already registered as '{existing_id}'"),
             ));
         }
+        {
+            let records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(record) = records.records.values().find(|record| {
+                record.workspace_id == workspace_id
+                    && !record
+                        .canonical_root
+                        .eq_ignore_ascii_case(workspace.canonical_root())
+            }) {
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    &format!(
+                        "workspace ID is retained by session record '{}' at another root",
+                        record.record_id,
+                    ),
+                ));
+            }
+        }
         let snapshot = WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
             canonical_root: workspace.canonical_root().to_owned(),
             sessions: Vec::new(),
         };
-        workspaces.insert(workspace_id, workspace.canonical_root().to_owned());
+        workspaces.insert(workspace_id.clone(), workspace.canonical_root().to_owned());
         drop(workspaces);
+        let previous_records = {
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = records.records.clone();
+            for record in records.records.values_mut().filter(|record| {
+                record.workspace_id == workspace_id
+                    && record
+                        .canonical_root
+                        .eq_ignore_ascii_case(workspace.canonical_root())
+            }) {
+                if record.active_session.is_none() {
+                    record.state = detached_record_state(record);
+                }
+                if record.last_error.as_deref() == Some(WORKSPACE_UNAVAILABLE_ERROR) {
+                    record.last_error = None;
+                }
+                record.updated_at_unix_ms = unix_time_ms();
+            }
+            previous
+        };
+        if let Err(error) = self.persist_state_locked() {
+            self.workspaces
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&workspace_id);
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records = previous_records;
+            return Err(persistence_failure(error));
+        }
+        let restored = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .values()
+            .filter(|record| record.workspace_id == workspace_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(transaction);
         self.publish(NodeEvent::WorkspaceAdded {
             workspace: snapshot.clone(),
         });
+        for record in restored {
+            self.publish_record(record);
+        }
         Ok(snapshot)
     }
 
@@ -775,6 +1616,10 @@ impl NodeShared {
             ));
         }
         drop(bindings);
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut workspaces = self
             .workspaces
             .write()
@@ -788,11 +1633,55 @@ impl NodeShared {
                 "node must retain at least one workspace",
             ));
         }
-        workspaces.remove(workspace_id);
+        let removed_root = workspaces
+            .remove(workspace_id)
+            .expect("workspace presence was validated");
         drop(workspaces);
+        let previous_records = {
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = records.records.clone();
+            for record in records
+                .records
+                .values_mut()
+                .filter(|record| &record.workspace_id == workspace_id)
+            {
+                record.active_session = None;
+                record.state = ManagedSessionState::Unavailable;
+                record.last_error = Some(WORKSPACE_UNAVAILABLE_ERROR.to_owned());
+                record.updated_at_unix_ms = unix_time_ms();
+            }
+            previous
+        };
+        if let Err(error) = self.persist_state_locked() {
+            self.workspaces
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(workspace_id.clone(), removed_root);
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records = previous_records;
+            return Err(persistence_failure(error));
+        }
+        let unavailable = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .values()
+            .filter(|record| &record.workspace_id == workspace_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(transaction);
         self.publish(NodeEvent::WorkspaceRemoved {
             workspace_id: workspace_id.clone(),
         });
+        for record in unavailable {
+            self.publish_record(record);
+        }
         Ok(())
     }
 
@@ -839,13 +1728,7 @@ impl NodeShared {
         let workspace = self
             .register_workspace(workspace_id, worktree.path.clone())
             .await
-            .map_err(|error| NodeFailure {
-                code: error.code,
-                message: format!(
-                    "Git created worktree '{}' but node registration failed: {}",
-                    worktree.path, error.message,
-                ),
-            })?;
+            .map_err(|error| failure(error.code, &error.message))?;
         worktree.workspace_id = Some(workspace.workspace_id.clone());
         Ok((worktree, workspace))
     }
@@ -906,13 +1789,8 @@ impl NodeShared {
             .await
             .map_err(git_worktree_failure)?;
         if let Some(workspace_id) = registered_workspace_id.as_ref() {
-            self.unregister_workspace(workspace_id).map_err(|error| NodeFailure {
-                code: error.code,
-                message: format!(
-                    "Git removed worktree '{}' but node unregistration failed: {}",
-                    removed.path, error.message,
-                ),
-            })?;
+            self.unregister_workspace(workspace_id)
+                .map_err(|error| failure(error.code, &error.message))?;
         }
         Ok((removed.path, registered_workspace_id))
     }
@@ -992,7 +1870,7 @@ impl NodeShared {
     }
 
     fn publish_control(&self, event: ControlEvent) {
-        let address = {
+        let (address, record_id, resume_command_rejected) = {
             let mut bindings = self
                 .session_bindings
                 .lock()
@@ -1000,6 +1878,7 @@ impl NodeShared {
             let Some(binding) = bindings.get_mut(&event.instance_id) else {
                 return;
             };
+            let mut resume_command_rejected = false;
             if binding.generation == event.generation {
                 if let Some((pending_generation, pending_command_id)) = binding.pending_resume {
                     let rejected_resume = matches!(
@@ -1014,6 +1893,7 @@ impl NodeShared {
                     if pending_generation == binding.generation
                         && (rejected_resume || resume_failed)
                     {
+                        resume_command_rejected = rejected_resume;
                         binding.pending_resume = None;
                     }
                 }
@@ -1031,15 +1911,302 @@ impl NodeShared {
                 binding.generation = event.generation;
                 binding.pending_resume = None;
             }
-            SessionAddress {
-                workspace_id: binding.workspace_id.clone(),
-                session: SessionKey {
-                    instance_id: event.instance_id,
-                    generation: event.generation,
+            (
+                SessionAddress {
+                    workspace_id: binding.workspace_id.clone(),
+                    session: SessionKey {
+                        instance_id: event.instance_id,
+                        generation: event.generation,
+                    },
                 },
-            }
+                binding.record_id.clone(),
+                resume_command_rejected,
+            )
         };
+        if let Some(record_id) = record_id {
+            self.reconcile_managed_record(
+                &record_id,
+                &address,
+                &event,
+                resume_command_rejected,
+            );
+        }
         self.publish(NodeEvent::Control { address, event });
+    }
+
+    fn reconcile_managed_record(
+        &self,
+        record_id: &SessionRecordId,
+        address: &SessionAddress,
+        event: &ControlEvent,
+        resume_command_rejected: bool,
+    ) {
+        let _transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let observed_identity = match &event.event {
+            ControlEventKind::ProviderEvent {
+                event: gate4agent_types::ProviderEvent::SessionIdentityObserved { identity },
+                ..
+            } => Some(identity.clone()),
+            _ => None,
+        };
+        let replacement_id = observed_identity
+            .as_ref()
+            .and_then(|_| self.allocate_record_id().ok());
+        let mut upserts = Vec::new();
+        let mut removals = Vec::new();
+        let mut rebind = None;
+        let original_records;
+        {
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            original_records = records.records.clone();
+            let Some(current_snapshot) = records.records.get(record_id).cloned() else {
+                return;
+            };
+            if let Some(identity) = observed_identity {
+                let existing_id = records
+                    .records
+                    .values()
+                    .find(|record| {
+                        record.record_id != *record_id
+                            && record.provider_session.as_ref().is_some_and(|record_identity| {
+                                session_registry::same_provider_session(
+                                    record.provider,
+                                    record_identity,
+                                    current_snapshot.provider,
+                                    &identity,
+                                )
+                            })
+                    })
+                    .map(|record| record.record_id.clone());
+                if let Some(existing_id) = existing_id {
+                    let scope_matches = records.records.get(&existing_id).is_some_and(|record| {
+                        record.mode == current_snapshot.mode
+                            && record.workspace_id == current_snapshot.workspace_id
+                            && record
+                                .canonical_root
+                                .eq_ignore_ascii_case(&current_snapshot.canonical_root)
+                    });
+                    if !scope_matches {
+                        if let Some(current) = records.records.get_mut(record_id) {
+                            current.state = ManagedSessionState::Unavailable;
+                            current.last_error =
+                                Some(PROVIDER_SESSION_SCOPE_CONFLICT_ERROR.to_owned());
+                            current.updated_at_unix_ms = unix_time_ms();
+                            upserts.push(current.clone());
+                        }
+                    } else {
+                        let existing_is_active = records
+                            .records
+                            .get(&existing_id)
+                            .is_some_and(|record| record.active_session.is_some());
+                        if existing_is_active {
+                            if let Some(current) = records.records.get_mut(record_id) {
+                                current.state = ManagedSessionState::Unavailable;
+                                current.last_error =
+                                    Some(PROVIDER_SESSION_LIVE_CONFLICT_ERROR.to_owned());
+                                current.updated_at_unix_ms = unix_time_ms();
+                                upserts.push(current.clone());
+                            }
+                        } else {
+                            if current_snapshot.provider_session.is_some() {
+                                if let Some(current) = records.records.get_mut(record_id) {
+                                    current.active_session = None;
+                                    current.state = ManagedSessionState::Dormant;
+                                    current.updated_at_unix_ms = unix_time_ms();
+                                    upserts.push(current.clone());
+                                }
+                            } else {
+                                records.records.remove(record_id);
+                                removals.push(record_id.clone());
+                            }
+                            if let Some(existing) = records.records.get_mut(&existing_id) {
+                                existing.provider_session = Some(identity.clone());
+                                existing.active_session = Some(address.clone());
+                                existing.state = ManagedSessionState::Live;
+                                existing.updated_at_unix_ms = unix_time_ms();
+                                existing.last_error = None;
+                                upserts.push(existing.clone());
+                            }
+                            rebind = Some(existing_id);
+                        }
+                    }
+                } else if current_snapshot
+                    .provider_session
+                    .as_ref()
+                    .is_some_and(|current| {
+                        !session_registry::same_provider_session(
+                            current_snapshot.provider,
+                            current,
+                            current_snapshot.provider,
+                            &identity,
+                        )
+                    })
+                {
+                    if let Some(current) = records.records.get_mut(record_id) {
+                        current.active_session = None;
+                        current.state = ManagedSessionState::Dormant;
+                        current.updated_at_unix_ms = unix_time_ms();
+                        upserts.push(current.clone());
+                    }
+                    if records.records.len() >= MAX_MANAGED_SESSION_RECORDS {
+                        if let Some(current) = records.records.get_mut(record_id) {
+                            current.state = ManagedSessionState::Unavailable;
+                            current.last_error =
+                                Some(MANAGED_SESSION_CAPACITY_ERROR.to_owned());
+                            current.updated_at_unix_ms = unix_time_ms();
+                            upserts.push(current.clone());
+                        }
+                    } else if let Some(new_record_id) = replacement_id {
+                        let now = unix_time_ms();
+                        let replacement = ManagedSessionRecord {
+                            record_id: new_record_id.clone(),
+                            display_name: format!(
+                                "{} #{}",
+                                current_snapshot.provider.agent_id(),
+                                records
+                                    .records
+                                    .values()
+                                    .filter(|record| {
+                                        record.provider == current_snapshot.provider
+                                    })
+                                    .count()
+                                    .saturating_add(1),
+                            ),
+                            provider: current_snapshot.provider,
+                            mode: current_snapshot.mode,
+                            state: ManagedSessionState::Live,
+                            workspace_id: current_snapshot.workspace_id,
+                            canonical_root: current_snapshot.canonical_root,
+                            provider_session: Some(identity),
+                            active_session: Some(address.clone()),
+                            created_at_unix_ms: now,
+                            updated_at_unix_ms: now,
+                            last_error: None,
+                        };
+                        records
+                            .records
+                            .insert(new_record_id.clone(), replacement.clone());
+                        upserts.push(replacement);
+                        rebind = Some(new_record_id);
+                    } else if let Some(current) = records.records.get_mut(record_id) {
+                        current.state = ManagedSessionState::Unavailable;
+                        current.last_error =
+                            Some(PROVIDER_IDENTITY_ALLOCATION_ERROR.to_owned());
+                        upserts.push(current.clone());
+                    }
+                } else if let Some(current) = records.records.get_mut(record_id) {
+                    current.provider_session = Some(identity);
+                    current.active_session = Some(address.clone());
+                    current.state = ManagedSessionState::Live;
+                    current.updated_at_unix_ms = unix_time_ms();
+                    current.last_error = None;
+                    upserts.push(current.clone());
+                }
+            } else if let Some(current) = records.records.get_mut(record_id) {
+                if resume_command_rejected {
+                    current.active_session = None;
+                    current.state = detached_record_state(current);
+                    current.updated_at_unix_ms = unix_time_ms();
+                    current.last_error =
+                        Some(PROVIDER_RESUME_REJECTED_ERROR.to_owned());
+                    upserts.push(current.clone());
+                } else {
+                    match &event.event {
+                    ControlEventKind::Running { .. }
+                    | ControlEventKind::ResumeAuthorized { .. }
+                    | ControlEventKind::Resumed { .. } => {
+                        current.active_session = Some(address.clone());
+                        current.state = if current.provider_session.is_some() {
+                            ManagedSessionState::Live
+                        } else {
+                            ManagedSessionState::IdentityPending
+                        };
+                        current.updated_at_unix_ms = unix_time_ms();
+                        current.last_error = None;
+                        upserts.push(current.clone());
+                    }
+                    ControlEventKind::Exited { .. } | ControlEventKind::Removed => {
+                        current.active_session = None;
+                        current.state = detached_record_state(current);
+                        current.updated_at_unix_ms = unix_time_ms();
+                        upserts.push(current.clone());
+                    }
+                    ControlEventKind::Failed { message }
+                    | ControlEventKind::ResumeFailed { message } => {
+                        current.active_session = None;
+                        current.state = detached_record_state(current);
+                        current.updated_at_unix_ms = unix_time_ms();
+                        current.last_error = Some(
+                            session_registry::sanitized_record_error_summary(message),
+                        );
+                        upserts.push(current.clone());
+                    }
+                    ControlEventKind::ResumeDenied { reason } => {
+                        current.active_session = None;
+                        current.state = detached_record_state(current);
+                        current.updated_at_unix_ms = unix_time_ms();
+                        current.last_error = Some(
+                            session_registry::sanitized_record_error_summary(reason),
+                        );
+                        upserts.push(current.clone());
+                    }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(new_record_id) = rebind {
+            if let Some(binding) = self
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_mut(&address.session.instance_id)
+            {
+                binding.record_id = Some(new_record_id);
+            }
+        }
+        if upserts.is_empty() && removals.is_empty() {
+            return;
+        }
+        if self.persist_state_locked().is_err() {
+            self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            records.records = original_records;
+            if let Some(current) = records.records.get_mut(record_id) {
+                current.state = ManagedSessionState::Unavailable;
+                current.last_error = Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned());
+                current.updated_at_unix_ms = unix_time_ms();
+                upserts = vec![current.clone()];
+            } else {
+                upserts.clear();
+            }
+            removals.clear();
+            drop(records);
+            if let Some(binding) = self
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_mut(&address.session.instance_id)
+            {
+                binding.record_id = Some(record_id.clone());
+            }
+            eprintln!("gate4agent-node: {DURABLE_STATE_COMMIT_FAILED_ERROR}");
+        }
+        for record in upserts {
+            self.publish_record(record);
+        }
+        for record_id in removals {
+            self.publish(NodeEvent::SessionRecordRemoved { record_id });
+        }
     }
 
     fn snapshot(&self) -> NodeSnapshot {
@@ -1082,6 +2249,14 @@ impl NodeShared {
             node_id: self.node_id.clone(),
             enabled_providers: self.enabled_providers.clone(),
             workspaces: workspaces.into_values().collect(),
+            session_records: self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .values()
+                .cloned()
+                .collect(),
         }
     }
 
@@ -1287,7 +2462,10 @@ impl NodeShared {
                 Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
             )
             .await?;
-        let deadline = Instant::now() + Duration::from_millis(MUTATION_SETTLE_TIMEOUT_MS);
+        // A semantic prompt may spend the provider's full readiness budget before
+        // the runtime emits InputCompleted. Keep the node request deadline bounded,
+        // but strictly beyond every readiness policy in this node's catalog.
+        let deadline = Instant::now() + Duration::from_millis(self.input_settle_timeout_ms);
         let mut scan_after = started_after;
         let mut accepted_after = None;
         loop {
@@ -1456,7 +2634,27 @@ impl NodeShared {
             workspace_id: workspace_id.clone(),
             session,
         };
-        self.bind_session(instance_id, workspace_id, session.generation);
+        let record = self.new_record(
+            &address,
+            provider,
+            mode,
+            ManagedSessionState::IdentityPending,
+            None,
+        )?;
+        let record_id = record.record_id.clone();
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.insert_record(record.clone())?;
+        self.bind_managed_session(&address, record_id.clone());
+        if let Err(error) = self.persist_state_locked() {
+            self.remove_binding(&address);
+            self.remove_record_memory(&record_id);
+            return Err(persistence_failure(error));
+        }
+        drop(transaction);
+        self.publish_record(record);
         let transport = match mode {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
@@ -1474,6 +2672,7 @@ impl NodeShared {
         )
         .await {
             self.remove_binding(&address);
+            self.discard_record(&record_id)?;
             return Err(error);
         }
         let start_result = self
@@ -1493,14 +2692,18 @@ impl NodeShared {
         if let Err(start_error) = start_result {
             let recovery = self.rollback_spawn(&address, dispatch_timeout).await;
             return match recovery {
-                Ok(()) => Err(start_error),
-                Err(recovery_error) => Err(failure(
-                    recovery_error.code,
-                    &format!(
+                Ok(()) => {
+                    self.discard_record(&record_id)?;
+                    Err(start_error)
+                }
+                Err(recovery_error) => {
+                    let diagnostic = format!(
                         "start failed and registration recovery failed: {}",
-                        recovery_error.message
-                    ),
-                )),
+                        recovery_error.message,
+                    );
+                    self.mark_record_error(&record_id, &diagnostic)?;
+                    Err(failure(recovery_error.code, &diagnostic))
+                }
             };
         }
 
@@ -1530,6 +2733,7 @@ impl NodeShared {
                             ),
                         )
                     })?;
+                self.discard_record(&record_id)?;
                 return Err(failure(
                     NodeFailureCode::BackendBusy,
                     "start did not commit before the bounded deadline; registration was removed",
@@ -2278,6 +3482,37 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             }
             Ok(NodeResponse::Accepted)
         }
+        NodeRequest::RenameSessionRecord {
+            record_id,
+            display_name,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let record = shared.rename_session_record(&record_id, display_name)?;
+            Ok(NodeResponse::SessionRecordUpdated { record })
+        }
+        NodeRequest::ResumeSessionRecord {
+            record_id,
+            terminal_size,
+            initial_prompt,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            if let Some(prompt) = initial_prompt.as_deref() {
+                validate_node_text("managed resume initial prompt", prompt)?;
+            }
+            let (record, session) = shared
+                .resume_session_record(
+                    &record_id,
+                    terminal_size,
+                    initial_prompt,
+                )
+                .await?;
+            Ok(NodeResponse::SessionRecordResumed { record, session })
+        }
+        NodeRequest::ForgetSessionRecord { record_id } => {
+            shared.require_controller(connection_id, role)?;
+            shared.forget_session_record(&record_id).await?;
+            Ok(NodeResponse::SessionRecordForgotten { record_id })
+        }
         NodeRequest::Prompt { session, text } => {
             let agent_id = controlled_session(shared, connection_id, role, &session)?;
             validate_node_text("prompt", &text)?;
@@ -2449,10 +3684,7 @@ fn git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
         GitWorktreeErrorKind::Locked => NodeFailureCode::WorktreeLocked,
         GitWorktreeErrorKind::Failed => NodeFailureCode::BackendOperationFailed,
     };
-    NodeFailure {
-        code,
-        message: error.message,
-    }
+    failure(code, &error.message)
 }
 
 fn normalize_windows_verbatim_path(path: String) -> String {
@@ -2491,8 +3723,70 @@ fn validate_workspace_root(
     Ok(())
 }
 
-fn failure(code: NodeFailureCode, message: &str) -> NodeFailure {
-    NodeFailure { code, message: message.to_owned() }
+fn failure(code: NodeFailureCode, _message: &str) -> NodeFailure {
+    NodeFailure {
+        code,
+        message: node_failure_category(code).to_owned(),
+    }
+}
+
+fn persistence_failure(_error: io::Error) -> NodeFailure {
+    NodeFailure {
+        code: NodeFailureCode::BackendOperationFailed,
+        message: DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned(),
+    }
+}
+
+fn node_failure_category(code: NodeFailureCode) -> &'static str {
+    match code {
+        NodeFailureCode::InvalidRequest => "invalid-request",
+        NodeFailureCode::Unauthorized => "unauthorized",
+        NodeFailureCode::ObserverReadOnly => "observer-read-only",
+        NodeFailureCode::ControllerBusy => "controller-busy",
+        NodeFailureCode::ControllerRequired => "controller-required",
+        NodeFailureCode::UnknownWorkspace => "unknown-workspace",
+        NodeFailureCode::InvalidWorkspaceRoot => "invalid-workspace-root",
+        NodeFailureCode::DuplicateWorkspaceId => "duplicate-workspace-id",
+        NodeFailureCode::DuplicateWorkspaceRoot => "duplicate-workspace-root",
+        NodeFailureCode::WorkspaceBusy => "workspace-busy",
+        NodeFailureCode::LastWorkspace => "last-workspace",
+        NodeFailureCode::NotGitRepository => "not-git-repository",
+        NodeFailureCode::WorktreeConflict => "worktree-conflict",
+        NodeFailureCode::WorktreeProtected => "worktree-protected",
+        NodeFailureCode::WorktreeDirty => "worktree-dirty",
+        NodeFailureCode::WorktreeLocked => "worktree-locked",
+        NodeFailureCode::UnknownSession => "unknown-session",
+        NodeFailureCode::UnknownSessionRecord => "unknown-session-record",
+        NodeFailureCode::SessionRecordNotResumable => "session-record-not-resumable",
+        NodeFailureCode::SessionRecordBusy => "session-record-busy",
+        NodeFailureCode::SessionRecordConflict => "session-record-conflict",
+        NodeFailureCode::SessionWorkspaceMismatch => "session-workspace-mismatch",
+        NodeFailureCode::StaleGeneration => "stale-generation",
+        NodeFailureCode::BackendBusy => "backend-busy",
+        NodeFailureCode::BackendDisconnected => "backend-disconnected",
+        NodeFailureCode::BackendOperationFailed => "backend-operation-failed",
+        NodeFailureCode::ShuttingDown => "shutting-down",
+    }
+}
+
+fn durable_state_server_error(error: io::Error, category: &'static str) -> NodeServerError {
+    NodeServerError::DurableState(io::Error::new(error.kind(), category))
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn detached_record_state(record: &ManagedSessionRecord) -> ManagedSessionState {
+    if record.provider_session.is_some() {
+        ManagedSessionState::Dormant
+    } else {
+        ManagedSessionState::Unavailable
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2503,6 +3797,12 @@ pub enum NodeServerError {
     InvalidAccessToken,
     #[error("node HTTP observer must listen on a loopback address: {0}")]
     InvalidApiListen(std::net::SocketAddr),
+    #[error("node durable state path must be an absolute file path: {0}")]
+    InvalidStatePath(String),
+    #[error("LOCALAPPDATA is unavailable; cannot derive the product node state path")]
+    LocalAppDataUnavailable,
+    #[error("node durable state failed: {0}")]
+    DurableState(io::Error),
     #[error("node requires at least one configured workspace")]
     NoWorkspaces,
     #[error("workspace '{workspace_id}' root '{path}' is invalid: {message}")]
@@ -2554,6 +3854,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_node_failures_expose_only_fixed_categories() {
+        let provider = failure(
+            NodeFailureCode::BackendOperationFailed,
+            r"provider bearer-secret failed at C:\private\session.jsonl",
+        );
+        assert_eq!(provider.message, "backend-operation-failed");
+        assert!(!provider.message.contains("bearer-secret"));
+        assert!(!provider.message.contains(r"C:\private"));
+        let persistence = persistence_failure(io::Error::new(
+            io::ErrorKind::Other,
+            r"state write failed at C:\private\state-v1.json",
+        ));
+        assert_eq!(persistence.message, DURABLE_STATE_COMMIT_FAILED_ERROR);
+        assert!(!persistence.message.contains(r"C:\private"));
+    }
+
+    #[test]
     fn terminal_byte_sequences_are_bounded_before_dispatch() {
         let sequence = b"\x1b[1;5D".to_vec();
         assert_eq!(
@@ -2570,6 +3887,55 @@ mod tests {
                 .code,
             NodeFailureCode::InvalidRequest,
         );
+    }
+
+    #[test]
+    fn node_server_rejects_a_second_owner_of_the_same_durable_state_path() {
+        let root = temporary_workspace_root("exclusive-state-owner");
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            &root,
+        )
+        .unwrap();
+        let state_path = root.join("state-v1.json");
+        let endpoint = format!(
+            r"\\.\pipe\gate4agent-node-state-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let config = NodeServerConfig::new(
+            endpoint,
+            "fixture-token",
+            NodeId::new("node-1").unwrap(),
+            [workspace],
+        )
+        .unwrap()
+        .with_state_path(&state_path)
+        .unwrap();
+
+        let first = NodeServer::new(config.clone()).unwrap();
+        let error = match NodeServer::new(config.clone()) {
+            Ok(_) => panic!("a second node server acquired the same durable state path"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            NodeServerError::DurableState(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            error.to_string(),
+            "node durable state failed: durable-state-lock-failed",
+        );
+        assert!(!error.to_string().contains(&state_path.to_string_lossy().into_owned()));
+        drop(first);
+        let second = NodeServer::new(config).unwrap();
+        drop(second);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2718,6 +4084,454 @@ mod tests {
                 event: NodeEvent::WorkspaceRemoved { workspace_id },
             } if workspace_id == &secondary_id
         ));
+    }
+
+    #[test]
+    fn managed_record_id_collision_preserves_the_existing_record() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace.clone()],
+            vec![AgentProvider::Claude],
+        );
+        let record_id = SessionRecordId::new("sr-collision").unwrap();
+        let original = ManagedSessionRecord {
+            record_id: record_id.clone(),
+            display_name: "original".to_owned(),
+            provider: AgentProvider::Claude,
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: workspace.workspace_id,
+            canonical_root: workspace.canonical_root,
+            provider_session: None,
+            active_session: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            last_error: None,
+        };
+        shared.insert_record(original.clone()).unwrap();
+        let mut collision = original.clone();
+        collision.display_name = "replacement".to_owned();
+        let error = shared.insert_record(collision).unwrap_err();
+        assert_eq!(error.code, NodeFailureCode::SessionRecordConflict);
+        assert_eq!(shared.record(&record_id).unwrap(), original);
+    }
+
+    #[test]
+    fn managed_record_runtime_errors_are_exposed_only_as_allowlisted_categories() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace.clone()],
+            vec![AgentProvider::Claude],
+        );
+        let record_id = SessionRecordId::new("sr-runtime-error").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: record_id.clone(),
+                display_name: "runtime error".to_owned(),
+                provider: AgentProvider::Claude,
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::IdentityPending,
+                workspace_id: workspace.workspace_id,
+                canonical_root: workspace.canonical_root,
+                provider_session: None,
+                active_session: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_error: None,
+            })
+            .unwrap();
+
+        shared
+            .mark_record_error(
+                &record_id,
+                r"provider failed with bearer-secret-123 at C:\private\session.jsonl",
+            )
+            .unwrap();
+        let record = shared.record(&record_id).unwrap();
+        assert_eq!(record.state, ManagedSessionState::Unavailable);
+        assert_eq!(
+            record.last_error.as_deref(),
+            Some("provider-runtime-failed"),
+        );
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.session_records, vec![record]);
+    }
+
+    #[test]
+    fn provider_identity_cannot_rebind_a_record_across_workspaces() {
+        let secondary_root = temporary_workspace_root("identity-scope");
+        std::fs::create_dir_all(&secondary_root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let primary = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let secondary = WorkspaceConfig::new(
+            WorkspaceId::new("secondary").unwrap(),
+            &secondary_root,
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![primary.clone(), secondary.clone()],
+            vec![AgentProvider::Claude],
+        );
+        let identity = gate4agent_types::ProviderSessionIdentity {
+            key: gate4agent_types::ProviderSessionKey::SessionId,
+            id: "provider-session".to_owned(),
+            transcript_path: None,
+        };
+        let dormant_id = SessionRecordId::new("sr-dormant").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: dormant_id.clone(),
+                display_name: "dormant".to_owned(),
+                provider: AgentProvider::Claude,
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::Dormant,
+                workspace_id: primary.workspace_id,
+                canonical_root: primary.canonical_root,
+                provider_session: Some(identity.clone()),
+                active_session: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_error: None,
+            })
+            .unwrap();
+        let address = SessionAddress {
+            workspace_id: secondary.workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(91),
+                generation: SessionGeneration(1),
+            },
+        };
+        let current_id = SessionRecordId::new("sr-current").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: current_id.clone(),
+                display_name: "current".to_owned(),
+                provider: AgentProvider::Claude,
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::IdentityPending,
+                workspace_id: secondary.workspace_id,
+                canonical_root: secondary.canonical_root,
+                provider_session: None,
+                active_session: Some(address.clone()),
+                created_at_unix_ms: 2,
+                updated_at_unix_ms: 2,
+                last_error: None,
+            })
+            .unwrap();
+        shared.bind_managed_session(&address, current_id.clone());
+        let event = ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 1,
+            command_id: None,
+            instance_id: address.session.instance_id,
+            generation: address.session.generation,
+            event: ControlEventKind::ProviderEvent {
+                sequence: 1,
+                source: gate4agent_types::ProviderSource {
+                    family: gate4agent_types::AdapterFamily::PtySemantic,
+                    binding: gate4agent_types::AdapterBinding::new(
+                        gate4agent_types::AdapterId::new("claude").unwrap(),
+                        "fixture/v1",
+                        gate4agent_types::AdapterVerification::SyntheticFixture,
+                    )
+                    .unwrap(),
+                },
+                source_sequence: 1,
+                event: gate4agent_types::ProviderEvent::SessionIdentityObserved {
+                    identity,
+                },
+            },
+        };
+        shared.reconcile_managed_record(&current_id, &address, &event, false);
+
+        let binding = shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&address.session.instance_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(binding.record_id.as_ref(), Some(&current_id));
+        assert_eq!(shared.record(&dormant_id).unwrap().state, ManagedSessionState::Dormant);
+        let current = shared.record(&current_id).unwrap();
+        assert_eq!(current.state, ManagedSessionState::Unavailable);
+        assert_eq!(current.active_session.as_ref(), Some(&address));
+        assert_eq!(
+            current.last_error.as_deref(),
+            Some(PROVIDER_SESSION_SCOPE_CONFLICT_ERROR),
+        );
+        std::fs::remove_dir_all(secondary_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn semantic_identity_with_transcript_path_reuses_record_and_survives_reload() {
+        let root = temporary_workspace_root("semantic-provider-session");
+        std::fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("state-v1.json");
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            &root,
+        )
+        .unwrap();
+        let node_id = NodeId::new("node-semantic-identity").unwrap();
+        let shared = NodeShared::new_with_incarnation(
+            handle,
+            "fixture-token".to_owned(),
+            node_id.clone(),
+            NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace.clone()],
+            vec![AgentProvider::Claude],
+            Some(state_path.clone()),
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+        let persisted_identity = gate4agent_types::ProviderSessionIdentity {
+            key: gate4agent_types::ProviderSessionKey::SessionId,
+            id: "provider-session".to_owned(),
+            transcript_path: None,
+        };
+        let durable_id = SessionRecordId::new("sr-durable").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: durable_id.clone(),
+                display_name: "durable".to_owned(),
+                provider: AgentProvider::Claude,
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::Dormant,
+                workspace_id: workspace.workspace_id.clone(),
+                canonical_root: workspace.canonical_root.clone(),
+                provider_session: Some(persisted_identity.clone()),
+                active_session: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_error: None,
+            })
+            .unwrap();
+        let address = SessionAddress {
+            workspace_id: workspace.workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(92),
+                generation: SessionGeneration(2),
+            },
+        };
+        let pending_id = SessionRecordId::new("sr-pending").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: pending_id.clone(),
+                display_name: "pending".to_owned(),
+                provider: AgentProvider::Claude,
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::IdentityPending,
+                workspace_id: workspace.workspace_id.clone(),
+                canonical_root: workspace.canonical_root.clone(),
+                provider_session: None,
+                active_session: Some(address.clone()),
+                created_at_unix_ms: 2,
+                updated_at_unix_ms: 2,
+                last_error: None,
+            })
+            .unwrap();
+        shared.bind_managed_session(&address, pending_id.clone());
+        let observed_identity = gate4agent_types::ProviderSessionIdentity {
+            transcript_path: Some(r"C:\private\provider-transcript.jsonl".to_owned()),
+            ..persisted_identity
+        };
+        let event = ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 1,
+            command_id: None,
+            instance_id: address.session.instance_id,
+            generation: address.session.generation,
+            event: ControlEventKind::ProviderEvent {
+                sequence: 1,
+                source: gate4agent_types::ProviderSource {
+                    family: gate4agent_types::AdapterFamily::PtySemantic,
+                    binding: gate4agent_types::AdapterBinding::new(
+                        gate4agent_types::AdapterId::new("claude").unwrap(),
+                        "fixture/v1",
+                        gate4agent_types::AdapterVerification::SyntheticFixture,
+                    )
+                    .unwrap(),
+                },
+                source_sequence: 1,
+                event: gate4agent_types::ProviderEvent::SessionIdentityObserved {
+                    identity: observed_identity.clone(),
+                },
+            },
+        };
+        shared.reconcile_managed_record(&pending_id, &address, &event, false);
+
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.session_records.len(), 1);
+        let live = &snapshot.session_records[0];
+        assert_eq!(live.record_id, durable_id);
+        assert_eq!(live.state, ManagedSessionState::Live);
+        assert_eq!(live.active_session.as_ref(), Some(&address));
+        assert_eq!(live.provider_session.as_ref(), Some(&observed_identity));
+        let binding = shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&address.session.instance_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(binding.record_id.as_ref(), Some(&durable_id));
+
+        let mut duplicate = live.clone();
+        duplicate.record_id = SessionRecordId::new("sr-duplicate").unwrap();
+        duplicate.display_name = "duplicate".to_owned();
+        duplicate.state = ManagedSessionState::Dormant;
+        duplicate.active_session = None;
+        duplicate.provider_session.as_mut().unwrap().transcript_path = None;
+        let duplicate_error = shared.insert_record(duplicate).unwrap_err();
+        assert_eq!(duplicate_error.code, NodeFailureCode::SessionRecordConflict);
+        assert_eq!(shared.snapshot().session_records.len(), 1);
+
+        let terminal_size = gate4agent_types::TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let (first_busy, second_busy) = tokio::join!(
+            shared.resume_session_record(&durable_id, terminal_size, None),
+            shared.resume_session_record(&durable_id, terminal_size, None),
+        );
+        for busy in [first_busy.unwrap_err(), second_busy.unwrap_err()] {
+            assert_eq!(busy.code, NodeFailureCode::SessionRecordBusy);
+            assert_eq!(busy.message, "session-record-busy");
+        }
+
+        let loaded = session_registry::load(Some(&state_path), &node_id).unwrap();
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.records[0].record_id, durable_id);
+        assert_eq!(loaded.records[0].state, ManagedSessionState::Dormant);
+        assert_eq!(
+            loaded.records[0]
+                .provider_session
+                .as_ref()
+                .unwrap()
+                .transcript_path,
+            None,
+        );
+        let catalog = active_registry().unwrap();
+        let (reloaded_handle, _reloaded_runtime) =
+            NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let reloaded = NodeShared::new_with_incarnation(
+            reloaded_handle,
+            "fixture-token".to_owned(),
+            node_id,
+            NodeIncarnationId::from_bytes([1; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace],
+            vec![AgentProvider::Claude],
+            None,
+            loaded.records,
+            loaded.warning,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+        assert_eq!(reloaded.snapshot().session_records.len(), 1);
+        assert_eq!(reloaded.snapshot().session_records[0].record_id, durable_id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_reregistration_requires_the_recorded_root_and_restores_records() {
+        let secondary_root = temporary_workspace_root("workspace-restore");
+        let other_root = temporary_workspace_root("workspace-conflict");
+        std::fs::create_dir_all(&secondary_root).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let primary = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let secondary = WorkspaceConfig::new(
+            WorkspaceId::new("secondary").unwrap(),
+            &secondary_root,
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![primary, secondary.clone()],
+            vec![AgentProvider::Claude],
+        );
+        let record_id = SessionRecordId::new("sr-workspace").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: record_id.clone(),
+                display_name: "workspace record".to_owned(),
+                provider: AgentProvider::Claude,
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::Dormant,
+                workspace_id: secondary.workspace_id.clone(),
+                canonical_root: secondary.canonical_root.clone(),
+                provider_session: Some(gate4agent_types::ProviderSessionIdentity {
+                    key: gate4agent_types::ProviderSessionKey::SessionId,
+                    id: "provider-session".to_owned(),
+                    transcript_path: None,
+                }),
+                active_session: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_error: None,
+            })
+            .unwrap();
+        shared.unregister_workspace(&secondary.workspace_id).unwrap();
+        let unavailable = shared.record(&record_id).unwrap();
+        assert_eq!(unavailable.state, ManagedSessionState::Unavailable);
+        assert_eq!(unavailable.canonical_root, secondary.canonical_root);
+
+        let conflict = shared
+            .register_workspace(
+                secondary.workspace_id.clone(),
+                other_root.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, NodeFailureCode::SessionRecordConflict);
+        shared
+            .register_workspace(
+                secondary.workspace_id,
+                secondary_root.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+        let restored = shared.record(&record_id).unwrap();
+        assert_eq!(restored.state, ManagedSessionState::Dormant);
+        assert!(restored.last_error.is_none());
+        std::fs::remove_dir_all(secondary_root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
     }
 
     #[test]

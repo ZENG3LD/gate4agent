@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::{
     c2_auth_transcript, C2AuthDirection, C2ClientAuthentication, C2ClientFrame,
-    C2ReplyEnvelope, C2ServerChallenge,
+    C2ReplyEnvelope, C2ServerChallenge, C2Topology,
     C2ServerFrame, C2Hello, C2_CONTROL_PROTOCOL_VERSION, MAX_C2_AUTH_FRAME_BYTES,
     MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES, MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -84,7 +84,7 @@ async fn serve_connection(
     connection_ids: Arc<AtomicU64>,
     token: &str,
     relays: Arc<BTreeMap<NodeId, RelayEndpoint>>,
-    status: watch::Receiver<Arc<StatusResponse>>,
+    mut status: watch::Receiver<Arc<StatusResponse>>,
     hub: OperatorHub,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), FrameError> {
@@ -149,6 +149,7 @@ async fn serve_connection(
         hub.detach(connection_id);
         return Ok(());
     }
+    let mut last_topology = C2Topology::from_status(&hello_status);
     if timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
         &C2ServerFrame::Hello(C2Hello {
@@ -196,6 +197,19 @@ async fn serve_connection(
                 }
             }
             changed = disconnect_rx.changed() => if changed.is_err() || *disconnect_rx.borrow() { break; },
+            changed = status.changed() => {
+                if changed.is_err() { break; }
+                let next_topology = {
+                    let latest = status.borrow_and_update();
+                    C2Topology::from_status(latest.as_ref())
+                };
+                if queue_topology_if_changed(
+                    &outbound_tx,
+                    &budget,
+                    &mut last_topology,
+                    next_topology,
+                ).is_err() { break; }
+            }
             changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { break; },
         }
         while dispatches.try_join_next().is_some() {}
@@ -244,10 +258,10 @@ async fn refresh_hello_status(
     }).await.unwrap_or_default();
     for response in completed {
         let Ok(response) = response else { continue; };
-        let Ok(NodeResponse::Snapshot { event_sequence, snapshot, .. }) = response.response else { continue; };
+        let Ok(C2NodeResponse::Snapshot { event_sequence, snapshot, .. }) = response.response else { continue; };
         if let Some(observed) = refreshed.nodes.get_mut(&response.node_id) {
             observed.cursor = Some(NodeCursor { incarnation_id: response.incarnation_id, sequence: event_sequence });
-            observed.inventory = Some(SlimNodeInventory::from_snapshot(&snapshot));
+            observed.inventory = Some(SlimNodeInventory::from_c2_snapshot(&snapshot));
         }
     }
     refreshed.observed_at_unix_ms = unix_ms();
@@ -386,6 +400,18 @@ pub(super) fn queue_operator_event(
     queue_event(sender, budget, C2ServerFrame::Event(event))
 }
 
+fn queue_topology_if_changed(
+    sender: &mpsc::Sender<QueuedFrame>,
+    budget: &AtomicUsize,
+    previous: &mut C2Topology,
+    next: C2Topology,
+) -> Result<(), ()> {
+    if *previous == next { return Ok(()); }
+    queue_event(sender, budget, C2ServerFrame::Topology(next.clone()))?;
+    *previous = next;
+    Ok(())
+}
+
 enum DispatchStart {
     Immediate(RelayResult),
     Pending(oneshot::Receiver<RelayResult>),
@@ -476,4 +502,63 @@ fn c2_proof(
 
 fn authentication_frame_error(message: String) -> FrameError {
     FrameError::Io(io::Error::new(io::ErrorKind::Other, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{C2_API_VERSION, NodeFreshness, ObservedNode};
+
+    fn status(transport: NodeTransportState, incarnation_id: Option<NodeIncarnationId>) -> StatusResponse {
+        let node_id = NodeId::new("node-a").unwrap();
+        let cursor = incarnation_id.map(|incarnation_id| NodeCursor { incarnation_id, sequence: 7 });
+        StatusResponse {
+            api_version: C2_API_VERSION,
+            ready: true,
+            observed_at_unix_ms: 1,
+            nodes: BTreeMap::from([(node_id, ObservedNode {
+                endpoint: r"\\.\pipe\node-a".to_owned(),
+                transport_label: "windows-named-pipe".to_owned(),
+                transport,
+                freshness: NodeFreshness::Unavailable,
+                cursor,
+                inventory: None,
+                last_attempt_unix_ms: None,
+                last_success_unix_ms: None,
+                consecutive_failures: 0,
+                last_error: None,
+                gaps: Vec::new(),
+                gaps_truncated: 0,
+            })]),
+        }
+    }
+
+    #[test]
+    fn offline_node_recovery_enqueues_one_topology_update() {
+        let incarnation_id = NodeIncarnationId::from_bytes([4; 16]);
+        let mut previous = C2Topology::from_status(&status(NodeTransportState::Offline, None));
+        let mut recovered_status = status(
+            NodeTransportState::Online,
+            Some(incarnation_id),
+        );
+        let recovered = C2Topology::from_status(&recovered_status);
+        let (sender, mut receiver) = mpsc::channel(2);
+        let budget = AtomicUsize::new(0);
+
+        queue_topology_if_changed(&sender, &budget, &mut previous, recovered.clone()).unwrap();
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.frame, C2ServerFrame::Topology(recovered.clone()));
+        budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+        assert_eq!(previous, recovered);
+
+        recovered_status.observed_at_unix_ms += 1;
+        queue_topology_if_changed(
+            &sender,
+            &budget,
+            &mut previous,
+            C2Topology::from_status(&recovered_status),
+        ).unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
 }

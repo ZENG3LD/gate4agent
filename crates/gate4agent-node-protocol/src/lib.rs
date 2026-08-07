@@ -1,8 +1,8 @@
 //! Bounded wire contract for the local Gate4Agent node.
 
 use gate4agent_types::{
-    AgentInstanceId, ControlEvent, SessionGeneration, SessionSnapshot, TerminalControl,
-    TerminalSize,
+    AgentInstanceId, ControlEvent, ProviderSessionIdentity, SessionGeneration, SessionSnapshot,
+    TerminalControl, TerminalSize,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -14,13 +14,14 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-pub const NODE_PROTOCOL_VERSION: u16 = 7;
+pub const NODE_PROTOCOL_VERSION: u16 = 8;
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const NODE_INCARNATION_ID_BYTES: usize = 16;
 pub const MAX_NODE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_NODE_CLIENT_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_NODE_TEXT_BYTES: usize = 32 * 1024;
 pub const MAX_NODE_TERMINAL_BYTES: usize = 64;
+pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
 pub const MAX_WORKSPACE_ROOT_BYTES: usize = gate4agent_types::WORKING_DIRECTORY_MAX_BYTES;
 pub const MAX_NODE_HELLO_FRAME_BYTES: usize = 8 * 1024;
 pub const NODE_AUTH_NONCE_BYTES: usize = 32;
@@ -67,6 +68,9 @@ pub struct NodeId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkspaceId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionRecordId(String);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeIncarnationId([u8; NODE_INCARNATION_ID_BYTES]);
@@ -209,6 +213,7 @@ macro_rules! identifier_impl {
 
 identifier_impl!(NodeId, "node");
 identifier_impl!(WorkspaceId, "workspace");
+identifier_impl!(SessionRecordId, "session record");
 
 fn validate_identifier(label: &'static str, value: &str) -> Result<(), NodeIdentifierError> {
     if value.is_empty() {
@@ -266,6 +271,31 @@ pub struct SessionKey {
 pub struct SessionAddress {
     pub workspace_id: WorkspaceId,
     pub session: SessionKey,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedSessionState {
+    IdentityPending,
+    Live,
+    Dormant,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedSessionRecord {
+    pub record_id: SessionRecordId,
+    pub display_name: String,
+    pub provider: AgentProvider,
+    pub mode: SessionMode,
+    pub state: ManagedSessionState,
+    pub workspace_id: WorkspaceId,
+    pub canonical_root: String,
+    pub provider_session: Option<ProviderSessionIdentity>,
+    pub active_session: Option<SessionAddress>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -340,6 +370,8 @@ pub struct NodeSnapshot {
     pub node_id: NodeId,
     pub enabled_providers: Vec<AgentProvider>,
     pub workspaces: Vec<WorkspaceSnapshot>,
+    #[serde(default)]
+    pub session_records: Vec<ManagedSessionRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -438,6 +470,18 @@ pub enum NodeRequest {
         terminal_size: TerminalSize,
         initial_prompt: Option<String>,
     },
+    RenameSessionRecord {
+        record_id: SessionRecordId,
+        display_name: String,
+    },
+    ResumeSessionRecord {
+        record_id: SessionRecordId,
+        terminal_size: TerminalSize,
+        initial_prompt: Option<String>,
+    },
+    ForgetSessionRecord {
+        record_id: SessionRecordId,
+    },
     Prompt { session: SessionAddress, text: String },
     Paste { session: SessionAddress, text: String },
     Input { session: SessionAddress, text: String },
@@ -477,6 +521,16 @@ pub enum NodeResponse {
     },
     SpawnAccepted {
         session: SessionAddress,
+    },
+    SessionRecordUpdated {
+        record: ManagedSessionRecord,
+    },
+    SessionRecordResumed {
+        record: ManagedSessionRecord,
+        session: SessionAddress,
+    },
+    SessionRecordForgotten {
+        record_id: SessionRecordId,
     },
     WorkspaceRegistered {
         workspace: WorkspaceSnapshot,
@@ -522,6 +576,10 @@ pub enum NodeFailureCode {
     WorktreeDirty,
     WorktreeLocked,
     UnknownSession,
+    UnknownSessionRecord,
+    SessionRecordNotResumable,
+    SessionRecordBusy,
+    SessionRecordConflict,
     SessionWorkspaceMismatch,
     StaleGeneration,
     BackendBusy,
@@ -543,6 +601,8 @@ pub enum NodeEvent {
     ControllerChanged { controller: Option<ControllerState> },
     WorkspaceAdded { workspace: WorkspaceSnapshot },
     WorkspaceRemoved { workspace_id: WorkspaceId },
+    SessionRecordUpserted { record: ManagedSessionRecord },
+    SessionRecordRemoved { record_id: SessionRecordId },
     ResyncRequired { oldest_available_sequence: u64 },
 }
 
@@ -827,8 +887,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v7_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 7);
+    fn protocol_v8_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 8);
         assert_eq!(MAX_WORKSPACE_ROOT_BYTES, gate4agent_types::WORKING_DIRECTORY_MAX_BYTES);
 
         let register = NodeRequest::RegisterWorkspace {
@@ -917,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn node_hello_v7_carries_the_incarnation_sequence_domain() {
+    fn node_hello_v8_carries_the_incarnation_sequence_domain() {
         let hello = NodeHello {
             protocol_version: NODE_PROTOCOL_VERSION,
             incarnation_id: NodeIncarnationId::from_bytes([0; NODE_INCARNATION_ID_BYTES]),
@@ -929,12 +989,13 @@ mod tests {
                 node_id: NodeId::new("fixture-node").unwrap(),
                 enabled_providers: Vec::new(),
                 workspaces: Vec::new(),
+                session_records: Vec::new(),
             },
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol_version":7,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[]}}"#,
+            r#"{"protocol_version":8,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}"#,
         );
         assert_eq!(serde_json::from_str::<NodeHello>(&json).unwrap(), hello);
     }
@@ -1118,5 +1179,104 @@ mod tests {
         let encoded = serde_json::to_string(&WorkspaceId::new("repo-1").unwrap()).unwrap();
         assert_eq!(encoded, "\"repo-1\"");
         assert!(serde_json::from_str::<WorkspaceId>("\"Repo-1\"").is_err());
+    }
+
+    #[test]
+    fn durable_session_wire_contract_round_trips() {
+        assert_eq!(MAX_SESSION_DISPLAY_NAME_BYTES, 256);
+        let record = ManagedSessionRecord {
+            record_id: SessionRecordId::new("session-001").unwrap(),
+            display_name: "release shepherd".to_owned(),
+            provider: AgentProvider::Claude,
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            canonical_root: r"C:\repo".to_owned(),
+            provider_session: Some(ProviderSessionIdentity {
+                key: gate4agent_types::ProviderSessionKey::SessionId,
+                id: "b1ef3250-47a2-42ca-9076-cc241487ea22".to_owned(),
+                transcript_path: Some(r"C:\provider\sessions\b1ef3250.jsonl".to_owned()),
+            }),
+            active_session: None,
+            created_at_unix_ms: 1_723_000_000_000,
+            updated_at_unix_ms: 1_723_000_000_123,
+            last_error: None,
+        };
+
+        let requests = [
+            NodeRequest::RenameSessionRecord {
+                record_id: record.record_id.clone(),
+                display_name: "release verification".to_owned(),
+            },
+            NodeRequest::ResumeSessionRecord {
+                record_id: record.record_id.clone(),
+                terminal_size: TerminalSize { rows: 40, columns: 120 },
+                initial_prompt: None,
+            },
+            NodeRequest::ForgetSessionRecord {
+                record_id: record.record_id.clone(),
+            },
+        ];
+        for request in requests {
+            let json = serde_json::to_string(&request).unwrap();
+            assert_eq!(serde_json::from_str::<NodeRequest>(&json).unwrap(), request);
+        }
+
+        let responses = [
+            NodeResponse::SessionRecordUpdated {
+                record: record.clone(),
+            },
+            NodeResponse::SessionRecordResumed {
+                record: record.clone(),
+                session: SessionAddress {
+                    workspace_id: record.workspace_id.clone(),
+                    session: SessionKey {
+                        instance_id: AgentInstanceId(8),
+                        generation: SessionGeneration(2),
+                    },
+                },
+            },
+            NodeResponse::SessionRecordForgotten {
+                record_id: record.record_id.clone(),
+            },
+        ];
+        for response in responses {
+            let json = serde_json::to_string(&response).unwrap();
+            assert_eq!(serde_json::from_str::<NodeResponse>(&json).unwrap(), response);
+        }
+
+        let events = [
+            NodeEvent::SessionRecordUpserted {
+                record: record.clone(),
+            },
+            NodeEvent::SessionRecordRemoved {
+                record_id: record.record_id.clone(),
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<NodeEvent>(&json).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn session_record_ids_are_bounded_validated_wire_values() {
+        let record_id = SessionRecordId::new("01j4k0jta3eynt5kxef132kr39").unwrap();
+        assert_eq!(record_id.as_str(), "01j4k0jta3eynt5kxef132kr39");
+        assert!(SessionRecordId::new("").is_err());
+        assert!(SessionRecordId::new("Session-1").is_err());
+        assert!(SessionRecordId::new("-session-1").is_err());
+        assert!(SessionRecordId::new("x".repeat(MAX_NODE_IDENTIFIER_BYTES + 1)).is_err());
+
+        let json = serde_json::to_string(&record_id).unwrap();
+        assert_eq!(serde_json::from_str::<SessionRecordId>(&json).unwrap(), record_id);
+        assert!(serde_json::from_str::<SessionRecordId>("\"Session-1\"").is_err());
+    }
+
+    #[test]
+    fn node_snapshot_defaults_managed_sessions_for_legacy_wire_payloads() {
+        let legacy = r#"{"node_id":"fixture-node","enabled_providers":[],"workspaces":[]}"#;
+        let snapshot = serde_json::from_str::<NodeSnapshot>(legacy).unwrap();
+        assert!(snapshot.session_records.is_empty());
     }
 }

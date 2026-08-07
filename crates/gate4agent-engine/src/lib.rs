@@ -1953,6 +1953,16 @@ impl Gate4AgentEngine {
                     })?;
                 ResumeAuthorityTarget::ProviderSession { identity }
             }
+            ResumeTarget::ProviderSession { identity } => {
+                identity
+                    .validate()
+                    .map_err(|error| ControlError::InvalidResumeRequest {
+                        message: error.to_string(),
+                    })?;
+                ResumeAuthorityTarget::ProviderSession {
+                    identity: identity.clone(),
+                }
+            }
             ResumeTarget::HistoryCandidate { candidate_id } => {
                 if state.snapshot.history.candidate(candidate_id).is_none()
                     || state.snapshot.history.loaded_candidate_id.as_deref()
@@ -2568,6 +2578,7 @@ fn resume_identity_matches_target(
 ) -> bool {
     match target {
         ResumeTarget::CurrentProvider => snapshot.provider.session.as_ref() == Some(identity),
+        ResumeTarget::ProviderSession { identity: expected } => expected == identity,
         ResumeTarget::HistoryCandidate { candidate_id } => {
             snapshot.history.loaded_candidate_id.as_deref() == Some(candidate_id.as_str())
                 && snapshot
@@ -6247,6 +6258,89 @@ mod tests {
             ControlEventKind::Resumed { session, process_id: Some(77) }
                 if session.id == "provider-session-1"
         )));
+    }
+
+    #[test]
+    fn explicit_provider_session_resume_still_requires_matching_authority() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine.drain_events();
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "durable-provider-session".to_owned(),
+            transcript_path: None,
+        };
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::ProviderSession {
+                        identity: identity.clone(),
+                    },
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                    },
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        assert!(matches!(
+            &authorize.effect,
+            ControlEffect::AuthorizeResume {
+                target: ResumeAuthorityTarget::ProviderSession { identity: requested },
+                ..
+            } if requested == &identity
+        ));
+        assert_eq!(engine.snapshot().sessions[0].provider.session, None);
+        assert_eq!(
+            engine.snapshot().sessions[0].status,
+            SessionStatus::Registered
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id: "wrong-provider-session".to_owned(),
+                    transcript_path: None,
+                },
+            },
+        });
+        assert!(engine.drain_effects().is_empty());
+        assert_eq!(
+            engine.snapshot().sessions[0].status,
+            SessionStatus::Registered
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: identity.clone(),
+            },
+        });
+        let spawn = engine.drain_effects().pop().unwrap();
+        assert_eq!(spawn.generation, SessionGeneration(1));
+        assert!(matches!(
+            spawn.effect,
+            ControlEffect::SpawnResume {
+                provider_session,
+                ..
+            } if provider_session == identity
+        ));
     }
 
     #[test]

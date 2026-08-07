@@ -5,9 +5,10 @@ use uzor_tui::{
 use gate4agent_node_protocol::{GitSnapshot, WorkspaceEntryKind, WorkspaceInspection};
 
 use crate::app::{
-    AddSpaceField, App, ConnectionState, ControlSection, CreateWorktreeField, DragState, Focus,
-    GridAxisKind, GridPaneLayout, GridPreset, HitRegion, HitTarget, LayoutRects, MenuPlacement,
-    NodeView, PtyColorMode, RosterMode, SessionView, SidebarMode, SurfaceMode, WorkspaceView,
+    managed_state_label, AddSpaceField, AgentRowKey, App, ConnectionState, ControlSection,
+    CreateWorktreeField, DragState, Focus, GridAxisKind, GridPaneLayout, GridPreset, HitRegion,
+    HitTarget, LayoutRects, MenuPlacement, NodeView, PtyColorMode, RosterMode, SessionView,
+    SidebarMode, SidebarPresentation, SurfaceMode, WorkspaceView,
 };
 use crate::pty_palette::{apply_pty_palette, GATE_FG, TERM_BG};
 
@@ -94,46 +95,81 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     Paragraph::new("")
         .style(Style::default().fg(theme.text).bg(theme.surface))
         .render(area, buf);
-    let (sidebar_content, spaces, agents, right_area) = if app.menu_placement == MenuPlacement::Sidebar {
-        let sidebar_width = app
-            .sidebar_width
-            .clamp(18, area.width.saturating_sub(24));
-        let columns = split(
-            area,
-            Direction::Horizontal,
-            &[Constraint::Fixed(sidebar_width), Constraint::Min(1)],
-        );
-        let sidebar_content = Rect::new(
-            columns[0].x,
-            columns[0].y,
-            columns[0].width.saturating_sub(1),
-            columns[0].height,
-        );
-        let split_percent = app.sidebar_split_percent.clamp(20, 80) as u32;
-        let top_height = ((sidebar_content.height as u32 * split_percent) / 100) as u16;
-        let top_height = top_height.clamp(3, sidebar_content.height.saturating_sub(3));
-        let spaces = Rect::new(
-            sidebar_content.x,
-            sidebar_content.y,
-            sidebar_content.width,
-            top_height,
-        );
-        let agents = Rect::new(
-            sidebar_content.x,
-            sidebar_content.y + top_height,
-            sidebar_content.width,
-            sidebar_content.height.saturating_sub(top_height),
-        );
-        (sidebar_content, spaces, agents, columns[1])
-    } else {
-        (Rect::default(), Rect::default(), Rect::default(), area)
-    };
+    let (activity_rail, sidebar_content, spaces, agents, right_area) =
+        match (app.menu_placement, app.sidebar_presentation) {
+            (MenuPlacement::Sidebar, SidebarPresentation::Split) => {
+                let sidebar_width = app.sidebar_width.clamp(18, area.width.saturating_sub(24));
+                let columns = split(
+                    area,
+                    Direction::Horizontal,
+                    &[Constraint::Fixed(sidebar_width), Constraint::Min(1)],
+                );
+                let sidebar_content = Rect::new(
+                    columns[0].x,
+                    columns[0].y,
+                    columns[0].width.saturating_sub(1),
+                    columns[0].height,
+                );
+                let split_percent = app.sidebar_split_percent.clamp(20, 80) as u32;
+                let top_height = ((sidebar_content.height as u32 * split_percent) / 100) as u16;
+                let top_height = top_height.clamp(3, sidebar_content.height.saturating_sub(3));
+                let spaces = Rect::new(
+                    sidebar_content.x,
+                    sidebar_content.y,
+                    sidebar_content.width,
+                    top_height,
+                );
+                let agents = Rect::new(
+                    sidebar_content.x,
+                    sidebar_content.y + top_height,
+                    sidebar_content.width,
+                    sidebar_content.height.saturating_sub(top_height),
+                );
+                (Rect::default(), sidebar_content, spaces, agents, columns[1])
+            }
+            (MenuPlacement::Sidebar, SidebarPresentation::Activity) => {
+                let rail_width = 3_u16.min(area.width.saturating_sub(1));
+                let content_width = if app.sidebar_collapsed {
+                    0
+                } else {
+                    app.sidebar_width.clamp(18, area.width.saturating_sub(rail_width + 24))
+                };
+                let total_width = rail_width.saturating_add(content_width);
+                let right_area = Rect::new(
+                    area.x + total_width,
+                    area.y,
+                    area.width.saturating_sub(total_width),
+                    area.height,
+                );
+                let rail = Rect::new(area.x, area.y, rail_width, area.height);
+                let content = Rect::new(area.x + rail_width, area.y, content_width, area.height);
+                let spaces = if matches!(app.control_section, ControlSection::Files | ControlSection::Git) {
+                    content
+                } else {
+                    Rect::default()
+                };
+                let agents = if matches!(app.control_section, ControlSection::Agents | ControlSection::Workspaces) {
+                    content
+                } else {
+                    Rect::default()
+                };
+                (rail, content, spaces, agents, right_area)
+            }
+            (MenuPlacement::Modal, _) => (
+                Rect::default(),
+                Rect::default(),
+                Rect::default(),
+                Rect::default(),
+                area,
+            ),
+        };
     let right = split(
         right_area,
         Direction::Vertical,
         &[Constraint::Fixed(1), Constraint::Min(1)],
     );
     let mut layout = LayoutRects {
+        activity_rail,
         spaces,
         agents,
         tabs: right[0],
@@ -146,7 +182,9 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         hits: Vec::new(),
     };
 
-    if app.menu_placement == MenuPlacement::Sidebar {
+    if app.menu_placement == MenuPlacement::Sidebar
+        && app.sidebar_presentation == SidebarPresentation::Split
+    {
         Paragraph::new("")
             .style(Style::default().bg(theme.panel))
             .render(sidebar_content, buf);
@@ -166,6 +204,38 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
             rect: Rect::new(agents.x, agents.y, agents.width, 1),
             target: HitTarget::SidebarSplitDrag,
         });
+    } else if app.menu_placement == MenuPlacement::Sidebar {
+        render_activity_rail(app, activity_rail, buf, &mut layout, theme);
+        if !app.sidebar_collapsed && sidebar_content.width > 0 {
+            Paragraph::new("")
+                .style(Style::default().bg(theme.panel))
+                .render(sidebar_content, buf);
+            match app.control_section {
+                ControlSection::Files => {
+                    render_workspace_files(app, spaces, buf, &mut layout, theme)
+                }
+                ControlSection::Git => {
+                    render_workspace_git(app, spaces, buf, &mut layout, theme)
+                }
+                ControlSection::Agents => {
+                    render_agent_list(app, agents, buf, &mut layout, theme)
+                }
+                ControlSection::Workspaces => {
+                    render_space_list(app, agents, buf, &mut layout, theme)
+                }
+                ControlSection::Settings => {}
+            }
+            let divider_x = sidebar_content.right().saturating_sub(1);
+            for y in sidebar_content.y..sidebar_content.bottom() {
+                let cell = buf.get_mut(divider_x, y);
+                cell.symbol = "│".into();
+                cell.style = Style::default().fg(theme.border).bg(theme.panel);
+            }
+            layout.hits.push(HitRegion {
+                rect: Rect::new(divider_x, sidebar_content.y, 1, sidebar_content.height),
+                target: HitTarget::SidebarWidthDrag,
+            });
+        }
     }
     render_tabs(app, right[0], buf, &mut layout, theme);
     render_surface(app, right[1], buf, &mut layout, theme);
@@ -182,6 +252,12 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     if app.focus == Focus::RemoveWorktree {
         render_remove_worktree(app, area, buf, theme);
     }
+    if app.focus == Focus::RenameSession {
+        render_rename_session(app, area, buf, theme);
+    }
+    if app.focus == Focus::ForgetSession {
+        render_forget_session(app, area, buf, theme);
+    }
     if app.focus == Focus::Settings {
         render_settings(app, area, buf, &mut layout, theme);
     }
@@ -190,6 +266,60 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         render_notice(notice, right[1], buf, theme);
     }
     layout
+}
+
+fn render_activity_rail(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    fill_rect(area, theme.panel, buf);
+    let sections = [
+        (ControlSection::Files, "F"),
+        (ControlSection::Git, "G"),
+        (ControlSection::Agents, "A"),
+        (ControlSection::Workspaces, "W"),
+    ];
+    for (index, (section, label)) in sections.into_iter().enumerate() {
+        let y = area.y.saturating_add(index as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        let selected = app.control_section == section && !app.sidebar_collapsed;
+        let row = Rect::new(area.x, y, area.width, 1);
+        Paragraph::new(centered_label(label, area.width as usize))
+            .style(
+                Style::default()
+                    .fg(if selected { theme.active_tab_text } else { theme.muted })
+                    .bg(if selected { theme.accent } else { theme.panel })
+                    .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+            )
+            .render(row, buf);
+        layout.hits.push(HitRegion {
+            rect: row,
+            target: HitTarget::ActivitySection(section),
+        });
+    }
+    if area.height >= 2 {
+        let collapse = Rect::new(area.x, area.bottom() - 2, area.width, 1);
+        Paragraph::new(centered_label(if app.sidebar_collapsed { ">" } else { "<" }, area.width as usize))
+            .style(Style::default().fg(theme.dim).bg(theme.panel))
+            .render(collapse, buf);
+        layout.hits.push(HitRegion { rect: collapse, target: HitTarget::SidebarCollapse });
+        let settings = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        Paragraph::new(centered_label("S", area.width as usize))
+            .style(Style::default().fg(theme.muted).bg(theme.panel))
+            .render(settings, buf);
+        layout.hits.push(HitRegion {
+            rect: settings,
+            target: HitTarget::ActivitySection(ControlSection::Settings),
+        });
+    }
 }
 
 fn render_inspector(
@@ -622,12 +752,12 @@ fn render_agent_list(
         target: HitTarget::AddAgent,
     });
 
-    let addresses = app.agent_addresses();
+    let rows = app.agent_rows();
     let capacity = area.height.saturating_sub(1) as usize / 2;
     let start = app
         .agents_scroll
-        .min(addresses.len().saturating_sub(capacity));
-    for (visible_index, (index, address)) in addresses
+        .min(rows.len().saturating_sub(capacity));
+    for (visible_index, (index, key)) in rows
         .iter()
         .enumerate()
         .skip(start)
@@ -635,22 +765,63 @@ fn render_agent_list(
         .enumerate()
     {
         let y = area.y + 1 + visible_index as u16 * 2;
-        let Some(session) = app.find_session(address) else {
-            continue;
-        };
         let selected = index == app.selected_agent;
         let background = if selected { theme.active } else { theme.panel };
-        let (marker, color, status) = session_state(session, theme);
+        let (title, marker, color, secondary) = match key {
+            AgentRowKey::Managed { .. } => {
+                let Some(record) = app.find_managed_session(key) else {
+                    continue;
+                };
+                let active = record
+                    .active_session
+                    .as_ref()
+                    .and_then(|address| app.find_session(address));
+                let (marker, color, state) = if record.state
+                    == gate4agent_node_protocol::ManagedSessionState::Live
+                {
+                    active
+                        .map(|session| session_state(session, theme))
+                        .unwrap_or_else(|| managed_session_state(record.state, theme))
+                } else {
+                    managed_session_state(record.state, theme)
+                };
+                let state = if record.mode == gate4agent_node_protocol::SessionMode::Inline {
+                    format!("{state} inline")
+                } else {
+                    state.to_owned()
+                };
+                (
+                    record.short_title().to_owned(),
+                    marker,
+                    color,
+                    format!(
+                        "{state} | {} | {} | {}",
+                        record.provider, record.workspace_id, record.node_id
+                    ),
+                )
+            }
+            AgentRowKey::Legacy(address) => {
+                let Some(session) = app.find_session(address) else {
+                    continue;
+                };
+                let (marker, color, status) = session_state(session, theme);
+                (
+                    session.short_title(),
+                    marker,
+                    color,
+                    format!("{status} | {} | {}", address.workspace_id, address.node_id),
+                )
+            }
+        };
         Paragraph::new(Text::from_lines(vec![Line::from_spans(vec![
             Span::styled(format!(" {marker} "), Style::default().fg(color)),
             Span::styled(
-                truncate_cells(&session.short_title(), area.width.saturating_sub(3) as usize),
+                truncate_cells(&title, area.width.saturating_sub(3) as usize),
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
         ])]))
         .style(Style::default().bg(background))
         .render(Rect::new(area.x, y, area.width, 1), buf);
-        let secondary = format!("{status} · {} · {}", address.workspace_id, address.node_id);
         Paragraph::new(format!(
             "   {}",
             compact_middle_cells(&secondary, area.width.saturating_sub(3) as usize)
@@ -665,6 +836,19 @@ fn render_agent_list(
             rect: Rect::new(area.x, y, area.width, 2),
             target: HitTarget::Agent(index),
         });
+    }
+}
+
+fn managed_session_state(
+    state: gate4agent_node_protocol::ManagedSessionState,
+    theme: Theme,
+) -> (&'static str, Color, &'static str) {
+    use gate4agent_node_protocol::ManagedSessionState;
+    match state {
+        ManagedSessionState::Live => ("*", theme.green, managed_state_label(state)),
+        ManagedSessionState::IdentityPending => ("~", theme.yellow, managed_state_label(state)),
+        ManagedSessionState::Dormant => ("o", theme.teal, managed_state_label(state)),
+        ManagedSessionState::Unavailable => ("x", theme.red, managed_state_label(state)),
     }
 }
 
@@ -689,8 +873,7 @@ fn render_tabs(
         .tabs
         .iter()
         .map(|tab| {
-            app.find_session(&tab.address)
-                .map(|session| session.short_title())
+            app.session_title(&tab.address)
                 .unwrap_or_else(|| format!("detached #{}", tab.address.instance_id))
         })
         .collect::<Vec<_>>();
@@ -927,8 +1110,7 @@ fn render_grid(
             if let Some(pane) = app.grid.panes.get(slot) {
                 let selected = app.grid.focused == slot;
                 let label = app
-                    .find_session(&pane.address)
-                    .map(|session| session.short_title())
+                    .session_title(&pane.address)
                     .unwrap_or_else(|| format!("detached #{}", pane.address.instance_id));
                 Paragraph::new(format!(" {label} "))
                     .style(
@@ -1201,6 +1383,68 @@ fn render_remove_worktree(app: &App, area: Rect, buf: &mut TerminalBuffer, theme
     .render(modal, buf);
 }
 
+fn render_rename_session(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    let Some(dialog) = &app.rename_session else {
+        return;
+    };
+    let width = 58.min(area.width.saturating_sub(4));
+    let height = 7.min(area.height.saturating_sub(2));
+    let modal = centered(area, width, height);
+    fill_rect(modal, theme.modal, buf);
+    Paragraph::new(Text::from_lines(vec![
+        Line::styled(
+            format!("{} / {}", dialog.node_id, dialog.record_id),
+            Style::default().fg(theme.muted),
+        ),
+        Line::styled(
+            format!("> {}", dialog.display_name),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled("Enter rename | Esc cancel", Style::default().fg(theme.muted)),
+    ]))
+    .block(
+        Block::bordered()
+            .title(" rename session ")
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(theme.modal)),
+    )
+    .style(Style::default().fg(theme.text).bg(theme.modal))
+    .render(modal, buf);
+}
+
+fn render_forget_session(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    let Some(dialog) = &app.forget_session else {
+        return;
+    };
+    let width = 62.min(area.width.saturating_sub(4));
+    let height = 8.min(area.height.saturating_sub(2));
+    let modal = centered(area, width, height);
+    fill_rect(modal, theme.modal, buf);
+    Paragraph::new(Text::from_lines(vec![
+        Line::styled(
+            dialog.display_name.clone(),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            format!("{} / {}", dialog.node_id, dialog.record_id),
+            Style::default().fg(theme.dim),
+        ),
+        Line::styled(
+            "Only the Gate4Agent record is removed; provider history stays intact.",
+            Style::default().fg(theme.yellow),
+        ),
+        Line::styled("Enter/y forget | n/Esc cancel", Style::default().fg(theme.muted)),
+    ]))
+    .block(
+        Block::bordered()
+            .title(" forget dormant session ")
+            .border_style(Style::default().fg(theme.red))
+            .style(Style::default().bg(theme.modal)),
+    )
+    .style(Style::default().fg(theme.text).bg(theme.modal))
+    .render(modal, buf);
+}
+
 fn render_settings(
     app: &App,
     area: Rect,
@@ -1350,18 +1594,27 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
             }
         }
         ControlSection::Agents => {
-            let addresses = app.agent_addresses();
-            let width = addresses
+            let rows = app.agent_rows();
+            let width = rows
                 .iter()
-                .filter_map(|address| app.find_session(address))
-                .map(|session| {
-                    cell_width(&session.short_title())
-                        .max(cell_width(&session.address.workspace_id) + cell_width(&session.address.node_id) + 7)
-                        + 3
+                .map(|key| {
+                    if let Some(record) = app.find_managed_session(key) {
+                        return cell_width(record.short_title())
+                            .max(cell_width(&record.workspace_id) + cell_width(&record.node_id) + 10)
+                            + 3;
+                    }
+                    let Some(address) = app.agent_row_active_address(key) else {
+                        return 24;
+                    };
+                    app.find_session(&address).map_or(24, |session| {
+                        cell_width(&session.short_title())
+                            .max(cell_width(&session.address.workspace_id) + cell_width(&session.address.node_id) + 7)
+                            + 3
+                    })
                 })
                 .max()
                 .unwrap_or(24);
-            (width, addresses.len().saturating_mul(2).saturating_add(1))
+            (width, rows.len().saturating_mul(2).saturating_add(1))
         }
         ControlSection::Workspaces => {
             let rows = app.space_rows();
@@ -1378,7 +1631,7 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
                 .unwrap_or(24);
             (width, rows.len().saturating_mul(2).saturating_add(1))
         }
-        ControlSection::Settings => (30, 3),
+        ControlSection::Settings => (40, 5),
     };
     let width = tab_width.max(content_width).saturating_add(2).clamp(44, 96);
     let height = content_rows.saturating_add(3).clamp(7, 30);
@@ -1435,6 +1688,38 @@ fn render_settings_controls(
     layout.hits.push(HitRegion {
         rect: Rect::new(area.x, area.y + 1, placement_width, 1),
         target: HitTarget::SettingsPlacement,
+    });
+    if area.height < 3 {
+        return;
+    }
+    let presentation_text = if app.sidebar_presentation == SidebarPresentation::Split {
+        " sidebar [split]|activity "
+    } else {
+        " sidebar split|[activity] "
+    };
+    let presentation_width = (cell_width(presentation_text) as u16).min(area.width);
+    Paragraph::new(presentation_text)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(Rect::new(area.x, area.y + 2, presentation_width, 1), buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(area.x, area.y + 2, presentation_width, 1),
+        target: HitTarget::SettingsPresentation,
+    });
+    if area.height < 4 {
+        return;
+    }
+    let collapsed_text = if app.sidebar_collapsed {
+        " panel shown|[collapsed] "
+    } else {
+        " panel [shown]|collapsed "
+    };
+    let collapsed_width = (cell_width(collapsed_text) as u16).min(area.width);
+    Paragraph::new(collapsed_text)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(Rect::new(area.x, area.y + 3, collapsed_width, 1), buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(area.x, area.y + 3, collapsed_width, 1),
+        target: HitTarget::SettingsSidebarCollapsed,
     });
 }
 
@@ -1498,8 +1783,7 @@ fn render_drag_preview(
     }
 
     let title = app
-        .find_session(address)
-        .map(|session| session.short_title())
+        .session_title(address)
         .unwrap_or_else(|| format!("detached #{}", address.instance_id));
     let label = format!(" {title} ");
     let width = (cell_width(&label) as u16).min(area.width);
@@ -1770,12 +2054,13 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        GitCommitSummary, GitStatusEntry, GitWorktreeSnapshot, WorkspaceEntry, WorkspaceId,
+        GitCommitSummary, GitStatusEntry, GitWorktreeSnapshot, ManagedSessionState, SessionMode,
+        WorkspaceEntry, WorkspaceId,
     };
     use gate4agent_types::TerminalMouseProtocolEncoding;
     use crate::app::{
-        DragSource, NodeView, Provider, ProviderInventory, SessionAddress, SessionTab,
-        SessionView, WorkspaceView,
+        DragSource, ManagedSessionView, NodeView, Provider, ProviderInventory, SessionAddress,
+        SessionTab, SessionView, WorkspaceView,
     };
 
     fn fixture(mode: PtyColorMode) -> App {
@@ -1793,6 +2078,7 @@ mod tests {
             connection: ConnectionState::Connected,
             controller_owned: true,
             event_sequence: 1,
+            session_records: Vec::new(),
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
@@ -2339,5 +2625,93 @@ mod tests {
         );
         assert_eq!(segments[0].0, 7);
         assert_eq!(segments.last().unwrap().0 + segments.last().unwrap().1, 48);
+    }
+
+    #[test]
+    fn managed_session_states_render_in_sidebar_and_modal_from_the_same_rows() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let states = [
+            ("pending", ManagedSessionState::IdentityPending),
+            ("live", ManagedSessionState::Live),
+            ("dormant", ManagedSessionState::Dormant),
+            ("unavailable", ManagedSessionState::Unavailable),
+        ];
+        let live_address = app.tabs[0].address.clone();
+        for (name, state) in states {
+            app.nodes[0].session_records.push(ManagedSessionView {
+                node_id: "node-a".to_owned(),
+                record_id: format!("record-{name}"),
+                display_name: format!("{name} session"),
+                provider: Provider::Codex,
+                mode: SessionMode::Pty,
+                state,
+                workspace_id: "workspace-a".to_owned(),
+                canonical_root: r"C:\work\nemo".to_owned(),
+                has_provider_session_identity: state != ManagedSessionState::IdentityPending,
+                active_session: matches!(
+                    state,
+                    ManagedSessionState::Live | ManagedSessionState::IdentityPending
+                )
+                    .then_some(live_address.clone()),
+                last_error: (state == ManagedSessionState::Unavailable)
+                    .then_some("workspace missing".to_owned()),
+            });
+        }
+        let mut sidebar = TerminalBuffer::new(100, 24);
+        let sidebar_layout = render(&app, &mut sidebar);
+        assert_eq!(
+            sidebar_layout
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit.target, HitTarget::Agent(_)))
+                .count(),
+            4
+        );
+        let sidebar_text = (0..sidebar.height())
+            .flat_map(|row| (0..sidebar.width()).map(move |column| (column, row)))
+            .map(|(column, row)| sidebar.get(column, row).symbol.as_str())
+            .collect::<String>();
+        assert!(sidebar_text.contains("identity"));
+
+        app.menu_placement = MenuPlacement::Modal;
+        app.focus = Focus::Settings;
+        app.control_section = ControlSection::Agents;
+        app.control_modal_size = Some((70, 18));
+        let mut modal = TerminalBuffer::new(100, 24);
+        let modal_layout = render(&app, &mut modal);
+        assert_eq!(
+            modal_layout
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit.target, HitTarget::Agent(_)))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn activity_rail_keeps_controls_when_selected_sidebar_is_collapsed() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.control_section = ControlSection::Agents;
+        let mut expanded = TerminalBuffer::new(100, 24);
+        let expanded_layout = render(&app, &mut expanded);
+        assert_eq!(expanded_layout.activity_rail.width, 3);
+        assert!(expanded_layout.agents.width > 0);
+        assert!(ControlSection::ALL.iter().take(4).all(|section| expanded_layout
+            .hits
+            .iter()
+            .any(|hit| hit.target == HitTarget::ActivitySection(*section))));
+
+        app.sidebar_collapsed = true;
+        let mut collapsed = TerminalBuffer::new(100, 24);
+        let collapsed_layout = render(&app, &mut collapsed);
+        assert_eq!(collapsed_layout.activity_rail.width, 3);
+        assert_eq!(collapsed_layout.agents.width, 0);
+        assert_eq!(collapsed_layout.tabs.x, 3);
+        assert!(collapsed_layout
+            .hits
+            .iter()
+            .any(|hit| hit.target == HitTarget::SidebarCollapse));
     }
 }

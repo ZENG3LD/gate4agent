@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 crossterm = "0.28"
+gate4agent-c2-client = { path = "../gate4agent-c2-client" }
+gate4agent-c2-protocol = { path = "../gate4agent-c2-protocol" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
 gate4agent-node-wire = { path = "../gate4agent-node-wire" }
 gate4agent-types = { path = "../gate4agent-types" }

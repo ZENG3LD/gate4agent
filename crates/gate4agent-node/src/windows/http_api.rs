@@ -18,6 +18,7 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HTTP_CONNECTIONS: usize = 16;
 const RESPONSE_BODY_LIMIT_BYTES: usize = MAX_NODE_FRAME_BYTES;
+const PUBLIC_PERSISTENCE_ERROR: &str = "durable-state-unavailable";
 
 pub(super) async fn run(
     listen: Option<SocketAddr>,
@@ -133,13 +134,15 @@ fn ready_body(shared: &NodeShared) -> Value {
         .map(|workspace| workspace.sessions.len())
         .sum::<usize>();
     let shutting_down = shared.shutdown.load(Ordering::Acquire);
+    let persistence_error = shared.persistence_error();
     json!({
-        "ready": !shutting_down,
+        "ready": !shutting_down && persistence_error.is_none(),
         "node_id": shared.node_id,
         "counts": {
             "providers": snapshot.enabled_providers.len(),
             "workspaces": workspace_count,
             "sessions": session_count,
+            "session_records": snapshot.session_records.len(),
         },
         "capabilities": {
             "named_pipe_control": true,
@@ -147,6 +150,7 @@ fn ready_body(shared: &NodeShared) -> Value {
             "http_mutations": false,
         },
         "shutdown": shutting_down,
+        "persistence_error": persistence_error.map(|_| PUBLIC_PERSISTENCE_ERROR),
     })
 }
 
@@ -159,6 +163,7 @@ fn status_body(shared: &NodeShared) -> Value {
         "shutdown": shared.shutdown.load(Ordering::Acquire),
         "pid": std::process::id(),
         "version": env!("CARGO_PKG_VERSION"),
+        "persistence_error": shared.persistence_error(),
     })
 }
 
@@ -388,6 +393,15 @@ mod tests {
         assert!(ready.contains("\"ready\":true"));
         assert!(ready.contains("\"workspaces\":1"));
 
+        shared.set_persistence_error(Some(
+            r"provider secret at C:\private\state-v1.json".to_owned(),
+        ));
+        let degraded = request(address, "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(degraded.contains("\"ready\":false"));
+        assert!(degraded.contains("\"persistence_error\":\"durable-state-unavailable\""));
+        assert!(!degraded.contains("provider secret"));
+        assert!(!degraded.contains(r"C:\private"));
+
         let unauthorized = request(address, "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(!unauthorized.contains("test-token"));
@@ -402,6 +416,9 @@ mod tests {
         assert!(authorized.contains("\"controller_active\":false"));
         assert!(authorized.contains("\"node_id\":\"test-node\""));
         assert!(authorized.contains(&format!("\"incarnation_id\":\"{incarnation_id}\"")));
+        assert!(authorized.contains("\"persistence_error\":\"durable-state-commit-failed\""));
+        assert!(!authorized.contains("provider secret"));
+        assert!(!authorized.contains(r"C:\private"));
         assert!(!authorized.contains("test-token"));
 
         server.shutdown_handle().request_shutdown().await.unwrap();

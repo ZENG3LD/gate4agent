@@ -12,10 +12,19 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use gate4agent_c2_client::{
+    connect_local as connect_c2_local, C2ControlError, C2ControlHandle,
+};
+use gate4agent_c2_protocol::{
+    C2ControlEvent, C2ControlEventKind, C2ManagedSessionRecord, C2NodeEvent, C2NodeResponse,
+    C2NodeSnapshot, C2SessionSnapshot, C2SessionStatus, C2Topology, NodeRoute,
+    NodeTransportState, C2WorkspaceInspection,
+};
 use gate4agent_node_protocol::{
-    AgentProvider, ClientRole, ControllerState, NodeEvent, NodeFailureCode, NodeId, NodeRequest,
-    NodeResponse, NodeSnapshot, SessionAddress as WireSessionAddress, SessionKey, SessionMode,
-    WorkspaceId, MAX_CONTROLLER_LEASE_MS, MAX_NODE_TEXT_BYTES,
+    AgentProvider, ClientRole, ControllerState, ManagedSessionRecord, NodeEvent, NodeFailureCode,
+    NodeId, NodeRequest, NodeResponse, NodeSnapshot, SessionAddress as WireSessionAddress,
+    SessionKey, SessionMode, SessionRecordId, WorkspaceId, MAX_CONTROLLER_LEASE_MS,
+    MAX_NODE_TEXT_BYTES,
 };
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
 use gate4agent_types::{
@@ -28,13 +37,15 @@ use uzor_tui::{Backend, CrosstermBackend, Screen};
 
 use crate::app::{
     App, AppAction, ConnectionState, NodeView, Provider, ProviderInventory, PtyColorMode,
-    SessionAddress, SessionView, UiKey, WorkspaceView,
+    ManagedSessionView, SessionAddress, SessionView, UiKey, WorkspaceView,
 };
+use crate::diagnostics::RuntimeDiagnostic;
 use crate::preferences::{self, UiPreferences};
 use crate::render;
 
 const COMMAND_QUEUE: usize = 64;
 const UPDATE_QUEUE: usize = 256;
+const C2_COMMAND_ROUTE: &str = "\0c2";
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
 const LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
@@ -59,6 +70,12 @@ pub struct NodeEndpoint {
 }
 
 #[derive(Clone)]
+pub struct C2Endpoint {
+    pub endpoint: String,
+    pub token: String,
+}
+
+#[derive(Clone)]
 pub struct StartupRequest {
     pub node_id: NodeId,
     pub workspace_id: WorkspaceId,
@@ -68,6 +85,7 @@ pub struct StartupRequest {
 #[derive(Clone)]
 pub struct RunOptions {
     pub nodes: Vec<NodeEndpoint>,
+    pub c2: Option<C2Endpoint>,
     pub startup: Option<StartupRequest>,
     pub color_mode_override: Option<PtyColorMode>,
 }
@@ -78,12 +96,27 @@ enum WorkerUpdate {
         endpoint: String,
         state: ConnectionState,
     },
+    TopologyNodeRemoved {
+        node_id: String,
+    },
     Snapshot {
         expected_node_id: String,
         endpoint: String,
         snapshot: NodeSnapshot,
         controller_owned: bool,
         event_sequence: u64,
+    },
+    C2Snapshot {
+        expected_node_id: String,
+        endpoint: String,
+        incarnation_id: gate4agent_c2_protocol::NodeIncarnationId,
+        snapshot: C2NodeSnapshot,
+        event_sequence: u64,
+    },
+    C2Event {
+        node_id: String,
+        cursor: gate4agent_c2_protocol::NodeCursor,
+        event: C2EventUpdate,
     },
     OpenSession(SessionAddress),
     SelectWorkspace { node_id: String, workspace_id: String },
@@ -96,7 +129,52 @@ enum WorkerUpdate {
         workspace_id: String,
         message: String,
     },
+    SessionRecordUpserted(ManagedSessionView),
+    SessionRecordRemoved { node_id: String, record_id: String },
     Notice(String),
+}
+
+enum C2EventUpdate {
+    SessionRecordUpserted(ManagedSessionView),
+    SessionRecordRemoved { record_id: String },
+    Notice(String),
+    ResyncRequired,
+    Ignored,
+}
+
+#[derive(Default)]
+struct C2ApplyState {
+    watermarks: BTreeMap<String, gate4agent_c2_protocol::NodeCursor>,
+}
+
+impl C2ApplyState {
+    fn accept_snapshot(
+        &mut self,
+        node_id: &str,
+        cursor: gate4agent_c2_protocol::NodeCursor,
+    ) -> bool {
+        if self.watermarks.get(node_id).is_some_and(|current| {
+            current.incarnation_id == cursor.incarnation_id && cursor.sequence < current.sequence
+        }) {
+            return false;
+        }
+        self.watermarks.insert(node_id.to_owned(), cursor);
+        true
+    }
+
+    fn accept_event(
+        &mut self,
+        node_id: &str,
+        cursor: gate4agent_c2_protocol::NodeCursor,
+    ) -> bool {
+        if self.watermarks.get(node_id).is_some_and(|current| {
+            current.incarnation_id == cursor.incarnation_id && cursor.sequence <= current.sequence
+        }) {
+            return false;
+        }
+        self.watermarks.insert(node_id.to_owned(), cursor);
+        true
+    }
 }
 
 struct PendingRaw {
@@ -133,13 +211,19 @@ impl Drop for TerminalGuard {
 }
 
 pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
-    if options.nodes.is_empty() {
-        return Err("at least one explicit node endpoint is required".into());
+    let RunOptions { nodes, c2, startup, color_mode_override } = options;
+    if nodes.is_empty() == c2.is_none() {
+        return Err("configure exactly one direct-node set or one C2 control endpoint".into());
     }
     let preferences_path = preferences::default_path();
-    let loaded_preferences = preferences_path
-        .as_deref()
-        .and_then(|path| UiPreferences::load(path).ok());
+    let loaded_preferences = preferences_path.as_deref().and_then(|path| match UiPreferences::load(path) {
+        Ok(preferences) => Some(preferences),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => {
+            crate::diagnostics::record_runtime(RuntimeDiagnostic::PreferencesLoadFailed);
+            None
+        }
+    });
     let initial_preferences = loaded_preferences.clone().unwrap_or_default();
     let _guard = TerminalGuard::enter()?;
     let (cols, rows) = terminal::size()?;
@@ -151,37 +235,49 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut commands = BTreeMap::new();
     let mut inspection_commands = BTreeMap::new();
     let mut app = App::default();
+    let mut c2_apply_state = C2ApplyState::default();
     initial_preferences.apply_to(&mut app);
-    if let Some(color_mode) = options.color_mode_override {
+    if let Some(color_mode) = color_mode_override {
         app.color_mode = color_mode;
     }
     app.terminal_cols = cols;
     app.terminal_rows = rows;
-    for endpoint in options.nodes {
-        let node_id = endpoint.expected_node_id.to_string();
-        app.set_node_connection(&node_id, &endpoint.endpoint, ConnectionState::Connecting);
+    if let Some(endpoint) = c2 {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
-        commands.insert(node_id.clone(), command_tx);
-        let (inspection_tx, inspection_rx) = watch::channel(None);
-        inspection_commands.insert(node_id.clone(), inspection_tx);
-        let startup = options
-            .startup
-            .as_ref()
-            .filter(|startup| startup.node_id == endpoint.expected_node_id)
-            .cloned();
-        let initial_terminal_size = initial_viewport_size(cols, rows);
-        tokio::spawn(inspection_worker(
-            endpoint.clone(),
-            inspection_rx,
-            updates_tx.clone(),
-        ));
-        tokio::spawn(node_worker(
+        commands.insert(C2_COMMAND_ROUTE.to_owned(), command_tx);
+        tokio::spawn(c2_worker(
             endpoint,
             startup,
-            initial_terminal_size,
+            initial_viewport_size(cols, rows),
             command_rx,
             updates_tx.clone(),
         ));
+    } else {
+        for endpoint in nodes {
+            let node_id = endpoint.expected_node_id.to_string();
+            app.set_node_connection(&node_id, &endpoint.endpoint, ConnectionState::Connecting);
+            let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+            commands.insert(node_id.clone(), command_tx);
+            let (inspection_tx, inspection_rx) = watch::channel(None);
+            inspection_commands.insert(node_id.clone(), inspection_tx);
+            let startup = startup
+                .as_ref()
+                .filter(|startup| startup.node_id == endpoint.expected_node_id)
+                .cloned();
+            let initial_terminal_size = initial_viewport_size(cols, rows);
+            tokio::spawn(inspection_worker(
+                endpoint.clone(),
+                inspection_rx,
+                updates_tx.clone(),
+            ));
+            tokio::spawn(node_worker(
+                endpoint,
+                startup,
+                initial_terminal_size,
+                command_rx,
+                updates_tx.clone(),
+            ));
+        }
     }
     drop(updates_tx);
 
@@ -198,7 +294,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut preferences_deadline = None;
     while !app.should_quit {
         while let Ok(update) = updates_rx.try_recv() {
-            apply_update(&mut app, update);
+            apply_update(&mut app, &mut c2_apply_state, update);
         }
         let selected_route = app.selected_workspace_route();
         if selected_route != auto_inspected_route {
@@ -241,8 +337,11 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
         if preferences_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             if persisted_preferences.as_ref() != Some(&observed_preferences) {
                 if let Some(path) = preferences_path.as_deref() {
-                    if observed_preferences.save(path).is_ok() {
-                        persisted_preferences = Some(observed_preferences.clone());
+                    match observed_preferences.save(path) {
+                        Ok(()) => persisted_preferences = Some(observed_preferences.clone()),
+                        Err(_) => crate::diagnostics::record_runtime(
+                            RuntimeDiagnostic::PreferencesSaveFailed,
+                        ),
                     }
                 }
             }
@@ -291,7 +390,9 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let final_preferences = preferences_for_save(&app, preferred_color_mode);
     if persisted_preferences.as_ref() != Some(&final_preferences) {
         if let Some(path) = preferences_path.as_deref() {
-            let _ = final_preferences.save(path);
+            if final_preferences.save(path).is_err() {
+                crate::diagnostics::record_runtime(RuntimeDiagnostic::PreferencesSaveFailed);
+            }
         }
     }
     flush_raw(&mut app, &commands, &mut pending_raw);
@@ -357,24 +458,18 @@ fn send_action(
     action: AppAction,
 ) {
     if let AppAction::InspectWorkspace { node_id, workspace_id } = &action {
-        let Some(sender) = inspection_commands.get(node_id) else {
-            app.fail_workspace_inspection(
-                node_id.clone(),
-                workspace_id.clone(),
-                "inspection channel unavailable".to_owned(),
-            );
+        if let Some(sender) = inspection_commands.get(node_id) {
+            let Ok(workspace_id_value) = WorkspaceId::new(workspace_id.clone()) else {
+                app.fail_workspace_inspection(
+                    node_id.clone(),
+                    workspace_id.clone(),
+                    "invalid workspace ID".to_owned(),
+                );
+                return;
+            };
+            sender.send_replace(Some(workspace_id_value));
             return;
-        };
-        let Ok(workspace_id_value) = WorkspaceId::new(workspace_id.clone()) else {
-            app.fail_workspace_inspection(
-                node_id.clone(),
-                workspace_id.clone(),
-                "invalid workspace ID".to_owned(),
-            );
-            return;
-        };
-        sender.send_replace(Some(workspace_id_value));
-        return;
+        }
     }
     send_operator_action(app, commands, action);
 }
@@ -387,7 +482,10 @@ fn send_operator_action(
     let Some(node_id) = action_node_id(&action).map(str::to_owned) else {
         return;
     };
-    let Some(sender) = commands.get(&node_id) else {
+    let Some(sender) = commands
+        .get(&node_id)
+        .or_else(|| commands.get(C2_COMMAND_ROUTE))
+    else {
         app.notice = Some(format!("unknown node {node_id}"));
         return;
     };
@@ -399,6 +497,9 @@ fn send_operator_action(
 fn action_node_id(action: &AppAction) -> Option<&str> {
     match action {
         AppAction::Spawn { node_id, .. }
+        | AppAction::ResumeSessionRecord { node_id, .. }
+        | AppAction::RenameSessionRecord { node_id, .. }
+        | AppAction::ForgetSessionRecord { node_id, .. }
         | AppAction::RegisterWorkspace { node_id, .. }
         | AppAction::UnregisterWorkspace { node_id, .. }
         | AppAction::CreateWorktree { node_id, .. }
@@ -636,6 +737,558 @@ async fn inspection_worker(
                 pending = None;
             }
         }
+    }
+}
+
+fn project_c2_topology(
+    topology: &C2Topology,
+) -> (BTreeMap<String, NodeRoute>, BTreeMap<String, String>) {
+    let mut routes = BTreeMap::new();
+    let mut endpoints = BTreeMap::new();
+    for node in &topology.nodes {
+        let node_id = node.node_id.to_string();
+        endpoints.insert(node_id.clone(), node.endpoint.clone());
+        if node.transport == NodeTransportState::Online {
+            if let Some(expected_incarnation_id) = node.current_incarnation_id {
+                routes.insert(
+                    node_id,
+                    NodeRoute {
+                        node_id: node.node_id.clone(),
+                        expected_incarnation_id,
+                    },
+                );
+            }
+        }
+    }
+    (routes, endpoints)
+}
+
+async fn reconcile_c2_topology(
+    topology: &C2Topology,
+    routes: &mut BTreeMap<String, NodeRoute>,
+    endpoints: &mut BTreeMap<String, String>,
+    updates: &mpsc::Sender<WorkerUpdate>,
+) -> Vec<NodeRoute> {
+    let (next_routes, next_endpoints) = project_c2_topology(topology);
+    for node_id in endpoints.keys() {
+        if !next_endpoints.contains_key(node_id) {
+            send_update(
+                updates,
+                WorkerUpdate::TopologyNodeRemoved {
+                    node_id: node_id.clone(),
+                },
+            )
+            .await;
+        }
+    }
+    let mut snapshots = Vec::new();
+    for (node_id, endpoint) in &next_endpoints {
+        let route_changed = routes.get(node_id) != next_routes.get(node_id);
+        let endpoint_changed = endpoints.get(node_id) != Some(endpoint);
+        if let Some(route) = next_routes.get(node_id) {
+            if route_changed || endpoint_changed {
+                send_update(
+                    updates,
+                    WorkerUpdate::State {
+                        node_id: node_id.clone(),
+                        endpoint: endpoint.clone(),
+                        state: ConnectionState::Connecting,
+                    },
+                )
+                .await;
+                snapshots.push(route.clone());
+            }
+        } else if route_changed || endpoint_changed || !endpoints.contains_key(node_id) {
+            send_update(
+                updates,
+                WorkerUpdate::State {
+                    node_id: node_id.clone(),
+                    endpoint: endpoint.clone(),
+                    state: ConnectionState::Disconnected("node offline at C2".to_owned()),
+                },
+            )
+            .await;
+        }
+    }
+    *routes = next_routes;
+    *endpoints = next_endpoints;
+    snapshots
+}
+
+async fn dispatch_c2_startup(
+    handle: &C2ControlHandle,
+    routes: &BTreeMap<String, NodeRoute>,
+    endpoints: &BTreeMap<String, String>,
+    startup: &mut Option<StartupRequest>,
+    initial_terminal_size: TerminalSize,
+    updates: &mpsc::Sender<WorkerUpdate>,
+) -> Result<bool, C2ControlError> {
+    let Some(pending) = startup.as_ref() else {
+        return Ok(false);
+    };
+    let Some(route) = routes.get(pending.node_id.as_str()).cloned() else {
+        return Ok(false);
+    };
+    let request = startup.take().expect("checked pending C2 startup request");
+    let action = AppAction::Spawn {
+        node_id: request.node_id.to_string(),
+        workspace_id: request.workspace_id.to_string(),
+        provider: request.provider,
+        rows: initial_terminal_size.rows,
+        cols: initial_terminal_size.columns,
+    };
+    if let Some(node_request) = action_to_request(action) {
+        c2_request_and_publish(handle, route, node_request, updates, endpoints).await?;
+    }
+    Ok(true)
+}
+
+async fn disconnect_c2_nodes(
+    endpoints: &BTreeMap<String, String>,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    reason: &str,
+) {
+    for (node_id, endpoint) in endpoints {
+        send_update(
+            updates,
+            WorkerUpdate::State {
+                node_id: node_id.clone(),
+                endpoint: endpoint.clone(),
+                state: ConnectionState::Disconnected(reason.to_owned()),
+            },
+        )
+        .await;
+    }
+}
+
+async fn c2_worker(
+    endpoint: C2Endpoint,
+    startup: Option<StartupRequest>,
+    initial_terminal_size: TerminalSize,
+    mut commands: mpsc::Receiver<AppAction>,
+    updates: mpsc::Sender<WorkerUpdate>,
+) {
+    let mut startup = startup;
+    let mut last_connect_failure = None;
+    loop {
+        let (handle, mut events) = match connect_c2_local(&endpoint.endpoint, &endpoint.token).await {
+            Ok(connection) => {
+                last_connect_failure = None;
+                connection
+            }
+            Err(error) => {
+                let failure = safe_c2_error(&error);
+                if last_connect_failure.as_deref() != Some(failure.as_str()) {
+                    crate::diagnostics::record_runtime(RuntimeDiagnostic::C2ReconnectFailed);
+                    send_update(
+                        &updates,
+                        WorkerUpdate::Notice(format!(
+                            "C2 control unavailable: {failure}; retrying"
+                        )),
+                    )
+                    .await;
+                    last_connect_failure = Some(failure);
+                }
+                sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        let mut topology = handle.subscribe_topology();
+        let (routed_events_tx, mut routed_events_rx) = mpsc::channel(UPDATE_QUEUE);
+        let event_forwarder = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if routed_events_tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut routes = BTreeMap::new();
+        let mut node_endpoints = BTreeMap::new();
+        let initial_topology = topology.borrow_and_update().clone();
+        let initial_routes = reconcile_c2_topology(
+            initial_topology.as_ref(),
+            &mut routes,
+            &mut node_endpoints,
+            &updates,
+        )
+        .await;
+        let mut transport_failed = false;
+        for route in initial_routes {
+            if c2_request_and_publish(
+                &handle,
+                route,
+                NodeRequest::Snapshot,
+                &updates,
+                &node_endpoints,
+            )
+            .await.is_err() {
+                crate::diagnostics::record_runtime(RuntimeDiagnostic::C2InitialSnapshotFailed);
+                transport_failed = true;
+                break;
+            }
+        }
+        if transport_failed {
+            event_forwarder.abort();
+            disconnect_c2_nodes(&node_endpoints, &updates, "C2 control disconnected").await;
+            sleep(RECONNECT_DELAY).await;
+            continue;
+        }
+        let startup_dispatched = match dispatch_c2_startup(
+            &handle,
+            &routes,
+            &node_endpoints,
+            &mut startup,
+            initial_terminal_size,
+            &updates,
+        )
+        .await
+        {
+            Ok(dispatched) => dispatched,
+            Err(_) => {
+                crate::diagnostics::record_runtime(RuntimeDiagnostic::C2StartupFailed);
+                event_forwarder.abort();
+                disconnect_c2_nodes(
+                    &node_endpoints,
+                    &updates,
+                    "C2 control disconnected",
+                )
+                .await;
+                sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        if !startup_dispatched {
+            if let Some(request) = startup.as_ref() {
+                send_update(
+                    &updates,
+                    WorkerUpdate::Notice(format!(
+                        "{}: startup waits for the node to become online at C2",
+                        request.node_id
+                    )),
+                )
+                .await;
+            }
+        }
+
+        let mut snapshot_tick = tokio::time::interval(SNAPSHOT_INTERVAL);
+        snapshot_tick.reset();
+        let _failure = 'connected: loop {
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else { return; };
+                    let Some(node_id) = action_node_id(&command).map(str::to_owned) else { continue; };
+                    let Some(route) = routes.get(&node_id).cloned() else {
+                        send_update(&updates, WorkerUpdate::Notice(format!("{node_id}: node offline at C2"))).await;
+                        continue;
+                    };
+                    let requests = match command {
+                        AppAction::Paste { address, text } => utf8_chunks(&text, MAX_NODE_TEXT_BYTES)
+                            .into_iter()
+                            .map(|chunk| NodeRequest::Paste {
+                                session: wire_address(&address).expect("validated TUI session address"),
+                                text: chunk.to_owned(),
+                            })
+                            .collect::<Vec<_>>(),
+                        command => action_to_request(command).into_iter().collect(),
+                    };
+                    for request in requests {
+                        if let Err(error) = c2_request_and_publish(
+                            &handle,
+                            route.clone(),
+                            request,
+                            &updates,
+                            &node_endpoints,
+                        ).await {
+                            break 'connected safe_c2_error(&error);
+                        }
+                    }
+                }
+                event = routed_events_rx.recv() => {
+                    let Some(event) = event else { break "event stream closed".to_owned(); };
+                    let node_id = event.node_id.to_string();
+                    if routes.get(&node_id).is_some_and(|route| {
+                        route.expected_incarnation_id == event.cursor.incarnation_id
+                    }) {
+                        publish_c2_event(event.event, event.cursor, &updates, &node_id).await;
+                    }
+                }
+                changed = topology.changed() => {
+                    if changed.is_err() {
+                        break "topology stream closed".to_owned();
+                    }
+                    let next = topology.borrow_and_update().clone();
+                    let snapshot_routes = reconcile_c2_topology(
+                        next.as_ref(),
+                        &mut routes,
+                        &mut node_endpoints,
+                        &updates,
+                    ).await;
+                    for route in snapshot_routes {
+                        if let Err(error) = c2_request_and_publish(
+                            &handle,
+                            route,
+                            NodeRequest::Snapshot,
+                            &updates,
+                            &node_endpoints,
+                        ).await {
+                            break 'connected safe_c2_error(&error);
+                        }
+                    }
+                    if let Err(error) = dispatch_c2_startup(
+                        &handle,
+                        &routes,
+                        &node_endpoints,
+                        &mut startup,
+                        initial_terminal_size,
+                        &updates,
+                    ).await {
+                        break 'connected safe_c2_error(&error);
+                    }
+                }
+                _ = snapshot_tick.tick() => {
+                    for route in routes.values().cloned().collect::<Vec<_>>() {
+                        if let Err(error) = c2_request_and_publish(
+                            &handle,
+                            route,
+                            NodeRequest::Snapshot,
+                            &updates,
+                            &node_endpoints,
+                        ).await {
+                            break 'connected safe_c2_error(&error);
+                        }
+                    }
+                }
+            }
+        };
+        event_forwarder.abort();
+        crate::diagnostics::record_runtime(RuntimeDiagnostic::C2ControlDisconnected);
+        disconnect_c2_nodes(&node_endpoints, &updates, "C2 control disconnected").await;
+        sleep(RECONNECT_DELAY).await;
+    }
+}
+
+async fn c2_request_and_publish(
+    handle: &C2ControlHandle,
+    route: NodeRoute,
+    request: NodeRequest,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    endpoints: &BTreeMap<String, String>,
+) -> Result<(), C2ControlError> {
+    let routed = handle.request(route, request).await?;
+    let node_id = routed.node_id.to_string();
+    let incarnation_id = routed.incarnation_id;
+    match routed.response {
+        Ok(response) => publish_c2_response(
+            response,
+            updates,
+            &node_id,
+            incarnation_id,
+            endpoints.get(&node_id).cloned().unwrap_or_default(),
+        )
+        .await,
+        Err(failure) => {
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{node_id}: {}",
+                    safe_node_failure_code(failure.code)
+                )),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+async fn publish_c2_response(
+    response: C2NodeResponse,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    node_id: &str,
+    incarnation_id: gate4agent_c2_protocol::NodeIncarnationId,
+    endpoint: String,
+) {
+    match response {
+        C2NodeResponse::Snapshot { event_sequence, snapshot, .. } => {
+            send_update(
+                updates,
+                WorkerUpdate::C2Snapshot {
+                    expected_node_id: node_id.to_owned(),
+                    endpoint,
+                    incarnation_id,
+                    snapshot,
+                    event_sequence,
+                },
+            )
+            .await;
+        }
+        C2NodeResponse::Resync { event_sequence, snapshot, events } => {
+            for envelope in events {
+                publish_c2_event(
+                    envelope.event,
+                    gate4agent_c2_protocol::NodeCursor {
+                        incarnation_id,
+                        sequence: envelope.sequence,
+                    },
+                    updates,
+                    node_id,
+                ).await;
+            }
+            send_update(
+                updates,
+                WorkerUpdate::C2Snapshot {
+                    expected_node_id: node_id.to_owned(),
+                    endpoint,
+                    incarnation_id,
+                    snapshot,
+                    event_sequence,
+                },
+            )
+            .await;
+        }
+        C2NodeResponse::WorkspaceInspected { inspection } => {
+            send_update(
+                updates,
+                WorkerUpdate::WorkspaceInspected {
+                    node_id: node_id.to_owned(),
+                    inspection: project_c2_workspace_inspection(inspection),
+                },
+            )
+            .await;
+        }
+        C2NodeResponse::SpawnAccepted { session } => {
+            send_update(updates, WorkerUpdate::OpenSession(project_wire_address(node_id, session))).await;
+        }
+        C2NodeResponse::SessionRecordUpdated { record } => {
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordUpserted(project_c2_managed_session(node_id, record)),
+            )
+            .await;
+        }
+        C2NodeResponse::SessionRecordResumed { record, session } => {
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordUpserted(project_c2_managed_session(node_id, record)),
+            )
+            .await;
+            send_update(updates, WorkerUpdate::OpenSession(project_wire_address(node_id, session))).await;
+        }
+        C2NodeResponse::SessionRecordForgotten { record_id } => {
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordRemoved {
+                    node_id: node_id.to_owned(),
+                    record_id: record_id.to_string(),
+                },
+            )
+            .await;
+        }
+        C2NodeResponse::WorkspaceRegistered { workspace } => {
+            send_update(
+                updates,
+                WorkerUpdate::SelectWorkspace {
+                    node_id: node_id.to_owned(),
+                    workspace_id: workspace.workspace_id.to_string(),
+                },
+            )
+            .await;
+        }
+        C2NodeResponse::WorkspaceUnregistered { workspace_id } => {
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!("{node_id}: space {workspace_id} unregistered")),
+            )
+            .await;
+        }
+        C2NodeResponse::WorktreeCreated { worktree, workspace } => {
+            send_update(
+                updates,
+                WorkerUpdate::SelectWorkspace {
+                    node_id: node_id.to_owned(),
+                    workspace_id: workspace.workspace_id.to_string(),
+                },
+            )
+            .await;
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!("{node_id}: worktree {} created", worktree.path)),
+            )
+            .await;
+        }
+        C2NodeResponse::WorktreeRemoved { target_root, .. } => {
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!("{node_id}: worktree {target_root} removed")),
+            )
+            .await;
+        }
+        C2NodeResponse::Controller { .. } | C2NodeResponse::Accepted => {}
+        C2NodeResponse::ShuttingDown => {
+            send_update(
+                updates,
+                WorkerUpdate::State {
+                    node_id: node_id.to_owned(),
+                    endpoint,
+                    state: ConnectionState::Disconnected("node shutdown".to_owned()),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn publish_c2_event(
+    event: C2NodeEvent,
+    cursor: gate4agent_c2_protocol::NodeCursor,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    node_id: &str,
+) {
+    let event = match event {
+        C2NodeEvent::Control { address, event } => {
+            if let Some(notice) = safe_c2_control_notice(node_id, &address, &event) {
+                Some(C2EventUpdate::Notice(notice))
+            } else {
+                None
+            }
+        }
+        C2NodeEvent::SessionRecordUpserted { record } => Some(
+            C2EventUpdate::SessionRecordUpserted(project_c2_managed_session(node_id, record)),
+        ),
+        C2NodeEvent::SessionRecordRemoved { record_id } => Some(
+            C2EventUpdate::SessionRecordRemoved { record_id: record_id.to_string() },
+        ),
+        C2NodeEvent::ResyncRequired { .. } => Some(C2EventUpdate::ResyncRequired),
+        C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceAdded { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. } => Some(C2EventUpdate::Ignored),
+    };
+    send_update(updates, WorkerUpdate::C2Event {
+        node_id: node_id.to_owned(),
+        cursor,
+        event: event.unwrap_or(C2EventUpdate::Ignored),
+    }).await;
+}
+
+fn project_wire_address(node_id: &str, address: WireSessionAddress) -> SessionAddress {
+    SessionAddress {
+        node_id: node_id.to_owned(),
+        workspace_id: address.workspace_id.to_string(),
+        instance_id: address.session.instance_id.0,
+        generation: address.session.generation.0,
+    }
+}
+
+fn safe_c2_error(error: &C2ControlError) -> String {
+    match error {
+        C2ControlError::InvalidEndpoint => "invalid C2 control endpoint".to_owned(),
+        C2ControlError::InvalidToken | C2ControlError::Authentication(_) => {
+            "C2 authentication unavailable".to_owned()
+        }
+        C2ControlError::AuthenticationTimedOut => "C2 authentication timed out".to_owned(),
+        C2ControlError::Io(_) | C2ControlError::Closed => "C2 transport unavailable".to_owned(),
+        C2ControlError::Frame(_) | C2ControlError::Protocol(_) => "C2 protocol invalid".to_owned(),
+        C2ControlError::Relay(failure) => format!("C2 relay {:?}", failure.code),
+        C2ControlError::RequestIdExhausted => "C2 request counter exhausted".to_owned(),
     }
 }
 
@@ -941,6 +1594,24 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
             terminal_size: TerminalSize { rows, columns: cols },
             initial_prompt: None,
         }),
+        AppAction::ResumeSessionRecord { record_id, rows, cols, .. } => {
+            Some(NodeRequest::ResumeSessionRecord {
+                record_id: SessionRecordId::new(record_id).ok()?,
+                terminal_size: TerminalSize { rows, columns: cols },
+                initial_prompt: None,
+            })
+        }
+        AppAction::RenameSessionRecord { record_id, display_name, .. } => {
+            Some(NodeRequest::RenameSessionRecord {
+                record_id: SessionRecordId::new(record_id).ok()?,
+                display_name,
+            })
+        }
+        AppAction::ForgetSessionRecord { record_id, .. } => {
+            Some(NodeRequest::ForgetSessionRecord {
+                record_id: SessionRecordId::new(record_id).ok()?,
+            })
+        }
         AppAction::Input { address, text } => Some(NodeRequest::Input {
             session: wire_address(&address).ok()?,
             text,
@@ -1108,6 +1779,72 @@ async fn request_and_publish(
                     session.workspace_id,
                     session.session.instance_id.0,
                     session.session.generation.0
+                )),
+            )
+            .await;
+        }
+        NodeResponse::SessionRecordUpdated { record } => {
+            let name = record.display_name.clone();
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordUpserted(project_managed_session(
+                    endpoint.expected_node_id.as_str(),
+                    record,
+                )),
+            )
+            .await;
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{}: session renamed to {name}",
+                    endpoint.expected_node_id
+                )),
+            )
+            .await;
+        }
+        NodeResponse::SessionRecordResumed { record, session } => {
+            let name = record.display_name.clone();
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordUpserted(project_managed_session(
+                    endpoint.expected_node_id.as_str(),
+                    record,
+                )),
+            )
+            .await;
+            send_update(
+                updates,
+                WorkerUpdate::OpenSession(SessionAddress {
+                    node_id: endpoint.expected_node_id.to_string(),
+                    workspace_id: session.workspace_id.to_string(),
+                    instance_id: session.session.instance_id.0,
+                    generation: session.session.generation.0,
+                }),
+            )
+            .await;
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{}: resumed {name}",
+                    endpoint.expected_node_id
+                )),
+            )
+            .await;
+        }
+        NodeResponse::SessionRecordForgotten { record_id } => {
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordRemoved {
+                    node_id: endpoint.expected_node_id.to_string(),
+                    record_id: record_id.to_string(),
+                },
+            )
+            .await;
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{}: session record forgotten",
+                    endpoint.expected_node_id
                 )),
             )
             .await;
@@ -1323,11 +2060,28 @@ async fn publish_node_event(
                 send_update(updates, WorkerUpdate::Notice(notice)).await;
             }
         }
+        NodeEvent::SessionRecordUpserted { record } => {
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordUpserted(project_managed_session(node_id, record)),
+            )
+            .await;
+        }
+        NodeEvent::SessionRecordRemoved { record_id } => {
+            send_update(
+                updates,
+                WorkerUpdate::SessionRecordRemoved {
+                    node_id: node_id.to_owned(),
+                    record_id: record_id.to_string(),
+                },
+            )
+            .await;
+        }
         NodeEvent::WorkspaceAdded { .. } | NodeEvent::WorkspaceRemoved { .. } => {}
     }
 }
 
-fn apply_update(app: &mut App, update: WorkerUpdate) {
+fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) {
     match update {
         WorkerUpdate::State { node_id, endpoint, state } => {
             let endpoint = if endpoint.is_empty() {
@@ -1340,6 +2094,10 @@ fn apply_update(app: &mut App, update: WorkerUpdate) {
                 endpoint
             };
             app.set_node_connection(&node_id, &endpoint, state);
+        }
+        WorkerUpdate::TopologyNodeRemoved { node_id } => {
+            c2.watermarks.remove(&node_id);
+            app.remove_topology_node(&node_id);
         }
         WorkerUpdate::Snapshot {
             expected_node_id,
@@ -1354,6 +2112,51 @@ fn apply_update(app: &mut App, update: WorkerUpdate) {
             controller_owned,
             event_sequence,
         )),
+        WorkerUpdate::C2Snapshot {
+            expected_node_id,
+            endpoint,
+            incarnation_id,
+            snapshot,
+            event_sequence,
+        } => {
+            let cursor = gate4agent_c2_protocol::NodeCursor {
+                incarnation_id,
+                sequence: event_sequence,
+            };
+            if c2.accept_snapshot(&expected_node_id, cursor) {
+                app.upsert_node(project_c2_node(
+                    expected_node_id,
+                    endpoint,
+                    snapshot,
+                    event_sequence,
+                ));
+            }
+        }
+        WorkerUpdate::C2Event { node_id, cursor, event } => {
+            if !c2.accept_event(&node_id, cursor) {
+                return;
+            }
+            match event {
+                C2EventUpdate::SessionRecordUpserted(record) => {
+                    app.upsert_managed_session(record)
+                }
+                C2EventUpdate::SessionRecordRemoved { record_id } => {
+                    app.remove_managed_session(&node_id, &record_id)
+                }
+                C2EventUpdate::Notice(notice) => app.notice = Some(notice),
+                C2EventUpdate::ResyncRequired => {
+                    let endpoint = app.nodes.iter()
+                        .find(|node| node.node_id == node_id)
+                        .map(|node| node.endpoint.clone())
+                        .unwrap_or_default();
+                    app.set_node_connection(&node_id, &endpoint, ConnectionState::Resyncing);
+                }
+                C2EventUpdate::Ignored => {}
+            }
+            if let Some(node) = app.nodes.iter_mut().find(|node| node.node_id == node_id) {
+                node.event_sequence = cursor.sequence;
+            }
+        }
         WorkerUpdate::OpenSession(address) => app.request_open(address),
         WorkerUpdate::SelectWorkspace { node_id, workspace_id } => {
             app.request_space_selection(node_id, workspace_id)
@@ -1366,7 +2169,63 @@ fn apply_update(app: &mut App, update: WorkerUpdate) {
             workspace_id,
             message,
         } => app.fail_workspace_inspection(node_id, workspace_id, message),
+        WorkerUpdate::SessionRecordUpserted(record) => app.upsert_managed_session(record),
+        WorkerUpdate::SessionRecordRemoved { node_id, record_id } => {
+            app.remove_managed_session(&node_id, &record_id)
+        }
         WorkerUpdate::Notice(notice) => app.notice = Some(notice),
+    }
+}
+
+fn project_c2_node(
+    expected_node_id: String,
+    endpoint: String,
+    snapshot: C2NodeSnapshot,
+    event_sequence: u64,
+) -> NodeView {
+    let providers = snapshot
+        .enabled_providers
+        .iter()
+        .map(|provider| ProviderInventory {
+            provider: project_provider(*provider),
+            enabled: true,
+        })
+        .collect::<Vec<_>>();
+    let node_id = snapshot.node_id.to_string();
+    debug_assert_eq!(node_id, expected_node_id);
+    let workspaces = snapshot
+        .workspaces
+        .into_iter()
+        .map(|workspace| {
+            let workspace_id = workspace.workspace_id.to_string();
+            let label = workspace_label(&workspace.canonical_root, &workspace_id);
+            let sessions = workspace
+                .sessions
+                .into_iter()
+                .filter_map(|session| project_c2_session(&node_id, &workspace_id, session))
+                .collect();
+            WorkspaceView {
+                workspace_id,
+                label,
+                canonical_root: workspace.canonical_root,
+                providers: providers.clone(),
+                sessions,
+            }
+        })
+        .collect();
+    let session_records = snapshot
+        .session_records
+        .into_iter()
+        .map(|record| project_c2_managed_session(&node_id, record))
+        .collect();
+    NodeView {
+        node_id,
+        endpoint,
+        connection: ConnectionState::Connected,
+        controller_owned: true,
+        event_sequence,
+        workspaces,
+        session_records,
     }
 }
 
@@ -1407,6 +2266,11 @@ fn project_node(
             }
         })
         .collect();
+    let session_records = snapshot
+        .session_records
+        .into_iter()
+        .map(|record| project_managed_session(&node_id, record))
+        .collect();
     NodeView {
         node_id,
         endpoint,
@@ -1414,7 +2278,138 @@ fn project_node(
         controller_owned,
         event_sequence,
         workspaces,
+        session_records,
     }
+}
+
+fn project_managed_session(node_id: &str, record: ManagedSessionRecord) -> ManagedSessionView {
+    ManagedSessionView {
+        node_id: node_id.to_owned(),
+        record_id: record.record_id.to_string(),
+        display_name: record.display_name,
+        provider: project_provider(record.provider),
+        mode: record.mode,
+        state: record.state,
+        workspace_id: record.workspace_id.to_string(),
+        canonical_root: record.canonical_root,
+        has_provider_session_identity: record.provider_session.is_some(),
+        active_session: record.active_session.map(|address| SessionAddress {
+            node_id: node_id.to_owned(),
+            workspace_id: address.workspace_id.to_string(),
+            instance_id: address.session.instance_id.0,
+            generation: address.session.generation.0,
+        }),
+        last_error: record.last_error,
+    }
+}
+
+fn project_c2_managed_session(
+    node_id: &str,
+    record: C2ManagedSessionRecord,
+) -> ManagedSessionView {
+    ManagedSessionView {
+        node_id: node_id.to_owned(),
+        record_id: record.record_id.to_string(),
+        display_name: record.display_name,
+        provider: project_provider(record.provider),
+        mode: record.mode,
+        state: record.state,
+        workspace_id: record.workspace_id.to_string(),
+        canonical_root: String::new(),
+        has_provider_session_identity: record.provider_identity_present,
+        active_session: record.active_session.map(|address| SessionAddress {
+            node_id: node_id.to_owned(),
+            workspace_id: address.workspace_id.to_string(),
+            instance_id: address.session.instance_id.0,
+            generation: address.session.generation.0,
+        }),
+        last_error: None,
+    }
+}
+
+fn project_c2_workspace_inspection(
+    inspection: C2WorkspaceInspection,
+) -> gate4agent_node_protocol::WorkspaceInspection {
+    gate4agent_node_protocol::WorkspaceInspection {
+        workspace_id: inspection.workspace_id,
+        entries: inspection.entries,
+        tree_truncated: inspection.tree_truncated,
+        git: gate4agent_node_protocol::GitSnapshot {
+            is_repository: inspection.git.is_repository,
+            branch: inspection.git.branch,
+            status: inspection.git.status,
+            recent_commits: inspection.git.recent_commits,
+            worktrees: inspection.git.worktrees.into_iter().map(|worktree| {
+                gate4agent_node_protocol::GitWorktreeSnapshot {
+                    path: worktree.path,
+                    head: worktree.head,
+                    branch: worktree.branch,
+                    is_bare: worktree.is_bare,
+                    is_main: worktree.is_main,
+                    locked: worktree.locked,
+                    lock_reason: worktree.locked.then(|| "locked".to_owned()),
+                    prunable: worktree.prunable,
+                    prunable_reason: worktree.prunable.then(|| "prunable".to_owned()),
+                    workspace_id: worktree.workspace_id,
+                }
+            }).collect(),
+            truncated: inspection.git.truncated,
+            diagnostic: inspection.git.diagnostic_present
+                .then(|| "git inspection unavailable".to_owned()),
+        },
+    }
+}
+
+fn project_c2_session(
+    node_id: &str,
+    workspace_id: &str,
+    session: C2SessionSnapshot,
+) -> Option<SessionView> {
+    let provider = session.agent_id.as_str().parse().ok()?;
+    if !supports_tui_transport(session.transport) {
+        return None;
+    }
+    let lifecycle = project_c2_lifecycle(&session.status);
+    let terminal_cursor = session.terminal_frame.as_ref()
+        .map(|frame| (frame.cursor_row, frame.cursor_column));
+    let terminal_formatted = session.terminal_frame.as_ref()
+        .map(|frame| frame.formatted.clone())
+        .unwrap_or_default();
+    let terminal_scrollback = session.terminal_frame.as_ref()
+        .map(|frame| frame.scrollback_formatted.clone())
+        .unwrap_or_default();
+    let terminal_alternate_screen = session.terminal_frame.as_ref()
+        .is_some_and(|frame| frame.alternate_screen);
+    let terminal_mouse_protocol_enabled = session.terminal_frame.as_ref()
+        .is_some_and(|frame| frame.mouse_protocol_enabled);
+    let terminal_mouse_protocol_encoding = session.terminal_frame.as_ref()
+        .map(|frame| frame.mouse_protocol_encoding)
+        .unwrap_or(TerminalMouseProtocolEncoding::Default);
+    Some(SessionView {
+        address: SessionAddress {
+            node_id: node_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            instance_id: session.instance_id.0,
+            generation: session.generation.0,
+        },
+        provider,
+        status: c2_status_label(&session.status),
+        running: lifecycle.running,
+        stoppable: lifecycle.stoppable,
+        removable: lifecycle.removable,
+        restartable: lifecycle.restartable,
+        attention: matches!(
+            session.provider_activity,
+            ProviderActivity::WaitingForInput | ProviderActivity::Blocked
+        ) || session.provider_interaction_pending,
+        has_provider_session_identity: session.provider_identity_present,
+        terminal_formatted,
+        terminal_scrollback,
+        terminal_alternate_screen,
+        terminal_mouse_protocol_enabled,
+        terminal_mouse_protocol_encoding,
+        terminal_cursor,
+    })
 }
 
 fn project_session(
@@ -1519,6 +2514,35 @@ fn project_lifecycle(status: &SessionStatus) -> ProjectedLifecycle {
     }
 }
 
+fn project_c2_lifecycle(status: &C2SessionStatus) -> ProjectedLifecycle {
+    match status {
+        C2SessionStatus::Registered => ProjectedLifecycle {
+            running: false,
+            stoppable: true,
+            removable: false,
+            restartable: false,
+        },
+        C2SessionStatus::Starting | C2SessionStatus::Running => ProjectedLifecycle {
+            running: true,
+            stoppable: true,
+            removable: false,
+            restartable: false,
+        },
+        C2SessionStatus::Stopping => ProjectedLifecycle {
+            running: false,
+            stoppable: true,
+            removable: false,
+            restartable: false,
+        },
+        C2SessionStatus::Exited { .. } | C2SessionStatus::Failed => ProjectedLifecycle {
+            running: false,
+            stoppable: false,
+            removable: true,
+            restartable: true,
+        },
+    }
+}
+
 fn supports_tui_transport(transport: TransportKind) -> bool {
     transport == TransportKind::Pty
 }
@@ -1554,33 +2578,40 @@ fn safe_control_notice(
     ))
 }
 
+fn safe_c2_control_notice(
+    node_id: &str,
+    address: &WireSessionAddress,
+    event: &C2ControlEvent,
+) -> Option<String> {
+    let class = match &event.event {
+        C2ControlEventKind::CommandRejected => "command rejected",
+        C2ControlEventKind::InputFailed => "input failed",
+        C2ControlEventKind::ResizeFailed => "resize failed",
+        C2ControlEventKind::ForegroundFailed => "foreground refresh failed",
+        C2ControlEventKind::CapabilityProbeFailed => "capability probe failed",
+        C2ControlEventKind::HistoryFailed => "history failed",
+        C2ControlEventKind::ResumeDenied => "resume denied",
+        C2ControlEventKind::ResumeFailed => "resume failed",
+        C2ControlEventKind::TerminalStale => "terminal snapshot stale",
+        C2ControlEventKind::InteractionResolutionFailed => "interaction resolution failed",
+        C2ControlEventKind::Resumed => "session resumed",
+        C2ControlEventKind::Exited { forced } => {
+            if *forced { "session force-stopped" } else { "session exited" }
+        }
+        C2ControlEventKind::Failed => "session failed",
+        _ => return None,
+    };
+    Some(format!(
+        "{node_id}/{} #{}:{}: {class}",
+        address.workspace_id,
+        address.session.instance_id.0,
+        address.session.generation.0
+    ))
+}
+
 fn safe_client_error(error: &NodeClientError) -> &'static str {
     match error {
-        NodeClientError::Node(failure) => match failure.code {
-            NodeFailureCode::InvalidRequest => "invalid request",
-            NodeFailureCode::Unauthorized => "authentication rejected",
-            NodeFailureCode::ObserverReadOnly => "operator access required",
-            NodeFailureCode::ControllerBusy => "controller busy",
-            NodeFailureCode::ControllerRequired => "controller required",
-            NodeFailureCode::UnknownWorkspace => "workspace unavailable",
-            NodeFailureCode::InvalidWorkspaceRoot => "workspace root invalid",
-            NodeFailureCode::DuplicateWorkspaceId => "workspace ID already registered",
-            NodeFailureCode::DuplicateWorkspaceRoot => "workspace root already registered",
-            NodeFailureCode::WorkspaceBusy => "workspace has managed sessions",
-            NodeFailureCode::LastWorkspace => "node must retain one workspace",
-            NodeFailureCode::NotGitRepository => "workspace is not a git repository",
-            NodeFailureCode::WorktreeConflict => "worktree path or branch conflicts",
-            NodeFailureCode::WorktreeProtected => "protected worktree cannot be removed",
-            NodeFailureCode::WorktreeDirty => "worktree has uncommitted changes",
-            NodeFailureCode::WorktreeLocked => "worktree is locked",
-            NodeFailureCode::UnknownSession => "session unavailable",
-            NodeFailureCode::SessionWorkspaceMismatch => "session/workspace mismatch",
-            NodeFailureCode::StaleGeneration => "stale session generation",
-            NodeFailureCode::BackendBusy => "node backend busy",
-            NodeFailureCode::BackendDisconnected => "node backend disconnected",
-            NodeFailureCode::BackendOperationFailed => "node backend operation failed",
-            NodeFailureCode::ShuttingDown => "node shutting down",
-        },
+        NodeClientError::Node(failure) => safe_node_failure_code(failure.code),
         NodeClientError::Io(_) => "node transport unavailable",
         NodeClientError::Frame(_) => "node frame invalid or timed out",
         NodeClientError::Protocol(_) => "node protocol mismatch",
@@ -1590,11 +2621,44 @@ fn safe_client_error(error: &NodeClientError) -> &'static str {
     }
 }
 
+fn safe_node_failure_code(code: NodeFailureCode) -> &'static str {
+    match code {
+        NodeFailureCode::InvalidRequest => "invalid request",
+        NodeFailureCode::Unauthorized => "authentication rejected",
+        NodeFailureCode::ObserverReadOnly => "operator access required",
+        NodeFailureCode::ControllerBusy => "controller busy",
+        NodeFailureCode::ControllerRequired => "controller required",
+        NodeFailureCode::UnknownWorkspace => "workspace unavailable",
+        NodeFailureCode::InvalidWorkspaceRoot => "workspace root invalid",
+        NodeFailureCode::DuplicateWorkspaceId => "workspace ID already registered",
+        NodeFailureCode::DuplicateWorkspaceRoot => "workspace root already registered",
+        NodeFailureCode::WorkspaceBusy => "workspace has managed sessions",
+        NodeFailureCode::LastWorkspace => "node must retain one workspace",
+        NodeFailureCode::NotGitRepository => "workspace is not a git repository",
+        NodeFailureCode::WorktreeConflict => "worktree path or branch conflicts",
+        NodeFailureCode::WorktreeProtected => "protected worktree cannot be removed",
+        NodeFailureCode::WorktreeDirty => "worktree has uncommitted changes",
+        NodeFailureCode::WorktreeLocked => "worktree is locked",
+        NodeFailureCode::UnknownSession => "session unavailable",
+        NodeFailureCode::UnknownSessionRecord => "managed session record unavailable",
+        NodeFailureCode::SessionRecordNotResumable => "managed session cannot resume",
+        NodeFailureCode::SessionRecordBusy => "managed session is already live",
+        NodeFailureCode::SessionRecordConflict => "managed session identity conflicts",
+        NodeFailureCode::SessionWorkspaceMismatch => "session/workspace mismatch",
+        NodeFailureCode::StaleGeneration => "stale session generation",
+        NodeFailureCode::BackendBusy => "node backend busy",
+        NodeFailureCode::BackendDisconnected => "node backend disconnected",
+        NodeFailureCode::BackendOperationFailed => "node backend operation failed",
+        NodeFailureCode::ShuttingDown => "node shutting down",
+    }
+}
+
 fn is_transport_error(error: &NodeClientError) -> bool {
     !matches!(error, NodeClientError::Node(_))
 }
 
 async fn disconnected(updates: &mpsc::Sender<WorkerUpdate>, endpoint: &NodeEndpoint, reason: &str) {
+    crate::diagnostics::record_runtime(RuntimeDiagnostic::NodeDisconnected);
     send_update(
         updates,
         WorkerUpdate::State {
@@ -1692,6 +2756,20 @@ fn status_label(status: &SessionStatus) -> String {
     }
 }
 
+fn c2_status_label(status: &C2SessionStatus) -> String {
+    match status {
+        C2SessionStatus::Registered => "registered".to_owned(),
+        C2SessionStatus::Starting => "starting".to_owned(),
+        C2SessionStatus::Running => "running".to_owned(),
+        C2SessionStatus::Stopping => "stopping".to_owned(),
+        C2SessionStatus::Exited { exit_code } => format!(
+            "exited({})",
+            exit_code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+        ),
+        C2SessionStatus::Failed => "failed".to_owned(),
+    }
+}
+
 fn workspace_label(root: &str, fallback: &str) -> String {
     root.trim_end_matches(['\\', '/'])
         .rsplit(['\\', '/'])
@@ -1723,6 +2801,7 @@ mod tests {
             connection: ConnectionState::Connected,
             controller_owned: true,
             event_sequence: 1,
+            session_records: Vec::new(),
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
@@ -1757,6 +2836,126 @@ mod tests {
     fn initial_viewport_matches_fixed_sidebar_and_single_tab_row() {
         assert_eq!(initial_viewport_size(100, 24), TerminalSize { rows: 23, columns: 74 });
         assert_eq!(initial_viewport_size(48, 12), TerminalSize { rows: 11, columns: 24 });
+    }
+
+    #[test]
+    fn c2_shared_command_route_accepts_actions_for_discovered_nodes() {
+        let mut app = cursor_app();
+        let address = app.tabs[0].address.clone();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let commands = BTreeMap::from([(C2_COMMAND_ROUTE.to_owned(), sender)]);
+
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::Resize {
+                address: address.clone(),
+                rows: 23,
+                cols: 79,
+            },
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppAction::Resize { address: routed, rows: 23, cols: 79 }) if routed == address
+        ));
+    }
+
+    #[tokio::test]
+    async fn c2_topology_reconciles_offline_parked_online_incarnation_and_removal() {
+        use gate4agent_c2_protocol::C2TopologyNode;
+        use gate4agent_node_protocol::NodeIncarnationId;
+
+        let node_id = NodeId::new("node-a").unwrap();
+        let endpoint = r"\\.\pipe\node-a".to_owned();
+        let offline = C2Topology {
+            nodes: vec![C2TopologyNode {
+                node_id: node_id.clone(),
+                endpoint: endpoint.clone(),
+                transport: NodeTransportState::Offline,
+                current_incarnation_id: None,
+            }],
+        };
+        let mut routes = BTreeMap::new();
+        let mut endpoints = BTreeMap::new();
+        let (updates, mut receiver) = mpsc::channel(8);
+
+        let snapshots = reconcile_c2_topology(
+            &offline,
+            &mut routes,
+            &mut endpoints,
+            &updates,
+        )
+        .await;
+        assert!(snapshots.is_empty());
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WorkerUpdate::State {
+                node_id: ref observed,
+                state: ConnectionState::Disconnected(_),
+                ..
+            }) if observed == "node-a"
+        ));
+
+        let parked = C2Topology {
+            nodes: vec![C2TopologyNode {
+                node_id: node_id.clone(),
+                endpoint: endpoint.clone(),
+                transport: NodeTransportState::Parked,
+                current_incarnation_id: None,
+            }],
+        };
+        let snapshots = reconcile_c2_topology(
+            &parked,
+            &mut routes,
+            &mut endpoints,
+            &updates,
+        )
+        .await;
+        assert!(snapshots.is_empty());
+        assert!(routes.is_empty());
+        assert_eq!(endpoints.get("node-a"), Some(&endpoint));
+        assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        let incarnation = NodeIncarnationId::from_bytes([7; 16]);
+        let online = C2Topology {
+            nodes: vec![C2TopologyNode {
+                node_id: node_id.clone(),
+                endpoint: endpoint.clone(),
+                transport: NodeTransportState::Online,
+                current_incarnation_id: Some(incarnation),
+            }],
+        };
+        let snapshots = reconcile_c2_topology(
+            &online,
+            &mut routes,
+            &mut endpoints,
+            &updates,
+        )
+        .await;
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].expected_incarnation_id, incarnation);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WorkerUpdate::State {
+                state: ConnectionState::Connecting,
+                ..
+            })
+        ));
+
+        let snapshots = reconcile_c2_topology(
+            &C2Topology { nodes: Vec::new() },
+            &mut routes,
+            &mut endpoints,
+            &updates,
+        )
+        .await;
+        assert!(snapshots.is_empty());
+        assert!(routes.is_empty());
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WorkerUpdate::TopologyNodeRemoved { node_id }) if node_id == "node-a"
+        ));
     }
 
     #[test]
@@ -1943,6 +3142,45 @@ mod tests {
     }
 
     #[test]
+    fn managed_session_actions_project_exact_node_protocol_requests() {
+        let resume = action_to_request(AppAction::ResumeSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-1".to_owned(),
+            rows: 31,
+            cols: 107,
+        })
+        .unwrap();
+        assert!(matches!(
+            resume,
+            NodeRequest::ResumeSessionRecord { record_id, terminal_size, initial_prompt: None }
+                if record_id.as_str() == "record-1"
+                    && terminal_size.rows == 31
+                    && terminal_size.columns == 107
+        ));
+        let rename = action_to_request(AppAction::RenameSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-1".to_owned(),
+            display_name: "review".to_owned(),
+        })
+        .unwrap();
+        assert!(matches!(
+            rename,
+            NodeRequest::RenameSessionRecord { record_id, display_name }
+                if record_id.as_str() == "record-1" && display_name == "review"
+        ));
+        let forget = action_to_request(AppAction::ForgetSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-1".to_owned(),
+        })
+        .unwrap();
+        assert!(matches!(
+            forget,
+            NodeRequest::ForgetSessionRecord { record_id }
+                if record_id.as_str() == "record-1"
+        ));
+    }
+
+    #[test]
     fn worktree_actions_project_exact_source_target_branch_and_base() {
         let create = action_to_request(AppAction::CreateWorktree {
             node_id: "node-a".to_owned(),
@@ -2095,6 +3333,7 @@ mod tests {
     fn run_options_can_carry_an_explicit_style_override() {
         let options = RunOptions {
             nodes: Vec::new(),
+            c2: None,
             startup: None,
             color_mode_override: Some(PtyColorMode::Inherited),
         };
@@ -2110,5 +3349,235 @@ mod tests {
 
         assert_eq!(app.color_mode, PtyColorMode::GateOverride);
         assert_eq!(preferences.color_mode, PtyColorMode::Inherited);
+    }
+
+    #[test]
+    fn c2_control_notice_uses_only_redacted_event_category_and_address() {
+        let address = WireSessionAddress {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            session: SessionKey {
+                instance_id: gate4agent_types::AgentInstanceId(7),
+                generation: gate4agent_types::SessionGeneration(2),
+            },
+        };
+        let event = C2ControlEvent {
+            protocol_version: gate4agent_types::CONTROL_PROTOCOL_VERSION,
+            sequence: 4,
+            command_id: None,
+            instance_id: gate4agent_types::AgentInstanceId(7),
+            generation: gate4agent_types::SessionGeneration(2),
+            event: C2ControlEventKind::Resumed,
+        };
+        assert_eq!(
+            safe_c2_control_notice("node-a", &address, &event).as_deref(),
+            Some("node-a/workspace-a #7:2: session resumed"),
+        );
+
+        let provider_event = C2ControlEvent {
+            event: C2ControlEventKind::ProviderEvent {
+                event: gate4agent_c2_protocol::C2ProviderEventKind::SessionIdentityObserved,
+            },
+            ..event
+        };
+        assert_eq!(safe_c2_control_notice("node-a", &address, &provider_event), None);
+    }
+
+    fn c2_test_record(display_name: &str) -> C2ManagedSessionRecord {
+        C2ManagedSessionRecord {
+            record_id: SessionRecordId::new("record-1").unwrap(),
+            display_name: display_name.to_owned(),
+            provider: AgentProvider::Codex,
+            mode: SessionMode::Pty,
+            state: gate4agent_node_protocol::ManagedSessionState::Dormant,
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            active_session: None,
+            provider_identity_present: true,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn c2_test_snapshot(display_name: &str) -> C2NodeSnapshot {
+        C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![AgentProvider::Codex],
+            workspaces: Vec::new(),
+            session_records: vec![c2_test_record(display_name)],
+        }
+    }
+
+    #[test]
+    fn c2_event_before_snapshot_stays_monotonic_and_snapshot_is_authoritative_at_watermark() {
+        let incarnation_id = gate4agent_c2_protocol::NodeIncarnationId::from_bytes([5; 16]);
+        let mut app = App::default();
+        let mut c2 = C2ApplyState::default();
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: c2_test_snapshot("baseline"),
+            event_sequence: 4,
+        });
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Event {
+            node_id: "node-a".to_owned(),
+            cursor: gate4agent_c2_protocol::NodeCursor {
+                incarnation_id,
+                sequence: 6,
+            },
+            event: C2EventUpdate::SessionRecordUpserted(project_c2_managed_session(
+                "node-a",
+                c2_test_record("event-newer"),
+            )),
+        });
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: c2_test_snapshot("snapshot-stale"),
+            event_sequence: 5,
+        });
+
+        assert_eq!(app.nodes[0].session_records[0].display_name, "event-newer");
+        assert_eq!(app.nodes[0].event_sequence, 6);
+
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: c2_test_snapshot("snapshot-authoritative"),
+            event_sequence: 6,
+        });
+        assert_eq!(
+            app.nodes[0].session_records[0].display_name,
+            "snapshot-authoritative"
+        );
+        assert_eq!(app.nodes[0].event_sequence, 6);
+    }
+
+    #[test]
+    fn c2_duplicate_and_stale_events_cannot_regress_snapshot_record() {
+        let incarnation_id = gate4agent_c2_protocol::NodeIncarnationId::from_bytes([6; 16]);
+        let mut app = App::default();
+        let mut c2 = C2ApplyState::default();
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: c2_test_snapshot("snapshot-current"),
+            event_sequence: 5,
+        });
+        for (sequence, display_name) in [(5, "duplicate"), (4, "stale")] {
+            apply_update(&mut app, &mut c2, WorkerUpdate::C2Event {
+                node_id: "node-a".to_owned(),
+                cursor: gate4agent_c2_protocol::NodeCursor {
+                    incarnation_id,
+                    sequence,
+                },
+                event: C2EventUpdate::SessionRecordUpserted(project_c2_managed_session(
+                    "node-a",
+                    c2_test_record(display_name),
+                )),
+            });
+        }
+        assert_eq!(app.nodes[0].session_records[0].display_name, "snapshot-current");
+        assert_eq!(app.nodes[0].event_sequence, 5);
+
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Event {
+            node_id: "node-a".to_owned(),
+            cursor: gate4agent_c2_protocol::NodeCursor {
+                incarnation_id,
+                sequence: 6,
+            },
+            event: C2EventUpdate::SessionRecordUpserted(project_c2_managed_session(
+                "node-a",
+                c2_test_record("fresh"),
+            )),
+        });
+        assert_eq!(app.nodes[0].session_records[0].display_name, "fresh");
+        assert_eq!(app.nodes[0].event_sequence, 6);
+
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Event {
+            node_id: "node-a".to_owned(),
+            cursor: gate4agent_c2_protocol::NodeCursor {
+                incarnation_id,
+                sequence: 7,
+            },
+            event: C2EventUpdate::Ignored,
+        });
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Event {
+            node_id: "node-a".to_owned(),
+            cursor: gate4agent_c2_protocol::NodeCursor {
+                incarnation_id,
+                sequence: 6,
+            },
+            event: C2EventUpdate::SessionRecordUpserted(project_c2_managed_session(
+                "node-a",
+                c2_test_record("stale-after-ignored-event"),
+            )),
+        });
+        assert_eq!(app.nodes[0].session_records[0].display_name, "fresh");
+        assert_eq!(app.nodes[0].event_sequence, 7);
+    }
+
+    #[tokio::test]
+    async fn c2_snapshot_and_record_event_feed_the_same_authoritative_app_projection() {
+        let record = C2ManagedSessionRecord {
+            record_id: SessionRecordId::new("record-1").unwrap(),
+            display_name: "review".to_owned(),
+            provider: AgentProvider::Codex,
+            mode: SessionMode::Pty,
+            state: gate4agent_node_protocol::ManagedSessionState::IdentityPending,
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            active_session: None,
+            provider_identity_present: true,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let snapshot = C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![AgentProvider::Codex],
+            workspaces: Vec::new(),
+            session_records: vec![record.clone()],
+        };
+        let (updates, mut receiver) = mpsc::channel(8);
+        publish_c2_response(
+            C2NodeResponse::Snapshot {
+                event_sequence: 4,
+                controller: None,
+                snapshot,
+            },
+            &updates,
+            "node-a",
+            gate4agent_c2_protocol::NodeIncarnationId::from_bytes([4; 16]),
+            r"\\.\pipe\node-a".to_owned(),
+        )
+        .await;
+        let mut app = App::default();
+        let mut c2 = C2ApplyState::default();
+        apply_update(&mut app, &mut c2, receiver.recv().await.unwrap());
+        assert_eq!(app.nodes[0].session_records[0].display_name, "review");
+        assert!(app.nodes[0].controller_owned);
+        assert!(app.nodes[0].session_records[0].has_provider_session_identity);
+
+        let mut dormant = record;
+        dormant.state = gate4agent_node_protocol::ManagedSessionState::Dormant;
+        dormant.display_name = "renamed".to_owned();
+        publish_c2_event(
+            C2NodeEvent::SessionRecordUpserted { record: dormant },
+            gate4agent_c2_protocol::NodeCursor {
+                incarnation_id: gate4agent_c2_protocol::NodeIncarnationId::from_bytes([4; 16]),
+                sequence: 5,
+            },
+            &updates,
+            "node-a",
+        )
+        .await;
+        apply_update(&mut app, &mut c2, receiver.recv().await.unwrap());
+        assert_eq!(app.nodes[0].session_records[0].display_name, "renamed");
+        assert_eq!(
+            app.nodes[0].session_records[0].state,
+            gate4agent_node_protocol::ManagedSessionState::Dormant
+        );
+        assert!(app.nodes[0].session_records[0].has_provider_session_identity);
     }
 }

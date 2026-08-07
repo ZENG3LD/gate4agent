@@ -38,6 +38,7 @@ impl ResumeLaunchRequest {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ResumeTarget {
     CurrentProvider,
+    ProviderSession { identity: ProviderSessionIdentity },
     HistoryCandidate { candidate_id: String },
 }
 
@@ -45,6 +46,9 @@ impl ResumeTarget {
     pub fn validate(&self) -> Result<(), ResumeValidationError> {
         match self {
             Self::CurrentProvider => Ok(()),
+            Self::ProviderSession { identity } => identity
+                .validate()
+                .map_err(|error| ResumeValidationError::InvalidProviderSession(error.to_string())),
             Self::HistoryCandidate { candidate_id } => validate_candidate_id(candidate_id)
                 .map_err(ResumeValidationError::InvalidHistoryCandidate),
         }
@@ -105,6 +109,8 @@ pub enum ResumeValidationError {
     InvalidInitialPrompt(String),
     #[error("resume history candidate is invalid: {0}")]
     InvalidHistoryCandidate(HistoryValidationError),
+    #[error("resume provider session is invalid: {0}")]
+    InvalidProviderSession(String),
     #[error("resume error is empty, too large, or contains unsafe controls")]
     InvalidError,
 }
@@ -151,6 +157,15 @@ mod tests {
         .is_err());
         assert!(ResumeTarget::HistoryCandidate {
             candidate_id: r"C:\sessions\one.jsonl".to_owned(),
+        }
+        .validate()
+        .is_err());
+        assert!(ResumeTarget::ProviderSession {
+            identity: ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: "-unsafe-option".to_owned(),
+                transcript_path: None,
+            },
         }
         .validate()
         .is_err());

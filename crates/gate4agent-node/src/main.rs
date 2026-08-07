@@ -1,5 +1,5 @@
 #[cfg(windows)]
-use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
+use gate4agent_node::{default_state_path, NodeServer, NodeServerConfig, WorkspaceConfig};
 #[cfg(windows)]
 use gate4agent_node::protocol::{NodeId, WorkspaceId, DEFAULT_NODE_ENDPOINT};
 
@@ -57,7 +57,9 @@ async fn main() {
         .unwrap_or_else(|_| fail(&format!("{NODE_TOKEN_ENV} is required")));
     std::env::remove_var(NODE_TOKEN_ENV);
     let node_id = node_id.unwrap_or_else(|| fail("--node-id is required"));
+    let state_path = default_state_path(&node_id).unwrap_or_else(|error| fail(&error.to_string()));
     let config = NodeServerConfig::new(endpoint, token, node_id, workspaces)
+        .and_then(|config| config.with_state_path(state_path))
         .and_then(|config| config.with_api_listen(api_listen))
         .unwrap_or_else(|error| fail(&error.to_string()));
     let server = NodeServer::new(config).unwrap_or_else(|error| fail(&error.to_string()));

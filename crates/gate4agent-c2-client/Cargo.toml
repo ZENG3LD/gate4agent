@@ -1,0 +1,18 @@
+[package]
+name = "gate4agent-c2-client"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_c2_client"
+
+[dependencies]
+gate4agent-c2-protocol = { path = "../gate4agent-c2-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }

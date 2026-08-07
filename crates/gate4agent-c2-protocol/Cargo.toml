@@ -1,0 +1,16 @@
+[package]
+name = "gate4agent-c2-protocol"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_c2_protocol"
+
+[dependencies]
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-types = { path = "../gate4agent-types" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

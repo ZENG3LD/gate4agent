@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
-use gate4agent_node::protocol::{NodeId, WorkspaceId};
+use gate4agent_node_protocol::{NodeId, WorkspaceId};
 use gate4agent_tui::{NodeEndpoint, Provider, PtyColorMode, RunOptions, StartupRequest};
 
 const TOKEN_ENV_PREFIX: &str = "GATE4AGENT_NODE_TOKEN_";

@@ -2,7 +2,7 @@ use uzor_tui::{
     split, Block, Color, Constraint, Direction, Line, Modifier, Paragraph, Rect, Span, Style,
     TerminalBuffer, Text, Widget,
 };
-use gate4agent_node::protocol::{GitSnapshot, WorkspaceEntryKind, WorkspaceInspection};
+use gate4agent_node_protocol::{GitSnapshot, WorkspaceEntryKind, WorkspaceInspection};
 
 use crate::app::{
     AddSpaceField, App, ConnectionState, ControlSection, CreateWorktreeField, DragState, Focus,
@@ -1769,7 +1769,7 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_node::protocol::{
+    use gate4agent_node_protocol::{
         GitCommitSummary, GitStatusEntry, GitWorktreeSnapshot, WorkspaceEntry, WorkspaceId,
     };
     use gate4agent_types::TerminalMouseProtocolEncoding;

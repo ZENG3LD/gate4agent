@@ -1,4 +1,4 @@
-//! Native Gate4Agent node and its reusable local client.
+//! Native Gate4Agent node server and runtime.
 
 #[cfg(windows)]
 mod git_worktree;
@@ -8,8 +8,7 @@ mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    NamedPipeNodeClient, NodeClientError, NodeServer, NodeServerConfig, NodeServerError,
-    NodeShutdownHandle, WorkspaceConfig,
+    NodeServer, NodeServerConfig, NodeServerError, NodeShutdownHandle, WorkspaceConfig,
 };
 
 pub use gate4agent_node_protocol as protocol;

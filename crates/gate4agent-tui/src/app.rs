@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use gate4agent_node::protocol::{
+use gate4agent_node_protocol::{
     GitWorktreeSnapshot, WorkspaceEntryKind, WorkspaceId, WorkspaceInspection,
     MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
 };
@@ -3476,7 +3476,7 @@ fn cycle_provider(enabled: &[Provider], current: Provider, forward: bool) -> Pro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_node::protocol::{
+    use gate4agent_node_protocol::{
         GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, WorkspaceEntry,
     };
 

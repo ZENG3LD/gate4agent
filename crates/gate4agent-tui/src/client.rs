@@ -12,12 +12,12 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use gate4agent_node::protocol::{
+use gate4agent_node_protocol::{
     AgentProvider, ClientRole, ControllerState, NodeEvent, NodeFailureCode, NodeId, NodeRequest,
     NodeResponse, NodeSnapshot, SessionAddress as WireSessionAddress, SessionKey, SessionMode,
     WorkspaceId, MAX_CONTROLLER_LEASE_MS, MAX_NODE_TEXT_BYTES,
 };
-use gate4agent_node::{NamedPipeNodeClient, NodeClientError};
+use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
 use gate4agent_types::{
     ControlEvent, ControlEventKind, ProviderActivity, SessionSnapshot, SessionStatus, TerminalSize,
     TerminalMouseProtocolEncoding, TransportKind,
@@ -89,7 +89,7 @@ enum WorkerUpdate {
     SelectWorkspace { node_id: String, workspace_id: String },
     WorkspaceInspected {
         node_id: String,
-        inspection: gate4agent_node::protocol::WorkspaceInspection,
+        inspection: gate4agent_node_protocol::WorkspaceInspection,
     },
     WorkspaceInspectionFailed {
         node_id: String,
@@ -1978,7 +1978,7 @@ mod tests {
     fn worktree_response_projection_selects_created_and_refreshes_authoritative_workspace() {
         let created_workspace_id = WorkspaceId::new("feature-a").unwrap();
         let created = NodeResponse::WorktreeCreated {
-            worktree: gate4agent_node::protocol::GitWorktreeSnapshot {
+            worktree: gate4agent_node_protocol::GitWorktreeSnapshot {
                 path: r"C:\work\feature-a".to_owned(),
                 head: "abc".to_owned(),
                 branch: Some("feature/a".to_owned()),
@@ -1990,7 +1990,7 @@ mod tests {
                 prunable_reason: None,
                 workspace_id: Some(created_workspace_id.clone()),
             },
-            workspace: gate4agent_node::protocol::WorkspaceSnapshot {
+            workspace: gate4agent_node_protocol::WorkspaceSnapshot {
                 workspace_id: created_workspace_id.clone(),
                 canonical_root: r"C:\work\feature-a".to_owned(),
                 sessions: Vec::new(),

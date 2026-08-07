@@ -417,6 +417,7 @@ dependencies = [
  "gate4agent-catalog",
  "gate4agent-handle",
  "gate4agent-node-protocol",
+ "gate4agent-node-wire",
  "gate4agent-runtime-native",
  "gate4agent-testkit",
  "gate4agent-types",
@@ -432,6 +433,15 @@ dependencies = [
  "gate4agent-types",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "gate4agent-node-wire"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-node-protocol",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -574,7 +584,8 @@ name = "gate4agent-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "gate4agent-node",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
  "gate4agent-types",
  "tokio",
  "uzor-tui",

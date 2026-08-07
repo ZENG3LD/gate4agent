@@ -6,7 +6,8 @@ publish = false
 
 [dependencies]
 crossterm = "0.28"
-gate4agent-node = { path = "../gate4agent-node" }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-node-wire = { path = "../gate4agent-node-wire" }
 gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uzor-tui = { path = "../../../uzor/uzor-tui" }

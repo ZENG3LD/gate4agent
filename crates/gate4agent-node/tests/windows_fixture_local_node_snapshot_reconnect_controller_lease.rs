@@ -5,10 +5,8 @@ use gate4agent_node::protocol::{
     NodeResponse, NodeSnapshot, ServerFrame, SessionAddress, SessionMode, WorkspaceId,
     MAX_NODE_TEXT_BYTES, NODE_PROTOCOL_VERSION,
 };
-use gate4agent_node::{
-    NamedPipeNodeClient, NodeClientError, NodeServer, NodeServerConfig, NodeServerError,
-    WorkspaceConfig,
-};
+use gate4agent_node::{NodeServer, NodeServerConfig, NodeServerError, WorkspaceConfig};
+use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
 use gate4agent_types::{
     ControlEventKind, SessionGeneration, SessionStatus, TerminalControl, TerminalSize,
 };
@@ -151,7 +149,7 @@ fn assert_git_success(root: &Path, arguments: &[&str]) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn windows_fixture_local_node_snapshot_reconnect_controller_lease() {
+async fn windows_fixture_extracted_named_pipe_client_preserves_auth_snapshot_events_and_controller_lease() {
     let endpoint = endpoint();
     let token = "fixture-control-token";
     let external = KillOnDrop(

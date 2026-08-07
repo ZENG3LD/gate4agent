@@ -15,6 +15,7 @@ path = "src/main.rs"
 gate4agent-catalog = { path = "../gate4agent-catalog" }
 gate4agent-handle = { path = "../gate4agent-handle" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-node-wire = { path = "../gate4agent-node-wire" }
 gate4agent-runtime-native = { path = "../gate4agent-runtime-native" }
 gate4agent-testkit = { path = "../gate4agent-testkit", optional = true }
 gate4agent-types = { path = "../gate4agent-types" }
@@ -24,7 +25,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt"
 
 [features]
 default = []
-fixture = ["dep:gate4agent-testkit"]
+fixture = ["dep:gate4agent-testkit", "gate4agent-node-wire/fixture"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

@@ -20,7 +20,7 @@ portable-pty = "0.8"
 vte = "0.13"
 
 # Full virtual terminal screen emulation (ScreenParser, PTY mirror mode)
-vt100 = "0.15"
+vt100 = "0.16"
 
 # Async runtime + broadcast channel (required for PtySession and PipeSession)
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "process"] }

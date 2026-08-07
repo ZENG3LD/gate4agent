@@ -5,8 +5,14 @@ use gate4agent_node::protocol::{
     WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, MAX_NODE_IDENTIFIER_BYTES,
     MAX_WORKSPACE_ROOT_BYTES,
 };
-use gate4agent_types::{TerminalControl, TERMINAL_INPUT_MAX_BYTES};
+use gate4agent_types::{
+    TerminalControl, TerminalMouseProtocolEncoding, TERMINAL_INPUT_MAX_BYTES,
+};
 use uzor_tui::Rect;
+
+const WHEEL_SCROLL_LINES: usize = 3;
+const MIN_CONTROL_MODAL_WIDTH: u16 = 36;
+const MIN_CONTROL_MODAL_HEIGHT: u16 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Provider {
@@ -115,6 +121,10 @@ pub struct SessionView {
     pub attention: bool,
     pub has_provider_session_identity: bool,
     pub terminal_formatted: Vec<u8>,
+    pub terminal_scrollback: Vec<Vec<u8>>,
+    pub terminal_alternate_screen: bool,
+    pub terminal_mouse_protocol_enabled: bool,
+    pub terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding,
     pub terminal_cursor: Option<(u16, u16)>,
 }
 
@@ -319,6 +329,12 @@ pub enum DragState {
         origin_x: u16,
         origin_y: u16,
     },
+    ControlModalResize {
+        start_column: u16,
+        start_row: u16,
+        origin_width: u16,
+        origin_height: u16,
+    },
     SidebarWidth,
     SidebarSplit,
     SessionChip {
@@ -326,6 +342,8 @@ pub enum DragState {
         address: SessionAddress,
         start_column: u16,
         start_row: u16,
+        current_column: u16,
+        current_row: u16,
         moved: bool,
     },
     GridDivider {
@@ -435,6 +453,7 @@ pub enum HitTarget {
     SettingsStyle,
     SettingsPlacement,
     ControlDrag,
+    ControlResize,
     SidebarWidthDrag,
     SidebarSplitDrag,
     Viewport,
@@ -483,11 +502,17 @@ pub struct App {
     pub roster_mode: RosterMode,
     pub files_cursor: usize,
     pub git_cursor: usize,
+    pub files_scroll: usize,
+    pub git_scroll: usize,
+    pub agents_scroll: usize,
+    pub workspaces_scroll: usize,
+    pub terminal_scroll_offsets: BTreeMap<SessionAddress, usize>,
     pub collapsed_directories: BTreeSet<(String, String, String)>,
     pub menu_placement: MenuPlacement,
     pub control_section: ControlSection,
     pub settings_return_focus: Focus,
     pub control_modal_position: Option<(u16, u16)>,
+    pub control_modal_size: Option<(u16, u16)>,
     pub sidebar_width: u16,
     pub sidebar_split_percent: u16,
     pub drag_state: Option<DragState>,
@@ -520,11 +545,17 @@ impl Default for App {
             roster_mode: RosterMode::Agents,
             files_cursor: 0,
             git_cursor: 0,
+            files_scroll: 0,
+            git_scroll: 0,
+            agents_scroll: 0,
+            workspaces_scroll: 0,
+            terminal_scroll_offsets: BTreeMap::new(),
             collapsed_directories: BTreeSet::new(),
             menu_placement: MenuPlacement::Sidebar,
             control_section: ControlSection::Files,
             settings_return_focus: Focus::Tabs,
             control_modal_position: None,
+            control_modal_size: None,
             sidebar_width: 26,
             sidebar_split_percent: 50,
             drag_state: None,
@@ -657,6 +688,10 @@ impl App {
             .files_cursor
             .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
         self.git_cursor = self.git_cursor.min(self.git_item_count().saturating_sub(1));
+        self.files_scroll = self
+            .files_scroll
+            .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
+        self.git_scroll = self.git_scroll.min(self.git_item_count().saturating_sub(1));
         if self
             .inspection_pending
             .as_ref()
@@ -799,6 +834,15 @@ impl App {
     }
 
     pub fn upsert_node(&mut self, node: NodeView) {
+        let previous_scrollback = self
+            .terminal_scroll_offsets
+            .keys()
+            .filter(|address| address.node_id == node.node_id)
+            .filter_map(|address| {
+                self.find_session(address)
+                    .map(|session| (address.clone(), session.terminal_scrollback.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
         let selected_space = self.selected_workspace().map(|(node, workspace)| {
             (node.node_id.clone(), workspace.workspace_id.clone())
         });
@@ -965,6 +1009,7 @@ impl App {
             .files_cursor
             .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
         self.git_cursor = self.git_cursor.min(self.git_item_count().saturating_sub(1));
+        self.reconcile_terminal_scroll_offsets(&previous_scrollback);
         self.reconcile_session_drag();
     }
 
@@ -1005,6 +1050,8 @@ impl App {
                 .panes
                 .retain(|pane| pane.address.node_id != expected_node_id);
             self.pending_open.retain(|address| address.node_id != expected_node_id);
+            self.terminal_scroll_offsets
+                .retain(|address, _| address.node_id != expected_node_id);
             if self.pending_space.as_ref().is_some_and(|(node_id, _)| node_id == expected_node_id) {
                 self.pending_space = None;
             }
@@ -1235,16 +1282,44 @@ impl App {
                 address,
                 start_column,
                 start_row,
+                current_column,
+                current_row,
                 moved,
             } => self.rebound_address(&address).map(|address| DragState::SessionChip {
                 source,
                 address,
                 start_column,
                 start_row,
+                current_column,
+                current_row,
                 moved,
             }),
             other => Some(other),
         };
+    }
+
+    fn reconcile_terminal_scroll_offsets(
+        &mut self,
+        previous_scrollback: &BTreeMap<SessionAddress, Vec<Vec<u8>>>,
+    ) {
+        let previous = std::mem::take(&mut self.terminal_scroll_offsets);
+        for (address, offset) in previous {
+            let Some(rebound) = self.rebound_address(&address) else {
+                continue;
+            };
+            let Some(session) = self.find_session(&rebound) else {
+                continue;
+            };
+            let maximum = session.terminal_scrollback.len();
+            let advance = previous_scrollback
+                .get(&address)
+                .map(|previous| scrollback_advance(previous, &session.terminal_scrollback))
+                .unwrap_or(0);
+            let offset = offset.saturating_add(advance).min(maximum);
+            if offset > 0 {
+                self.terminal_scroll_offsets.insert(rebound, offset);
+            }
+        }
     }
 
     pub fn close_selected_tab(&mut self) {
@@ -1366,6 +1441,9 @@ impl App {
             .map(|hit| hit.target.clone());
         if self.focus == Focus::Settings {
             match target {
+                Some(HitTarget::ControlResize) => {
+                    self.begin_control_resize(column, row);
+                }
                 Some(HitTarget::ControlDrag) => {
                     self.begin_control_drag(column, row);
                 }
@@ -1386,7 +1464,15 @@ impl App {
                 }
                 Some(HitTarget::Agent(index)) => {
                     self.selected_agent = index;
-                    self.open_selected_agent();
+                    if let Some(address) = self.agent_addresses().get(index).cloned() {
+                        self.open_address(address.clone());
+                        self.begin_session_drag(
+                            DragSource::Agent(index),
+                            address,
+                            column,
+                            row,
+                        );
+                    }
                 }
                 Some(HitTarget::Space(index)) => {
                     self.select_workspace_without_inspection(index);
@@ -1481,7 +1567,8 @@ impl App {
                 HitTarget::ControlSection(_)
                 | HitTarget::SettingsStyle
                 | HitTarget::SettingsPlacement
-                | HitTarget::ControlDrag,
+                | HitTarget::ControlDrag
+                | HitTarget::ControlResize,
             ) => {}
             Some(HitTarget::Viewport) => self.focus = Focus::Viewport,
             None => {}
@@ -1494,20 +1581,32 @@ impl App {
             return AppAction::None;
         }
         if self.focus == Focus::Settings {
-            return if self.layout.control_content.contains(column, row) {
-                self.scroll_control(up)
+            return if self.layout.control_modal.contains(column, row)
+                || self.layout.control_content.contains(column, row)
+            {
+                self.wheel_control(up)
             } else {
                 AppAction::None
             };
         }
-        let key = if up { UiKey::Up } else { UiKey::Down };
+        if let Some((address, viewport)) = self.terminal_target_at(column, row) {
+            return self.scroll_terminal(address, viewport, column, row, up);
+        }
         if self.layout.spaces.contains(column, row) {
-            self.focus = Focus::Spaces;
-            return self.reduce_spaces(key);
+            let reserved_rows = match self.sidebar_mode {
+                SidebarMode::Files => 2,
+                SidebarMode::Git => 3,
+            };
+            self.scroll_inspector(
+                self.sidebar_mode,
+                up,
+                self.layout.spaces.height.saturating_sub(reserved_rows),
+            );
+            return AppAction::None;
         }
         if self.layout.agents.contains(column, row) {
-            self.focus = Focus::Agents;
-            return self.reduce_agents(key);
+            self.scroll_roster(self.roster_mode, up, self.layout.agents.height.saturating_sub(3));
+            return AppAction::None;
         }
         AppAction::None
     }
@@ -1532,6 +1631,35 @@ impl App {
                     y.clamp(0, i32::from(max_y)) as u16,
                 ));
             }
+            DragState::ControlModalResize {
+                start_column,
+                start_row,
+                origin_width,
+                origin_height,
+            } => {
+                let width = i32::from(origin_width) + i32::from(column) - i32::from(start_column);
+                let height = i32::from(origin_height) + i32::from(row) - i32::from(start_row);
+                let max_width = self
+                    .control_modal_position
+                    .map(|(x, _)| self.terminal_cols.saturating_sub(x))
+                    .unwrap_or(self.terminal_cols)
+                    .max(1);
+                let max_height = self
+                    .control_modal_position
+                    .map(|(_, y)| self.terminal_rows.saturating_sub(y))
+                    .unwrap_or(self.terminal_rows)
+                    .max(1);
+                self.control_modal_size = Some((
+                    width.clamp(
+                        i32::from(MIN_CONTROL_MODAL_WIDTH.min(max_width)),
+                        i32::from(max_width),
+                    ) as u16,
+                    height.clamp(
+                        i32::from(MIN_CONTROL_MODAL_HEIGHT.min(max_height)),
+                        i32::from(max_height),
+                    ) as u16,
+                ));
+            }
             DragState::SidebarWidth => {
                 let maximum = self.terminal_cols.saturating_sub(24).min(60).max(18);
                 self.sidebar_width = column.saturating_add(1).clamp(18, maximum);
@@ -1546,8 +1674,16 @@ impl App {
                 start_row,
                 ..
             } => {
-                if column != start_column || row != start_row {
-                    if let Some(DragState::SessionChip { moved, .. }) = self.drag_state.as_mut() {
+                if let Some(DragState::SessionChip {
+                    current_column,
+                    current_row,
+                    moved,
+                    ..
+                }) = self.drag_state.as_mut()
+                {
+                    *current_column = column;
+                    *current_row = row;
+                    if column != start_column || row != start_row {
                         *moved = true;
                     }
                 }
@@ -1619,6 +1755,21 @@ impl App {
         });
     }
 
+    fn begin_control_resize(&mut self, column: u16, row: u16) {
+        let modal = self.layout.control_modal;
+        if modal.width == 0 || modal.height == 0 {
+            return;
+        }
+        self.control_modal_position = Some((modal.x, modal.y));
+        self.control_modal_size = Some((modal.width, modal.height));
+        self.drag_state = Some(DragState::ControlModalResize {
+            start_column: column,
+            start_row: row,
+            origin_width: modal.width,
+            origin_height: modal.height,
+        });
+    }
+
     fn begin_session_drag(
         &mut self,
         source: DragSource,
@@ -1631,6 +1782,8 @@ impl App {
             address,
             start_column: column,
             start_row: row,
+            current_column: column,
+            current_row: row,
             moved: false,
         });
     }
@@ -1695,6 +1848,8 @@ impl App {
         self.selected_space = index;
         self.files_cursor = 0;
         self.git_cursor = 0;
+        self.files_scroll = 0;
+        self.git_scroll = 0;
     }
 
     fn select_inspector_item(&mut self, mode: SidebarMode, index: usize) -> AppAction {
@@ -1721,6 +1876,9 @@ impl App {
                 }
                 self.files_cursor = self
                     .files_cursor
+                    .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
+                self.files_scroll = self
+                    .files_scroll
                     .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
             }
             SidebarMode::Git => self.git_cursor = index.min(self.git_item_count().saturating_sub(1)),
@@ -1818,29 +1976,225 @@ impl App {
         }
     }
 
-    fn scroll_control(&mut self, up: bool) -> AppAction {
+    fn wheel_control(&mut self, up: bool) -> AppAction {
+        match self.control_section {
+            ControlSection::Files => self.scroll_inspector(
+                SidebarMode::Files,
+                up,
+                self.layout.control_content.height.saturating_sub(1),
+            ),
+            ControlSection::Git => self.scroll_inspector(
+                SidebarMode::Git,
+                up,
+                self.layout.control_content.height.saturating_sub(2),
+            ),
+            ControlSection::Agents => self.scroll_roster(
+                RosterMode::Agents,
+                up,
+                self.layout.control_content.height.saturating_sub(1),
+            ),
+            ControlSection::Workspaces => self.scroll_roster(
+                RosterMode::Workspaces,
+                up,
+                self.layout.control_content.height.saturating_sub(1),
+            ),
+            ControlSection::Settings => {}
+        }
+        AppAction::None
+    }
+
+    fn move_control_selection(&mut self, up: bool) -> AppAction {
         match self.control_section {
             ControlSection::Files => {
-                let count = self.visible_workspace_entry_indices().len();
-                self.files_cursor = scrolled_index(self.files_cursor, count, up);
+                self.files_cursor = moved_index(
+                    self.files_cursor,
+                    self.visible_workspace_entry_indices().len(),
+                    up,
+                );
             }
             ControlSection::Git => {
-                self.git_cursor = scrolled_index(self.git_cursor, self.git_item_count(), up);
+                self.git_cursor = moved_index(self.git_cursor, self.git_item_count(), up);
             }
             ControlSection::Agents => {
-                self.selected_agent =
-                    scrolled_index(self.selected_agent, self.agent_addresses().len(), up);
+                self.selected_agent = moved_index(
+                    self.selected_agent,
+                    self.agent_addresses().len(),
+                    up,
+                );
             }
             ControlSection::Workspaces => {
-                let next = scrolled_index(self.selected_space, self.space_rows().len(), up);
+                let next = moved_index(self.selected_space, self.space_rows().len(), up);
                 if next != self.selected_space {
                     self.select_workspace_without_inspection(next);
+                    self.reveal_roster_selection(
+                        RosterMode::Workspaces,
+                        self.layout.control_content.height.saturating_sub(1),
+                    );
                     return self.inspect_selected_workspace();
                 }
             }
             ControlSection::Settings => {}
         }
+        match self.control_section {
+            ControlSection::Files => self.reveal_inspector_selection(
+                SidebarMode::Files,
+                self.layout.control_content.height.saturating_sub(1),
+            ),
+            ControlSection::Git => self.reveal_inspector_selection(
+                SidebarMode::Git,
+                self.layout.control_content.height.saturating_sub(2),
+            ),
+            ControlSection::Agents => self.reveal_roster_selection(
+                RosterMode::Agents,
+                self.layout.control_content.height.saturating_sub(1),
+            ),
+            ControlSection::Workspaces => self.reveal_roster_selection(
+                RosterMode::Workspaces,
+                self.layout.control_content.height.saturating_sub(1),
+            ),
+            ControlSection::Settings => {}
+        }
         AppAction::None
+    }
+
+    fn terminal_target_at(&self, column: u16, row: u16) -> Option<(SessionAddress, Rect)> {
+        match self.surface_mode {
+            SurfaceMode::Tab if self.layout.viewport.contains(column, row) => {
+                self.focused_address()
+                    .cloned()
+                    .map(|address| (address, self.layout.viewport))
+            }
+            SurfaceMode::Grid => self
+                .layout
+                .grid_panes
+                .iter()
+                .find(|pane| pane.viewport.contains(column, row))
+                .and_then(|layout| {
+                    self.grid
+                        .panes
+                        .get(layout.pane_index)
+                        .map(|pane| (pane.address.clone(), layout.viewport))
+                }),
+            SurfaceMode::Tab => None,
+        }
+    }
+
+    fn scroll_terminal(
+        &mut self,
+        address: SessionAddress,
+        viewport: Rect,
+        column: u16,
+        row: u16,
+        up: bool,
+    ) -> AppAction {
+        let Some(session) = self.find_session(&address) else {
+            return AppAction::None;
+        };
+        let maximum = session.terminal_scrollback.len();
+        let current = self.terminal_scroll_offset(&address).min(maximum);
+        if current > 0 {
+            let next = if up {
+                current.saturating_add(WHEEL_SCROLL_LINES).min(maximum)
+            } else {
+                current.saturating_sub(WHEEL_SCROLL_LINES)
+            };
+            if next == 0 {
+                self.terminal_scroll_offsets.remove(&address);
+            } else {
+                self.terminal_scroll_offsets.insert(address, next);
+            }
+            return AppAction::None;
+        }
+        if session.running && session.terminal_mouse_protocol_enabled {
+            let x = column
+                .saturating_sub(viewport.x)
+                .saturating_add(1)
+                .min(viewport.width.max(1));
+            let y = row
+                .saturating_sub(viewport.y)
+                .saturating_add(1)
+                .min(viewport.height.max(1));
+            return AppAction::TerminalBytes {
+                address,
+                bytes: terminal_mouse_wheel_bytes(
+                    session.terminal_mouse_protocol_encoding,
+                    x,
+                    y,
+                    up,
+                ),
+            };
+        }
+        if session.terminal_alternate_screen || maximum == 0 {
+            return AppAction::None;
+        }
+        let next = if up {
+            WHEEL_SCROLL_LINES.min(maximum)
+        } else {
+            0
+        };
+        if next > 0 {
+            self.terminal_scroll_offsets.insert(address, next);
+        }
+        AppAction::None
+    }
+
+    fn scroll_inspector(&mut self, mode: SidebarMode, up: bool, visible_rows: u16) {
+        let count = match mode {
+            SidebarMode::Files => self.visible_workspace_entry_indices().len(),
+            SidebarMode::Git => self.git_item_count(),
+        };
+        let maximum = count.saturating_sub(visible_rows as usize);
+        let offset = match mode {
+            SidebarMode::Files => &mut self.files_scroll,
+            SidebarMode::Git => &mut self.git_scroll,
+        };
+        *offset = wheel_scroll_start(*offset, maximum, up);
+    }
+
+    fn scroll_roster(&mut self, mode: RosterMode, up: bool, visible_rows: u16) {
+        let capacity = visible_rows as usize / 2;
+        let count = match mode {
+            RosterMode::Agents => self.agent_addresses().len(),
+            RosterMode::Workspaces => self.space_rows().len(),
+        };
+        let maximum = count.saturating_sub(capacity);
+        let offset = match mode {
+            RosterMode::Agents => &mut self.agents_scroll,
+            RosterMode::Workspaces => &mut self.workspaces_scroll,
+        };
+        *offset = wheel_scroll_start(*offset, maximum, up);
+    }
+
+    fn reveal_inspector_selection(&mut self, mode: SidebarMode, visible_rows: u16) {
+        let (selected, count) = match mode {
+            SidebarMode::Files => (
+                self.files_cursor,
+                self.visible_workspace_entry_indices().len(),
+            ),
+            SidebarMode::Git => (self.git_cursor, self.git_item_count()),
+        };
+        let offset = match mode {
+            SidebarMode::Files => &mut self.files_scroll,
+            SidebarMode::Git => &mut self.git_scroll,
+        };
+        *offset = visible_selection_start(*offset, selected, count, visible_rows as usize);
+    }
+
+    fn reveal_roster_selection(&mut self, mode: RosterMode, visible_rows: u16) {
+        let capacity = visible_rows as usize / 2;
+        let (selected, count) = match mode {
+            RosterMode::Agents => (self.selected_agent, self.agent_addresses().len()),
+            RosterMode::Workspaces => (self.selected_space, self.space_rows().len()),
+        };
+        let offset = match mode {
+            RosterMode::Agents => &mut self.agents_scroll,
+            RosterMode::Workspaces => &mut self.workspaces_scroll,
+        };
+        *offset = visible_selection_start(*offset, selected, count, capacity);
+    }
+
+    pub fn terminal_scroll_offset(&self, address: &SessionAddress) -> usize {
+        self.terminal_scroll_offsets.get(address).copied().unwrap_or(0)
     }
 
     pub fn inspect_selected_workspace(&mut self) -> AppAction {
@@ -1949,6 +2303,7 @@ impl App {
 
     fn reduce_spaces(&mut self, key: UiKey) -> AppAction {
         let count = self.sidebar_item_count();
+        let navigated = matches!(&key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
         match key {
             UiKey::Up => match self.sidebar_mode {
                 SidebarMode::Files => self.files_cursor = self.files_cursor.saturating_sub(1),
@@ -1980,6 +2335,16 @@ impl App {
             UiKey::Char('f') => return self.select_sidebar_mode(SidebarMode::Files),
             UiKey::Char('g') => return self.select_sidebar_mode(SidebarMode::Git),
             _ => {}
+        }
+        if navigated {
+            let reserved_rows = match self.sidebar_mode {
+                SidebarMode::Files => 2,
+                SidebarMode::Git => 3,
+            };
+            self.reveal_inspector_selection(
+                self.sidebar_mode,
+                self.layout.spaces.height.saturating_sub(reserved_rows),
+            );
         }
         AppAction::None
     }
@@ -2016,7 +2381,8 @@ impl App {
         }
         if self.roster_mode == RosterMode::Workspaces {
             let count = self.space_rows().len();
-            return match key {
+            let navigated = matches!(&key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
+            let action = match key {
                 UiKey::Up if self.selected_space > 0 => {
                     self.select_workspace(self.selected_space - 1)
                 }
@@ -2034,8 +2400,16 @@ impl App {
                 UiKey::Char('r') => self.inspect_selected_workspace(),
                 _ => AppAction::None,
             };
+            if navigated {
+                self.reveal_roster_selection(
+                    RosterMode::Workspaces,
+                    self.layout.agents.height.saturating_sub(3),
+                );
+            }
+            return action;
         }
         let count = self.agent_addresses().len();
+        let navigated = matches!(&key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
         match key {
             UiKey::Up => self.selected_agent = self.selected_agent.saturating_sub(1),
             UiKey::Down if count > 0 => self.selected_agent = (self.selected_agent + 1).min(count - 1),
@@ -2063,6 +2437,12 @@ impl App {
             UiKey::Char('+') | UiKey::Insert => return self.begin_spawn(),
             UiKey::Char('r') => return self.restart_selected_agent(),
             _ => {}
+        }
+        if navigated {
+            self.reveal_roster_selection(
+                RosterMode::Agents,
+                self.layout.agents.height.saturating_sub(3),
+            );
         }
         AppAction::None
     }
@@ -2340,8 +2720,8 @@ impl App {
                     true,
                 ));
             }
-            UiKey::Up => return self.scroll_control(true),
-            UiKey::Down => return self.scroll_control(false),
+            UiKey::Up => return self.move_control_selection(true),
+            UiKey::Down => return self.move_control_selection(false),
             UiKey::Enter => match self.control_section {
                 ControlSection::Files => {
                     let Some(entry_index) = self
@@ -2441,6 +2821,7 @@ impl App {
             self.notice = Some("no PTY selected".to_owned());
             return AppAction::None;
         };
+        self.terminal_scroll_offsets.remove(&address);
         make(address)
     }
 
@@ -2456,13 +2837,82 @@ fn is_absolute_root(root: &str) -> bool {
         || (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/'))
 }
 
-fn scrolled_index(current: usize, count: usize, up: bool) -> usize {
+fn wheel_scroll_start(current: usize, maximum: usize, up: bool) -> usize {
+    if up {
+        current.saturating_sub(WHEEL_SCROLL_LINES)
+    } else {
+        current.saturating_add(WHEEL_SCROLL_LINES).min(maximum)
+    }
+}
+
+fn visible_selection_start(
+    current: usize,
+    selected: usize,
+    count: usize,
+    capacity: usize,
+) -> usize {
+    if count == 0 || capacity == 0 {
+        return 0;
+    }
+    let maximum = count.saturating_sub(capacity);
+    let current = current.min(maximum);
+    if selected < current {
+        selected
+    } else if selected >= current.saturating_add(capacity) {
+        selected.saturating_add(1).saturating_sub(capacity).min(maximum)
+    } else {
+        current
+    }
+}
+
+fn moved_index(current: usize, count: usize, up: bool) -> usize {
     if count == 0 {
         0
     } else if up {
         current.saturating_sub(1)
     } else {
-        (current + 1).min(count - 1)
+        current.saturating_add(1).min(count - 1)
+    }
+}
+
+fn scrollback_advance(previous: &[Vec<u8>], current: &[Vec<u8>]) -> usize {
+    let maximum_overlap = previous.len().min(current.len());
+    for overlap in (1..=maximum_overlap).rev() {
+        if previous[previous.len() - overlap..] == current[..overlap] {
+            return current.len().saturating_sub(overlap);
+        }
+    }
+    0
+}
+
+fn terminal_mouse_wheel_bytes(
+    encoding: TerminalMouseProtocolEncoding,
+    column: u16,
+    row: u16,
+    up: bool,
+) -> Vec<u8> {
+    let button = if up { 64_u32 } else { 65_u32 };
+    match encoding {
+        TerminalMouseProtocolEncoding::Sgr => {
+            format!("\x1b[<{button};{column};{row}M").into_bytes()
+        }
+        TerminalMouseProtocolEncoding::Default => vec![
+            0x1b,
+            b'[',
+            b'M',
+            (button + 32) as u8,
+            u8::try_from(u32::from(column.min(223)) + 32).unwrap_or(u8::MAX),
+            u8::try_from(u32::from(row.min(223)) + 32).unwrap_or(u8::MAX),
+        ],
+        TerminalMouseProtocolEncoding::Utf8 => {
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [button + 32, u32::from(column) + 32, u32::from(row) + 32] {
+                let character = char::from_u32(value).unwrap_or('\u{fffd}');
+                let mut encoded = [0_u8; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            }
+            bytes
+        }
     }
 }
 
@@ -2637,6 +3087,10 @@ mod tests {
                     attention: false,
                     has_provider_session_identity: true,
                     terminal_formatted: b"codex".to_vec(),
+                    terminal_scrollback: Vec::new(),
+                    terminal_alternate_screen: false,
+                    terminal_mouse_protocol_enabled: false,
+                    terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                     terminal_cursor: Some((0, 5)),
                 }],
             }],
@@ -2852,31 +3306,28 @@ mod tests {
         second_agent.address.instance_id = 8;
         second_agent.provider = Provider::Claude;
         app.nodes[0].workspaces[0].sessions.push(second_agent);
-        app.layout.spaces = Rect::new(0, 0, 25, 10);
-        app.layout.agents = Rect::new(0, 10, 25, 10);
+        app.layout.spaces = Rect::new(0, 0, 25, 4);
+        app.layout.agents = Rect::new(0, 4, 25, 5);
 
         app.sidebar_mode = SidebarMode::Files;
         assert_eq!(app.scroll(2, 2, false), AppAction::None);
-        assert_eq!(app.files_cursor, 1);
-        assert_eq!(app.git_cursor, 0);
+        assert_eq!(app.files_scroll, 2);
+        assert_eq!((app.files_cursor, app.git_cursor), (0, 0));
 
         app.sidebar_mode = SidebarMode::Git;
         assert_eq!(app.scroll(2, 2, false), AppAction::None);
-        assert_eq!(app.files_cursor, 1);
-        assert_eq!(app.git_cursor, 1);
+        assert_eq!(app.git_scroll, 1);
+        assert_eq!((app.files_cursor, app.git_cursor), (0, 0));
 
         app.roster_mode = RosterMode::Agents;
-        assert_eq!(app.scroll(2, 12, false), AppAction::None);
-        assert_eq!(app.selected_agent, 1);
-        assert_eq!(app.selected_space, 0);
+        assert_eq!(app.scroll(2, 6, false), AppAction::None);
+        assert_eq!(app.agents_scroll, 1);
+        assert_eq!((app.selected_agent, app.selected_space), (0, 0));
 
         app.roster_mode = RosterMode::Workspaces;
-        assert!(matches!(
-            app.scroll(2, 12, false),
-            AppAction::InspectWorkspace { workspace_id, .. } if workspace_id == "workspace-b"
-        ));
-        assert_eq!(app.selected_space, 1);
-        assert_eq!(app.selected_agent, 1);
+        assert_eq!(app.scroll(2, 6, false), AppAction::None);
+        assert_eq!(app.workspaces_scroll, 1);
+        assert_eq!((app.selected_agent, app.selected_space), (0, 0));
     }
 
     #[test]
@@ -2907,10 +3358,11 @@ mod tests {
         app.menu_placement = MenuPlacement::Modal;
         app.control_section = ControlSection::Files;
         app.sidebar_mode = SidebarMode::Files;
-        app.layout.control_content = Rect::new(10, 4, 60, 14);
+        app.layout.control_content = Rect::new(10, 4, 60, 3);
 
-        assert_eq!(app.scroll(20, 8, false), AppAction::None);
-        assert_eq!(app.files_cursor, 1);
+        assert_eq!(app.scroll(20, 5, false), AppAction::None);
+        assert_eq!(app.files_scroll, 2);
+        assert_eq!(app.files_cursor, 0);
         assert_eq!(app.focus, Focus::Settings);
         app.layout.hits.push(HitRegion {
             rect: Rect::new(12, 6, 40, 1),
@@ -2924,8 +3376,9 @@ mod tests {
             app.select_control_section(ControlSection::Git),
             AppAction::InspectWorkspace { .. }
         ));
-        assert_eq!(app.scroll(20, 8, false), AppAction::None);
-        assert_eq!(app.git_cursor, 1);
+        assert_eq!(app.scroll(20, 5, false), AppAction::None);
+        assert_eq!(app.git_scroll, 1);
+        assert_eq!(app.git_cursor, 0);
         assert_eq!(app.files_cursor, 0);
         assert_eq!(app.focus, Focus::Settings);
     }
@@ -3518,5 +3971,181 @@ mod tests {
         assert_eq!(app.grid.focused, 1);
         app.reduce(UiKey::Down);
         assert_eq!(app.grid.focused, 2);
+    }
+
+    #[test]
+    fn wheel_scrolls_terminal_history_without_sending_cursor_keys() {
+        let mut app = fixture();
+        let address = app.tabs[0].address.clone();
+        app.nodes[0].workspaces[0].sessions[0].terminal_scrollback =
+            (0..10).map(|line| format!("history-{line}").into_bytes()).collect();
+        app.layout.viewport = Rect::new(26, 1, 74, 20);
+
+        assert_eq!(app.scroll(30, 5, true), AppAction::None);
+        assert_eq!(app.terminal_scroll_offset(&address), WHEEL_SCROLL_LINES);
+        assert_eq!(app.scroll(30, 5, false), AppAction::None);
+        assert_eq!(app.terminal_scroll_offset(&address), 0);
+    }
+
+    #[test]
+    fn wheel_forwards_native_sgr_mouse_event_to_alternate_screen() {
+        let mut app = fixture();
+        let session = &mut app.nodes[0].workspaces[0].sessions[0];
+        session.terminal_alternate_screen = true;
+        session.terminal_mouse_protocol_enabled = true;
+        session.terminal_mouse_protocol_encoding = TerminalMouseProtocolEncoding::Sgr;
+        app.layout.viewport = Rect::new(26, 1, 74, 20);
+
+        assert!(matches!(
+            app.scroll(30, 5, true),
+            AppAction::TerminalBytes { bytes, .. } if bytes == b"\x1b[<64;5;5M"
+        ));
+        assert!(matches!(
+            app.scroll(30, 5, false),
+            AppAction::TerminalBytes { bytes, .. } if bytes == b"\x1b[<65;5;5M"
+        ));
+    }
+
+    #[test]
+    fn wheel_prefers_observed_mouse_tracking_over_primary_screen_history() {
+        let mut app = fixture();
+        let session = &mut app.nodes[0].workspaces[0].sessions[0];
+        session.terminal_scrollback = vec![b"history".to_vec()];
+        session.terminal_mouse_protocol_enabled = true;
+        session.terminal_mouse_protocol_encoding = TerminalMouseProtocolEncoding::Sgr;
+        app.layout.viewport = Rect::new(26, 1, 74, 20);
+
+        assert!(matches!(
+            app.scroll(30, 5, true),
+            AppAction::TerminalBytes { bytes, .. } if bytes == b"\x1b[<64;5;5M"
+        ));
+        assert!(app.terminal_scroll_offsets.is_empty());
+    }
+
+    #[test]
+    fn stopped_terminal_with_retained_mouse_mode_scrolls_local_history() {
+        let mut app = fixture();
+        let address = app.tabs[0].address.clone();
+        let session = &mut app.nodes[0].workspaces[0].sessions[0];
+        session.running = false;
+        session.terminal_scrollback = vec![b"history".to_vec()];
+        session.terminal_mouse_protocol_enabled = true;
+        session.terminal_mouse_protocol_encoding = TerminalMouseProtocolEncoding::Sgr;
+        app.layout.viewport = Rect::new(26, 1, 74, 20);
+
+        assert_eq!(app.scroll(30, 5, true), AppAction::None);
+        assert_eq!(app.terminal_scroll_offset(&address), 1);
+    }
+
+    #[test]
+    fn wheel_scrolls_the_hovered_grid_pane_independently() {
+        let mut app = fixture();
+        let first = app.tabs[0].address.clone();
+        let second = add_session(&mut app, 8, Provider::Claude);
+        for session in &mut app.nodes[0].workspaces[0].sessions {
+            session.terminal_scrollback =
+                (0..8).map(|line| format!("history-{line}").into_bytes()).collect();
+        }
+        app.move_address_to_grid(first.clone(), None);
+        app.move_address_to_grid(second.clone(), None);
+        app.surface_mode = SurfaceMode::Grid;
+        app.layout.grid_panes = vec![
+            GridPaneLayout {
+                pane_index: 0,
+                frame: Rect::new(0, 1, 50, 20),
+                header: Rect::new(0, 1, 50, 1),
+                viewport: Rect::new(0, 2, 50, 19),
+            },
+            GridPaneLayout {
+                pane_index: 1,
+                frame: Rect::new(51, 1, 49, 20),
+                header: Rect::new(51, 1, 49, 1),
+                viewport: Rect::new(51, 2, 49, 19),
+            },
+        ];
+
+        assert_eq!(app.scroll(60, 5, true), AppAction::None);
+        assert_eq!(app.terminal_scroll_offset(&first), 0);
+        assert_eq!(app.terminal_scroll_offset(&second), WHEEL_SCROLL_LINES);
+    }
+
+    #[test]
+    fn control_modal_header_wheel_scrolls_the_active_viewport() {
+        let mut app = fixture();
+        app.apply_workspace_inspection("node-a".to_owned(), workspace_inspection());
+        app.focus = Focus::Settings;
+        app.menu_placement = MenuPlacement::Modal;
+        app.control_section = ControlSection::Files;
+        app.layout.control_modal = Rect::new(10, 3, 60, 10);
+        app.layout.control_content = Rect::new(11, 5, 58, 2);
+
+        assert_eq!(app.scroll(20, 3, false), AppAction::None);
+        assert_eq!(app.files_scroll, WHEEL_SCROLL_LINES);
+        assert_eq!(app.files_cursor, 0);
+    }
+
+    #[test]
+    fn modal_agent_chip_starts_the_same_drag_as_the_sidebar() {
+        let mut app = fixture();
+        let address = app.tabs[0].address.clone();
+        app.focus = Focus::Settings;
+        app.menu_placement = MenuPlacement::Modal;
+        app.control_section = ControlSection::Agents;
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(20, 8, 24, 2),
+            target: HitTarget::Agent(0),
+        });
+
+        assert_eq!(app.click(22, 8), AppAction::None);
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::SessionChip {
+                source: DragSource::Agent(0),
+                ref address,
+                start_column: 22,
+                start_row: 8,
+                ..
+            }) if *address == app.tabs[0].address
+        ));
+        assert_eq!(app.tabs[0].address, address);
+    }
+
+    #[test]
+    fn sidebar_wheel_moves_viewport_without_moving_selection() {
+        let mut app = fixture();
+        app.apply_workspace_inspection("node-a".to_owned(), workspace_inspection());
+        app.layout.spaces = Rect::new(0, 0, 26, 4);
+        app.files_cursor = 1;
+
+        assert_eq!(app.scroll(4, 2, false), AppAction::None);
+        assert_eq!(app.files_cursor, 1);
+        assert_eq!(app.files_scroll, 2);
+    }
+
+    #[test]
+    fn terminal_input_returns_scrolled_view_to_live_bottom() {
+        let mut app = fixture();
+        let address = app.tabs[0].address.clone();
+        app.focus = Focus::Viewport;
+        app.terminal_scroll_offsets.insert(address, 9);
+
+        assert!(matches!(app.reduce(UiKey::Char('x')), AppAction::Input { .. }));
+        assert!(app.terminal_scroll_offsets.is_empty());
+    }
+
+    #[test]
+    fn live_output_keeps_a_scrolled_terminal_anchored() {
+        let mut app = fixture();
+        let address = app.tabs[0].address.clone();
+        app.nodes[0].workspaces[0].sessions[0].terminal_scrollback =
+            ["a", "b", "c"].into_iter().map(|row| row.as_bytes().to_vec()).collect();
+        app.terminal_scroll_offsets.insert(address.clone(), 1);
+        let mut update = app.nodes[0].clone();
+        update.workspaces[0].sessions[0].terminal_scrollback =
+            ["b", "c", "d"].into_iter().map(|row| row.as_bytes().to_vec()).collect();
+
+        app.upsert_node(update);
+
+        assert_eq!(app.terminal_scroll_offset(&address), 2);
     }
 }

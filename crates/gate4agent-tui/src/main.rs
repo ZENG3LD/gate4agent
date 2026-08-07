@@ -39,7 +39,7 @@ fn parse_args_from(
     let mut startup_node = None;
     let mut workspace = None;
     let mut provider = None;
-    let mut color_mode = PtyColorMode::Inherited;
+    let mut color_mode_override = None;
     let mut index = 1;
 
     while index < args.len() {
@@ -61,7 +61,7 @@ fn parse_args_from(
                 provider = Some(Provider::from_str(&value(args, &mut index, "--agent")?)?)
             }
             "--style" => {
-                color_mode = PtyColorMode::from_str(&value(args, &mut index, "--style")?)?
+                color_mode_override = Some(PtyColorMode::from_str(&value(args, &mut index, "--style")?)?)
             }
             "--help" | "-h" => {
                 return Err(
@@ -115,7 +115,7 @@ fn parse_args_from(
     } else {
         None
     };
-    Ok(RunOptions { nodes, startup, color_mode })
+    Ok(RunOptions { nodes, startup, color_mode_override })
 }
 
 fn parse_args() -> Result<RunOptions, String> {
@@ -221,7 +221,7 @@ mod tests {
             &[("GATE4AGENT_NODE_TOKEN_DESK_A", "token")],
         )
         .unwrap();
-        assert_eq!(inherited.color_mode, PtyColorMode::Inherited);
+        assert_eq!(inherited.color_mode_override, None);
         let gate = parse(
             &[
                 "gate4agent-tui",
@@ -233,7 +233,7 @@ mod tests {
             &[("GATE4AGENT_NODE_TOKEN_DESK_A", "token")],
         )
         .unwrap();
-        assert_eq!(gate.color_mode, PtyColorMode::GateOverride);
+        assert_eq!(gate.color_mode_override, Some(PtyColorMode::GateOverride));
     }
 
 }

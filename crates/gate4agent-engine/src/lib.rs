@@ -5051,6 +5051,10 @@ mod tests {
             cursor_column: 2,
             contents: "current".to_owned(),
             formatted: b"current".to_vec(),
+            scrollback_formatted: Vec::new(),
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: Default::default(),
         };
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -5080,6 +5084,10 @@ mod tests {
                     cursor_column: 0,
                     contents: "stale".to_owned(),
                     formatted: Vec::new(),
+                    scrollback_formatted: Vec::new(),
+                    alternate_screen: false,
+                    mouse_protocol_enabled: false,
+                    mouse_protocol_encoding: Default::default(),
                 },
             },
         });

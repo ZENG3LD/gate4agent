@@ -585,7 +585,7 @@ impl MultiCliManager {
     /// Resize the PTY for a single instance.
     pub async fn resize_instance(&mut self, id: InstanceId, cols: u16, rows: u16) {
         if let Some(inst) = self.instances.get_mut(&id) {
-            inst.pty_parser.set_size(rows, cols);
+            inst.pty_parser.screen_mut().set_size(rows, cols);
             if let Some(ref session) = inst.pty_session {
                 let _ = session.resize(rows, cols).await;
             }
@@ -956,7 +956,7 @@ impl MultiCliManager {
         self.cols = cols;
         self.rows = rows;
         for inst in self.instances.values_mut() {
-            inst.pty_parser.set_size(rows, cols);
+            inst.pty_parser.screen_mut().set_size(rows, cols);
             if let Some(ref session) = inst.pty_session {
                 let _ = session.resize(rows, cols).await;
             }
@@ -1267,7 +1267,7 @@ impl MultiCliManager {
                         ch: if contents.is_empty() {
                             " ".to_string()
                         } else {
-                            contents
+                            contents.to_owned()
                         },
                         fg,
                         bg,
@@ -1362,7 +1362,7 @@ impl MultiCliManager {
                             ch: if contents.is_empty() {
                                 " ".to_string()
                             } else {
-                                contents
+                                contents.to_owned()
                             },
                             fg,
                             bg,

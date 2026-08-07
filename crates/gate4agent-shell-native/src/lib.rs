@@ -18,6 +18,7 @@ pub use provider_supervisor::{
 use gate4agent::agent::ReadinessStatus;
 use gate4agent::pty::cli::codex::strip_ansi_codes;
 use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
+use gate4agent::pty::event::PtyMouseProtocolEncoding;
 use gate4agent::pty::{
     PtyAttachment, PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtyForegroundObservation,
     PtyReplayCursor, PtySession, PtyTerminalSnapshot, RateLimitDetector,
@@ -39,8 +40,8 @@ use gate4agent_types::{
     ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderEvent, ProviderInteractionKind,
     ProviderSessionIdentity, ProviderSessionKey, ProviderSource, ResumeLaunchRequest,
-    SessionGeneration, StartRequest, TerminalFrame, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    SessionGeneration, StartRequest, TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize,
+    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
@@ -1505,6 +1506,14 @@ fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
         cursor_column: snapshot.cursor.1,
         contents: snapshot.contents,
         formatted: snapshot.formatted,
+        scrollback_formatted: snapshot.scrollback_formatted,
+        alternate_screen: snapshot.alternate_screen,
+        mouse_protocol_enabled: snapshot.mouse_protocol_enabled,
+        mouse_protocol_encoding: match snapshot.mouse_protocol_encoding {
+            PtyMouseProtocolEncoding::Default => TerminalMouseProtocolEncoding::Default,
+            PtyMouseProtocolEncoding::Utf8 => TerminalMouseProtocolEncoding::Utf8,
+            PtyMouseProtocolEncoding::Sgr => TerminalMouseProtocolEncoding::Sgr,
+        },
     }
 }
 
@@ -2358,10 +2367,11 @@ fn elapsed_ms(started: Instant) -> u64 {
 mod tests {
     use super::{
         prepare_fresh_pty_provider_session, prompt_render_probe, prompt_rendered,
-        startup_operator_gate, ReadinessDiagnostics, Utf8ChunkDecoder,
+        startup_operator_gate, terminal_frame, ReadinessDiagnostics, Utf8ChunkDecoder,
     };
     use gate4agent_adapters::builtin_adapter_registry;
-    use gate4agent_types::AdapterFamily;
+    use gate4agent::pty::event::PtyMouseProtocolEncoding;
+    use gate4agent_types::{AdapterFamily, TerminalMouseProtocolEncoding};
     use std::ffi::OsString;
 
     fn snapshot(sequence: u64, contents: &str) -> super::PtyTerminalSnapshot {
@@ -2375,7 +2385,26 @@ mod tests {
             bracketed_paste: false,
             contents: contents.to_owned(),
             formatted: Vec::new(),
+            scrollback_formatted: Vec::new(),
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: PtyMouseProtocolEncoding::Default,
         }
+    }
+
+    #[test]
+    fn terminal_frame_preserves_scrollback_and_terminal_input_metadata() {
+        let mut snapshot = snapshot(7, "visible");
+        snapshot.scrollback_formatted = vec![b"older".to_vec()];
+        snapshot.alternate_screen = true;
+        snapshot.mouse_protocol_enabled = true;
+        snapshot.mouse_protocol_encoding = PtyMouseProtocolEncoding::Sgr;
+
+        let frame = terminal_frame(snapshot);
+        assert_eq!(frame.scrollback_formatted, vec![b"older".to_vec()]);
+        assert!(frame.alternate_screen);
+        assert!(frame.mouse_protocol_enabled);
+        assert_eq!(frame.mouse_protocol_encoding, TerminalMouseProtocolEncoding::Sgr);
     }
 
     #[test]

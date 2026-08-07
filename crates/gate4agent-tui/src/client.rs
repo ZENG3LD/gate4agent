@@ -20,7 +20,7 @@ use gate4agent_node::protocol::{
 use gate4agent_node::{NamedPipeNodeClient, NodeClientError};
 use gate4agent_types::{
     ControlEvent, ControlEventKind, ProviderActivity, SessionSnapshot, SessionStatus, TerminalSize,
-    TransportKind,
+    TerminalMouseProtocolEncoding, TransportKind,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
@@ -30,6 +30,7 @@ use crate::app::{
     App, AppAction, ConnectionState, NodeView, Provider, ProviderInventory, PtyColorMode,
     SessionAddress, SessionView, UiKey, WorkspaceView,
 };
+use crate::preferences::{self, UiPreferences};
 use crate::render;
 
 const COMMAND_QUEUE: usize = 64;
@@ -40,6 +41,7 @@ const LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
 const RAW_INPUT_COALESCE: Duration = Duration::from_millis(12);
 const INPUT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const INSPECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const PREFERENCES_SAVE_DEBOUNCE: Duration = Duration::from_millis(350);
 
 fn initial_viewport_size(cols: u16, rows: u16) -> TerminalSize {
     let sidebar_width = 26.min(cols / 2);
@@ -67,7 +69,7 @@ pub struct StartupRequest {
 pub struct RunOptions {
     pub nodes: Vec<NodeEndpoint>,
     pub startup: Option<StartupRequest>,
-    pub color_mode: PtyColorMode,
+    pub color_mode_override: Option<PtyColorMode>,
 }
 
 enum WorkerUpdate {
@@ -134,6 +136,11 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     if options.nodes.is_empty() {
         return Err("at least one explicit node endpoint is required".into());
     }
+    let preferences_path = preferences::default_path();
+    let loaded_preferences = preferences_path
+        .as_deref()
+        .and_then(|path| UiPreferences::load(path).ok());
+    let initial_preferences = loaded_preferences.clone().unwrap_or_default();
     let _guard = TerminalGuard::enter()?;
     let (cols, rows) = terminal::size()?;
     let backend = CrosstermBackend::new(stdout());
@@ -144,7 +151,10 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut commands = BTreeMap::new();
     let mut inspection_commands = BTreeMap::new();
     let mut app = App::default();
-    app.color_mode = options.color_mode;
+    initial_preferences.apply_to(&mut app);
+    if let Some(color_mode) = options.color_mode_override {
+        app.color_mode = color_mode;
+    }
     app.terminal_cols = cols;
     app.terminal_rows = rows;
     for endpoint in options.nodes {
@@ -181,6 +191,11 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut notice_deadline = None;
     let mut auto_inspected_route = None;
     let mut next_auto_inspection = Instant::now();
+    let mut preferred_color_mode = initial_preferences.color_mode;
+    let mut observed_app_color_mode = app.color_mode;
+    let mut observed_preferences = preferences_for_save(&app, preferred_color_mode);
+    let mut persisted_preferences = loaded_preferences;
+    let mut preferences_deadline = None;
     while !app.should_quit {
         while let Ok(update) = updates_rx.try_recv() {
             apply_update(&mut app, update);
@@ -213,6 +228,25 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             app.notice = None;
             last_notice = None;
             notice_deadline = None;
+        }
+        if app.color_mode != observed_app_color_mode {
+            observed_app_color_mode = app.color_mode;
+            preferred_color_mode = app.color_mode;
+        }
+        let current_preferences = preferences_for_save(&app, preferred_color_mode);
+        if current_preferences != observed_preferences {
+            observed_preferences = current_preferences;
+            preferences_deadline = Some(Instant::now() + PREFERENCES_SAVE_DEBOUNCE);
+        }
+        if preferences_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if persisted_preferences.as_ref() != Some(&observed_preferences) {
+                if let Some(path) = preferences_path.as_deref() {
+                    if observed_preferences.save(path).is_ok() {
+                        persisted_preferences = Some(observed_preferences.clone());
+                    }
+                }
+            }
+            preferences_deadline = None;
         }
 
         app.layout = render::render(&app, screen.buffer_mut());
@@ -254,9 +288,21 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             }
         }
     }
+    let final_preferences = preferences_for_save(&app, preferred_color_mode);
+    if persisted_preferences.as_ref() != Some(&final_preferences) {
+        if let Some(path) = preferences_path.as_deref() {
+            let _ = final_preferences.save(path);
+        }
+    }
     flush_raw(&mut app, &commands, &mut pending_raw);
     screen.backend_mut().show_cursor()?;
     Ok(())
+}
+
+fn preferences_for_save(app: &App, color_mode: PtyColorMode) -> UiPreferences {
+    let mut preferences = UiPreferences::from_app(app);
+    preferences.color_mode = color_mode;
+    preferences
 }
 
 fn queue_action(
@@ -387,6 +433,9 @@ fn visible_cursor_position(app: &App) -> Option<(u16, u16)> {
     }
     let session = app.focused_session()?;
     if !session.running {
+        return None;
+    }
+    if app.terminal_scroll_offset(&session.address) > 0 {
         return None;
     }
     let (row, column) = session.terminal_cursor?;
@@ -1277,6 +1326,24 @@ fn project_session(
         .as_ref()
         .map(|frame| frame.formatted.clone())
         .unwrap_or_default();
+    let terminal_scrollback = session
+        .terminal_frame
+        .as_ref()
+        .map(|frame| frame.scrollback_formatted.clone())
+        .unwrap_or_default();
+    let terminal_alternate_screen = session
+        .terminal_frame
+        .as_ref()
+        .is_some_and(|frame| frame.alternate_screen);
+    let terminal_mouse_protocol_enabled = session
+        .terminal_frame
+        .as_ref()
+        .is_some_and(|frame| frame.mouse_protocol_enabled);
+    let terminal_mouse_protocol_encoding = session
+        .terminal_frame
+        .as_ref()
+        .map(|frame| frame.mouse_protocol_encoding)
+        .unwrap_or(TerminalMouseProtocolEncoding::Default);
     Some(SessionView {
         address: SessionAddress {
             node_id: node_id.to_owned(),
@@ -1293,6 +1360,10 @@ fn project_session(
         attention,
         has_provider_session_identity: session.provider.session.is_some(),
         terminal_formatted,
+        terminal_scrollback,
+        terminal_alternate_screen,
+        terminal_mouse_protocol_enabled,
+        terminal_mouse_protocol_encoding,
         terminal_cursor,
     })
 }
@@ -1549,6 +1620,10 @@ mod tests {
                     attention: false,
                     has_provider_session_identity: true,
                     terminal_formatted: Vec::new(),
+                    terminal_scrollback: Vec::new(),
+                    terminal_alternate_screen: false,
+                    terminal_mouse_protocol_enabled: false,
+                    terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                     terminal_cursor: Some((99, 99)),
                 }],
             }],
@@ -1588,6 +1663,10 @@ mod tests {
         assert_eq!(visible_cursor_position(&app), None);
         app.nodes[0].workspaces[0].sessions[0].running = true;
         app.focus = crate::app::Focus::Tabs;
+        assert_eq!(visible_cursor_position(&app), None);
+        app.focus = crate::app::Focus::Viewport;
+        let address = app.tabs[0].address.clone();
+        app.terminal_scroll_offsets.insert(address, 1);
         assert_eq!(visible_cursor_position(&app), None);
     }
 
@@ -1810,12 +1889,23 @@ mod tests {
     }
 
     #[test]
-    fn run_options_default_style_is_explicitly_carried() {
+    fn run_options_can_carry_an_explicit_style_override() {
         let options = RunOptions {
             nodes: Vec::new(),
             startup: None,
-            color_mode: PtyColorMode::Inherited,
+            color_mode_override: Some(PtyColorMode::Inherited),
         };
-        assert_eq!(options.color_mode, PtyColorMode::Inherited);
+        assert_eq!(options.color_mode_override, Some(PtyColorMode::Inherited));
+    }
+
+    #[test]
+    fn invocation_style_override_is_not_persisted_without_a_user_change() {
+        let mut app = App::default();
+        app.color_mode = PtyColorMode::GateOverride;
+
+        let preferences = preferences_for_save(&app, PtyColorMode::Inherited);
+
+        assert_eq!(app.color_mode, PtyColorMode::GateOverride);
+        assert_eq!(preferences.color_mode, PtyColorMode::Inherited);
     }
 }

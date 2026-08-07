@@ -13,11 +13,21 @@ pub const DEFAULT_PTY_REPLAY_BYTES: usize = 64 * 1024;
 pub const PTY_PROVIDER_PROTOCOL_REVISION: &str = "gate4agent-pty-r1";
 const DEFAULT_PTY_REPLAY_EVENTS: usize = 4_096;
 const DEFAULT_PTY_SNAPSHOT_SCROLLBACK_ROWS: usize = 1_000;
+pub const PTY_TERMINAL_SCROLLBACK_ROWS_MAX: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PtySize {
     pub rows: u16,
     pub cols: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PtyMouseProtocolEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,6 +118,15 @@ pub struct PtyTerminalSnapshot {
     pub contents: String,
     /// ANSI-formatted visible screen suitable for reconstructing decoration.
     pub formatted: Vec<u8>,
+    /// Recent primary-screen rows, oldest to newest, excluding the visible screen.
+    #[serde(default)]
+    pub scrollback_formatted: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub alternate_screen: bool,
+    #[serde(default)]
+    pub mouse_protocol_enabled: bool,
+    #[serde(default)]
+    pub mouse_protocol_encoding: PtyMouseProtocolEncoding,
 }
 
 #[derive(Debug, Error)]
@@ -429,6 +448,7 @@ impl PtyEventPublisher {
             .lock()
             .map_err(|_| PtyAttachError::JournalPoisoned)?;
         let screen = state.terminal.screen();
+        let scrollback_formatted = recent_scrollback_formatted(screen);
         let (rows, cols) = screen.size();
         Ok(PtyTerminalSnapshot {
             pty_id: self.pty_id.clone(),
@@ -440,15 +460,41 @@ impl PtyEventPublisher {
             bracketed_paste: screen.bracketed_paste(),
             contents: screen.contents(),
             formatted: screen.contents_formatted(),
+            scrollback_formatted,
+            alternate_screen: screen.alternate_screen(),
+            mouse_protocol_enabled: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+            mouse_protocol_encoding: match screen.mouse_protocol_encoding() {
+                vt100::MouseProtocolEncoding::Default => PtyMouseProtocolEncoding::Default,
+                vt100::MouseProtocolEncoding::Utf8 => PtyMouseProtocolEncoding::Utf8,
+                vt100::MouseProtocolEncoding::Sgr => PtyMouseProtocolEncoding::Sgr,
+            },
         })
     }
+}
+
+pub(super) fn recent_scrollback_formatted(screen: &vt100::Screen) -> Vec<Vec<u8>> {
+    if screen.alternate_screen() {
+        return Vec::new();
+    }
+    let mut view = screen.clone();
+    view.set_scrollback(usize::MAX);
+    let available = view.scrollback().min(PTY_TERMINAL_SCROLLBACK_ROWS_MAX);
+    let columns = view.size().1;
+    let mut rows = Vec::with_capacity(available);
+    for offset in (1..=available).rev() {
+        view.set_scrollback(offset);
+        if let Some(row) = view.rows_formatted(0, columns).next() {
+            rows.push(row);
+        }
+    }
+    rows
 }
 
 impl PtyEventState {
     fn observe_terminal(&mut self, event: &PtyEvent) {
         match event {
             PtyEvent::Output(data) => self.terminal.process(data),
-            PtyEvent::Resized(size) => self.terminal.set_size(size.rows, size.cols),
+            PtyEvent::Resized(size) => self.terminal.screen_mut().set_size(size.rows, size.cols),
             PtyEvent::Started
             | PtyEvent::DataGap { .. }
             | PtyEvent::ReaderError { .. }
@@ -589,6 +635,40 @@ mod tests {
         assert_eq!(snapshot.size, PtySize { rows: 2, cols: 10 });
         assert_eq!(snapshot.provider_revision, REVISION);
         assert!(snapshot.bracketed_paste);
+    }
+
+    #[test]
+    fn snapshot_exports_only_the_recent_primary_scrollback_in_chronological_order() {
+        let publisher =
+            PtyEventPublisher::new("pty-test".to_owned(), REVISION.to_owned(), 1, 8, 64, 2, 16);
+        for line in 0..300 {
+            publisher.publish(PtyEvent::Output(format!("{line:03}\r\n").into_bytes()));
+        }
+
+        let snapshot = publisher.snapshot().expect("snapshot");
+        assert_eq!(snapshot.scrollback_formatted.len(), PTY_TERMINAL_SCROLLBACK_ROWS_MAX);
+        let row_text = |formatted: &[u8]| {
+            let mut parser = vt100::Parser::new(1, 16, 0);
+            parser.process(formatted);
+            parser.screen().contents()
+        };
+        assert_eq!(row_text(&snapshot.scrollback_formatted[0]), "043");
+        assert_eq!(row_text(snapshot.scrollback_formatted.last().unwrap()), "298");
+    }
+
+    #[test]
+    fn snapshot_reports_alternate_screen_and_mouse_protocol_metadata() {
+        let publisher =
+            PtyEventPublisher::new("pty-test".to_owned(), REVISION.to_owned(), 1, 8, 64, 2, 16);
+        publisher.publish(PtyEvent::Output(
+            b"before\r\nafter\r\n\x1b[?1000h\x1b[?1006h\x1b[?1049halternate".to_vec(),
+        ));
+
+        let snapshot = publisher.snapshot().expect("snapshot");
+        assert!(snapshot.alternate_screen);
+        assert!(snapshot.mouse_protocol_enabled);
+        assert_eq!(snapshot.mouse_protocol_encoding, PtyMouseProtocolEncoding::Sgr);
+        assert!(snapshot.scrollback_formatted.is_empty());
     }
 
     #[test]

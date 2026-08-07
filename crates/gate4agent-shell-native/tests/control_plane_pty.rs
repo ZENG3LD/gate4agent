@@ -312,6 +312,93 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
     assert_eq!(shell.active_session_count(), 0);
 }
 
+#[tokio::test]
+async fn real_pty_scrollback_reaches_terminal_frame() {
+    let mut spec = interactive_agent_spec();
+    #[cfg(windows)]
+    let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; for($i=0; $i -lt 24; $i++){ [Console]::WriteLine(('scroll-{0:D2}' -f $i)) }; [Console]::Write('fixture-ready>'); Start-Sleep -Seconds 60";
+    #[cfg(not(windows))]
+    let script = "i=0; while [ $i -lt 24 ]; do printf 'scroll-%02d\\n' \"$i\"; i=$((i + 1)); done; printf 'fixture-ready>'; sleep 60";
+    *spec
+        .launch
+        .fixed_args
+        .last_mut()
+        .expect("fixture script argument") = script.to_owned();
+    let registry = AgentRegistry::new([spec]).expect("fixture registry");
+    let mut kernel = Gate4AgentKernel::new(registry.clone());
+    let mut shell = NativeEffectShell::new(registry);
+    let instance_id = AgentInstanceId(511);
+
+    let registered = kernel.step(
+        [command(
+            1,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Pty,
+            },
+        )],
+        [],
+    );
+    assert!(registered.command_outcomes[0].result.is_ok());
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            2,
+            ControlCommand::Start {
+                instance_id,
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .expect("current directory")
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 4,
+                        columns: 40,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ),
+    )
+    .await;
+    let running = kernel.snapshot().sessions[0].clone();
+    let key = NativeSessionKey {
+        instance_id,
+        generation: running.generation,
+    };
+    wait_for_contents(&shell, key, "fixture-ready>").await;
+
+    let live = shell.terminal_snapshot(key).expect("live terminal frame");
+    assert!(live.scrollback_formatted.len() >= 16);
+    assert!(live.scrollback_formatted.len() <= 256);
+    assert!(live
+        .scrollback_formatted
+        .iter()
+        .any(|row| String::from_utf8_lossy(row).contains("scroll-")));
+
+    execute_only_effect(
+        &mut kernel,
+        &mut shell,
+        command(
+            3,
+            ControlCommand::Stop {
+                instance_id,
+                force: true,
+            },
+        ),
+    )
+    .await;
+    let final_frame = kernel.snapshot().sessions[0]
+        .terminal_frame
+        .clone()
+        .expect("final terminal frame");
+    assert!(final_frame.scrollback_formatted.len() >= 16);
+    assert_eq!(shell.active_session_count(), 0);
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn terminal_bytes_reach_real_conpty_as_alt_key() {

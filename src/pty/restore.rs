@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::event::{PtyEvent, PtyEventEnvelope, PtyGapReason, PtySize, PtyTerminalSnapshot};
+use super::event::{
+    recent_scrollback_formatted, PtyEvent, PtyEventEnvelope, PtyGapReason,
+    PtyMouseProtocolEncoding, PtySize, PtyTerminalSnapshot, PTY_TERMINAL_SCROLLBACK_ROWS_MAX,
+};
 
 pub const PTY_COLD_RESTORE_FORMAT_REVISION: u16 = 1;
 pub const PTY_COLD_RESTORE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -110,6 +113,7 @@ impl PtyColdRestoreCheckpoint {
             self.terminal.size.cols,
             PTY_COLD_RESTORE_SCROLLBACK_ROWS,
         );
+        restore_terminal_modes(&mut parser, &self.terminal);
         parser.process(&self.terminal.formatted);
         let mut expected_sequence = self
             .terminal
@@ -128,7 +132,7 @@ impl PtyColdRestoreCheckpoint {
                             cols: size.cols,
                         });
                     }
-                    parser.set_size(size.rows, size.cols);
+                    parser.screen_mut().set_size(size.rows, size.cols);
                 }
                 PtyEvent::DataGap { .. } => unreachable!("gaps are rejected during validation"),
                 PtyEvent::Started
@@ -143,8 +147,17 @@ impl PtyColdRestoreCheckpoint {
                 .ok_or(PtyColdRestoreError::SequenceExhausted)?;
         }
 
+        let reconstructed_scrollback = recent_scrollback_formatted(parser.screen());
         let screen = parser.screen();
         let (rows, cols) = screen.size();
+        let scrollback_formatted = if screen.alternate_screen() {
+            Vec::new()
+        } else {
+            merge_recent_scrollback(
+                &self.terminal.scrollback_formatted,
+                reconstructed_scrollback,
+            )
+        };
         Ok(PtyTerminalSnapshot {
             pty_id: self.terminal.pty_id.clone(),
             provider_revision: self.terminal.provider_revision.clone(),
@@ -155,6 +168,14 @@ impl PtyColdRestoreCheckpoint {
             bracketed_paste: screen.bracketed_paste(),
             contents: screen.contents(),
             formatted: screen.contents_formatted(),
+            scrollback_formatted,
+            alternate_screen: screen.alternate_screen(),
+            mouse_protocol_enabled: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+            mouse_protocol_encoding: match screen.mouse_protocol_encoding() {
+                vt100::MouseProtocolEncoding::Default => PtyMouseProtocolEncoding::Default,
+                vt100::MouseProtocolEncoding::Utf8 => PtyMouseProtocolEncoding::Utf8,
+                vt100::MouseProtocolEncoding::Sgr => PtyMouseProtocolEncoding::Sgr,
+            },
         })
     }
 
@@ -240,6 +261,43 @@ fn terminal_snapshot_bytes(snapshot: &PtyTerminalSnapshot) -> usize {
         .saturating_add(snapshot.provider_revision.len())
         .saturating_add(snapshot.contents.len())
         .saturating_add(snapshot.formatted.len())
+        .saturating_add(
+            snapshot
+                .scrollback_formatted
+                .iter()
+                .fold(0usize, |bytes, row| bytes.saturating_add(row.len())),
+        )
+}
+
+fn restore_terminal_modes(parser: &mut vt100::Parser, terminal: &PtyTerminalSnapshot) {
+    if terminal.alternate_screen {
+        parser.process(b"\x1b[?1049h");
+    }
+    if terminal.bracketed_paste {
+        parser.process(b"\x1b[?2004h");
+    }
+    if terminal.mouse_protocol_enabled {
+        parser.process(b"\x1b[?1000h");
+    }
+    match terminal.mouse_protocol_encoding {
+        PtyMouseProtocolEncoding::Default => {}
+        PtyMouseProtocolEncoding::Utf8 => parser.process(b"\x1b[?1005h"),
+        PtyMouseProtocolEncoding::Sgr => parser.process(b"\x1b[?1006h"),
+    }
+}
+
+fn merge_recent_scrollback(
+    checkpoint: &[Vec<u8>],
+    reconstructed: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    let total = checkpoint.len().saturating_add(reconstructed.len());
+    let skip = total.saturating_sub(PTY_TERMINAL_SCROLLBACK_ROWS_MAX);
+    checkpoint
+        .iter()
+        .cloned()
+        .chain(reconstructed)
+        .skip(skip)
+        .collect()
 }
 
 fn event_restore_bytes(event: &PtyEventEnvelope) -> usize {
@@ -281,6 +339,10 @@ mod tests {
             bracketed_paste: false,
             contents: "base".to_owned(),
             formatted: b"base".to_vec(),
+            scrollback_formatted: Vec::new(),
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: Default::default(),
         })
         .expect("checkpoint")
     }
@@ -297,7 +359,10 @@ mod tests {
 
     #[test]
     fn checkpoint_round_trips_and_applies_contiguous_tail() {
-        let checkpoint = checkpoint();
+        let mut checkpoint = checkpoint();
+        checkpoint.terminal.scrollback_formatted = vec![b"older".to_vec()];
+        checkpoint.terminal.mouse_protocol_enabled = true;
+        checkpoint.terminal.mouse_protocol_encoding = PtyMouseProtocolEncoding::Sgr;
         let encoded = serde_json::to_vec(&checkpoint).expect("serialize checkpoint");
         let decoded: PtyColdRestoreCheckpoint =
             serde_json::from_slice(&encoded).expect("deserialize checkpoint");
@@ -311,6 +376,26 @@ mod tests {
         assert!(restored.contents.contains("base tail"));
         assert_eq!(restored.sequence, 10);
         assert_eq!(restored.size, PtySize { rows: 5, cols: 50 });
+        assert_eq!(restored.scrollback_formatted, vec![b"older".to_vec()]);
+        assert!(restored.mouse_protocol_enabled);
+        assert_eq!(restored.mouse_protocol_encoding, PtyMouseProtocolEncoding::Sgr);
+    }
+
+    #[test]
+    fn restore_derives_alternate_screen_from_checkpoint_and_tail() {
+        let mut checkpoint = checkpoint();
+        checkpoint.terminal.alternate_screen = true;
+
+        let retained = checkpoint
+            .restore_terminal(&[tail(8, PtyEvent::Started)])
+            .expect("retain alternate screen");
+        assert!(retained.alternate_screen);
+        assert!(retained.scrollback_formatted.is_empty());
+
+        let exited = checkpoint
+            .restore_terminal(&[tail(8, PtyEvent::Output(b"\x1b[?1049l".to_vec()))])
+            .expect("exit alternate screen");
+        assert!(!exited.alternate_screen);
     }
 
     #[test]

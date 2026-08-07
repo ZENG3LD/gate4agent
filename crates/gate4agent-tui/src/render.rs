@@ -5,9 +5,9 @@ use uzor_tui::{
 use gate4agent_node::protocol::{GitSnapshot, WorkspaceEntryKind, WorkspaceInspection};
 
 use crate::app::{
-    AddSpaceField, App, ConnectionState, ControlSection, Focus, GridAxisKind, GridPaneLayout,
-    GridPreset, HitRegion, HitTarget, LayoutRects, MenuPlacement, NodeView, PtyColorMode,
-    RosterMode, SessionView, SidebarMode, SurfaceMode, WorkspaceView,
+    AddSpaceField, App, ConnectionState, ControlSection, DragState, Focus, GridAxisKind,
+    GridPaneLayout, GridPreset, HitRegion, HitTarget, LayoutRects, MenuPlacement, NodeView,
+    PtyColorMode, RosterMode, SessionView, SidebarMode, SurfaceMode, WorkspaceView,
 };
 use crate::pty_palette::{apply_pty_palette, GATE_FG, TERM_BG};
 
@@ -179,6 +179,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     if app.focus == Focus::Settings {
         render_settings(app, area, buf, &mut layout, theme);
     }
+    render_drag_preview(app, area, buf, &layout, theme);
     if let Some(notice) = &app.notice {
         render_notice(notice, right[1], buf, theme);
     }
@@ -262,7 +263,9 @@ fn render_space_list(
 
     let rows = app.space_rows();
     let capacity = area.height.saturating_sub(1) as usize / 2;
-    let start = visible_window_start(rows.len(), app.selected_space, capacity);
+    let start = app
+        .workspaces_scroll
+        .min(rows.len().saturating_sub(capacity));
     for (visible_index, (index, (node_index, workspace_index))) in rows
         .into_iter()
         .enumerate()
@@ -364,7 +367,9 @@ fn render_workspace_files(
     };
     let entry_indices = app.visible_workspace_entry_indices();
     let capacity = list.height as usize;
-    let start = visible_window_start(entry_indices.len(), app.files_cursor, capacity);
+    let start = app
+        .files_scroll
+        .min(entry_indices.len().saturating_sub(capacity));
     for (visible, (visible_index, index)) in entry_indices
         .iter()
         .copied()
@@ -478,7 +483,7 @@ fn render_git_status(
     theme: Theme,
 ) {
     let capacity = area.height as usize;
-    let start = visible_window_start(git.status.len(), app.git_cursor, capacity);
+    let start = app.git_scroll.min(git.status.len().saturating_sub(capacity));
     for (visible, (index, entry)) in git.status.iter().enumerate().skip(start).take(capacity).enumerate() {
         let y = area.y + visible as u16;
         let selected = index == app.git_cursor;
@@ -515,7 +520,9 @@ fn render_git_commits(
         return;
     }
     let capacity = area.height as usize;
-    let start = visible_window_start(git.recent_commits.len(), app.git_cursor, capacity);
+    let start = app
+        .git_scroll
+        .min(git.recent_commits.len().saturating_sub(capacity));
     for (visible, (index, commit)) in git
         .recent_commits
         .iter()
@@ -622,7 +629,9 @@ fn render_agent_list(
 
     let addresses = app.agent_addresses();
     let capacity = area.height.saturating_sub(1) as usize / 2;
-    let start = visible_window_start(addresses.len(), app.selected_agent, capacity);
+    let start = app
+        .agents_scroll
+        .min(addresses.len().saturating_sub(capacity));
     for (visible_index, (index, address)) in addresses
         .iter()
         .enumerate()
@@ -830,7 +839,13 @@ fn render_viewport(app: &App, area: Rect, buf: &mut TerminalBuffer, layout: &mut
     let Some(session) = app.selected_tab_session() else {
         return;
     };
-    render_terminal(session, area, app.color_mode, buf);
+    render_terminal(
+        session,
+        area,
+        app.color_mode,
+        app.terminal_scroll_offset(&session.address),
+        buf,
+    );
 }
 
 fn render_grid(
@@ -864,11 +879,11 @@ fn render_grid(
     let (columns, column_dividers) = axis_segments(area.x, area.width, &column_specs);
     let (rows, row_dividers) = axis_segments(area.y, area.height, &row_specs);
 
-    for (index, x) in column_dividers {
+    for (index, x) in column_dividers.iter().copied() {
         let divider = Rect::new(x, area.y, 1, area.height);
         for y in divider.y..divider.bottom() {
             let cell = buf.get_mut(divider.x, y);
-            cell.symbol = "|".into();
+            cell.symbol = "│".into();
             cell.style = Style::default().fg(theme.border).bg(theme.surface);
         }
         layout.hits.push(HitRegion {
@@ -876,17 +891,24 @@ fn render_grid(
             target: HitTarget::GridDivider(GridAxisKind::Columns, index),
         });
     }
-    for (index, y) in row_dividers {
+    for (index, y) in row_dividers.iter().copied() {
         let divider = Rect::new(area.x, y, area.width, 1);
         for x in divider.x..divider.right() {
             let cell = buf.get_mut(x, divider.y);
-            cell.symbol = "-".into();
+            cell.symbol = "─".into();
             cell.style = Style::default().fg(theme.border).bg(theme.surface);
         }
         layout.hits.push(HitRegion {
             rect: divider,
             target: HitTarget::GridDivider(GridAxisKind::Rows, index),
         });
+    }
+    for (_, x) in &column_dividers {
+        for (_, y) in &row_dividers {
+            let cell = buf.get_mut(*x, *y);
+            cell.symbol = "┼".into();
+            cell.style = Style::default().fg(theme.border).bg(theme.surface);
+        }
     }
 
     let mut slot = 0;
@@ -936,7 +958,13 @@ fn render_grid(
                     viewport,
                 });
                 if let Some(session) = app.find_session(&pane.address) {
-                    render_terminal(session, viewport, app.color_mode, buf);
+                    render_terminal(
+                        session,
+                        viewport,
+                        app.color_mode,
+                        app.terminal_scroll_offset(&session.address),
+                        buf,
+                    );
                 }
             } else {
                 Paragraph::new(" + drop ")
@@ -952,22 +980,45 @@ fn render_terminal(
     session: &SessionView,
     area: Rect,
     color_mode: PtyColorMode,
+    scroll_offset: usize,
     buf: &mut TerminalBuffer,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if session.terminal_formatted.is_empty() {
+    if session.terminal_formatted.is_empty() && session.terminal_scrollback.is_empty() {
         return;
     }
     let mut parser = vt100::Parser::new(area.height.max(1), area.width.max(1), 0);
     parser.process(&session.terminal_formatted);
-    let mut terminal = TerminalBuffer::new(area.width, area.height);
-    uzor_tui::vt100_to_buffer(parser.screen(), &mut terminal);
-    apply_pty_palette(&mut terminal, color_mode);
+    let mut current = TerminalBuffer::new(area.width, area.height);
+    uzor_tui::vt100_to_buffer(parser.screen(), &mut current);
+    apply_pty_palette(&mut current, color_mode);
+    let history_len = session.terminal_scrollback.len();
+    let scroll_offset = scroll_offset.min(history_len);
+    let first_logical_row = history_len.saturating_sub(scroll_offset);
     for row in 0..area.height {
+        let logical_row = first_logical_row.saturating_add(row as usize);
+        let history_row = if logical_row < history_len {
+            let mut row_parser = vt100::Parser::new(1, area.width.max(1), 0);
+            row_parser.process(&session.terminal_scrollback[logical_row]);
+            let mut row_buffer = TerminalBuffer::new(area.width, 1);
+            uzor_tui::vt100_to_buffer(row_parser.screen(), &mut row_buffer);
+            apply_pty_palette(&mut row_buffer, color_mode);
+            Some(row_buffer)
+        } else {
+            None
+        };
+        let current_row = logical_row.saturating_sub(history_len) as u16;
         for column in 0..area.width {
-            buf.set(area.x + column, area.y + row, terminal.get(column, row).clone());
+            let cell = if let Some(history_row) = &history_row {
+                history_row.get(column, 0).clone()
+            } else if current_row < area.height {
+                current.get(column, current_row).clone()
+            } else {
+                current.get(column, area.height.saturating_sub(1)).clone()
+            };
+            buf.set(area.x + column, area.y + row, cell);
         }
     }
 }
@@ -1094,8 +1145,19 @@ fn render_settings(
     theme: Theme,
 ) {
     let expanded = app.menu_placement == MenuPlacement::Modal;
-    let width = if expanded { 96 } else { 44 }.min(area.width.saturating_sub(6));
-    let height = if expanded { 30 } else { 7 }.min(area.height.saturating_sub(4));
+    let available_width = area.width.saturating_sub(6);
+    let available_height = area.height.saturating_sub(4);
+    let (default_width, default_height) = control_modal_default_size(app);
+    let (requested_width, requested_height) = if expanded {
+        app.control_modal_size
+            .unwrap_or((default_width, default_height))
+    } else {
+        (44, 7)
+    };
+    let width = requested_width
+        .clamp(36.min(available_width), available_width);
+    let height = requested_height
+        .clamp(6.min(available_height), available_height);
     let modal = positioned_modal(area, width, height, app.control_modal_position);
     layout.control_modal = modal;
     fill_rect(modal, theme.modal, buf);
@@ -1108,6 +1170,16 @@ fn render_settings(
         rect: Rect::new(modal.x, modal.y, modal.width, 1),
         target: HitTarget::ControlDrag,
     });
+    if expanded && modal.width > 0 && modal.height > 0 {
+        let resize = Rect::new(modal.right() - 1, modal.bottom() - 1, 1, 1);
+        let cell = buf.get_mut(resize.x, resize.y);
+        cell.symbol = "◢".into();
+        cell.style = Style::default().fg(theme.accent).bg(theme.modal);
+        layout.hits.push(HitRegion {
+            rect: resize,
+            target: HitTarget::ControlResize,
+        });
+    }
     if modal.width < 12 || modal.height < 5 {
         return;
     }
@@ -1123,15 +1195,15 @@ fn render_settings(
         return;
     }
 
+    let section_count = ControlSection::ALL.len() as u16;
+    let base_width = inner.width / section_count;
+    let remainder = inner.width % section_count;
     let mut x = inner.x;
-    for section in ControlSection::ALL {
-        let label = format!(" {} ", section.id());
-        let width = (cell_width(&label) as u16).min(inner.right().saturating_sub(x));
-        if width == 0 {
-            break;
-        }
+    for (index, section) in ControlSection::ALL.into_iter().enumerate() {
+        let width = base_width + u16::from((index as u16) < remainder);
+        let label = centered_label(section.id(), width as usize);
         let selected = app.control_section == section;
-        Paragraph::new(truncate_cells(&label, width as usize))
+        Paragraph::new(label)
             .style(
                 Style::default()
                     .fg(if selected { theme.active_tab_text } else { theme.muted })
@@ -1164,6 +1236,100 @@ fn render_settings(
         ControlSection::Workspaces => render_space_list(app, content, buf, layout, content_theme),
         ControlSection::Settings => render_settings_controls(app, content, buf, layout, content_theme),
     }
+}
+
+fn control_modal_default_size(app: &App) -> (u16, u16) {
+    let tab_width = ControlSection::ALL
+        .iter()
+        .map(|section| cell_width(section.id()) + 2)
+        .sum::<usize>()
+        .max(42);
+    let (content_width, content_rows) = match app.control_section {
+        ControlSection::Files => {
+            let indices = app.visible_workspace_entry_indices();
+            let width = app
+                .selected_workspace_inspection()
+                .map(|inspection| {
+                    indices
+                        .iter()
+                        .filter_map(|index| inspection.entries.get(*index))
+                        .map(|entry| cell_width(&entry.relative_path) + 8)
+                        .max()
+                        .unwrap_or(24)
+                })
+                .unwrap_or(24);
+            (width, indices.len().saturating_add(1))
+        }
+        ControlSection::Git => {
+            let Some(inspection) = app.selected_workspace_inspection() else {
+                return ((tab_width + 2).min(u16::MAX as usize) as u16, 8);
+            };
+            let git = &inspection.git;
+            if !git.status.is_empty() {
+                (
+                    git.status
+                        .iter()
+                        .map(|entry| cell_width(&entry.path) + 5)
+                        .max()
+                        .unwrap_or(24),
+                    git.status.len().saturating_add(2),
+                )
+            } else {
+                (
+                    git.recent_commits
+                        .iter()
+                        .map(|commit| cell_width(&commit.summary) + commit.id.len() + 3)
+                        .max()
+                        .unwrap_or(24),
+                    git.recent_commits.len().saturating_add(2),
+                )
+            }
+        }
+        ControlSection::Agents => {
+            let addresses = app.agent_addresses();
+            let width = addresses
+                .iter()
+                .filter_map(|address| app.find_session(address))
+                .map(|session| {
+                    cell_width(&session.short_title())
+                        .max(cell_width(&session.address.workspace_id) + cell_width(&session.address.node_id) + 7)
+                        + 3
+                })
+                .max()
+                .unwrap_or(24);
+            (width, addresses.len().saturating_mul(2).saturating_add(1))
+        }
+        ControlSection::Workspaces => {
+            let rows = app.space_rows();
+            let width = rows
+                .iter()
+                .map(|(node_index, workspace_index)| {
+                    let node = &app.nodes[*node_index];
+                    let workspace = &node.workspaces[*workspace_index];
+                    cell_width(&workspace.label)
+                        .max(cell_width(&workspace.canonical_root) + cell_width(&node.node_id) + 3)
+                        + 12
+                })
+                .max()
+                .unwrap_or(24);
+            (width, rows.len().saturating_mul(2).saturating_add(1))
+        }
+        ControlSection::Settings => (30, 3),
+    };
+    let width = tab_width.max(content_width).saturating_add(2).clamp(44, 96);
+    let height = content_rows.saturating_add(3).clamp(7, 30);
+    (
+        width.min(u16::MAX as usize) as u16,
+        height.min(u16::MAX as usize) as u16,
+    )
+}
+
+fn centered_label(label: &str, width: usize) -> String {
+    let label = truncate_cells(label, width);
+    let label_width = cell_width(&label);
+    let left = width.saturating_sub(label_width) / 2;
+    let right = width.saturating_sub(label_width).saturating_sub(left);
+    format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
 }
 
 fn render_settings_controls(
@@ -1206,6 +1372,127 @@ fn render_settings_controls(
         rect: Rect::new(area.x, area.y + 1, placement_width, 1),
         target: HitTarget::SettingsPlacement,
     });
+}
+
+fn render_drag_preview(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &LayoutRects,
+    theme: Theme,
+) {
+    let Some(DragState::SessionChip {
+        address,
+        current_column,
+        current_row,
+        moved: true,
+        ..
+    }) = &app.drag_state
+    else {
+        return;
+    };
+    let drop = layout.hits.iter().rev().find(|hit| {
+        hit.rect.contains(*current_column, *current_row)
+            && matches!(
+                &hit.target,
+                HitTarget::Tab(_)
+                    | HitTarget::AddTab
+                    | HitTarget::TabDrop
+                    | HitTarget::GridToggle
+                    | HitTarget::GridPreset(_)
+                    | HitTarget::GridPaneHeader(_)
+                    | HitTarget::GridPaneBody(_)
+                    | HitTarget::GridDropSlot(_)
+            )
+    });
+    if let Some(drop) = drop {
+        match &drop.target {
+            HitTarget::GridPaneHeader(index)
+            | HitTarget::GridPaneBody(index)
+            | HitTarget::GridDropSlot(index) => {
+                let target = layout
+                    .grid_panes
+                    .iter()
+                    .find(|pane| pane.pane_index == *index)
+                    .map(|pane| pane.frame)
+                    .unwrap_or(drop.rect);
+                draw_outline(target, theme.accent, theme.surface, buf);
+            }
+            _ => {
+                for row in drop.rect.y..drop.rect.bottom() {
+                    for column in drop.rect.x..drop.rect.right() {
+                        let cell = buf.get_mut(column, row);
+                        cell.style = cell
+                            .style
+                            .fg(theme.active_tab_text)
+                            .bg(theme.accent)
+                            .add_modifier(Modifier::BOLD);
+                    }
+                }
+            }
+        }
+    }
+
+    let title = app
+        .find_session(address)
+        .map(|session| session.short_title())
+        .unwrap_or_else(|| format!("detached #{}", address.instance_id));
+    let label = format!(" {title} ");
+    let width = (cell_width(&label) as u16).min(area.width);
+    if width == 0 || area.height == 0 {
+        return;
+    }
+    let maximum_x = area.right().saturating_sub(width);
+    let x = current_column
+        .saturating_sub(width / 2)
+        .clamp(area.x, maximum_x);
+    let y = (*current_row).clamp(area.y, area.bottom().saturating_sub(1));
+    Paragraph::new(truncate_cells(&label, width as usize))
+        .style(
+            Style::default()
+                .fg(theme.active_tab_text)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .render(Rect::new(x, y, width, 1), buf);
+}
+
+fn draw_outline(area: Rect, color: Color, background: Color, buf: &mut TerminalBuffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    for x in area.x..area.right() {
+        let top = buf.get_mut(x, area.y);
+        top.symbol = "─".into();
+        top.style = Style::default().fg(color).bg(background);
+        if area.height > 1 {
+            let bottom = buf.get_mut(x, area.bottom() - 1);
+            bottom.symbol = "─".into();
+            bottom.style = Style::default().fg(color).bg(background);
+        }
+    }
+    for y in area.y..area.bottom() {
+        let left = buf.get_mut(area.x, y);
+        left.symbol = "│".into();
+        left.style = Style::default().fg(color).bg(background);
+        if area.width > 1 {
+            let right = buf.get_mut(area.right() - 1, y);
+            right.symbol = "│".into();
+            right.style = Style::default().fg(color).bg(background);
+        }
+    }
+    if area.width > 1 && area.height > 1 {
+        for (x, y, symbol) in [
+            (area.x, area.y, "┌"),
+            (area.right() - 1, area.y, "┐"),
+            (area.x, area.bottom() - 1, "└"),
+            (area.right() - 1, area.bottom() - 1, "┘"),
+        ] {
+            let cell = buf.get_mut(x, y);
+            cell.symbol = symbol.into();
+            cell.style = Style::default().fg(color).bg(background);
+        }
+    }
 }
 
 fn render_notice(notice: &str, viewport: Rect, buf: &mut TerminalBuffer, theme: Theme) {
@@ -1260,17 +1547,6 @@ fn fill_rect(area: Rect, background: Color, buf: &mut TerminalBuffer) {
             cell.symbol = " ".into();
             cell.style = Style::default().bg(background);
         }
-    }
-}
-
-fn visible_window_start(len: usize, selected: usize, capacity: usize) -> usize {
-    if capacity == 0 || len <= capacity {
-        0
-    } else {
-        selected
-            .min(len.saturating_sub(1))
-            .saturating_add(1)
-            .saturating_sub(capacity)
     }
 }
 
@@ -1432,9 +1708,10 @@ mod tests {
     use gate4agent_node::protocol::{
         GitCommitSummary, GitStatusEntry, WorkspaceEntry, WorkspaceId,
     };
+    use gate4agent_types::TerminalMouseProtocolEncoding;
     use crate::app::{
-        NodeView, Provider, ProviderInventory, SessionAddress, SessionTab, SessionView,
-        WorkspaceView,
+        DragSource, NodeView, Provider, ProviderInventory, SessionAddress, SessionTab,
+        SessionView, WorkspaceView,
     };
 
     fn fixture(mode: PtyColorMode) -> App {
@@ -1468,6 +1745,10 @@ mod tests {
                     attention: false,
                     has_provider_session_identity: true,
                     terminal_formatted: b"\x1b[38;2;80;160;255;48;2;0;51;102mK".to_vec(),
+                    terminal_scrollback: Vec::new(),
+                    terminal_alternate_screen: false,
+                    terminal_mouse_protocol_enabled: false,
+                    terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                     terminal_cursor: Some((0, 1)),
                 }],
             }],
@@ -1549,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn overflow_window_keeps_selected_space_visible_and_addressable() {
+    fn workspace_window_uses_scroll_offset_without_moving_selection() {
         let mut app = fixture(PtyColorMode::Inherited);
         let template = app.nodes[0].workspaces[0].clone();
         for index in 1..8 {
@@ -1564,11 +1845,30 @@ mod tests {
         app.roster_mode = RosterMode::Workspaces;
         let mut buf = TerminalBuffer::new(60, 12);
 
+        let top_layout = render(&app, &mut buf);
+        assert!(top_layout.hits.iter().any(|hit| hit.target == HitTarget::Space(0)));
+        assert!(!top_layout.hits.iter().any(|hit| hit.target == HitTarget::Space(7)));
+
+        app.workspaces_scroll = 7;
+        let scrolled_layout = render(&app, &mut buf);
+        assert!(scrolled_layout.hits.iter().any(|hit| hit.target == HitTarget::Space(7)));
+        assert!(!scrolled_layout.hits.iter().any(|hit| hit.target == HitTarget::Space(0)));
+    }
+
+    #[test]
+    fn terminal_scrollback_shifts_history_into_the_viewport() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        let address = app.tabs[0].address.clone();
+        let session = &mut app.nodes[0].workspaces[0].sessions[0];
+        session.terminal_scrollback = vec![b"H".to_vec()];
+        session.terminal_formatted = b"C".to_vec();
+        app.terminal_scroll_offsets.insert(address, 1);
+        let mut buf = TerminalBuffer::new(100, 24);
+
         let layout = render(&app, &mut buf);
 
-        assert_eq!(visible_window_start(8, 7, 1), 7);
-        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::Space(7)));
-        assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::Space(0)));
+        assert_eq!(buf.get(layout.viewport.x, layout.viewport.y).symbol, "H");
+        assert_eq!(buf.get(layout.viewport.x, layout.viewport.y + 1).symbol, "C");
     }
 
     #[test]
@@ -1676,11 +1976,30 @@ mod tests {
                 .iter()
                 .any(|hit| hit.target == HitTarget::ControlSection(section)));
         }
+        let section_hits = layout
+            .hits
+            .iter()
+            .filter(|hit| matches!(hit.target, HitTarget::ControlSection(_)))
+            .collect::<Vec<_>>();
+        let narrowest = section_hits.iter().map(|hit| hit.rect.width).min().unwrap();
+        let widest = section_hits.iter().map(|hit| hit.rect.width).max().unwrap();
+        assert!(widest.saturating_sub(narrowest) <= 1);
+        assert_eq!(
+            section_hits.iter().map(|hit| hit.rect.width).sum::<u16>(),
+            layout.control_modal.width.saturating_sub(2)
+        );
         assert_eq!(ControlSection::ALL.len(), 5);
         assert!(layout.control_content.width > 0);
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::ControlDrag));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::ControlResize));
+        assert!(layout.control_modal.width < 96);
+        assert!(layout.control_modal.height < 24);
         assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(0)));
+
+        app.control_modal_size = Some((72, 18));
+        let resized_layout = render(&app, &mut buf);
+        assert_eq!((resized_layout.control_modal.width, resized_layout.control_modal.height), (72, 18));
 
         app.control_section = ControlSection::Settings;
         let settings_layout = render(&app, &mut buf);
@@ -1791,6 +2110,21 @@ mod tests {
         assert!(layout.hits.iter().any(|hit| {
             hit.target == HitTarget::GridDivider(GridAxisKind::Rows, 1)
         }));
+        let column = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::GridDivider(GridAxisKind::Columns, 1))
+            .unwrap()
+            .rect;
+        let row = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::GridDivider(GridAxisKind::Rows, 1))
+            .unwrap()
+            .rect;
+        assert_eq!(buf.get(column.x, column.y).symbol, "│");
+        assert_eq!(buf.get(row.x, row.y).symbol, "─");
+        assert_eq!(buf.get(column.x, row.y).symbol, "┼");
         assert_eq!(
             buf.get(layout.grid_panes[0].viewport.x, layout.grid_panes[0].viewport.y)
                 .symbol,
@@ -1802,6 +2136,38 @@ mod tests {
             "B"
         );
         assert!(layout.grid_panes[0].viewport.right() < layout.grid_panes[1].viewport.x);
+    }
+
+    #[test]
+    fn session_drag_renders_a_pointer_ghost_and_drop_outline() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let address = app.tabs[0].address.clone();
+        assert!(app.move_address_to_grid(address.clone(), None));
+        let mut buf = TerminalBuffer::new(120, 32);
+        let base = render(&app, &mut buf);
+        let target = base
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::GridDropSlot(1))
+            .unwrap()
+            .rect;
+        let current_column = target.x + target.width / 2;
+        let current_row = target.y + target.height / 2;
+        app.drag_state = Some(DragState::SessionChip {
+            source: DragSource::Pane(0),
+            address,
+            start_column: 1,
+            start_row: 1,
+            current_column,
+            current_row,
+            moved: true,
+        });
+
+        render(&app, &mut buf);
+
+        assert_eq!(buf.get(target.x, target.y).symbol, "┌");
+        assert_eq!(buf.get(target.x, target.y).style.fg, MAUVE);
+        assert_eq!(buf.get(current_column, current_row).style.bg, MAUVE);
     }
 
     #[test]

@@ -59,6 +59,15 @@ pub struct TerminalSize {
     pub columns: u16,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalMouseProtocolEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalFrame {
     pub sequence: u64,
@@ -67,6 +76,14 @@ pub struct TerminalFrame {
     pub cursor_column: u16,
     pub contents: String,
     pub formatted: Vec<u8>,
+    #[serde(default)]
+    pub scrollback_formatted: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub alternate_screen: bool,
+    #[serde(default)]
+    pub mouse_protocol_enabled: bool,
+    #[serde(default)]
+    pub mouse_protocol_encoding: TerminalMouseProtocolEncoding,
 }
 
 pub const FOREGROUND_PROCESS_NAME_MAX_BYTES: usize = 512;
@@ -1277,8 +1294,8 @@ mod tests {
     use super::{
         ForegroundProcess, ForegroundProcessKind, ProviderEvent, ProviderEventValidationError,
         ProviderInteractionKind, ProviderInteractionResponse, ProviderInteractionResponseError,
-        ProviderSessionIdentity, ProviderSessionKey, FOREGROUND_PROCESS_NAME_MAX_BYTES,
-        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
+        ProviderSessionIdentity, ProviderSessionKey, TerminalFrame, TerminalMouseProtocolEncoding,
+        FOREGROUND_PROCESS_NAME_MAX_BYTES, PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
     };
     use crate::AgentId;
 
@@ -1300,6 +1317,19 @@ mod tests {
             ..process
         }
         .is_valid_for(&claude));
+    }
+
+    #[test]
+    fn terminal_frame_metadata_defaults_for_older_serialized_frames() {
+        let frame: TerminalFrame = serde_json::from_str(
+            r#"{"sequence":1,"size":{"rows":24,"columns":80},"cursor_row":0,"cursor_column":0,"contents":"ready","formatted":[114]}"#,
+        )
+        .expect("legacy terminal frame");
+
+        assert!(frame.scrollback_formatted.is_empty());
+        assert!(!frame.alternate_screen);
+        assert!(!frame.mouse_protocol_enabled);
+        assert_eq!(frame.mouse_protocol_encoding, TerminalMouseProtocolEncoding::Default);
     }
 
     #[test]

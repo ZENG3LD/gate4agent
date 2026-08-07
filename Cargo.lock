@@ -358,7 +358,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
- "vt100 0.15.2",
+ "vt100",
  "vte 0.13.1",
 ]
 
@@ -577,7 +577,7 @@ dependencies = [
  "gate4agent-types",
  "tokio",
  "uzor-tui",
- "vt100 0.16.2",
+ "vt100",
 ]
 
 [[package]]
@@ -1946,12 +1946,6 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "unicode-width"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
-
-[[package]]
-name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
@@ -2011,8 +2005,8 @@ dependencies = [
  "bitflags 2.11.0",
  "compact_str",
  "crossterm",
- "unicode-width 0.2.2",
- "vt100 0.16.2",
+ "unicode-width",
+ "vt100",
 ]
 
 [[package]]
@@ -2029,36 +2023,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vt100"
-version = "0.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84cd863bf0db7e392ba3bd04994be3473491b31e66340672af5d11943c6274de"
-dependencies = [
- "itoa",
- "log",
- "unicode-width 0.1.14",
- "vte 0.11.1",
-]
-
-[[package]]
-name = "vt100"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
 dependencies = [
  "itoa",
- "unicode-width 0.2.2",
+ "unicode-width",
  "vte 0.15.0",
-]
-
-[[package]]
-name = "vte"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5022b5fbf9407086c180e9557be968742d839e68346af7792b8592489732197"
-dependencies = [
- "arrayvec",
- "utf8parse",
- "vte_generate_state_changes",
 ]
 
 [[package]]

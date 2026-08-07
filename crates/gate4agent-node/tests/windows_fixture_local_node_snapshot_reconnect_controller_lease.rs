@@ -516,7 +516,7 @@ async fn windows_fixture_cmd_provider_uses_the_exact_registry_workspace_cwd() {
     let command = workspace_root.join("cwd-fixture.cmd");
     std::fs::write(
         &command,
-        "@echo off\r\ncd\r\nping -n 60 127.0.0.1 >nul\r\n",
+        "@echo off\r\ncd\r\nfor /L %%i in (1,1,32) do @echo scroll-%%i\r\ncd\r\nping -n 60 127.0.0.1 >nul\r\n",
     )
     .unwrap();
     let workspace = WorkspaceConfig::new(
@@ -556,7 +556,7 @@ async fn windows_fixture_cmd_provider_uses_the_exact_registry_workspace_cwd() {
             workspace_id: WorkspaceId::new("primary").unwrap(),
             provider: AgentProvider::Claude,
             mode: SessionMode::Pty,
-            terminal_size: TerminalSize { rows: 24, columns: 120 },
+            terminal_size: TerminalSize { rows: 8, columns: 120 },
             initial_prompt: None,
         })
         .await
@@ -565,6 +565,7 @@ async fn windows_fixture_cmd_provider_uses_the_exact_registry_workspace_cwd() {
         panic!("cmd cwd fixture spawn returned another response");
     };
     let mut observed_contents = String::new();
+    let mut observed_scrollback = Vec::new();
     for _ in 0..250 {
         let NodeResponse::Snapshot { snapshot, .. } = client
             .request(NodeRequest::Snapshot)
@@ -577,7 +578,8 @@ async fn windows_fixture_cmd_provider_uses_the_exact_registry_workspace_cwd() {
             .and_then(|current| current.terminal_frame.as_ref())
         {
             observed_contents = frame.contents.clone();
-            if observed_contents.contains(&expected_root) {
+            observed_scrollback.clone_from(&frame.scrollback_formatted);
+            if observed_contents.contains(&expected_root) && observed_scrollback.len() >= 20 {
                 break;
             }
         }
@@ -588,6 +590,11 @@ async fn windows_fixture_cmd_provider_uses_the_exact_registry_workspace_cwd() {
         ".cmd provider cwd was not the canonical registry root; expected '{expected_root}', terminal was {observed_contents:?}",
     );
     assert!(!observed_contents.contains(r"C:\Windows"));
+    assert!(observed_scrollback.len() >= 20);
+    assert!(observed_scrollback.len() <= 256);
+    assert!(observed_scrollback
+        .iter()
+        .any(|row| String::from_utf8_lossy(row).contains("scroll-")));
     shutdown.request_shutdown().await.unwrap();
     timeout(Duration::from_secs(5), server_task)
         .await

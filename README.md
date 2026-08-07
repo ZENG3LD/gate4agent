@@ -13,9 +13,9 @@ deterministic owner for session lifecycle and host-capability authority.
 
 | Tool | Transport | Pipe mode | ACP | Resume | Notes |
 |---|---|---|---|---|---|
-| **Claude Code** | Structured inline + PTY | current `stream-json` | not in default catalog | current `--resume <id>` | Inline fresh/resume and full native Windows PTY lifecycle verified on 2.1.223 |
+| **Claude Code** | Structured inline + PTY | current `stream-json` | not in default catalog | current `--resume <id>` | Full native Windows PTY lifecycle verified on 2.1.224 |
 | **Codex CLI** | Structured inline + PTY | current `exec --json` | not in default catalog | current `exec resume` | Inline and Windows PTY verified on 0.144.6; inline defaults to read-only |
-| **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | current `-r <id>` | Inline and Windows terminal fidelity verified on 0.31.1; PTY semantic events are not claimed |
+| **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | active adapter `--session <id>`; legacy `PipeSession` `-r <id>` | Version 0.31.1 exposes `--session`; the latest PTY canary exited before readiness with a local provider `EPERM`, so current PTY lifecycle is not claimed |
 
 ### Transitional reference registry
 
@@ -150,9 +150,12 @@ let opts = SpawnOptions {
 };
 ```
 
-Each active CLI handles resume in its own way: Codex uses the current
-`exec resume` shape, Claude uses `--resume <id>`, and Kimi uses `-r <id>`.
-Gate4Agent hides that difference behind `SpawnOptions::resume_session_id`.
+Each active catalog adapter handles resume in its own way: Codex uses the
+current `exec resume` shape, Claude uses `--resume <id>`, and Kimi uses
+`--session <id>`. The backwards-compatible `PipeSession` Kimi builder still
+emits the legacy `-r <id>` shape; it is a separate compatibility surface, not
+evidence for the active adapter. Gate4Agent hides the active-adapter difference
+behind `SpawnOptions::resume_session_id`.
 
 ### Using PipeSession directly (backwards-compatible API)
 
@@ -312,13 +315,24 @@ gate4agent/
 
 | Tool | Pipe | PTY | ACP | Notes |
 |---|---|---|---|---|
-| **Claude Code 2.1.223** | ✓ fresh/resume | ✓ full lifecycle | not active | Initial/follow-up prompt, resize, in-flight interrupt, recovery, and teardown live-verified |
+| **Claude Code 2.1.224** | fresh observed; current resume canary failed | ✓ full lifecycle | not active | Current PTY: initial/follow-up prompt, resize, in-flight interrupt, recovery, and teardown live-verified |
 | **Codex 0.144.6** | ✓ fresh/resume | ✓ live | not active | Initial/follow-up, resize, in-flight interrupt, recovery, cleanup |
-| **Kimi Code 0.31.1** | ✓ fresh/resume | ✓ raw terminal fidelity | unsupported | PTY structured semantic events are not claimed |
+| **Kimi Code 0.31.1** | current canary exited before completion | current canary failed before readiness | unsupported | Local provider state reported `EPERM`; no current PTY lifecycle claim |
 
 Vendor-live inline and PTY cases are opt-in because they require installed,
 authenticated CLIs and network access. Run them with `--ignored`; ordinary
 `cargo test` is hermetic and does not contact provider accounts.
+
+Runtime readiness matching is not yet gated by the resolved vendor CLI version.
+The versioned vendor-contract lab is development-only; it records evidence but
+does not yet make an unknown runtime version fail closed. Its report is
+transport-scoped. The lab resolves the first `.cmd` or `.exe` launcher from the
+inherited Windows `PATH` and never rewrites `PATH` for a canary. PTY receives
+that exact launcher path; structured inline only confirms that its inherited
+`PATH` resolves the same file. A `.cmd` proves a stable shim, not its downstream
+native/Node entrypoint chain, so passing behavior remains non-selectable with
+the `launcher-chain-not-pinned` reason. An exact `.exe` can satisfy the launcher
+chain gate where the transport accepts exact launch injection.
 
 ## Windows spawn strategy
 

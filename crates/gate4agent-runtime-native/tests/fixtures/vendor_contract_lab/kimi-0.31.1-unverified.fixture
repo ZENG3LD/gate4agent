@@ -1,0 +1,8 @@
+agent=kimi
+platform=windows-x86_64
+version=0.31.1
+check.inline.auth_gate=pass
+check.pty.auth_gate=pass
+check.readiness.no_bracketed_paste=pass
+check.exit.direct_propagation=missing
+check.resume.current_session_flag=mismatch

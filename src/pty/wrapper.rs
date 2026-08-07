@@ -583,12 +583,8 @@ fn windows_command_wrapper(program: &OsStr) -> Option<OsString> {
     })
 }
 
-fn windows_wrapper_mode(agent_id: &AgentId) -> &'static str {
-    if agent_id.as_str() == "kimi" {
-        "/K"
-    } else {
-        "/C"
-    }
+fn windows_wrapper_mode(_agent_id: &AgentId) -> &'static str {
+    "/C"
 }
 
 fn windows_child_working_directory(path: &Path) -> PathBuf {
@@ -636,11 +632,124 @@ fn is_safe_windows_wrapper_argument(argument: &OsStr) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    struct WindowsWrapperTestRoot(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for WindowsWrapperTestRoot {
+        fn drop(&mut self) {
+            if self
+                .0
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("gate4agent-wrapper-reap-"))
+            {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
     #[test]
-    fn kimi_keeps_the_windows_command_wrapper_as_the_process_tree_anchor() {
-        assert_eq!(windows_wrapper_mode(&AgentId::new("kimi").unwrap()), "/K");
+    fn windows_command_wrappers_exit_with_the_vendor_cli() {
+        assert_eq!(windows_wrapper_mode(&AgentId::new("kimi").unwrap()), "/C");
         assert_eq!(windows_wrapper_mode(&AgentId::new("claude").unwrap()), "/C");
         assert_eq!(windows_wrapper_mode(&AgentId::new("codex").unwrap()), "/C");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_c_wrapper_exits_after_and_reaps_its_fixture_descendant() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = WindowsWrapperTestRoot(std::env::temp_dir().join(format!(
+            "gate4agent-wrapper-reap-{}-{nonce}",
+            std::process::id(),
+        )));
+        std::fs::create_dir_all(&root.0).unwrap();
+        let child_pid_file = root.0.join("child.pid");
+        let fixture = root.0.join("fixture.cmd");
+        std::fs::write(
+            &fixture,
+            b"@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText($env:GATE4AGENT_WRAPPER_CHILD_PID_FILE, [string]$PID); Start-Sleep -Seconds 5\"\r\nexit /b %errorlevel%\r\n",
+        )
+        .unwrap();
+        let plan = LaunchPlan {
+            agent_id: AgentId::new("kimi").unwrap(),
+            program: fixture.into_os_string(),
+            args: Vec::new(),
+            working_dir: root.0.clone(),
+            env: vec![crate::agent::EnvMutation {
+                key: OsString::from("GATE4AGENT_WRAPPER_CHILD_PID_FILE"),
+                value: Some(child_pid_file.as_os_str().to_owned()),
+            }],
+            followup_prompt: None,
+            followup_draft: None,
+            applied_session_options: None,
+        };
+        let mut wrapper = PtyWrapper::from_launch_plan(plan, None, 24, 80).unwrap();
+        let root_pid = wrapper.root_pid().unwrap();
+
+        let pid_deadline = Instant::now() + Duration::from_secs(3);
+        while !child_pid_file.is_file() && Instant::now() < pid_deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let child_pid: u32 = std::fs::read_to_string(&child_pid_file)
+            .expect("fixture descendant did not publish its PID")
+            .trim()
+            .parse()
+            .unwrap();
+        let running_rows = crate::pty::os_process::query_process_rows().unwrap();
+        let root_row = running_rows
+            .iter()
+            .find(|row| row.pid == root_pid)
+            .expect("cmd /C root was not observable while its descendant was running")
+            .clone();
+        let child_row = running_rows
+            .iter()
+            .find(|row| row.pid == child_pid)
+            .expect("fixture descendant was not observable")
+            .clone();
+        assert!(crate::pty::os_process::collect_descendants(&running_rows, root_pid)
+            .iter()
+            .any(|(row, _)| row.pid == child_pid));
+
+        let exit_deadline = Instant::now() + Duration::from_secs(8);
+        let exit_code = loop {
+            if let Some(exit_code) = wrapper.try_exit_code() {
+                break exit_code;
+            }
+            if Instant::now() >= exit_deadline {
+                let _ = wrapper.kill();
+                panic!("cmd wrapper did not exit after its fixture descendant");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exit_code, 0);
+        wrapper
+            .close_and_join_reader(Duration::from_secs(2))
+            .unwrap();
+
+        let reaped_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let rows = crate::pty::os_process::query_process_rows().unwrap();
+            let root_alive = rows.iter().any(|row| {
+                row.pid == root_row.pid && row.started_at == root_row.started_at
+            });
+            let child_alive = rows.iter().any(|row| {
+                row.pid == child_row.pid && row.started_at == child_row.started_at
+            });
+            if !root_alive && !child_alive {
+                break;
+            }
+            if Instant::now() >= reaped_deadline {
+                panic!(
+                    "cmd /C wrapper process tree survived: root_alive={root_alive} child_alive={child_alive}"
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[cfg(windows)]

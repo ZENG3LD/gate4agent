@@ -386,9 +386,9 @@ fn readiness(id: &str) -> AgentReadinessSpec {
         draft_signal: match id {
             "codex" => DraftReadySignal::CodexComposerPrompt,
             "kimi" => DraftReadySignal::BracketedPaste,
-            // Claude 2.1.223 renders an ASCII `>` composer instead of the
-            // older `❯` glyph. Cursor visibility after the bracketed-paste
-            // handshake is the stable terminal-level readiness signal.
+            // Claude 2.1.224 on Windows enables Win32 input plus focus
+            // reporting instead of bracketed paste. The scanner accepts that
+            // full bootstrap or the older bracketed-paste contract.
             "claude" | "opencode" | "mimo-code" => {
                 DraftReadySignal::CursorAfterBracketedPaste
             }

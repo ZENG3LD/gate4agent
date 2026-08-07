@@ -1,0 +1,11 @@
+agent=claude
+platform=windows-x86_64
+version=2.1.223
+check.inline.auth_gate=missing
+check.inline.fresh_resume=missing
+check.pty.auth_gate=pass
+check.readiness.bracketed_paste=pass
+check.pty.prompt_round_trip=pass
+check.pty.resize=pass
+check.pty.interrupt_recovery=pass
+check.pty.teardown=pass

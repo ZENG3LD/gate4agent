@@ -1,0 +1,8 @@
+agent=codex
+platform=windows-x86_64
+version=0.144.6
+check.inline.auth_gate=auth-gated
+check.inline.fresh_resume=missing
+check.pty.auth_gate=auth-gated
+check.pty.authenticated_contract=missing
+check.pty.whole_chunk_input=missing

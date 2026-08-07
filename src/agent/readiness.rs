@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 pub use gate4agent_types::DraftReadySignal;
 
 const DECSET_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+const DECSET_WIN32_INPUT_MODE: &[u8] = b"\x1b[?9001h";
+const DECSET_FOCUS_REPORTING: &[u8] = b"\x1b[?1004h";
 const DECTCEM_SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const DECTCEM_HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const ED_CLEAR_SCREEN: &[u8] = b"\x1b[2J";
@@ -198,6 +200,8 @@ struct DraftReadyScanner {
     recent: Vec<u8>,
     post_handshake_recent: Vec<u8>,
     saw_bracketed_paste: bool,
+    saw_win32_input_mode: bool,
+    saw_focus_reporting: bool,
     saw_claude_composer: bool,
     saw_cursor_show: bool,
     saw_cursor_hide: bool,
@@ -231,6 +235,8 @@ impl DraftReadyScanner {
             recent: Vec::new(),
             post_handshake_recent: Vec::new(),
             saw_bracketed_paste: false,
+            saw_win32_input_mode: false,
+            saw_focus_reporting: false,
             saw_claude_composer: false,
             saw_cursor_show: false,
             saw_cursor_hide: false,
@@ -246,6 +252,10 @@ impl DraftReadyScanner {
         }
         let combined = concat_tail(&self.recent, data);
         self.recent = tail(&combined, SCANNER_TAIL_BYTES);
+        self.saw_win32_input_mode |=
+            find_subslice(&combined, DECSET_WIN32_INPUT_MODE).is_some();
+        self.saw_focus_reporting |=
+            find_subslice(&combined, DECSET_FOCUS_REPORTING).is_some();
         self.saw_cursor_show |= find_subslice(&combined, DECTCEM_SHOW_CURSOR).is_some();
         self.saw_cursor_hide |= find_subslice(&combined, DECTCEM_HIDE_CURSOR).is_some();
         self.saw_clear_screen |= find_subslice(&combined, ED_CLEAR_SCREEN).is_some();
@@ -255,24 +265,26 @@ impl DraftReadyScanner {
             self.saw_claude_composer = true;
         }
         if !self.saw_bracketed_paste {
-            let marker_index = find_subslice(&combined, DECSET_BRACKETED_PASTE)?;
-            self.saw_bracketed_paste = true;
-            if self.signal == DraftReadySignal::BracketedPaste {
-                self.ready = Some(ReadyReason::DraftSignal);
-                return self.ready;
+            let marker_index = find_subslice(&combined, DECSET_BRACKETED_PASTE);
+            if let Some(marker_index) = marker_index {
+                self.saw_bracketed_paste = true;
+                if self.signal == DraftReadySignal::BracketedPaste {
+                    self.ready = Some(ReadyReason::DraftSignal);
+                    return self.ready;
+                }
+                if self.signal == DraftReadySignal::ClaudeComposerPrompt
+                    && self.saw_claude_composer
+                {
+                    self.ready = Some(ReadyReason::DraftSignal);
+                    return self.ready;
+                }
+                let post_handshake = &combined[marker_index + DECSET_BRACKETED_PASTE.len()..];
+                if self.marker_seen(post_handshake) {
+                    self.ready = Some(ReadyReason::DraftSignal);
+                    return self.ready;
+                }
+                self.post_handshake_recent = tail(post_handshake, SCANNER_TAIL_BYTES);
             }
-            if self.signal == DraftReadySignal::ClaudeComposerPrompt
-                && self.saw_claude_composer
-            {
-                self.ready = Some(ReadyReason::DraftSignal);
-                return self.ready;
-            }
-            let post_handshake = &combined[marker_index + DECSET_BRACKETED_PASTE.len()..];
-            if self.marker_seen(post_handshake) {
-                self.ready = Some(ReadyReason::DraftSignal);
-                return self.ready;
-            }
-            self.post_handshake_recent = tail(post_handshake, SCANNER_TAIL_BYTES);
         } else {
             if self.signal == DraftReadySignal::ClaudeComposerPrompt
                 && self.saw_claude_composer
@@ -288,7 +300,9 @@ impl DraftReadyScanner {
             self.post_handshake_recent = tail(&post_combined, SCANNER_TAIL_BYTES);
         }
 
-        if self.signal == DraftReadySignal::QuietAfterBracketedPaste {
+        if self.signal == DraftReadySignal::QuietAfterBracketedPaste
+            && self.saw_bracketed_paste
+        {
             self.quiet_deadline_ms = Some(elapsed_ms.saturating_add(self.quiet_ms));
         }
         if self.vendor_bootstrap_complete() {
@@ -308,8 +322,8 @@ impl DraftReadyScanner {
 
     fn poll(&mut self, elapsed_ms: u64) -> Option<ReadyReason> {
         if self.ready.is_none()
-            && self.saw_bracketed_paste
-            && (self.signal == DraftReadySignal::QuietAfterBracketedPaste
+            && ((self.signal == DraftReadySignal::QuietAfterBracketedPaste
+                && self.saw_bracketed_paste)
                 || self.vendor_bootstrap_complete())
             && self
                 .quiet_deadline_ms
@@ -338,8 +352,15 @@ impl DraftReadyScanner {
     }
 
     fn vendor_bootstrap_complete(&self) -> bool {
-        self.bootstrap_settle != BootstrapSettle::None
-            && self.saw_bracketed_paste
+        let terminal_mode_ready = match self.bootstrap_settle {
+            BootstrapSettle::RestartOnOutput => {
+                self.saw_bracketed_paste
+                    || (self.saw_win32_input_mode && self.saw_focus_reporting)
+            }
+            BootstrapSettle::FixedFromHandshake => self.saw_bracketed_paste,
+            BootstrapSettle::None => false,
+        };
+        terminal_mode_ready
             && self.saw_cursor_show
             && self.saw_cursor_hide
             && self.saw_clear_screen
@@ -656,6 +677,72 @@ mod tests {
         assert_eq!(tracker.poll(1_699), ReadinessStatus::Waiting);
         assert_eq!(
             tracker.poll(1_700),
+            ReadinessStatus::Ready(ReadyReason::DraftQuiet)
+        );
+    }
+
+    #[test]
+    fn claude_2_1_224_windows_input_bootstrap_settles_after_quiet() {
+        let mut tracker = tracker("claude", ReadinessIntent::FollowupPrompt);
+        tracker.observe_foreground(
+            &ForegroundObservation {
+                process_name: Some("claude".to_owned()),
+                has_child_processes: false,
+                is_shell: false,
+            },
+            100,
+        );
+        assert_eq!(
+            tracker.observe_output(
+                b"\x1b[?9001h\x1b[?1004h\x1b[?25h\x1b[?25l\x1b[2J",
+                200,
+            ),
+            ReadinessStatus::Waiting
+        );
+        assert_eq!(tracker.poll(1_699), ReadinessStatus::Waiting);
+        assert_eq!(
+            tracker.poll(1_700),
+            ReadinessStatus::Ready(ReadyReason::DraftQuiet)
+        );
+    }
+
+    #[test]
+    fn claude_windows_input_bootstrap_rejects_an_incomplete_handshake() {
+        let mut tracker = tracker("claude", ReadinessIntent::FollowupPrompt);
+        tracker.observe_foreground(
+            &ForegroundObservation {
+                process_name: Some("claude".to_owned()),
+                has_child_processes: false,
+                is_shell: false,
+            },
+            100,
+        );
+        tracker.observe_output(b"\x1b[?9001h\x1b[?25h\x1b[?25l\x1b[2J", 200);
+        assert_eq!(tracker.poll(1_700), ReadinessStatus::Waiting);
+    }
+
+    #[test]
+    fn claude_windows_input_bootstrap_quiet_restarts_on_late_output() {
+        let mut tracker = tracker("claude", ReadinessIntent::FollowupPrompt);
+        tracker.observe_foreground(
+            &ForegroundObservation {
+                process_name: Some("claude".to_owned()),
+                has_child_processes: false,
+                is_shell: false,
+            },
+            100,
+        );
+        tracker.observe_output(
+            b"\x1b[?9001h\x1b[?1004h\x1b[?25h\x1b[?25l\x1b[2J",
+            200,
+        );
+        assert_eq!(
+            tracker.observe_output(b"late onboarding render", 1_000),
+            ReadinessStatus::Waiting
+        );
+        assert_eq!(tracker.poll(1_700), ReadinessStatus::Waiting);
+        assert_eq!(
+            tracker.poll(2_500),
             ReadinessStatus::Ready(ReadyReason::DraftQuiet)
         );
     }

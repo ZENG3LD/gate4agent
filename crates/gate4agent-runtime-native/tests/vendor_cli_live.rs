@@ -10,6 +10,8 @@ use gate4agent_types::{
 };
 
 const LIVE_CANARY_ENV: &str = "GATE4AGENT_VENDOR_CANARY";
+const LIVE_LAUNCHER_ENV: &str = "GATE4AGENT_VENDOR_CANARY_LAUNCHER";
+const LIVE_LAUNCHER_AGENT_ENV: &str = "GATE4AGENT_VENDOR_CANARY_AGENT";
 const LIVE_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -270,30 +272,108 @@ fn provider_text_for(events: &[ControlEvent], instance_id: AgentInstanceId) -> S
         .join("")
 }
 
-fn provider_errors(events: &[ControlEvent]) -> Vec<&str> {
+fn provider_error_count(events: &[ControlEvent]) -> usize {
     events
         .iter()
-        .filter_map(|event| match &event.event {
+        .filter(|event| matches!(
+            &event.event,
             ControlEventKind::ProviderEvent {
-                event: ProviderEvent::Error { message },
+                event: ProviderEvent::Error { .. },
                 ..
-            } => Some(message.as_str()),
-            _ => None,
-        })
-        .collect()
+            }
+        ))
+        .count()
 }
 
-fn provider_session_results(events: &[ControlEvent]) -> Vec<&str> {
+fn provider_error_categories(events: &[ControlEvent]) -> String {
+    let mut categories = Vec::new();
+    for message in events.iter().filter_map(|event| match &event.event {
+        ControlEventKind::ProviderEvent {
+            event: ProviderEvent::Error { message },
+            ..
+        } => Some(message.to_ascii_lowercase()),
+        _ => None,
+    }) {
+        for (category, marker) in [
+            ("authentication", "auth"),
+            ("login", "login"),
+            ("invalid-session", "invalid session"),
+            ("session-not-found", "session not found"),
+            ("not-found", "not found"),
+            ("does-not-exist", "does not exist"),
+            ("in-use", "already in use"),
+            ("resume", "resume"),
+            ("conversation", "conversation"),
+            ("expired", "expired"),
+            ("network", "network"),
+            ("offline", "offline"),
+            ("unavailable", "unavailable"),
+            ("overloaded", "overloaded"),
+            ("rate-limit", "rate limit"),
+            ("permission", "permission"),
+            ("unsupported", "unsupported"),
+            ("unknown-option", "unknown option"),
+        ] {
+            if message.contains(marker) && !categories.contains(&category) {
+                categories.push(category);
+            }
+        }
+    }
+    if categories.is_empty() {
+        "unclassified".to_owned()
+    } else {
+        categories.join(",")
+    }
+}
+
+fn provider_session_result_count(events: &[ControlEvent]) -> usize {
     events
         .iter()
-        .filter_map(|event| match &event.event {
+        .filter(|event| matches!(
+            &event.event,
             ControlEventKind::ProviderEvent {
-                event: ProviderEvent::SessionEnded { result, .. },
+                event: ProviderEvent::SessionEnded { .. },
                 ..
-            } => Some(result.as_str()),
-            _ => None,
+            }
+        ))
+        .count()
+}
+
+fn assert_inherited_path_resolves_vendor_launcher(agent_id: &str) {
+    let selected_agent = std::env::var_os(LIVE_LAUNCHER_AGENT_ENV);
+    let selected_launcher = std::env::var_os(LIVE_LAUNCHER_ENV);
+    if selected_agent.is_none() && selected_launcher.is_none() {
+        return;
+    }
+    let selected_agent = selected_agent
+        .expect("inline launcher evidence requires both vendor contract lab variables");
+    let selected_launcher = selected_launcher
+        .expect("inline launcher evidence requires both vendor contract lab variables");
+    assert_eq!(
+        selected_agent.to_str(),
+        Some(agent_id),
+        "vendor contract lab must identify the inline agent"
+    );
+    let expected = PathBuf::from(selected_launcher);
+    assert!(expected.is_absolute());
+    assert!(expected.is_file());
+    let path = std::env::var_os("PATH").expect("inline canary PATH");
+    let directories = std::env::split_paths(&path).collect::<Vec<_>>();
+    let resolved = ["cmd", "exe"]
+        .into_iter()
+        .find_map(|extension| {
+            let file_name = format!("{agent_id}.{extension}");
+            directories
+                .iter()
+                .map(|directory| directory.join(&file_name))
+                .find(|candidate| candidate.is_file())
         })
-        .collect()
+        .expect("inline launcher must resolve on the inherited PATH");
+    assert_eq!(
+        resolved.canonicalize().expect("resolved inline launcher"),
+        expected.canonicalize().expect("expected inline launcher"),
+        "inline canary inherited PATH resolved a different vendor launcher"
+    );
 }
 
 async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
@@ -302,6 +382,7 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
         Ok("1"),
         "set {LIVE_CANARY_ENV}=1 to opt into authenticated vendor execution"
     );
+    assert_inherited_path_resolves_vendor_launcher(agent_id);
 
     let working_directory = isolated_working_directory(agent_id);
     let marker = format!("GATE4AGENT_{agent_id}_CANARY_OK");
@@ -397,8 +478,9 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
 
     assert!(
         failure.is_none(),
-        "{agent_id} emitted provider failure: {failure:?}; exit_code={exit_code:?}; provider_errors={:?}",
-        provider_errors(&events),
+        "{agent_id} emitted provider failure: {failure:?}; exit_code={exit_code:?}; provider_error_count={} provider_error_categories={}",
+        provider_error_count(&events),
+        provider_error_categories(&events),
     );
     assert_eq!(exit_code, Some(0), "{agent_id} exited unsuccessfully");
     assert!(
@@ -489,11 +571,12 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
             resumed.status,
             SessionStatus::Exited { exit_code: Some(0) }
         ),
-        "{agent_id} resumed child exited unsuccessfully; status={:?}; failure_kind={:?}; provider_errors={:?}; session_results={:?}; response_bytes={}",
+        "{agent_id} resumed child exited unsuccessfully; status={:?}; failure_kind={:?}; provider_error_count={}; provider_error_categories={}; session_result_count={}; response_bytes={}",
         resumed.status,
         provider_failure_kind(&events[event_boundary..]),
-        provider_errors(&events[event_boundary..]),
-        provider_session_results(&events[event_boundary..]),
+        provider_error_count(&events[event_boundary..]),
+        provider_error_categories(&events[event_boundary..]),
+        provider_session_result_count(&events[event_boundary..]),
         provider_text(&events[event_boundary..]).len(),
     );
     assert!(
@@ -503,12 +586,10 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
     let resumed_text = provider_text(&events[event_boundary..]);
     assert!(
         resumed_text.contains(&marker),
-        "{agent_id} resumed response did not retain prior-turn context; response={resumed_text:?}; errors={:?}; events={:?}",
-        provider_errors(&events[event_boundary..]),
-        events[event_boundary..]
-            .iter()
-            .map(|event| format!("{:?}", event.event))
-            .collect::<Vec<_>>(),
+        "{agent_id} resumed response did not retain prior-turn context; response_bytes={} provider_error_count={} event_count={}",
+        resumed_text.len(),
+        provider_error_count(&events[event_boundary..]),
+        events[event_boundary..].len(),
     );
     assert!(
         successful_provider_end_count(&events) >= 2,

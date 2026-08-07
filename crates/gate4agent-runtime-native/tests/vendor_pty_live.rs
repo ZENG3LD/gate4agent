@@ -1,5 +1,7 @@
-use std::sync::mpsc::TryRecvError;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
@@ -12,6 +14,8 @@ use gate4agent_types::{
 };
 
 const LIVE_CANARY_ENV: &str = "GATE4AGENT_VENDOR_PTY_CANARY";
+const LIVE_LAUNCHER_ENV: &str = "GATE4AGENT_VENDOR_CANARY_LAUNCHER";
+const LIVE_LAUNCHER_AGENT_ENV: &str = "GATE4AGENT_VENDOR_CANARY_AGENT";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -86,11 +90,75 @@ fn session_failure_category(status: &SessionStatus) -> &'static str {
         "vendor-onboarding"
     } else if message.contains("PTY readiness timed out") {
         "readiness-timeout"
+    } else if message.starts_with("PTY exited with code")
+        || (message.contains("PTY process observation failed")
+            && message.contains("no row for root PID"))
+    {
+        "provider-exit"
     } else if message.contains("cleanup failed") {
         "cleanup"
     } else {
         "other"
     }
+}
+
+fn terminal_flag_names(contents: &str, agent_id: &str) -> Vec<&'static str> {
+    let normalized = contents.to_ascii_lowercase();
+    [
+        ("agent-name", agent_id),
+        ("login", "login"),
+        ("logged-out", "not logged in"),
+        ("sign-in", "sign in"),
+        ("authenticated", "authenticated"),
+        ("authentication", "authentication"),
+        ("auth", "auth"),
+        ("api-key", "api key"),
+        ("error", "error"),
+        ("api-error", "api error"),
+        ("usage-limit", "usage limit"),
+        ("rate-limit", "rate limit"),
+        ("output-limit", "output limit"),
+        ("too-long", "too long"),
+        ("overloaded", "overloaded"),
+        ("retry", "try again"),
+        ("permission", "permission"),
+        ("approval", "approval"),
+        ("trust", "trust"),
+        ("workspace", "workspace"),
+        ("update", "update"),
+        ("welcome", "welcome to claude code"),
+        (
+            "terminal-style-setup",
+            "choose the text style that looks best with your terminal",
+        ),
+        ("ide-onboarding", "selected lines"),
+        ("safety-check", "quick safety check"),
+        ("connect", "connect"),
+        ("network", "network"),
+        ("offline", "offline"),
+        ("unavailable", "unavailable"),
+        ("nested", "nested"),
+        ("already-running", "already running"),
+        ("unsupported", "unsupported"),
+        ("unknown-option", "unknown option"),
+        ("invalid", "invalid"),
+        ("failed", "failed"),
+        ("enter", "enter"),
+        ("escape", "esc"),
+        ("press", "press"),
+        ("shortcut", "shortcut"),
+        ("model", "model"),
+        ("sandbox", "sandbox"),
+        ("openai", "openai"),
+        ("working", "working"),
+        ("thinking", "thinking"),
+        ("prompt-visible", "reply with one string only"),
+        ("claude-composer", "❯"),
+        ("codex-composer", "›"),
+    ]
+    .into_iter()
+    .filter_map(|(name, needle)| normalized.contains(needle).then_some(name))
+    .collect()
 }
 
 fn sanitized_diagnostics(
@@ -105,54 +173,7 @@ fn sanitized_diagnostics(
     let (frame_sequence, frame_chars, flags) = session.terminal_frame.as_ref().map_or_else(
         || (0, 0, "none".to_owned()),
         |frame| {
-            let normalized = frame.contents.to_ascii_lowercase();
-            let mut flags = Vec::new();
-            for (name, needle) in [
-                ("agent-name", session.agent_id.as_str()),
-                ("login", "login"),
-                ("logged-out", "not logged in"),
-                ("sign-in", "sign in"),
-                ("authenticated", "authenticated"),
-                ("authentication", "authentication"),
-                ("auth", "auth"),
-                ("api-key", "api key"),
-                ("error", "error"),
-                ("api-error", "api error"),
-                ("usage-limit", "usage limit"),
-                ("rate-limit", "rate limit"),
-                ("output-limit", "output limit"),
-                ("too-long", "too long"),
-                ("overloaded", "overloaded"),
-                ("retry", "try again"),
-                ("permission", "permission"),
-                ("approval", "approval"),
-                ("trust", "trust"),
-                ("workspace", "workspace"),
-                ("update", "update"),
-                ("welcome", "welcome to claude code"),
-                (
-                    "terminal-style-setup",
-                    "choose the text style that looks best with your terminal",
-                ),
-                ("ide-onboarding", "selected lines"),
-                ("safety-check", "quick safety check"),
-                ("enter", "enter"),
-                ("escape", "esc"),
-                ("press", "press"),
-                ("shortcut", "shortcut"),
-                ("model", "model"),
-                ("sandbox", "sandbox"),
-                ("openai", "openai"),
-                ("working", "working"),
-                ("thinking", "thinking"),
-                ("prompt-visible", "reply with one string only"),
-                ("claude-composer", "❯"),
-                ("codex-composer", "›"),
-            ] {
-                if normalized.contains(needle) {
-                    flags.push(name);
-                }
-            }
+            let flags = terminal_flag_names(&frame.contents, session.agent_id.as_str());
             (
                 frame.sequence,
                 frame.contents.chars().count(),
@@ -179,10 +200,17 @@ fn sanitized_diagnostics(
     let startup_detail = match &session.status {
         SessionStatus::Failed { message }
             if message.starts_with("PTY readiness timed out (")
+                || message.starts_with("PTY exited with code")
                 || message.contains("initial prompt")
                 || message.contains("deferred initial prompt")
                 || message.contains("identity probe")
                 || message.contains("requires operator action") => message.as_str(),
+        SessionStatus::Failed { message }
+            if message.contains("PTY process observation failed")
+                && message.contains("no row for root PID") =>
+        {
+            "provider process exited before readiness"
+        }
         _ => "none",
     };
     format!(
@@ -205,10 +233,11 @@ fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
 fn runtime_for(
     agent_id: &str,
 ) -> (gate4agent_handle::Gate4AgentHandle, NativeRuntime) {
-    let spec = builtin_registry()
+    let mut spec = builtin_registry()
         .get_by_id(agent_id)
         .unwrap_or_else(|| panic!("missing built-in agent spec for {agent_id}"))
         .clone();
+    pin_exact_live_launcher(&mut spec, agent_id);
     NativeRuntime::new(
         AgentRegistry::new([spec]).expect("single-agent live PTY registry"),
         NativeRuntimeConfig {
@@ -222,10 +251,12 @@ fn runtime_for_agents(
     agent_ids: &[&str],
 ) -> (gate4agent_handle::Gate4AgentHandle, NativeRuntime) {
     let specs = agent_ids.iter().map(|agent_id| {
-        builtin_registry()
+        let mut spec = builtin_registry()
             .get_by_id(agent_id)
             .unwrap_or_else(|| panic!("missing built-in agent spec for {agent_id}"))
-            .clone()
+            .clone();
+        pin_exact_live_launcher(&mut spec, agent_id);
+        spec
     });
     NativeRuntime::new(
         AgentRegistry::new(specs).expect("multi-agent live PTY registry"),
@@ -234,6 +265,36 @@ fn runtime_for_agents(
             ..NativeRuntimeConfig::default()
         },
     )
+}
+
+fn pin_exact_live_launcher(spec: &mut gate4agent_catalog::AgentSpec, agent_id: &str) {
+    let selected_agent = std::env::var_os(LIVE_LAUNCHER_AGENT_ENV);
+    let selected_launcher = std::env::var_os(LIVE_LAUNCHER_ENV);
+    if selected_agent.is_none() && selected_launcher.is_none() {
+        return;
+    }
+    let selected_agent = selected_agent
+        .expect("exact PTY evidence requires both vendor contract lab variables");
+    let selected_launcher = selected_launcher
+        .expect("exact PTY evidence requires both vendor contract lab variables");
+    if selected_agent != agent_id {
+        return;
+    }
+    let path = PathBuf::from(selected_launcher);
+    assert!(path.is_absolute(), "exact PTY launcher must be absolute");
+    assert!(path.is_file(), "exact PTY launcher must be a file");
+    assert!(matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("cmd" | "exe")
+    ));
+    let value = path
+        .to_str()
+        .expect("exact PTY launcher path must be Unicode");
+    assert!(!value.bytes().any(|byte| matches!(byte, b'"' | b'&' | b'|' | b'<' | b'>' | b'^' | b'%' | b'!' | b'\r' | b'\n')));
+    spec.launch.program = value.to_owned();
 }
 
 fn drain_events(
@@ -282,6 +343,9 @@ async fn wait_for_running(
     events: &mut Vec<ControlEvent>,
     subscription: &gate4agent_handle::EventSubscription,
 ) -> Result<(), String> {
+    let mut retained_flags = BTreeSet::new();
+    let mut retained_frame_sequence = 0_u64;
+    let mut retained_frame_chars = 0_usize;
     match tokio::time::timeout(START_TIMEOUT, async {
         loop {
             runtime.tick().await;
@@ -290,12 +354,27 @@ async fn wait_for_running(
             let Some(session) = snapshot.sessions.first() else {
                 return Err("live PTY session snapshot is missing during startup".to_owned());
             };
+            if let Some(frame) = &session.terminal_frame {
+                retained_frame_sequence = retained_frame_sequence.max(frame.sequence);
+                retained_frame_chars = retained_frame_chars.max(frame.contents.chars().count());
+                retained_flags.extend(terminal_flag_names(
+                    &frame.contents,
+                    session.agent_id.as_str(),
+                ));
+            }
             match &session.status {
                 SessionStatus::Running => return Ok(()),
                 SessionStatus::Failed { .. } | SessionStatus::Exited { .. } => {
                     return Err(format!(
-                        "live PTY session stopped during startup; {}",
-                        sanitized_diagnostics(handle, events, 0)
+                        "live PTY session stopped during startup; {} retained_frame_sequence={} retained_frame_chars={} retained_frame_flags={}",
+                        sanitized_diagnostics(handle, events, 0),
+                        retained_frame_sequence,
+                        retained_frame_chars,
+                        if retained_flags.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            retained_flags.iter().copied().collect::<Vec<_>>().join(",")
+                        },
                     ));
                 }
                 _ => {}

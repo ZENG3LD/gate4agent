@@ -9,7 +9,8 @@ use crate::protocol::{
     AgentProvider, ClientFrame, ClientRole,
     ControllerState, FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
     GitWorktreeSnapshot, NodeEvent,
-    NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeRequest,
+    NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
+    NodeRequest,
     NodeResponse, NodeSnapshot, RequestEnvelope,
     ResponseEnvelope, ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode,
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
@@ -22,7 +23,9 @@ use crate::protocol::{
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
 use gate4agent_runtime_native::{HookIngressConfig, NativeRuntime, NativeRuntimeConfig};
-use gate4agent_node_wire::{auth_proof, proofs_match, random_nonce, AuthDirection};
+use gate4agent_node_wire::{
+    auth_proof, proofs_match, random_incarnation_id, random_nonce, AuthDirection,
+};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, InputAction, PromptFraming, PromptPayload, ResumeLaunchRequest,
@@ -283,10 +286,13 @@ impl NodeServer {
             .collect();
         let (handle, runtime) = NativeRuntime::new(catalog, config.runtime);
         let events = handle.subscribe(CONTROL_EVENT_SUBSCRIPTION_CAPACITY);
-        let shared = Arc::new(NodeShared::new(
+        let incarnation_id = random_incarnation_id()
+            .map_err(NodeServerError::IncarnationIdentity)?;
+        let shared = Arc::new(NodeShared::new_with_incarnation(
             handle,
             config.access_token.clone(),
             config.node_id.clone(),
+            incarnation_id,
             config.workspaces.clone(),
             enabled_providers,
         ));
@@ -469,6 +475,7 @@ struct NodeShared {
     handle: Gate4AgentHandle,
     access_token: String,
     node_id: NodeId,
+    incarnation_id: NodeIncarnationId,
     started_at_unix_ms: u64,
     workspaces: RwLock<BTreeMap<WorkspaceId, String>>,
     enabled_providers: Vec<AgentProvider>,
@@ -515,10 +522,11 @@ impl NodeEventHistory {
 }
 
 impl NodeShared {
-    fn new(
+    fn new_with_incarnation(
         handle: Gate4AgentHandle,
         access_token: String,
         node_id: NodeId,
+        incarnation_id: NodeIncarnationId,
         workspaces: Vec<WorkspaceConfig>,
         enabled_providers: Vec<AgentProvider>,
     ) -> Self {
@@ -527,6 +535,7 @@ impl NodeShared {
             handle,
             access_token,
             node_id,
+            incarnation_id,
             started_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -553,6 +562,24 @@ impl NodeShared {
             mutation_gate: AsyncMutex::new(()),
             session_bindings: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn new(
+        handle: Gate4AgentHandle,
+        access_token: String,
+        node_id: NodeId,
+        workspaces: Vec<WorkspaceConfig>,
+        enabled_providers: Vec<AgentProvider>,
+    ) -> Self {
+        Self::new_with_incarnation(
+            handle,
+            access_token,
+            node_id,
+            NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            workspaces,
+            enabled_providers,
+        )
     }
 
     async fn begin_shutdown(&self) -> Result<(), NodeFailure> {
@@ -1722,6 +1749,7 @@ async fn serve_connection(
         &mut pipe,
         &ServerFrame::Hello(NodeHello {
             protocol_version: NODE_PROTOCOL_VERSION,
+            incarnation_id: shared.incarnation_id,
             connection_id,
             role: hello.role,
             event_sequence: shared.current_sequence(),
@@ -2507,6 +2535,8 @@ pub enum NodeServerError {
     AuthenticationTimedOut,
     #[error("node authentication primitive failed: {0}")]
     Authentication(String),
+    #[error("node incarnation identity generation failed: {0}")]
+    IncarnationIdentity(String),
     #[error("node pre-authentication limiter is closed")]
     PreauthClosed,
     #[error("node authenticated connection limit was reached")]

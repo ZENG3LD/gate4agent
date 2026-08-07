@@ -149,6 +149,68 @@ fn assert_git_success(root: &Path, arguments: &[&str]) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_node_incarnation_is_stable_for_reconnect_and_changes_after_restart() {
+    let endpoint = endpoint();
+    let token = "fixture-incarnation-token";
+    let server = NodeServer::new_fixture(server_config(&endpoint, token)).unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_task = tokio::spawn(server.run());
+
+    let first = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Observer,
+        token,
+    )
+    .await
+    .unwrap();
+    let first_incarnation = first.hello().incarnation_id;
+    assert_eq!(first.hello().event_sequence, 0);
+
+    let second = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Observer,
+        token,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.hello().incarnation_id, first_incarnation);
+    assert_eq!(second.hello().event_sequence, first.hello().event_sequence);
+
+    drop(first);
+    drop(second);
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let restarted = NodeServer::new_fixture(server_config(&endpoint, token)).unwrap();
+    let restarted_shutdown = restarted.shutdown_handle();
+    let restarted_task = tokio::spawn(restarted.run());
+    let reconnected = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Observer,
+        token,
+    )
+    .await
+    .unwrap();
+    assert_ne!(reconnected.hello().incarnation_id, first_incarnation);
+    assert_eq!(reconnected.hello().event_sequence, 0);
+
+    drop(reconnected);
+    restarted_shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), restarted_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn windows_fixture_extracted_named_pipe_client_preserves_auth_snapshot_events_and_controller_lease() {
     let endpoint = endpoint();
     let token = "fixture-control-token";

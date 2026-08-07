@@ -1,9 +1,10 @@
 use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, ClientAuthentication,
     ClientFrame, ClientHello, ClientRole, FrameError, NodeEventEnvelope, NodeFailure, NodeHello,
-    NodeId, NodeRequest, NodeResponse, RequestEnvelope, ServerFrame, MAX_NODE_CLIENT_FRAME_BYTES,
-    MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES, NODE_AUTH_NONCE_BYTES,
-    NODE_AUTH_PROOF_BYTES, NODE_PROTOCOL_VERSION,
+    NodeId, NodeIncarnationId, NodeRequest, NodeResponse, RequestEnvelope, ServerFrame,
+    MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
+    NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
+    NODE_PROTOCOL_VERSION,
 };
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -226,16 +227,27 @@ pub enum AuthDirection {
 
 pub fn random_nonce() -> Result<[u8; NODE_AUTH_NONCE_BYTES], String> {
     let mut nonce = [0; NODE_AUTH_NONCE_BYTES];
+    fill_random(&mut nonce)?;
+    Ok(nonce)
+}
+
+pub fn random_incarnation_id() -> Result<NodeIncarnationId, String> {
+    let mut bytes = [0; NODE_INCARNATION_ID_BYTES];
+    fill_random(&mut bytes)?;
+    Ok(NodeIncarnationId::from_bytes(bytes))
+}
+
+fn fill_random(bytes: &mut [u8]) -> Result<(), String> {
     let status = unsafe {
         BCryptGenRandom(
             ptr::null_mut(),
-            nonce.as_mut_ptr(),
-            nonce.len() as u32,
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
             BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         )
     };
     cng_status("BCryptGenRandom", status)?;
-    Ok(nonce)
+    Ok(())
 }
 
 pub fn auth_proof(
@@ -482,5 +494,13 @@ mod tests {
         assert!(!proofs_match(&server, &client));
         assert!(!proofs_match(&server, &observer));
         assert!(proofs_match(&server, &server));
+    }
+
+    #[test]
+    fn windows_cng_generates_a_bounded_incarnation_id() {
+        let incarnation_id = random_incarnation_id().unwrap();
+        let encoded = incarnation_id.to_string();
+        assert_eq!(encoded.len(), NODE_INCARNATION_ID_BYTES * 2);
+        assert_eq!(encoded.parse::<NodeIncarnationId>().unwrap(), incarnation_id);
     }
 }

@@ -14,8 +14,9 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-pub const NODE_PROTOCOL_VERSION: u16 = 6;
+pub const NODE_PROTOCOL_VERSION: u16 = 7;
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
+pub const NODE_INCARNATION_ID_BYTES: usize = 16;
 pub const MAX_NODE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_NODE_CLIENT_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_NODE_TEXT_BYTES: usize = 32 * 1024;
@@ -66,6 +67,84 @@ pub struct NodeId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkspaceId(String);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeIncarnationId([u8; NODE_INCARNATION_ID_BYTES]);
+
+impl NodeIncarnationId {
+    pub fn from_bytes(bytes: [u8; NODE_INCARNATION_ID_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; NODE_INCARNATION_ID_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Display for NodeIncarnationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for NodeIncarnationId {
+    type Err = NodeIncarnationIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != NODE_INCARNATION_ID_BYTES * 2 {
+            return Err(NodeIncarnationIdError::InvalidLength {
+                len: value.len(),
+                expected: NODE_INCARNATION_ID_BYTES * 2,
+            });
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')) {
+            return Err(NodeIncarnationIdError::InvalidHex(value.to_owned()));
+        }
+        let mut bytes = [0; NODE_INCARNATION_ID_BYTES];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            bytes[index] = (decode_lower_hex(pair[0]) << 4) | decode_lower_hex(pair[1]);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for NodeIncarnationId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeIncarnationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_lower_hex(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("lowercase hexadecimal input was validated"),
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum NodeIncarnationIdError {
+    #[error("node incarnation ID length {len} does not match the required {expected} lowercase hexadecimal characters")]
+    InvalidLength { len: usize, expected: usize },
+    #[error("node incarnation ID must contain exactly 32 lowercase hexadecimal characters: {0}")]
+    InvalidHex(String),
+}
 
 macro_rules! identifier_impl {
     ($type:ident, $label:literal) => {
@@ -298,9 +377,16 @@ pub struct ControllerState {
     pub lease_remaining_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct NodeCursor {
+    pub incarnation_id: NodeIncarnationId,
+    pub sequence: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeHello {
     pub protocol_version: u16,
+    pub incarnation_id: NodeIncarnationId,
     pub connection_id: u64,
     pub role: ClientRole,
     pub event_sequence: u64,
@@ -741,8 +827,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v6_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 6);
+    fn protocol_v7_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 7);
         assert_eq!(MAX_WORKSPACE_ROOT_BYTES, gate4agent_types::WORKING_DIRECTORY_MAX_BYTES);
 
         let register = NodeRequest::RegisterWorkspace {
@@ -790,6 +876,67 @@ mod tests {
             r#"{"kind":"remove-worktree","source_workspace_id":"primary","target_root":"C:\\trees\\topic-one"}"#,
         );
         assert_eq!(serde_json::from_str::<NodeRequest>(&remove_json).unwrap(), remove);
+    }
+
+    #[test]
+    fn incarnation_id_and_cursor_have_exact_lowercase_hex_wire_shapes() {
+        let incarnation_id = NodeIncarnationId::from_bytes([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ]);
+        assert_eq!(
+            incarnation_id.to_string(),
+            "00112233445566778899aabbccddeeff",
+        );
+        let json = serde_json::to_string(&incarnation_id).unwrap();
+        assert_eq!(json, r#""00112233445566778899aabbccddeeff""#);
+        assert_eq!(
+            serde_json::from_str::<NodeIncarnationId>(&json).unwrap(),
+            incarnation_id,
+        );
+        assert!("00112233445566778899AABBCCDDEEFF"
+            .parse::<NodeIncarnationId>()
+            .is_err());
+        assert!("00112233445566778899aabbccddeef"
+            .parse::<NodeIncarnationId>()
+            .is_err());
+        assert!("00112233445566778899aabbccddeefg"
+            .parse::<NodeIncarnationId>()
+            .is_err());
+
+        let cursor = NodeCursor {
+            incarnation_id,
+            sequence: 17,
+        };
+        let cursor_json = serde_json::to_string(&cursor).unwrap();
+        assert_eq!(
+            cursor_json,
+            r#"{"incarnation_id":"00112233445566778899aabbccddeeff","sequence":17}"#,
+        );
+        assert_eq!(serde_json::from_str::<NodeCursor>(&cursor_json).unwrap(), cursor);
+    }
+
+    #[test]
+    fn node_hello_v7_carries_the_incarnation_sequence_domain() {
+        let hello = NodeHello {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            incarnation_id: NodeIncarnationId::from_bytes([0; NODE_INCARNATION_ID_BYTES]),
+            connection_id: 42,
+            role: ClientRole::Observer,
+            event_sequence: 9,
+            controller: None,
+            snapshot: NodeSnapshot {
+                node_id: NodeId::new("fixture-node").unwrap(),
+                enabled_providers: Vec::new(),
+                workspaces: Vec::new(),
+            },
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(
+            json,
+            r#"{"protocol_version":7,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[]}}"#,
+        );
+        assert_eq!(serde_json::from_str::<NodeHello>(&json).unwrap(), hello);
     }
 
     #[test]

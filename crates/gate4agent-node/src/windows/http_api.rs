@@ -116,6 +116,7 @@ fn health_body(shared: &NodeShared) -> Value {
         "ok": true,
         "service": SERVICE_NAME,
         "node_id": shared.node_id,
+        "incarnation_id": shared.incarnation_id,
         "pid": std::process::id(),
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": NODE_PROTOCOL_VERSION,
@@ -152,6 +153,7 @@ fn ready_body(shared: &NodeShared) -> Value {
 fn status_body(shared: &NodeShared) -> Value {
     json!({
         "snapshot": shared.snapshot(),
+        "incarnation_id": shared.incarnation_id,
         "event_sequence": shared.current_sequence(),
         "controller_active": shared.controller_state().is_some(),
         "shutdown": shared.shutdown.load(Ordering::Acquire),
@@ -368,6 +370,7 @@ mod tests {
     #[tokio::test]
     async fn health_ready_and_authenticated_status_are_bounded_and_read_only() {
         let server = node_server();
+        let incarnation_id = server.shared.incarnation_id.to_string();
         let shared = Arc::clone(&server.shared);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -377,6 +380,7 @@ mod tests {
         assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(health.contains("\"service\":\"gate4agent-node\""));
         assert!(health.contains("\"protocol_version\":"));
+        assert!(health.contains(&format!("\"incarnation_id\":\"{incarnation_id}\"")));
         assert!(!health.contains("test-token"));
 
         let ready = request(address, "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
@@ -397,6 +401,7 @@ mod tests {
         assert!(authorized.contains("\"event_sequence\":0"));
         assert!(authorized.contains("\"controller_active\":false"));
         assert!(authorized.contains("\"node_id\":\"test-node\""));
+        assert!(authorized.contains(&format!("\"incarnation_id\":\"{incarnation_id}\"")));
         assert!(!authorized.contains("test-token"));
 
         server.shutdown_handle().request_shutdown().await.unwrap();

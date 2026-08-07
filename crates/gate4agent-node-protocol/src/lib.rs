@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-pub const NODE_PROTOCOL_VERSION: u16 = 5;
+pub const NODE_PROTOCOL_VERSION: u16 = 6;
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_NODE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_NODE_CLIENT_FRAME_BYTES: usize = 256 * 1024;
@@ -223,11 +223,27 @@ pub struct GitCommitSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitWorktreeSnapshot {
+    pub path: String,
+    pub head: String,
+    pub branch: Option<String>,
+    pub is_bare: bool,
+    pub is_main: bool,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub prunable: bool,
+    pub prunable_reason: Option<String>,
+    pub workspace_id: Option<WorkspaceId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitSnapshot {
     pub is_repository: bool,
     pub branch: Option<String>,
     pub status: Vec<GitStatusEntry>,
     pub recent_commits: Vec<GitCommitSummary>,
+    #[serde(default)]
+    pub worktrees: Vec<GitWorktreeSnapshot>,
     pub truncated: bool,
     pub diagnostic: Option<String>,
 }
@@ -313,6 +329,17 @@ pub enum NodeRequest {
     UnregisterWorkspace {
         workspace_id: WorkspaceId,
     },
+    CreateWorktree {
+        source_workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
+        target_root: String,
+        branch: String,
+        base: Option<String>,
+    },
+    RemoveWorktree {
+        source_workspace_id: WorkspaceId,
+        target_root: String,
+    },
     Spawn {
         workspace_id: WorkspaceId,
         provider: AgentProvider,
@@ -371,6 +398,14 @@ pub enum NodeResponse {
     WorkspaceUnregistered {
         workspace_id: WorkspaceId,
     },
+    WorktreeCreated {
+        worktree: GitWorktreeSnapshot,
+        workspace: WorkspaceSnapshot,
+    },
+    WorktreeRemoved {
+        target_root: String,
+        workspace_id: Option<WorkspaceId>,
+    },
     Accepted,
     ShuttingDown,
 }
@@ -395,6 +430,11 @@ pub enum NodeFailureCode {
     DuplicateWorkspaceRoot,
     WorkspaceBusy,
     LastWorkspace,
+    NotGitRepository,
+    WorktreeConflict,
+    WorktreeProtected,
+    WorktreeDirty,
+    WorktreeLocked,
     UnknownSession,
     SessionWorkspaceMismatch,
     StaleGeneration,
@@ -701,8 +741,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v5_workspace_mutations_have_exact_bounded_wire_shapes() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 5);
+    fn protocol_v6_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 6);
         assert_eq!(MAX_WORKSPACE_ROOT_BYTES, gate4agent_types::WORKING_DIRECTORY_MAX_BYTES);
 
         let register = NodeRequest::RegisterWorkspace {
@@ -725,6 +765,31 @@ mod tests {
             r#"{"kind":"unregister-workspace","workspace_id":"repo-2"}"#,
         );
         assert_eq!(serde_json::from_str::<NodeRequest>(&unregister_json).unwrap(), unregister);
+
+        let create = NodeRequest::CreateWorktree {
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: WorkspaceId::new("topic-one").unwrap(),
+            target_root: r"C:\trees\topic-one".to_owned(),
+            branch: "codex/topic-one".to_owned(),
+            base: Some("main".to_owned()),
+        };
+        let create_json = serde_json::to_string(&create).unwrap();
+        assert_eq!(
+            create_json,
+            r#"{"kind":"create-worktree","source_workspace_id":"primary","workspace_id":"topic-one","target_root":"C:\\trees\\topic-one","branch":"codex/topic-one","base":"main"}"#,
+        );
+        assert_eq!(serde_json::from_str::<NodeRequest>(&create_json).unwrap(), create);
+
+        let remove = NodeRequest::RemoveWorktree {
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            target_root: r"C:\trees\topic-one".to_owned(),
+        };
+        let remove_json = serde_json::to_string(&remove).unwrap();
+        assert_eq!(
+            remove_json,
+            r#"{"kind":"remove-worktree","source_workspace_id":"primary","target_root":"C:\\trees\\topic-one"}"#,
+        );
+        assert_eq!(serde_json::from_str::<NodeRequest>(&remove_json).unwrap(), remove);
     }
 
     #[test]
@@ -776,7 +841,7 @@ mod tests {
         let removed = NodeEventEnvelope {
             sequence: 20,
             event: NodeEvent::WorkspaceRemoved {
-                workspace_id: workspace.workspace_id,
+                workspace_id: workspace.workspace_id.clone(),
             },
         };
         let removed_json = serde_json::to_string(&removed).unwrap();
@@ -784,6 +849,30 @@ mod tests {
             serde_json::from_str::<NodeEventEnvelope>(&removed_json).unwrap(),
             removed,
         );
+
+        let created = NodeResponse::WorktreeCreated {
+            worktree: GitWorktreeSnapshot {
+                path: r"C:\trees\topic-one".to_owned(),
+                head: "abc1234".to_owned(),
+                branch: Some("codex/topic-one".to_owned()),
+                is_bare: false,
+                is_main: false,
+                locked: false,
+                lock_reason: None,
+                prunable: false,
+                prunable_reason: None,
+                workspace_id: Some(workspace.workspace_id.clone()),
+            },
+            workspace: workspace.clone(),
+        };
+        let created_json = serde_json::to_string(&created).unwrap();
+        assert_eq!(serde_json::from_str::<NodeResponse>(&created_json).unwrap(), created);
+        let removed = NodeResponse::WorktreeRemoved {
+            target_root: r"C:\trees\topic-one".to_owned(),
+            workspace_id: Some(workspace.workspace_id),
+        };
+        let removed_json = serde_json::to_string(&removed).unwrap();
+        assert_eq!(serde_json::from_str::<NodeResponse>(&removed_json).unwrap(), removed);
     }
 
     #[test]
@@ -825,6 +914,18 @@ mod tests {
                         id: "abc1234".to_owned(),
                         summary: "bounded summary".to_owned(),
                     }],
+                    worktrees: vec![GitWorktreeSnapshot {
+                        path: r"C:\repo".to_owned(),
+                        head: "abc1234".to_owned(),
+                        branch: Some("main".to_owned()),
+                        is_bare: false,
+                        is_main: true,
+                        locked: false,
+                        lock_reason: None,
+                        prunable: false,
+                        prunable_reason: None,
+                        workspace_id: Some(WorkspaceId::new("primary").unwrap()),
+                    }],
                     truncated: false,
                     diagnostic: None,
                 },
@@ -832,6 +933,13 @@ mod tests {
         };
         let response_json = serde_json::to_string(&response).unwrap();
         assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn git_snapshot_defaults_worktrees_for_legacy_inspection_payloads() {
+        let json = r#"{"is_repository":true,"branch":"main","status":[],"recent_commits":[],"truncated":false,"diagnostic":null}"#;
+        let snapshot = serde_json::from_str::<GitSnapshot>(json).unwrap();
+        assert!(snapshot.worktrees.is_empty());
     }
 
     #[test]

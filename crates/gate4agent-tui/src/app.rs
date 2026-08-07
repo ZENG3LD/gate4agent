@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use gate4agent_node::protocol::{
-    WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, MAX_NODE_IDENTIFIER_BYTES,
-    MAX_WORKSPACE_ROOT_BYTES,
+    GitWorktreeSnapshot, WorkspaceEntryKind, WorkspaceId, WorkspaceInspection,
+    MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
 };
 use gate4agent_types::{
     TerminalControl, TerminalMouseProtocolEncoding, TERMINAL_INPUT_MAX_BYTES,
@@ -240,6 +240,8 @@ pub enum Focus {
     Viewport,
     Spawn,
     AddSpace,
+    CreateWorktree,
+    RemoveWorktree,
     Settings,
 }
 
@@ -373,6 +375,33 @@ pub struct AddSpaceDialog {
     pub field: AddSpaceField,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateWorktreeField {
+    WorkspaceId,
+    TargetRoot,
+    Branch,
+    Base,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateWorktreeDialog {
+    pub node_id: String,
+    pub source_workspace_id: String,
+    pub workspace_id: String,
+    pub target_root: String,
+    pub branch: String,
+    pub base: String,
+    pub field: CreateWorktreeField,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoveWorktreeDialog {
+    pub node_id: String,
+    pub source_workspace_id: String,
+    pub target_root: String,
+    pub branch: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiKey {
     Char(char),
@@ -423,6 +452,19 @@ pub enum AppAction {
     Remove { address: SessionAddress },
     RegisterWorkspace { node_id: String, workspace_id: String, root: String },
     UnregisterWorkspace { node_id: String, workspace_id: String },
+    CreateWorktree {
+        node_id: String,
+        source_workspace_id: String,
+        workspace_id: String,
+        target_root: String,
+        branch: String,
+        base: Option<String>,
+    },
+    RemoveWorktree {
+        node_id: String,
+        source_workspace_id: String,
+        target_root: String,
+    },
     InspectWorkspace { node_id: String, workspace_id: String },
     Resync { node_id: String, after_sequence: u64 },
 }
@@ -436,6 +478,10 @@ pub enum HitTarget {
     AddSpace,
     RemoveSpace,
     RefreshWorkspace,
+    CreateWorktree,
+    Worktree(usize),
+    RegisterWorktree(usize),
+    RemoveWorktree(usize),
     SidebarItem(usize),
     Agent(usize),
     AddAgent,
@@ -521,6 +567,8 @@ pub struct App {
     pub focus: Focus,
     pub spawn: Option<SpawnDialog>,
     pub add_space: Option<AddSpaceDialog>,
+    pub create_worktree: Option<CreateWorktreeDialog>,
+    pub remove_worktree: Option<RemoveWorktreeDialog>,
     pub color_mode: PtyColorMode,
     pub notice: Option<String>,
     pub terminal_rows: u16,
@@ -564,6 +612,8 @@ impl Default for App {
             focus: Focus::Spaces,
             spawn: None,
             add_space: None,
+            create_worktree: None,
+            remove_worktree: None,
             color_mode: PtyColorMode::Inherited,
             notice: None,
             terminal_rows: 24,
@@ -1389,6 +1439,12 @@ impl App {
         if self.focus == Focus::AddSpace {
             return self.reduce_add_space(key);
         }
+        if self.focus == Focus::CreateWorktree {
+            return self.reduce_create_worktree(key);
+        }
+        if self.focus == Focus::RemoveWorktree {
+            return self.reduce_remove_worktree(key);
+        }
         if self.focus == Focus::Settings {
             return self.reduce_settings(key);
         }
@@ -1421,7 +1477,12 @@ impl App {
                 Focus::Spaces => self.reduce_spaces(key),
                 Focus::Agents => self.reduce_agents(key),
                 Focus::Tabs => self.reduce_tabs(key),
-                Focus::Viewport | Focus::Spawn | Focus::AddSpace | Focus::Settings => {
+                Focus::Viewport
+                | Focus::Spawn
+                | Focus::AddSpace
+                | Focus::CreateWorktree
+                | Focus::RemoveWorktree
+                | Focus::Settings => {
                     AppAction::None
                 }
             },
@@ -1429,7 +1490,10 @@ impl App {
     }
 
     pub fn click(&mut self, column: u16, row: u16) -> AppAction {
-        if matches!(self.focus, Focus::Spawn | Focus::AddSpace) {
+        if matches!(
+            self.focus,
+            Focus::Spawn | Focus::AddSpace | Focus::CreateWorktree | Focus::RemoveWorktree
+        ) {
             return AppAction::None;
         }
         let target = self
@@ -1463,9 +1527,7 @@ impl App {
                     return self.select_inspector_item(mode, index);
                 }
                 Some(HitTarget::Agent(index)) => {
-                    self.selected_agent = index;
                     if let Some(address) = self.agent_addresses().get(index).cloned() {
-                        self.open_address(address.clone());
                         self.begin_session_drag(
                             DragSource::Agent(index),
                             address,
@@ -1485,6 +1547,14 @@ impl App {
                 Some(HitTarget::AddSpace) => return self.begin_add_space(),
                 Some(HitTarget::RemoveSpace) => return self.remove_selected_space(),
                 Some(HitTarget::RefreshWorkspace) => return self.inspect_selected_workspace(),
+                Some(HitTarget::CreateWorktree) => return self.begin_create_worktree(),
+                Some(HitTarget::Worktree(index)) => return self.activate_worktree(index),
+                Some(HitTarget::RegisterWorktree(index)) => {
+                    return self.begin_register_worktree(index);
+                }
+                Some(HitTarget::RemoveWorktree(index)) => {
+                    return self.begin_remove_worktree(index);
+                }
                 Some(HitTarget::AddAgent) => return self.begin_spawn(),
                 Some(HitTarget::Settings) => self.close_settings(),
                 _ => {}
@@ -1511,14 +1581,18 @@ impl App {
             Some(HitTarget::AddSpace) => return self.begin_add_space(),
             Some(HitTarget::RemoveSpace) => return self.remove_selected_space(),
             Some(HitTarget::RefreshWorkspace) => return self.inspect_selected_workspace(),
+            Some(HitTarget::CreateWorktree) => return self.begin_create_worktree(),
+            Some(HitTarget::Worktree(index)) => return self.activate_worktree(index),
+            Some(HitTarget::RegisterWorktree(index)) => {
+                return self.begin_register_worktree(index);
+            }
+            Some(HitTarget::RemoveWorktree(index)) => return self.begin_remove_worktree(index),
             Some(HitTarget::SidebarItem(index)) => {
                 self.focus = Focus::Spaces;
                 return self.select_inspector_item(self.sidebar_mode, index);
             }
             Some(HitTarget::Agent(index)) => {
-                self.selected_agent = index;
                 if let Some(address) = self.agent_addresses().get(index).cloned() {
-                    self.open_address(address.clone());
                     self.begin_session_drag(
                         DragSource::Agent(index),
                         address,
@@ -1530,9 +1604,6 @@ impl App {
             Some(HitTarget::AddAgent) => return self.begin_spawn(),
             Some(HitTarget::Tab(index)) => {
                 if let Some(address) = self.tabs.get(index).map(|tab| tab.address.clone()) {
-                    self.selected_tab = index;
-                    self.surface_mode = SurfaceMode::Tab;
-                    self.focus = Focus::Viewport;
                     self.begin_session_drag(DragSource::Tab(index), address, column, row);
                 }
             }
@@ -1548,7 +1619,6 @@ impl App {
             Some(HitTarget::GridPreset(preset)) => self.set_grid_preset(preset),
             Some(HitTarget::GridPaneHeader(index)) => {
                 if let Some(address) = self.grid.panes.get(index).map(|pane| pane.address.clone()) {
-                    self.focus_grid_pane(index);
                     self.begin_session_drag(DragSource::Pane(index), address, column, row);
                 }
             }
@@ -1577,7 +1647,10 @@ impl App {
     }
 
     pub fn scroll(&mut self, column: u16, row: u16, up: bool) -> AppAction {
-        if matches!(self.focus, Focus::Spawn | Focus::AddSpace) {
+        if matches!(
+            self.focus,
+            Focus::Spawn | Focus::AddSpace | Focus::CreateWorktree | Focus::RemoveWorktree
+        ) {
             return AppAction::None;
         }
         if self.focus == Focus::Settings {
@@ -1703,6 +1776,7 @@ impl App {
             return AppAction::None;
         };
         if !moved {
+            self.open_address(address);
             return AppAction::None;
         }
         let target = self
@@ -1890,6 +1964,9 @@ impl App {
         if self.focus == Focus::AddSpace {
             return self.paste_add_space(text);
         }
+        if self.focus == Focus::CreateWorktree {
+            return self.paste_create_worktree(text);
+        }
         if self.focus != Focus::Viewport {
             return AppAction::None;
         }
@@ -1948,6 +2025,109 @@ impl App {
             field: AddSpaceField::WorkspaceId,
         });
         self.focus = Focus::AddSpace;
+        AppAction::None
+    }
+
+    fn begin_create_worktree(&mut self) -> AppAction {
+        let Some((node, workspace)) = self.selected_workspace() else {
+            self.notice = Some("select a workspace before creating a worktree".to_owned());
+            return AppAction::None;
+        };
+        if !matches!(node.connection, ConnectionState::Connected) {
+            self.notice = Some(format!("{} is disconnected; worktree creation unavailable", node.node_id));
+            return AppAction::None;
+        }
+        let workspace_id = next_worktree_id(&workspace.workspace_id);
+        self.create_worktree = Some(CreateWorktreeDialog {
+            node_id: node.node_id.clone(),
+            source_workspace_id: workspace.workspace_id.clone(),
+            target_root: format!("{}-{workspace_id}", workspace.canonical_root.trim_end_matches(['\\', '/'])),
+            branch: workspace_id.clone(),
+            workspace_id,
+            base: String::new(),
+            field: CreateWorktreeField::WorkspaceId,
+        });
+        self.focus = Focus::CreateWorktree;
+        AppAction::None
+    }
+
+    fn selected_git_worktree(&self) -> Option<(usize, &GitWorktreeSnapshot)> {
+        let inspection = self.selected_workspace_inspection()?;
+        let index = self.git_cursor;
+        inspection.git.worktrees.get(index).map(|worktree| (index, worktree))
+    }
+
+    fn activate_worktree(&mut self, index: usize) -> AppAction {
+        self.git_cursor = index.min(self.git_item_count().saturating_sub(1));
+        let Some((node_id, workspace_id)) = self
+            .selected_workspace()
+            .and_then(|(node, _)| {
+                self.selected_workspace_inspection()?
+                    .git
+                    .worktrees
+                    .get(index)?
+                    .workspace_id
+                    .as_ref()
+                    .map(|workspace_id| (node.node_id.clone(), workspace_id.to_string()))
+            })
+        else {
+            return self.begin_register_worktree(index);
+        };
+        self.request_space_selection(node_id, workspace_id);
+        self.inspect_selected_workspace()
+    }
+
+    fn begin_register_worktree(&mut self, index: usize) -> AppAction {
+        let Some((node_id, worktree)) = self.selected_workspace().and_then(|(node, _)| {
+            self.selected_workspace_inspection()?
+                .git
+                .worktrees
+                .get(index)
+                .cloned()
+                .map(|worktree| (node.node_id.clone(), worktree))
+        }) else {
+            return AppAction::None;
+        };
+        if worktree.workspace_id.is_some() {
+            return self.activate_worktree(index);
+        }
+        self.add_space = Some(AddSpaceDialog {
+            node_id,
+            workspace_id: suggested_workspace_id(&worktree),
+            root: worktree.path,
+            field: AddSpaceField::WorkspaceId,
+        });
+        self.focus = Focus::AddSpace;
+        AppAction::None
+    }
+
+    fn begin_remove_worktree(&mut self, index: usize) -> AppAction {
+        let Some((node_id, source_workspace_id, worktree)) = self
+            .selected_workspace()
+            .and_then(|(node, workspace)| {
+                self.selected_workspace_inspection()?
+                    .git
+                    .worktrees
+                    .get(index)
+                    .cloned()
+                    .map(|worktree| {
+                        (node.node_id.clone(), workspace.workspace_id.clone(), worktree)
+                    })
+            })
+        else {
+            return AppAction::None;
+        };
+        if !worktree_can_be_removed(&worktree) {
+            self.notice = Some("main, bare, locked, or prunable worktrees cannot be removed here".to_owned());
+            return AppAction::None;
+        }
+        self.remove_worktree = Some(RemoveWorktreeDialog {
+            node_id,
+            source_workspace_id,
+            target_root: worktree.path,
+            branch: worktree.branch,
+        });
+        self.focus = Focus::RemoveWorktree;
         AppAction::None
     }
 
@@ -2331,6 +2511,15 @@ impl App {
                 };
                 return self.select_inspector_item(SidebarMode::Files, entry_index);
             }
+            UiKey::Enter if self.sidebar_mode == SidebarMode::Git => {
+                return self.activate_selected_git_item();
+            }
+            UiKey::Char('+') | UiKey::Insert if self.sidebar_mode == SidebarMode::Git => {
+                return self.begin_create_worktree();
+            }
+            UiKey::Delete if self.sidebar_mode == SidebarMode::Git => {
+                return self.remove_selected_git_worktree();
+            }
             UiKey::Char('r') => return self.inspect_selected_workspace(),
             UiKey::Char('f') => return self.select_sidebar_mode(SidebarMode::Files),
             UiKey::Char('g') => return self.select_sidebar_mode(SidebarMode::Git),
@@ -2360,11 +2549,32 @@ impl App {
         let Some(inspection) = self.selected_workspace_inspection() else {
             return 0;
         };
-        if inspection.git.status.is_empty() {
+        let details = if inspection.git.status.is_empty() {
             inspection.git.recent_commits.len()
         } else {
             inspection.git.status.len()
+        };
+        inspection.git.worktrees.len().saturating_add(details)
+    }
+
+    fn activate_selected_git_item(&mut self) -> AppAction {
+        let worktree_count = self
+            .selected_workspace_inspection()
+            .map(|inspection| inspection.git.worktrees.len())
+            .unwrap_or(0);
+        if self.git_cursor < worktree_count {
+            self.activate_worktree(self.git_cursor)
+        } else {
+            AppAction::None
         }
+    }
+
+    fn remove_selected_git_worktree(&mut self) -> AppAction {
+        let Some((index, _)) = self.selected_git_worktree() else {
+            self.notice = Some("select a removable worktree".to_owned());
+            return AppAction::None;
+        };
+        self.begin_remove_worktree(index)
     }
 
     fn reduce_agents(&mut self, key: UiKey) -> AppAction {
@@ -2664,6 +2874,110 @@ impl App {
         AppAction::None
     }
 
+    fn reduce_create_worktree(&mut self, key: UiKey) -> AppAction {
+        let Some(mut dialog) = self.create_worktree.take() else {
+            self.focus = Focus::Spaces;
+            return AppAction::None;
+        };
+        match key {
+            UiKey::Escape => {
+                self.focus = Focus::Spaces;
+                return AppAction::None;
+            }
+            UiKey::Tab => dialog.field = next_create_worktree_field(dialog.field, true),
+            UiKey::BackTab => dialog.field = next_create_worktree_field(dialog.field, false),
+            UiKey::Up => dialog.field = next_create_worktree_field(dialog.field, false),
+            UiKey::Down => dialog.field = next_create_worktree_field(dialog.field, true),
+            UiKey::Backspace => {
+                create_worktree_field_mut(&mut dialog).pop();
+            }
+            UiKey::Char(ch) => {
+                if let Err(message) = append_create_worktree_char(&mut dialog, ch) {
+                    self.notice = Some(message);
+                }
+            }
+            UiKey::Enter => {
+                if dialog.workspace_id.trim().is_empty()
+                    || dialog.target_root.trim().is_empty()
+                    || dialog.branch.trim().is_empty()
+                {
+                    self.notice = Some("workspace ID, absolute target root, and branch are required".to_owned());
+                } else if let Err(error) = WorkspaceId::new(dialog.workspace_id.clone()) {
+                    self.notice = Some(format!("invalid workspace ID: {error}"));
+                } else if !is_absolute_root(&dialog.target_root) {
+                    self.notice = Some("worktree target root must be absolute".to_owned());
+                } else {
+                    self.focus = Focus::Spaces;
+                    return AppAction::CreateWorktree {
+                        node_id: dialog.node_id,
+                        source_workspace_id: dialog.source_workspace_id,
+                        workspace_id: dialog.workspace_id,
+                        target_root: dialog.target_root,
+                        branch: dialog.branch,
+                        base: (!dialog.base.trim().is_empty()).then_some(dialog.base),
+                    };
+                }
+            }
+            _ => {}
+        }
+        self.create_worktree = Some(dialog);
+        AppAction::None
+    }
+
+    fn paste_create_worktree(&mut self, text: String) -> AppAction {
+        let Some(dialog) = self.create_worktree.as_mut() else {
+            return AppAction::None;
+        };
+        if text.contains(['\r', '\n', '\0']) {
+            self.notice = Some("worktree field cannot contain control characters".to_owned());
+            return AppAction::None;
+        }
+        let field = dialog.field;
+        let current = create_worktree_field_mut(dialog);
+        let limit = match field {
+            CreateWorktreeField::WorkspaceId => MAX_NODE_IDENTIFIER_BYTES,
+            CreateWorktreeField::TargetRoot => MAX_WORKSPACE_ROOT_BYTES,
+            CreateWorktreeField::Branch | CreateWorktreeField::Base => MAX_NODE_TEXT_BYTES,
+        };
+        if current.len().saturating_add(text.len()) > limit {
+            self.notice = Some("worktree field exceeds protocol limit".to_owned());
+            return AppAction::None;
+        }
+        if field == CreateWorktreeField::WorkspaceId
+            && text.chars().any(|ch| !workspace_id_char(ch))
+        {
+            self.notice = Some("workspace ID contains unsupported characters".to_owned());
+            return AppAction::None;
+        }
+        current.push_str(&text);
+        AppAction::None
+    }
+
+    fn reduce_remove_worktree(&mut self, key: UiKey) -> AppAction {
+        let Some(dialog) = self.remove_worktree.take() else {
+            self.focus = Focus::Spaces;
+            return AppAction::None;
+        };
+        match key {
+            UiKey::Char('y') | UiKey::Char('Y') | UiKey::Enter => {
+                self.focus = Focus::Spaces;
+                AppAction::RemoveWorktree {
+                    node_id: dialog.node_id,
+                    source_workspace_id: dialog.source_workspace_id,
+                    target_root: dialog.target_root,
+                }
+            }
+            UiKey::Escape | UiKey::Char('n') | UiKey::Char('N') => {
+                self.focus = Focus::Spaces;
+                AppAction::None
+            }
+            _ => {
+                self.remove_worktree = Some(dialog);
+                AppAction::None
+            }
+        }
+    }
+
     fn cycle_color_mode(&mut self) {
         self.color_mode = self.color_mode.cycle();
         self.notice = Some(format!("terminal style: {}", self.color_mode));
@@ -2733,7 +3047,7 @@ impl App {
                     };
                     return self.select_inspector_item(SidebarMode::Files, entry_index);
                 }
-                ControlSection::Git => {}
+                ControlSection::Git => return self.activate_selected_git_item(),
                 ControlSection::Agents => self.open_selected_agent(),
                 ControlSection::Workspaces => return self.inspect_selected_workspace(),
                 ControlSection::Settings => {}
@@ -2741,12 +3055,14 @@ impl App {
             UiKey::Char('+') | UiKey::Insert => match self.control_section {
                 ControlSection::Agents => return self.begin_spawn(),
                 ControlSection::Workspaces => return self.begin_add_space(),
-                ControlSection::Files | ControlSection::Git | ControlSection::Settings => {}
+                ControlSection::Git => return self.begin_create_worktree(),
+                ControlSection::Files | ControlSection::Settings => {}
             },
             UiKey::Delete => match self.control_section {
                 ControlSection::Agents => return self.reduce_agents(UiKey::Delete),
                 ControlSection::Workspaces => return self.remove_selected_space(),
-                ControlSection::Files | ControlSection::Git | ControlSection::Settings => {}
+                ControlSection::Git => return self.remove_selected_git_worktree(),
+                ControlSection::Files | ControlSection::Settings => {}
             },
             UiKey::Char('r') => match self.control_section {
                 ControlSection::Files | ControlSection::Git | ControlSection::Workspaces => {}
@@ -2786,7 +3102,11 @@ impl App {
                 Focus::Tabs => Focus::Viewport,
                 Focus::Viewport => Focus::Tabs,
                 Focus::Spaces | Focus::Agents => Focus::Tabs,
-                Focus::Spawn | Focus::AddSpace | Focus::Settings => self.focus,
+                Focus::Spawn
+                | Focus::AddSpace
+                | Focus::CreateWorktree
+                | Focus::RemoveWorktree
+                | Focus::Settings => self.focus,
             };
         }
         match self.focus {
@@ -2794,7 +3114,11 @@ impl App {
             Focus::Agents => Focus::Tabs,
             Focus::Tabs => Focus::Viewport,
             Focus::Viewport => Focus::Spaces,
-            Focus::Spawn | Focus::AddSpace | Focus::Settings => self.focus,
+            Focus::Spawn
+            | Focus::AddSpace
+            | Focus::CreateWorktree
+            | Focus::RemoveWorktree
+            | Focus::Settings => self.focus,
         }
     }
 
@@ -2804,7 +3128,11 @@ impl App {
                 Focus::Tabs => Focus::Viewport,
                 Focus::Viewport => Focus::Tabs,
                 Focus::Spaces | Focus::Agents => Focus::Tabs,
-                Focus::Spawn | Focus::AddSpace | Focus::Settings => self.focus,
+                Focus::Spawn
+                | Focus::AddSpace
+                | Focus::CreateWorktree
+                | Focus::RemoveWorktree
+                | Focus::Settings => self.focus,
             };
         }
         match self.focus {
@@ -2812,7 +3140,11 @@ impl App {
             Focus::Agents => Focus::Spaces,
             Focus::Tabs => Focus::Agents,
             Focus::Viewport => Focus::Tabs,
-            Focus::Spawn | Focus::AddSpace | Focus::Settings => self.focus,
+            Focus::Spawn
+            | Focus::AddSpace
+            | Focus::CreateWorktree
+            | Focus::RemoveWorktree
+            | Focus::Settings => self.focus,
         }
     }
 
@@ -2835,6 +3167,98 @@ fn is_absolute_root(root: &str) -> bool {
     root.starts_with("\\\\")
         || root.starts_with('/')
         || (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/'))
+}
+
+fn next_worktree_id(source: &str) -> String {
+    let suffix = "-worktree";
+    let keep = MAX_NODE_IDENTIFIER_BYTES.saturating_sub(suffix.len());
+    format!("{}{suffix}", &source[..source.len().min(keep)])
+}
+
+fn workspace_id_char(ch: char) -> bool {
+    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')
+}
+
+fn suggested_workspace_id(worktree: &GitWorktreeSnapshot) -> String {
+    let source = worktree
+        .branch
+        .as_deref()
+        .or_else(|| (!worktree.head.is_empty()).then_some(worktree.head.as_str()))
+        .unwrap_or("worktree");
+    let mut id = source
+        .chars()
+        .map(|ch| {
+            let ch = ch.to_ascii_lowercase();
+            if workspace_id_char(ch) { ch } else { '-' }
+        })
+        .take(MAX_NODE_IDENTIFIER_BYTES)
+        .collect::<String>();
+    while id.starts_with('-') || id.starts_with('_') {
+        id.remove(0);
+    }
+    if id.is_empty() {
+        "worktree".to_owned()
+    } else {
+        id
+    }
+}
+
+fn worktree_can_be_removed(worktree: &GitWorktreeSnapshot) -> bool {
+    !worktree.is_main && !worktree.is_bare && !worktree.locked && !worktree.prunable
+}
+
+fn next_create_worktree_field(
+    current: CreateWorktreeField,
+    forward: bool,
+) -> CreateWorktreeField {
+    let fields = [
+        CreateWorktreeField::WorkspaceId,
+        CreateWorktreeField::TargetRoot,
+        CreateWorktreeField::Branch,
+        CreateWorktreeField::Base,
+    ];
+    let index = fields.iter().position(|field| *field == current).unwrap_or(0);
+    let next = if forward {
+        (index + 1) % fields.len()
+    } else if index == 0 {
+        fields.len() - 1
+    } else {
+        index - 1
+    };
+    fields[next]
+}
+
+fn create_worktree_field_mut(dialog: &mut CreateWorktreeDialog) -> &mut String {
+    match dialog.field {
+        CreateWorktreeField::WorkspaceId => &mut dialog.workspace_id,
+        CreateWorktreeField::TargetRoot => &mut dialog.target_root,
+        CreateWorktreeField::Branch => &mut dialog.branch,
+        CreateWorktreeField::Base => &mut dialog.base,
+    }
+}
+
+fn append_create_worktree_char(
+    dialog: &mut CreateWorktreeDialog,
+    ch: char,
+) -> Result<(), String> {
+    if ch.is_control() {
+        return Err("worktree field cannot contain control characters".to_owned());
+    }
+    let field = dialog.field;
+    if field == CreateWorktreeField::WorkspaceId && !workspace_id_char(ch) {
+        return Err("workspace ID contains unsupported characters".to_owned());
+    }
+    let limit = match field {
+        CreateWorktreeField::WorkspaceId => MAX_NODE_IDENTIFIER_BYTES,
+        CreateWorktreeField::TargetRoot => MAX_WORKSPACE_ROOT_BYTES,
+        CreateWorktreeField::Branch | CreateWorktreeField::Base => MAX_NODE_TEXT_BYTES,
+    };
+    let target = create_worktree_field_mut(dialog);
+    if target.len().saturating_add(ch.len_utf8()) > limit {
+        return Err("worktree field exceeds protocol limit".to_owned());
+    }
+    target.push(ch);
+    Ok(())
 }
 
 fn wheel_scroll_start(current: usize, maximum: usize, up: bool) -> usize {
@@ -3052,7 +3476,9 @@ fn cycle_provider(enabled: &[Provider], current: Provider, forward: bool) -> Pro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_node::protocol::{GitSnapshot, GitStatusEntry, WorkspaceEntry};
+    use gate4agent_node::protocol::{
+        GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, WorkspaceEntry,
+    };
 
     fn fixture() -> App {
         let address = SessionAddress {
@@ -3147,9 +3573,25 @@ mod tests {
                     },
                 ],
                 recent_commits: Vec::new(),
+                worktrees: Vec::new(),
                 truncated: false,
                 diagnostic: None,
             },
+        }
+    }
+
+    fn worktree(path: &str, branch: &str, workspace_id: Option<&str>) -> GitWorktreeSnapshot {
+        GitWorktreeSnapshot {
+            path: path.to_owned(),
+            head: "0123456789abcdef".to_owned(),
+            branch: Some(branch.to_owned()),
+            is_bare: false,
+            is_main: false,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            workspace_id: workspace_id.map(|id| WorkspaceId::new(id).unwrap()),
         }
     }
 
@@ -3170,6 +3612,8 @@ mod tests {
         app.focus = Focus::Agents;
         app.layout.hits.push(HitRegion { rect: Rect::new(26, 0, 8, 1), target: HitTarget::Tab(0) });
         assert_eq!(app.click(27, 0), AppAction::None);
+        assert_eq!(app.focus, Focus::Agents);
+        assert_eq!(app.drop_at(27, 0), AppAction::None);
         assert_eq!(app.focus, Focus::Viewport);
         assert!(matches!(app.reduce(UiKey::Char('x')), AppAction::Input { text, .. } if text == "x"));
     }
@@ -3395,6 +3839,78 @@ mod tests {
         let action = app.reduce(UiKey::Enter);
         assert!(matches!(action, AppAction::RegisterWorkspace { node_id, workspace_id, root } if node_id == "node-a" && workspace_id == "scratch" && root == r"C:\tmp\scratch"));
         assert_eq!(app.space_rows().len(), 1);
+    }
+
+    #[test]
+    fn create_worktree_modal_is_prefilled_validated_and_projects_exact_action() {
+        let mut app = fixture();
+        assert_eq!(app.begin_create_worktree(), AppAction::None);
+        let dialog = app.create_worktree.as_ref().unwrap();
+        assert_eq!(dialog.source_workspace_id, "workspace-a");
+        assert_eq!(dialog.workspace_id, "workspace-a-worktree");
+        assert!(is_absolute_root(&dialog.target_root));
+        assert_eq!(dialog.branch, "workspace-a-worktree");
+
+        app.create_worktree.as_mut().unwrap().workspace_id = "Bad.Id".to_owned();
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(app.notice.as_deref().unwrap().contains("invalid workspace ID"));
+        assert_eq!(app.focus, Focus::CreateWorktree);
+
+        let dialog = app.create_worktree.as_mut().unwrap();
+        dialog.workspace_id = "feature-a".to_owned();
+        dialog.target_root = r"C:\work\feature-a".to_owned();
+        dialog.branch = "feature/a".to_owned();
+        dialog.base = "origin/main".to_owned();
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::CreateWorktree {
+                node_id,
+                source_workspace_id,
+                workspace_id,
+                target_root,
+                branch,
+                base: Some(base),
+            } if node_id == "node-a"
+                && source_workspace_id == "workspace-a"
+                && workspace_id == "feature-a"
+                && target_root == r"C:\work\feature-a"
+                && branch == "feature/a"
+                && base == "origin/main"
+        ));
+    }
+
+    #[test]
+    fn worktree_rows_open_registered_prefill_unregistered_and_confirm_safe_remove() {
+        let mut app = fixture();
+        let mut inspection = workspace_inspection();
+        inspection.git.worktrees = vec![
+            worktree(r"C:\work\registered", "feature/registered", Some("registered")),
+            worktree(r"C:\work\unregistered", "feature/unregistered", None),
+        ];
+        app.apply_workspace_inspection("node-a".to_owned(), inspection);
+
+        assert_eq!(app.activate_worktree(1), AppAction::None);
+        let add = app.add_space.as_ref().unwrap();
+        assert_eq!(add.root, r"C:\work\unregistered");
+        assert_eq!(add.workspace_id, "feature-unregistered");
+
+        app.focus = Focus::Spaces;
+        app.add_space = None;
+        assert_eq!(app.begin_remove_worktree(1), AppAction::None);
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::RemoveWorktree {
+                source_workspace_id,
+                target_root,
+                ..
+            } if source_workspace_id == "workspace-a" && target_root == r"C:\work\unregistered"
+        ));
+
+        let inspection = app.workspace_inspections.get_mut(&("node-a".to_owned(), "workspace-a".to_owned())).unwrap();
+        inspection.git.worktrees[0].is_main = true;
+        assert_eq!(app.begin_remove_worktree(0), AppAction::None);
+        assert!(app.remove_worktree.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("cannot be removed"));
     }
 
     #[test]
@@ -3808,6 +4324,50 @@ mod tests {
     }
 
     #[test]
+    fn agent_chip_activates_only_on_release_and_drag_preserves_the_active_surface() {
+        let mut click_app = fixture();
+        let first = click_app.tabs[0].address.clone();
+        let second = add_session(&mut click_app, 8, Provider::Claude);
+        let addresses = click_app.agent_addresses();
+        let first_index = addresses.iter().position(|address| address == &first).unwrap();
+        let second_index = addresses.iter().position(|address| address == &second).unwrap();
+        click_app.selected_agent = first_index;
+        click_app.layout.hits.push(HitRegion {
+            rect: Rect::new(0, 5, 24, 2),
+            target: HitTarget::Agent(second_index),
+        });
+
+        assert_eq!(click_app.click(4, 5), AppAction::None);
+        assert_eq!(click_app.focused_address(), Some(&first));
+        assert_eq!(click_app.selected_agent, first_index);
+        assert_eq!(click_app.drop_at(4, 5), AppAction::None);
+        assert_eq!(click_app.focused_address(), Some(&second));
+        assert_eq!(click_app.selected_agent, second_index);
+
+        let mut drag_app = fixture();
+        let first = drag_app.tabs[0].address.clone();
+        let second = add_session(&mut drag_app, 8, Provider::Claude);
+        let second_index = drag_app
+            .agent_addresses()
+            .iter()
+            .position(|address| address == &second)
+            .unwrap();
+        drag_app.layout.hits.push(HitRegion {
+            rect: Rect::new(0, 5, 24, 2),
+            target: HitTarget::Agent(second_index),
+        });
+        drag_app.layout.grid_drop = Rect::new(30, 2, 30, 12);
+
+        assert_eq!(drag_app.click(4, 5), AppAction::None);
+        assert_eq!(drag_app.drag(35, 6), AppAction::None);
+        assert_eq!(drag_app.focused_address(), Some(&first));
+        assert_eq!(drag_app.surface_mode, SurfaceMode::Tab);
+        assert_eq!(drag_app.drop_at(35, 6), AppAction::None);
+        assert_eq!(drag_app.grid.panes, vec![GridPane { address: second }]);
+        assert_eq!(drag_app.tabs, vec![SessionTab { address: first }]);
+    }
+
+    #[test]
     fn grid_reorders_duplicates_and_rejects_a_fifth_unique_pty() {
         let mut app = fixture();
         let first = app.tabs[0].address.clone();
@@ -4097,6 +4657,7 @@ mod tests {
         });
 
         assert_eq!(app.click(22, 8), AppAction::None);
+        assert_eq!(app.focus, Focus::Settings);
         assert!(matches!(
             app.drag_state,
             Some(DragState::SessionChip {
@@ -4108,6 +4669,8 @@ mod tests {
             }) if *address == app.tabs[0].address
         ));
         assert_eq!(app.tabs[0].address, address);
+        assert_eq!(app.drop_at(22, 8), AppAction::None);
+        assert_eq!(app.focus, Focus::Viewport);
     }
 
     #[test]

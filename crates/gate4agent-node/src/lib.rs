@@ -1,6 +1,9 @@
 //! Native Gate4Agent node and its reusable local client.
 
 #[cfg(windows)]
+mod git_worktree;
+
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]

@@ -5,9 +5,9 @@ use uzor_tui::{
 use gate4agent_node::protocol::{GitSnapshot, WorkspaceEntryKind, WorkspaceInspection};
 
 use crate::app::{
-    AddSpaceField, App, ConnectionState, ControlSection, DragState, Focus, GridAxisKind,
-    GridPaneLayout, GridPreset, HitRegion, HitTarget, LayoutRects, MenuPlacement, NodeView,
-    PtyColorMode, RosterMode, SessionView, SidebarMode, SurfaceMode, WorkspaceView,
+    AddSpaceField, App, ConnectionState, ControlSection, CreateWorktreeField, DragState, Focus,
+    GridAxisKind, GridPaneLayout, GridPreset, HitRegion, HitTarget, LayoutRects, MenuPlacement,
+    NodeView, PtyColorMode, RosterMode, SessionView, SidebarMode, SurfaceMode, WorkspaceView,
 };
 use crate::pty_palette::{apply_pty_palette, GATE_FG, TERM_BG};
 
@@ -175,6 +175,12 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     }
     if app.focus == Focus::AddSpace {
         render_add_space(app, area, buf, theme);
+    }
+    if app.focus == Focus::CreateWorktree {
+        render_create_worktree(app, area, buf, theme);
+    }
+    if app.focus == Focus::RemoveWorktree {
+        render_remove_worktree(app, area, buf, theme);
     }
     if app.focus == Focus::Settings {
         render_settings(app, area, buf, &mut layout, theme);
@@ -463,88 +469,77 @@ fn render_git_snapshot(
         return;
     }
     let branch = git.branch.as_deref().unwrap_or("detached");
-    Paragraph::new(format!(" branch {}", truncate_cells(branch, area.width.saturating_sub(8) as usize)))
+    let create = " + worktree ";
+    let branch_width = area.width.saturating_sub(cell_width(create) as u16);
+    Paragraph::new(format!(" branch {}", truncate_cells(branch, branch_width.saturating_sub(8) as usize)))
         .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-        .render(Rect::new(area.x, area.y, area.width, 1), buf);
-    let list = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
-    if !git.status.is_empty() {
-        render_git_status(app, git, list, buf, layout, theme);
-    } else {
-        render_git_commits(app, git, list, buf, layout, theme);
+        .render(Rect::new(area.x, area.y, branch_width, 1), buf);
+    if branch_width < area.width {
+        let create_rect = Rect::new(area.x + branch_width, area.y, area.width - branch_width, 1);
+        Paragraph::new(create)
+            .style(Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD))
+            .render(create_rect, buf);
+        layout.hits.push(HitRegion { rect: create_rect, target: HitTarget::CreateWorktree });
     }
-}
-
-fn render_git_status(
-    app: &App,
-    git: &GitSnapshot,
-    area: Rect,
-    buf: &mut TerminalBuffer,
-    layout: &mut LayoutRects,
-    theme: Theme,
-) {
+    let area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
     let capacity = area.height as usize;
-    let start = app.git_scroll.min(git.status.len().saturating_sub(capacity));
-    for (visible, (index, entry)) in git.status.iter().enumerate().skip(start).take(capacity).enumerate() {
-        let y = area.y + visible as u16;
-        let selected = index == app.git_cursor;
-        let code = format!("{}{}", entry.index_status, entry.worktree_status);
-        let color = if entry.index_status.trim().is_empty() { theme.yellow } else { theme.green };
-        Paragraph::new(Text::from_lines(vec![Line::from_spans(vec![
-            Span::styled(format!(" {code} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                truncate_cells(&entry.path, area.width.saturating_sub(4) as usize),
-                Style::default().fg(theme.text),
-            ),
-        ])]))
-        .style(Style::default().bg(if selected { theme.active } else { theme.panel }))
-        .render(Rect::new(area.x, y, area.width, 1), buf);
-        layout.hits.push(HitRegion {
-            rect: Rect::new(area.x, y, area.width, 1),
-            target: HitTarget::SidebarItem(index),
-        });
-    }
-}
-
-fn render_git_commits(
-    app: &App,
-    git: &GitSnapshot,
-    area: Rect,
-    buf: &mut TerminalBuffer,
-    layout: &mut LayoutRects,
-    theme: Theme,
-) {
-    if git.recent_commits.is_empty() {
+    let detail_count = if git.status.is_empty() { git.recent_commits.len() } else { git.status.len() };
+    let count = git.worktrees.len().saturating_add(detail_count);
+    if count == 0 {
         Paragraph::new(" clean workspace")
             .style(Style::default().fg(theme.green).bg(theme.panel))
             .render(area, buf);
         return;
     }
-    let capacity = area.height as usize;
-    let start = app
-        .git_scroll
-        .min(git.recent_commits.len().saturating_sub(capacity));
-    for (visible, (index, commit)) in git
-        .recent_commits
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(capacity)
-        .enumerate()
-    {
+    let start = app.git_scroll.min(count.saturating_sub(capacity));
+    for (visible, index) in (start..count).take(capacity).enumerate() {
         let y = area.y + visible as u16;
-        Paragraph::new(Text::from_lines(vec![Line::from_spans(vec![
-            Span::styled(format!(" {} ", commit.id), Style::default().fg(theme.accent)),
-            Span::styled(
-                truncate_cells(&commit.summary, area.width.saturating_sub(commit.id.len() as u16 + 2) as usize),
-                Style::default().fg(theme.dim),
-            ),
-        ])]))
-        .style(Style::default().bg(if index == app.git_cursor { theme.active } else { theme.panel }))
-        .render(Rect::new(area.x, y, area.width, 1), buf);
-        layout.hits.push(HitRegion {
-            rect: Rect::new(area.x, y, area.width, 1),
-            target: HitTarget::SidebarItem(index),
-        });
+        let row = Rect::new(area.x, y, area.width, 1);
+        if let Some(worktree) = git.worktrees.get(index) {
+            let state = if worktree.is_main { "main" } else if worktree.locked { "locked" } else if worktree.prunable { "prunable" } else { "worktree" };
+            let branch = worktree.branch.as_deref().unwrap_or("detached");
+            let action = if worktree.workspace_id.is_some() { " open " } else { " add " };
+            let removable = !worktree.is_main && !worktree.is_bare && !worktree.locked && !worktree.prunable;
+            let remove = if removable { " rm " } else { "" };
+            let reserved = cell_width(action) + cell_width(remove);
+            let label = format!(" {state} {branch} · {}", worktree.path);
+            layout.hits.push(HitRegion { rect: row, target: HitTarget::Worktree(index) });
+            Paragraph::new(truncate_cells(&label, area.width.saturating_sub(reserved as u16) as usize))
+                .style(Style::default().fg(theme.text).bg(if index == app.git_cursor { theme.active } else { theme.panel }))
+                .render(Rect::new(row.x, row.y, row.width.saturating_sub(reserved as u16), 1), buf);
+            let action_x = row.right().saturating_sub(reserved as u16);
+            let action_rect = Rect::new(action_x, y, cell_width(action) as u16, 1);
+            Paragraph::new(action).style(Style::default().fg(theme.teal).bg(theme.panel)).render(action_rect, buf);
+            layout.hits.push(HitRegion {
+                rect: action_rect,
+                target: if worktree.workspace_id.is_some() { HitTarget::Worktree(index) } else { HitTarget::RegisterWorktree(index) },
+            });
+            if removable {
+                let remove_rect = Rect::new(action_rect.right(), y, cell_width(remove) as u16, 1);
+                Paragraph::new(remove).style(Style::default().fg(theme.red).bg(theme.panel)).render(remove_rect, buf);
+                layout.hits.push(HitRegion { rect: remove_rect, target: HitTarget::RemoveWorktree(index) });
+            }
+        } else {
+            let detail_index = index - git.worktrees.len();
+            let line = if let Some(entry) = git.status.get(detail_index).filter(|_| !git.status.is_empty()) {
+                let code = format!("{}{}", entry.index_status, entry.worktree_status);
+                Line::from_spans(vec![
+                    Span::styled(format!(" {code} "), Style::default().fg(theme.yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(truncate_cells(&entry.path, area.width.saturating_sub(4) as usize), Style::default().fg(theme.text)),
+                ])
+            } else if let Some(commit) = git.recent_commits.get(detail_index) {
+                Line::from_spans(vec![
+                    Span::styled(format!(" {} ", commit.id), Style::default().fg(theme.accent)),
+                    Span::styled(truncate_cells(&commit.summary, area.width.saturating_sub(commit.id.len() as u16 + 2) as usize), Style::default().fg(theme.dim)),
+                ])
+            } else {
+                Line::from_spans(Vec::new())
+            };
+            Paragraph::new(Text::from_lines(vec![line]))
+                .style(Style::default().bg(if index == app.git_cursor { theme.active } else { theme.panel }))
+                .render(row, buf);
+            layout.hits.push(HitRegion { rect: row, target: HitTarget::SidebarItem(index) });
+        }
     }
 }
 
@@ -1137,6 +1132,75 @@ fn render_add_space(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Them
     .render(modal, buf);
 }
 
+fn render_create_worktree(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    let Some(dialog) = &app.create_worktree else {
+        return;
+    };
+    let width = 72.min(area.width.saturating_sub(4));
+    let height = 12.min(area.height.saturating_sub(2));
+    let modal = centered(area, width, height);
+    fill_rect(modal, theme.modal, buf);
+    let prefix = |field| if dialog.field == field { ">" } else { " " };
+    Paragraph::new(Text::from_lines(vec![
+        Line::styled(
+            format!("source  {} / {}", dialog.node_id, dialog.source_workspace_id),
+            Style::default().fg(theme.muted),
+        ),
+        Line::styled(
+            format!("{} id      {}", prefix(CreateWorktreeField::WorkspaceId), dialog.workspace_id),
+            Style::default().fg(theme.text),
+        ),
+        Line::styled(
+            format!("{} root    {}", prefix(CreateWorktreeField::TargetRoot), dialog.target_root),
+            Style::default().fg(theme.text),
+        ),
+        Line::styled(
+            format!("{} branch  {}", prefix(CreateWorktreeField::Branch), dialog.branch),
+            Style::default().fg(theme.text),
+        ),
+        Line::styled(
+            format!("{} base    {}", prefix(CreateWorktreeField::Base), if dialog.base.is_empty() { "(HEAD)" } else { &dialog.base }),
+            Style::default().fg(theme.text),
+        ),
+        Line::styled("Tab field · Enter create and register · Esc cancel", Style::default().fg(theme.muted)),
+    ]))
+    .block(
+        Block::bordered()
+            .title(" create git worktree ")
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(theme.modal)),
+    )
+    .style(Style::default().fg(theme.text).bg(theme.modal))
+    .render(modal, buf);
+}
+
+fn render_remove_worktree(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    let Some(dialog) = &app.remove_worktree else {
+        return;
+    };
+    let width = 68.min(area.width.saturating_sub(4));
+    let height = 8.min(area.height.saturating_sub(2));
+    let modal = centered(area, width, height);
+    fill_rect(modal, theme.modal, buf);
+    Paragraph::new(Text::from_lines(vec![
+        Line::styled(
+            dialog.branch.as_deref().unwrap_or("detached worktree"),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(truncate_cells(&dialog.target_root, width.saturating_sub(4) as usize), Style::default().fg(theme.dim)),
+        Line::styled("Git refuses dirty or unsafe removal; no force is used.", Style::default().fg(theme.yellow)),
+        Line::styled("Enter/y remove · n/Esc cancel", Style::default().fg(theme.muted)),
+    ]))
+    .block(
+        Block::bordered()
+            .title(" confirm worktree removal ")
+            .border_style(Style::default().fg(theme.red))
+            .style(Style::default().bg(theme.modal)),
+    )
+    .style(Style::default().fg(theme.text).bg(theme.modal))
+    .render(modal, buf);
+}
+
 fn render_settings(
     app: &App,
     area: Rect,
@@ -1706,7 +1770,7 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 mod tests {
     use super::*;
     use gate4agent_node::protocol::{
-        GitCommitSummary, GitStatusEntry, WorkspaceEntry, WorkspaceId,
+        GitCommitSummary, GitStatusEntry, GitWorktreeSnapshot, WorkspaceEntry, WorkspaceId,
     };
     use gate4agent_types::TerminalMouseProtocolEncoding;
     use crate::app::{
@@ -1783,6 +1847,7 @@ mod tests {
                     id: "abcdef0".to_owned(),
                     summary: "ship workspace controls".to_owned(),
                 }],
+                worktrees: Vec::new(),
                 truncated: false,
                 diagnostic: None,
             },
@@ -2037,6 +2102,50 @@ mod tests {
         let git_layout = render(&app, &mut git);
         assert!(!git_layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
         assert!(git_layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(0)));
+    }
+
+    #[test]
+    fn git_worktree_rows_expose_create_open_register_remove_and_shift_detail_hits() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let mut snapshot = inspection();
+        snapshot.git.worktrees = vec![
+            GitWorktreeSnapshot {
+                path: r"C:\work\main".to_owned(),
+                head: "aaaa".to_owned(),
+                branch: Some("main".to_owned()),
+                is_bare: false,
+                is_main: true,
+                locked: false,
+                lock_reason: None,
+                prunable: false,
+                prunable_reason: None,
+                workspace_id: Some(WorkspaceId::new("workspace-a").unwrap()),
+            },
+            GitWorktreeSnapshot {
+                path: r"C:\work\feature".to_owned(),
+                head: "bbbb".to_owned(),
+                branch: Some("feature/a".to_owned()),
+                is_bare: false,
+                is_main: false,
+                locked: false,
+                lock_reason: None,
+                prunable: false,
+                prunable_reason: None,
+                workspace_id: None,
+            },
+        ];
+        app.apply_workspace_inspection("node-a".to_owned(), snapshot);
+        app.sidebar_mode = SidebarMode::Git;
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::CreateWorktree));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::Worktree(0)));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::RegisterWorktree(1)));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::RemoveWorktree(1)));
+        assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::RemoveWorktree(0)));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(2)));
     }
 
     #[test]

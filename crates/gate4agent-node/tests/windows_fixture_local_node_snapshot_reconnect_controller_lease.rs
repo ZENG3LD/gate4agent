@@ -12,6 +12,7 @@ use gate4agent_node::{
 use gate4agent_types::{
     ControlEventKind, SessionGeneration, SessionStatus, TerminalControl, TerminalSize,
 };
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,6 +65,24 @@ fn two_workspace_server_config(endpoint: &str, token: &str) -> NodeServerConfig 
     .unwrap()
 }
 
+fn git_workspace_server_config(
+    endpoint: &str,
+    token: &str,
+    root: &Path,
+) -> NodeServerConfig {
+    NodeServerConfig::new(
+        endpoint,
+        token,
+        NodeId::new("fixture-node").unwrap(),
+        [WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            root,
+        )
+        .unwrap()],
+    )
+    .unwrap()
+}
+
 fn all_sessions(snapshot: &NodeSnapshot) -> Vec<&gate4agent_types::SessionSnapshot> {
     snapshot
         .workspaces
@@ -95,6 +114,40 @@ impl Drop for KillOnDrop {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+struct RemoveTestDirectoryOnDrop(PathBuf);
+
+impl Drop for RemoveTestDirectoryOnDrop {
+    fn drop(&mut self) {
+        let safe_name = self
+            .0
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("gate4agent-node-worktree-e2e-"));
+        if safe_name {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn git_command(root: &Path, arguments: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+fn assert_git_success(root: &Path, arguments: &[&str]) {
+    let output = git_command(root, arguments);
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -897,6 +950,263 @@ async fn windows_fixture_dynamic_workspaces_are_authoritative_and_evented() {
         last,
         NodeClientError::Node(ref failure) if failure.code == NodeFailureCode::LastWorkspace
     ));
+    assert_eq!(
+        operator.request(NodeRequest::Shutdown).await.unwrap(),
+        NodeResponse::ShuttingDown,
+    );
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("node server did not shut down")
+        .expect("node server task panicked")
+        .expect("node server failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_root = std::env::temp_dir().join(format!(
+        "gate4agent-node-worktree-e2e-{}-{unique}",
+        std::process::id(),
+    ));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let _cleanup = RemoveTestDirectoryOnDrop(test_root.clone());
+    let repository = test_root.join("repository");
+    let init = Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repository)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr),
+    );
+    std::fs::write(repository.join("README.md"), b"fixture\n").unwrap();
+    assert_git_success(&repository, &["add", "--", "README.md"]);
+    assert_git_success(
+        &repository,
+        &[
+            "-c",
+            "user.name=Gate4Agent Fixture",
+            "-c",
+            "user.email=fixture@gate4agent.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=NUL",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+
+    let endpoint = endpoint();
+    let token = "fixture-git-worktree-token";
+    let server = NodeServer::new_fixture(git_workspace_server_config(
+        &endpoint,
+        token,
+        &repository,
+    ))
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut operator = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Operator,
+        token,
+    )
+    .await
+    .unwrap();
+    let target = test_root.join("topic-one");
+    let target_root = target.to_string_lossy().into_owned();
+    let unauthorized = operator
+        .request(NodeRequest::CreateWorktree {
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: WorkspaceId::new("topic-one").unwrap(),
+            target_root: target_root.clone(),
+            branch: "codex/topic-one".to_owned(),
+            base: Some("HEAD".to_owned()),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        unauthorized,
+        NodeClientError::Node(ref failure)
+            if failure.code == NodeFailureCode::ControllerRequired
+    ));
+    operator
+        .request(NodeRequest::AcquireController { lease_ms: 30_000 })
+        .await
+        .unwrap();
+
+    let NodeResponse::WorktreeCreated { worktree, workspace } = operator
+        .request(NodeRequest::CreateWorktree {
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: WorkspaceId::new("topic-one").unwrap(),
+            target_root: target_root.clone(),
+            branch: "codex/topic-one".to_owned(),
+            base: Some("HEAD".to_owned()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("worktree create returned another response");
+    };
+    assert_eq!(
+        std::fs::canonicalize(&worktree.path).unwrap(),
+        std::fs::canonicalize(&workspace.canonical_root).unwrap(),
+    );
+    assert_eq!(worktree.branch.as_deref(), Some("codex/topic-one"));
+    assert_eq!(worktree.workspace_id.as_ref(), Some(&workspace.workspace_id));
+    assert!(target.join("README.md").is_file());
+
+    let NodeResponse::WorkspaceInspected { inspection } = operator
+        .request(NodeRequest::InspectWorkspace {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("worktree inspection returned another response");
+    };
+    assert_eq!(inspection.git.worktrees.len(), 2);
+    assert!(inspection.git.worktrees.iter().any(|item| {
+        item.workspace_id.as_ref() == Some(&WorkspaceId::new("topic-one").unwrap())
+            && item.branch.as_deref() == Some("codex/topic-one")
+    }));
+
+    let NodeResponse::SpawnAccepted { session } = operator
+        .request(NodeRequest::Spawn {
+            workspace_id: WorkspaceId::new("topic-one").unwrap(),
+            provider: AgentProvider::Claude,
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize { rows: 24, columns: 80 },
+            initial_prompt: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("fixture spawn returned another response");
+    };
+    let busy = operator
+        .request(NodeRequest::RemoveWorktree {
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            target_root: target_root.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        busy,
+        NodeClientError::Node(ref failure) if failure.code == NodeFailureCode::WorkspaceBusy
+    ));
+    assert_eq!(
+        operator
+            .request(NodeRequest::Stop {
+                session: session.clone(),
+                force: true,
+            })
+            .await
+            .unwrap(),
+        NodeResponse::Accepted,
+    );
+    let mut stopped = false;
+    for _ in 0..250 {
+        let NodeResponse::Snapshot { snapshot, .. } = operator
+            .request(NodeRequest::Snapshot)
+            .await
+            .unwrap()
+        else {
+            panic!("snapshot request returned another response");
+        };
+        if addressed_session(&snapshot, &session).is_some_and(|item| {
+            matches!(item.status, SessionStatus::Exited { .. } | SessionStatus::Failed { .. })
+        }) {
+            stopped = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(stopped, "fixture session did not stop before worktree cleanup");
+    assert_eq!(
+        operator
+            .request(NodeRequest::Remove {
+                session: session.clone(),
+            })
+            .await
+            .unwrap(),
+        NodeResponse::Accepted,
+    );
+
+    std::fs::write(target.join("dirty.txt"), b"dirty\n").unwrap();
+    let dirty = operator
+        .request(NodeRequest::RemoveWorktree {
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            target_root: target_root.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &dirty,
+        NodeClientError::Node(ref failure) if failure.code == NodeFailureCode::WorktreeDirty
+    ), "unexpected dirty-worktree refusal: {dirty:?}");
+    assert!(target.is_dir());
+    std::fs::remove_file(target.join("dirty.txt")).unwrap();
+
+    let NodeResponse::WorktreeRemoved {
+        target_root: removed_root,
+        workspace_id,
+    } = operator
+        .request(NodeRequest::RemoveWorktree {
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            target_root: target_root.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("worktree remove returned another response");
+    };
+    assert_eq!(removed_root, worktree.path);
+    assert_eq!(workspace_id.as_ref(), Some(&workspace.workspace_id));
+    assert!(!target.exists());
+    assert_git_success(
+        &repository,
+        &["show-ref", "--verify", "--quiet", "refs/heads/codex/topic-one"],
+    );
+    let list = git_command(&repository, &["worktree", "list", "--porcelain"]);
+    assert!(list.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1,
+    );
+    let NodeResponse::Snapshot { snapshot, .. } = operator
+        .request(NodeRequest::Snapshot)
+        .await
+        .unwrap()
+    else {
+        panic!("snapshot request returned another response");
+    };
+    assert!(!snapshot
+        .workspaces
+        .iter()
+        .any(|item| item.workspace_id == workspace.workspace_id));
+    let events = std::iter::from_fn(|| operator.take_event()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        NodeEvent::WorkspaceAdded { workspace: added }
+            if added.workspace_id == workspace.workspace_id
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        NodeEvent::WorkspaceRemoved { workspace_id }
+            if workspace_id == &workspace.workspace_id
+    )));
+
     assert_eq!(
         operator.request(NodeRequest::Shutdown).await.unwrap(),
         NodeResponse::ShuttingDown,

@@ -401,6 +401,8 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         AppAction::Spawn { node_id, .. }
         | AppAction::RegisterWorkspace { node_id, .. }
         | AppAction::UnregisterWorkspace { node_id, .. }
+        | AppAction::CreateWorktree { node_id, .. }
+        | AppAction::RemoveWorktree { node_id, .. }
         | AppAction::InspectWorkspace { node_id, .. }
         | AppAction::Resync { node_id, .. } => Some(node_id),
         AppAction::Resume { address, .. }
@@ -977,6 +979,28 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
                 workspace_id: WorkspaceId::new(workspace_id).ok()?,
             })
         }
+        AppAction::CreateWorktree {
+            source_workspace_id,
+            workspace_id,
+            target_root,
+            branch,
+            base,
+            ..
+        } => Some(NodeRequest::CreateWorktree {
+            source_workspace_id: WorkspaceId::new(source_workspace_id).ok()?,
+            workspace_id: WorkspaceId::new(workspace_id).ok()?,
+            target_root,
+            branch,
+            base,
+        }),
+        AppAction::RemoveWorktree {
+            source_workspace_id,
+            target_root,
+            ..
+        } => Some(NodeRequest::RemoveWorktree {
+            source_workspace_id: WorkspaceId::new(source_workspace_id).ok()?,
+            target_root,
+        }),
         AppAction::InspectWorkspace { workspace_id, .. } => {
             Some(NodeRequest::InspectWorkspace {
                 workspace_id: WorkspaceId::new(workspace_id).ok()?,
@@ -1025,6 +1049,14 @@ async fn request_and_publish(
     controller_owned: &mut bool,
     connection_id: u64,
 ) -> Result<(), NodeClientError> {
+    let source_workspace_id = match &request {
+        NodeRequest::CreateWorktree { source_workspace_id, .. }
+        | NodeRequest::RemoveWorktree { source_workspace_id, .. } => {
+            Some(source_workspace_id.clone())
+        }
+        _ => None,
+    };
+    let mut refresh_workspace_id = source_workspace_id.clone();
     let response = node.request(request).await?;
     match response {
         NodeResponse::Snapshot { event_sequence, controller, snapshot } => {
@@ -1108,6 +1140,38 @@ async fn request_and_publish(
             )
             .await;
         }
+        NodeResponse::WorktreeCreated { worktree, workspace } => {
+            let response = NodeResponse::WorktreeCreated { worktree, workspace };
+            let projection = project_worktree_response(
+                &response,
+                endpoint.expected_node_id.as_str(),
+                source_workspace_id.as_ref(),
+            )
+            .expect("worktree response projection");
+            refresh_workspace_id = projection.refresh_workspace_id;
+            if let Some(workspace_id) = projection.selected_workspace_id {
+                send_update(
+                    updates,
+                    WorkerUpdate::SelectWorkspace {
+                        node_id: endpoint.expected_node_id.to_string(),
+                        workspace_id,
+                    },
+                )
+                .await;
+            }
+            send_update(updates, WorkerUpdate::Notice(projection.notice)).await;
+        }
+        NodeResponse::WorktreeRemoved { target_root, workspace_id } => {
+            let response = NodeResponse::WorktreeRemoved { target_root, workspace_id };
+            let projection = project_worktree_response(
+                &response,
+                endpoint.expected_node_id.as_str(),
+                source_workspace_id.as_ref(),
+            )
+            .expect("worktree response projection");
+            refresh_workspace_id = projection.refresh_workspace_id;
+            send_update(updates, WorkerUpdate::Notice(projection.notice)).await;
+        }
         NodeResponse::Accepted => {}
         NodeResponse::ShuttingDown => {
             send_update(
@@ -1121,7 +1185,57 @@ async fn request_and_publish(
             .await;
         }
     }
+    if let Some(workspace_id) = refresh_workspace_id {
+        if let NodeResponse::WorkspaceInspected { inspection } = node
+            .request(NodeRequest::InspectWorkspace { workspace_id })
+            .await?
+        {
+            send_update(
+                updates,
+                WorkerUpdate::WorkspaceInspected {
+                    node_id: endpoint.expected_node_id.to_string(),
+                    inspection,
+                },
+            )
+            .await;
+        }
+    }
     Ok(())
+}
+
+struct WorktreeResponseProjection {
+    selected_workspace_id: Option<String>,
+    refresh_workspace_id: Option<WorkspaceId>,
+    notice: String,
+}
+
+fn project_worktree_response(
+    response: &NodeResponse,
+    node_id: &str,
+    source_workspace_id: Option<&WorkspaceId>,
+) -> Option<WorktreeResponseProjection> {
+    match response {
+        NodeResponse::WorktreeCreated { worktree, workspace } => Some(WorktreeResponseProjection {
+            selected_workspace_id: Some(workspace.workspace_id.to_string()),
+            refresh_workspace_id: Some(workspace.workspace_id.clone()),
+            notice: format!("{node_id}: worktree {} created", worktree.path),
+        }),
+        NodeResponse::WorktreeRemoved { target_root, workspace_id } => Some(WorktreeResponseProjection {
+            selected_workspace_id: None,
+            refresh_workspace_id: source_workspace_id
+                .filter(|source| workspace_id.as_ref() != Some(*source))
+                .cloned(),
+            notice: format!(
+                "{node_id}: worktree {} removed{}",
+                target_root,
+                workspace_id
+                    .as_ref()
+                    .map(|workspace_id| format!(" ({workspace_id})"))
+                    .unwrap_or_default()
+            ),
+        }),
+        _ => None,
+    }
 }
 
 async fn await_input_completion(
@@ -1454,6 +1568,11 @@ fn safe_client_error(error: &NodeClientError) -> &'static str {
             NodeFailureCode::DuplicateWorkspaceRoot => "workspace root already registered",
             NodeFailureCode::WorkspaceBusy => "workspace has managed sessions",
             NodeFailureCode::LastWorkspace => "node must retain one workspace",
+            NodeFailureCode::NotGitRepository => "workspace is not a git repository",
+            NodeFailureCode::WorktreeConflict => "worktree path or branch conflicts",
+            NodeFailureCode::WorktreeProtected => "protected worktree cannot be removed",
+            NodeFailureCode::WorktreeDirty => "worktree has uncommitted changes",
+            NodeFailureCode::WorktreeLocked => "worktree is locked",
             NodeFailureCode::UnknownSession => "session unavailable",
             NodeFailureCode::SessionWorkspaceMismatch => "session/workspace mismatch",
             NodeFailureCode::StaleGeneration => "stale session generation",
@@ -1821,6 +1940,90 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(inspect, NodeRequest::InspectWorkspace { workspace_id } if workspace_id.as_str() == "scratch"));
+    }
+
+    #[test]
+    fn worktree_actions_project_exact_source_target_branch_and_base() {
+        let create = action_to_request(AppAction::CreateWorktree {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            workspace_id: "feature-a".to_owned(),
+            target_root: r"C:\work\feature-a".to_owned(),
+            branch: "feature/a".to_owned(),
+            base: Some("origin/main".to_owned()),
+        })
+        .unwrap();
+        assert!(matches!(create, NodeRequest::CreateWorktree {
+            source_workspace_id,
+            workspace_id,
+            target_root,
+            branch,
+            base: Some(base),
+        } if source_workspace_id.as_str() == "workspace-a"
+            && workspace_id.as_str() == "feature-a"
+            && target_root == r"C:\work\feature-a"
+            && branch == "feature/a"
+            && base == "origin/main"));
+        let remove = action_to_request(AppAction::RemoveWorktree {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            target_root: r"C:\work\feature-a".to_owned(),
+        })
+        .unwrap();
+        assert!(matches!(remove, NodeRequest::RemoveWorktree { source_workspace_id, target_root }
+            if source_workspace_id.as_str() == "workspace-a" && target_root == r"C:\work\feature-a"));
+    }
+
+    #[test]
+    fn worktree_response_projection_selects_created_and_refreshes_authoritative_workspace() {
+        let created_workspace_id = WorkspaceId::new("feature-a").unwrap();
+        let created = NodeResponse::WorktreeCreated {
+            worktree: gate4agent_node::protocol::GitWorktreeSnapshot {
+                path: r"C:\work\feature-a".to_owned(),
+                head: "abc".to_owned(),
+                branch: Some("feature/a".to_owned()),
+                is_bare: false,
+                is_main: false,
+                locked: false,
+                lock_reason: None,
+                prunable: false,
+                prunable_reason: None,
+                workspace_id: Some(created_workspace_id.clone()),
+            },
+            workspace: gate4agent_node::protocol::WorkspaceSnapshot {
+                workspace_id: created_workspace_id.clone(),
+                canonical_root: r"C:\work\feature-a".to_owned(),
+                sessions: Vec::new(),
+            },
+        };
+        let projection = project_worktree_response(
+            &created,
+            "node-a",
+            Some(&WorkspaceId::new("workspace-a").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(projection.selected_workspace_id.as_deref(), Some("feature-a"));
+        assert_eq!(projection.refresh_workspace_id, Some(created_workspace_id));
+        assert!(projection.notice.contains("created"));
+
+        let source = WorkspaceId::new("workspace-a").unwrap();
+        let removed = NodeResponse::WorktreeRemoved {
+            target_root: r"C:\work\feature-a".to_owned(),
+            workspace_id: Some(WorkspaceId::new("feature-a").unwrap()),
+        };
+        let projection = project_worktree_response(&removed, "node-a", Some(&source)).unwrap();
+        assert_eq!(projection.selected_workspace_id, None);
+        assert_eq!(projection.refresh_workspace_id, Some(source.clone()));
+        assert!(projection.notice.contains("removed"));
+
+        let removed_source = NodeResponse::WorktreeRemoved {
+            target_root: r"C:\work\workspace-a".to_owned(),
+            workspace_id: Some(source.clone()),
+        };
+        let projection = project_worktree_response(&removed_source, "node-a", Some(&source)).unwrap();
+        assert_eq!(projection.selected_workspace_id, None);
+        assert_eq!(projection.refresh_workspace_id, None);
+        assert!(projection.notice.contains("removed"));
     }
 
     #[test]

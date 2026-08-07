@@ -1,7 +1,14 @@
+use crate::git_worktree::{
+    create_worktree as create_git_worktree, list_worktrees as list_git_worktrees,
+    paths_equal as worktree_paths_equal, remove_worktree as remove_git_worktree,
+    removal_lookup_path as normalize_worktree_removal_target, run_git_read_bounded,
+    GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind,
+};
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     AgentProvider, ClientAuthentication, ClientFrame, ClientHello, ClientRole,
-    ControllerState, FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry, NodeEvent,
+    ControllerState, FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
+    GitWorktreeSnapshot, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeRequest,
     NodeResponse, NodeSnapshot, RequestEnvelope,
     ResponseEnvelope, ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode,
@@ -26,14 +33,12 @@ use std::ffi::c_void;
 use std::io;
 use std::path::Path;
 use std::ptr;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 #[cfg(feature = "fixture")]
 use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions};
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
@@ -60,7 +65,6 @@ const GIT_COMMIT_MAX_ENTRIES: usize = 12;
 const GIT_OUTPUT_MAX_BYTES: usize = 64 * 1_024;
 const GIT_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
 const GIT_COMMAND_TIMEOUT_MS: u64 = 1_500;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceConfig {
@@ -622,7 +626,22 @@ impl NodeShared {
                 &format!("workspace inspection task failed: {error}"),
             )
         })?;
-        let git = inspect_git_workspace(&canonical_root).await;
+        let mut git = inspect_git_workspace(&canonical_root).await;
+        if !git.worktrees.is_empty() {
+            let registered = self
+                .workspaces
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(workspace_id, root)| (workspace_id.clone(), root.clone()))
+                .collect::<Vec<_>>();
+            for worktree in &mut git.worktrees {
+                worktree.workspace_id = registered
+                    .iter()
+                    .find(|(_, root)| worktree_paths_equal(root, &worktree.path))
+                    .map(|(workspace_id, _)| workspace_id.clone());
+            }
+        }
         Ok(WorkspaceInspection {
             workspace_id,
             entries,
@@ -711,6 +730,127 @@ impl NodeShared {
             workspace_id: workspace_id.clone(),
         });
         Ok(())
+    }
+
+    async fn create_worktree(
+        &self,
+        source_workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
+        target_root: String,
+        branch: String,
+        base: Option<String>,
+    ) -> Result<(GitWorktreeSnapshot, WorkspaceSnapshot), NodeFailure> {
+        validate_workspace_request_root(&target_root)?;
+        validate_git_revision("worktree base", base.as_deref())?;
+        let source_root = self.workspace_root(&source_workspace_id)?;
+        {
+            let workspaces = self
+                .workspaces
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if workspaces.contains_key(&workspace_id) {
+                return Err(failure(
+                    NodeFailureCode::DuplicateWorkspaceId,
+                    "workspace ID is already registered",
+                ));
+            }
+            if let Some((existing_id, _)) = workspaces
+                .iter()
+                .find(|(_, root)| worktree_paths_equal(root, &target_root))
+            {
+                return Err(failure(
+                    NodeFailureCode::DuplicateWorkspaceRoot,
+                    &format!("workspace root is already registered as '{existing_id}'"),
+                ));
+            }
+        }
+        let mut worktree = create_git_worktree(
+            &source_root,
+            &target_root,
+            &branch,
+            base.as_deref(),
+        )
+        .await
+        .map_err(git_worktree_failure)?;
+        let workspace = self
+            .register_workspace(workspace_id, worktree.path.clone())
+            .await
+            .map_err(|error| NodeFailure {
+                code: error.code,
+                message: format!(
+                    "Git created worktree '{}' but node registration failed: {}",
+                    worktree.path, error.message,
+                ),
+            })?;
+        worktree.workspace_id = Some(workspace.workspace_id.clone());
+        Ok((worktree, workspace))
+    }
+
+    async fn remove_worktree(
+        &self,
+        source_workspace_id: WorkspaceId,
+        target_root: String,
+    ) -> Result<(String, Option<WorkspaceId>), NodeFailure> {
+        validate_workspace_request_root(&target_root)?;
+        let source_root = self.workspace_root(&source_workspace_id)?;
+        let target_root = normalize_worktree_removal_target(&target_root)
+            .map_err(git_worktree_failure)?;
+        let target = list_git_worktrees(&source_root)
+            .await
+            .map_err(git_worktree_failure)?
+            .into_iter()
+            .find(|worktree| worktree_paths_equal(&worktree.path, &target_root))
+            .ok_or_else(|| {
+                failure(
+                    NodeFailureCode::WorktreeProtected,
+                    "refusing to remove a path that is not in Git's worktree listing",
+                )
+            })?;
+        let registered_workspace_id = {
+            let workspaces = self
+                .workspaces
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let matched = workspaces
+                .iter()
+                .find(|(_, root)| worktree_paths_equal(root, &target.path))
+                .map(|(workspace_id, _)| workspace_id.clone());
+            if matched.is_some() && workspaces.len() == 1 {
+                return Err(failure(
+                    NodeFailureCode::LastWorkspace,
+                    "node must retain at least one workspace",
+                ));
+            }
+            matched
+        };
+        if let Some(workspace_id) = registered_workspace_id.as_ref() {
+            let bindings = self
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if bindings
+                .values()
+                .any(|binding| &binding.workspace_id == workspace_id)
+            {
+                return Err(failure(
+                    NodeFailureCode::WorkspaceBusy,
+                    "worktree workspace retains a bound session; remove every session first",
+                ));
+            }
+        }
+        let removed = remove_git_worktree(&source_root, &target.path)
+            .await
+            .map_err(git_worktree_failure)?;
+        if let Some(workspace_id) = registered_workspace_id.as_ref() {
+            self.unregister_workspace(workspace_id).map_err(|error| NodeFailure {
+                code: error.code,
+                message: format!(
+                    "Git removed worktree '{}' but node unregistration failed: {}",
+                    removed.path, error.message,
+                ),
+            })?;
+        }
+        Ok((removed.path, registered_workspace_id))
     }
 
     fn bound_workspace_root(&self, address: &SessionAddress) -> Result<String, NodeFailure> {
@@ -1727,20 +1867,13 @@ fn is_skipped_workspace_directory(name: &str) -> bool {
         || name.eq_ignore_ascii_case("node_modules")
 }
 
-struct GitCommandOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
-    timed_out: bool,
-}
-
 async fn inspect_git_workspace(root: &str) -> GitSnapshot {
     let mut snapshot = GitSnapshot {
         is_repository: false,
         branch: None,
         status: Vec::new(),
         recent_commits: Vec::new(),
+        worktrees: Vec::new(),
         truncated: false,
         diagnostic: None,
     };
@@ -1867,6 +2000,13 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
             &format!("git log failed: {error}"),
         ),
     }
+    match list_git_worktrees(root).await {
+        Ok(worktrees) => snapshot.worktrees = worktrees,
+        Err(error) => append_git_diagnostic(
+            &mut snapshot,
+            &format!("git worktree list failed: {}", error.message),
+        ),
+    }
     snapshot
 }
 
@@ -1948,69 +2088,7 @@ async fn run_git_bounded(
     arguments: &[&str],
     output_limit: usize,
 ) -> io::Result<GitCommandOutput> {
-    use std::os::windows::process::CommandExt;
-
-    let mut command = tokio::process::Command::new("git");
-    command
-        .arg("--no-pager")
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-c")
-        .arg("core.quotepath=false")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "git stdout pipe is unavailable")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "git stderr pipe is unavailable")
-    })?;
-    let stdout_task = tokio::spawn(read_process_output(stdout, output_limit));
-    let stderr_task = tokio::spawn(read_process_output(stderr, GIT_DIAGNOSTIC_MAX_BYTES));
-    let (status, timed_out) = match timeout(
-        Duration::from_millis(GIT_COMMAND_TIMEOUT_MS),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(status) => (status?, false),
-        Err(_) => {
-            let _ = child.kill().await;
-            (child.wait().await?, true)
-        }
-    };
-    let (stdout, stdout_truncated) = stdout_task
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))??;
-    let (stderr, stderr_truncated) = stderr_task
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))??;
-    Ok(GitCommandOutput {
-        success: status.success(),
-        stdout,
-        stderr,
-        truncated: stdout_truncated || stderr_truncated,
-        timed_out,
-    })
-}
-
-async fn read_process_output<R>(reader: R, max_bytes: usize) -> io::Result<(Vec<u8>, bool)>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = reader.take((max_bytes + 1) as u64);
-    let mut output = Vec::with_capacity(max_bytes.min(8 * 1_024));
-    reader.read_to_end(&mut output).await?;
-    let truncated = output.len() > max_bytes;
-    output.truncate(max_bytes);
-    Ok((output, truncated))
+    run_git_read_bounded(root, arguments, output_limit, GIT_COMMAND_TIMEOUT_MS).await
 }
 
 async fn process_request(shared: &NodeShared, connection_id: u64, role: ClientRole, envelope: RequestEnvelope) -> ResponseEnvelope {
@@ -2062,6 +2140,38 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             shared.require_controller(connection_id, role)?;
             shared.unregister_workspace(&workspace_id)?;
             Ok(NodeResponse::WorkspaceUnregistered { workspace_id })
+        }
+        NodeRequest::CreateWorktree {
+            source_workspace_id,
+            workspace_id,
+            target_root,
+            branch,
+            base,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let (worktree, workspace) = shared
+                .create_worktree(
+                    source_workspace_id,
+                    workspace_id,
+                    target_root,
+                    branch,
+                    base,
+                )
+                .await?;
+            Ok(NodeResponse::WorktreeCreated { worktree, workspace })
+        }
+        NodeRequest::RemoveWorktree {
+            source_workspace_id,
+            target_root,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let (target_root, workspace_id) = shared
+                .remove_worktree(source_workspace_id, target_root)
+                .await?;
+            Ok(NodeResponse::WorktreeRemoved {
+                target_root,
+                workspace_id,
+            })
         }
         NodeRequest::Spawn { workspace_id, provider, mode, terminal_size, initial_prompt } => {
             shared.require_controller(connection_id, role)?;
@@ -2244,6 +2354,40 @@ fn validate_workspace_request_root(root: &str) -> Result<(), NodeFailure> {
         ));
     }
     Ok(())
+}
+
+fn validate_git_revision(field: &str, revision: Option<&str>) -> Result<(), NodeFailure> {
+    let Some(revision) = revision else {
+        return Ok(());
+    };
+    if revision.is_empty()
+        || revision.len() > WORKSPACE_RELATIVE_PATH_MAX_BYTES
+        || revision.chars().any(char::is_control)
+    {
+        return Err(failure(
+            NodeFailureCode::InvalidRequest,
+            &format!(
+                "{field} must contain 1..={WORKSPACE_RELATIVE_PATH_MAX_BYTES} bytes and no control characters",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
+    let code = match error.kind {
+        GitWorktreeErrorKind::Invalid => NodeFailureCode::InvalidRequest,
+        GitWorktreeErrorKind::NotRepository => NodeFailureCode::NotGitRepository,
+        GitWorktreeErrorKind::Conflict => NodeFailureCode::WorktreeConflict,
+        GitWorktreeErrorKind::Protected => NodeFailureCode::WorktreeProtected,
+        GitWorktreeErrorKind::Dirty => NodeFailureCode::WorktreeDirty,
+        GitWorktreeErrorKind::Locked => NodeFailureCode::WorktreeLocked,
+        GitWorktreeErrorKind::Failed => NodeFailureCode::BackendOperationFailed,
+    };
+    NodeFailure {
+        code,
+        message: error.message,
+    }
 }
 
 fn normalize_windows_verbatim_path(path: String) -> String {
@@ -3141,6 +3285,7 @@ mod tests {
             branch: Some("main".to_owned()),
             status: Vec::new(),
             recent_commits: Vec::new(),
+            worktrees: Vec::new(),
             truncated: false,
             diagnostic: None,
         };

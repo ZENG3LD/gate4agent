@@ -1,6 +1,8 @@
-//! Stable, serde-only observer API contract for Gate4Agent C2.
+//! Stable, serde-only inventory and control contract for Gate4Agent C2.
 
-pub use gate4agent_node_protocol::{NodeCursor, NodeId};
+pub use gate4agent_node_protocol::{
+    NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest, NodeResponse,
+};
 use gate4agent_node_protocol::{AgentProvider, NodeSnapshot, WorkspaceId};
 use gate4agent_types::{
     AgentInstanceId, SessionGeneration, SessionStatus, TerminalSize, TransportKind,
@@ -10,6 +12,14 @@ use std::collections::BTreeMap;
 
 pub const C2_API_VERSION: u16 = 1;
 pub const DEFAULT_C2_API_LISTEN: &str = "127.0.0.1:18320";
+pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const DEFAULT_C2_CONTROL_ENDPOINT: &str = r"\\.\pipe\gate4agent-c2";
+pub const C2_AUTH_NONCE_BYTES: usize = 32;
+pub const C2_AUTH_PROOF_BYTES: usize = 32;
+pub const MAX_C2_CLIENT_FRAME_BYTES: usize = 256 * 1024;
+pub const MAX_C2_SERVER_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_C2_AUTH_FRAME_BYTES: usize = 8 * 1024;
+pub const MAX_C2_HELLO_FRAME_BYTES: usize = MAX_C2_SERVER_FRAME_BYTES;
 pub const MAX_C2_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_C2_NODES: usize = 64;
 pub const MAX_C2_ENDPOINT_BYTES: usize = 1024;
@@ -17,6 +27,138 @@ pub const MAX_C2_WORKSPACES_PER_NODE: usize = 32;
 pub const MAX_C2_SESSIONS_PER_NODE: usize = 128;
 pub const MAX_C2_GAPS_PER_NODE: usize = 64;
 pub const MAX_C2_ROOT_BYTES: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct C2RequestId(pub u64);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeRoute {
+    pub node_id: NodeId,
+    pub expected_incarnation_id: NodeIncarnationId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RoutedNodeRequest {
+    pub route: NodeRoute,
+    pub request: NodeRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RoutedNodeResponse {
+    pub node_id: NodeId,
+    pub incarnation_id: NodeIncarnationId,
+    pub response: Result<NodeResponse, NodeFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RoutedNodeEvent {
+    pub node_id: NodeId,
+    pub cursor: NodeCursor,
+    pub event: NodeEvent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum C2RelayFailureCode {
+    UnknownNode,
+    NodeOffline,
+    StaleNodeIncarnation,
+    RelayBusy,
+    OperatorAlreadyConnected,
+    RequestIdReused,
+    RequestForbidden,
+    ClientLagged,
+    ShuttingDown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2RelayFailure {
+    pub code: C2RelayFailureCode,
+    pub message: String,
+    pub current_incarnation_id: Option<NodeIncarnationId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2ClientHello {
+    pub protocol_version: u16,
+    pub client_nonce: [u8; C2_AUTH_NONCE_BYTES],
+}
+
+impl C2ClientHello {
+    pub fn new(client_nonce: [u8; C2_AUTH_NONCE_BYTES]) -> Self {
+        Self { protocol_version: C2_CONTROL_PROTOCOL_VERSION, client_nonce }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2ServerChallenge {
+    pub protocol_version: u16,
+    pub server_nonce: [u8; C2_AUTH_NONCE_BYTES],
+    pub server_proof: [u8; C2_AUTH_PROOF_BYTES],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2ClientAuthentication {
+    pub client_proof: [u8; C2_AUTH_PROOF_BYTES],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2Hello {
+    pub protocol_version: u16,
+    pub connection_id: u64,
+    pub status: StatusResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2RequestEnvelope {
+    pub request_id: C2RequestId,
+    pub request: RoutedNodeRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2ReplyEnvelope {
+    pub request_id: C2RequestId,
+    pub result: Result<RoutedNodeResponse, C2RelayFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "kebab-case")]
+pub enum C2ClientFrame {
+    Hello(C2ClientHello),
+    Authenticate(C2ClientAuthentication),
+    Request(C2RequestEnvelope),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "kebab-case")]
+pub enum C2ServerFrame {
+    Challenge(C2ServerChallenge),
+    Hello(C2Hello),
+    Reply(C2ReplyEnvelope),
+    Event(RoutedNodeEvent),
+    Rejected(C2RelayFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum C2AuthDirection {
+    Server,
+    Client,
+}
+
+pub fn c2_auth_transcript(
+    direction: C2AuthDirection,
+    client_nonce: &[u8; C2_AUTH_NONCE_BYTES],
+    server_nonce: &[u8; C2_AUTH_NONCE_BYTES],
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(32 + (C2_AUTH_NONCE_BYTES * 2));
+    message.extend_from_slice(b"gate4agent-c2-control-auth-v1\0");
+    message.extend_from_slice(&C2_CONTROL_PROTOCOL_VERSION.to_le_bytes());
+    message.push(match direction { C2AuthDirection::Server => 1, C2AuthDirection::Client => 2 });
+    message.extend_from_slice(client_nonce);
+    message.extend_from_slice(server_nonce);
+    message
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -316,5 +458,18 @@ mod tests {
         assert!(slim.workspaces_truncated);
         assert_eq!(slim.session_count, 1);
         assert!(slim.sessions_truncated);
+    }
+
+    #[test]
+    fn control_auth_transcript_is_direction_and_protocol_domain_separated() {
+        let client_nonce = [3; C2_AUTH_NONCE_BYTES];
+        let server_nonce = [7; C2_AUTH_NONCE_BYTES];
+        let server = c2_auth_transcript(C2AuthDirection::Server, &client_nonce, &server_nonce);
+        let client = c2_auth_transcript(C2AuthDirection::Client, &client_nonce, &server_nonce);
+        assert_ne!(server, client);
+        assert!(server.starts_with(b"gate4agent-c2-control-auth-v1\0"));
+        assert!(!server.windows(b"gate4agent-node-auth-v3".len()).any(|window| window == b"gate4agent-node-auth-v3"));
+        assert_eq!(&server[server.len() - (C2_AUTH_NONCE_BYTES * 2)..server.len() - C2_AUTH_NONCE_BYTES], &client_nonce);
+        assert_eq!(&server[server.len() - C2_AUTH_NONCE_BYTES..], &server_nonce);
     }
 }

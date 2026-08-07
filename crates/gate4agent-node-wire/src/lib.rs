@@ -5,6 +5,6 @@ mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    auth_proof, proofs_match, random_incarnation_id, random_nonce, AuthDirection,
+    auth_proof, local_hmac_sha256, proofs_match, random_incarnation_id, random_nonce, AuthDirection,
     NamedPipeNodeClient, NodeClientError,
 };

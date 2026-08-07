@@ -1,7 +1,7 @@
 #[cfg(windows)]
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running};
 #[cfg(windows)]
-use gate4agent_c2::protocol::{NodeId, DEFAULT_C2_API_LISTEN, MAX_C2_NODES};
+use gate4agent_c2::protocol::{NodeId, DEFAULT_C2_API_LISTEN, DEFAULT_C2_CONTROL_ENDPOINT, MAX_C2_NODES};
 #[cfg(windows)]
 use std::collections::BTreeSet;
 
@@ -12,6 +12,7 @@ const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut api_listen = DEFAULT_C2_API_LISTEN.parse().expect("built-in C2 listen address is valid");
+    let mut control_endpoint = DEFAULT_C2_CONTROL_ENDPOINT.to_owned();
     let mut node_args = Vec::new();
     let mut seen = BTreeSet::new();
     let mut seen_endpoints = BTreeSet::new();
@@ -22,6 +23,7 @@ async fn main() {
                 api_listen = required_value("--api-listen", args.next()).parse()
                     .unwrap_or_else(|error| fail(&format!("--api-listen is invalid: {error}")));
             }
+            "--control-endpoint" => control_endpoint = required_value("--control-endpoint", args.next()),
             "--node" => {
                 if node_args.len() == MAX_C2_NODES { fail("at most 64 --node values are allowed"); }
                 let value = required_value("--node", args.next());
@@ -32,7 +34,7 @@ async fn main() {
                 node_args.push((node_id, endpoint.to_owned()));
             }
             "--help" | "-h" => {
-                println!("gate4agent-c2 --node NODE_ID=\\\\.\\pipe\\ENDPOINT [--node ...] [--api-listen 127.0.0.1:PORT]");
+                println!("gate4agent-c2 --node NODE_ID=\\\\.\\pipe\\ENDPOINT [--node ...] [--api-listen 127.0.0.1:PORT] [--control-endpoint \\\\.\\pipe\\ENDPOINT]");
                 println!("API token: {C2_TOKEN_ENV}; node tokens: GATE4AGENT_NODE_TOKEN_<NORMALIZED_NODE_ID>");
                 return;
             }
@@ -52,7 +54,9 @@ async fn main() {
     }
     let api_token = std::env::var(C2_TOKEN_ENV).unwrap_or_else(|_| fail(&format!("{C2_TOKEN_ENV} is required")));
     std::env::remove_var(C2_TOKEN_ENV);
-    let config = C2Config::new(api_listen, api_token, nodes).unwrap_or_else(|error| fail(&error.to_string()));
+    let config = C2Config::new(api_listen, api_token, nodes)
+        .and_then(|config| config.with_control_endpoint(control_endpoint))
+        .unwrap_or_else(|error| fail(&error.to_string()));
     let running = C2Running::start(config).await.unwrap_or_else(|error| fail(&error.to_string()));
     let shutdown = running.shutdown_handle();
     let wait = running.wait();

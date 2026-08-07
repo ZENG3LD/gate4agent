@@ -270,10 +270,10 @@ pub fn auth_proof(
     });
     message.extend_from_slice(client_nonce);
     message.extend_from_slice(server_nonce);
-    hmac_sha256(access_token, &message)
+    local_hmac_sha256(access_token, &message)
 }
 
-fn hmac_sha256(
+pub fn local_hmac_sha256(
     secret: &[u8],
     message: &[u8],
 ) -> Result<[u8; NODE_AUTH_PROOF_BYTES], String> {
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn windows_cng_hmac_sha256_matches_the_standard_vector() {
-        let actual = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog").unwrap();
+        let actual = local_hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog").unwrap();
         let expected = [
             0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24,
             0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f, 0xb1, 0x43,

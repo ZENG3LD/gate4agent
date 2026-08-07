@@ -10,6 +10,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+pub use windows::{connect_local, C2ControlError, C2ControlHandle, C2EventReceiver};
+
 const MAX_RESPONSE_HEADERS: usize = 16 * 1024;
 
 #[derive(Clone)]

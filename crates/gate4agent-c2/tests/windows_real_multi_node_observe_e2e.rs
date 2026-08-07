@@ -75,6 +75,7 @@ async fn client_when_healthy(address: std::net::SocketAddr, token: &str) -> C2Cl
 async fn windows_real_multi_node_observe_only_c2_survives_partial_loss_restart_and_shutdown() {
     let endpoint_a = endpoint("a");
     let endpoint_b = endpoint("b");
+    let control_endpoint = endpoint("control");
     let token_a = "node-a-token";
     let token_b = "node-b-token";
     let c2_token = "c2-api-token";
@@ -94,6 +95,7 @@ async fn windows_real_multi_node_observe_only_c2_survives_partial_loss_restart_a
     let mut command = Command::new(env!("CARGO_BIN_EXE_gate4agent-c2"));
     command.args([
         "--api-listen", &c2_addr.to_string(),
+        "--control-endpoint", &control_endpoint,
         "--node", &format!("{}={endpoint_a}", id_a.as_str()),
         "--node", &format!("{}={endpoint_b}", id_b.as_str()),
     ]);

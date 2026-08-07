@@ -1,25 +1,29 @@
 use crate::protocol::{
-    C2ErrorCategory, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
+    C2ErrorCategory, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
+    NodeIncarnationId, NodeRequest, RoutedNodeEvent, RoutedNodeResponse,
     NodeTransportState, ObservedNode, ReadyResponse, SanitizedError, SlimNodeInventory,
-    StatusResponse, C2_API_VERSION, MAX_C2_ENDPOINT_BYTES, MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
+    StatusResponse, C2_API_VERSION, DEFAULT_C2_CONTROL_ENDPOINT, MAX_C2_ENDPOINT_BYTES, MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
 };
-use gate4agent_node_protocol::{ClientRole, FrameError, NodeEventEnvelope, NodeFailureCode, NodeRequest, NodeResponse, NodeSnapshot};
+use gate4agent_node_protocol::{ClientRole, FrameError, NodeEventEnvelope, NodeFailureCode, NodeResponse, NodeSnapshot};
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 const HEADER_LIMIT_BYTES: usize = 16 * 1024;
 const MAX_HTTP_CONNECTIONS: usize = 16;
 const RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
+mod control;
 
 #[derive(Clone)]
 pub struct C2NodeConfig {
@@ -55,7 +59,7 @@ pub struct C2Timings {
 impl Default for C2Timings {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(250),
             fresh_for: Duration::from_secs(10),
             attempt_deadline: Duration::from_secs(5),
             transient_backoffs: [
@@ -71,6 +75,7 @@ impl Default for C2Timings {
 #[derive(Clone)]
 pub struct C2Config {
     pub api_listen: SocketAddr,
+    pub control_endpoint: String,
     api_token: String,
     pub nodes: Vec<C2NodeConfig>,
     pub timings: C2Timings,
@@ -86,13 +91,35 @@ impl C2Config {
         let mut endpoints = BTreeSet::new();
         if nodes.iter().any(|node| !ids.insert(node.node_id.clone())) { return Err(C2ConfigError::DuplicateNode); }
         if nodes.iter().any(|node| !endpoints.insert(node.endpoint.to_ascii_lowercase())) { return Err(C2ConfigError::DuplicateEndpoint); }
-        Ok(Self { api_listen, api_token, nodes, timings: C2Timings::default() })
+        if nodes.iter().any(|node| node.endpoint.eq_ignore_ascii_case(DEFAULT_C2_CONTROL_ENDPOINT)) {
+            return Err(C2ConfigError::ControlEndpointConflict);
+        }
+        Ok(Self { api_listen, control_endpoint: DEFAULT_C2_CONTROL_ENDPOINT.to_owned(), api_token, nodes, timings: C2Timings::default() })
     }
 
     pub fn with_timings(mut self, timings: C2Timings) -> Self {
         self.timings = timings;
         self
     }
+
+    pub fn with_control_endpoint(mut self, endpoint: impl Into<String>) -> Result<Self, C2ConfigError> {
+        let endpoint = endpoint.into();
+        validate_control_endpoint(&endpoint)?;
+        if self.nodes.iter().any(|node| node.endpoint.eq_ignore_ascii_case(&endpoint)) {
+            return Err(C2ConfigError::ControlEndpointConflict);
+        }
+        self.control_endpoint = endpoint;
+        Ok(self)
+    }
+}
+
+fn validate_control_endpoint(endpoint: &str) -> Result<(), C2ConfigError> {
+    if !endpoint.starts_with(r"\\.\pipe\") || endpoint.len() <= r"\\.\pipe\".len()
+        || endpoint.len() > MAX_C2_ENDPOINT_BYTES
+    {
+        return Err(C2ConfigError::InvalidControlEndpoint);
+    }
+    Ok(())
 }
 
 fn validate_token(token: &str) -> Result<(), C2ConfigError> {
@@ -116,6 +143,80 @@ pub enum C2ConfigError {
     DuplicateNode,
     #[error("C2 named-pipe endpoints must be unique")]
     DuplicateEndpoint,
+    #[error("C2 control endpoint must be a bounded local Windows named pipe")]
+    InvalidControlEndpoint,
+    #[error("C2 control endpoint must not equal a configured node endpoint")]
+    ControlEndpointConflict,
+}
+
+type RelayResult = Result<RoutedNodeResponse, C2RelayFailure>;
+
+enum RelayCommand {
+    Request {
+        operator_connection_id: u64,
+        expected_incarnation_id: NodeIncarnationId,
+        request: NodeRequest,
+        reply: oneshot::Sender<RelayResult>,
+    },
+}
+
+#[derive(Clone)]
+struct RelayEndpoint {
+    commands: mpsc::Sender<RelayCommand>,
+    releases: mpsc::Sender<oneshot::Sender<()>>,
+    force_disconnect: watch::Sender<u64>,
+}
+
+#[derive(Clone)]
+struct OperatorHub {
+    sink: Arc<Mutex<Option<OperatorEventSink>>>,
+}
+
+#[derive(Clone)]
+struct OperatorEventSink {
+    connection_id: u64,
+    outbound: mpsc::Sender<control::QueuedFrame>,
+    budget: Arc<AtomicUsize>,
+    disconnect: watch::Sender<bool>,
+}
+
+impl OperatorHub {
+    fn new() -> Self { Self { sink: Arc::new(Mutex::new(None)) } }
+
+    fn attach(&self, sink: OperatorEventSink) {
+        *self.sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    fn detach(&self, connection_id: u64) {
+        let mut sink = self.sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sink.as_ref().is_some_and(|current| current.connection_id == connection_id) { *sink = None; }
+    }
+
+    fn is_active(&self, connection_id: u64) -> bool {
+        self.sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref().is_some_and(|current| current.connection_id == connection_id)
+    }
+
+    fn has_active_operator(&self) -> bool {
+        self.sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
+    }
+
+    fn publish(&self, event: RoutedNodeEvent) {
+        let sink = self.sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sink) = sink.as_ref() {
+            if control::queue_operator_event(&sink.outbound, &sink.budget, event).is_err() {
+                let _ = sink.disconnect.send(true);
+            }
+        }
+    }
+}
+
+fn relay_failure(
+    code: C2RelayFailureCode,
+    message: &'static str,
+    current_incarnation_id: Option<NodeIncarnationId>,
+) -> C2RelayFailure {
+    C2RelayFailure { code, message: message.to_owned(), current_incarnation_id }
 }
 
 #[derive(Debug, Error)]
@@ -177,12 +278,35 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
     let (status_tx, status_rx) = watch::channel(initial);
     let (ingress_tx, ingress_rx) = mpsc::channel(config.nodes.len().saturating_mul(2).max(2));
     let mut tasks = JoinSet::new();
-    tasks.spawn(inventory_owner(config.nodes.len(), config.timings.fresh_for, ingress_rx, status_tx, shutdown.clone()));
+    let hub = OperatorHub::new();
+    let mut relay_senders = BTreeMap::new();
+    let mut relay_receivers = Vec::new();
     for node in config.nodes.clone() {
-        tasks.spawn(node_poller(node, config.timings, ingress_tx.clone(), status_rx.clone(), shutdown.clone()));
+        let (commands_tx, commands_rx) = mpsc::channel(8);
+        let (releases_tx, releases_rx) = mpsc::channel(1);
+        let (force_tx, force_rx) = watch::channel(0_u64);
+        relay_senders.insert(node.node_id.clone(), RelayEndpoint {
+            commands: commands_tx,
+            releases: releases_tx,
+            force_disconnect: force_tx,
+        });
+        relay_receivers.push((node, commands_rx, releases_rx, force_rx));
+    }
+    let relay_senders = Arc::new(relay_senders);
+    tasks.spawn(inventory_owner(config.nodes.len(), config.timings.fresh_for, ingress_rx, status_tx, shutdown.clone()));
+    for (node, commands, releases, force_disconnect) in relay_receivers {
+        tasks.spawn(node_relay_worker(node, config.timings, commands, releases, force_disconnect, ingress_tx.clone(), status_rx.clone(), hub.clone(), shutdown.clone()));
     }
     drop(ingress_tx);
-    tasks.spawn(http_server(listener, config.api_token, config.timings.http_io_deadline, status_rx, shutdown.clone()));
+    tasks.spawn(http_server(listener, config.api_token.clone(), config.timings.http_io_deadline, status_rx.clone(), shutdown.clone()));
+    tasks.spawn(control::run(
+        config.control_endpoint,
+        config.api_token,
+        relay_senders,
+        status_rx,
+        hub,
+        shutdown.clone(),
+    ));
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -205,66 +329,201 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
 
 enum AttemptResult {
     Success { cursor: NodeCursor, snapshot: NodeSnapshot, gaps: Vec<GapKind> },
+    Cursor { cursor: NodeCursor, gaps: Vec<GapKind> },
     Failure { error: SanitizedError, hard: bool },
 }
 
 struct Attempt { node_id: NodeId, at_unix_ms: u64, result: AttemptResult }
 
-async fn node_poller(
-    node: C2NodeConfig, timings: C2Timings, ingress: mpsc::Sender<Attempt>,
-    status: watch::Receiver<Arc<StatusResponse>>, mut shutdown: watch::Receiver<bool>,
+async fn node_relay_worker(
+    node: C2NodeConfig,
+    timings: C2Timings,
+    mut commands: mpsc::Receiver<RelayCommand>,
+    mut releases: mpsc::Receiver<oneshot::Sender<()>>,
+    mut force_disconnect: watch::Receiver<u64>,
+    ingress: mpsc::Sender<Attempt>,
+    status: watch::Receiver<Arc<StatusResponse>>,
+    hub: OperatorHub,
+    mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut failures = 0_usize;
     loop {
         if *shutdown.borrow() { return Ok(()); }
         let previous = status.borrow().nodes.get(&node.node_id).and_then(|item| item.cursor);
-        let result = match timeout(timings.attempt_deadline, observe_once(&node, previous)).await {
-            Ok(Ok(success)) => { failures = 0; AttemptResult::Success { cursor: success.0, snapshot: success.1, gaps: success.2 } }
+        let connected = timeout(timings.attempt_deadline, connect_operator(&node)).await;
+        let mut client = match connected {
+            Ok(Ok(client)) => client,
             Ok(Err(error)) => {
                 failures = failures.saturating_add(1);
                 let (error, hard) = sanitize_node_error(&error);
-                AttemptResult::Failure { error, hard }
+                ingress_attempt(&ingress, &node.node_id, AttemptResult::Failure { error, hard }).await?;
+                reject_disconnected_commands(&mut commands, previous);
+                acknowledge_disconnected_releases(&mut releases);
+                relay_backoff(&mut shutdown, timings, failures, hard).await?;
+                continue;
             }
             Err(_) => {
                 failures = failures.saturating_add(1);
-                AttemptResult::Failure { error: SanitizedError { category: C2ErrorCategory::Timeout, message: "node observation deadline exceeded".to_owned() }, hard: false }
+                ingress_attempt(&ingress, &node.node_id, AttemptResult::Failure {
+                    error: SanitizedError { category: C2ErrorCategory::Timeout, message: "node connection deadline exceeded".to_owned() },
+                    hard: false,
+                }).await?;
+                reject_disconnected_commands(&mut commands, previous);
+                acknowledge_disconnected_releases(&mut releases);
+                relay_backoff(&mut shutdown, timings, failures, false).await?;
+                continue;
             }
         };
-        let success = matches!(result, AttemptResult::Success { .. });
-        let hard = matches!(result, AttemptResult::Failure { hard: true, .. });
-        if ingress.send(Attempt { node_id: node.node_id.clone(), at_unix_ms: unix_ms(), result }).await.is_err() { return Ok(()); }
-        let delay = if success { timings.poll_interval } else if hard || failures >= timings.transient_backoffs.len() {
-            timings.parked_backoff
-        } else {
-            timings.transient_backoffs[failures - 1]
-        };
-        tokio::select! {
-            _ = sleep(delay) => {}
-            changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return Ok(()); },
+        failures = 0;
+        let hello = client.hello().clone();
+        let incarnation_id = hello.incarnation_id;
+        let connection_id = hello.connection_id;
+        let mut controller_owned = hello.controller.as_ref().is_some_and(|controller| controller.connection_id == connection_id);
+        let mut cursor = NodeCursor { incarnation_id, sequence: hello.event_sequence };
+        let mut snapshot = hello.snapshot;
+        let mut gaps = Vec::new();
+        let mut did_resync = false;
+        if let Some(previous) = previous {
+            if previous.incarnation_id != incarnation_id {
+                gaps.push(GapKind::IncarnationChanged);
+            } else if cursor.sequence < previous.sequence {
+                gaps.push(GapKind::CursorRegression);
+            } else if cursor.sequence > previous.sequence {
+                match bounded_node_request(&mut client, NodeRequest::Resync { after_sequence: previous.sequence }).await {
+                    Ok(NodeResponse::Resync { event_sequence, snapshot: resync_snapshot, events }) => {
+                        let resync_gaps = validate_resync(previous.sequence, cursor.sequence, event_sequence, &events);
+                        if resync_gaps.is_empty() {
+                            publish_recovered_events(&node.node_id, incarnation_id, &events, &hub);
+                        } else {
+                            hub.publish(RoutedNodeEvent {
+                                node_id: node.node_id.clone(),
+                                cursor: NodeCursor { incarnation_id, sequence: event_sequence },
+                                event: gate4agent_node_protocol::NodeEvent::ResyncRequired {
+                                    oldest_available_sequence: events.first().map_or(event_sequence, |event| event.sequence),
+                                },
+                            });
+                        }
+                        gaps.extend(resync_gaps);
+                        cursor.sequence = event_sequence;
+                        snapshot = resync_snapshot;
+                        did_resync = true;
+                    }
+                    Ok(_) => gaps.push(GapKind::NonContiguousEvents),
+                    Err(error) => {
+                        ingress_attempt(&ingress, &node.node_id, relay_failure_attempt(&error)).await?;
+                        reject_disconnected_commands(&mut commands, Some(cursor));
+                        continue;
+                    }
+                }
+            }
         }
+        ingress_attempt(&ingress, &node.node_id, AttemptResult::Success { cursor, snapshot, gaps }).await?;
+        if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, did_resync).await {
+            ingress_attempt(&ingress, &node.node_id, relay_failure_attempt(&error)).await?;
+            reject_disconnected_commands(&mut commands, Some(cursor));
+            continue;
+        }
+
+        let cadence = timings.poll_interval.max(Duration::from_millis(1)).min(Duration::from_millis(250));
+        let mut snapshot_tick = tokio::time::interval(cadence);
+        snapshot_tick.reset();
+        let mut lease_tick = tokio::time::interval(Duration::from_secs(30));
+        lease_tick.reset();
+        let disconnect_error = loop {
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else { return Ok(()); };
+                    tokio::select! {
+                        result = handle_relay_command(
+                            &mut client, command, &node.node_id, incarnation_id, connection_id,
+                            &mut controller_owned, &hub, &mut cursor, &ingress,
+                        ) => match result {
+                            Ok(()) => {}
+                            Err(error) => break error,
+                        },
+                        changed = force_disconnect.changed() => {
+                            let _ = changed;
+                            break NodeClientError::Io(io::Error::new(io::ErrorKind::ConnectionAborted, "node relay cleanup forced reconnect"));
+                        }
+                    }
+                }
+                release = releases.recv() => {
+                    let Some(reply) = release else { return Ok(()); };
+                    let result = release_controller(&mut client, &mut controller_owned).await;
+                    let _ = reply.send(());
+                    if let Err(error) = result { break error; }
+                }
+                changed = force_disconnect.changed() => {
+                    let _ = changed;
+                    break NodeClientError::Io(io::Error::new(io::ErrorKind::ConnectionAborted, "node relay cleanup forced reconnect"));
+                }
+                _ = snapshot_tick.tick() => {
+                    match bounded_node_request(&mut client, NodeRequest::Snapshot).await {
+                        Ok(NodeResponse::Snapshot { event_sequence, snapshot, .. }) => {
+                            if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, false).await { break error; }
+                            if event_sequence >= cursor.sequence {
+                                cursor.sequence = event_sequence;
+                                ingress_attempt(&ingress, &node.node_id, AttemptResult::Success { cursor, snapshot, gaps: Vec::new() }).await?;
+                            }
+                        }
+                        Ok(_) => break NodeClientError::Protocol("snapshot returned a different response".to_owned()),
+                        Err(error) => break error,
+                    }
+                }
+                _ = lease_tick.tick() => {
+                    if controller_owned {
+                        if hub.has_active_operator() {
+                            match acquire_controller(&mut client, connection_id).await {
+                                Ok(owned) => controller_owned = owned,
+                                Err(error) => break error,
+                            }
+                        } else if let Err(error) = release_controller(&mut client, &mut controller_owned).await {
+                            break error;
+                        }
+                        if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, false).await { break error; }
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        let _ = release_controller(&mut client, &mut controller_owned).await;
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let (error, hard) = sanitize_node_error(&disconnect_error);
+        ingress_attempt(&ingress, &node.node_id, AttemptResult::Failure { error, hard }).await?;
+        reject_disconnected_commands(&mut commands, Some(cursor));
+        failures = failures.saturating_add(1);
+        relay_backoff(&mut shutdown, timings, failures, hard).await?;
     }
 }
 
-async fn observe_once(node: &C2NodeConfig, previous: Option<NodeCursor>) -> Result<(NodeCursor, NodeSnapshot, Vec<GapKind>), NodeClientError> {
-    let mut client = connect_observer(node).await?;
-    let hello = client.hello().clone();
-    let hello_cursor = NodeCursor { incarnation_id: hello.incarnation_id, sequence: hello.event_sequence };
-    let Some(previous) = previous else { return Ok((hello_cursor, hello.snapshot, Vec::new())); };
-    if hello_cursor.incarnation_id != previous.incarnation_id {
-        return Ok((hello_cursor, hello.snapshot, vec![GapKind::IncarnationChanged]));
-    }
-    if hello_cursor.sequence < previous.sequence {
-        return Ok((hello_cursor, hello.snapshot, vec![GapKind::CursorRegression]));
-    }
-    if hello_cursor.sequence == previous.sequence {
-        return Ok((hello_cursor, hello.snapshot, Vec::new()));
-    }
-    let NodeResponse::Resync { event_sequence, snapshot, events } = client.request(NodeRequest::Resync { after_sequence: previous.sequence }).await? else {
-        return Err(NodeClientError::Protocol("resync returned a different response".to_owned()));
+async fn connect_operator(node: &C2NodeConfig) -> Result<NamedPipeNodeClient, NodeClientError> {
+    NamedPipeNodeClient::connect(&node.endpoint, &node.node_id, ClientRole::Operator, &node.token).await
+}
+
+async fn bounded_node_request(
+    client: &mut NamedPipeNodeClient,
+    request: NodeRequest,
+) -> Result<NodeResponse, NodeClientError> {
+    let deadline = match &request {
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController => Duration::from_secs(5),
+        NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. } => Duration::from_secs(240),
+        NodeRequest::Spawn { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::Stop { .. } => Duration::from_secs(15),
+        _ => Duration::from_secs(10),
     };
-    let cursor = NodeCursor { incarnation_id: hello.incarnation_id, sequence: event_sequence };
-    let gaps = validate_resync(previous.sequence, hello_cursor.sequence, event_sequence, &events);
-    Ok((cursor, snapshot, gaps))
+    match timeout(deadline, client.request(request)).await {
+        Ok(result) => result,
+        Err(_) => Err(NodeClientError::Frame(FrameError::PrefixTimedOut)),
+    }
 }
 
 fn validate_resync(previous: u64, hello: u64, current: u64, events: &[NodeEventEnvelope]) -> Vec<GapKind> {
@@ -275,10 +534,244 @@ fn validate_resync(previous: u64, hello: u64, current: u64, events: &[NodeEventE
     gaps
 }
 
-// Transport boundary: the milestone only enables Windows named pipes. A future WSS
-// implementation belongs behind this constructor, without changing inventory ownership.
-async fn connect_observer(node: &C2NodeConfig) -> Result<NamedPipeNodeClient, NodeClientError> {
-    NamedPipeNodeClient::connect(&node.endpoint, &node.node_id, ClientRole::Observer, &node.token).await
+async fn ingress_attempt(
+    ingress: &mpsc::Sender<Attempt>,
+    node_id: &NodeId,
+    result: AttemptResult,
+) -> io::Result<()> {
+    ingress.send(Attempt { node_id: node_id.clone(), at_unix_ms: unix_ms(), result })
+        .await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "inventory owner closed"))
+}
+
+async fn relay_backoff(
+    shutdown: &mut watch::Receiver<bool>,
+    timings: C2Timings,
+    failures: usize,
+    hard: bool,
+) -> io::Result<()> {
+    let delay = if hard || failures >= timings.transient_backoffs.len() {
+        timings.parked_backoff
+    } else {
+        timings.transient_backoffs[failures.saturating_sub(1)]
+    };
+    tokio::select! {
+        _ = sleep(delay) => Ok(()),
+        _ = shutdown.changed() => {
+            Ok(())
+        }
+    }
+}
+
+fn relay_failure_attempt(error: &NodeClientError) -> AttemptResult {
+    let (error, hard) = sanitize_node_error(error);
+    AttemptResult::Failure { error, hard }
+}
+
+async fn handle_relay_command(
+    client: &mut NamedPipeNodeClient,
+    command: RelayCommand,
+    node_id: &NodeId,
+    incarnation_id: NodeIncarnationId,
+    connection_id: u64,
+    controller_owned: &mut bool,
+    hub: &OperatorHub,
+    cursor: &mut NodeCursor,
+    ingress: &mpsc::Sender<Attempt>,
+) -> Result<(), NodeClientError> {
+    match command {
+        RelayCommand::Request { operator_connection_id, expected_incarnation_id, request, reply } => {
+            if !hub.is_active(operator_connection_id) {
+                let _ = reply.send(Err(relay_failure(C2RelayFailureCode::ClientLagged, "C2 operator connection is no longer active", Some(incarnation_id))));
+                return Ok(());
+            }
+            if expected_incarnation_id != incarnation_id {
+                let _ = reply.send(Err(relay_failure(C2RelayFailureCode::StaleNodeIncarnation, "node incarnation changed", Some(incarnation_id))));
+                return Ok(());
+            }
+            if !is_read_only_request(&request) && !*controller_owned {
+                match acquire_controller(client, connection_id).await {
+                    Ok(owned) if owned => *controller_owned = true,
+                    Ok(_) => {
+                        let _ = reply.send(Err(relay_failure(C2RelayFailureCode::RelayBusy, "node controller lease is unavailable", Some(incarnation_id))));
+                        return Ok(());
+                    }
+                    Err(NodeClientError::Node(failure)) => {
+                        let _ = reply.send(Ok(RoutedNodeResponse { node_id: node_id.clone(), incarnation_id, response: Err(failure) }));
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(relay_failure(C2RelayFailureCode::NodeOffline, "node relay disconnected", Some(incarnation_id))));
+                        return Err(error);
+                    }
+                }
+            }
+            let response = match bounded_node_request(client, request).await {
+                Ok(response) => Ok(response),
+                Err(NodeClientError::Node(failure)) => Err(failure),
+                Err(error) => {
+                    let _ = reply.send(Err(relay_failure(C2RelayFailureCode::NodeOffline, "node relay disconnected", Some(incarnation_id))));
+                    return Err(error);
+                }
+            };
+            drain_pending_events(client, node_id, cursor, hub, ingress, false).await?;
+            update_inventory_from_response(node_id, cursor, &response, ingress).await
+                .map_err(NodeClientError::Io)?;
+            let _ = reply.send(Ok(RoutedNodeResponse { node_id: node_id.clone(), incarnation_id, response }));
+        }
+    }
+    Ok(())
+}
+
+fn is_read_only_request(request: &NodeRequest) -> bool {
+    matches!(request, NodeRequest::Snapshot | NodeRequest::Resync { .. } | NodeRequest::InspectWorkspace { .. })
+}
+
+async fn acquire_controller(
+    client: &mut NamedPipeNodeClient,
+    connection_id: u64,
+) -> Result<bool, NodeClientError> {
+    match bounded_node_request(client, NodeRequest::AcquireController { lease_ms: gate4agent_node_protocol::MAX_CONTROLLER_LEASE_MS }).await? {
+        NodeResponse::Controller { controller } => Ok(controller.as_ref().is_some_and(|state| state.connection_id == connection_id)),
+        _ => Err(NodeClientError::Protocol("controller acquisition returned a different response".to_owned())),
+    }
+}
+
+async fn release_controller(
+    client: &mut NamedPipeNodeClient,
+    controller_owned: &mut bool,
+) -> Result<(), NodeClientError> {
+    if !*controller_owned { return Ok(()); }
+    match bounded_node_request(client, NodeRequest::ReleaseController).await? {
+        NodeResponse::Controller { .. } => { *controller_owned = false; Ok(()) }
+        _ => Err(NodeClientError::Protocol("controller release returned a different response".to_owned())),
+    }
+}
+
+async fn update_inventory_from_response(
+    node_id: &NodeId,
+    cursor: &mut NodeCursor,
+    response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
+    ingress: &mpsc::Sender<Attempt>,
+) -> io::Result<()> {
+    match response {
+        Ok(NodeResponse::Snapshot { event_sequence, snapshot, .. })
+        | Ok(NodeResponse::Resync { event_sequence, snapshot, .. }) => {
+            if *event_sequence < cursor.sequence { return Ok(()); }
+            cursor.sequence = *event_sequence;
+            ingress_attempt(ingress, node_id, AttemptResult::Success { cursor: *cursor, snapshot: snapshot.clone(), gaps: Vec::new() }).await
+        }
+        _ => Ok(()),
+    }
+}
+
+fn publish_recovered_events(
+    node_id: &NodeId,
+    incarnation_id: NodeIncarnationId,
+    events: &[NodeEventEnvelope],
+    hub: &OperatorHub,
+) {
+    for envelope in events {
+        hub.publish(RoutedNodeEvent {
+            node_id: node_id.clone(),
+            cursor: NodeCursor { incarnation_id, sequence: envelope.sequence },
+            event: envelope.event.clone(),
+        });
+    }
+}
+
+async fn drain_pending_events(
+    client: &mut NamedPipeNodeClient,
+    node_id: &NodeId,
+    cursor: &mut NodeCursor,
+    hub: &OperatorHub,
+    ingress: &mpsc::Sender<Attempt>,
+    skip_replayed: bool,
+) -> Result<(), NodeClientError> {
+    let mut skip_replayed = skip_replayed;
+    for repair_pass in 0..=1 {
+        let mut gaps = Vec::new();
+        let mut changed = false;
+        let mut repair = false;
+        while let Some(envelope) = client.take_event() {
+            if skip_replayed && envelope.sequence <= cursor.sequence { continue; }
+            let resync_required = matches!(&envelope.event, gate4agent_node_protocol::NodeEvent::ResyncRequired { .. });
+            if resync_required || envelope.sequence != cursor.sequence.saturating_add(1) {
+                gaps.push(if envelope.sequence <= cursor.sequence && !resync_required {
+                    GapKind::CursorRegression
+                } else if resync_required {
+                    GapKind::HistoryEvicted
+                } else {
+                    GapKind::NonContiguousEvents
+                });
+                repair = true;
+                continue;
+            }
+            let event_cursor = NodeCursor { incarnation_id: cursor.incarnation_id, sequence: envelope.sequence };
+            hub.publish(RoutedNodeEvent { node_id: node_id.clone(), cursor: event_cursor, event: envelope.event });
+            cursor.sequence = envelope.sequence;
+            changed = true;
+        }
+        if !repair {
+            if changed || !gaps.is_empty() {
+                ingress_attempt(ingress, node_id, AttemptResult::Cursor { cursor: *cursor, gaps }).await
+                    .map_err(NodeClientError::Io)?;
+            }
+            return Ok(());
+        }
+        if repair_pass == 1 {
+            ingress_attempt(ingress, node_id, AttemptResult::Cursor { cursor: *cursor, gaps }).await
+                .map_err(NodeClientError::Io)?;
+            return Err(NodeClientError::Protocol("node event stream remained noncontiguous after resync".to_owned()));
+        }
+        let after_sequence = cursor.sequence;
+        let response = bounded_node_request(client, NodeRequest::Resync { after_sequence }).await?;
+        let NodeResponse::Resync { event_sequence, snapshot, events } = response else {
+            return Err(NodeClientError::Protocol("event repair resync returned a different response".to_owned()));
+        };
+        let repair_gaps = validate_events(after_sequence, event_sequence, &events);
+        let contiguous = repair_gaps.is_empty();
+        gaps.extend(repair_gaps);
+        if contiguous {
+            for envelope in events.iter().filter(|event| event.sequence > after_sequence) {
+                hub.publish(RoutedNodeEvent {
+                    node_id: node_id.clone(),
+                    cursor: NodeCursor { incarnation_id: cursor.incarnation_id, sequence: envelope.sequence },
+                    event: envelope.event.clone(),
+                });
+            }
+        } else {
+            hub.publish(RoutedNodeEvent {
+                node_id: node_id.clone(),
+                cursor: NodeCursor { incarnation_id: cursor.incarnation_id, sequence: event_sequence },
+                event: gate4agent_node_protocol::NodeEvent::ResyncRequired {
+                    oldest_available_sequence: events.first().map_or(event_sequence, |event| event.sequence),
+                },
+            });
+        }
+        cursor.sequence = event_sequence;
+        ingress_attempt(ingress, node_id, AttemptResult::Success { cursor: *cursor, snapshot, gaps }).await
+            .map_err(NodeClientError::Io)?;
+        skip_replayed = true;
+    }
+    Ok(())
+}
+
+fn reject_disconnected_commands(commands: &mut mpsc::Receiver<RelayCommand>, cursor: Option<NodeCursor>) {
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            RelayCommand::Request { reply, .. } => {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::NodeOffline,
+                    "node relay disconnected before request dispatch",
+                    cursor.map(|value| value.incarnation_id),
+                )));
+            }
+        }
+    }
+}
+
+fn acknowledge_disconnected_releases(releases: &mut mpsc::Receiver<oneshot::Sender<()>>) {
+    while let Ok(reply) = releases.try_recv() { let _ = reply.send(()); }
 }
 
 fn validate_events(previous: u64, current: u64, events: &[NodeEventEnvelope]) -> Vec<GapKind> {
@@ -338,6 +831,19 @@ async fn inventory_owner(
                         node.freshness = NodeFreshness::Fresh;
                         node.cursor = Some(cursor);
                         node.inventory = Some(SlimNodeInventory::from_snapshot(&snapshot));
+                        node.last_success_unix_ms = Some(attempt.at_unix_ms);
+                        node.consecutive_failures = 0;
+                        node.last_error = None;
+                        for kind in gaps {
+                            if node.gaps.len() == MAX_C2_GAPS_PER_NODE { node.gaps.remove(0); node.gaps_truncated += 1; }
+                            node.gaps.push(NodeGap { kind, detected_at_unix_ms: attempt.at_unix_ms, previous, observed: cursor });
+                        }
+                    }
+                    AttemptResult::Cursor { cursor, gaps } => {
+                        let previous = node.cursor;
+                        node.transport = NodeTransportState::Online;
+                        node.freshness = NodeFreshness::Fresh;
+                        node.cursor = Some(cursor);
                         node.last_success_unix_ms = Some(attempt.at_unix_ms);
                         node.consecutive_failures = 0;
                         node.last_error = None;

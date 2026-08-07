@@ -392,6 +392,8 @@ name = "gate4agent-c2-client"
 version = "0.2.37"
 dependencies = [
  "gate4agent-c2-protocol",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

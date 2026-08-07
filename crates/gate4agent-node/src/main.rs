@@ -10,12 +10,21 @@ const NODE_TOKEN_ENV: &str = "GATE4AGENT_NODE_TOKEN";
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut endpoint = DEFAULT_NODE_ENDPOINT.to_owned();
+    let mut api_listen = "127.0.0.1:18310"
+        .parse()
+        .expect("the built-in node API listen address must be valid");
     let mut node_id = None;
     let mut workspaces = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--endpoint" => endpoint = required_value("--endpoint", args.next()),
+            "--api-listen" => {
+                let value = required_value("--api-listen", args.next());
+                api_listen = value
+                    .parse()
+                    .unwrap_or_else(|error| fail(&format!("--api-listen is invalid: {error}")));
+            }
             "--node-id" => {
                 let value = required_value("--node-id", args.next());
                 let parsed = NodeId::new(value)
@@ -37,7 +46,7 @@ async fn main() {
                 );
             }
             "--help" | "-h" => {
-                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--workspace ID=ABSOLUTE_PATH ...] [--endpoint <named-pipe>]");
+                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--workspace ID=ABSOLUTE_PATH ...] [--endpoint <named-pipe>] [--api-listen 127.0.0.1:PORT]");
                 println!("control token: {NODE_TOKEN_ENV} environment variable");
                 return;
             }
@@ -49,6 +58,7 @@ async fn main() {
     std::env::remove_var(NODE_TOKEN_ENV);
     let node_id = node_id.unwrap_or_else(|| fail("--node-id is required"));
     let config = NodeServerConfig::new(endpoint, token, node_id, workspaces)
+        .and_then(|config| config.with_api_listen(api_listen))
         .unwrap_or_else(|error| fail(&error.to_string()));
     let server = NodeServer::new(config).unwrap_or_else(|error| fail(&error.to_string()));
     if let Err(error) = server.run_until_ctrl_signal().await {

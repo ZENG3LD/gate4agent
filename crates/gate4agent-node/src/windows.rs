@@ -44,6 +44,8 @@ use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, Notify, OwnedSemaphorePe
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
+mod http_api;
+
 const NODE_EVENT_HISTORY_MAX: usize = 4_096;
 const NODE_BROADCAST_CAPACITY: usize = 1_024;
 const CONTROL_EVENT_SUBSCRIPTION_CAPACITY: usize = 1_024;
@@ -126,6 +128,7 @@ impl WorkspaceConfig {
 #[derive(Clone, Eq, PartialEq)]
 pub struct NodeServerConfig {
     pub endpoint: String,
+    api_listen: Option<std::net::SocketAddr>,
     pub node_id: NodeId,
     pub workspaces: Vec<WorkspaceConfig>,
     access_token: String,
@@ -176,11 +179,23 @@ impl NodeServerConfig {
         }
         Ok(Self {
             endpoint,
+            api_listen: None,
             node_id,
             workspaces,
             access_token,
             runtime: NativeRuntimeConfig::default(),
         })
+    }
+
+    pub fn with_api_listen(
+        mut self,
+        api_listen: std::net::SocketAddr,
+    ) -> Result<Self, NodeServerError> {
+        if !api_listen.ip().is_loopback() {
+            return Err(NodeServerError::InvalidApiListen(api_listen));
+        }
+        self.api_listen = Some(api_listen);
+        Ok(self)
     }
 }
 
@@ -321,7 +336,9 @@ impl NodeServer {
             .await
             .map_err(|error| NodeServerError::HookIngressStartup(error.to_string()))?;
         let endpoint = config.endpoint.clone();
+        let api_listen = config.api_listen;
         let accept_shared = Arc::clone(&shared);
+        let api_shared = Arc::clone(&shared);
         let shutdown_shared = Arc::clone(&shared);
         let shutdown_timeout = Duration::from_millis(
             config.runtime.provider_shutdown_timeout_ms.max(1),
@@ -334,18 +351,22 @@ impl NodeServer {
                 shutdown_timeout,
             );
             let accept_loop = accept_connections(&endpoint, accept_shared);
+            let api_loop = http_api::run(api_listen, api_shared);
             tokio::pin!(runtime_loop);
             tokio::pin!(accept_loop);
+            tokio::pin!(api_loop);
             tokio::select! {
                 runtime_result = &mut runtime_loop => {
                     let shutdown_result = shutdown_shared
                         .begin_shutdown()
                         .await
                         .map_err(NodeServerError::ShutdownDispatch);
-                    let accept_result = accept_loop.await;
+                    let (accept_result, api_result) = tokio::join!(&mut accept_loop, &mut api_loop);
                     match runtime_result {
                         Err(error) => Err(error),
-                        Ok(()) => shutdown_result.and(accept_result),
+                        Ok(()) => shutdown_result
+                            .and(accept_result)
+                            .and(api_result.map_err(NodeServerError::HttpApi)),
                     }
                 }
                 accept_result = &mut accept_loop => {
@@ -353,10 +374,25 @@ impl NodeServer {
                         .begin_shutdown()
                         .await
                         .map_err(NodeServerError::ShutdownDispatch);
-                    let runtime_result = runtime_loop.await;
+                    let (runtime_result, api_result) = tokio::join!(&mut runtime_loop, &mut api_loop);
                     match accept_result {
                         Err(error) => Err(error),
-                        Ok(()) => shutdown_result.and(runtime_result),
+                        Ok(()) => shutdown_result
+                            .and(runtime_result)
+                            .and(api_result.map_err(NodeServerError::HttpApi)),
+                    }
+                }
+                api_result = &mut api_loop => {
+                    let shutdown_result = shutdown_shared
+                        .begin_shutdown()
+                        .await
+                        .map_err(NodeServerError::ShutdownDispatch);
+                    let (runtime_result, accept_result) = tokio::join!(&mut runtime_loop, &mut accept_loop);
+                    match api_result {
+                        Err(error) => Err(NodeServerError::HttpApi(error)),
+                        Ok(()) => shutdown_result
+                            .and(runtime_result)
+                            .and(accept_result),
                     }
                 }
             }
@@ -438,6 +474,7 @@ struct NodeShared {
     handle: Gate4AgentHandle,
     access_token: String,
     node_id: NodeId,
+    started_at_unix_ms: u64,
     workspaces: RwLock<BTreeMap<WorkspaceId, String>>,
     enabled_providers: Vec<AgentProvider>,
     controller: Mutex<Option<ControllerLease>>,
@@ -495,6 +532,11 @@ impl NodeShared {
             handle,
             access_token,
             node_id,
+            started_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
             workspaces: RwLock::new(
                 workspaces
                     .into_iter()
@@ -2787,6 +2829,8 @@ pub enum NodeServerError {
     InvalidEndpoint,
     #[error("node access token must contain 1..=4096 bytes")]
     InvalidAccessToken,
+    #[error("node HTTP observer must listen on a loopback address: {0}")]
+    InvalidApiListen(std::net::SocketAddr),
     #[error("node requires at least one configured workspace")]
     NoWorkspaces,
     #[error("workspace '{workspace_id}' root '{path}' is invalid: {message}")]
@@ -2809,6 +2853,8 @@ pub enum NodeServerError {
     HookIngressStartup(String),
     #[error("named pipe I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("node HTTP observer failed: {0}")]
+    HttpApi(io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
     #[error("node handshake failed: {0}")]

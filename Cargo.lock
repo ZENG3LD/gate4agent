@@ -420,6 +420,7 @@ dependencies = [
  "gate4agent-runtime-native",
  "gate4agent-testkit",
  "gate4agent-types",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]

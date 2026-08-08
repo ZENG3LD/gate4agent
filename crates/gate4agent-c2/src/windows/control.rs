@@ -14,9 +14,11 @@ use crate::protocol::{
 use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, FrameError,
 };
-use gate4agent_node_wire::{local_hmac_sha256, proofs_match, random_nonce};
+use gate4agent_node_wire::{
+    local_hmac_sha256, proofs_match, random_nonce, LocalServerStream,
+    OwnerOnlyLocalListener,
+};
 use std::sync::atomic::AtomicUsize;
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -43,11 +45,11 @@ pub(super) async fn run(
     hub: OperatorHub,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
+    let mut listener = OwnerOnlyLocalListener::bind(&endpoint)?;
     let preauth = Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS));
     let authenticated = Arc::new(Semaphore::new(1));
     let next_connection_id = Arc::new(AtomicU64::new(1));
     let mut connections = JoinSet::new();
-    let mut first = true;
     loop {
         let permit = tokio::select! {
             permit = Arc::clone(&preauth).acquire_owned() => permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "C2 preauth slots closed"))?,
@@ -56,15 +58,13 @@ pub(super) async fn run(
                 continue;
             }
         };
-        let server = create_pipe(&endpoint, first)?;
-        tokio::select! {
-            connected = server.connect() => connected?,
+        let server = tokio::select! {
+            accepted = listener.accept() => accepted?,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { break; }
                 continue;
             }
-        }
-        first = false;
+        };
         let token = token.clone();
         let authenticated = Arc::clone(&authenticated);
         let connection_ids = Arc::clone(&next_connection_id);
@@ -84,14 +84,8 @@ pub(super) async fn run(
     Ok(())
 }
 
-fn create_pipe(endpoint: &str, first: bool) -> io::Result<NamedPipeServer> {
-    let mut options = ServerOptions::new();
-    options.first_pipe_instance(first);
-    options.create(endpoint)
-}
-
 async fn serve_connection(
-    mut pipe: NamedPipeServer,
+    mut pipe: LocalServerStream,
     preauth_permit: OwnedSemaphorePermit,
     authenticated: Arc<Semaphore>,
     connection_ids: Arc<AtomicU64>,
@@ -396,7 +390,7 @@ fn prune_pre_hello_events(
 }
 
 async fn read_client_frame(
-    pipe: &mut NamedPipeServer,
+    pipe: &mut LocalServerStream,
     limit: usize,
 ) -> Result<C2ClientFrame, FrameError> {
     read_json_frame_limited_body_timeout(pipe, limit, FRAME_BODY_DEADLINE).await

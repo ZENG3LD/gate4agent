@@ -13,6 +13,7 @@ use gate4agent_node_protocol::{
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
+use crate::{connect_local_stream, LocalClientStream};
 #[cfg(test)]
 use gate4agent_node_protocol::{
     ProtocolRange, StateSchemaSupport, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
@@ -25,16 +26,13 @@ use std::time::Duration;
 use thiserror::Error;
 #[cfg(feature = "fixture")]
 use tokio::io::AsyncWriteExt;
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
-const PIPE_CONNECT_RETRIES: usize = 100;
-const PIPE_CONNECT_RETRY_DELAY_MS: u64 = 20;
 const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 
 pub struct NamedPipeNodeClient {
-    pipe: NamedPipeClient,
+    pipe: LocalClientStream,
     hello: NodeHello,
     opaque_unix_paths_enabled: bool,
     repository_paths_enabled: bool,
@@ -50,7 +48,7 @@ impl NamedPipeNodeClient {
         role: ClientRole,
         access_token: &str,
     ) -> Result<Self, NodeClientError> {
-        let mut pipe = connect_pipe(endpoint).await?;
+        let mut pipe = connect_local_stream(endpoint).await?;
         let client_nonce = random_nonce().map_err(NodeClientError::Authentication)?;
         let compatibility_offer = client_compatibility_offer()?;
         write_json_frame_limited(
@@ -674,27 +672,6 @@ fn validate_selected_compatibility(
         }
     }
     Ok(())
-}
-
-async fn connect_pipe(endpoint: &str) -> io::Result<NamedPipeClient> {
-    let mut last_error = None;
-    for _ in 0..PIPE_CONNECT_RETRIES {
-        match ClientOptions::new().open(endpoint) {
-            Ok(client) => return Ok(client),
-            Err(error) => {
-                let retryable = matches!(error.kind(), io::ErrorKind::NotFound)
-                    || error.raw_os_error() == Some(231);
-                if !retryable {
-                    return Err(error);
-                }
-                last_error = Some(error);
-                sleep(Duration::from_millis(PIPE_CONNECT_RETRY_DELAY_MS)).await;
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "named pipe was not available")
-    }))
 }
 
 #[derive(Clone, Copy)]

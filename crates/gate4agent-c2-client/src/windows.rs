@@ -13,18 +13,18 @@ use gate4agent_c2_protocol::{
 use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, FrameError,
 };
-use gate4agent_node_wire::{local_hmac_sha256, proofs_match, random_nonce};
+use gate4agent_node_wire::{
+    connect_local_stream, local_hmac_sha256, proofs_match, random_nonce,
+    LocalClientStream,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
-const CONNECT_RETRIES: usize = 100;
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
 const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(5);
@@ -128,7 +128,7 @@ pub async fn connect_local(
 ) -> Result<(C2ControlHandle, C2EventReceiver), C2ControlError> {
     validate_endpoint(endpoint)?;
     validate_token(token)?;
-    let mut pipe = connect_pipe(endpoint).await?;
+    let mut pipe = connect_local_stream(endpoint).await?;
     let client_nonce = random_nonce().map_err(C2ControlError::Authentication)?;
     let compatibility_offer = client_compatibility_offer()?;
     timeout(AUTH_DEADLINE, write_json_frame_limited(
@@ -509,7 +509,7 @@ fn c2_node_event_has_unix_bytes(event: &C2NodeEvent) -> bool {
 }
 
 async fn read_server_frame(
-    pipe: &mut NamedPipeClient,
+    pipe: &mut LocalClientStream,
     limit: usize,
 ) -> Result<C2ServerFrame, C2ControlError> {
     Ok(read_json_frame_limited_body_timeout(pipe, limit, FRAME_BODY_DEADLINE).await?)
@@ -664,21 +664,6 @@ fn c2_proof(
     };
     local_hmac_sha256(token.as_bytes(), &transcript)
         .map_err(C2ControlError::Authentication)
-}
-
-async fn connect_pipe(endpoint: &str) -> io::Result<NamedPipeClient> {
-    let mut last_error = None;
-    for _ in 0..CONNECT_RETRIES {
-        match ClientOptions::new().open(endpoint) {
-            Ok(pipe) => return Ok(pipe),
-            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound) || error.raw_os_error() == Some(231) => {
-                last_error = Some(error);
-                sleep(CONNECT_RETRY_DELAY).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "C2 control pipe unavailable")))
 }
 
 fn validate_endpoint(endpoint: &str) -> Result<(), C2ControlError> {

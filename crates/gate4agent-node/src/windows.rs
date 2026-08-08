@@ -38,7 +38,7 @@ use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
 use gate4agent_runtime_native::{HookIngressConfig, NativeRuntime, NativeRuntimeConfig};
 use gate4agent_node_wire::{
     auth_proof, negotiated_auth_proof, proofs_match, random_incarnation_id, random_nonce,
-    AuthDirection,
+    AuthDirection, LocalServerStream, OwnerOnlyLocalListener,
 };
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
@@ -53,7 +53,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -3117,7 +3116,7 @@ async fn accept_connections_inner(
     shared: Arc<NodeShared>,
     connections: &mut JoinSet<Result<(), NodeServerError>>,
 ) -> Result<(), NodeServerError> {
-    let mut first = true;
+    let mut listener = OwnerOnlyLocalListener::bind(endpoint)?;
     loop {
         while connections.try_join_next().is_some() {}
         if shared.shutdown.load(Ordering::Acquire) {
@@ -3129,12 +3128,10 @@ async fn accept_connections_inner(
             }
             _ = shared.shutdown_notify.notified() => return Ok(()),
         };
-        let server = create_pipe(endpoint, first)?;
-        tokio::select! {
-            result = server.connect() => result?,
+        let server = tokio::select! {
+            result = listener.accept() => result?,
             _ = shared.shutdown_notify.notified() => return Ok(()),
-        }
-        first = false;
+        };
         let connection_shared = Arc::clone(&shared);
         connections.spawn(async move {
             serve_connection(server, connection_shared, preauth_permit).await
@@ -3145,14 +3142,8 @@ async fn accept_connections_inner(
     }
 }
 
-fn create_pipe(endpoint: &str, first: bool) -> io::Result<NamedPipeServer> {
-    let mut options = ServerOptions::new();
-    options.first_pipe_instance(first);
-    options.create(endpoint)
-}
-
 async fn serve_connection(
-    mut pipe: NamedPipeServer,
+    mut pipe: LocalServerStream,
     shared: Arc<NodeShared>,
     preauth_permit: OwnedSemaphorePermit,
 ) -> Result<(), NodeServerError> {

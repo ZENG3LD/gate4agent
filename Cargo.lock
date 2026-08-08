@@ -485,6 +485,7 @@ dependencies = [
  "gate4agent-node-protocol",
  "thiserror 2.0.18",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

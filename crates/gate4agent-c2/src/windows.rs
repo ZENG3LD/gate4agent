@@ -10,7 +10,7 @@ use gate4agent_node_protocol::{
     ClientRole, FrameError, NegotiatedNodeCompatibility, NodeEventEnvelope, NodeFailureCode,
     NodeResponse, NodeSnapshot,
 };
-use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
+use gate4agent_node_wire::{LocalNodeClient, NodeClientError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
@@ -544,19 +544,19 @@ async fn node_relay_worker(
     }
 }
 
-async fn connect_operator(node: &C2NodeConfig) -> Result<NamedPipeNodeClient, NodeClientError> {
-    NamedPipeNodeClient::connect(&node.endpoint, &node.node_id, ClientRole::Operator, &node.token).await
+async fn connect_operator(node: &C2NodeConfig) -> Result<LocalNodeClient, NodeClientError> {
+    LocalNodeClient::connect(&node.endpoint, &node.node_id, ClientRole::Operator, &node.token).await
 }
 
 async fn bounded_node_request(
-    client: &mut NamedPipeNodeClient,
+    client: &mut LocalNodeClient,
     request: NodeRequest,
 ) -> Result<NodeResponse, NodeClientError> {
     bounded_node_request_with_deadline(client, request, None).await
 }
 
 async fn bounded_node_request_with_deadline(
-    client: &mut NamedPipeNodeClient,
+    client: &mut LocalNodeClient,
     request: NodeRequest,
     relay_deadline: Option<Instant>,
 ) -> Result<NodeResponse, NodeClientError> {
@@ -644,7 +644,7 @@ fn relay_failure_attempt(error: &NodeClientError) -> AttemptResult {
 }
 
 async fn handle_relay_command(
-    client: &mut NamedPipeNodeClient,
+    client: &mut LocalNodeClient,
     command: RelayCommand,
     node_id: &NodeId,
     incarnation_id: NodeIncarnationId,
@@ -744,14 +744,14 @@ fn is_read_only_request(request: &NodeRequest) -> bool {
 }
 
 async fn acquire_controller(
-    client: &mut NamedPipeNodeClient,
+    client: &mut LocalNodeClient,
     connection_id: u64,
 ) -> Result<bool, NodeClientError> {
     acquire_controller_with_deadline(client, connection_id, None).await
 }
 
 async fn acquire_controller_with_deadline(
-    client: &mut NamedPipeNodeClient,
+    client: &mut LocalNodeClient,
     connection_id: u64,
     relay_deadline: Option<Instant>,
 ) -> Result<bool, NodeClientError> {
@@ -766,7 +766,7 @@ async fn acquire_controller_with_deadline(
 }
 
 async fn release_controller(
-    client: &mut NamedPipeNodeClient,
+    client: &mut LocalNodeClient,
     controller_owned: &mut bool,
 ) -> Result<(), NodeClientError> {
     if !*controller_owned { return Ok(()); }
@@ -809,7 +809,7 @@ fn publish_recovered_events(
 }
 
 async fn drain_pending_events(
-    client: &mut NamedPipeNodeClient,
+    client: &mut LocalNodeClient,
     node_id: &NodeId,
     cursor: &mut NodeCursor,
     hub: &OperatorHub,

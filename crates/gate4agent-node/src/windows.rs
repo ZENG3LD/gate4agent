@@ -2,27 +2,26 @@ use crate::git_worktree::{
     create_worktree as create_git_worktree, list_worktrees as list_git_worktrees,
     paths_equal as worktree_paths_equal, remove_worktree as remove_git_worktree,
     removal_lookup_path as normalize_worktree_removal_target, run_git_read_bounded,
-    GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind,
+    GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind, NativeGitWorktreeSnapshot,
 };
 use crate::session_registry::{
     self, validate_display_name, LoadedNodeState, MAX_MANAGED_SESSION_RECORDS,
 };
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
-    AgentProvider, ArchitectureId, CapabilityId, ClientFrame, ClientRole,
-    ControllerState, FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
+    AgentProvider, ArchitectureId, CapabilityId, ClientFrame, ClientRole, ControllerState,
+    FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
     GitWorktreeSnapshot, HostDescriptor, LocalTransportKind, NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
-    NodeRequest, OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
-    NodeResponse, NodeSnapshot, RequestEnvelope,
-    ResponseEnvelope, ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode,
-    ManagedSessionRecord, ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry,
-    WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
-    DEFAULT_CONTROLLER_LEASE_MS, MAX_CONTROLLER_LEASE_MS,
-    MIN_CONTROLLER_LEASE_MS,
-    NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES,
-    MAX_NODE_HELLO_FRAME_BYTES, MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES,
-    MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1,
+    NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath, OperatingSystemId, PathEncoding,
+    PathSemantics, PathStyle, ProtocolRange, RequestEnvelope, ResponseEnvelope, ServerChallenge,
+    ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
+    ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind,
+    WorkspaceId, WorkspaceInspection, WorkspaceSnapshot, DEFAULT_CONTROLLER_LEASE_MS,
+    MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
+    NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
+    MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1,
+    NODE_STATE_SCHEMA_V2,
 };
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
@@ -86,6 +85,41 @@ const DURABLE_STATE_LOCK_FAILED_ERROR: &str = "durable-state-lock-failed";
 const DURABLE_STATE_LOAD_FAILED_ERROR: &str = "durable-state-load-failed";
 const DURABLE_STATE_CONFLICT_ERROR: &str = "durable-state-conflict";
 const DURABLE_STATE_SCHEMA_UNSUPPORTED_ERROR: &str = "durable-state-schema-unsupported";
+const DURABLE_STATE_PATH_SEMANTICS_UNSUPPORTED_ERROR: &str =
+    "durable-state-path-semantics-unsupported";
+
+fn opaque_windows_path(value: String) -> OpaqueHostPath {
+    OpaqueHostPath::utf8(value).expect("validated Windows node path must remain wire-safe")
+}
+
+fn windows_path_text(path: &OpaqueHostPath) -> &str {
+    path.as_utf8()
+        .expect("Windows node only creates UTF-8 opaque host paths")
+}
+
+fn require_windows_path(path: OpaqueHostPath) -> Result<String, NodeFailure> {
+    path.as_utf8()
+        .map(str::to_owned)
+        .ok_or_else(|| failure(
+            NodeFailureCode::InvalidRequest,
+            "Windows node rejects non-UTF-8 host paths",
+        ))
+}
+
+fn protocol_worktree(mut worktree: NativeGitWorktreeSnapshot) -> GitWorktreeSnapshot {
+    GitWorktreeSnapshot {
+        path: opaque_windows_path(worktree.path),
+        head: worktree.head,
+        branch: worktree.branch,
+        is_bare: worktree.is_bare,
+        is_main: worktree.is_main,
+        locked: worktree.locked,
+        lock_reason: worktree.lock_reason,
+        prunable: worktree.prunable,
+        prunable_reason: worktree.prunable_reason,
+        workspace_id: worktree.workspace_id.take(),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceConfig {
@@ -617,7 +651,7 @@ fn merge_durable_state(
             Some(workspace)
                 if workspace
                     .canonical_root
-                    .eq_ignore_ascii_case(&record.canonical_root) => {}
+                    .eq_ignore_ascii_case(windows_path_text(&record.canonical_root)) => {}
             Some(_) => {
                 return Err(NodeServerError::DurableState(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -990,7 +1024,7 @@ impl NodeShared {
             mode,
             state,
             workspace_id: address.workspace_id.clone(),
-            canonical_root,
+            canonical_root: opaque_windows_path(canonical_root),
             provider_session,
             active_session: Some(address.clone()),
             created_at_unix_ms: now,
@@ -1245,7 +1279,7 @@ impl NodeShared {
             )
         })?;
         let working_directory = self.workspace_root(&record.workspace_id)?;
-        if !working_directory.eq_ignore_ascii_case(&record.canonical_root) {
+        if !working_directory.eq_ignore_ascii_case(windows_path_text(&record.canonical_root)) {
             return Err(failure(
                 NodeFailureCode::SessionRecordConflict,
                 "managed session workspace root changed; refusing to resume in another directory",
@@ -1475,7 +1509,9 @@ impl NodeShared {
             for worktree in &mut git.worktrees {
                 worktree.workspace_id = registered
                     .iter()
-                    .find(|(_, root)| worktree_paths_equal(root, &worktree.path))
+                    .find(|(_, root)| {
+                        worktree_paths_equal(root, windows_path_text(&worktree.path))
+                    })
                     .map(|(workspace_id, _)| workspace_id.clone());
             }
         }
@@ -1536,7 +1572,8 @@ impl NodeShared {
                 record.workspace_id == workspace_id
                     && !record
                         .canonical_root
-                        .eq_ignore_ascii_case(workspace.canonical_root())
+                        .as_utf8()
+                        .is_some_and(|root| root.eq_ignore_ascii_case(workspace.canonical_root()))
             }) {
                 return Err(failure(
                     NodeFailureCode::SessionRecordConflict,
@@ -1549,7 +1586,7 @@ impl NodeShared {
         }
         let snapshot = WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
-            canonical_root: workspace.canonical_root().to_owned(),
+            canonical_root: opaque_windows_path(workspace.canonical_root().to_owned()),
             sessions: Vec::new(),
         };
         workspaces.insert(workspace_id.clone(), workspace.canonical_root().to_owned());
@@ -1564,7 +1601,8 @@ impl NodeShared {
                 record.workspace_id == workspace_id
                     && record
                         .canonical_root
-                        .eq_ignore_ascii_case(workspace.canonical_root())
+                        .as_utf8()
+                        .is_some_and(|root| root.eq_ignore_ascii_case(workspace.canonical_root()))
             }) {
                 if record.active_session.is_none() {
                     record.state = detached_record_state(record);
@@ -1732,14 +1770,14 @@ impl NodeShared {
             .await
             .map_err(|error| failure(error.code, &error.message))?;
         worktree.workspace_id = Some(workspace.workspace_id.clone());
-        Ok((worktree, workspace))
+        Ok((protocol_worktree(worktree), workspace))
     }
 
     async fn remove_worktree(
         &self,
         source_workspace_id: WorkspaceId,
         target_root: String,
-    ) -> Result<(String, Option<WorkspaceId>), NodeFailure> {
+    ) -> Result<Option<WorkspaceId>, NodeFailure> {
         validate_workspace_request_root(&target_root)?;
         let source_root = self.workspace_root(&source_workspace_id)?;
         let target_root = normalize_worktree_removal_target(&target_root)
@@ -1787,14 +1825,14 @@ impl NodeShared {
                 ));
             }
         }
-        let removed = remove_git_worktree(&source_root, &target.path)
+        remove_git_worktree(&source_root, &target.path)
             .await
             .map_err(git_worktree_failure)?;
         if let Some(workspace_id) = registered_workspace_id.as_ref() {
             self.unregister_workspace(workspace_id)
                 .map_err(|error| failure(error.code, &error.message))?;
         }
-        Ok((removed.path, registered_workspace_id))
+        Ok(registered_workspace_id)
     }
 
     fn bound_workspace_root(&self, address: &SessionAddress) -> Result<String, NodeFailure> {
@@ -1992,7 +2030,9 @@ impl NodeShared {
                             && record.workspace_id == current_snapshot.workspace_id
                             && record
                                 .canonical_root
-                                .eq_ignore_ascii_case(&current_snapshot.canonical_root)
+                                .as_utf8()
+                                .zip(current_snapshot.canonical_root.as_utf8())
+                                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
                     });
                     if !scope_matches {
                         if let Some(current) = records.records.get_mut(record_id) {
@@ -2230,7 +2270,7 @@ impl NodeShared {
                     workspace_id.clone(),
                     WorkspaceSnapshot {
                         workspace_id: workspace_id.clone(),
-                        canonical_root: canonical_root.clone(),
+                        canonical_root: opaque_windows_path(canonical_root.clone()),
                         sessions: Vec::new(),
                     },
                 )
@@ -3075,7 +3115,7 @@ fn node_compatibility_support() -> Result<NodeCompatibilitySupport, NodeServerEr
         },
         local_transport: LocalTransportKind::WindowsNamedPipe,
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::exact(NODE_STATE_SCHEMA_V1)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: Vec::new(),
@@ -3340,7 +3380,9 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
         ),
     }
     match list_git_worktrees(root).await {
-        Ok(worktrees) => snapshot.worktrees = worktrees,
+        Ok(worktrees) => {
+            snapshot.worktrees = worktrees.into_iter().map(protocol_worktree).collect()
+        }
         Err(error) => append_git_diagnostic(
             &mut snapshot,
             &format!("git worktree list failed: {}", error.message),
@@ -3472,6 +3514,7 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         }
         NodeRequest::RegisterWorkspace { workspace_id, root } => {
             shared.require_controller(connection_id, role)?;
+            let root = require_windows_path(root)?;
             let workspace = shared.register_workspace(workspace_id, root).await?;
             Ok(NodeResponse::WorkspaceRegistered { workspace })
         }
@@ -3488,6 +3531,7 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             base,
         } => {
             shared.require_controller(connection_id, role)?;
+            let target_root = require_windows_path(target_root)?;
             let (worktree, workspace) = shared
                 .create_worktree(
                     source_workspace_id,
@@ -3504,8 +3548,9 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             target_root,
         } => {
             shared.require_controller(connection_id, role)?;
-            let (target_root, workspace_id) = shared
-                .remove_worktree(source_workspace_id, target_root)
+            let native_target_root = require_windows_path(target_root.clone())?;
+            let workspace_id = shared
+                .remove_worktree(source_workspace_id, native_target_root)
                 .await?;
             Ok(NodeResponse::WorktreeRemoved {
                 target_root,
@@ -3848,6 +3893,9 @@ fn durable_state_load_error(error: io::Error) -> NodeServerError {
         Some(session_registry::StateLoadRefusal::UnsupportedSchema) => {
             DURABLE_STATE_SCHEMA_UNSUPPORTED_ERROR
         }
+        Some(session_registry::StateLoadRefusal::PathSemanticsUnsupported) => {
+            DURABLE_STATE_PATH_SEMANTICS_UNSUPPORTED_ERROR
+        }
         Some(session_registry::StateLoadRefusal::NodeIdentityMismatch) => {
             DURABLE_STATE_CONFLICT_ERROR
         }
@@ -4110,6 +4158,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn windows_rejects_unix_bytes_workspace_path_before_filesystem_access() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let primary = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![primary],
+            vec![AgentProvider::Claude],
+        );
+        shared
+            .acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS)
+            .unwrap();
+        let before = shared.snapshot();
+        let error = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::RegisterWorkspace {
+                workspace_id: WorkspaceId::new("foreign").unwrap(),
+                root: OpaqueHostPath::unix_bytes(b"/srv/repo".to_vec()).unwrap(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, NodeFailureCode::InvalidRequest);
+        assert_eq!(error.message, "invalid-request");
+        assert_eq!(shared.snapshot().workspaces, before.workspaces);
+    }
+
+    #[tokio::test]
     async fn dynamic_workspaces_reject_duplicates_busy_and_last_then_publish_ordered_events() {
         let catalog = active_registry().unwrap();
         let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
@@ -4149,7 +4233,7 @@ mod tests {
         let duplicate_root = shared
             .register_workspace(
                 WorkspaceId::new("duplicate-root").unwrap(),
-                secondary.canonical_root.clone(),
+                windows_path_text(&secondary.canonical_root).to_owned(),
             )
             .await
             .unwrap_err();
@@ -4219,7 +4303,7 @@ mod tests {
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: workspace.workspace_id,
-            canonical_root: workspace.canonical_root,
+            canonical_root: opaque_windows_path(workspace.canonical_root),
             provider_session: None,
             active_session: None,
             created_at_unix_ms: 1,
@@ -4259,7 +4343,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::IdentityPending,
                 workspace_id: workspace.workspace_id,
-                canonical_root: workspace.canonical_root,
+                canonical_root: opaque_windows_path(workspace.canonical_root),
                 provider_session: None,
                 active_session: None,
                 created_at_unix_ms: 1,
@@ -4321,7 +4405,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::Dormant,
                 workspace_id: primary.workspace_id,
-                canonical_root: primary.canonical_root,
+                canonical_root: opaque_windows_path(primary.canonical_root),
                 provider_session: Some(identity.clone()),
                 active_session: None,
                 created_at_unix_ms: 1,
@@ -4345,7 +4429,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::IdentityPending,
                 workspace_id: secondary.workspace_id,
-                canonical_root: secondary.canonical_root,
+                canonical_root: opaque_windows_path(secondary.canonical_root),
                 provider_session: None,
                 active_session: Some(address.clone()),
                 created_at_unix_ms: 2,
@@ -4437,7 +4521,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::Dormant,
                 workspace_id: workspace.workspace_id.clone(),
-                canonical_root: workspace.canonical_root.clone(),
+                canonical_root: opaque_windows_path(workspace.canonical_root.clone()),
                 provider_session: Some(persisted_identity.clone()),
                 active_session: None,
                 created_at_unix_ms: 1,
@@ -4461,7 +4545,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::IdentityPending,
                 workspace_id: workspace.workspace_id.clone(),
-                canonical_root: workspace.canonical_root.clone(),
+                canonical_root: opaque_windows_path(workspace.canonical_root.clone()),
                 provider_session: None,
                 active_session: Some(address.clone()),
                 created_at_unix_ms: 2,
@@ -4604,7 +4688,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::Dormant,
                 workspace_id: secondary.workspace_id.clone(),
-                canonical_root: secondary.canonical_root.clone(),
+                canonical_root: opaque_windows_path(secondary.canonical_root.clone()),
                 provider_session: Some(gate4agent_types::ProviderSessionIdentity {
                     key: gate4agent_types::ProviderSessionKey::SessionId,
                     id: "provider-session".to_owned(),
@@ -4619,7 +4703,7 @@ mod tests {
         shared.unregister_workspace(&secondary.workspace_id).unwrap();
         let unavailable = shared.record(&record_id).unwrap();
         assert_eq!(unavailable.state, ManagedSessionState::Unavailable);
-        assert_eq!(unavailable.canonical_root, secondary.canonical_root);
+        assert_eq!(windows_path_text(&unavailable.canonical_root), secondary.canonical_root);
 
         let conflict = shared
             .register_workspace(

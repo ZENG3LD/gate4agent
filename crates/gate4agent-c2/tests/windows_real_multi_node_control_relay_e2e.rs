@@ -3,11 +3,12 @@
 use gate4agent_c2::protocol::{
     C2NodeEvent, C2NodeResponse, C2RelayFailureCode, NodeId, NodeRoute, NodeTransportState,
     PathStyle, C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    C2_OPAQUE_UNIX_PATH_CAPABILITY,
 };
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
     AgentProvider, ClientRole, ManagedSessionState, NodeFailureCode, NodeRequest,
-    NodeResponse, SessionMode, WorkspaceId,
+    NodeResponse, OpaqueHostPath, SessionMode, WorkspaceId,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
 use gate4agent_node_wire::NamedPipeNodeClient;
@@ -174,10 +175,14 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     let compatibility = control.hello().compatibility.as_ref()
         .expect("negotiated C2 compatibility metadata");
     assert_eq!(compatibility.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
-    assert_eq!(compatibility.capabilities.len(), 1);
+    assert_eq!(compatibility.capabilities.len(), 2);
     assert_eq!(
         compatibility.capabilities[0].as_str(),
         C2_COMPATIBILITY_METADATA_CAPABILITY,
+    );
+    assert_eq!(
+        compatibility.capabilities[1].as_str(),
+        C2_OPAQUE_UNIX_PATH_CAPABILITY,
     );
     assert_eq!(compatibility.host.operating_system.as_str(), "windows");
     assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);
@@ -244,7 +249,7 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     let added_id = WorkspaceId::new("relay-added").unwrap();
     let added = control.request(route_a.clone(), NodeRequest::RegisterWorkspace {
         workspace_id: added_id.clone(),
-        root: std::env::temp_dir().to_string_lossy().into_owned(),
+        root: OpaqueHostPath::utf8(std::env::temp_dir().to_string_lossy().into_owned()).unwrap(),
     }).await.unwrap();
     assert!(matches!(added.response, Ok(C2NodeResponse::WorkspaceRegistered { .. })));
     let changed = wait_status(&http, |status| {

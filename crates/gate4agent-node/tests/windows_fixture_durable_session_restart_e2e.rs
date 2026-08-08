@@ -2,8 +2,8 @@
 
 use gate4agent_node::protocol::{
     AgentProvider, ClientRole, ManagedSessionRecord, ManagedSessionState, NodeFailureCode, NodeId,
-    NodeEvent, NodeRequest, NodeResponse, SessionMode, SessionRecordId, WorkspaceId,
-    NODE_STATE_SCHEMA_V1,
+    NodeEvent, NodeRequest, NodeResponse, OpaqueHostPath, SessionMode, SessionRecordId, WorkspaceId,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
@@ -259,7 +259,7 @@ async fn windows_fixture_durable_record_survives_process_restart_and_cold_resume
     first
         .request(NodeRequest::RegisterWorkspace {
             workspace_id: secondary_id.clone(),
-            root: secondary.to_string_lossy().into_owned(),
+            root: OpaqueHostPath::utf8(secondary.to_string_lossy().into_owned()).unwrap(),
         })
         .await
         .unwrap();
@@ -494,7 +494,7 @@ async fn windows_fixture_node_refuses_unknown_newer_state_schema_without_rewrite
     let backup = state.with_file_name(".state-v1.json.bak");
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     let future_state = serde_json::to_vec_pretty(&serde_json::json!({
-        "version": NODE_STATE_SCHEMA_V1 + 1,
+        "version": NODE_STATE_SCHEMA_V2 + 1,
         "node_id": "durable-fixture-node",
         "workspaces": [],
         "session_records": [],
@@ -520,6 +520,49 @@ async fn windows_fixture_node_refuses_unknown_newer_state_schema_without_rewrite
     assert!(diagnostics.contains("durable-state-schema-unsupported"));
     assert!(!diagnostics.contains(&state.to_string_lossy().into_owned()));
     assert_eq!(std::fs::read(&state).unwrap(), future_state);
+    assert_eq!(std::fs::read(&backup).unwrap(), valid_backup);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_node_refuses_v2_unix_bytes_state_without_backup_fallback() {
+    let root = unique_root();
+    let primary = root.0.join("primary");
+    let state = root.0.join("state").join("state-v1.json");
+    let backup = state.with_file_name(".state-v1.json.bak");
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let foreign_state = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": NODE_STATE_SCHEMA_V2,
+        "node_id": "durable-fixture-node",
+        "workspaces": [{
+            "workspace_id": "foreign",
+            "canonical_root": {
+                "kind": "unix-bytes",
+                "bytes": [47, 115, 114, 118, 47, 114, 101, 112, 111],
+            },
+        }],
+        "session_records": [],
+    }))
+    .unwrap();
+    let valid_backup = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": NODE_STATE_SCHEMA_V1,
+        "node_id": "durable-fixture-node",
+        "workspaces": [],
+        "session_records": [],
+    }))
+    .unwrap();
+    std::fs::write(&state, &foreign_state).unwrap();
+    std::fs::write(&backup, &valid_backup).unwrap();
+
+    let child = spawn_fixture_node(
+        &endpoint(),
+        "durable-path-semantics-fixture-token",
+        &primary,
+        &state,
+    );
+    let diagnostics = child.wait_failure().await;
+    assert!(diagnostics.contains("durable-state-path-semantics-unsupported"));
+    assert!(!diagnostics.contains(&state.to_string_lossy().into_owned()));
+    assert_eq!(std::fs::read(&state).unwrap(), foreign_state);
     assert_eq!(std::fs::read(&backup).unwrap(), valid_backup);
 }
 

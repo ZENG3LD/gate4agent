@@ -2,12 +2,13 @@ use gate4agent_node_protocol::{
     encode_node_compatibility_auth_binding, read_json_frame_limited_body_timeout,
     write_json_frame_limited, CapabilityId, ClientAuthentication, ClientCompatibilityOffer,
     ClientFrame, ClientHello, ClientRole, FrameError, NegotiatedNodeCompatibility,
-    NodeEventEnvelope, NodeFailure, NodeHello, NodeId, NodeIncarnationId, NodeRequest,
-    NodeResponse, ProtocolRange, RequestEnvelope, ServerFrame, StateSchemaSupport,
-    NODE_STATE_SCHEMA_V1,
+    NodeEvent, NodeEventEnvelope, NodeFailure, NodeHello, NodeId, NodeIncarnationId, NodeRequest,
+    NodeResponse, NodeSnapshot, ProtocolRange, RequestEnvelope, ServerFrame, StateSchemaSupport,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
-    NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION,
+    NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
+    NODE_PROTOCOL_VERSION,
 };
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -28,6 +29,7 @@ const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 pub struct NamedPipeNodeClient {
     pipe: NamedPipeClient,
     hello: NodeHello,
+    opaque_unix_paths_enabled: bool,
     next_request_id: u64,
     pending_events: VecDeque<NodeEventEnvelope>,
 }
@@ -151,6 +153,10 @@ impl NamedPipeNodeClient {
             ));
         }
         validate_selected_compatibility(&compatibility_offer, hello.compatibility.as_ref())?;
+        let opaque_unix_paths_enabled = selected_supports_opaque_unix_paths(
+            hello.compatibility.as_ref(),
+        );
+        ensure_node_hello_path_capability(&hello, opaque_unix_paths_enabled)?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
                 "node identity mismatch: expected '{}', received '{}'",
@@ -161,6 +167,7 @@ impl NamedPipeNodeClient {
         Ok(Self {
             pipe,
             hello,
+            opaque_unix_paths_enabled,
             next_request_id: 1,
             pending_events: VecDeque::new(),
         })
@@ -171,6 +178,7 @@ impl NamedPipeNodeClient {
     }
 
     pub async fn send(&mut self, request: NodeRequest) -> Result<u64, NodeClientError> {
+        ensure_node_request_path_capability(&request, self.opaque_unix_paths_enabled)?;
         let request_id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
@@ -189,12 +197,14 @@ impl NamedPipeNodeClient {
     }
 
     pub async fn recv(&mut self) -> Result<ServerFrame, NodeClientError> {
-        Ok(read_json_frame_limited_body_timeout(
+        let frame = read_json_frame_limited_body_timeout(
             &mut self.pipe,
             MAX_NODE_FRAME_BYTES,
             Duration::from_millis(FRAME_BODY_TIMEOUT_MS),
         )
-        .await?)
+        .await?;
+        ensure_server_frame_path_capability(&frame, self.opaque_unix_paths_enabled)?;
+        Ok(frame)
     }
 
     pub async fn request(&mut self, request: NodeRequest) -> Result<NodeResponse, NodeClientError> {
@@ -238,20 +248,179 @@ impl NamedPipeNodeClient {
     }
 }
 
+fn selected_supports_opaque_unix_paths(
+    selected: Option<&NegotiatedNodeCompatibility>,
+) -> bool {
+    selected.is_some_and(|compatibility| {
+        compatibility.capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_OPAQUE_UNIX_PATH_CAPABILITY
+        })
+    })
+}
+
+fn ensure_node_hello_path_capability(
+    hello: &NodeHello,
+    opaque_unix_paths_enabled: bool,
+) -> Result<(), NodeClientError> {
+    ensure_opaque_unix_path_capability(
+        node_snapshot_contains_opaque_unix_path(&hello.snapshot),
+        opaque_unix_paths_enabled,
+    )
+}
+
+fn ensure_node_request_path_capability(
+    request: &NodeRequest,
+    opaque_unix_paths_enabled: bool,
+) -> Result<(), NodeClientError> {
+    ensure_opaque_unix_path_capability(
+        node_request_contains_opaque_unix_path(request),
+        opaque_unix_paths_enabled,
+    )
+}
+
+fn ensure_server_frame_path_capability(
+    frame: &ServerFrame,
+    opaque_unix_paths_enabled: bool,
+) -> Result<(), NodeClientError> {
+    ensure_opaque_unix_path_capability(
+        server_frame_contains_opaque_unix_path(frame),
+        opaque_unix_paths_enabled,
+    )
+}
+
+fn ensure_opaque_unix_path_capability(
+    contains_opaque_unix_path: bool,
+    opaque_unix_paths_enabled: bool,
+) -> Result<(), NodeClientError> {
+    if contains_opaque_unix_path && !opaque_unix_paths_enabled {
+        return Err(NodeClientError::Protocol(
+            "node sent or received opaque Unix path bytes without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
+    match request {
+        NodeRequest::RegisterWorkspace { root, .. } => root.as_unix_bytes().is_some(),
+        NodeRequest::CreateWorktree { target_root, .. }
+        | NodeRequest::RemoveWorktree { target_root, .. } => {
+            target_root.as_unix_bytes().is_some()
+        }
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ResumeSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::Prompt { .. }
+        | NodeRequest::Paste { .. }
+        | NodeRequest::Input { .. }
+        | NodeRequest::TerminalBytes { .. }
+        | NodeRequest::TerminalControl { .. }
+        | NodeRequest::Resize { .. }
+        | NodeRequest::Interrupt { .. }
+        | NodeRequest::Stop { .. }
+        | NodeRequest::Remove { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
+fn server_frame_contains_opaque_unix_path(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Hello(hello) => node_snapshot_contains_opaque_unix_path(&hello.snapshot),
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(
+            node_response_contains_opaque_unix_path,
+        ),
+        ServerFrame::Event(event) => node_event_contains_opaque_unix_path(&event.event),
+        ServerFrame::Challenge(_) => false,
+    }
+}
+
+fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => {
+            node_snapshot_contains_opaque_unix_path(snapshot)
+        }
+        NodeResponse::Resync { snapshot, events, .. } => {
+            node_snapshot_contains_opaque_unix_path(snapshot)
+                || events.iter().any(|event| {
+                    node_event_contains_opaque_unix_path(&event.event)
+                })
+        }
+        NodeResponse::WorkspaceInspected { inspection } => inspection.git.worktrees
+            .iter()
+            .any(|worktree| worktree.path.as_unix_bytes().is_some()),
+        NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::SessionRecordResumed { record, .. } => {
+            record.canonical_root.as_unix_bytes().is_some()
+        }
+        NodeResponse::WorkspaceRegistered { workspace } => {
+            workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        NodeResponse::WorktreeCreated { worktree, workspace } => {
+            worktree.path.as_unix_bytes().is_some()
+                || workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        NodeResponse::WorktreeRemoved { target_root, .. } => {
+            target_root.as_unix_bytes().is_some()
+        }
+        NodeResponse::Controller { .. }
+        | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::WorkspaceUnregistered { .. }
+        | NodeResponse::Accepted
+        | NodeResponse::ShuttingDown => false,
+    }
+}
+
+fn node_snapshot_contains_opaque_unix_path(snapshot: &NodeSnapshot) -> bool {
+    snapshot.workspaces.iter().any(|workspace| {
+        workspace.canonical_root.as_unix_bytes().is_some()
+    }) || snapshot.session_records.iter().any(|record| {
+        record.canonical_root.as_unix_bytes().is_some()
+    })
+}
+
+fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
+    match event {
+        NodeEvent::WorkspaceAdded { workspace } => {
+            workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        NodeEvent::SessionRecordUpserted { record } => {
+            record.canonical_root.as_unix_bytes().is_some()
+        }
+        NodeEvent::Control { .. }
+        | NodeEvent::ControllerChanged { .. }
+        | NodeEvent::WorkspaceRemoved { .. }
+        | NodeEvent::SessionRecordRemoved { .. }
+        | NodeEvent::ResyncRequired { .. } => false,
+    }
+}
+
 fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, NodeClientError> {
     Ok(ClientCompatibilityOffer {
         protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION)
             .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
         capabilities: baseline_capabilities()?,
         state_schema: Some(StateSchemaSupport {
-            versions: ProtocolRange::exact(NODE_STATE_SCHEMA_V1)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2)
                 .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
         }),
     })
 }
 
 fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeClientError> {
-    [NODE_COMPATIBILITY_METADATA_CAPABILITY]
+    [
+        NODE_COMPATIBILITY_METADATA_CAPABILITY,
+        NODE_OPAQUE_UNIX_PATH_CAPABILITY,
+    ]
         .into_iter()
         .map(|capability| {
             CapabilityId::new(capability)
@@ -588,8 +757,11 @@ pub enum NodeClientError {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        ArchitectureId, HostDescriptor, LocalTransportKind, NodeCompatibilitySupport,
-        OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+        AgentProvider, ArchitectureId, GitSnapshot, GitWorktreeSnapshot, HostDescriptor,
+        LocalTransportKind, ManagedSessionRecord, ManagedSessionState,
+        NodeCompatibilitySupport, OpaqueHostPath, OperatingSystemId, PathEncoding,
+        PathSemantics, PathStyle, ResponseEnvelope, SessionMode, SessionRecordId,
+        WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     };
 
     fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
@@ -619,6 +791,251 @@ mod tests {
         };
         let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
         (offer, selected)
+    }
+
+    fn unix_path() -> OpaqueHostPath {
+        OpaqueHostPath::unix_bytes(vec![b'/', b's', b'r', b'v', b'/', 0xff]).unwrap()
+    }
+
+    fn utf8_path() -> OpaqueHostPath {
+        OpaqueHostPath::utf8(r"C:\repo".to_owned()).unwrap()
+    }
+
+    fn workspace_with_path(canonical_root: OpaqueHostPath) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            canonical_root,
+            sessions: Vec::new(),
+        }
+    }
+
+    fn session_record_with_path(canonical_root: OpaqueHostPath) -> ManagedSessionRecord {
+        ManagedSessionRecord {
+            record_id: SessionRecordId::new("session-a").unwrap(),
+            display_name: "session a".to_owned(),
+            provider: AgentProvider::Claude,
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            canonical_root,
+            provider_session: None,
+            active_session: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            last_error: None,
+        }
+    }
+
+    fn worktree_with_path(path: OpaqueHostPath) -> GitWorktreeSnapshot {
+        GitWorktreeSnapshot {
+            path,
+            head: "abcdef".to_owned(),
+            branch: Some("main".to_owned()),
+            is_bare: false,
+            is_main: true,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            workspace_id: Some(WorkspaceId::new("workspace-a").unwrap()),
+        }
+    }
+
+    fn empty_snapshot() -> NodeSnapshot {
+        NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+        }
+    }
+
+    fn hello_with_snapshot(snapshot: NodeSnapshot) -> NodeHello {
+        NodeHello {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            incarnation_id: NodeIncarnationId::from_bytes([3; NODE_INCARNATION_ID_BYTES]),
+            connection_id: 7,
+            role: ClientRole::Operator,
+            event_sequence: 0,
+            controller: None,
+            snapshot,
+            compatibility: None,
+        }
+    }
+
+    fn response_frame(response: NodeResponse) -> ServerFrame {
+        ServerFrame::Reply(ResponseEnvelope {
+            request_id: 1,
+            result: Ok(response),
+        })
+    }
+
+    #[test]
+    fn client_offer_accepts_durable_state_schema_v1_through_v2() {
+        let offer = client_compatibility_offer().unwrap();
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
+        ));
+        assert_eq!(
+            offer.state_schema.unwrap().versions,
+            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2).unwrap(),
+        );
+    }
+
+    #[test]
+    fn opaque_unix_path_gate_requires_explicit_authenticated_selection() {
+        let (_, mut selected) = negotiated_fixture();
+        assert!(!selected_supports_opaque_unix_paths(None));
+        assert!(!selected_supports_opaque_unix_paths(Some(&selected)));
+
+        selected.capabilities.push(
+            CapabilityId::new(NODE_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
+        );
+        assert!(selected_supports_opaque_unix_paths(Some(&selected)));
+    }
+
+    #[test]
+    fn malicious_legacy_hello_with_unix_path_is_rejected_before_exposure() {
+        let mut snapshot = empty_snapshot();
+        snapshot.workspaces.push(workspace_with_path(unix_path()));
+        let hello = hello_with_snapshot(snapshot);
+
+        assert!(ensure_node_hello_path_capability(&hello, false).is_err());
+        assert!(ensure_server_frame_path_capability(
+            &ServerFrame::Hello(hello),
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_utf8_hello_and_payloads_remain_accepted() {
+        let mut snapshot = empty_snapshot();
+        snapshot.workspaces.push(workspace_with_path(utf8_path()));
+        let hello = hello_with_snapshot(snapshot);
+
+        assert!(ensure_node_hello_path_capability(&hello, false).is_ok());
+        assert!(ensure_node_request_path_capability(
+            &NodeRequest::RegisterWorkspace {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                root: utf8_path(),
+            },
+            false,
+        )
+        .is_ok());
+        assert!(ensure_server_frame_path_capability(
+            &response_frame(NodeResponse::WorkspaceRegistered {
+                workspace: workspace_with_path(utf8_path()),
+            }),
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn outbound_guard_covers_every_path_bearing_request_variant() {
+        let requests = [
+            NodeRequest::RegisterWorkspace {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                root: unix_path(),
+            },
+            NodeRequest::CreateWorktree {
+                source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+                target_root: unix_path(),
+                branch: "feature/a".to_owned(),
+                base: None,
+            },
+            NodeRequest::RemoveWorktree {
+                source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                target_root: unix_path(),
+            },
+        ];
+
+        for request in requests {
+            assert!(ensure_node_request_path_capability(&request, false).is_err());
+            assert!(ensure_node_request_path_capability(&request, true).is_ok());
+        }
+        assert!(ensure_node_request_path_capability(&NodeRequest::Snapshot, false).is_ok());
+    }
+
+    #[test]
+    fn inbound_guard_covers_path_bearing_response_variants() {
+        let mut snapshot = empty_snapshot();
+        snapshot.workspaces.push(workspace_with_path(unix_path()));
+        let inspection = WorkspaceInspection {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            entries: Vec::new(),
+            tree_truncated: false,
+            git: GitSnapshot {
+                is_repository: true,
+                branch: Some("main".to_owned()),
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                worktrees: vec![worktree_with_path(unix_path())],
+                truncated: false,
+                diagnostic: None,
+            },
+        };
+        let responses = vec![
+            NodeResponse::Snapshot {
+                event_sequence: 1,
+                controller: None,
+                snapshot: snapshot.clone(),
+            },
+            NodeResponse::Resync {
+                event_sequence: 1,
+                snapshot: empty_snapshot(),
+                events: vec![NodeEventEnvelope {
+                    sequence: 1,
+                    event: NodeEvent::WorkspaceAdded {
+                        workspace: workspace_with_path(unix_path()),
+                    },
+                }],
+            },
+            NodeResponse::WorkspaceInspected { inspection },
+            NodeResponse::SessionRecordUpdated {
+                record: session_record_with_path(unix_path()),
+            },
+            NodeResponse::WorkspaceRegistered {
+                workspace: workspace_with_path(unix_path()),
+            },
+            NodeResponse::WorktreeCreated {
+                worktree: worktree_with_path(unix_path()),
+                workspace: workspace_with_path(utf8_path()),
+            },
+            NodeResponse::WorktreeRemoved {
+                target_root: unix_path(),
+                workspace_id: None,
+            },
+        ];
+
+        for response in responses {
+            let frame = response_frame(response);
+            assert!(ensure_server_frame_path_capability(&frame, false).is_err());
+            assert!(ensure_server_frame_path_capability(&frame, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn inbound_guard_covers_path_bearing_event_variants() {
+        let events = [
+            NodeEvent::WorkspaceAdded {
+                workspace: workspace_with_path(unix_path()),
+            },
+            NodeEvent::SessionRecordUpserted {
+                record: session_record_with_path(unix_path()),
+            },
+        ];
+
+        for event in events {
+            let frame = ServerFrame::Event(NodeEventEnvelope {
+                sequence: 1,
+                event,
+            });
+            assert!(ensure_server_frame_path_capability(&frame, false).is_err());
+            assert!(ensure_server_frame_path_capability(&frame, true).is_ok());
+        }
     }
 
     #[test]

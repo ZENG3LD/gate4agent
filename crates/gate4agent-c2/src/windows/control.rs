@@ -6,6 +6,7 @@ use crate::protocol::{
     HostDescriptor, NegotiatedC2ControlCompatibility,
     OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    C2_OPAQUE_UNIX_PATH_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -172,6 +173,11 @@ async fn serve_connection(
         return Ok(());
     }
     let mut last_topology = C2Topology::from_status(&hello_status);
+    let opaque_unix_paths_enabled = compatibility.as_ref().is_some_and(|selected| {
+        selected.capabilities.iter().any(|capability| {
+            capability.as_str() == C2_OPAQUE_UNIX_PATH_CAPABILITY
+        })
+    });
     if timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
         &C2ServerFrame::Hello(C2Hello {
@@ -188,7 +194,13 @@ async fn serve_connection(
     let (reader, writer) = tokio::io::split(pipe);
     let (incoming_tx, mut incoming_rx) = mpsc::channel(MAX_INBOUND_FRAMES);
     let reader_task = tokio::spawn(control_reader(reader, incoming_tx));
-    let writer_task = tokio::spawn(control_writer(writer, outbound_rx, Arc::clone(&budget), disconnect_tx.clone()));
+    let writer_task = tokio::spawn(control_writer(
+        writer,
+        outbound_rx,
+        Arc::clone(&budget),
+        disconnect_tx.clone(),
+        opaque_unix_paths_enabled,
+    ));
     let mut dispatches = JoinSet::new();
     let mut last_request_id = 0_u64;
 
@@ -196,6 +208,11 @@ async fn serve_connection(
         tokio::select! {
             incoming = incoming_rx.recv() => {
                 let Some(Ok(C2ClientFrame::Request(request))) = incoming else { break; };
+                if !opaque_unix_paths_enabled
+                    && node_request_contains_opaque_unix_path(&request.request.request)
+                {
+                    break;
+                }
                 if request.request_id.0 == 0 || request.request_id.0 <= last_request_id {
                     let failure = relay_failure(C2RelayFailureCode::RequestIdReused, "C2 request IDs must be nonzero and strictly increasing", None);
                     if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result: Err(failure) }).await.is_err() { break; }
@@ -359,10 +376,15 @@ async fn control_writer<W>(
     mut frames: mpsc::Receiver<QueuedFrame>,
     budget: Arc<AtomicUsize>,
     disconnect: watch::Sender<bool>,
+    opaque_unix_paths_enabled: bool,
 ) where
     W: tokio::io::AsyncWrite + Unpin,
 {
     while let Some(queued) = frames.recv().await {
+        if !opaque_unix_paths_enabled && server_frame_contains_opaque_unix_path(&queued.frame) {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         let result = timeout(FRAME_BODY_DEADLINE, write_json_frame_limited(
             &mut writer,
             &queued.frame,
@@ -372,6 +394,93 @@ async fn control_writer<W>(
         if !matches!(result, Ok(Ok(()))) { break; }
     }
     let _ = disconnect.send(true);
+}
+
+fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
+    match request {
+        NodeRequest::RegisterWorkspace { root, .. } => root.as_unix_bytes().is_some(),
+        NodeRequest::CreateWorktree { target_root, .. }
+        | NodeRequest::RemoveWorktree { target_root, .. } => target_root.as_unix_bytes().is_some(),
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ResumeSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::Prompt { .. }
+        | NodeRequest::Paste { .. }
+        | NodeRequest::Input { .. }
+        | NodeRequest::TerminalBytes { .. }
+        | NodeRequest::TerminalControl { .. }
+        | NodeRequest::Resize { .. }
+        | NodeRequest::Interrupt { .. }
+        | NodeRequest::Stop { .. }
+        | NodeRequest::Remove { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
+fn server_frame_contains_opaque_unix_path(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(c2_response_contains_opaque_unix_path)
+        }),
+        C2ServerFrame::Event(event) => c2_event_contains_opaque_unix_path(&event.event),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. } => c2_snapshot_contains_opaque_unix_path(snapshot),
+        C2NodeResponse::Resync { snapshot, events, .. } => {
+            c2_snapshot_contains_opaque_unix_path(snapshot)
+                || events.iter().any(|event| c2_event_contains_opaque_unix_path(&event.event))
+        }
+        C2NodeResponse::WorkspaceInspected { inspection } => inspection.git.worktrees
+            .iter()
+            .any(|worktree| worktree.path.as_unix_bytes().is_some()),
+        C2NodeResponse::WorkspaceRegistered { workspace } => {
+            workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        C2NodeResponse::WorktreeCreated { worktree, workspace } => {
+            worktree.path.as_unix_bytes().is_some()
+                || workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        C2NodeResponse::WorktreeRemoved { target_root, .. } => target_root.as_unix_bytes().is_some(),
+        C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SessionRecordUpdated { .. }
+        | C2NodeResponse::SessionRecordResumed { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => false,
+    }
+}
+
+fn c2_snapshot_contains_opaque_unix_path(snapshot: &crate::protocol::C2NodeSnapshot) -> bool {
+    snapshot.workspaces.iter().any(|workspace| workspace.canonical_root.as_unix_bytes().is_some())
+}
+
+fn c2_event_contains_opaque_unix_path(event: &C2NodeEvent) -> bool {
+    match event {
+        C2NodeEvent::WorkspaceAdded { workspace } => workspace.canonical_root.as_unix_bytes().is_some(),
+        C2NodeEvent::Control { .. }
+        | C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::SessionRecordUpserted { .. }
+        | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ResyncRequired { .. } => false,
+    }
 }
 
 fn reserve_budget(budget: &AtomicUsize, bytes: usize) -> bool {
@@ -542,8 +651,12 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
     Ok(C2ControlCompatibilitySupport {
         protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)
             .map_err(|error| authentication_frame_error(error.to_string()))?,
-        capabilities: vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
-            .map_err(|error| authentication_frame_error(error.to_string()))?],
+        capabilities: vec![
+            CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+        ],
         host: HostDescriptor {
             operating_system: OperatingSystemId::new("windows")
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
@@ -560,7 +673,7 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{C2_API_VERSION, NodeFreshness, ObservedNode};
+    use crate::protocol::{C2ClientHello, C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath};
 
     fn status(transport: NodeTransportState, incarnation_id: Option<NodeIncarnationId>) -> StatusResponse {
         let node_id = NodeId::new("node-a").unwrap();
@@ -587,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn c2_control_server_support_is_exact_v2_windows_metadata_only() {
+    fn c2_control_server_selects_authenticated_opaque_unix_path_opt_in() {
         let support = c2_control_compatibility_support().unwrap();
 
         assert_eq!(
@@ -596,12 +709,54 @@ mod tests {
         );
         assert_eq!(
             support.capabilities,
-            vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
+            vec![
+                CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
+            ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
         assert_eq!(support.host.architecture.as_str(), std::env::consts::ARCH);
         assert_eq!(support.path_semantics.style, PathStyle::Windows);
         assert_eq!(support.path_semantics.encoding, PathEncoding::Utf8);
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: support.capabilities.clone(),
+            state_schema: None,
+        };
+        let selected = support.negotiate(&C2ClientHello::negotiating(
+            [7; crate::protocol::C2_AUTH_NONCE_BYTES],
+            offer,
+        )).unwrap();
+        assert_eq!(selected.capabilities, support.capabilities);
+
+        let legacy = support.negotiate(&C2ClientHello::new(
+            [8; crate::protocol::C2_AUTH_NONCE_BYTES],
+        )).unwrap();
+        assert!(legacy.capabilities.is_empty());
+    }
+
+    #[test]
+    fn legacy_control_path_gate_rejects_tagged_requests_and_responses() {
+        let path = OpaqueHostPath::unix_bytes(vec![b'/', 0xff]).unwrap();
+        let request = NodeRequest::RegisterWorkspace {
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("opaque").unwrap(),
+            root: path.clone(),
+        };
+        assert!(node_request_contains_opaque_unix_path(&request));
+
+        let frame = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(1),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                response: Ok(C2NodeResponse::WorktreeRemoved {
+                    target_root: path,
+                    workspace_id: None,
+                }),
+            }),
+        });
+        assert!(server_frame_contains_opaque_unix_path(&frame));
     }
 
     #[test]

@@ -4,9 +4,10 @@ use gate4agent_types::{
     AgentInstanceId, ControlEvent, ProviderSessionIdentity, SessionGeneration, SessionSnapshot,
     TerminalControl, TerminalSize,
 };
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::io;
 use std::str::FromStr;
@@ -16,7 +17,9 @@ use tokio::time::{timeout, Duration};
 
 pub const NODE_PROTOCOL_VERSION: u16 = 8;
 pub const NODE_STATE_SCHEMA_V1: u16 = 1;
+pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
+pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_PROVIDER_CONTRACT_REVISION_BYTES: usize = 128;
@@ -520,6 +523,205 @@ pub enum PathStyle {
 #[serde(rename_all = "kebab-case")]
 pub enum PathEncoding {
     Utf8,
+    UnixBytes,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct OpaqueHostPath(OpaqueHostPathRepr);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum OpaqueHostPathRepr {
+    Utf8(String),
+    UnixBytes(Vec<u8>),
+}
+
+impl OpaqueHostPath {
+    pub fn utf8(value: String) -> Result<Self, OpaqueHostPathError> {
+        validate_opaque_host_path(&value.as_bytes())?;
+        Ok(Self(OpaqueHostPathRepr::Utf8(value)))
+    }
+
+    pub fn unix_bytes(value: Vec<u8>) -> Result<Self, OpaqueHostPathError> {
+        validate_opaque_host_path(&value)?;
+        Ok(Self(OpaqueHostPathRepr::UnixBytes(value)))
+    }
+
+    pub fn byte_len(&self) -> usize {
+        match &self.0 {
+            OpaqueHostPathRepr::Utf8(value) => value.len(),
+            OpaqueHostPathRepr::UnixBytes(value) => value.len(),
+        }
+    }
+
+    pub fn display_text(&self) -> Cow<'_, str> {
+        match &self.0 {
+            OpaqueHostPathRepr::Utf8(value) => Cow::Borrowed(value),
+            OpaqueHostPathRepr::UnixBytes(value) => String::from_utf8_lossy(value),
+        }
+    }
+
+    pub fn as_utf8(&self) -> Option<&str> {
+        match &self.0 {
+            OpaqueHostPathRepr::Utf8(value) => Some(value),
+            OpaqueHostPathRepr::UnixBytes(_) => None,
+        }
+    }
+
+    pub fn as_unix_bytes(&self) -> Option<&[u8]> {
+        match &self.0 {
+            OpaqueHostPathRepr::Utf8(_) => None,
+            OpaqueHostPathRepr::UnixBytes(value) => Some(value),
+        }
+    }
+}
+
+fn validate_opaque_host_path(value: &[u8]) -> Result<(), OpaqueHostPathError> {
+    if value.is_empty() {
+        return Err(OpaqueHostPathError::Empty);
+    }
+    if value.len() > MAX_WORKSPACE_ROOT_BYTES {
+        return Err(OpaqueHostPathError::TooLong {
+            len: value.len(),
+            max: MAX_WORKSPACE_ROOT_BYTES,
+        });
+    }
+    if value.contains(&0) {
+        return Err(OpaqueHostPathError::ContainsNul);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum OpaqueHostPathError {
+    #[error("host path cannot be empty")]
+    Empty,
+    #[error("host path length {len} exceeds the {max}-byte limit")]
+    TooLong { len: usize, max: usize },
+    #[error("host path cannot contain a NUL byte")]
+    ContainsNul,
+}
+
+impl Serialize for OpaqueHostPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match &self.0 {
+            OpaqueHostPathRepr::Utf8(value) => serializer.serialize_str(value),
+            OpaqueHostPathRepr::UnixBytes(value) => {
+                let mut state = serializer.serialize_struct("OpaqueHostPath", 2)?;
+                state.serialize_field("kind", "unix-bytes")?;
+                state.serialize_field("bytes", value)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OpaqueHostPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(OpaqueHostPathVisitor)
+    }
+}
+
+struct OpaqueHostPathVisitor;
+
+impl<'de> Visitor<'de> for OpaqueHostPathVisitor {
+    type Value = OpaqueHostPath;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded UTF-8 path string or strict unix-bytes path object")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        OpaqueHostPath::utf8(value.to_owned()).map_err(E::custom)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        OpaqueHostPath::utf8(value).map_err(E::custom)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut kind = None;
+        let mut bytes = None;
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "kind" => {
+                    if kind.is_some() {
+                        return Err(serde::de::Error::duplicate_field("kind"));
+                    }
+                    kind = Some(map.next_value::<String>()?);
+                }
+                "bytes" => {
+                    if bytes.is_some() {
+                        return Err(serde::de::Error::duplicate_field("bytes"));
+                    }
+                    bytes = Some(map.next_value::<BoundedOpaquePathBytes>()?.0);
+                }
+                _ => {
+                    return Err(serde::de::Error::unknown_field(&field, &["kind", "bytes"]));
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+        if kind != "unix-bytes" {
+            return Err(serde::de::Error::unknown_variant(&kind, &["unix-bytes"]));
+        }
+        let bytes = bytes.ok_or_else(|| serde::de::Error::missing_field("bytes"))?;
+        OpaqueHostPath::unix_bytes(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+struct BoundedOpaquePathBytes(Vec<u8>);
+
+impl<'de> Deserialize<'de> for BoundedOpaquePathBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedOpaquePathBytesVisitor)
+    }
+}
+
+struct BoundedOpaquePathBytesVisitor;
+
+impl<'de> Visitor<'de> for BoundedOpaquePathBytesVisitor {
+    type Value = BoundedOpaquePathBytes;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at most {MAX_WORKSPACE_ROOT_BYTES} path bytes")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut bytes = Vec::with_capacity(
+            sequence.size_hint().unwrap_or(0).min(MAX_WORKSPACE_ROOT_BYTES),
+        );
+        while let Some(byte) = sequence.next_element::<u8>()? {
+            if bytes.len() == MAX_WORKSPACE_ROOT_BYTES {
+                return Err(serde::de::Error::invalid_length(
+                    bytes.len() + 1,
+                    &self,
+                ));
+            }
+            bytes.push(byte);
+        }
+        Ok(BoundedOpaquePathBytes(bytes))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -696,7 +898,7 @@ pub struct ManagedSessionRecord {
     pub mode: SessionMode,
     pub state: ManagedSessionState,
     pub workspace_id: WorkspaceId,
-    pub canonical_root: String,
+    pub canonical_root: OpaqueHostPath,
     pub provider_session: Option<ProviderSessionIdentity>,
     pub active_session: Option<SessionAddress>,
     pub created_at_unix_ms: u64,
@@ -707,7 +909,7 @@ pub struct ManagedSessionRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceSnapshot {
     pub workspace_id: WorkspaceId,
-    pub canonical_root: String,
+    pub canonical_root: OpaqueHostPath,
     pub sessions: Vec<SessionSnapshot>,
 }
 
@@ -739,7 +941,7 @@ pub struct GitCommitSummary {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitWorktreeSnapshot {
-    pub path: String,
+    pub path: OpaqueHostPath,
     pub head: String,
     pub branch: Option<String>,
     pub is_bare: bool,
@@ -868,7 +1070,7 @@ pub enum NodeRequest {
     ReleaseController,
     RegisterWorkspace {
         workspace_id: WorkspaceId,
-        root: String,
+        root: OpaqueHostPath,
     },
     UnregisterWorkspace {
         workspace_id: WorkspaceId,
@@ -876,13 +1078,13 @@ pub enum NodeRequest {
     CreateWorktree {
         source_workspace_id: WorkspaceId,
         workspace_id: WorkspaceId,
-        target_root: String,
+        target_root: OpaqueHostPath,
         branch: String,
         base: Option<String>,
     },
     RemoveWorktree {
         source_workspace_id: WorkspaceId,
-        target_root: String,
+        target_root: OpaqueHostPath,
     },
     Spawn {
         workspace_id: WorkspaceId,
@@ -969,7 +1171,7 @@ pub enum NodeResponse {
         workspace: WorkspaceSnapshot,
     },
     WorktreeRemoved {
-        target_root: String,
+        target_root: OpaqueHostPath,
         workspace_id: Option<WorkspaceId>,
     },
     Accepted,
@@ -1150,6 +1352,10 @@ pub enum FrameError {
 mod tests {
     use super::*;
 
+    fn host_path(value: &str) -> OpaqueHostPath {
+        OpaqueHostPath::utf8(value.to_owned()).unwrap()
+    }
+
     fn portable_node_support() -> NodeCompatibilitySupport {
         NodeCompatibilitySupport {
             protocol_versions: ProtocolRange::new(7, 9).unwrap(),
@@ -1313,6 +1519,50 @@ mod tests {
         let json = serde_json::to_string(&foreign).unwrap();
         assert!(json.contains(r#""raw":"C:\\Users\\operator\\repo\\src\\lib.rs""#));
         assert_eq!(serde_json::from_str::<ForeignPath>(&json).unwrap(), foreign);
+    }
+
+    #[test]
+    fn opaque_host_path_utf8_preserves_legacy_json_string_shape() {
+        let path = host_path(r"C:\Users\operator\repo");
+        assert_eq!(path.byte_len(), 22);
+        assert_eq!(path.as_utf8(), Some(r"C:\Users\operator\repo"));
+        assert_eq!(path.as_unix_bytes(), None);
+        assert_eq!(path.display_text(), r"C:\Users\operator\repo");
+
+        let json = serde_json::to_string(&path).unwrap();
+        assert_eq!(json, r#""C:\\Users\\operator\\repo""#);
+        assert_eq!(serde_json::from_str::<OpaqueHostPath>(&json).unwrap(), path);
+    }
+
+    #[test]
+    fn opaque_host_path_unix_bytes_has_strict_bounded_tagged_wire_shape() {
+        let raw = vec![b'/', b'r', b'e', b'p', b'o', b'/', 0xff];
+        let path = OpaqueHostPath::unix_bytes(raw.clone()).unwrap();
+        assert_eq!(path.byte_len(), raw.len());
+        assert_eq!(path.as_utf8(), None);
+        assert_eq!(path.as_unix_bytes(), Some(raw.as_slice()));
+
+        let json = serde_json::to_string(&path).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"unix-bytes","bytes":[47,114,101,112,111,47,255]}"#,
+        );
+        assert_eq!(serde_json::from_str::<OpaqueHostPath>(&json).unwrap(), path);
+
+        for invalid in [
+            r#"{"kind":"future","bytes":[47]}"#,
+            r#"{"kind":"unix-bytes","bytes":[47],"extra":true}"#,
+            r#"{"kind":"unix-bytes"}"#,
+            r#"{"bytes":[47]}"#,
+            r#"{"kind":"unix-bytes","bytes":[]}"#,
+            r#"{"kind":"unix-bytes","bytes":[47,0]}"#,
+        ] {
+            assert!(serde_json::from_str::<OpaqueHostPath>(invalid).is_err(), "{invalid}");
+        }
+        assert!(OpaqueHostPath::utf8(String::new()).is_err());
+        assert!(OpaqueHostPath::utf8("a\0b".to_owned()).is_err());
+        assert!(OpaqueHostPath::utf8("x".repeat(MAX_WORKSPACE_ROOT_BYTES + 1)).is_err());
+        assert!(OpaqueHostPath::unix_bytes(vec![b'x'; MAX_WORKSPACE_ROOT_BYTES + 1]).is_err());
     }
 
     #[tokio::test]
@@ -1484,7 +1734,7 @@ mod tests {
 
         let register = NodeRequest::RegisterWorkspace {
             workspace_id: WorkspaceId::new("repo-2").unwrap(),
-            root: r"C:\repo-2".to_owned(),
+            root: host_path(r"C:\repo-2"),
         };
         let register_json = serde_json::to_string(&register).unwrap();
         assert_eq!(
@@ -1506,7 +1756,7 @@ mod tests {
         let create = NodeRequest::CreateWorktree {
             source_workspace_id: WorkspaceId::new("primary").unwrap(),
             workspace_id: WorkspaceId::new("topic-one").unwrap(),
-            target_root: r"C:\trees\topic-one".to_owned(),
+            target_root: host_path(r"C:\trees\topic-one"),
             branch: "codex/topic-one".to_owned(),
             base: Some("main".to_owned()),
         };
@@ -1519,7 +1769,7 @@ mod tests {
 
         let remove = NodeRequest::RemoveWorktree {
             source_workspace_id: WorkspaceId::new("primary").unwrap(),
-            target_root: r"C:\trees\topic-one".to_owned(),
+            target_root: host_path(r"C:\trees\topic-one"),
         };
         let remove_json = serde_json::to_string(&remove).unwrap();
         assert_eq!(
@@ -1616,7 +1866,7 @@ mod tests {
     fn workspace_responses_and_events_round_trip_without_client_only_state() {
         let workspace = WorkspaceSnapshot {
             workspace_id: WorkspaceId::new("repo-2").unwrap(),
-            canonical_root: r"C:\repo-2".to_owned(),
+            canonical_root: host_path(r"C:\repo-2"),
             sessions: Vec::new(),
         };
         let registered = NodeResponse::WorkspaceRegistered {
@@ -1652,7 +1902,7 @@ mod tests {
 
         let created = NodeResponse::WorktreeCreated {
             worktree: GitWorktreeSnapshot {
-                path: r"C:\trees\topic-one".to_owned(),
+                path: host_path(r"C:\trees\topic-one"),
                 head: "abc1234".to_owned(),
                 branch: Some("codex/topic-one".to_owned()),
                 is_bare: false,
@@ -1668,7 +1918,7 @@ mod tests {
         let created_json = serde_json::to_string(&created).unwrap();
         assert_eq!(serde_json::from_str::<NodeResponse>(&created_json).unwrap(), created);
         let removed = NodeResponse::WorktreeRemoved {
-            target_root: r"C:\trees\topic-one".to_owned(),
+            target_root: host_path(r"C:\trees\topic-one"),
             workspace_id: Some(workspace.workspace_id),
         };
         let removed_json = serde_json::to_string(&removed).unwrap();
@@ -1715,7 +1965,7 @@ mod tests {
                         summary: "bounded summary".to_owned(),
                     }],
                     worktrees: vec![GitWorktreeSnapshot {
-                        path: r"C:\repo".to_owned(),
+                        path: host_path(r"C:\repo"),
                         head: "abc1234".to_owned(),
                         branch: Some("main".to_owned()),
                         is_bare: false,
@@ -1783,7 +2033,7 @@ mod tests {
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            canonical_root: r"C:\repo".to_owned(),
+            canonical_root: host_path(r"C:\repo"),
             provider_session: Some(ProviderSessionIdentity {
                 key: gate4agent_types::ProviderSessionKey::SessionId,
                 id: "b1ef3250-47a2-42ca-9076-cc241487ea22".to_owned(),

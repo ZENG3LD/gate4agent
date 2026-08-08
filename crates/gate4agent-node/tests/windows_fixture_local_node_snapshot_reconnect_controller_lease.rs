@@ -3,8 +3,8 @@
 use gate4agent_node::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, AgentProvider,
     ClientAuthentication, ClientFrame, ClientHello, ClientRole, FrameError, LocalTransportKind,
-    NodeEvent, NodeFailureCode, NodeId, NodeRequest, NodeResponse, NodeSnapshot, PathEncoding,
-    PathStyle, ServerFrame, SessionAddress, SessionMode, WorkspaceId,
+    NodeEvent, NodeFailureCode, NodeId, NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath,
+    PathEncoding, PathStyle, ServerFrame, SessionAddress, SessionMode, WorkspaceId,
     MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES, MAX_NODE_TEXT_BYTES,
     NODE_PROTOCOL_VERSION,
 };
@@ -33,6 +33,10 @@ fn endpoint() -> String {
         r"\\.\pipe\gate4agent-node-e2e-{}-{nonce}-{sequence}",
         std::process::id()
     )
+}
+
+fn host_path(value: impl Into<String>) -> OpaqueHostPath {
+    OpaqueHostPath::utf8(value.into()).unwrap()
 }
 
 fn expected_node_id() -> NodeId {
@@ -204,7 +208,7 @@ async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility
     assert_eq!(compatibility.path_semantics.style, PathStyle::Windows);
     assert_eq!(compatibility.path_semantics.encoding, PathEncoding::Utf8);
     assert_eq!(compatibility.local_transport, LocalTransportKind::WindowsNamedPipe);
-    assert_eq!(compatibility.state_schema_version, Some(1));
+    assert_eq!(compatibility.state_schema_version, Some(2));
     assert!(compatibility.provider_contracts.is_empty());
 
     drop(client);
@@ -1040,6 +1044,53 @@ async fn windows_fixture_malformed_authenticated_connection_releases_controller(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_rejects_unix_bytes_workspace_path_before_filesystem_access() {
+    let endpoint = endpoint();
+    let token = "fixture-unix-bytes-path-token";
+    let server = NodeServer::new_fixture(server_config(&endpoint, token)).unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut operator = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Operator,
+        token,
+    )
+    .await
+    .unwrap();
+    operator
+        .request(NodeRequest::AcquireController { lease_ms: 5_000 })
+        .await
+        .unwrap();
+    let before = operator.hello().snapshot.workspaces.clone();
+
+    let error = operator
+        .request(NodeRequest::RegisterWorkspace {
+            workspace_id: WorkspaceId::new("foreign").unwrap(),
+            root: OpaqueHostPath::unix_bytes(b"/srv/repo".to_vec()).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        NodeClientError::Node(ref failure) if failure.code == NodeFailureCode::InvalidRequest
+    ));
+    let NodeResponse::Snapshot { snapshot, .. } = operator
+        .request(NodeRequest::Snapshot)
+        .await
+        .unwrap()
+    else {
+        panic!("snapshot request returned another response");
+    };
+    assert_eq!(snapshot.workspaces, before);
+    assert_eq!(
+        operator.request(NodeRequest::Shutdown).await.unwrap(),
+        NodeResponse::ShuttingDown,
+    );
+    drop(operator);
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn windows_fixture_dynamic_workspaces_are_authoritative_and_evented() {
     let endpoint = endpoint();
     let token = "fixture-dynamic-workspace-token";
@@ -1063,7 +1114,7 @@ async fn windows_fixture_dynamic_workspaces_are_authoritative_and_evented() {
     let NodeResponse::WorkspaceRegistered { workspace } = operator
         .request(NodeRequest::RegisterWorkspace {
             workspace_id: workspace_id.clone(),
-            root: root.clone(),
+            root: host_path(root.clone()),
         })
         .await
         .unwrap()
@@ -1073,7 +1124,7 @@ async fn windows_fixture_dynamic_workspaces_are_authoritative_and_evented() {
     assert_eq!(workspace.workspace_id, workspace_id);
     assert!(workspace.sessions.is_empty());
     let expected_workspace = WorkspaceConfig::new(workspace_id.clone(), &root).unwrap();
-    assert_eq!(workspace.canonical_root, expected_workspace.canonical_root());
+    assert_eq!(workspace.canonical_root.as_utf8(), Some(expected_workspace.canonical_root()));
 
     let NodeResponse::Snapshot { snapshot, .. } = operator
         .request(NodeRequest::Snapshot)
@@ -1094,7 +1145,7 @@ async fn windows_fixture_dynamic_workspaces_are_authoritative_and_evented() {
     let duplicate_id = operator
         .request(NodeRequest::RegisterWorkspace {
             workspace_id: workspace_id.clone(),
-            root: std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+            root: host_path(std::env::current_dir().unwrap().to_string_lossy().into_owned()),
         })
         .await
         .unwrap_err();
@@ -1106,7 +1157,7 @@ async fn windows_fixture_dynamic_workspaces_are_authoritative_and_evented() {
     let duplicate_root = operator
         .request(NodeRequest::RegisterWorkspace {
             workspace_id: WorkspaceId::new("dynamic-copy").unwrap(),
-            root,
+            root: host_path(root),
         })
         .await
         .unwrap_err();
@@ -1230,7 +1281,7 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
         .request(NodeRequest::CreateWorktree {
             source_workspace_id: WorkspaceId::new("primary").unwrap(),
             workspace_id: WorkspaceId::new("topic-one").unwrap(),
-            target_root: target_root.clone(),
+            target_root: host_path(target_root.clone()),
             branch: "codex/topic-one".to_owned(),
             base: Some("HEAD".to_owned()),
         })
@@ -1250,7 +1301,7 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
         .request(NodeRequest::CreateWorktree {
             source_workspace_id: WorkspaceId::new("primary").unwrap(),
             workspace_id: WorkspaceId::new("topic-one").unwrap(),
-            target_root: target_root.clone(),
+            target_root: host_path(target_root.clone()),
             branch: "codex/topic-one".to_owned(),
             base: Some("HEAD".to_owned()),
         })
@@ -1260,8 +1311,8 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
         panic!("worktree create returned another response");
     };
     assert_eq!(
-        std::fs::canonicalize(&worktree.path).unwrap(),
-        std::fs::canonicalize(&workspace.canonical_root).unwrap(),
+        std::fs::canonicalize(worktree.path.as_utf8().unwrap()).unwrap(),
+        std::fs::canonicalize(workspace.canonical_root.as_utf8().unwrap()).unwrap(),
     );
     assert_eq!(worktree.branch.as_deref(), Some("codex/topic-one"));
     assert_eq!(worktree.workspace_id.as_ref(), Some(&workspace.workspace_id));
@@ -1298,7 +1349,7 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
     let busy = operator
         .request(NodeRequest::RemoveWorktree {
             source_workspace_id: WorkspaceId::new("primary").unwrap(),
-            target_root: target_root.clone(),
+            target_root: host_path(target_root.clone()),
         })
         .await
         .unwrap_err();
@@ -1348,7 +1399,7 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
     let dirty = operator
         .request(NodeRequest::RemoveWorktree {
             source_workspace_id: WorkspaceId::new("primary").unwrap(),
-            target_root: target_root.clone(),
+            target_root: host_path(target_root.clone()),
         })
         .await
         .unwrap_err();
@@ -1359,20 +1410,23 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
     assert!(target.is_dir());
     std::fs::remove_file(target.join("dirty.txt")).unwrap();
 
+    let removal_token = target_root.to_ascii_uppercase();
+    assert_ne!(removal_token, target_root);
     let NodeResponse::WorktreeRemoved {
         target_root: removed_root,
         workspace_id,
     } = operator
         .request(NodeRequest::RemoveWorktree {
             source_workspace_id: WorkspaceId::new("primary").unwrap(),
-            target_root: target_root.clone(),
+            target_root: host_path(removal_token.clone()),
         })
         .await
         .unwrap()
     else {
         panic!("worktree remove returned another response");
     };
-    assert_eq!(removed_root, worktree.path);
+    assert_eq!(removed_root, host_path(removal_token));
+    assert_ne!(removed_root, worktree.path);
     assert_eq!(workspace_id.as_ref(), Some(&workspace.workspace_id));
     assert!(!target.exists());
     assert_git_success(

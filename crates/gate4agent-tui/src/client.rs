@@ -36,7 +36,7 @@ use tokio::time::sleep;
 use uzor_tui::{Backend, CrosstermBackend, Screen};
 
 use crate::app::{
-    App, AppAction, ConnectionState, NodeView, Provider, ProviderInventory, PtyColorMode,
+    host_path_display, App, AppAction, ConnectionState, NodeView, Provider, ProviderInventory, PtyColorMode,
     ManagedSessionView, SessionAddress, SessionView, UiKey, WorkspaceView,
 };
 use crate::diagnostics::RuntimeDiagnostic;
@@ -1211,14 +1211,14 @@ async fn publish_c2_response(
             .await;
             send_update(
                 updates,
-                WorkerUpdate::Notice(format!("{node_id}: worktree {} created", worktree.path)),
+                WorkerUpdate::Notice(format!("{node_id}: worktree {} created", host_path_display(&worktree.path))),
             )
             .await;
         }
         C2NodeResponse::WorktreeRemoved { target_root, .. } => {
             send_update(
                 updates,
-                WorkerUpdate::Notice(format!("{node_id}: worktree {target_root} removed")),
+                WorkerUpdate::Notice(format!("{node_id}: worktree {} removed", host_path_display(&target_root))),
             )
             .await;
         }
@@ -1955,7 +1955,7 @@ fn project_worktree_response(
         NodeResponse::WorktreeCreated { worktree, workspace } => Some(WorktreeResponseProjection {
             selected_workspace_id: Some(workspace.workspace_id.to_string()),
             refresh_workspace_id: Some(workspace.workspace_id.clone()),
-            notice: format!("{node_id}: worktree {} created", worktree.path),
+            notice: format!("{node_id}: worktree {} created", host_path_display(&worktree.path)),
         }),
         NodeResponse::WorktreeRemoved { target_root, workspace_id } => Some(WorktreeResponseProjection {
             selected_workspace_id: None,
@@ -1964,7 +1964,7 @@ fn project_worktree_response(
                 .cloned(),
             notice: format!(
                 "{node_id}: worktree {} removed{}",
-                target_root,
+                host_path_display(target_root),
                 workspace_id
                     .as_ref()
                     .map(|workspace_id| format!(" ({workspace_id})"))
@@ -2198,7 +2198,7 @@ fn project_c2_node(
         .into_iter()
         .map(|workspace| {
             let workspace_id = workspace.workspace_id.to_string();
-            let label = workspace_label(&workspace.canonical_root, &workspace_id);
+            let label = workspace_id.clone();
             let sessions = workspace
                 .sessions
                 .into_iter()
@@ -2251,7 +2251,7 @@ fn project_node(
         .into_iter()
         .map(|workspace| {
             let workspace_id = workspace.workspace_id.to_string();
-            let label = workspace_label(&workspace.canonical_root, &workspace_id);
+            let label = workspace_id.clone();
             let sessions = workspace
                 .sessions
                 .into_iter()
@@ -2291,7 +2291,7 @@ fn project_managed_session(node_id: &str, record: ManagedSessionRecord) -> Manag
         mode: record.mode,
         state: record.state,
         workspace_id: record.workspace_id.to_string(),
-        canonical_root: record.canonical_root,
+        canonical_root: Some(record.canonical_root),
         has_provider_session_identity: record.provider_session.is_some(),
         active_session: record.active_session.map(|address| SessionAddress {
             node_id: node_id.to_owned(),
@@ -2315,7 +2315,7 @@ fn project_c2_managed_session(
         mode: record.mode,
         state: record.state,
         workspace_id: record.workspace_id.to_string(),
-        canonical_root: String::new(),
+        canonical_root: None,
         has_provider_session_identity: record.provider_identity_present,
         active_session: record.active_session.map(|address| SessionAddress {
             node_id: node_id.to_owned(),
@@ -2770,22 +2770,18 @@ fn c2_status_label(status: &C2SessionStatus) -> String {
     }
 }
 
-fn workspace_label(root: &str, fallback: &str) -> String {
-    root.trim_end_matches(['\\', '/'])
-        .rsplit(['\\', '/'])
-        .next()
-        .filter(|label| !label.is_empty())
-        .unwrap_or(fallback)
-        .to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_node_protocol::OpaqueHostPath;
     use crate::app::{
         DragState, GridPane, GridPaneLayout, HitRegion, HitTarget, PtyColorMode, SessionTab,
         SurfaceMode,
     };
+
+    fn host_path(value: impl Into<String>) -> OpaqueHostPath {
+        OpaqueHostPath::utf8(value.into()).unwrap()
+    }
 
     fn cursor_app() -> App {
         let address = SessionAddress {
@@ -2805,7 +2801,7 @@ mod tests {
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
-                canonical_root: r"C:\work\nemo".to_owned(),
+                canonical_root: host_path(r"C:\work\nemo"),
                 providers: Vec::new(),
                 sessions: vec![SessionView {
                     address: address.clone(),
@@ -2836,6 +2832,29 @@ mod tests {
     fn initial_viewport_matches_fixed_sidebar_and_single_tab_row() {
         assert_eq!(initial_viewport_size(100, 24), TerminalSize { rows: 23, columns: 74 });
         assert_eq!(initial_viewport_size(48, 12), TerminalSize { rows: 11, columns: 24 });
+    }
+
+    #[test]
+    fn c2_workspace_projection_uses_id_label_and_preserves_foreign_path_token() {
+        let opaque = OpaqueHostPath::unix_bytes(vec![b'/', b's', b'r', b'v', b'/', 0xff, b'/', b'.', b'.']).unwrap();
+        let view = project_c2_node(
+            "node-a".to_owned(),
+            "remote".to_owned(),
+            C2NodeSnapshot {
+                node_id: NodeId::new("node-a").unwrap(),
+                enabled_providers: Vec::new(),
+                workspaces: vec![gate4agent_c2_protocol::C2WorkspaceSnapshot {
+                    workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                    canonical_root: opaque.clone(),
+                    sessions: Vec::new(),
+                }],
+                session_records: Vec::new(),
+            },
+            7,
+        );
+
+        assert_eq!(view.workspaces[0].label, "workspace-a");
+        assert_eq!(view.workspaces[0].canonical_root, opaque);
     }
 
     #[test]
@@ -3123,10 +3142,10 @@ mod tests {
         let register = action_to_request(AppAction::RegisterWorkspace {
             node_id: "node-a".to_owned(),
             workspace_id: "scratch".to_owned(),
-            root: r"C:\tmp\scratch".to_owned(),
+            root: host_path(r"C:\tmp\scratch"),
         })
         .unwrap();
-        assert!(matches!(register, NodeRequest::RegisterWorkspace { workspace_id, root } if workspace_id.as_str() == "scratch" && root == r"C:\tmp\scratch"));
+        assert!(matches!(register, NodeRequest::RegisterWorkspace { workspace_id, root } if workspace_id.as_str() == "scratch" && root == host_path(r"C:\tmp\scratch")));
         let unregister = action_to_request(AppAction::UnregisterWorkspace {
             node_id: "node-a".to_owned(),
             workspace_id: "scratch".to_owned(),
@@ -3186,7 +3205,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             source_workspace_id: "workspace-a".to_owned(),
             workspace_id: "feature-a".to_owned(),
-            target_root: r"C:\work\feature-a".to_owned(),
+            target_root: host_path(r"C:\work\feature-a"),
             branch: "feature/a".to_owned(),
             base: Some("origin/main".to_owned()),
         })
@@ -3199,17 +3218,17 @@ mod tests {
             base: Some(base),
         } if source_workspace_id.as_str() == "workspace-a"
             && workspace_id.as_str() == "feature-a"
-            && target_root == r"C:\work\feature-a"
+            && target_root == host_path(r"C:\work\feature-a")
             && branch == "feature/a"
             && base == "origin/main"));
         let remove = action_to_request(AppAction::RemoveWorktree {
             node_id: "node-a".to_owned(),
             source_workspace_id: "workspace-a".to_owned(),
-            target_root: r"C:\work\feature-a".to_owned(),
+            target_root: host_path(r"C:\work\feature-a"),
         })
         .unwrap();
         assert!(matches!(remove, NodeRequest::RemoveWorktree { source_workspace_id, target_root }
-            if source_workspace_id.as_str() == "workspace-a" && target_root == r"C:\work\feature-a"));
+            if source_workspace_id.as_str() == "workspace-a" && target_root == host_path(r"C:\work\feature-a")));
     }
 
     #[test]
@@ -3217,7 +3236,7 @@ mod tests {
         let created_workspace_id = WorkspaceId::new("feature-a").unwrap();
         let created = NodeResponse::WorktreeCreated {
             worktree: gate4agent_node_protocol::GitWorktreeSnapshot {
-                path: r"C:\work\feature-a".to_owned(),
+                path: host_path(r"C:\work\feature-a"),
                 head: "abc".to_owned(),
                 branch: Some("feature/a".to_owned()),
                 is_bare: false,
@@ -3230,7 +3249,7 @@ mod tests {
             },
             workspace: gate4agent_node_protocol::WorkspaceSnapshot {
                 workspace_id: created_workspace_id.clone(),
-                canonical_root: r"C:\work\feature-a".to_owned(),
+                canonical_root: host_path(r"C:\work\feature-a"),
                 sessions: Vec::new(),
             },
         };
@@ -3246,7 +3265,7 @@ mod tests {
 
         let source = WorkspaceId::new("workspace-a").unwrap();
         let removed = NodeResponse::WorktreeRemoved {
-            target_root: r"C:\work\feature-a".to_owned(),
+            target_root: host_path(r"C:\work\feature-a"),
             workspace_id: Some(WorkspaceId::new("feature-a").unwrap()),
         };
         let projection = project_worktree_response(&removed, "node-a", Some(&source)).unwrap();
@@ -3255,7 +3274,7 @@ mod tests {
         assert!(projection.notice.contains("removed"));
 
         let removed_source = NodeResponse::WorktreeRemoved {
-            target_root: r"C:\work\workspace-a".to_owned(),
+            target_root: host_path(r"C:\work\workspace-a"),
             workspace_id: Some(source.clone()),
         };
         let projection = project_worktree_response(&removed_source, "node-a", Some(&source)).unwrap();

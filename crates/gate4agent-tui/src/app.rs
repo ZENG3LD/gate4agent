@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use gate4agent_node_protocol::{
-    GitWorktreeSnapshot, ManagedSessionState, SessionMode, WorkspaceEntryKind, WorkspaceId,
+    GitWorktreeSnapshot, ManagedSessionState, OpaqueHostPath, SessionMode, WorkspaceEntryKind, WorkspaceId,
     WorkspaceInspection, MAX_SESSION_DISPLAY_NAME_BYTES,
     MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
 };
@@ -138,7 +138,7 @@ pub struct ManagedSessionView {
     pub mode: SessionMode,
     pub state: ManagedSessionState,
     pub workspace_id: String,
-    pub canonical_root: String,
+    pub canonical_root: Option<OpaqueHostPath>,
     pub has_provider_session_identity: bool,
     pub active_session: Option<SessionAddress>,
     pub last_error: Option<String>,
@@ -172,7 +172,7 @@ pub struct ProviderInventory {
 pub struct WorkspaceView {
     pub workspace_id: String,
     pub label: String,
-    pub canonical_root: String,
+    pub canonical_root: OpaqueHostPath,
     pub providers: Vec<ProviderInventory>,
     pub sessions: Vec<SessionView>,
 }
@@ -425,6 +425,8 @@ pub struct AddSpaceDialog {
     pub node_id: String,
     pub workspace_id: String,
     pub root: String,
+    pub original_root: Option<OpaqueHostPath>,
+    pub root_edited: bool,
     pub field: AddSpaceField,
 }
 
@@ -451,7 +453,7 @@ pub struct CreateWorktreeDialog {
 pub struct RemoveWorktreeDialog {
     pub node_id: String,
     pub source_workspace_id: String,
-    pub target_root: String,
+    pub target_root: OpaqueHostPath,
     pub branch: Option<String>,
 }
 
@@ -533,20 +535,20 @@ pub enum AppAction {
     Resize { address: SessionAddress, rows: u16, cols: u16 },
     Stop { address: SessionAddress, force: bool },
     Remove { address: SessionAddress },
-    RegisterWorkspace { node_id: String, workspace_id: String, root: String },
+    RegisterWorkspace { node_id: String, workspace_id: String, root: OpaqueHostPath },
     UnregisterWorkspace { node_id: String, workspace_id: String },
     CreateWorktree {
         node_id: String,
         source_workspace_id: String,
         workspace_id: String,
-        target_root: String,
+        target_root: OpaqueHostPath,
         branch: String,
         base: Option<String>,
     },
     RemoveWorktree {
         node_id: String,
         source_workspace_id: String,
-        target_root: String,
+        target_root: OpaqueHostPath,
     },
     InspectWorkspace { node_id: String, workspace_id: String },
     Resync { node_id: String, after_sequence: u64 },
@@ -2505,6 +2507,8 @@ impl App {
             node_id,
             workspace_id: String::new(),
             root: String::new(),
+            original_root: None,
+            root_edited: true,
             field: AddSpaceField::WorkspaceId,
         });
         self.focus = Focus::AddSpace;
@@ -2524,7 +2528,7 @@ impl App {
         self.create_worktree = Some(CreateWorktreeDialog {
             node_id: node.node_id.clone(),
             source_workspace_id: workspace.workspace_id.clone(),
-            target_root: format!("{}-{workspace_id}", workspace.canonical_root.trim_end_matches(['\\', '/'])),
+            target_root: String::new(),
             branch: workspace_id.clone(),
             workspace_id,
             base: String::new(),
@@ -2577,7 +2581,9 @@ impl App {
         self.add_space = Some(AddSpaceDialog {
             node_id,
             workspace_id: suggested_workspace_id(&worktree),
-            root: worktree.path,
+            root: host_path_display(&worktree.path),
+            original_root: Some(worktree.path),
+            root_edited: false,
             field: AddSpaceField::WorkspaceId,
         });
         self.focus = Focus::AddSpace;
@@ -3435,7 +3441,10 @@ impl App {
             UiKey::Down => dialog.node_id = self.cycle_add_space_node(&dialog.node_id, true),
             UiKey::Backspace => match dialog.field {
                 AddSpaceField::WorkspaceId => { dialog.workspace_id.pop(); }
-                AddSpaceField::Root => { dialog.root.pop(); }
+                AddSpaceField::Root => {
+                    dialog.root.pop();
+                    dialog.root_edited = true;
+                }
             },
             UiKey::Char(ch) => {
                 let result = append_modal_char(&mut dialog, ch);
@@ -3444,19 +3453,33 @@ impl App {
                 }
             }
             UiKey::Enter => {
-                if dialog.workspace_id.trim().is_empty() || dialog.root.trim().is_empty() {
-                    self.notice = Some("workspace ID and absolute root are required".to_owned());
+                if dialog.workspace_id.trim().is_empty() || dialog.root.is_empty() {
+                    self.notice = Some("workspace ID and root are required".to_owned());
                 } else if let Err(error) = WorkspaceId::new(dialog.workspace_id.clone()) {
                     self.notice = Some(format!("invalid workspace ID: {error}"));
-                } else if !is_absolute_root(&dialog.root) {
-                    self.notice = Some("workspace root must be absolute".to_owned());
                 } else {
+                    let root = if !dialog.root_edited {
+                        dialog.original_root.clone()
+                    } else {
+                        None
+                    };
+                    let root = match root {
+                        Some(root) => root,
+                        None => {
+                            let Ok(root) = OpaqueHostPath::utf8(dialog.root.clone()) else {
+                                self.notice = Some("workspace root is invalid".to_owned());
+                                self.add_space = Some(dialog);
+                                return AppAction::None;
+                            };
+                            root
+                        }
+                    };
                     self.focus = Focus::Agents;
                     self.roster_mode = RosterMode::Workspaces;
                     return AppAction::RegisterWorkspace {
                         node_id: dialog.node_id,
                         workspace_id: dialog.workspace_id,
-                        root: dialog.root,
+                        root,
                     };
                 }
             }
@@ -3502,18 +3525,21 @@ impl App {
                     || dialog.target_root.trim().is_empty()
                     || dialog.branch.trim().is_empty()
                 {
-                    self.notice = Some("workspace ID, absolute target root, and branch are required".to_owned());
+                    self.notice = Some("workspace ID, target root, and branch are required".to_owned());
                 } else if let Err(error) = WorkspaceId::new(dialog.workspace_id.clone()) {
                     self.notice = Some(format!("invalid workspace ID: {error}"));
-                } else if !is_absolute_root(&dialog.target_root) {
-                    self.notice = Some("worktree target root must be absolute".to_owned());
                 } else {
+                    let Ok(target_root) = OpaqueHostPath::utf8(dialog.target_root.clone()) else {
+                        self.notice = Some("worktree target root is invalid".to_owned());
+                        self.create_worktree = Some(dialog);
+                        return AppAction::None;
+                    };
                     self.focus = Focus::Spaces;
                     return AppAction::CreateWorktree {
                         node_id: dialog.node_id,
                         source_workspace_id: dialog.source_workspace_id,
                         workspace_id: dialog.workspace_id,
-                        target_root: dialog.target_root,
+                        target_root,
                         branch: dialog.branch,
                         base: (!dialog.base.trim().is_empty()).then_some(dialog.base),
                     };
@@ -3942,11 +3968,16 @@ impl App {
     }
 }
 
-fn is_absolute_root(root: &str) -> bool {
-    let bytes = root.as_bytes();
-    root.starts_with("\\\\")
-        || root.starts_with('/')
-        || (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/'))
+pub(crate) fn host_path_display(path: &OpaqueHostPath) -> String {
+    let mut sanitized = String::new();
+    for ch in path.display_text().chars() {
+        if ch.is_control() {
+            sanitized.extend(ch.escape_default());
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    sanitized
 }
 
 fn next_worktree_id(source: &str) -> String {
@@ -4155,6 +4186,7 @@ fn append_modal_char(dialog: &mut AddSpaceDialog, ch: char) -> Result<(), String
                 return Err(format!("workspace root exceeds the {MAX_WORKSPACE_ROOT_BYTES}-byte limit"));
             }
             dialog.root.push(ch);
+            dialog.root_edited = true;
         }
     }
     Ok(())
@@ -4175,6 +4207,7 @@ fn append_modal_paste(dialog: &mut AddSpaceDialog, text: &str) -> Result<(), Str
                 return Err(format!("workspace root exceeds the {MAX_WORKSPACE_ROOT_BYTES}-byte limit"));
             }
             dialog.root.push_str(text);
+            dialog.root_edited = true;
         }
     }
     Ok(())
@@ -4290,6 +4323,10 @@ mod tests {
         GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, WorkspaceEntry,
     };
 
+    fn host_path(value: impl Into<String>) -> OpaqueHostPath {
+        OpaqueHostPath::utf8(value.into()).unwrap()
+    }
+
     fn fixture() -> App {
         let address = SessionAddress {
             node_id: "node-a".to_owned(),
@@ -4308,7 +4345,7 @@ mod tests {
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
-                canonical_root: r"C:\work\nemo".to_owned(),
+                canonical_root: host_path(r"C:\work\nemo"),
                 providers: Provider::ALL
                     .into_iter()
                     .map(|provider| ProviderInventory { provider, enabled: true })
@@ -4362,7 +4399,7 @@ mod tests {
             mode: SessionMode::Pty,
             state,
             workspace_id: "workspace-a".to_owned(),
-            canonical_root: r"C:\work\nemo".to_owned(),
+            canonical_root: Some(host_path(r"C:\work\nemo")),
             has_provider_session_identity: has_identity,
             active_session,
             last_error: None,
@@ -4420,7 +4457,7 @@ mod tests {
 
     fn worktree(path: &str, branch: &str, workspace_id: Option<&str>) -> GitWorktreeSnapshot {
         GitWorktreeSnapshot {
-            path: path.to_owned(),
+            path: host_path(path),
             head: "0123456789abcdef".to_owned(),
             branch: Some(branch.to_owned()),
             is_bare: false,
@@ -4547,7 +4584,7 @@ mod tests {
         let mut second = app.nodes[0].workspaces[0].clone();
         second.workspace_id = "workspace-b".to_owned();
         second.label = "other".to_owned();
-        second.canonical_root = r"C:\work\other".to_owned();
+        second.canonical_root = host_path(r"C:\work\other");
         second.sessions.clear();
         second.providers = vec![ProviderInventory {
             provider: Provider::Kimi,
@@ -4695,21 +4732,23 @@ mod tests {
         app.reduce(UiKey::Tab);
         assert_eq!(app.paste(r"C:\tmp\scratch".to_owned()), AppAction::None);
         let action = app.reduce(UiKey::Enter);
-        assert!(matches!(action, AppAction::RegisterWorkspace { node_id, workspace_id, root } if node_id == "node-a" && workspace_id == "scratch" && root == r"C:\tmp\scratch"));
+        assert!(matches!(action, AppAction::RegisterWorkspace { node_id, workspace_id, root } if node_id == "node-a" && workspace_id == "scratch" && root == host_path(r"C:\tmp\scratch")));
         assert_eq!(app.space_rows().len(), 1);
     }
 
     #[test]
-    fn create_worktree_modal_is_prefilled_validated_and_projects_exact_action() {
+    fn create_worktree_modal_starts_with_empty_foreign_target_and_projects_exact_action() {
         let mut app = fixture();
         assert_eq!(app.begin_create_worktree(), AppAction::None);
         let dialog = app.create_worktree.as_ref().unwrap();
         assert_eq!(dialog.source_workspace_id, "workspace-a");
         assert_eq!(dialog.workspace_id, "workspace-a-worktree");
-        assert!(is_absolute_root(&dialog.target_root));
+        assert!(dialog.target_root.is_empty());
         assert_eq!(dialog.branch, "workspace-a-worktree");
 
-        app.create_worktree.as_mut().unwrap().workspace_id = "Bad.Id".to_owned();
+        let dialog = app.create_worktree.as_mut().unwrap();
+        dialog.workspace_id = "Bad.Id".to_owned();
+        dialog.target_root = r"C:\work\feature-a".to_owned();
         assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
         assert!(app.notice.as_deref().unwrap().contains("invalid workspace ID"));
         assert_eq!(app.focus, Focus::CreateWorktree);
@@ -4731,7 +4770,7 @@ mod tests {
             } if node_id == "node-a"
                 && source_workspace_id == "workspace-a"
                 && workspace_id == "feature-a"
-                && target_root == r"C:\work\feature-a"
+                && target_root == host_path(r"C:\work\feature-a")
                 && branch == "feature/a"
                 && base == "origin/main"
         ));
@@ -4761,7 +4800,7 @@ mod tests {
                 source_workspace_id,
                 target_root,
                 ..
-            } if source_workspace_id == "workspace-a" && target_root == r"C:\work\unregistered"
+            } if source_workspace_id == "workspace-a" && target_root == host_path(r"C:\work\unregistered")
         ));
 
         let inspection = app.workspace_inspections.get_mut(&("node-a".to_owned(), "workspace-a".to_owned())).unwrap();
@@ -4769,6 +4808,48 @@ mod tests {
         assert_eq!(app.begin_remove_worktree(0), AppAction::None);
         assert!(app.remove_worktree.is_none());
         assert!(app.notice.as_deref().unwrap().contains("cannot be removed"));
+    }
+
+    #[test]
+    fn foreign_worktree_path_is_sanitized_for_display_but_echoed_as_original_token() {
+        let mut app = fixture();
+        let opaque = OpaqueHostPath::unix_bytes(vec![b'/', b't', b'm', b'p', b'/', 0xff, b'\n', 0x1b]).unwrap();
+        let mut inspection = workspace_inspection();
+        inspection.git.worktrees = vec![GitWorktreeSnapshot {
+            path: opaque.clone(),
+            head: "0123456789abcdef".to_owned(),
+            branch: Some("feature/opaque".to_owned()),
+            is_bare: false,
+            is_main: false,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            workspace_id: None,
+        }];
+        app.apply_workspace_inspection("node-a".to_owned(), inspection);
+
+        assert_eq!(app.begin_register_worktree(0), AppAction::None);
+        let dialog = app.add_space.as_ref().unwrap();
+        assert!(!dialog.root.contains('\n'));
+        assert!(!dialog.root.contains('\u{1b}'));
+        assert_eq!(dialog.original_root.as_ref(), Some(&opaque));
+        assert!(!dialog.root_edited);
+
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::RegisterWorkspace { root, .. } if root == opaque.clone()
+        ));
+
+        assert_eq!(app.begin_register_worktree(0), AppAction::None);
+        app.add_space.as_mut().unwrap().field = AddSpaceField::Root;
+        assert_eq!(app.reduce(UiKey::Char('x')), AppAction::None);
+        let edited_text = app.add_space.as_ref().unwrap().root.clone();
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::RegisterWorkspace { root, .. }
+                if root.as_utf8() == Some(edited_text.as_str()) && root != opaque
+        ));
     }
 
     #[test]
@@ -4780,7 +4861,7 @@ mod tests {
         node.workspaces.push(WorkspaceView {
             workspace_id: "scratch".to_owned(),
             label: "scratch".to_owned(),
-            canonical_root: r"C:\tmp\scratch".to_owned(),
+            canonical_root: host_path(r"C:\tmp\scratch"),
             providers: Vec::new(),
             sessions: Vec::new(),
         });
@@ -4796,7 +4877,7 @@ mod tests {
         node.workspaces.push(WorkspaceView {
             workspace_id: "scratch".to_owned(),
             label: "scratch".to_owned(),
-            canonical_root: r"C:\tmp\scratch".to_owned(),
+            canonical_root: host_path(r"C:\tmp\scratch"),
             providers: Vec::new(),
             sessions: Vec::new(),
         });
@@ -5187,7 +5268,7 @@ mod tests {
         let mut workspace = app.nodes[0].workspaces[0].clone();
         workspace.workspace_id = "workspace-b".to_owned();
         workspace.label = "other".to_owned();
-        workspace.canonical_root = r"C:\work\other".to_owned();
+        workspace.canonical_root = host_path(r"C:\work\other");
         workspace.sessions.clear();
         app.nodes[0].workspaces.push(workspace);
         app.selected_space = 1;

@@ -3,7 +3,7 @@
 pub use gate4agent_node_protocol::{
     ArchitectureId, CapabilityId, ClientCompatibilityOffer, HostDescriptor,
     NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
-    NodeResponse, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+    NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
     ProtocolNegotiationError, ProtocolRange,
 };
 use gate4agent_node_protocol::{
@@ -22,6 +22,8 @@ pub const C2_API_VERSION: u16 = 2;
 pub const DEFAULT_C2_API_LISTEN: &str = "127.0.0.1:18320";
 pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 2;
 pub const C2_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
+pub const C2_OPAQUE_UNIX_PATH_CAPABILITY: &str =
+    gate4agent_node_protocol::NODE_OPAQUE_UNIX_PATH_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -208,7 +210,7 @@ impl From<&gate4agent_types::SessionSnapshot> for C2SessionSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2WorkspaceSnapshot {
     pub workspace_id: WorkspaceId,
-    pub canonical_root: String,
+    pub canonical_root: OpaqueHostPath,
     pub sessions: Vec<C2SessionSnapshot>,
 }
 
@@ -459,7 +461,7 @@ impl From<&NodeEvent> for C2NodeEvent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2GitWorktreeSnapshot {
-    pub path: String,
+    pub path: OpaqueHostPath,
     pub head: String,
     pub branch: Option<String>,
     pub is_bare: bool,
@@ -563,7 +565,7 @@ pub enum C2NodeResponse {
         workspace: C2WorkspaceSnapshot,
     },
     WorktreeRemoved {
-        target_root: String,
+        target_root: OpaqueHostPath,
         workspace_id: Option<WorkspaceId>,
     },
     Accepted,
@@ -892,6 +894,7 @@ pub fn c2_bound_auth_transcript(
     });
     message.push(match selected.path_semantics.encoding {
         PathEncoding::Utf8 => 1,
+        PathEncoding::UnixBytes => 2,
     });
 
     if message.len() > MAX_C2_BOUND_AUTH_TRANSCRIPT_BYTES {
@@ -1103,7 +1106,9 @@ impl SlimNodeInventory {
                 input_pending: session.pending_input.is_some(),
             }).collect();
             remaining_sessions -= take;
-            let (canonical_root, canonical_root_truncated) = truncate_utf8(&workspace.canonical_root, MAX_C2_ROOT_BYTES);
+            let display_root = sanitize_host_path_display(&workspace.canonical_root);
+            let (canonical_root, canonical_root_truncated) =
+                truncate_utf8(&display_root, MAX_C2_ROOT_BYTES);
             workspaces.insert(workspace.workspace_id.clone(), SlimWorkspace {
                 workspace_id: workspace.workspace_id.clone(),
                 canonical_root,
@@ -1165,8 +1170,9 @@ impl SlimNodeInventory {
                 input_pending: session.pending_input.is_some(),
             }).collect();
             remaining_sessions -= take;
+            let display_root = sanitize_host_path_display(&workspace.canonical_root);
             let (canonical_root, canonical_root_truncated) =
-                truncate_utf8(&workspace.canonical_root, MAX_C2_ROOT_BYTES);
+                truncate_utf8(&display_root, MAX_C2_ROOT_BYTES);
             workspaces.insert(workspace.workspace_id.clone(), SlimWorkspace {
                 workspace_id: workspace.workspace_id.clone(),
                 canonical_root,
@@ -1250,6 +1256,18 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
     (value[..end].to_owned(), true)
 }
 
+fn sanitize_host_path_display(path: &OpaqueHostPath) -> String {
+    let mut sanitized = String::new();
+    for ch in path.display_text().chars() {
+        if ch.is_control() {
+            sanitized.extend(ch.escape_default());
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    sanitized
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ObservedNode {
     pub endpoint: String,
@@ -1309,6 +1327,10 @@ mod tests {
         SessionGeneration, SessionSnapshot, SessionStatus, TerminalSize, TransportKind,
     };
 
+    fn host_path(value: impl Into<String>) -> OpaqueHostPath {
+        OpaqueHostPath::utf8(value.into()).unwrap()
+    }
+
     fn fixture_session() -> SessionSnapshot {
         SessionSnapshot {
             instance_id: AgentInstanceId(7),
@@ -1339,7 +1361,7 @@ mod tests {
             mode: SessionMode::Pty,
             state: ManagedSessionState::Live,
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            canonical_root: r"C:\private\canonical-root".to_owned(),
+            canonical_root: host_path(r"C:\private\canonical-root"),
             provider_session: Some(ProviderSessionIdentity {
                 key: ProviderSessionKey::SessionId,
                 id: "private-provider-session-id".to_owned(),
@@ -1635,7 +1657,7 @@ mod tests {
             enabled_providers: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("repo").unwrap(),
-                canonical_root: "/srv/CaseSensitive/../literal-root".to_owned(),
+                canonical_root: host_path("/srv/CaseSensitive/../literal-root"),
                 sessions: Vec::new(),
             }],
             session_records: Vec::new(),
@@ -1647,7 +1669,7 @@ mod tests {
         )>(&json).unwrap();
 
         assert_eq!(
-            projected.workspaces[0].canonical_root,
+            projected.workspaces[0].canonical_root.display_text(),
             "/srv/CaseSensitive/../literal-root",
         );
         assert_eq!(negotiated.host.operating_system.as_str(), "darwin");
@@ -1661,10 +1683,10 @@ mod tests {
             node_id: NodeId::new("node-a").unwrap(),
             enabled_providers: vec![AgentProvider::Codex, AgentProvider::Claude, AgentProvider::Codex],
             workspaces: vec![
-                WorkspaceSnapshot { workspace_id: WorkspaceId::new("z-work").unwrap(), canonical_root: "z".to_owned(), sessions: Vec::new() },
+                WorkspaceSnapshot { workspace_id: WorkspaceId::new("z-work").unwrap(), canonical_root: host_path("z"), sessions: Vec::new() },
                 WorkspaceSnapshot {
                     workspace_id: WorkspaceId::new("a-work").unwrap(),
-                    canonical_root: "a".to_owned(),
+                    canonical_root: host_path("a"),
                     sessions: vec![fixture_session()],
                 },
             ],
@@ -1689,13 +1711,13 @@ mod tests {
         let mut workspaces = (0..MAX_C2_WORKSPACES_PER_NODE)
             .map(|index| WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new(format!("work-{index:02}")).unwrap(),
-                canonical_root: format!("root-{index:02}"),
+                canonical_root: host_path(format!("root-{index:02}")),
                 sessions: Vec::new(),
             })
             .collect::<Vec<_>>();
         workspaces.push(WorkspaceSnapshot {
             workspace_id: WorkspaceId::new("work-zz").unwrap(),
-            canonical_root: "hidden-root".to_owned(),
+            canonical_root: host_path("hidden-root"),
             sessions: vec![fixture_session()],
         });
         let slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
@@ -1875,7 +1897,7 @@ mod tests {
     #[test]
     fn routed_workspace_inspection_omits_raw_git_diagnostics_and_reasons() {
         let worktree = GitWorktreeSnapshot {
-            path: r"C:\work\feature".to_owned(),
+            path: host_path(r"C:\work\feature"),
             head: "abc123".to_owned(),
             branch: Some("feature/privacy".to_owned()),
             is_bare: false,
@@ -1922,14 +1944,40 @@ mod tests {
         assert!(inspection.git.diagnostic_present);
         assert!(inspection.git.worktrees[0].locked);
         assert!(inspection.git.worktrees[0].prunable);
-        assert_eq!(inspection.git.worktrees[0].path, r"C:\work\feature");
+        assert_eq!(inspection.git.worktrees[0].path.display_text(), r"C:\work\feature");
+    }
+
+    #[test]
+    fn c2_projection_roundtrips_non_utf8_host_paths_without_interpretation() {
+        let opaque = OpaqueHostPath::unix_bytes(vec![b'/', b's', b'r', b'v', b'/', 0xff, b'\n', 0x1b]).unwrap();
+        let projected = C2NodeSnapshot::from(&NodeSnapshot {
+            node_id: NodeId::new("remote-linux").unwrap(),
+            enabled_providers: Vec::new(),
+            workspaces: vec![WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                canonical_root: opaque.clone(),
+                sessions: Vec::new(),
+            }],
+            session_records: Vec::new(),
+        });
+
+        let encoded = serde_json::to_string(&projected).unwrap();
+        let decoded = serde_json::from_str::<C2NodeSnapshot>(&encoded).unwrap();
+
+        assert_eq!(decoded.workspaces[0].canonical_root, opaque);
+        assert_eq!(decoded.workspaces[0].workspace_id.as_str(), "repo");
+        let slim = SlimNodeInventory::from_c2_snapshot(&decoded);
+        let display = &slim.workspaces[&WorkspaceId::new("repo").unwrap()].canonical_root;
+        assert!(!display.chars().any(char::is_control));
+        assert!(display.contains("\\n"));
+        assert!(display.contains("\\u{1b}"));
     }
 
     #[test]
     fn routed_worktree_created_omits_raw_git_reasons() {
         let response = routed_response(NodeResponse::WorktreeCreated {
             worktree: GitWorktreeSnapshot {
-                path: r"C:\work\feature".to_owned(),
+                path: host_path(r"C:\work\feature"),
                 head: "abc123".to_owned(),
                 branch: Some("feature/privacy".to_owned()),
                 is_bare: false,
@@ -1942,7 +1990,7 @@ mod tests {
             },
             workspace: WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("feature").unwrap(),
-                canonical_root: r"C:\work\feature".to_owned(),
+                canonical_root: host_path(r"C:\work\feature"),
                 sessions: Vec::new(),
             },
         });
@@ -2044,7 +2092,7 @@ mod tests {
                 enabled_providers: vec![AgentProvider::Codex],
                 workspaces: vec![WorkspaceSnapshot {
                     workspace_id: WorkspaceId::new("primary").unwrap(),
-                    canonical_root: r"C:\workspace".to_owned(),
+                    canonical_root: host_path(r"C:\workspace"),
                     sessions: vec![session],
                 }],
                 session_records: Vec::new(),
@@ -2085,7 +2133,7 @@ mod tests {
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            canonical_root: r"C:\private\workspace".to_owned(),
+            canonical_root: host_path(r"C:\private\workspace"),
             provider_session: Some(ProviderSessionIdentity {
                 key: ProviderSessionKey::SessionId,
                 id: "5af75a6b-3e64-41dd-96fa-private-provider-id".to_owned(),
@@ -2145,7 +2193,7 @@ mod tests {
                 mode: SessionMode::Inline,
                 state: ManagedSessionState::Unavailable,
                 workspace_id: WorkspaceId::new("primary").unwrap(),
-                canonical_root: r"C:\repo".to_owned(),
+                canonical_root: host_path(r"C:\repo"),
                 provider_session: None,
                 active_session: None,
                 created_at_unix_ms: index as u64,

@@ -2,7 +2,7 @@
 
 use gate4agent_c2::protocol::{GapKind, NodeFreshness, NodeId, NodeTransportState};
 use gate4agent_c2_client::{C2Client, C2ClientError};
-use gate4agent_node::protocol::{ClientRole, NodeRequest, WorkspaceId};
+use gate4agent_node::protocol::{ClientRole, NodeRequest, OpaqueHostPath, WorkspaceId};
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
 use gate4agent_node_wire::NamedPipeNodeClient;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,7 +128,7 @@ async fn windows_real_multi_node_observe_only_c2_survives_partial_loss_restart_a
     operator_a.request(NodeRequest::AcquireController { lease_ms: 5_000 }).await.unwrap();
     operator_a.request(NodeRequest::RegisterWorkspace {
         workspace_id: WorkspaceId::new("added-by-operator").unwrap(),
-        root: std::env::temp_dir().to_string_lossy().into_owned(),
+        root: OpaqueHostPath::utf8(std::env::temp_dir().to_string_lossy().into_owned()).unwrap(),
     }).await.unwrap();
     drop(operator_a);
     let changed = status_until(&client, Duration::from_secs(5), |status| {

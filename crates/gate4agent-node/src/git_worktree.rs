@@ -1,4 +1,3 @@
-use crate::protocol::GitWorktreeSnapshot;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +13,20 @@ const GIT_WORKTREE_MAX_ENTRIES: usize = 512;
 const GIT_READ_TIMEOUT_MS: u64 = 5_000;
 const GIT_REMOVE_PREFLIGHT_TIMEOUT_MS: u64 = 30_000;
 const GIT_MUTATION_TIMEOUT_MS: u64 = 180_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeGitWorktreeSnapshot {
+    pub path: String,
+    pub head: String,
+    pub branch: Option<String>,
+    pub is_bare: bool,
+    pub is_main: bool,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub prunable: bool,
+    pub prunable_reason: Option<String>,
+    pub workspace_id: Option<crate::protocol::WorkspaceId>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitWorktreeErrorKind {
@@ -159,7 +172,7 @@ where
 
 pub(crate) async fn list_worktrees(
     root: &str,
-) -> Result<Vec<GitWorktreeSnapshot>, GitWorktreeError> {
+) -> Result<Vec<NativeGitWorktreeSnapshot>, GitWorktreeError> {
     let nul = run_git_read_bounded(
         root,
         &["worktree", "list", "--porcelain", "-z"],
@@ -201,7 +214,7 @@ pub(crate) async fn create_worktree(
     target_root: &str,
     branch: &str,
     base: Option<&str>,
-) -> Result<GitWorktreeSnapshot, GitWorktreeError> {
+) -> Result<NativeGitWorktreeSnapshot, GitWorktreeError> {
     let worktrees = list_worktrees(source_root).await?;
     let repository_root = repository_root(&worktrees)?;
     let target = normalized_absent_target(target_root)?;
@@ -254,7 +267,7 @@ pub(crate) async fn create_worktree(
 pub(crate) async fn remove_worktree(
     source_root: &str,
     requested_target: &str,
-) -> Result<GitWorktreeSnapshot, GitWorktreeError> {
+) -> Result<NativeGitWorktreeSnapshot, GitWorktreeError> {
     let requested_target = removal_lookup_path(requested_target)?;
     let worktrees = list_worktrees(source_root).await?;
     let repository_root = repository_root(&worktrees)?;
@@ -321,7 +334,7 @@ pub(crate) fn removal_lookup_path(value: &str) -> Result<String, GitWorktreeErro
     }
 }
 
-fn repository_root(worktrees: &[GitWorktreeSnapshot]) -> Result<String, GitWorktreeError> {
+fn repository_root(worktrees: &[NativeGitWorktreeSnapshot]) -> Result<String, GitWorktreeError> {
     worktrees
         .iter()
         .find(|worktree| worktree.is_main && !worktree.is_bare)
@@ -427,8 +440,8 @@ async fn ensure_clean(target: &str) -> Result<(), GitWorktreeError> {
 
 fn validate_removal_target(
     repository_root: &str,
-    target: &GitWorktreeSnapshot,
-    worktrees: &[GitWorktreeSnapshot],
+    target: &NativeGitWorktreeSnapshot,
+    worktrees: &[NativeGitWorktreeSnapshot],
 ) -> Result<(), GitWorktreeError> {
     if target.is_main || target.is_bare || dangerous_path(&target.path, repository_root) {
         return Err(GitWorktreeError::new(
@@ -598,14 +611,24 @@ fn command_result(
 }
 
 fn bounded_worktree_list(
-    worktrees: Vec<GitWorktreeSnapshot>,
-) -> Result<Vec<GitWorktreeSnapshot>, GitWorktreeError> {
+    worktrees: Vec<NativeGitWorktreeSnapshot>,
+) -> Result<Vec<NativeGitWorktreeSnapshot>, GitWorktreeError> {
     if worktrees.len() > GIT_WORKTREE_MAX_ENTRIES {
         return Err(GitWorktreeError::new(
             GitWorktreeErrorKind::Failed,
             format!(
                 "git worktree list exceeds the {GIT_WORKTREE_MAX_ENTRIES}-entry safety limit",
             ),
+        ));
+    }
+    if worktrees.iter().any(|worktree| {
+        worktree.path.is_empty()
+            || worktree.path.len() > crate::protocol::MAX_WORKSPACE_ROOT_BYTES
+            || worktree.path.as_bytes().contains(&0)
+    }) {
+        return Err(GitWorktreeError::new(
+            GitWorktreeErrorKind::Failed,
+            "git worktree list contains an invalid or oversized host path",
         ));
     }
     Ok(worktrees)
@@ -628,7 +651,7 @@ fn io_error(error: io::Error) -> GitWorktreeError {
     )
 }
 
-fn parse_worktree_list_nul(output: &[u8]) -> Vec<GitWorktreeSnapshot> {
+fn parse_worktree_list_nul(output: &[u8]) -> Vec<NativeGitWorktreeSnapshot> {
     let mut records = Vec::new();
     let mut fields = Vec::new();
     for field in output.split(|byte| *byte == 0) {
@@ -650,7 +673,7 @@ fn parse_worktree_list_nul(output: &[u8]) -> Vec<GitWorktreeSnapshot> {
     records.into_iter().flatten().collect()
 }
 
-fn parse_worktree_list_lines(output: &[u8]) -> Vec<GitWorktreeSnapshot> {
+fn parse_worktree_list_lines(output: &[u8]) -> Vec<NativeGitWorktreeSnapshot> {
     let text = String::from_utf8_lossy(output).replace("\r\n", "\n");
     text.split("\n\n")
         .take(GIT_WORKTREE_MAX_ENTRIES + 1)
@@ -674,7 +697,7 @@ fn parse_worktree_record(
     fields: &[String],
     is_main: bool,
     decode_paths: bool,
-) -> Option<GitWorktreeSnapshot> {
+) -> Option<NativeGitWorktreeSnapshot> {
     let mut path = None;
     let mut head = String::new();
     let mut branch = None;
@@ -704,7 +727,7 @@ fn parse_worktree_record(
             });
         }
     }
-    Some(GitWorktreeSnapshot {
+    Some(NativeGitWorktreeSnapshot {
         path: path?,
         head,
         branch,
@@ -789,6 +812,17 @@ mod tests {
     }
 
     #[test]
+    fn oversized_worktree_path_is_rejected_before_wire_conversion() {
+        let oversized = "x".repeat(crate::protocol::MAX_WORKSPACE_ROOT_BYTES + 1);
+        let error = bounded_worktree_list(vec![worktree(&oversized, true)]).unwrap_err();
+        assert_eq!(error.kind, GitWorktreeErrorKind::Failed);
+        assert_eq!(
+            error.message,
+            "git worktree list contains an invalid or oversized host path",
+        );
+    }
+
+    #[test]
     fn removal_safety_rejects_main_locked_prunable_and_nested_worktrees() {
         let main = worktree("C:/repo", true);
         let mut locked = worktree("C:/trees/locked", false);
@@ -816,8 +850,8 @@ mod tests {
         );
     }
 
-    fn worktree(path: &str, is_main: bool) -> GitWorktreeSnapshot {
-        GitWorktreeSnapshot {
+    fn worktree(path: &str, is_main: bool) -> NativeGitWorktreeSnapshot {
+        NativeGitWorktreeSnapshot {
             path: path.to_owned(),
             head: "abc".to_owned(),
             branch: Some("topic".to_owned()),

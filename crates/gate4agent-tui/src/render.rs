@@ -5,7 +5,7 @@ use uzor_tui::{
 use gate4agent_node_protocol::{GitSnapshot, WorkspaceEntryKind, WorkspaceInspection};
 
 use crate::app::{
-    managed_state_label, AddSpaceField, AgentRowKey, App, ConnectionState, ControlSection,
+    host_path_display, managed_state_label, AddSpaceField, AgentRowKey, App, ConnectionState, ControlSection,
     CreateWorktreeField, DragState, Focus, GridAxisKind, GridPaneLayout, GridPreset, HitRegion,
     HitTarget, LayoutRects, MenuPlacement, NodeView, PtyColorMode, RosterMode, SessionView,
     SidebarMode, SidebarPresentation, SurfaceMode, WorkspaceView,
@@ -438,7 +438,7 @@ fn render_space_list(
                     .add_modifier(Modifier::BOLD),
             )
             .render(Rect::new(spawn_x, y, spawn_width, 1), buf);
-        let secondary = format!("{} · {}", node.node_id, workspace.canonical_root);
+        let secondary = format!("{} · {}", node.node_id, host_path_display(&workspace.canonical_root));
         Paragraph::new(format!(
             "   {}",
             compact_middle_cells(&secondary, area.width.saturating_sub(3) as usize)
@@ -632,7 +632,7 @@ fn render_git_snapshot(
             let removable = !worktree.is_main && !worktree.is_bare && !worktree.locked && !worktree.prunable;
             let remove = if removable { " rm " } else { "" };
             let reserved = cell_width(action) + cell_width(remove);
-            let label = format!(" {state} {branch} · {}", worktree.path);
+            let label = format!(" {state} {branch} · {}", host_path_display(&worktree.path));
             layout.hits.push(HitRegion { rect: row, target: HitTarget::Worktree(index) });
             Paragraph::new(truncate_cells(&label, area.width.saturating_sub(reserved as u16) as usize))
                 .style(Style::default().fg(theme.text).bg(if index == app.git_cursor { theme.active } else { theme.panel }))
@@ -1369,7 +1369,7 @@ fn render_remove_worktree(app: &App, area: Rect, buf: &mut TerminalBuffer, theme
             dialog.branch.as_deref().unwrap_or("detached worktree"),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
-        Line::styled(truncate_cells(&dialog.target_root, width.saturating_sub(4) as usize), Style::default().fg(theme.dim)),
+        Line::styled(truncate_cells(&host_path_display(&dialog.target_root), width.saturating_sub(4) as usize), Style::default().fg(theme.dim)),
         Line::styled("Git refuses dirty or unsafe removal; no force is used.", Style::default().fg(theme.yellow)),
         Line::styled("Enter/y remove · n/Esc cancel", Style::default().fg(theme.muted)),
     ]))
@@ -1624,7 +1624,7 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
                     let node = &app.nodes[*node_index];
                     let workspace = &node.workspaces[*workspace_index];
                     cell_width(&workspace.label)
-                        .max(cell_width(&workspace.canonical_root) + cell_width(&node.node_id) + 3)
+                        .max(cell_width(&host_path_display(&workspace.canonical_root)) + cell_width(&node.node_id) + 3)
                         + 12
                 })
                 .max()
@@ -2063,6 +2063,10 @@ mod tests {
         SessionTab, SessionView, WorkspaceView,
     };
 
+    fn host_path(value: impl Into<String>) -> gate4agent_node_protocol::OpaqueHostPath {
+        gate4agent_node_protocol::OpaqueHostPath::utf8(value.into()).unwrap()
+    }
+
     fn fixture(mode: PtyColorMode) -> App {
         let address = SessionAddress {
             node_id: "node-a".to_owned(),
@@ -2082,7 +2086,7 @@ mod tests {
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
-                canonical_root: r"C:\work\nemo".to_owned(),
+                canonical_root: host_path(r"C:\work\nemo"),
                 providers: vec![ProviderInventory { provider: Provider::Kimi, enabled: true }],
                 sessions: vec![SessionView {
                     address: address.clone(),
@@ -2188,7 +2192,7 @@ mod tests {
             let mut workspace = template.clone();
             workspace.workspace_id = format!("workspace-{index}");
             workspace.label = format!("space-{index}");
-            workspace.canonical_root = format!(r"C:\work\space-{index}");
+            workspace.canonical_root = host_path(format!(r"C:\work\space-{index}"));
             workspace.sessions.clear();
             app.nodes[0].workspaces.push(workspace);
         }
@@ -2261,6 +2265,8 @@ mod tests {
             node_id: "node-a".to_owned(),
             workspace_id: "scratch".to_owned(),
             root: r"C:\work\scratch".to_owned(),
+            original_root: None,
+            root_edited: true,
             field: AddSpaceField::WorkspaceId,
         });
         let mut buf = TerminalBuffer::new(100, 24);
@@ -2396,7 +2402,7 @@ mod tests {
         let mut snapshot = inspection();
         snapshot.git.worktrees = vec![
             GitWorktreeSnapshot {
-                path: r"C:\work\main".to_owned(),
+                path: host_path(r"C:\work\main"),
                 head: "aaaa".to_owned(),
                 branch: Some("main".to_owned()),
                 is_bare: false,
@@ -2408,7 +2414,7 @@ mod tests {
                 workspace_id: Some(WorkspaceId::new("workspace-a").unwrap()),
             },
             GitWorktreeSnapshot {
-                path: r"C:\work\feature".to_owned(),
+                path: host_path(r"C:\work\feature"),
                 head: "bbbb".to_owned(),
                 branch: Some("feature/a".to_owned()),
                 is_bare: false,
@@ -2646,7 +2652,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state,
                 workspace_id: "workspace-a".to_owned(),
-                canonical_root: r"C:\work\nemo".to_owned(),
+                canonical_root: Some(host_path(r"C:\work\nemo")),
                 has_provider_session_identity: state != ManagedSessionState::IdentityPending,
                 active_session: matches!(
                     state,

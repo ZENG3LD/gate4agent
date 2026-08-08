@@ -1,10 +1,11 @@
 use gate4agent_c2_protocol::{
     c2_auth_transcript, c2_bound_auth_transcript, C2AuthDirection, C2ClientAuthentication, C2ClientFrame,
-    C2ClientHello, C2Hello, C2RelayFailure, C2RequestEnvelope, C2RequestId,
-    C2ServerFrame, C2Topology, CapabilityId, ClientCompatibilityOffer,
-    NegotiatedC2ControlCompatibility, NodeRequest, NodeRoute, ProtocolRange,
-    RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
+    C2ClientHello, C2Hello, C2NodeEvent, C2NodeResponse, C2RelayFailure,
+    C2RequestEnvelope, C2RequestId, C2ServerFrame, C2Topology, CapabilityId,
+    ClientCompatibilityOffer, NegotiatedC2ControlCompatibility, NodeRequest, NodeRoute,
+    ProtocolRange, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    C2_OPAQUE_UNIX_PATH_CAPABILITY,
     C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -31,6 +32,8 @@ const COMMAND_CAPACITY: usize = 64;
 const INBOUND_CAPACITY: usize = 2;
 const WRITER_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 2;
+const OPAQUE_UNIX_PATH_NOT_NEGOTIATED: &str =
+    "opaque Unix paths require negotiated C2 capability";
 
 #[derive(Clone)]
 pub struct C2ControlHandle {
@@ -53,6 +56,10 @@ impl C2ControlHandle {
         route: NodeRoute,
         request: NodeRequest,
     ) -> Result<RoutedNodeResponse, C2ControlError> {
+        reject_unnegotiated_outbound_path(
+            &request,
+            negotiated_opaque_unix_paths(self.hello.compatibility.as_ref()),
+        )?;
         let deadline = control_request_deadline(&request);
         let (reply_tx, reply_rx) = oneshot::channel();
         timeout(deadline, async {
@@ -177,10 +184,18 @@ pub async fn connect_local(
     let (topology_tx, topology_rx) = watch::channel(initial_topology);
     let (writer_tx, writer_rx) = mpsc::channel(WRITER_CAPACITY);
     let (owner_tx, owner_rx) = mpsc::channel(INBOUND_CAPACITY);
+    let opaque_unix_paths = negotiated_opaque_unix_paths(hello.compatibility.as_ref());
     let reader_task = tokio::spawn(control_reader(reader, owner_tx.clone()));
     let writer_task = tokio::spawn(control_writer(writer, writer_rx, owner_tx));
     tokio::spawn(async move {
-        control_owner(commands_rx, events_tx, topology_tx, writer_tx, owner_rx).await;
+        control_owner(
+            commands_rx,
+            events_tx,
+            topology_tx,
+            writer_tx,
+            owner_rx,
+            opaque_unix_paths,
+        ).await;
         reader_task.abort();
         writer_task.abort();
     });
@@ -195,8 +210,12 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
     Ok(ClientCompatibilityOffer {
         protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)
             .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
-        capabilities: vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
-            .map_err(|error| C2ControlError::Protocol(error.to_string()))?],
+        capabilities: vec![
+            CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+        ],
         state_schema: None,
     })
 }
@@ -228,6 +247,127 @@ fn validate_selected_compatibility(
         ));
     }
     Ok(())
+}
+
+fn negotiated_opaque_unix_paths(
+    selected: Option<&NegotiatedC2ControlCompatibility>,
+) -> bool {
+    selected.is_some_and(|selected| {
+        selected
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == C2_OPAQUE_UNIX_PATH_CAPABILITY)
+    })
+}
+
+fn reject_unnegotiated_outbound_path(
+    request: &NodeRequest,
+    opaque_unix_paths: bool,
+) -> Result<(), C2ControlError> {
+    if !opaque_unix_paths && node_request_has_unix_bytes(request) {
+        return Err(C2ControlError::Protocol(
+            OPAQUE_UNIX_PATH_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
+    match request {
+        NodeRequest::RegisterWorkspace { root, .. } => root.as_unix_bytes().is_some(),
+        NodeRequest::CreateWorktree { target_root, .. }
+        | NodeRequest::RemoveWorktree { target_root, .. } => {
+            target_root.as_unix_bytes().is_some()
+        }
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ResumeSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::Prompt { .. }
+        | NodeRequest::Paste { .. }
+        | NodeRequest::Input { .. }
+        | NodeRequest::TerminalBytes { .. }
+        | NodeRequest::TerminalControl { .. }
+        | NodeRequest::Resize { .. }
+        | NodeRequest::Interrupt { .. }
+        | NodeRequest::Stop { .. }
+        | NodeRequest::Remove { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
+fn routed_response_has_unix_bytes(response: &RoutedNodeResponse) -> bool {
+    response
+        .response
+        .as_ref()
+        .is_ok_and(c2_node_response_has_unix_bytes)
+}
+
+fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. } => node_snapshot_has_unix_bytes(snapshot),
+        C2NodeResponse::Resync { snapshot, events, .. } => {
+            node_snapshot_has_unix_bytes(snapshot)
+                || events
+                    .iter()
+                    .any(|envelope| c2_node_event_has_unix_bytes(&envelope.event))
+        }
+        C2NodeResponse::WorkspaceInspected { inspection } => inspection
+            .git
+            .worktrees
+            .iter()
+            .any(|worktree| worktree.path.as_unix_bytes().is_some()),
+        C2NodeResponse::WorkspaceRegistered { workspace } => {
+            workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        C2NodeResponse::WorktreeCreated { worktree, workspace } => {
+            worktree.path.as_unix_bytes().is_some()
+                || workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        C2NodeResponse::WorktreeRemoved { target_root, .. } => {
+            target_root.as_unix_bytes().is_some()
+        }
+        C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SessionRecordUpdated { .. }
+        | C2NodeResponse::SessionRecordResumed { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => false,
+    }
+}
+
+fn node_snapshot_has_unix_bytes(snapshot: &gate4agent_c2_protocol::C2NodeSnapshot) -> bool {
+    snapshot
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.canonical_root.as_unix_bytes().is_some())
+}
+
+fn routed_event_has_unix_bytes(event: &RoutedNodeEvent) -> bool {
+    c2_node_event_has_unix_bytes(&event.event)
+}
+
+fn c2_node_event_has_unix_bytes(event: &C2NodeEvent) -> bool {
+    match event {
+        C2NodeEvent::WorkspaceAdded { workspace } => {
+            workspace.canonical_root.as_unix_bytes().is_some()
+        }
+        C2NodeEvent::Control { .. }
+        | C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::SessionRecordUpserted { .. }
+        | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ResyncRequired { .. } => false,
+    }
 }
 
 async fn read_server_frame(
@@ -278,6 +418,7 @@ async fn control_owner(
     topology: watch::Sender<Arc<C2Topology>>,
     writer: mpsc::Sender<C2ClientFrame>,
     mut incoming: mpsc::Receiver<OwnerInput>,
+    opaque_unix_paths: bool,
 ) {
     let mut next_request_id = 1_u64;
     let mut pending = BTreeMap::new();
@@ -285,6 +426,13 @@ async fn control_owner(
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { break; };
+                if let Err(error) = reject_unnegotiated_outbound_path(
+                    &command.request,
+                    opaque_unix_paths,
+                ) {
+                    let _ = command.reply.send(Err(error));
+                    continue;
+                }
                 let request_id = C2RequestId(next_request_id);
                 let Some(next) = next_request_id.checked_add(1) else {
                     let _ = command.reply.send(Err(C2ControlError::RequestIdExhausted));
@@ -302,9 +450,23 @@ async fn control_owner(
                 match input {
                     Some(OwnerInput::Frame(C2ServerFrame::Reply(reply))) => {
                         let Some(waiter) = pending.remove(&reply.request_id) else { break; };
+                        if !opaque_unix_paths
+                            && reply
+                                .result
+                                .as_ref()
+                                .is_ok_and(routed_response_has_unix_bytes)
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                OPAQUE_UNIX_PATH_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
+                        if !opaque_unix_paths && routed_event_has_unix_bytes(&event) {
+                            break;
+                        }
                         if events.try_send(event).is_err() { break; }
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Topology(next))) => {
@@ -399,10 +561,10 @@ pub enum C2ControlError {
 mod tests {
     use super::*;
     use gate4agent_c2_protocol::{
-        ArchitectureId, HostDescriptor, NodeCursor, NodeId, OperatingSystemId,
-        PathEncoding, PathSemantics, PathStyle,
+        ArchitectureId, C2WorkspaceSnapshot, HostDescriptor, NodeCursor, NodeId,
+        OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
     };
-    use gate4agent_node_protocol::NodeIncarnationId;
+    use gate4agent_node_protocol::{NodeIncarnationId, WorkspaceId};
 
     fn event(sequence: u64) -> OwnerInput {
         OwnerInput::Frame(C2ServerFrame::Event(RoutedNodeEvent {
@@ -435,8 +597,43 @@ mod tests {
         }))
     }
 
+    fn unix_path() -> OpaqueHostPath {
+        OpaqueHostPath::unix_bytes(vec![b'/', b's', b'r', b'v', b'/', 0xff]).unwrap()
+    }
+
+    fn unix_path_reply(request_id: u64) -> OwnerInput {
+        OwnerInput::Frame(C2ServerFrame::Reply(gate4agent_c2_protocol::C2ReplyEnvelope {
+            request_id: C2RequestId(request_id),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Ok(C2NodeResponse::WorktreeRemoved {
+                    target_root: unix_path(),
+                    workspace_id: None,
+                }),
+            }),
+        }))
+    }
+
+    fn unix_path_event(sequence: u64) -> OwnerInput {
+        OwnerInput::Frame(C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                sequence,
+            },
+            event: C2NodeEvent::WorkspaceAdded {
+                workspace: C2WorkspaceSnapshot {
+                    workspace_id: WorkspaceId::new("foreign").unwrap(),
+                    canonical_root: unix_path(),
+                    sessions: Vec::new(),
+                },
+            },
+        }))
+    }
+
     #[test]
-    fn c2_control_client_offer_is_exact_v2_metadata_only() {
+    fn c2_control_client_offer_is_exact_v2_with_opaque_unix_path_opt_in() {
         let offer = client_compatibility_offer().unwrap();
 
         assert_eq!(
@@ -445,7 +642,10 @@ mod tests {
         );
         assert_eq!(
             offer.capabilities,
-            vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
+            vec![
+                CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
+            ],
         );
         assert_eq!(offer.state_schema, None);
         assert!(validate_selected_compatibility(&offer, None).is_ok());
@@ -509,6 +709,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_unix_path_before_write() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, false,
+        ));
+        let request = NodeRequest::RegisterWorkspace {
+            workspace_id: WorkspaceId::new("foreign").unwrap(),
+            root: unix_path(),
+        };
+        assert!(reject_unnegotiated_outbound_path(&request, true).is_ok());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx
+            .send(ControlCommand { route: route(), request, reply: reply_tx })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == OPAQUE_UNIX_PATH_NOT_NEGOTIATED
+        ));
+        assert!(writer_rx.try_recv().is_err());
+        drop(commands_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_unix_path_reply_and_closes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, false,
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx
+            .send(ControlCommand {
+                route: route(),
+                request: NodeRequest::Snapshot,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(unix_path_reply(1)).await.unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == OPAQUE_UNIX_PATH_NOT_NEGOTIATED
+        ));
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+        assert!(commands_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_unix_path_event_and_closes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, false,
+        ));
+        incoming_tx.send(unix_path_event(1)).await.unwrap();
+
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+        assert!(events_rx.try_recv().is_err());
+        assert!(commands_tx.is_closed());
+    }
+
+    #[tokio::test]
     async fn late_reply_after_timed_waiter_does_not_desynchronize_following_request() {
         let (commands_tx, commands_rx) = mpsc::channel(2);
         let (events_tx, _events_rx) = mpsc::channel(1);
@@ -516,7 +798,7 @@ mod tests {
         let (incoming_tx, incoming_rx) = mpsc::channel(2);
         let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
         let owner = tokio::spawn(control_owner(
-            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx,
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, false,
         ));
 
         let (expired_tx, expired_rx) = oneshot::channel();
@@ -553,7 +835,9 @@ mod tests {
         let (writer_tx, _writer_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(4);
         let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
-        let owner = tokio::spawn(control_owner(commands_rx, events_tx, topology_tx, writer_tx, incoming_rx));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, false,
+        ));
 
         incoming_tx.send(event(1)).await.unwrap();
         incoming_tx.send(event(2)).await.unwrap();
@@ -578,7 +862,7 @@ mod tests {
         }] });
         let (topology_tx, mut topology_rx) = watch::channel(offline);
         let owner = tokio::spawn(control_owner(
-            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx,
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, false,
         ));
         let incarnation_id = NodeIncarnationId::from_bytes([9; 16]);
         incoming_tx.send(OwnerInput::Frame(C2ServerFrame::Topology(C2Topology {

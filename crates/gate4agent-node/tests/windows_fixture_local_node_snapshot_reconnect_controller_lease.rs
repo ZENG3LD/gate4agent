@@ -26,6 +26,8 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOpti
 use tokio::time::{sleep, timeout, Duration};
 
 fn endpoint() -> String {
+    gate4agent_testkit::suppress_windows_fault_dialogs_for_test();
+    gate4agent_testkit::require_windows_headless_supervisor_for_test();
     static NEXT_ENDPOINT: AtomicU64 = AtomicU64::new(1);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

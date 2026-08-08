@@ -17,6 +17,8 @@ use gate4agent_types::{
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
+    gate4agent_testkit::suppress_windows_fault_dialogs_for_test();
+    gate4agent_testkit::require_windows_headless_supervisor_for_test();
     CommandEnvelope {
         protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),

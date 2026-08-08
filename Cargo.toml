@@ -14,7 +14,7 @@ gate4agent-types = { path = "crates/gate4agent-types" }
 gate4agent-catalog = { path = "crates/gate4agent-catalog" }
 
 # PTY creation and cross-platform ConPTY support
-portable-pty = "0.8"
+portable-pty = { package = "gate4agent-portable-pty", version = "=0.8.1-gate4agent.1", path = "vendor/portable-pty-0.8.1-gate4agent" }
 
 # ANSI escape sequence stripping (VteParser)
 vte = "0.13"
@@ -87,4 +87,5 @@ members = [
     "crates/gate4agent-tui",
     "crates/gate4agent-testkit",
 ]
+exclude = ["vendor/portable-pty-0.8.1-gate4agent"]
 resolver = "2"

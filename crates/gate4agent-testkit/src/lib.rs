@@ -15,6 +15,44 @@ pub const ACP_FIXTURE_ID: &str = "acp-fixture";
 pub const PTY_PROVIDER_FIXTURE_ID: &str = "pty-provider-fixture";
 pub const HOOK_POSTING_FIXTURE_ID: &str = "hook-posting-fixture";
 
+/// Prevent automated Windows fault paths from opening modal UI.
+///
+/// Call this before the first native or provider FFI operation in a test
+/// process. The process error mode is inherited by fixture children.
+pub fn suppress_windows_fault_dialogs_for_test() {
+    #[cfg(windows)]
+    unsafe {
+        const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+        const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+        const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+        const WER_FAULT_REPORTING_NO_UI: u32 = 0x0020;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+            fn WerSetFlags(flags: u32) -> i32;
+        }
+
+        SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX,
+        );
+        let _ = WerSetFlags(WER_FAULT_REPORTING_NO_UI);
+    }
+}
+
+/// Refuse to run Windows PTY integration code outside the bounded supervisor.
+///
+/// The supervisor sets this exact marker only after creating its containment
+/// job. Non-Windows tests do not require the Windows-specific containment.
+pub fn require_windows_headless_supervisor_for_test() {
+    #[cfg(windows)]
+    assert_eq!(
+        std::env::var_os("GATE4AGENT_HEADLESS_SUPERVISOR").as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "Windows PTY tests must run through windows-headless-supervisor"
+    );
+}
+
 pub fn interactive_agent_spec() -> AgentSpec {
     #[cfg(windows)]
     let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write([char]27 + '[?2004h' + [char]27 + '[?25hfixture-ready>'); $line=[Console]::ReadLine(); [Console]::Write('fixture-echo:' + $line); Start-Sleep -Seconds 60";

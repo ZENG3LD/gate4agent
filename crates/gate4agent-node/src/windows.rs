@@ -7,6 +7,10 @@ use crate::git_worktree::{
 use crate::session_registry::{
     self, validate_display_name, LoadedNodeState, MAX_MANAGED_SESSION_RECORDS,
 };
+use crate::workspace_file_windows::{
+    read_workspace_file as read_workspace_file_from_disk, WorkspaceFileBytes,
+    WorkspaceFileReadErrorKind,
+};
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     AgentProvider, ArchitectureId, CapabilityId, ClientFrame, ClientRole, ControllerState,
@@ -17,11 +21,13 @@ use crate::protocol::{
     PathSemantics, PathStyle, ProtocolRange, RepositoryPath, RequestEnvelope, ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
     ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceId, WorkspaceInspection, WorkspaceSnapshot, DEFAULT_CONTROLLER_LEASE_MS,
+    WorkspaceFileContent, WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
+    DEFAULT_CONTROLLER_LEASE_MS,
     MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
+    NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
-    MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
+    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
 };
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
@@ -65,6 +71,7 @@ const MUTATION_SETTLE_TIMEOUT_MS: u64 = 5_000;
 const READINESS_SETTLE_HEADROOM_MS: u64 = 2_000;
 const MANAGED_RESUME_SETTLE_TIMEOUT_MS: u64 = 30_000;
 const WORKSPACE_INSPECTION_MAX_CONCURRENCY: usize = 4;
+const WORKSPACE_FILE_READ_TIMEOUT_MS: u64 = 2_000;
 const WORKSPACE_TREE_MAX_DEPTH: usize = 6;
 const WORKSPACE_TREE_MAX_ENTRIES: usize = 512;
 const GIT_STATUS_MAX_ENTRIES: usize = 128;
@@ -1519,6 +1526,73 @@ impl NodeShared {
             entries,
             tree_truncated,
             git,
+        })
+    }
+
+    async fn read_workspace_file(
+        &self,
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+    ) -> Result<WorkspaceFileRead, NodeFailure> {
+        let repository_path = path.as_utf8().map(str::to_owned).ok_or_else(|| {
+            failure(
+                NodeFailureCode::InvalidRepositoryPath,
+                "repository path is not supported by this node",
+            )
+        })?;
+        let canonical_root = self.workspace_root(&workspace_id)?;
+        let permit = self
+            .inspection_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendBusy,
+                    "workspace file read capacity is busy",
+                )
+            })?;
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            read_workspace_file_from_disk(Path::new(&canonical_root), &repository_path)
+        });
+        let content = timeout(
+            Duration::from_millis(WORKSPACE_FILE_READ_TIMEOUT_MS),
+            task,
+        )
+        .await
+        .map_err(|_| {
+            failure(
+                NodeFailureCode::RepositoryFileReadTimedOut,
+                "repository file read exceeded its bounded deadline",
+            )
+        })?
+        .map_err(|_| {
+            failure(
+                NodeFailureCode::RepositoryFileReadFailed,
+                "repository file read task failed",
+            )
+        })?
+        .map_err(workspace_file_failure)?;
+        let content = match content {
+            WorkspaceFileBytes::Utf8(text) => WorkspaceFileContent::Utf8 {
+                byte_len: u32::try_from(text.len())
+                    .expect("bounded workspace text length must fit u32"),
+                text,
+            },
+            WorkspaceFileBytes::NonUtf8 { byte_length } => {
+                WorkspaceFileContent::NonUtf8 {
+                    byte_len: u32::try_from(byte_length)
+                        .expect("bounded workspace file length must fit u32"),
+                }
+            }
+            WorkspaceFileBytes::TooLarge => WorkspaceFileContent::TooLarge {
+                limit_bytes: MAX_WORKSPACE_FILE_BYTES as u32,
+            },
+        };
+        Ok(WorkspaceFileRead {
+            workspace_id,
+            path,
+            content,
         })
     }
 
@@ -3012,6 +3086,10 @@ async fn serve_connection(
     if !proofs_match(&authentication.client_proof, &expected_client_proof) {
         return Err(NodeServerError::Handshake("access denied".to_owned()));
     }
+    let selected_capabilities = compatibility
+        .as_ref()
+        .map(|selected| selected.capabilities.clone())
+        .unwrap_or_default();
     let authenticated_permit = Arc::clone(&shared.authenticated_slots)
         .try_acquire_owned()
         .map_err(|_| NodeServerError::AuthenticatedConnectionLimit)?;
@@ -3069,7 +3147,25 @@ async fn serve_connection(
                 let ClientFrame::Request(request) = frame else {
                     return Err(NodeServerError::Handshake("hello may only be sent once".to_owned()));
                 };
-                let reply = process_request(&shared, connection_id, hello.role, request).await;
+                let reply = if request
+                    .request
+                    .required_capability()
+                    .is_some_and(|required| {
+                        !selected_capabilities
+                            .iter()
+                            .any(|selected| selected.as_str() == required)
+                    })
+                {
+                    ResponseEnvelope {
+                        request_id: request.request_id,
+                        result: Err(failure(
+                            NodeFailureCode::UnsupportedCapability,
+                            "request capability was not negotiated",
+                        )),
+                    }
+                } else {
+                    process_request(&shared, connection_id, hello.role, request).await
+                };
                 write_json_frame(&mut writer, &ServerFrame::Reply(reply)).await?;
             }
             event = event_rx.recv() => {
@@ -3122,7 +3218,10 @@ fn node_compatibility_support() -> Result<NodeCompatibilitySupport, NodeServerEr
 }
 
 fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
-    [NODE_COMPATIBILITY_METADATA_CAPABILITY]
+    [
+        NODE_COMPATIBILITY_METADATA_CAPABILITY,
+        NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    ]
         .into_iter()
         .map(|capability| {
             CapabilityId::new(capability)
@@ -3533,6 +3632,7 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         NodeRequest::Snapshot
             | NodeRequest::Resync { .. }
             | NodeRequest::InspectWorkspace { .. }
+            | NodeRequest::ReadWorkspaceFile { .. }
     );
     let _mutation_guard = if read_only {
         None
@@ -3553,6 +3653,10 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         NodeRequest::InspectWorkspace { workspace_id } => {
             let inspection = shared.inspect_workspace(workspace_id).await?;
             Ok(NodeResponse::WorkspaceInspected { inspection })
+        }
+        NodeRequest::ReadWorkspaceFile { workspace_id, path } => {
+            let file = shared.read_workspace_file(workspace_id, path).await?;
+            Ok(NodeResponse::WorkspaceFileRead { file })
         }
         NodeRequest::AcquireController { lease_ms } => {
             let controller = shared.acquire_controller(connection_id, role, lease_ms)?;
@@ -3852,6 +3956,23 @@ fn git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
     failure(code, &error.message)
 }
 
+fn workspace_file_failure(error: crate::workspace_file_windows::WorkspaceFileReadError) -> NodeFailure {
+    let code = match error.kind() {
+        WorkspaceFileReadErrorKind::InvalidPath => NodeFailureCode::InvalidRepositoryPath,
+        WorkspaceFileReadErrorKind::UnsafePath | WorkspaceFileReadErrorKind::ReparsePoint => {
+            NodeFailureCode::RepositoryPathUnsafe
+        }
+        WorkspaceFileReadErrorKind::NotFound => NodeFailureCode::RepositoryFileNotFound,
+        WorkspaceFileReadErrorKind::NotRegularFile => {
+            NodeFailureCode::RepositoryFileNotRegular
+        }
+        WorkspaceFileReadErrorKind::AccessDenied | WorkspaceFileReadErrorKind::Io => {
+            NodeFailureCode::RepositoryFileReadFailed
+        }
+    };
+    failure(code, "repository file read failed")
+}
+
 fn normalize_windows_verbatim_path(path: String) -> String {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -3905,11 +4026,18 @@ fn persistence_failure(_error: io::Error) -> NodeFailure {
 fn node_failure_category(code: NodeFailureCode) -> &'static str {
     match code {
         NodeFailureCode::InvalidRequest => "invalid-request",
+        NodeFailureCode::UnsupportedCapability => "unsupported-capability",
         NodeFailureCode::Unauthorized => "unauthorized",
         NodeFailureCode::ObserverReadOnly => "observer-read-only",
         NodeFailureCode::ControllerBusy => "controller-busy",
         NodeFailureCode::ControllerRequired => "controller-required",
         NodeFailureCode::UnknownWorkspace => "unknown-workspace",
+        NodeFailureCode::InvalidRepositoryPath => "invalid-repository-path",
+        NodeFailureCode::RepositoryFileNotFound => "repository-file-not-found",
+        NodeFailureCode::RepositoryFileNotRegular => "repository-file-not-regular",
+        NodeFailureCode::RepositoryPathUnsafe => "repository-path-unsafe",
+        NodeFailureCode::RepositoryFileReadTimedOut => "repository-file-read-timed-out",
+        NodeFailureCode::RepositoryFileReadFailed => "repository-file-read-failed",
         NodeFailureCode::InvalidWorkspaceRoot => "invalid-workspace-root",
         NodeFailureCode::DuplicateWorkspaceId => "duplicate-workspace-id",
         NodeFailureCode::DuplicateWorkspaceRoot => "duplicate-workspace-root",

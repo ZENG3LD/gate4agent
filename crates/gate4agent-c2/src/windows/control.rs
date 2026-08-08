@@ -7,6 +7,7 @@ use crate::protocol::{
     OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
+    C2_WORKSPACE_FILE_READ_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -31,6 +32,7 @@ const REPLY_QUEUE_DEADLINE: Duration = Duration::from_secs(3);
 struct NegotiatedPathCapabilities {
     opaque_host_paths: bool,
     repository_paths: bool,
+    workspace_file_read: bool,
 }
 
 pub(super) async fn run(
@@ -221,6 +223,16 @@ async fn serve_connection(
                     continue;
                 }
                 last_request_id = request.request_id.0;
+                if let Some(failure) = unnegotiated_request_failure(
+                    &request.request.request,
+                    path_capabilities,
+                ) {
+                    if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope {
+                        request_id: request.request_id,
+                        result: Err(failure),
+                    }).await.is_err() { break; }
+                    continue;
+                }
                 match dispatch_start(connection_id, request.request, &relays, &status) {
                     DispatchStart::Immediate(result) => {
                         if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result }).await.is_err() { break; }
@@ -387,6 +399,8 @@ async fn control_writer<W>(
             && server_frame_contains_opaque_unix_path(&queued.frame))
             || (!path_capabilities.repository_paths
                 && server_frame_contains_unix_repository_path(&queued.frame))
+            || (!path_capabilities.workspace_file_read
+                && server_frame_contains_workspace_file_read(&queued.frame))
         {
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
@@ -415,7 +429,37 @@ fn negotiated_path_capabilities(
     NegotiatedPathCapabilities {
         opaque_host_paths: selected_has(C2_OPAQUE_UNIX_PATH_CAPABILITY),
         repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
+        workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
     }
+}
+
+fn unnegotiated_request_failure(
+    request: &NodeRequest,
+    capabilities: NegotiatedPathCapabilities,
+) -> Option<C2RelayFailure> {
+    let required_capability_available = match request.required_capability() {
+        None => true,
+        Some(C2_WORKSPACE_FILE_READ_CAPABILITY) => capabilities.workspace_file_read,
+        Some(_) => false,
+    };
+    if !required_capability_available {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "request capability was not negotiated with C2",
+            None,
+        ));
+    }
+    if !capabilities.repository_paths
+        && matches!(request, NodeRequest::ReadWorkspaceFile { path, .. }
+            if path.as_unix_bytes().is_some())
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "tagged repository paths require negotiated C2 capability",
+            None,
+        ));
+    }
+    None
 }
 
 fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
@@ -426,6 +470,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
         | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
@@ -475,6 +520,9 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                                 })
                         })
                     }
+                    C2NodeResponse::WorkspaceFileRead { file } => {
+                        file.path.as_unix_bytes().is_some()
+                    }
                     C2NodeResponse::Snapshot { .. }
                     | C2NodeResponse::Resync { .. }
                     | C2NodeResponse::Controller { .. }
@@ -499,6 +547,21 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
     }
 }
 
+fn server_frame_contains_workspace_file_read(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(|response| {
+                matches!(response, C2NodeResponse::WorkspaceFileRead { .. })
+            })
+        }),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Event(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
 fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
     match response {
         C2NodeResponse::Snapshot { snapshot, .. } => c2_snapshot_contains_opaque_unix_path(snapshot),
@@ -509,6 +572,7 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         C2NodeResponse::WorkspaceInspected { inspection } => inspection.git.worktrees
             .iter()
             .any(|worktree| worktree.path.as_unix_bytes().is_some()),
+        C2NodeResponse::WorkspaceFileRead { .. } => false,
         C2NodeResponse::WorkspaceRegistered { workspace } => {
             workspace.canonical_root.as_unix_bytes().is_some()
         }
@@ -719,6 +783,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
             operating_system: OperatingSystemId::new("windows")
@@ -739,6 +805,7 @@ mod tests {
     use crate::protocol::{
         C2ClientHello, C2GitSnapshot, C2WorkspaceInspection, C2_API_VERSION,
         NodeFreshness, ObservedNode, OpaqueHostPath, RepositoryPath,
+        WorkspaceFileContent, WorkspaceFileRead,
     };
     use gate4agent_node_protocol::{GitStatusEntry, WorkspaceEntry, WorkspaceEntryKind};
     use tokio::io::AsyncReadExt;
@@ -781,6 +848,7 @@ mod tests {
                 CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -888,6 +956,95 @@ mod tests {
             NegotiatedPathCapabilities {
                 opaque_host_paths: false,
                 repository_paths: false,
+                workspace_file_read: false,
+            },
+        ).await;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    fn workspace_file_frame(path: RepositoryPath) -> C2ServerFrame {
+        C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(3),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                response: Ok(C2NodeResponse::WorkspaceFileRead {
+                    file: WorkspaceFileRead {
+                        workspace_id: gate4agent_node_protocol::WorkspaceId::new("repo").unwrap(),
+                        path,
+                        content: WorkspaceFileContent::Utf8 {
+                            text: "hello\n".to_owned(),
+                            byte_len: 6,
+                        },
+                    },
+                }),
+            }),
+        })
+    }
+
+    #[test]
+    fn c2_workspace_file_read_gate_requires_file_and_tagged_path_capabilities() {
+        let utf8_request = NodeRequest::ReadWorkspaceFile {
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("repo").unwrap(),
+            path: repository_path("src/lib.rs"),
+        };
+        let tagged_request = NodeRequest::ReadWorkspaceFile {
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("repo").unwrap(),
+            path: tagged_repository_path(),
+        };
+        let no_file_read = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: false,
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&utf8_request, no_file_read),
+            Some(C2RelayFailure { code: C2RelayFailureCode::RequestForbidden, .. })
+        ));
+        let no_repository_path = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: false,
+            workspace_file_read: true,
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&tagged_request, no_repository_path),
+            Some(C2RelayFailure { code: C2RelayFailureCode::RequestForbidden, .. })
+        ));
+        let all = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+        };
+        assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
+        assert!(server_frame_contains_workspace_file_read(
+            &workspace_file_frame(repository_path("src/lib.rs")),
+        ));
+        assert!(server_frame_contains_unix_repository_path(
+            &workspace_file_frame(tagged_repository_path()),
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_writer_fails_closed_before_unnegotiated_workspace_file_read_write() {
+        let frame = workspace_file_frame(repository_path("src/lib.rs"));
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender.send(queued(frame, &budget).unwrap()).await.unwrap();
+        drop(sender);
+        let (disconnect, _disconnected) = watch::channel(false);
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: true,
+                repository_paths: true,
+                workspace_file_read: false,
             },
         ).await;
         let mut bytes = Vec::new();

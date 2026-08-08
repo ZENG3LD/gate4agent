@@ -1155,6 +1155,7 @@ async fn publish_c2_response(
             )
             .await;
         }
+        C2NodeResponse::WorkspaceFileRead { .. } => {}
         C2NodeResponse::SpawnAccepted { session } => {
             send_update(updates, WorkerUpdate::OpenSession(project_wire_address(node_id, session))).await;
         }
@@ -1757,6 +1758,7 @@ async fn request_and_publish(
             )
             .await;
         }
+        NodeResponse::WorkspaceFileRead { .. } => {}
         NodeResponse::Controller { controller } => {
             *controller_owned = owns_controller(&controller, connection_id);
         }
@@ -2617,6 +2619,7 @@ fn safe_client_error(error: &NodeClientError) -> &'static str {
         NodeClientError::Protocol(_) => "node protocol mismatch",
         NodeClientError::AuthenticationTimedOut => "authentication timed out",
         NodeClientError::Authentication(_) => "authentication unavailable",
+        NodeClientError::UnsupportedCapability(_) => "required capability unavailable",
         NodeClientError::RequestIdExhausted => "request counter exhausted",
     }
 }
@@ -2624,11 +2627,18 @@ fn safe_client_error(error: &NodeClientError) -> &'static str {
 fn safe_node_failure_code(code: NodeFailureCode) -> &'static str {
     match code {
         NodeFailureCode::InvalidRequest => "invalid request",
+        NodeFailureCode::UnsupportedCapability => "required capability unavailable",
         NodeFailureCode::Unauthorized => "authentication rejected",
         NodeFailureCode::ObserverReadOnly => "operator access required",
         NodeFailureCode::ControllerBusy => "controller busy",
         NodeFailureCode::ControllerRequired => "controller required",
         NodeFailureCode::UnknownWorkspace => "workspace unavailable",
+        NodeFailureCode::InvalidRepositoryPath => "repository path invalid",
+        NodeFailureCode::RepositoryFileNotFound => "repository file unavailable",
+        NodeFailureCode::RepositoryFileNotRegular => "repository path is not a regular file",
+        NodeFailureCode::RepositoryPathUnsafe => "repository path is unsafe",
+        NodeFailureCode::RepositoryFileReadTimedOut => "repository file read timed out",
+        NodeFailureCode::RepositoryFileReadFailed => "repository file read failed",
         NodeFailureCode::InvalidWorkspaceRoot => "workspace root invalid",
         NodeFailureCode::DuplicateWorkspaceId => "workspace ID already registered",
         NodeFailureCode::DuplicateWorkspaceRoot => "workspace root already registered",
@@ -2654,7 +2664,10 @@ fn safe_node_failure_code(code: NodeFailureCode) -> &'static str {
 }
 
 fn is_transport_error(error: &NodeClientError) -> bool {
-    !matches!(error, NodeClientError::Node(_))
+    !matches!(
+        error,
+        NodeClientError::Node(_) | NodeClientError::UnsupportedCapability(_)
+    )
 }
 
 async fn disconnected(updates: &mpsc::Sender<WorkerUpdate>, endpoint: &NodeEndpoint, reason: &str) {

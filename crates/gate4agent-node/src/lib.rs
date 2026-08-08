@@ -7,6 +7,9 @@ mod git_worktree;
 mod session_registry;
 
 #[cfg(windows)]
+mod workspace_file_windows;
+
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]

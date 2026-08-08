@@ -6,6 +6,7 @@ use gate4agent_c2_protocol::{
     ProtocolRange, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
+    C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -36,11 +37,14 @@ const OPAQUE_UNIX_PATH_NOT_NEGOTIATED: &str =
     "opaque Unix paths require negotiated C2 capability";
 const REPOSITORY_PATH_NOT_NEGOTIATED: &str =
     "tagged repository paths require negotiated C2 capability";
+const WORKSPACE_FILE_READ_NOT_NEGOTIATED: &str =
+    "workspace file reads require negotiated C2 capability";
 
 #[derive(Clone, Copy)]
 struct NegotiatedPathCapabilities {
     opaque_host_paths: bool,
     repository_paths: bool,
+    workspace_file_read: bool,
 }
 
 #[derive(Clone)]
@@ -83,6 +87,7 @@ fn control_request_deadline(request: &NodeRequest) -> Duration {
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
         | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::RenameSessionRecord { .. }
@@ -225,6 +230,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
     })
@@ -273,6 +280,7 @@ fn negotiated_path_capabilities(
     NegotiatedPathCapabilities {
         opaque_host_paths: selected_has(C2_OPAQUE_UNIX_PATH_CAPABILITY),
         repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
+        workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
     }
 }
 
@@ -285,7 +293,52 @@ fn reject_unnegotiated_outbound_path(
             OPAQUE_UNIX_PATH_NOT_NEGOTIATED.to_owned(),
         ));
     }
+    let required_capability_available = match request.required_capability() {
+        None => true,
+        Some(C2_WORKSPACE_FILE_READ_CAPABILITY) => capabilities.workspace_file_read,
+        Some(_) => false,
+    };
+    if !required_capability_available {
+        return Err(C2ControlError::Protocol(
+            WORKSPACE_FILE_READ_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
+    if !capabilities.repository_paths && node_request_has_unix_repository_path(request) {
+        return Err(C2ControlError::Protocol(
+            REPOSITORY_PATH_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
+    match request {
+        NodeRequest::ReadWorkspaceFile { path, .. } => path.as_unix_bytes().is_some(),
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ResumeSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::Prompt { .. }
+        | NodeRequest::Paste { .. }
+        | NodeRequest::Input { .. }
+        | NodeRequest::TerminalBytes { .. }
+        | NodeRequest::TerminalControl { .. }
+        | NodeRequest::Resize { .. }
+        | NodeRequest::Interrupt { .. }
+        | NodeRequest::Stop { .. }
+        | NodeRequest::Remove { .. }
+        | NodeRequest::Shutdown => false,
+    }
 }
 
 fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
@@ -298,6 +351,7 @@ fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
         | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
@@ -340,6 +394,7 @@ fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
             .worktrees
             .iter()
             .any(|worktree| worktree.path.as_unix_bytes().is_some()),
+        C2NodeResponse::WorkspaceFileRead { .. } => false,
         C2NodeResponse::WorkspaceRegistered { workspace } => {
             workspace.canonical_root.as_unix_bytes().is_some()
         }
@@ -380,6 +435,7 @@ fn c2_node_response_has_unix_repository_path(response: &C2NodeResponse) -> bool 
                     })
             })
         }
+        C2NodeResponse::WorkspaceFileRead { file } => file.path.as_unix_bytes().is_some(),
         C2NodeResponse::Snapshot { .. }
         | C2NodeResponse::Resync { .. }
         | C2NodeResponse::Controller { .. }
@@ -394,6 +450,12 @@ fn c2_node_response_has_unix_repository_path(response: &C2NodeResponse) -> bool 
         | C2NodeResponse::Accepted
         | C2NodeResponse::ShuttingDown => false,
     }
+}
+
+fn routed_response_requires_workspace_file_read(response: &RoutedNodeResponse) -> bool {
+    response.response.as_ref().is_ok_and(|response| {
+        matches!(response, C2NodeResponse::WorkspaceFileRead { .. })
+    })
 }
 
 fn node_snapshot_has_unix_bytes(snapshot: &gate4agent_c2_protocol::C2NodeSnapshot) -> bool {
@@ -523,6 +585,17 @@ async fn control_owner(
                             )));
                             break;
                         }
+                        if !path_capabilities.workspace_file_read
+                            && reply
+                                .result
+                                .as_ref()
+                                .is_ok_and(routed_response_requires_workspace_file_read)
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                WORKSPACE_FILE_READ_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
@@ -628,6 +701,7 @@ mod tests {
         ArchitectureId, C2GitSnapshot, C2WorkspaceInspection, C2WorkspaceSnapshot,
         HostDescriptor, NodeCursor, NodeId, OpaqueHostPath, OperatingSystemId,
         PathEncoding, PathSemantics, PathStyle, RepositoryPath,
+        WorkspaceFileContent, WorkspaceFileRead,
     };
     use gate4agent_node_protocol::{
         GitStatusEntry, NodeIncarnationId, WorkspaceEntry, WorkspaceEntryKind, WorkspaceId,
@@ -657,6 +731,7 @@ mod tests {
         NegotiatedPathCapabilities {
             opaque_host_paths: false,
             repository_paths: false,
+            workspace_file_read: false,
         }
     }
 
@@ -664,6 +739,7 @@ mod tests {
         NegotiatedPathCapabilities {
             opaque_host_paths: true,
             repository_paths: true,
+            workspace_file_read: true,
         }
     }
 
@@ -781,6 +857,7 @@ mod tests {
                 CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -890,6 +967,101 @@ mod tests {
         assert!(writer_rx.try_recv().is_err());
         drop(commands_tx);
         timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_workspace_file_read_before_write_and_stays_healthy() {
+        let (commands_tx, commands_rx) = mpsc::channel(2);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, no_path_capabilities(),
+        ));
+        let (read_tx, read_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::ReadWorkspaceFile {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                path: repository_path("src/lib.rs"),
+            },
+            reply: read_tx,
+        }).await.unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), read_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == WORKSPACE_FILE_READ_NOT_NEGOTIATED
+        ));
+        assert!(writer_rx.try_recv().is_err());
+
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: snapshot_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(reply(1)).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), snapshot_rx).await.unwrap().unwrap(),
+            Ok(RoutedNodeResponse { response: Ok(C2NodeResponse::Accepted), .. })
+        ));
+
+        drop(commands_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn tagged_workspace_file_read_requires_both_file_and_repository_capabilities() {
+        let request = NodeRequest::ReadWorkspaceFile {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            path: unix_repository_path(b"src/\xff"),
+        };
+        let missing_repository = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: false,
+            workspace_file_read: true,
+        };
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(&request, missing_repository),
+            Err(C2ControlError::Protocol(ref message))
+                if message == REPOSITORY_PATH_NOT_NEGOTIATED
+        ));
+        let missing_file_read = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: false,
+        };
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(&request, missing_file_read),
+            Err(C2ControlError::Protocol(ref message))
+                if message == WORKSPACE_FILE_READ_NOT_NEGOTIATED
+        ));
+        assert!(reject_unnegotiated_outbound_path(
+            &request,
+            all_path_capabilities(),
+        ).is_ok());
+    }
+
+    #[test]
+    fn workspace_file_read_response_is_gated_and_path_checked() {
+        let response = RoutedNodeResponse {
+            node_id: NodeId::new("node-a").unwrap(),
+            incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            response: Ok(C2NodeResponse::WorkspaceFileRead {
+                file: WorkspaceFileRead {
+                    workspace_id: WorkspaceId::new("primary").unwrap(),
+                    path: unix_repository_path(b"src/\xff"),
+                    content: WorkspaceFileContent::NonUtf8 { byte_len: 3 },
+                },
+            }),
+        };
+        assert!(routed_response_requires_workspace_file_read(&response));
+        assert!(routed_response_has_unix_repository_path(&response));
+        assert!(!routed_response_has_unix_bytes(&response));
     }
 
     #[tokio::test]

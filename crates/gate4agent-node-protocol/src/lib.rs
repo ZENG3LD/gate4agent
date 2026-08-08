@@ -23,6 +23,7 @@ pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
+pub const NODE_WORKSPACE_FILE_READ_CAPABILITY: &str = "workspace-file-read-v1";
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_PROVIDER_CONTRACT_REVISION_BYTES: usize = 128;
@@ -34,6 +35,7 @@ pub const MAX_NODE_TERMINAL_BYTES: usize = 64;
 pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
 pub const MAX_WORKSPACE_ROOT_BYTES: usize = gate4agent_types::WORKING_DIRECTORY_MAX_BYTES;
 pub const MAX_REPOSITORY_PATH_BYTES: usize = 1_024;
+pub const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
 pub const MAX_NODE_HELLO_FRAME_BYTES: usize = 8 * 1024;
 pub const NODE_AUTH_NONCE_BYTES: usize = 32;
 pub const NODE_AUTH_PROOF_BYTES: usize = 32;
@@ -1253,6 +1255,73 @@ pub struct WorkspaceInspection {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceFileRead {
+    pub workspace_id: WorkspaceId,
+    pub path: RepositoryPath,
+    pub content: WorkspaceFileContent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum WorkspaceFileContent {
+    Utf8 { text: String, byte_len: u32 },
+    NonUtf8 { byte_len: u32 },
+    TooLarge { limit_bytes: u32 },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum WorkspaceFileContentWire {
+    Utf8 { text: String, byte_len: u32 },
+    NonUtf8 { byte_len: u32 },
+    TooLarge { limit_bytes: u32 },
+}
+
+impl<'de> Deserialize<'de> for WorkspaceFileContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WorkspaceFileContentWire::deserialize(deserializer)?;
+        let limit_bytes = MAX_WORKSPACE_FILE_BYTES as u32;
+        match wire {
+            WorkspaceFileContentWire::Utf8 { text, byte_len } => {
+                let actual_bytes = text.len();
+                if actual_bytes > MAX_WORKSPACE_FILE_BYTES {
+                    return Err(serde::de::Error::custom(format!(
+                        "workspace file content length {actual_bytes} exceeds the {MAX_WORKSPACE_FILE_BYTES}-byte limit",
+                    )));
+                }
+                if u64::from(byte_len) != actual_bytes as u64 {
+                    return Err(serde::de::Error::custom(format!(
+                        "workspace file content declares {byte_len} bytes but contains {actual_bytes}",
+                    )));
+                }
+                Ok(Self::Utf8 { text, byte_len })
+            }
+            WorkspaceFileContentWire::NonUtf8 { byte_len } => {
+                if byte_len > limit_bytes {
+                    return Err(serde::de::Error::custom(format!(
+                        "workspace non-UTF-8 file length {byte_len} exceeds the {MAX_WORKSPACE_FILE_BYTES}-byte limit",
+                    )));
+                }
+                Ok(Self::NonUtf8 { byte_len })
+            }
+            WorkspaceFileContentWire::TooLarge {
+                limit_bytes: declared_limit,
+            } => {
+                if declared_limit != limit_bytes {
+                    return Err(serde::de::Error::custom(format!(
+                        "workspace file limit {declared_limit} does not match protocol limit {limit_bytes}",
+                    )));
+                }
+                Ok(Self::TooLarge { limit_bytes })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeSnapshot {
     pub node_id: NodeId,
     pub enabled_providers: Vec<AgentProvider>,
@@ -1345,6 +1414,10 @@ pub enum NodeRequest {
     Snapshot,
     Resync { after_sequence: u64 },
     InspectWorkspace { workspace_id: WorkspaceId },
+    ReadWorkspaceFile {
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+    },
     AcquireController { lease_ms: u64 },
     ReleaseController,
     RegisterWorkspace {
@@ -1401,6 +1474,38 @@ pub enum NodeRequest {
     Shutdown,
 }
 
+impl NodeRequest {
+    pub fn required_capability(&self) -> Option<&'static str> {
+        match self {
+            Self::ReadWorkspaceFile { .. } => Some(NODE_WORKSPACE_FILE_READ_CAPABILITY),
+            Self::Snapshot
+            | Self::Resync { .. }
+            | Self::InspectWorkspace { .. }
+            | Self::AcquireController { .. }
+            | Self::ReleaseController
+            | Self::RegisterWorkspace { .. }
+            | Self::UnregisterWorkspace { .. }
+            | Self::CreateWorktree { .. }
+            | Self::RemoveWorktree { .. }
+            | Self::Spawn { .. }
+            | Self::Resume { .. }
+            | Self::RenameSessionRecord { .. }
+            | Self::ResumeSessionRecord { .. }
+            | Self::ForgetSessionRecord { .. }
+            | Self::Prompt { .. }
+            | Self::Paste { .. }
+            | Self::Input { .. }
+            | Self::TerminalBytes { .. }
+            | Self::TerminalControl { .. }
+            | Self::Resize { .. }
+            | Self::Interrupt { .. }
+            | Self::Stop { .. }
+            | Self::Remove { .. }
+            | Self::Shutdown => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResponseEnvelope {
     pub request_id: u64,
@@ -1422,6 +1527,9 @@ pub enum NodeResponse {
     },
     WorkspaceInspected {
         inspection: WorkspaceInspection,
+    },
+    WorkspaceFileRead {
+        file: WorkspaceFileRead,
     },
     Controller {
         controller: Option<ControllerState>,
@@ -1467,11 +1575,18 @@ pub struct NodeFailure {
 #[serde(rename_all = "kebab-case")]
 pub enum NodeFailureCode {
     InvalidRequest,
+    UnsupportedCapability,
     Unauthorized,
     ObserverReadOnly,
     ControllerBusy,
     ControllerRequired,
     UnknownWorkspace,
+    InvalidRepositoryPath,
+    RepositoryFileNotFound,
+    RepositoryFileNotRegular,
+    RepositoryPathUnsafe,
+    RepositoryFileReadTimedOut,
+    RepositoryFileReadFailed,
     InvalidWorkspaceRoot,
     DuplicateWorkspaceId,
     DuplicateWorkspaceRoot,
@@ -2403,6 +2518,110 @@ mod tests {
         };
         let response_json = serde_json::to_string(&response).unwrap();
         assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn workspace_file_read_has_an_exact_capability_gated_wire_contract() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let path = repository_path("src/lib.rs");
+        let request = NodeRequest::ReadWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        };
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            request_json,
+            r#"{"kind":"read-workspace-file","workspace_id":"primary","path":"src/lib.rs"}"#,
+        );
+        assert_eq!(request.required_capability(), Some(NODE_WORKSPACE_FILE_READ_CAPABILITY));
+        assert_eq!(serde_json::from_str::<NodeRequest>(&request_json).unwrap(), request);
+
+        let response = NodeResponse::WorkspaceFileRead {
+            file: WorkspaceFileRead {
+                workspace_id,
+                path,
+                content: WorkspaceFileContent::Utf8 {
+                    text: "fn main() {}\n".to_owned(),
+                    byte_len: 13,
+                },
+            },
+        };
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            response_json,
+            r#"{"kind":"workspace-file-read","file":{"workspace_id":"primary","path":"src/lib.rs","content":{"kind":"utf8","text":"fn main() {}\n","byte_len":13}}}"#,
+        );
+        assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn workspace_file_read_worst_case_json_stays_within_the_server_frame_limit() {
+        let response = NodeResponse::WorkspaceFileRead {
+            file: WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                path: repository_path(&"x".repeat(MAX_REPOSITORY_PATH_BYTES)),
+                content: WorkspaceFileContent::Utf8 {
+                    text: "\0".repeat(MAX_WORKSPACE_FILE_BYTES),
+                    byte_len: u32::try_from(MAX_WORKSPACE_FILE_BYTES).unwrap(),
+                },
+            },
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(encoded.len() <= MAX_NODE_FRAME_BYTES, "{}", encoded.len());
+    }
+
+    #[test]
+    fn workspace_file_content_deserialization_rejects_unbounded_or_inconsistent_lengths() {
+        let valid = [
+            WorkspaceFileContent::Utf8 {
+                text: "тест".to_owned(),
+                byte_len: 8,
+            },
+            WorkspaceFileContent::NonUtf8 { byte_len: 17 },
+            WorkspaceFileContent::TooLarge {
+                limit_bytes: MAX_WORKSPACE_FILE_BYTES as u32,
+            },
+        ];
+        for content in valid {
+            let encoded = serde_json::to_string(&content).unwrap();
+            assert_eq!(
+                serde_json::from_str::<WorkspaceFileContent>(&encoded).unwrap(),
+                content,
+            );
+        }
+
+        let inconsistent = r#"{"kind":"utf8","text":"hello","byte_len":4}"#;
+        assert!(serde_json::from_str::<WorkspaceFileContent>(inconsistent).is_err());
+
+        let oversized_non_utf8 = format!(
+            r#"{{"kind":"non-utf8","byte_len":{}}}"#,
+            MAX_WORKSPACE_FILE_BYTES + 1,
+        );
+        assert!(serde_json::from_str::<WorkspaceFileContent>(&oversized_non_utf8).is_err());
+
+        let wrong_limit = r#"{"kind":"too-large","limit_bytes":1}"#;
+        assert!(serde_json::from_str::<WorkspaceFileContent>(wrong_limit).is_err());
+
+        let oversized_utf8 = WorkspaceFileContent::Utf8 {
+            text: "x".repeat(MAX_WORKSPACE_FILE_BYTES + 1),
+            byte_len: u32::try_from(MAX_WORKSPACE_FILE_BYTES + 1).unwrap(),
+        };
+        let encoded = serde_json::to_string(&oversized_utf8).unwrap();
+        assert!(serde_json::from_str::<WorkspaceFileContent>(&encoded).is_err());
+    }
+
+    #[test]
+    fn legacy_requests_do_not_acquire_a_new_required_capability() {
+        let legacy_requests = [
+            NodeRequest::Snapshot,
+            NodeRequest::Resync { after_sequence: 7 },
+            NodeRequest::InspectWorkspace {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+            },
+        ];
+        for request in legacy_requests {
+            assert_eq!(request.required_capability(), None);
+        }
     }
 
     #[test]

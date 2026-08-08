@@ -9,6 +9,7 @@ use gate4agent_node_protocol::{
     NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_REPOSITORY_PATH_CAPABILITY,
+    NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
 use std::collections::VecDeque;
@@ -32,6 +33,7 @@ pub struct NamedPipeNodeClient {
     hello: NodeHello,
     opaque_unix_paths_enabled: bool,
     repository_paths_enabled: bool,
+    negotiated_capabilities: Vec<CapabilityId>,
     next_request_id: u64,
     pending_events: VecDeque<NodeEventEnvelope>,
 }
@@ -161,6 +163,9 @@ impl NamedPipeNodeClient {
         let repository_paths_enabled = selected_supports_repository_paths(
             hello.compatibility.as_ref(),
         );
+        let negotiated_capabilities = hello.compatibility.as_ref()
+            .map(|compatibility| compatibility.capabilities.clone())
+            .unwrap_or_default();
         ensure_node_hello_path_capability(&hello, opaque_unix_paths_enabled)?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
@@ -174,6 +179,7 @@ impl NamedPipeNodeClient {
             hello,
             opaque_unix_paths_enabled,
             repository_paths_enabled,
+            negotiated_capabilities,
             next_request_id: 1,
             pending_events: VecDeque::new(),
         })
@@ -184,12 +190,13 @@ impl NamedPipeNodeClient {
     }
 
     pub async fn send(&mut self, request: NodeRequest) -> Result<u64, NodeClientError> {
-        ensure_node_request_path_capability(&request, self.opaque_unix_paths_enabled)?;
-        let request_id = self.next_request_id;
-        self.next_request_id = self
-            .next_request_id
-            .checked_add(1)
-            .ok_or(NodeClientError::RequestIdExhausted)?;
+        let request_id = reserve_request_id(
+            &mut self.next_request_id,
+            &request,
+            self.opaque_unix_paths_enabled,
+            self.repository_paths_enabled,
+            &self.negotiated_capabilities,
+        )?;
         write_json_frame_limited(
             &mut self.pipe,
             &ClientFrame::Request(RequestEnvelope {
@@ -209,6 +216,7 @@ impl NamedPipeNodeClient {
             Duration::from_millis(FRAME_BODY_TIMEOUT_MS),
         )
         .await?;
+        ensure_server_frame_required_capability(&frame, &self.negotiated_capabilities)?;
         ensure_server_frame_path_capability(
             &frame,
             self.opaque_unix_paths_enabled,
@@ -278,6 +286,59 @@ fn selected_supports_repository_paths(
     })
 }
 
+fn reserve_request_id(
+    next_request_id: &mut u64,
+    request: &NodeRequest,
+    opaque_unix_paths_enabled: bool,
+    repository_paths_enabled: bool,
+    negotiated_capabilities: &[CapabilityId],
+) -> Result<u64, NodeClientError> {
+    ensure_node_request_required_capability(request, negotiated_capabilities)?;
+    ensure_node_request_path_capability(
+        request,
+        opaque_unix_paths_enabled,
+        repository_paths_enabled,
+    )?;
+    let request_id = *next_request_id;
+    *next_request_id = next_request_id
+        .checked_add(1)
+        .ok_or(NodeClientError::RequestIdExhausted)?;
+    Ok(request_id)
+}
+
+fn ensure_node_request_required_capability(
+    request: &NodeRequest,
+    negotiated_capabilities: &[CapabilityId],
+) -> Result<(), NodeClientError> {
+    if let Some(required) = request.required_capability() {
+        if !negotiated_capabilities.iter().any(|capability| capability.as_str() == required) {
+            return Err(NodeClientError::UnsupportedCapability(required.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_server_frame_required_capability(
+    frame: &ServerFrame,
+    negotiated_capabilities: &[CapabilityId],
+) -> Result<(), NodeClientError> {
+    let requires_workspace_file_read = matches!(
+        frame,
+        ServerFrame::Reply(reply)
+            if matches!(reply.result.as_ref(), Ok(NodeResponse::WorkspaceFileRead { .. }))
+    );
+    if requires_workspace_file_read
+        && !negotiated_capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_WORKSPACE_FILE_READ_CAPABILITY
+        })
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_WORKSPACE_FILE_READ_CAPABILITY.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_node_hello_path_capability(
     hello: &NodeHello,
     opaque_unix_paths_enabled: bool,
@@ -291,10 +352,15 @@ fn ensure_node_hello_path_capability(
 fn ensure_node_request_path_capability(
     request: &NodeRequest,
     opaque_unix_paths_enabled: bool,
+    repository_paths_enabled: bool,
 ) -> Result<(), NodeClientError> {
     ensure_opaque_unix_path_capability(
         node_request_contains_opaque_unix_path(request),
         opaque_unix_paths_enabled,
+    )?;
+    ensure_repository_path_capability(
+        node_request_contains_tagged_repository_path(request),
+        repository_paths_enabled,
     )
 }
 
@@ -349,9 +415,40 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
         | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ResumeSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::Prompt { .. }
+        | NodeRequest::Paste { .. }
+        | NodeRequest::Input { .. }
+        | NodeRequest::TerminalBytes { .. }
+        | NodeRequest::TerminalControl { .. }
+        | NodeRequest::Resize { .. }
+        | NodeRequest::Interrupt { .. }
+        | NodeRequest::Stop { .. }
+        | NodeRequest::Remove { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
+fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
+    match request {
+        NodeRequest::ReadWorkspaceFile { path, .. } => path.as_unix_bytes().is_some(),
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::Spawn { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
@@ -402,6 +499,7 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
                     })
             })
         }
+        NodeResponse::WorkspaceFileRead { file } => file.path.as_unix_bytes().is_some(),
         NodeResponse::Snapshot { .. }
         | NodeResponse::Resync { .. }
         | NodeResponse::Controller { .. }
@@ -432,6 +530,7 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         NodeResponse::WorkspaceInspected { inspection } => inspection.git.worktrees
             .iter()
             .any(|worktree| worktree.path.as_unix_bytes().is_some()),
+        NodeResponse::WorkspaceFileRead { .. } => false,
         NodeResponse::SessionRecordUpdated { record }
         | NodeResponse::SessionRecordResumed { record, .. } => {
             record.canonical_root.as_unix_bytes().is_some()
@@ -496,6 +595,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeClientError> {
         NODE_COMPATIBILITY_METADATA_CAPABILITY,
         NODE_OPAQUE_UNIX_PATH_CAPABILITY,
         NODE_REPOSITORY_PATH_CAPABILITY,
+        NODE_WORKSPACE_FILE_READ_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -821,6 +921,8 @@ pub enum NodeClientError {
     Node(NodeFailure),
     #[error("node protocol failed: {0}")]
     Protocol(String),
+    #[error("node capability was not negotiated: {0}")]
+    UnsupportedCapability(String),
     #[error("node authentication frame was not received before the bounded deadline")]
     AuthenticationTimedOut,
     #[error("node authentication primitive failed: {0}")]
@@ -838,7 +940,8 @@ mod tests {
         LocalTransportKind, ManagedSessionRecord, ManagedSessionState,
         NodeCompatibilitySupport, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics,
         PathStyle, RepositoryPath, ResponseEnvelope, SessionMode, SessionRecordId, WorkspaceEntry,
-        WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
+        WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
+        WorkspaceInspection, WorkspaceSnapshot,
     };
 
     fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
@@ -964,6 +1067,9 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_REPOSITORY_PATH_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
             ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2).unwrap(),
@@ -995,6 +1101,63 @@ mod tests {
     }
 
     #[test]
+    fn unnegotiated_workspace_file_read_is_rejected_before_consuming_a_request_id() {
+        let request = NodeRequest::ReadWorkspaceFile {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            path: utf8_repository_path("src/lib.rs"),
+        };
+        let mut next_request_id = 41;
+        let no_capabilities = Vec::new();
+        let error = reserve_request_id(
+            &mut next_request_id,
+            &request,
+            false,
+            false,
+            &no_capabilities,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeClientError::UnsupportedCapability(capability)
+                if capability == NODE_WORKSPACE_FILE_READ_CAPABILITY
+        ));
+        assert_eq!(next_request_id, 41);
+
+        let file_read_capabilities = vec![
+            CapabilityId::new(NODE_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
+        ];
+        let request_id = reserve_request_id(
+            &mut next_request_id,
+            &request,
+            false,
+            false,
+            &file_read_capabilities,
+        )
+        .unwrap();
+        assert_eq!(request_id, 41);
+        assert_eq!(next_request_id, 42);
+    }
+
+    #[test]
+    fn unnegotiated_workspace_file_response_is_rejected_before_exposure() {
+        let frame = response_frame(NodeResponse::WorkspaceFileRead {
+            file: WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                path: utf8_repository_path("src/lib.rs"),
+                content: WorkspaceFileContent::Utf8 {
+                    text: "hello".to_owned(),
+                    byte_len: 5,
+                },
+            },
+        });
+        assert!(ensure_server_frame_required_capability(&frame, &[]).is_err());
+        let capabilities = vec![
+            CapabilityId::new(NODE_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
+        ];
+        assert!(ensure_server_frame_required_capability(&frame, &capabilities).is_ok());
+    }
+
+    #[test]
     fn malicious_legacy_hello_with_unix_path_is_rejected_before_exposure() {
         let mut snapshot = empty_snapshot();
         snapshot.workspaces.push(workspace_with_path(unix_path()));
@@ -1021,6 +1184,7 @@ mod tests {
                 workspace_id: WorkspaceId::new("workspace-a").unwrap(),
                 root: utf8_path(),
             },
+            false,
             false,
         )
         .is_ok());
@@ -1055,10 +1219,17 @@ mod tests {
         ];
 
         for request in requests {
-            assert!(ensure_node_request_path_capability(&request, false).is_err());
-            assert!(ensure_node_request_path_capability(&request, true).is_ok());
+            assert!(ensure_node_request_path_capability(&request, false, false).is_err());
+            assert!(ensure_node_request_path_capability(&request, true, false).is_ok());
         }
-        assert!(ensure_node_request_path_capability(&NodeRequest::Snapshot, false).is_ok());
+        assert!(ensure_node_request_path_capability(&NodeRequest::Snapshot, false, false).is_ok());
+
+        let tagged_file_read = NodeRequest::ReadWorkspaceFile {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            path: tagged_repository_path(b"src/\xff"),
+        };
+        assert!(ensure_node_request_path_capability(&tagged_file_read, false, false).is_err());
+        assert!(ensure_node_request_path_capability(&tagged_file_read, false, true).is_ok());
     }
 
     #[test]
@@ -1205,6 +1376,16 @@ mod tests {
             assert!(ensure_server_frame_path_capability(&frame, false, false).is_err());
             assert!(ensure_server_frame_path_capability(&frame, false, true).is_ok());
         }
+
+        let file_frame = response_frame(NodeResponse::WorkspaceFileRead {
+            file: WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                path: tagged_repository_path(b"src/\xff"),
+                content: WorkspaceFileContent::NonUtf8 { byte_len: 3 },
+            },
+        });
+        assert!(ensure_server_frame_path_capability(&file_frame, false, false).is_err());
+        assert!(ensure_server_frame_path_capability(&file_frame, false, true).is_ok());
     }
 
     #[test]

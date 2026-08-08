@@ -3,7 +3,8 @@
 use gate4agent_c2::protocol::{
     C2NodeEvent, C2NodeResponse, C2RelayFailureCode, NodeId, NodeRoute, NodeTransportState,
     PathStyle, C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
-    C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY, RepositoryPath,
+    C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
+    C2_WORKSPACE_FILE_READ_CAPABILITY, RepositoryPath, WorkspaceFileContent,
 };
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
@@ -175,7 +176,7 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     let compatibility = control.hello().compatibility.as_ref()
         .expect("negotiated C2 compatibility metadata");
     assert_eq!(compatibility.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
-    assert_eq!(compatibility.capabilities.len(), 3);
+    assert_eq!(compatibility.capabilities.len(), 4);
     assert_eq!(
         compatibility.capabilities[0].as_str(),
         C2_COMPATIBILITY_METADATA_CAPABILITY,
@@ -187,6 +188,10 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     assert_eq!(
         compatibility.capabilities[2].as_str(),
         C2_REPOSITORY_PATH_CAPABILITY,
+    );
+    assert_eq!(
+        compatibility.capabilities[3].as_str(),
+        C2_WORKSPACE_FILE_READ_CAPABILITY,
     );
     assert_eq!(compatibility.host.operating_system.as_str(), "windows");
     assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);
@@ -258,6 +263,37 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
         .expect("real C2 relay inspection omitted Cargo.toml");
     assert_eq!(relayed_repository_path.relative_path.as_utf8(), Some("Cargo.toml"));
     assert_eq!(relayed_repository_path.relative_path.as_unix_bytes(), None);
+
+    let expected_file_path = RepositoryPath::utf8("Cargo.toml".to_owned()).unwrap();
+    let expected_file_text = std::fs::read_to_string(
+        std::env::current_dir().unwrap().join("Cargo.toml"),
+    ).unwrap();
+    let read = control.request(
+        route_a.clone(),
+        NodeRequest::ReadWorkspaceFile {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            path: expected_file_path.clone(),
+        },
+    ).await.unwrap();
+    match read.response {
+        Ok(C2NodeResponse::WorkspaceFileRead { file }) => {
+            assert_eq!(file.workspace_id, WorkspaceId::new("primary").unwrap());
+            assert_eq!(file.path, expected_file_path);
+            assert_eq!(file.content, WorkspaceFileContent::Utf8 {
+                byte_len: expected_file_text.len() as u32,
+                text: expected_file_text,
+            });
+        }
+        response => panic!("unexpected workspace file response: {response:?}"),
+    }
+    let post_read = control.request(route_a.clone(), NodeRequest::Snapshot).await.unwrap();
+    assert!(matches!(post_read.response,
+        Ok(C2NodeResponse::Snapshot { controller: None, .. })
+    ));
+    assert!(matches!(
+        control.request(route_b.clone(), NodeRequest::Snapshot).await.unwrap().response,
+        Ok(C2NodeResponse::Snapshot { .. })
+    ));
 
     let added_id = WorkspaceId::new("relay-added").unwrap();
     let added = control.request(route_a.clone(), NodeRequest::RegisterWorkspace {

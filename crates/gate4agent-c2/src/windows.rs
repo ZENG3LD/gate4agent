@@ -546,6 +546,7 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
         | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::RenameSessionRecord { .. }
@@ -631,11 +632,13 @@ async fn handle_relay_command(
                         let _ = reply.send(Err(relay_failure(C2RelayFailureCode::RelayBusy, "node controller lease is unavailable", Some(incarnation_id))));
                         return Ok(());
                     }
-                    Err(NodeClientError::Node(failure)) => {
+                    Err(error) if relay_node_failure(&error).is_some() => {
+                        let failure = relay_node_failure(&error)
+                            .expect("guarded node request failure");
                         let _ = reply.send(Ok(RoutedNodeResponse {
                             node_id: node_id.clone(),
                             incarnation_id,
-                            response: Err(C2NodeFailure::from(&failure)),
+                            response: Err(failure),
                         }));
                         return Ok(());
                     }
@@ -648,6 +651,16 @@ async fn handle_relay_command(
             let response = match bounded_node_request_with_deadline(client, request, relay_deadline).await {
                 Ok(response) => Ok(response),
                 Err(NodeClientError::Node(failure)) => Err(failure),
+                Err(error @ NodeClientError::UnsupportedCapability(_)) => {
+                    let failure = relay_node_failure(&error)
+                        .expect("unsupported capability is a routed node failure");
+                    let _ = reply.send(Ok(RoutedNodeResponse {
+                        node_id: node_id.clone(),
+                        incarnation_id,
+                        response: Err(failure),
+                    }));
+                    return Ok(());
+                }
                 Err(error) => {
                     let _ = reply.send(Err(relay_failure(C2RelayFailureCode::NodeOffline, "node relay disconnected", Some(incarnation_id))));
                     return Err(error);
@@ -665,8 +678,29 @@ async fn handle_relay_command(
     Ok(())
 }
 
+fn relay_node_failure(error: &NodeClientError) -> Option<C2NodeFailure> {
+    match error {
+        NodeClientError::Node(failure) => Some(C2NodeFailure::from(failure)),
+        NodeClientError::UnsupportedCapability(_) => Some(C2NodeFailure {
+            code: NodeFailureCode::UnsupportedCapability,
+            message: "required capability unavailable".to_owned(),
+        }),
+        NodeClientError::Io(_)
+        | NodeClientError::Frame(_)
+        | NodeClientError::Protocol(_)
+        | NodeClientError::AuthenticationTimedOut
+        | NodeClientError::Authentication(_)
+        | NodeClientError::RequestIdExhausted => None,
+    }
+}
+
 fn is_read_only_request(request: &NodeRequest) -> bool {
-    matches!(request, NodeRequest::Snapshot | NodeRequest::Resync { .. } | NodeRequest::InspectWorkspace { .. })
+    matches!(request,
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
+    )
 }
 
 async fn acquire_controller(
@@ -860,6 +894,8 @@ fn sanitize_node_error(error: &NodeClientError) -> (SanitizedError, bool) {
             (C2ErrorCategory::Authentication, "node authentication failed", true),
         NodeClientError::Protocol(_) | NodeClientError::Frame(FrameError::Json(_) | FrameError::InvalidLength { .. }) =>
             (C2ErrorCategory::Protocol, "node protocol failed", true),
+        NodeClientError::UnsupportedCapability(_) =>
+            (C2ErrorCategory::Protocol, "node capability unavailable", true),
         NodeClientError::Node(failure) if failure.code == NodeFailureCode::Unauthorized =>
             (C2ErrorCategory::Authentication, "node request authentication failed", true),
         NodeClientError::Node(_) =>
@@ -1186,6 +1222,37 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(node_request_deadline(&forget), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn workspace_file_reads_are_read_only_with_five_second_deadline() {
+        let request = NodeRequest::ReadWorkspaceFile {
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("primary").unwrap(),
+            path: gate4agent_node_protocol::RepositoryPath::utf8(
+                "src/lib.rs".to_owned(),
+            ).unwrap(),
+        };
+
+        assert!(is_read_only_request(&request));
+        assert_eq!(node_request_deadline(&request), Duration::from_secs(5));
+        assert!(relay_request_deadline(&request, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn unsupported_node_capability_is_correlated_without_offline_classification() {
+        let error = NodeClientError::UnsupportedCapability(
+            "workspace-file-read-v1-private-detail".to_owned(),
+        );
+        let failure = relay_node_failure(&error)
+            .expect("unsupported node capability must remain an in-band node failure");
+
+        assert_eq!(failure.code, NodeFailureCode::UnsupportedCapability);
+        assert_eq!(failure.message, "required capability unavailable");
+        assert!(!failure.message.contains("private-detail"));
+        assert!(relay_node_failure(&NodeClientError::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "transport closed",
+        ))).is_none());
     }
 
     async fn raw_request(request: Vec<u8>, status: StatusResponse) -> Vec<u8> {

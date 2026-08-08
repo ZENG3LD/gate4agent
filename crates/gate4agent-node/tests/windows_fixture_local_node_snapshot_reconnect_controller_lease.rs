@@ -201,7 +201,7 @@ async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility
             .iter()
             .map(|capability| capability.as_str())
             .collect::<Vec<_>>(),
-        vec!["compatibility.metadata"],
+        vec!["compatibility.metadata", "workspace-file-read-v1"],
     );
     assert_eq!(compatibility.host.operating_system.as_str(), "windows");
     assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);

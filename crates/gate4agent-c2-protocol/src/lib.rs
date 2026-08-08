@@ -4,7 +4,7 @@ pub use gate4agent_node_protocol::{
     ArchitectureId, CapabilityId, ClientCompatibilityOffer, HostDescriptor,
     NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
-    RepositoryPath,
+    RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     ProtocolNegotiationError, ProtocolRange,
 };
 use gate4agent_node_protocol::{
@@ -27,6 +27,8 @@ pub const C2_OPAQUE_UNIX_PATH_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_OPAQUE_UNIX_PATH_CAPABILITY;
 pub const C2_REPOSITORY_PATH_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_REPOSITORY_PATH_CAPABILITY;
+pub const C2_WORKSPACE_FILE_READ_CAPABILITY: &str =
+    gate4agent_node_protocol::NODE_WORKSPACE_FILE_READ_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -87,11 +89,18 @@ impl From<&NodeFailure> for C2NodeFailure {
         use gate4agent_node_protocol::NodeFailureCode;
         let message = match failure.code {
             NodeFailureCode::InvalidRequest => "invalid request",
+            NodeFailureCode::UnsupportedCapability => "required capability unavailable",
             NodeFailureCode::Unauthorized => "authentication rejected",
             NodeFailureCode::ObserverReadOnly => "operator access required",
             NodeFailureCode::ControllerBusy => "controller busy",
             NodeFailureCode::ControllerRequired => "controller required",
             NodeFailureCode::UnknownWorkspace => "workspace unavailable",
+            NodeFailureCode::InvalidRepositoryPath => "repository path invalid",
+            NodeFailureCode::RepositoryFileNotFound => "repository file unavailable",
+            NodeFailureCode::RepositoryFileNotRegular => "repository path is not a regular file",
+            NodeFailureCode::RepositoryPathUnsafe => "repository path is unsafe",
+            NodeFailureCode::RepositoryFileReadTimedOut => "repository file read timed out",
+            NodeFailureCode::RepositoryFileReadFailed => "repository file read failed",
             NodeFailureCode::InvalidWorkspaceRoot => "workspace root invalid",
             NodeFailureCode::DuplicateWorkspaceId => "workspace ID already registered",
             NodeFailureCode::DuplicateWorkspaceRoot => "workspace root already registered",
@@ -549,6 +558,9 @@ pub enum C2NodeResponse {
     WorkspaceInspected {
         inspection: C2WorkspaceInspection,
     },
+    WorkspaceFileRead {
+        file: WorkspaceFileRead,
+    },
     Controller {
         controller: Option<gate4agent_node_protocol::ControllerState>,
     },
@@ -590,6 +602,9 @@ impl From<&NodeResponse> for C2NodeResponse {
             },
             NodeResponse::WorkspaceInspected { inspection } => Self::WorkspaceInspected {
                 inspection: C2WorkspaceInspection::from(inspection),
+            },
+            NodeResponse::WorkspaceFileRead { file } => Self::WorkspaceFileRead {
+                file: file.clone(),
             },
             NodeResponse::Controller { controller } => Self::Controller {
                 controller: controller.clone(),
@@ -2015,6 +2030,39 @@ mod tests {
         assert!(inspection.git.worktrees[0].locked);
         assert!(inspection.git.worktrees[0].prunable);
         assert_eq!(inspection.git.worktrees[0].path.display_text(), r"C:\work\feature");
+    }
+
+    #[test]
+    fn routed_workspace_file_read_projects_only_correlated_operator_content() {
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let response = routed_response(NodeResponse::WorkspaceFileRead {
+            file: WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                path: path.clone(),
+                content: WorkspaceFileContent::Utf8 {
+                    text: "pub fn fixture() {}\n".to_owned(),
+                    byte_len: 20,
+                },
+            },
+        });
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("canonical_root"));
+        assert!(!json.contains("diagnostic"));
+        assert!(!json.contains("controller"));
+        assert!(!json.contains("inventory"));
+        assert!(!json.contains("event_sequence"));
+        let decoded = serde_json::from_str::<RoutedNodeResponse>(&json).unwrap();
+        assert_eq!(decoded.response, Ok(C2NodeResponse::WorkspaceFileRead {
+            file: WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                path,
+                content: WorkspaceFileContent::Utf8 {
+                    text: "pub fn fixture() {}\n".to_owned(),
+                    byte_len: 20,
+                },
+            },
+        }));
     }
 
     #[test]

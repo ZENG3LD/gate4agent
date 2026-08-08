@@ -3,7 +3,8 @@ use gate4agent_node_protocol::{
     write_json_frame_limited, CapabilityId, ClientAuthentication, ClientCompatibilityOffer,
     ClientFrame, ClientHello, ClientRole, FrameError, NegotiatedNodeCompatibility,
     NodeEvent, NodeEventEnvelope, NodeFailure, NodeHello, NodeId, NodeIncarnationId, NodeRequest,
-    NodeResponse, NodeSnapshot, ProtocolRange, RequestEnvelope, ServerFrame, StateSchemaSupport,
+    NodeResponse, NodeSnapshot, ProtocolRange, RequestEnvelope, ServerChallenge, ServerFrame,
+    StateSchemaSupport,
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
@@ -78,56 +79,16 @@ impl NamedPipeNodeClient {
                 "node protocol version mismatch".to_owned(),
             ));
         }
-        validate_selected_compatibility(
+        let authentication = prepare_negotiated_authentication(
+            &challenge,
             &compatibility_offer,
-            challenge.compatibility.as_ref(),
+            role,
+            &client_nonce,
+            access_token,
         )?;
-        let expected_server_proof = match challenge.compatibility.as_ref() {
-            Some(selected) => negotiated_auth_proof(
-                access_token.as_bytes(),
-                AuthDirection::Server,
-                role,
-                &client_nonce,
-                &challenge.server_nonce,
-                &compatibility_offer,
-                selected,
-            ),
-            None => auth_proof(
-                access_token.as_bytes(),
-                AuthDirection::Server,
-                role,
-                &client_nonce,
-                &challenge.server_nonce,
-            ),
-        }
-        .map_err(NodeClientError::Authentication)?;
-        if !proofs_match(&challenge.server_proof, &expected_server_proof) {
-            return Err(NodeClientError::Protocol(
-                "server failed access-token proof".to_owned(),
-            ));
-        }
-        let client_proof = match challenge.compatibility.as_ref() {
-            Some(selected) => negotiated_auth_proof(
-                access_token.as_bytes(),
-                AuthDirection::Client,
-                role,
-                &client_nonce,
-                &challenge.server_nonce,
-                &compatibility_offer,
-                selected,
-            ),
-            None => auth_proof(
-                access_token.as_bytes(),
-                AuthDirection::Client,
-                role,
-                &client_nonce,
-                &challenge.server_nonce,
-            ),
-        }
-        .map_err(NodeClientError::Authentication)?;
         write_json_frame_limited(
             &mut pipe,
-            &ClientFrame::Authenticate(ClientAuthentication { client_proof }),
+            &ClientFrame::Authenticate(authentication),
             MAX_NODE_HELLO_FRAME_BYTES,
         )
         .await?;
@@ -151,12 +112,15 @@ impl NamedPipeNodeClient {
                 "node protocol version mismatch".to_owned(),
             ));
         }
-        if hello.compatibility != challenge.compatibility {
-            return Err(NodeClientError::Protocol(
-                "node compatibility selection changed during authentication".to_owned(),
-            ));
-        }
-        validate_selected_compatibility(&compatibility_offer, hello.compatibility.as_ref())?;
+        validate_authenticated_hello_compatibility(
+            &compatibility_offer,
+            challenge.compatibility.as_ref().ok_or_else(|| {
+                NodeClientError::Protocol(
+                    "node omitted the required authenticated compatibility selection".to_owned(),
+                )
+            })?,
+            hello.compatibility.as_ref(),
+        )?;
         let opaque_unix_paths_enabled = selected_supports_opaque_unix_paths(
             hello.compatibility.as_ref(),
         );
@@ -605,13 +569,69 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeClientError> {
         .collect()
 }
 
+fn prepare_negotiated_authentication(
+    challenge: &ServerChallenge,
+    offer: &ClientCompatibilityOffer,
+    role: ClientRole,
+    client_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
+    access_token: &str,
+) -> Result<ClientAuthentication, NodeClientError> {
+    let selected = challenge.compatibility.as_ref().ok_or_else(|| {
+        NodeClientError::Protocol(
+            "node omitted the required authenticated compatibility selection".to_owned(),
+        )
+    })?;
+    validate_selected_compatibility(offer, selected)?;
+    let expected_server_proof = negotiated_auth_proof(
+        access_token.as_bytes(),
+        AuthDirection::Server,
+        role,
+        client_nonce,
+        &challenge.server_nonce,
+        offer,
+        selected,
+    )
+    .map_err(NodeClientError::Authentication)?;
+    if !proofs_match(&challenge.server_proof, &expected_server_proof) {
+        return Err(NodeClientError::Protocol(
+            "server failed access-token proof".to_owned(),
+        ));
+    }
+    let client_proof = negotiated_auth_proof(
+        access_token.as_bytes(),
+        AuthDirection::Client,
+        role,
+        client_nonce,
+        &challenge.server_nonce,
+        offer,
+        selected,
+    )
+    .map_err(NodeClientError::Authentication)?;
+    Ok(ClientAuthentication { client_proof })
+}
+
+fn validate_authenticated_hello_compatibility(
+    offer: &ClientCompatibilityOffer,
+    challenge: &NegotiatedNodeCompatibility,
+    hello: Option<&NegotiatedNodeCompatibility>,
+) -> Result<(), NodeClientError> {
+    let hello = hello.ok_or_else(|| {
+        NodeClientError::Protocol(
+            "node hello omitted the required authenticated compatibility selection".to_owned(),
+        )
+    })?;
+    if hello != challenge {
+        return Err(NodeClientError::Protocol(
+            "node compatibility selection changed during authentication".to_owned(),
+        ));
+    }
+    validate_selected_compatibility(offer, hello)
+}
+
 fn validate_selected_compatibility(
     offer: &ClientCompatibilityOffer,
-    selected: Option<&NegotiatedNodeCompatibility>,
+    selected: &NegotiatedNodeCompatibility,
 ) -> Result<(), NodeClientError> {
-    let Some(selected) = selected else {
-        return Ok(());
-    };
     if selected.protocol_version != NODE_PROTOCOL_VERSION {
         return Err(NodeClientError::Protocol(format!(
             "node selected protocol version {} for active wire protocol {}",
@@ -632,6 +652,13 @@ fn validate_selected_compatibility(
     {
         return Err(NodeClientError::Protocol(
             "node selected a capability outside the client offer".to_owned(),
+        ));
+    }
+    if !selected.capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_COMPATIBILITY_METADATA_CAPABILITY
+    }) {
+        return Err(NodeClientError::Protocol(
+            "node omitted the required compatibility metadata capability".to_owned(),
         ));
     }
     if let Some(state_schema_version) = selected.state_schema_version {
@@ -1074,6 +1101,105 @@ mod tests {
             offer.state_schema.unwrap().versions,
             ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2).unwrap(),
         );
+    }
+
+    #[test]
+    fn hmac_valid_legacy_challenge_is_rejected_before_authenticate() {
+        let offer = client_compatibility_offer().unwrap();
+        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
+        let access_token = "strict-negotiation-token";
+        let server_proof = auth_proof(
+            access_token.as_bytes(),
+            AuthDirection::Server,
+            ClientRole::Observer,
+            &client_nonce,
+            &server_nonce,
+        )
+        .unwrap();
+        let challenge = ServerChallenge {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            server_nonce,
+            server_proof,
+            compatibility: None,
+        };
+
+        let result = prepare_negotiated_authentication(
+            &challenge,
+            &offer,
+            ClientRole::Observer,
+            &client_nonce,
+            access_token,
+        );
+        assert!(matches!(
+            result,
+            Err(NodeClientError::Protocol(message))
+                if message.contains("required authenticated compatibility selection")
+        ));
+    }
+
+    #[test]
+    fn hmac_valid_selection_without_compatibility_metadata_is_rejected() {
+        let (offer, mut selected) = negotiated_fixture();
+        selected.capabilities.clear();
+        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
+        let access_token = "strict-negotiation-token";
+        let server_proof = negotiated_auth_proof(
+            access_token.as_bytes(),
+            AuthDirection::Server,
+            ClientRole::Observer,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        let challenge = ServerChallenge {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            server_nonce,
+            server_proof,
+            compatibility: Some(selected),
+        };
+
+        let result = prepare_negotiated_authentication(
+            &challenge,
+            &offer,
+            ClientRole::Observer,
+            &client_nonce,
+            access_token,
+        );
+        assert!(matches!(
+            result,
+            Err(NodeClientError::Protocol(message))
+                if message.contains("required compatibility metadata capability")
+        ));
+    }
+
+    #[test]
+    fn node_hello_requires_the_same_nonempty_compatibility_selection() {
+        let (offer, selected) = negotiated_fixture();
+        assert!(validate_authenticated_hello_compatibility(
+            &offer,
+            &selected,
+            None,
+        )
+        .is_err());
+
+        let mut changed = selected.clone();
+        changed.path_semantics.style = PathStyle::Posix;
+        assert!(validate_authenticated_hello_compatibility(
+            &offer,
+            &selected,
+            Some(&changed),
+        )
+        .is_err());
+        assert!(validate_authenticated_hello_compatibility(
+            &offer,
+            &selected,
+            Some(&selected),
+        )
+        .is_ok());
     }
 
     #[test]

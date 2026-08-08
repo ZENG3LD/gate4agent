@@ -147,16 +147,21 @@ pub async fn connect_local(
     if challenge.protocol_version != C2_CONTROL_PROTOCOL_VERSION {
         return Err(C2ControlError::Protocol("C2 control protocol version mismatch".to_owned()));
     }
+    let selected = challenge.compatibility.as_ref().ok_or_else(|| {
+        C2ControlError::Protocol(
+            "C2 omitted the required authenticated compatibility selection".to_owned(),
+        )
+    })?;
     validate_selected_compatibility(
         &compatibility_offer,
-        challenge.compatibility.as_ref(),
+        Some(selected),
     )?;
     let expected_server = c2_proof(
         token,
         C2AuthDirection::Server,
         &client_nonce,
         &challenge.server_nonce,
-        challenge.compatibility.as_ref().map(|selected| (&compatibility_offer, selected)),
+        Some((&compatibility_offer, selected)),
     )?;
     if !proofs_match(&challenge.server_proof, &expected_server) {
         return Err(C2ControlError::Authentication("C2 server proof mismatch".to_owned()));
@@ -166,7 +171,7 @@ pub async fn connect_local(
         C2AuthDirection::Client,
         &client_nonce,
         &challenge.server_nonce,
-        challenge.compatibility.as_ref().map(|selected| (&compatibility_offer, selected)),
+        Some((&compatibility_offer, selected)),
     )?;
     timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
@@ -183,6 +188,11 @@ pub async fn connect_local(
             return Err(C2ControlError::Protocol("C2 control protocol version mismatch".to_owned())),
         _ => return Err(C2ControlError::Protocol("C2 did not return hello".to_owned())),
     };
+    if hello.compatibility.is_none() {
+        return Err(C2ControlError::Protocol(
+            "C2 omitted the authenticated compatibility selection from hello".to_owned(),
+        ));
+    }
     validate_selected_compatibility(&compatibility_offer, hello.compatibility.as_ref())?;
     if hello.compatibility != challenge.compatibility {
         return Err(C2ControlError::Protocol(
@@ -246,7 +256,11 @@ fn validate_selected_compatibility(
             "C2 compatibility offer excludes control protocol v2".to_owned(),
         ));
     }
-    let Some(selected) = selected else { return Ok(()); };
+    let Some(selected) = selected else {
+        return Err(C2ControlError::Protocol(
+            "C2 omitted the required authenticated compatibility selection".to_owned(),
+        ));
+    };
     if selected.protocol_version != C2_CONTROL_PROTOCOL_VERSION
         || !offer.protocol_versions.contains(selected.protocol_version)
     {
@@ -261,6 +275,15 @@ fn validate_selected_compatibility(
     {
         return Err(C2ControlError::Protocol(
             "C2 selected a capability outside the client offer".to_owned(),
+        ));
+    }
+    if !selected
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == C2_COMPATIBILITY_METADATA_CAPABILITY)
+    {
+        return Err(C2ControlError::Protocol(
+            "C2 omitted the required compatibility metadata capability".to_owned(),
         ));
     }
     Ok(())
@@ -699,13 +722,29 @@ mod tests {
     use super::*;
     use gate4agent_c2_protocol::{
         ArchitectureId, C2GitSnapshot, C2WorkspaceInspection, C2WorkspaceSnapshot,
-        HostDescriptor, NodeCursor, NodeId, OpaqueHostPath, OperatingSystemId,
-        PathEncoding, PathSemantics, PathStyle, RepositoryPath,
+        C2ServerChallenge, HostDescriptor, NodeCursor, NodeId, OpaqueHostPath,
+        OperatingSystemId, PathEncoding, PathSemantics, PathStyle, RepositoryPath,
         WorkspaceFileContent, WorkspaceFileRead,
     };
     use gate4agent_node_protocol::{
         GitStatusEntry, NodeIncarnationId, WorkspaceEntry, WorkspaceEntryKind, WorkspaceId,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    fn unique_control_endpoint() -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!(
+            r"\\.\pipe\gate4agent-c2-client-strict-{}-{now}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        )
+    }
 
     fn event(sequence: u64) -> OwnerInput {
         OwnerInput::Frame(C2ServerFrame::Event(RoutedNodeEvent {
@@ -861,7 +900,10 @@ mod tests {
             ],
         );
         assert_eq!(offer.state_schema, None);
-        assert!(validate_selected_compatibility(&offer, None).is_ok());
+        assert!(matches!(
+            validate_selected_compatibility(&offer, None),
+            Err(C2ControlError::Protocol(_)),
+        ));
     }
 
     #[test]
@@ -900,6 +942,101 @@ mod tests {
             validate_selected_compatibility(&offer, Some(&selected)),
             Err(C2ControlError::Protocol(_)),
         ));
+    }
+
+    #[test]
+    fn c2_control_client_requires_authenticated_compatibility_metadata() {
+        let offer = client_compatibility_offer().unwrap();
+        let selected = NegotiatedC2ControlCompatibility {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![
+                CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
+            ],
+            host: HostDescriptor {
+                operating_system: OperatingSystemId::new("windows").unwrap(),
+                architecture: ArchitectureId::new("x86_64").unwrap(),
+            },
+            path_semantics: PathSemantics {
+                style: PathStyle::Windows,
+                encoding: PathEncoding::Utf8,
+            },
+        };
+
+        assert!(matches!(
+            validate_selected_compatibility(&offer, Some(&selected)),
+            Err(C2ControlError::Protocol(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn negotiating_c2_client_rejects_hmac_valid_legacy_challenge_before_authenticate() {
+        let endpoint = unique_control_endpoint();
+        let token = "strict-negotiation-token";
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&endpoint)
+            .unwrap();
+        let server_task = tokio::spawn({
+            let token = token.to_owned();
+            async move {
+                server.connect().await.unwrap();
+                let frame = read_json_frame_limited_body_timeout::<_, C2ClientFrame>(
+                    &mut server,
+                    MAX_C2_AUTH_FRAME_BYTES,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                let C2ClientFrame::Hello(hello) = frame else {
+                    panic!("client did not send hello");
+                };
+                assert!(hello.compatibility.is_some());
+                let server_nonce = [7; C2_AUTH_NONCE_BYTES];
+                let server_proof = c2_proof(
+                    &token,
+                    C2AuthDirection::Server,
+                    &hello.client_nonce,
+                    &server_nonce,
+                    None,
+                )
+                .unwrap();
+                write_json_frame_limited(
+                    &mut server,
+                    &C2ServerFrame::Challenge(C2ServerChallenge {
+                        protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+                        server_nonce,
+                        server_proof,
+                        compatibility: None,
+                    }),
+                    MAX_C2_AUTH_FRAME_BYTES,
+                )
+                .await
+                .unwrap();
+                timeout(
+                    Duration::from_secs(1),
+                    read_json_frame_limited_body_timeout::<_, C2ClientFrame>(
+                        &mut server,
+                        MAX_C2_AUTH_FRAME_BYTES,
+                        Duration::from_secs(1),
+                    ),
+                )
+                .await
+            }
+        });
+
+        let error = match connect_local(&endpoint, token).await {
+            Ok(_) => panic!("negotiated client accepted a legacy challenge"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            C2ControlError::Protocol(ref message)
+                if message.contains("omitted the required authenticated compatibility selection")
+        ));
+        match server_task.await.unwrap() {
+            Ok(Ok(frame)) => panic!("client sent a post-challenge frame: {frame:?}"),
+            Ok(Err(_)) | Err(_) => {}
+        }
     }
 
     #[test]

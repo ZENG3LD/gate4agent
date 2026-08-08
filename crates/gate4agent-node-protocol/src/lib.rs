@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
 pub const NODE_PROTOCOL_VERSION: u16 = 8;
+pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
@@ -32,8 +33,6 @@ pub const NODE_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_CONTROLLER_LEASE_MS: u64 = 60_000;
 pub const MIN_CONTROLLER_LEASE_MS: u64 = 1_000;
 pub const DEFAULT_CONTROLLER_LEASE_MS: u64 = 15_000;
-pub const DEFAULT_NODE_ENDPOINT: &str = r"\\.\pipe\gate4agent-node";
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClientRole {

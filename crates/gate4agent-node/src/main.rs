@@ -1,7 +1,9 @@
 #[cfg(windows)]
-use gate4agent_node::{default_state_path, NodeServer, NodeServerConfig, WorkspaceConfig};
+use gate4agent_node::{
+    default_state_path, NodeServer, NodeServerConfig, WorkspaceConfig, DEFAULT_NODE_ENDPOINT,
+};
 #[cfg(windows)]
-use gate4agent_node::protocol::{NodeId, WorkspaceId, DEFAULT_NODE_ENDPOINT};
+use gate4agent_node::protocol::{NodeId, WorkspaceId};
 
 #[cfg(windows)]
 const NODE_TOKEN_ENV: &str = "GATE4AGENT_NODE_TOKEN";

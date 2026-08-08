@@ -12,7 +12,7 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{
     default_state_path, NodeServer, NodeServerConfig, NodeServerError, NodeShutdownHandle,
-    WorkspaceConfig,
+    WorkspaceConfig, DEFAULT_NODE_ENDPOINT,
 };
 
 pub use gate4agent_node_protocol as protocol;

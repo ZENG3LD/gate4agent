@@ -4,6 +4,7 @@ use gate4agent_node_protocol::{
     ClientFrame, ClientHello, ClientRole, FrameError, NegotiatedNodeCompatibility,
     NodeEventEnvelope, NodeFailure, NodeHello, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, ProtocolRange, RequestEnvelope, ServerFrame, StateSchemaSupport,
+    NODE_STATE_SCHEMA_V1,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION,
@@ -243,7 +244,7 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, NodeClientEr
             .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
         capabilities: baseline_capabilities()?,
         state_schema: Some(StateSchemaSupport {
-            versions: ProtocolRange::exact(1)
+            versions: ProtocolRange::exact(NODE_STATE_SCHEMA_V1)
                 .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
         }),
     })

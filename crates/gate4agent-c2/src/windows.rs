@@ -2,7 +2,7 @@ use crate::protocol::{
     C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
     NodeIncarnationId, NodeRequest, RoutedNodeEvent, RoutedNodeResponse,
     NodeTransportState, ObservedNode, ReadyResponse, SanitizedError, SlimNodeInventory,
-    StatusResponse, C2_API_VERSION, DEFAULT_C2_CONTROL_ENDPOINT, MAX_C2_ENDPOINT_BYTES, MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
+    StatusResponse, C2_API_VERSION, MAX_C2_ENDPOINT_BYTES, MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
 };
 use gate4agent_node_protocol::{ClientRole, FrameError, NodeEventEnvelope, NodeFailureCode, NodeResponse, NodeSnapshot};
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
@@ -27,6 +27,8 @@ const MAX_HTTP_CONNECTIONS: usize = 16;
 const RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 mod control;
+
+pub const DEFAULT_C2_CONTROL_ENDPOINT: &str = r"\\.\pipe\gate4agent-c2";
 
 #[derive(Clone)]
 pub struct C2NodeConfig {
@@ -1074,6 +1076,43 @@ mod tests {
     use gate4agent_node_protocol::SessionRecordId;
     use gate4agent_types::TerminalSize;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn windows_runtime_default_control_endpoint_is_exact_valid_and_distinct_from_a_node() {
+        assert_eq!(DEFAULT_C2_CONTROL_ENDPOINT, r"\\.\pipe\gate4agent-c2");
+        validate_control_endpoint(DEFAULT_C2_CONTROL_ENDPOINT).unwrap();
+        let node = C2NodeConfig::new(
+            NodeId::new("node-a").unwrap(),
+            r"\\.\pipe\gate4agent-node",
+            "safe-token",
+        )
+        .unwrap();
+        let config = C2Config::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "safe-token",
+            vec![node],
+        )
+        .unwrap();
+        assert_eq!(config.control_endpoint, DEFAULT_C2_CONTROL_ENDPOINT);
+        assert!(!config.nodes[0]
+            .endpoint
+            .eq_ignore_ascii_case(&config.control_endpoint));
+
+        let conflicting_node = C2NodeConfig::new(
+            NodeId::new("node-b").unwrap(),
+            DEFAULT_C2_CONTROL_ENDPOINT,
+            "safe-token",
+        )
+        .unwrap();
+        assert!(matches!(
+            C2Config::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "safe-token",
+                vec![conflicting_node],
+            ),
+            Err(C2ConfigError::ControlEndpointConflict)
+        ));
+    }
 
     #[test]
     fn state_gap_validation_distinguishes_eviction_and_non_contiguous_events() {

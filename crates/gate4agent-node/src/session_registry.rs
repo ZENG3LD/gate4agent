@@ -1,16 +1,18 @@
 use crate::protocol::{
     ManagedSessionRecord, ManagedSessionState, NodeId, WorkspaceId,
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
+    NODE_STATE_SCHEMA_V1,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const STATE_VERSION: u16 = 1;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PERSISTED_WORKSPACES: usize = 256;
 pub(crate) const MAX_MANAGED_SESSION_RECORDS: usize = 4_096;
@@ -125,6 +127,47 @@ struct PersistedNodeState {
     session_records: Vec<ManagedSessionRecord>,
 }
 
+#[derive(Deserialize)]
+struct PersistedNodeStateHeader {
+    version: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StateLoadRefusal {
+    UnsupportedSchema,
+    NodeIdentityMismatch,
+}
+
+#[derive(Debug)]
+enum StateLoadRefusalError {
+    UnsupportedSchema(u16),
+    NodeIdentityMismatch,
+}
+
+impl StateLoadRefusalError {
+    fn refusal(&self) -> StateLoadRefusal {
+        match self {
+            Self::UnsupportedSchema(_) => StateLoadRefusal::UnsupportedSchema,
+            Self::NodeIdentityMismatch => StateLoadRefusal::NodeIdentityMismatch,
+        }
+    }
+}
+
+impl fmt::Display for StateLoadRefusalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSchema(version) => {
+                write!(formatter, "unsupported durable state version {version}")
+            }
+            Self::NodeIdentityMismatch => {
+                formatter.write_str("durable state belongs to a different node")
+            }
+        }
+    }
+}
+
+impl StdError for StateLoadRefusalError {}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PersistedWorkspace {
     workspace_id: WorkspaceId,
@@ -151,6 +194,9 @@ pub(crate) fn load(path: Option<&Path>, expected_node_id: &NodeId) -> io::Result
     }
     match load_one(path, expected_node_id) {
         Ok(loaded) => Ok(loaded),
+        Err(primary_error) if is_authoritative_state_error(&primary_error) => {
+            Err(primary_error)
+        }
         Err(primary_error) => recover_from_copies(
             path,
             &pending_backup,
@@ -177,6 +223,9 @@ fn recover_from_copies(
                 loaded.warning = Some(DURABLE_STATE_RECOVERY_WARNING.to_owned());
                 return Ok(loaded);
             }
+            Err(error) if is_authoritative_state_error(&error) => {
+                return Err(error);
+            }
             Err(_) => {}
         }
     }
@@ -196,19 +245,12 @@ fn load_one(path: &Path, expected_node_id: &NodeId) -> io::Result<LoadedNodeStat
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err(invalid_data("durable state exceeds the bounded file size"));
     }
-    let state: PersistedNodeState = serde_json::from_slice(&bytes)
-        .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
-    if state.version != STATE_VERSION {
-        return Err(invalid_data(format!(
-            "unsupported durable state version {}",
-            state.version,
-        )));
-    }
+    let state = decode_persisted_state(&bytes)?;
     if &state.node_id != expected_node_id {
-        return Err(invalid_data(format!(
-            "durable state belongs to node '{}' instead of '{}'",
-            state.node_id, expected_node_id,
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            StateLoadRefusalError::NodeIdentityMismatch,
+        ));
     }
     if state.workspaces.len() > MAX_PERSISTED_WORKSPACES {
         return Err(invalid_data("durable state contains too many workspaces"));
@@ -268,6 +310,30 @@ fn load_one(path: &Path, expected_node_id: &NodeId) -> io::Result<LoadedNodeStat
     })
 }
 
+fn decode_persisted_state(bytes: &[u8]) -> io::Result<PersistedNodeState> {
+    let header: PersistedNodeStateHeader = serde_json::from_slice(bytes)
+        .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+    match header.version {
+        NODE_STATE_SCHEMA_V1 => serde_json::from_slice(bytes)
+            .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}"))),
+        version => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            StateLoadRefusalError::UnsupportedSchema(version),
+        )),
+    }
+}
+
+fn is_authoritative_state_error(error: &io::Error) -> bool {
+    state_load_refusal(error).is_some()
+}
+
+pub(crate) fn state_load_refusal(error: &io::Error) -> Option<StateLoadRefusal> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<StateLoadRefusalError>())
+        .map(StateLoadRefusalError::refusal)
+}
+
 pub(crate) fn save(
     path: Option<&Path>,
     node_id: &NodeId,
@@ -312,7 +378,7 @@ pub(crate) fn save(
         persisted_records.push(persisted);
     }
     let state = PersistedNodeState {
-        version: STATE_VERSION,
+        version: NODE_STATE_SCHEMA_V1,
         node_id: node_id.clone(),
         workspaces: workspaces
             .iter()
@@ -328,7 +394,15 @@ pub(crate) fn save(
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err(invalid_data("refusing to persist oversized durable state"));
     }
-    let previous_primary_valid = !path.exists() || load_one(path, node_id).is_ok();
+    let previous_primary_valid = if !path.exists() {
+        true
+    } else {
+        match load_one(path, node_id) {
+            Ok(_) => true,
+            Err(error) if is_authoritative_state_error(&error) => return Err(error),
+            Err(_) => false,
+        }
+    };
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
@@ -776,7 +850,7 @@ mod tests {
         record.provider_session.as_mut().unwrap().transcript_path =
             Some("C:\\private\\bearer-secret\nprovider-transcript.jsonl".to_owned());
         let legacy = PersistedNodeState {
-            version: STATE_VERSION,
+            version: NODE_STATE_SCHEMA_V1,
             node_id: node_id.clone(),
             workspaces: workspaces
                 .iter()
@@ -841,7 +915,7 @@ mod tests {
         duplicate.provider_session.as_mut().unwrap().transcript_path =
             Some(r"D:\another\transcript.jsonl".to_owned());
         let legacy = PersistedNodeState {
-            version: STATE_VERSION,
+            version: NODE_STATE_SCHEMA_V1,
             node_id: node_id.clone(),
             workspaces: workspaces
                 .iter()
@@ -898,6 +972,193 @@ mod tests {
         assert!(!loaded.warning.unwrap().contains(&path.to_string_lossy().into_owned()));
         assert_eq!(fs::read(&path).unwrap(), corrupt);
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn newer_primary_schema_refuses_without_falling_back_to_valid_v1_backup() {
+        let path = temp_path("newer-primary-schema");
+        let backup = sibling_path(&path, "bak");
+        let (node_id, workspaces, mut record) = fixture(&path);
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        record.display_name = "generation-2".to_owned();
+        record.updated_at_unix_ms += 1;
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        load_one(&backup, &node_id).unwrap();
+
+        let future = PersistedNodeState {
+            version: NODE_STATE_SCHEMA_V1 + 1,
+            node_id: node_id.clone(),
+            workspaces: workspaces
+                .iter()
+                .map(|(workspace_id, canonical_root)| PersistedWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    canonical_root: canonical_root.clone(),
+                })
+                .collect(),
+            session_records: vec![record.clone()],
+        };
+        let future_bytes = serde_json::to_vec_pretty(&future).unwrap();
+        fs::write(&path, &future_bytes).unwrap();
+        let backup_bytes = fs::read(&backup).unwrap();
+
+        let error = load(Some(&path), &node_id).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            state_load_refusal(&error),
+            Some(StateLoadRefusal::UnsupportedSchema),
+        );
+        assert_eq!(fs::read(&path).unwrap(), future_bytes);
+        assert_eq!(fs::read(&backup).unwrap(), backup_bytes);
+        let save_error = save(Some(&path), &node_id, &workspaces, &[record]).unwrap_err();
+        assert_eq!(save_error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(fs::read(&path).unwrap(), future_bytes);
+        assert_eq!(fs::read(&backup).unwrap(), backup_bytes);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn newer_pending_schema_refuses_without_skipping_to_older_backup() {
+        let path = temp_path("newer-pending-schema");
+        let backup = sibling_path(&path, "bak");
+        let pending_backup = sibling_path(&path, "pending-backup");
+        let (node_id, workspaces, mut record) = fixture(&path);
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        record.display_name = "generation-2".to_owned();
+        record.updated_at_unix_ms += 1;
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        load_one(&backup, &node_id).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let future = PersistedNodeState {
+            version: NODE_STATE_SCHEMA_V1 + 1,
+            node_id: node_id.clone(),
+            workspaces: workspaces
+                .iter()
+                .map(|(workspace_id, canonical_root)| PersistedWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    canonical_root: canonical_root.clone(),
+                })
+                .collect(),
+            session_records: vec![record],
+        };
+        let future_bytes = serde_json::to_vec_pretty(&future).unwrap();
+        fs::write(&pending_backup, &future_bytes).unwrap();
+        let backup_bytes = fs::read(&backup).unwrap();
+
+        let error = load(Some(&path), &node_id).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            state_load_refusal(&error),
+            Some(StateLoadRefusal::UnsupportedSchema),
+        );
+        assert_eq!(fs::read(&pending_backup).unwrap(), future_bytes);
+        assert_eq!(fs::read(&backup).unwrap(), backup_bytes);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn wrong_node_primary_refuses_without_falling_back_or_rewriting() {
+        let path = temp_path("wrong-node-primary");
+        let backup = sibling_path(&path, "bak");
+        let (node_id, workspaces, mut record) = fixture(&path);
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        record.display_name = "generation-2".to_owned();
+        record.updated_at_unix_ms += 1;
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        load_one(&backup, &node_id).unwrap();
+
+        let wrong_node = PersistedNodeState {
+            version: NODE_STATE_SCHEMA_V1,
+            node_id: NodeId::new("node-b").unwrap(),
+            workspaces: workspaces
+                .iter()
+                .map(|(workspace_id, canonical_root)| PersistedWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    canonical_root: canonical_root.clone(),
+                })
+                .collect(),
+            session_records: vec![record.clone()],
+        };
+        let wrong_node_bytes = serde_json::to_vec_pretty(&wrong_node).unwrap();
+        fs::write(&path, &wrong_node_bytes).unwrap();
+        let backup_bytes = fs::read(&backup).unwrap();
+
+        let error = load(Some(&path), &node_id).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            state_load_refusal(&error),
+            Some(StateLoadRefusal::NodeIdentityMismatch),
+        );
+        let save_error = save(Some(&path), &node_id, &workspaces, &[record]).unwrap_err();
+        assert_eq!(save_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), wrong_node_bytes);
+        assert_eq!(fs::read(&backup).unwrap(), backup_bytes);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn wrong_node_pending_refuses_without_skipping_to_older_backup() {
+        let path = temp_path("wrong-node-pending");
+        let backup = sibling_path(&path, "bak");
+        let pending_backup = sibling_path(&path, "pending-backup");
+        let (node_id, workspaces, mut record) = fixture(&path);
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        record.display_name = "generation-2".to_owned();
+        record.updated_at_unix_ms += 1;
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+        load_one(&backup, &node_id).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let wrong_node = PersistedNodeState {
+            version: NODE_STATE_SCHEMA_V1,
+            node_id: NodeId::new("node-b").unwrap(),
+            workspaces: workspaces
+                .iter()
+                .map(|(workspace_id, canonical_root)| PersistedWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    canonical_root: canonical_root.clone(),
+                })
+                .collect(),
+            session_records: vec![record],
+        };
+        let wrong_node_bytes = serde_json::to_vec_pretty(&wrong_node).unwrap();
+        fs::write(&pending_backup, &wrong_node_bytes).unwrap();
+        let backup_bytes = fs::read(&backup).unwrap();
+
+        let error = load(Some(&path), &node_id).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            state_load_refusal(&error),
+            Some(StateLoadRefusal::NodeIdentityMismatch),
+        );
+        assert_eq!(fs::read(&pending_backup).unwrap(), wrong_node_bytes);
+        assert_eq!(fs::read(&backup).unwrap(), backup_bytes);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn authoritative_refusals_are_typed_not_inferred_from_io_kinds() {
+        let generic_permission = io::Error::new(io::ErrorKind::PermissionDenied, "access denied");
+        let generic_unsupported = io::Error::new(io::ErrorKind::Unsupported, "operation unsupported");
+        assert_eq!(state_load_refusal(&generic_permission), None);
+        assert_eq!(state_load_refusal(&generic_unsupported), None);
+
+        let schema = io::Error::new(
+            io::ErrorKind::Unsupported,
+            StateLoadRefusalError::UnsupportedSchema(NODE_STATE_SCHEMA_V1 + 1),
+        );
+        let node = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            StateLoadRefusalError::NodeIdentityMismatch,
+        );
+        assert_eq!(
+            state_load_refusal(&schema),
+            Some(StateLoadRefusal::UnsupportedSchema),
+        );
+        assert_eq!(
+            state_load_refusal(&node),
+            Some(StateLoadRefusal::NodeIdentityMismatch),
+        );
     }
 
     #[test]

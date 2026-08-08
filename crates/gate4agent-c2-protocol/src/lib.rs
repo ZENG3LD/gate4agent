@@ -22,7 +22,6 @@ pub const C2_API_VERSION: u16 = 2;
 pub const DEFAULT_C2_API_LISTEN: &str = "127.0.0.1:18320";
 pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 2;
 pub const C2_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
-pub const DEFAULT_C2_CONTROL_ENDPOINT: &str = r"\\.\pipe\gate4agent-c2";
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;

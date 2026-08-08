@@ -22,7 +22,7 @@ use crate::protocol::{
     MIN_CONTROLLER_LEASE_MS,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES,
     MAX_NODE_HELLO_FRAME_BYTES, MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES,
-    MAX_WORKSPACE_ROOT_BYTES,
+    MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1,
 };
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
@@ -51,6 +51,8 @@ use tokio::time::{sleep, timeout};
 
 mod http_api;
 
+pub const DEFAULT_NODE_ENDPOINT: &str = r"\\.\pipe\gate4agent-node";
+
 const NODE_EVENT_HISTORY_MAX: usize = 4_096;
 const NODE_BROADCAST_CAPACITY: usize = 1_024;
 const CONTROL_EVENT_SUBSCRIPTION_CAPACITY: usize = 1_024;
@@ -72,7 +74,6 @@ const GIT_COMMIT_MAX_ENTRIES: usize = 12;
 const GIT_OUTPUT_MAX_BYTES: usize = 64 * 1_024;
 const GIT_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
 const GIT_COMMAND_TIMEOUT_MS: u64 = 1_500;
-const NODE_STATE_SCHEMA_VERSION: u16 = 1;
 const WORKSPACE_UNAVAILABLE_ERROR: &str = "workspace-unavailable";
 const PROVIDER_SESSION_SCOPE_CONFLICT_ERROR: &str = "provider-session-scope-conflict";
 const PROVIDER_SESSION_LIVE_CONFLICT_ERROR: &str = "provider-session-live-conflict";
@@ -84,6 +85,7 @@ const DURABLE_STATE_COMMIT_FAILED_ERROR: &str = "durable-state-commit-failed";
 const DURABLE_STATE_LOCK_FAILED_ERROR: &str = "durable-state-lock-failed";
 const DURABLE_STATE_LOAD_FAILED_ERROR: &str = "durable-state-load-failed";
 const DURABLE_STATE_CONFLICT_ERROR: &str = "durable-state-conflict";
+const DURABLE_STATE_SCHEMA_UNSUPPORTED_ERROR: &str = "durable-state-schema-unsupported";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceConfig {
@@ -355,9 +357,7 @@ impl NodeServer {
         let incarnation_id = random_incarnation_id()
             .map_err(NodeServerError::IncarnationIdentity)?;
         let loaded = session_registry::load(config.state_path.as_deref(), &config.node_id)
-            .map_err(|error| {
-                durable_state_server_error(error, DURABLE_STATE_LOAD_FAILED_ERROR)
-            })?;
+            .map_err(durable_state_load_error)?;
         let (workspaces, records, persistence_warning) =
             merge_durable_state(&config.workspaces, loaded)?;
         let shared = Arc::new(NodeShared::new_with_incarnation(
@@ -3075,7 +3075,7 @@ fn node_compatibility_support() -> Result<NodeCompatibilitySupport, NodeServerEr
         },
         local_transport: LocalTransportKind::WindowsNamedPipe,
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::exact(NODE_STATE_SCHEMA_VERSION)
+            versions: ProtocolRange::exact(NODE_STATE_SCHEMA_V1)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: Vec::new(),
@@ -3843,6 +3843,19 @@ fn durable_state_server_error(error: io::Error, category: &'static str) -> NodeS
     NodeServerError::DurableState(io::Error::new(error.kind(), category))
 }
 
+fn durable_state_load_error(error: io::Error) -> NodeServerError {
+    let category = match session_registry::state_load_refusal(&error) {
+        Some(session_registry::StateLoadRefusal::UnsupportedSchema) => {
+            DURABLE_STATE_SCHEMA_UNSUPPORTED_ERROR
+        }
+        Some(session_registry::StateLoadRefusal::NodeIdentityMismatch) => {
+            DURABLE_STATE_CONFLICT_ERROR
+        }
+        _ => DURABLE_STATE_LOAD_FAILED_ERROR,
+    };
+    durable_state_server_error(error, category)
+}
+
 fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3924,6 +3937,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_runtime_default_node_endpoint_is_exact_and_valid() {
+        assert_eq!(DEFAULT_NODE_ENDPOINT, r"\\.\pipe\gate4agent-node");
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let config = NodeServerConfig::new(
+            DEFAULT_NODE_ENDPOINT,
+            "fixture-token",
+            NodeId::new("node-1").unwrap(),
+            [workspace],
+        )
+        .unwrap();
+        assert_eq!(config.endpoint, DEFAULT_NODE_ENDPOINT);
+    }
+
+    #[test]
     fn public_node_failures_expose_only_fixed_categories() {
         let provider = failure(
             NodeFailureCode::BackendOperationFailed,
@@ -3938,6 +3969,14 @@ mod tests {
         ));
         assert_eq!(persistence.message, DURABLE_STATE_COMMIT_FAILED_ERROR);
         assert!(!persistence.message.contains(r"C:\private"));
+
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Unsupported] {
+            let generic = durable_state_load_error(io::Error::new(kind, "host I/O failure"));
+            assert_eq!(
+                generic.to_string(),
+                "node durable state failed: durable-state-load-failed",
+            );
+        }
     }
 
     #[test]

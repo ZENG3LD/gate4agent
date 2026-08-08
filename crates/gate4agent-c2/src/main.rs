@@ -1,7 +1,7 @@
 #[cfg(windows)]
-use gate4agent_c2::{C2Config, C2NodeConfig, C2Running};
+use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, DEFAULT_C2_CONTROL_ENDPOINT};
 #[cfg(windows)]
-use gate4agent_c2::protocol::{NodeId, DEFAULT_C2_API_LISTEN, DEFAULT_C2_CONTROL_ENDPOINT, MAX_C2_NODES};
+use gate4agent_c2::protocol::{NodeId, DEFAULT_C2_API_LISTEN, MAX_C2_NODES};
 #[cfg(windows)]
 use std::collections::BTreeSet;
 

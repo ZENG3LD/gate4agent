@@ -9,18 +9,18 @@ use crate::session_registry::{
 };
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
-    AgentProvider, ClientFrame, ClientRole,
+    AgentProvider, ArchitectureId, CapabilityId, ClientFrame, ClientRole,
     ControllerState, FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
-    GitWorktreeSnapshot, NodeEvent,
+    GitWorktreeSnapshot, HostDescriptor, LocalTransportKind, NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
-    NodeRequest,
+    NodeRequest, OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
     NodeResponse, NodeSnapshot, RequestEnvelope,
     ResponseEnvelope, ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode,
-    ManagedSessionRecord, ManagedSessionState, SessionRecordId, WorkspaceEntry,
+    ManagedSessionRecord, ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry,
     WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     DEFAULT_CONTROLLER_LEASE_MS, MAX_CONTROLLER_LEASE_MS,
     MIN_CONTROLLER_LEASE_MS,
-    NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES,
+    NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES,
     MAX_NODE_HELLO_FRAME_BYTES, MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES,
     MAX_WORKSPACE_ROOT_BYTES,
 };
@@ -28,7 +28,8 @@ use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
 use gate4agent_runtime_native::{HookIngressConfig, NativeRuntime, NativeRuntimeConfig};
 use gate4agent_node_wire::{
-    auth_proof, proofs_match, random_incarnation_id, random_nonce, AuthDirection,
+    auth_proof, negotiated_auth_proof, proofs_match, random_incarnation_id, random_nonce,
+    AuthDirection,
 };
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
@@ -71,6 +72,7 @@ const GIT_COMMIT_MAX_ENTRIES: usize = 12;
 const GIT_OUTPUT_MAX_BYTES: usize = 64 * 1_024;
 const GIT_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
 const GIT_COMMAND_TIMEOUT_MS: u64 = 1_500;
+const NODE_STATE_SCHEMA_VERSION: u16 = 1;
 const WORKSPACE_UNAVAILABLE_ERROR: &str = "workspace-unavailable";
 const PROVIDER_SESSION_SCOPE_CONFLICT_ERROR: &str = "provider-session-scope-conflict";
 const PROVIDER_SESSION_LIVE_CONFLICT_ERROR: &str = "provider-session-live-conflict";
@@ -2895,14 +2897,34 @@ async fn serve_connection(
     if hello.protocol_version != NODE_PROTOCOL_VERSION {
         return Err(NodeServerError::Handshake("node protocol version mismatch".to_owned()));
     }
+    let compatibility = match hello.compatibility.as_ref() {
+        Some(offer) => Some(
+            node_compatibility_support()?
+                .negotiate(NODE_PROTOCOL_VERSION, offer)
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        ),
+        None => None,
+    };
     let server_nonce = random_nonce().map_err(NodeServerError::Authentication)?;
-    let server_proof = auth_proof(
-        shared.access_token.as_bytes(),
-        AuthDirection::Server,
-        hello.role,
-        &hello.client_nonce,
-        &server_nonce,
-    )
+    let server_proof = match (hello.compatibility.as_ref(), compatibility.as_ref()) {
+        (Some(offer), Some(selected)) => negotiated_auth_proof(
+            shared.access_token.as_bytes(),
+            AuthDirection::Server,
+            hello.role,
+            &hello.client_nonce,
+            &server_nonce,
+            offer,
+            selected,
+        ),
+        (None, None) => auth_proof(
+            shared.access_token.as_bytes(),
+            AuthDirection::Server,
+            hello.role,
+            &hello.client_nonce,
+            &server_nonce,
+        ),
+        _ => Err("node compatibility authentication state is inconsistent".to_owned()),
+    }
     .map_err(NodeServerError::Authentication)?;
     write_json_frame_limited(
         &mut pipe,
@@ -2910,6 +2932,7 @@ async fn serve_connection(
             protocol_version: NODE_PROTOCOL_VERSION,
             server_nonce,
             server_proof,
+            compatibility: compatibility.clone(),
         }),
         MAX_NODE_HELLO_FRAME_BYTES,
     )
@@ -2927,13 +2950,25 @@ async fn serve_connection(
     let ClientFrame::Authenticate(authentication) = authentication else {
         return Err(NodeServerError::Handshake("second frame must authenticate the challenge".to_owned()));
     };
-    let expected_client_proof = auth_proof(
-        shared.access_token.as_bytes(),
-        AuthDirection::Client,
-        hello.role,
-        &hello.client_nonce,
-        &server_nonce,
-    )
+    let expected_client_proof = match (hello.compatibility.as_ref(), compatibility.as_ref()) {
+        (Some(offer), Some(selected)) => negotiated_auth_proof(
+            shared.access_token.as_bytes(),
+            AuthDirection::Client,
+            hello.role,
+            &hello.client_nonce,
+            &server_nonce,
+            offer,
+            selected,
+        ),
+        (None, None) => auth_proof(
+            shared.access_token.as_bytes(),
+            AuthDirection::Client,
+            hello.role,
+            &hello.client_nonce,
+            &server_nonce,
+        ),
+        _ => Err("node compatibility authentication state is inconsistent".to_owned()),
+    }
     .map_err(NodeServerError::Authentication)?;
     if !proofs_match(&authentication.client_proof, &expected_client_proof) {
         return Err(NodeServerError::Handshake("access denied".to_owned()));
@@ -2959,6 +2994,7 @@ async fn serve_connection(
             event_sequence: shared.current_sequence(),
             controller: shared.controller_state(),
             snapshot: shared.snapshot(),
+            compatibility,
         }),
     )
     .await?;
@@ -3020,6 +3056,40 @@ async fn serve_connection(
         }
     }
     Ok(())
+}
+
+fn node_compatibility_support() -> Result<NodeCompatibilitySupport, NodeServerError> {
+    Ok(NodeCompatibilitySupport {
+        protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION)
+            .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        capabilities: baseline_capabilities()?,
+        host: HostDescriptor {
+            operating_system: OperatingSystemId::new("windows")
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+            architecture: ArchitectureId::new(std::env::consts::ARCH)
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        },
+        path_semantics: PathSemantics {
+            style: PathStyle::Windows,
+            encoding: PathEncoding::Utf8,
+        },
+        local_transport: LocalTransportKind::WindowsNamedPipe,
+        state_schema: StateSchemaSupport {
+            versions: ProtocolRange::exact(NODE_STATE_SCHEMA_VERSION)
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        },
+        provider_contracts: Vec::new(),
+    })
+}
+
+fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
+    [NODE_COMPATIBILITY_METADATA_CAPABILITY]
+        .into_iter()
+        .map(|capability| {
+            CapabilityId::new(capability)
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))
+        })
+        .collect()
 }
 
 struct ControllerReleaseGuard {

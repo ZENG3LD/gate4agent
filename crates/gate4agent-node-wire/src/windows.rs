@@ -1,10 +1,12 @@
 use gate4agent_node_protocol::{
-    read_json_frame_limited_body_timeout, write_json_frame_limited, ClientAuthentication,
-    ClientFrame, ClientHello, ClientRole, FrameError, NodeEventEnvelope, NodeFailure, NodeHello,
-    NodeId, NodeIncarnationId, NodeRequest, NodeResponse, RequestEnvelope, ServerFrame,
+    encode_node_compatibility_auth_binding, read_json_frame_limited_body_timeout,
+    write_json_frame_limited, CapabilityId, ClientAuthentication, ClientCompatibilityOffer,
+    ClientFrame, ClientHello, ClientRole, FrameError, NegotiatedNodeCompatibility,
+    NodeEventEnvelope, NodeFailure, NodeHello, NodeId, NodeIncarnationId, NodeRequest,
+    NodeResponse, ProtocolRange, RequestEnvelope, ServerFrame, StateSchemaSupport,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
-    NODE_PROTOCOL_VERSION,
+    NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION,
 };
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -38,9 +40,14 @@ impl NamedPipeNodeClient {
     ) -> Result<Self, NodeClientError> {
         let mut pipe = connect_pipe(endpoint).await?;
         let client_nonce = random_nonce().map_err(NodeClientError::Authentication)?;
+        let compatibility_offer = client_compatibility_offer()?;
         write_json_frame_limited(
             &mut pipe,
-            &ClientFrame::Hello(ClientHello::new(role, client_nonce)),
+            &ClientFrame::Hello(ClientHello::negotiating(
+                role,
+                client_nonce,
+                compatibility_offer.clone(),
+            )),
             MAX_NODE_HELLO_FRAME_BYTES,
         )
         .await?;
@@ -64,26 +71,52 @@ impl NamedPipeNodeClient {
                 "node protocol version mismatch".to_owned(),
             ));
         }
-        let expected_server_proof = auth_proof(
-            access_token.as_bytes(),
-            AuthDirection::Server,
-            role,
-            &client_nonce,
-            &challenge.server_nonce,
-        )
+        validate_selected_compatibility(
+            &compatibility_offer,
+            challenge.compatibility.as_ref(),
+        )?;
+        let expected_server_proof = match challenge.compatibility.as_ref() {
+            Some(selected) => negotiated_auth_proof(
+                access_token.as_bytes(),
+                AuthDirection::Server,
+                role,
+                &client_nonce,
+                &challenge.server_nonce,
+                &compatibility_offer,
+                selected,
+            ),
+            None => auth_proof(
+                access_token.as_bytes(),
+                AuthDirection::Server,
+                role,
+                &client_nonce,
+                &challenge.server_nonce,
+            ),
+        }
         .map_err(NodeClientError::Authentication)?;
         if !proofs_match(&challenge.server_proof, &expected_server_proof) {
             return Err(NodeClientError::Protocol(
                 "server failed access-token proof".to_owned(),
             ));
         }
-        let client_proof = auth_proof(
-            access_token.as_bytes(),
-            AuthDirection::Client,
-            role,
-            &client_nonce,
-            &challenge.server_nonce,
-        )
+        let client_proof = match challenge.compatibility.as_ref() {
+            Some(selected) => negotiated_auth_proof(
+                access_token.as_bytes(),
+                AuthDirection::Client,
+                role,
+                &client_nonce,
+                &challenge.server_nonce,
+                &compatibility_offer,
+                selected,
+            ),
+            None => auth_proof(
+                access_token.as_bytes(),
+                AuthDirection::Client,
+                role,
+                &client_nonce,
+                &challenge.server_nonce,
+            ),
+        }
         .map_err(NodeClientError::Authentication)?;
         write_json_frame_limited(
             &mut pipe,
@@ -111,6 +144,12 @@ impl NamedPipeNodeClient {
                 "node protocol version mismatch".to_owned(),
             ));
         }
+        if hello.compatibility != challenge.compatibility {
+            return Err(NodeClientError::Protocol(
+                "node compatibility selection changed during authentication".to_owned(),
+            ));
+        }
+        validate_selected_compatibility(&compatibility_offer, hello.compatibility.as_ref())?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
                 "node identity mismatch: expected '{}', received '{}'",
@@ -198,6 +237,72 @@ impl NamedPipeNodeClient {
     }
 }
 
+fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, NodeClientError> {
+    Ok(ClientCompatibilityOffer {
+        protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION)
+            .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
+        capabilities: baseline_capabilities()?,
+        state_schema: Some(StateSchemaSupport {
+            versions: ProtocolRange::exact(1)
+                .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
+        }),
+    })
+}
+
+fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeClientError> {
+    [NODE_COMPATIBILITY_METADATA_CAPABILITY]
+        .into_iter()
+        .map(|capability| {
+            CapabilityId::new(capability)
+                .map_err(|error| NodeClientError::Protocol(error.to_string()))
+        })
+        .collect()
+}
+
+fn validate_selected_compatibility(
+    offer: &ClientCompatibilityOffer,
+    selected: Option<&NegotiatedNodeCompatibility>,
+) -> Result<(), NodeClientError> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    if selected.protocol_version != NODE_PROTOCOL_VERSION {
+        return Err(NodeClientError::Protocol(format!(
+            "node selected protocol version {} for active wire protocol {}",
+            selected.protocol_version,
+            NODE_PROTOCOL_VERSION,
+        )));
+    }
+    if !offer.protocol_versions.contains(selected.protocol_version) {
+        return Err(NodeClientError::Protocol(format!(
+            "node selected protocol version {} outside the client offer",
+            selected.protocol_version,
+        )));
+    }
+    if selected
+        .capabilities
+        .iter()
+        .any(|capability| !offer.capabilities.contains(capability))
+    {
+        return Err(NodeClientError::Protocol(
+            "node selected a capability outside the client offer".to_owned(),
+        ));
+    }
+    if let Some(state_schema_version) = selected.state_schema_version {
+        let Some(state_schema) = offer.state_schema else {
+            return Err(NodeClientError::Protocol(
+                "node selected a state schema that the client did not offer".to_owned(),
+            ));
+        };
+        if !state_schema.versions.contains(state_schema_version) {
+            return Err(NodeClientError::Protocol(format!(
+                "node selected state schema version {state_schema_version} outside the client offer",
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn connect_pipe(endpoint: &str) -> io::Result<NamedPipeClient> {
     let mut last_error = None;
     for _ in 0..PIPE_CONNECT_RETRIES {
@@ -270,6 +375,37 @@ pub fn auth_proof(
     });
     message.extend_from_slice(client_nonce);
     message.extend_from_slice(server_nonce);
+    local_hmac_sha256(access_token, &message)
+}
+
+pub fn negotiated_auth_proof(
+    access_token: &[u8],
+    direction: AuthDirection,
+    role: ClientRole,
+    client_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
+    server_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
+    offer: &ClientCompatibilityOffer,
+    selected: &NegotiatedNodeCompatibility,
+) -> Result<[u8; NODE_AUTH_PROOF_BYTES], String> {
+    let binding = encode_node_compatibility_auth_binding(offer, selected)
+        .map_err(|error| error.to_string())?;
+    let binding_length = u32::try_from(binding.len())
+        .map_err(|_| "node compatibility authentication binding is too large".to_owned())?;
+    let mut message = Vec::with_capacity(48 + (NODE_AUTH_NONCE_BYTES * 2) + binding.len());
+    message.extend_from_slice(b"gate4agent-node-auth-negotiated-v1\0");
+    message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
+    message.push(match direction {
+        AuthDirection::Server => 1,
+        AuthDirection::Client => 2,
+    });
+    message.push(match role {
+        ClientRole::Operator => 1,
+        ClientRole::Observer => 2,
+    });
+    message.extend_from_slice(client_nonce);
+    message.extend_from_slice(server_nonce);
+    message.extend_from_slice(&binding_length.to_le_bytes());
+    message.extend_from_slice(&binding);
     local_hmac_sha256(access_token, &message)
 }
 
@@ -450,6 +586,39 @@ pub enum NodeClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_node_protocol::{
+        ArchitectureId, HostDescriptor, LocalTransportKind, NodeCompatibilitySupport,
+        OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+    };
+
+    fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
+            state_schema: Some(StateSchemaSupport {
+                versions: ProtocolRange::exact(1).unwrap(),
+            }),
+        };
+        let support = NodeCompatibilitySupport {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
+            host: HostDescriptor {
+                operating_system: OperatingSystemId::new("windows").unwrap(),
+                architecture: ArchitectureId::new("x86_64").unwrap(),
+            },
+            path_semantics: PathSemantics {
+                style: PathStyle::Windows,
+                encoding: PathEncoding::Utf8,
+            },
+            local_transport: LocalTransportKind::WindowsNamedPipe,
+            state_schema: StateSchemaSupport {
+                versions: ProtocolRange::exact(1).unwrap(),
+            },
+            provider_contracts: Vec::new(),
+        };
+        let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
+        (offer, selected)
+    }
 
     #[test]
     fn windows_cng_hmac_sha256_matches_the_standard_vector() {
@@ -494,6 +663,78 @@ mod tests {
         assert!(!proofs_match(&server, &client));
         assert!(!proofs_match(&server, &observer));
         assert!(proofs_match(&server, &server));
+    }
+
+    #[test]
+    fn legacy_v3_auth_proof_remains_byte_exact() {
+        let proof = auth_proof(
+            b"local-secret",
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &[3; NODE_AUTH_NONCE_BYTES],
+            &[7; NODE_AUTH_NONCE_BYTES],
+        )
+        .unwrap();
+        assert_eq!(
+            proof,
+            [
+                3, 223, 60, 233, 83, 165, 237, 88, 37, 4, 161, 140, 80, 94, 154, 41,
+                127, 184, 168, 120, 191, 162, 156, 3, 208, 139, 243, 60, 48, 21, 233, 64,
+            ],
+        );
+    }
+
+    #[test]
+    fn negotiated_auth_proof_is_exact_and_rejects_offer_or_selection_tampering() {
+        let (offer, selected) = negotiated_fixture();
+        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
+        let proof = negotiated_auth_proof(
+            b"local-secret",
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        assert_eq!(
+            proof,
+            [
+                193, 68, 218, 167, 15, 163, 252, 198, 158, 232, 189, 176, 101, 170, 37,
+                34, 175, 88, 202, 213, 175, 46, 15, 204, 51, 179, 165, 120, 82, 40, 19,
+                53,
+            ],
+        );
+
+        let mut tampered_offer = offer.clone();
+        tampered_offer.capabilities.clear();
+        let offer_proof = negotiated_auth_proof(
+            b"local-secret",
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &tampered_offer,
+            &selected,
+        )
+        .unwrap();
+        assert!(!proofs_match(&proof, &offer_proof));
+
+        let mut tampered_selection = selected.clone();
+        tampered_selection.state_schema_version = None;
+        let selection_proof = negotiated_auth_proof(
+            b"local-secret",
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &tampered_selection,
+        )
+        .unwrap();
+        assert!(!proofs_match(&proof, &selection_proof));
     }
 
     #[test]

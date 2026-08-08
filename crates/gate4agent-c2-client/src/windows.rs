@@ -1,8 +1,12 @@
 use gate4agent_c2_protocol::{
-    c2_auth_transcript, C2AuthDirection, C2ClientAuthentication, C2ClientFrame, C2ClientHello,
-    C2Hello, C2RelayFailure, C2RequestEnvelope, C2RequestId, C2ServerFrame, C2Topology, NodeRequest,
-    NodeRoute, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse, C2_CONTROL_PROTOCOL_VERSION,
-    MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES, MAX_C2_SERVER_FRAME_BYTES,
+    c2_auth_transcript, c2_bound_auth_transcript, C2AuthDirection, C2ClientAuthentication, C2ClientFrame,
+    C2ClientHello, C2Hello, C2RelayFailure, C2RequestEnvelope, C2RequestId,
+    C2ServerFrame, C2Topology, CapabilityId, ClientCompatibilityOffer,
+    NegotiatedC2ControlCompatibility, NodeRequest, NodeRoute, ProtocolRange,
+    RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
+    C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
+    MAX_C2_SERVER_FRAME_BYTES,
 };
 use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, FrameError,
@@ -106,9 +110,13 @@ pub async fn connect_local(
     validate_token(token)?;
     let mut pipe = connect_pipe(endpoint).await?;
     let client_nonce = random_nonce().map_err(C2ControlError::Authentication)?;
+    let compatibility_offer = client_compatibility_offer()?;
     timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
-        &C2ClientFrame::Hello(C2ClientHello::new(client_nonce)),
+        &C2ClientFrame::Hello(C2ClientHello::negotiating(
+            client_nonce,
+            compatibility_offer.clone(),
+        )),
         MAX_C2_AUTH_FRAME_BYTES,
     )).await.map_err(|_| C2ControlError::AuthenticationTimedOut)??;
     let challenge = timeout(AUTH_DEADLINE, read_server_frame(&mut pipe, MAX_C2_AUTH_FRAME_BYTES))
@@ -119,11 +127,27 @@ pub async fn connect_local(
     if challenge.protocol_version != C2_CONTROL_PROTOCOL_VERSION {
         return Err(C2ControlError::Protocol("C2 control protocol version mismatch".to_owned()));
     }
-    let expected_server = c2_proof(token, C2AuthDirection::Server, &client_nonce, &challenge.server_nonce)?;
+    validate_selected_compatibility(
+        &compatibility_offer,
+        challenge.compatibility.as_ref(),
+    )?;
+    let expected_server = c2_proof(
+        token,
+        C2AuthDirection::Server,
+        &client_nonce,
+        &challenge.server_nonce,
+        challenge.compatibility.as_ref().map(|selected| (&compatibility_offer, selected)),
+    )?;
     if !proofs_match(&challenge.server_proof, &expected_server) {
         return Err(C2ControlError::Authentication("C2 server proof mismatch".to_owned()));
     }
-    let client_proof = c2_proof(token, C2AuthDirection::Client, &client_nonce, &challenge.server_nonce)?;
+    let client_proof = c2_proof(
+        token,
+        C2AuthDirection::Client,
+        &client_nonce,
+        &challenge.server_nonce,
+        challenge.compatibility.as_ref().map(|selected| (&compatibility_offer, selected)),
+    )?;
     timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
         &C2ClientFrame::Authenticate(C2ClientAuthentication { client_proof }),
@@ -139,6 +163,12 @@ pub async fn connect_local(
             return Err(C2ControlError::Protocol("C2 control protocol version mismatch".to_owned())),
         _ => return Err(C2ControlError::Protocol("C2 did not return hello".to_owned())),
     };
+    validate_selected_compatibility(&compatibility_offer, hello.compatibility.as_ref())?;
+    if hello.compatibility != challenge.compatibility {
+        return Err(C2ControlError::Protocol(
+            "C2 compatibility selection changed after authentication".to_owned(),
+        ));
+    }
 
     let (reader, writer) = tokio::io::split(pipe);
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -159,6 +189,45 @@ pub async fn connect_local(
         hello: Arc::new(hello),
         topology: topology_rx,
     }, C2EventReceiver { events: events_rx }))
+}
+
+fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlError> {
+    Ok(ClientCompatibilityOffer {
+        protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)
+            .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+        capabilities: vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
+            .map_err(|error| C2ControlError::Protocol(error.to_string()))?],
+        state_schema: None,
+    })
+}
+
+fn validate_selected_compatibility(
+    offer: &ClientCompatibilityOffer,
+    selected: Option<&NegotiatedC2ControlCompatibility>,
+) -> Result<(), C2ControlError> {
+    if !offer.protocol_versions.contains(C2_CONTROL_PROTOCOL_VERSION) {
+        return Err(C2ControlError::Protocol(
+            "C2 compatibility offer excludes control protocol v2".to_owned(),
+        ));
+    }
+    let Some(selected) = selected else { return Ok(()); };
+    if selected.protocol_version != C2_CONTROL_PROTOCOL_VERSION
+        || !offer.protocol_versions.contains(selected.protocol_version)
+    {
+        return Err(C2ControlError::Protocol(
+            "C2 selected a protocol version outside the client offer".to_owned(),
+        ));
+    }
+    if selected
+        .capabilities
+        .iter()
+        .any(|capability| !offer.capabilities.contains(capability))
+    {
+        return Err(C2ControlError::Protocol(
+            "C2 selected a capability outside the client offer".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn read_server_frame(
@@ -255,10 +324,21 @@ async fn control_owner(
 fn c2_proof(
     token: &str,
     direction: C2AuthDirection,
-    client_nonce: &[u8; 32],
-    server_nonce: &[u8; 32],
+    client_nonce: &[u8; C2_AUTH_NONCE_BYTES],
+    server_nonce: &[u8; C2_AUTH_NONCE_BYTES],
+    compatibility: Option<(&ClientCompatibilityOffer, &NegotiatedC2ControlCompatibility)>,
 ) -> Result<[u8; 32], C2ControlError> {
-    local_hmac_sha256(token.as_bytes(), &c2_auth_transcript(direction, client_nonce, server_nonce))
+    let transcript = match compatibility {
+        Some((offer, selected)) => c2_bound_auth_transcript(
+            direction,
+            client_nonce,
+            server_nonce,
+            offer,
+            selected,
+        ).map_err(|error| C2ControlError::Authentication(error.to_string()))?,
+        None => c2_auth_transcript(direction, client_nonce, server_nonce),
+    };
+    local_hmac_sha256(token.as_bytes(), &transcript)
         .map_err(C2ControlError::Authentication)
 }
 
@@ -318,7 +398,10 @@ pub enum C2ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_c2_protocol::{NodeCursor, NodeId};
+    use gate4agent_c2_protocol::{
+        ArchitectureId, HostDescriptor, NodeCursor, NodeId, OperatingSystemId,
+        PathEncoding, PathSemantics, PathStyle,
+    };
     use gate4agent_node_protocol::NodeIncarnationId;
 
     fn event(sequence: u64) -> OwnerInput {
@@ -350,6 +433,79 @@ mod tests {
                 response: Ok(gate4agent_c2_protocol::C2NodeResponse::Accepted),
             }),
         }))
+    }
+
+    #[test]
+    fn c2_control_client_offer_is_exact_v2_metadata_only() {
+        let offer = client_compatibility_offer().unwrap();
+
+        assert_eq!(
+            offer.protocol_versions,
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+        );
+        assert_eq!(
+            offer.capabilities,
+            vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
+        );
+        assert_eq!(offer.state_schema, None);
+        assert!(validate_selected_compatibility(&offer, None).is_ok());
+    }
+
+    #[test]
+    fn c2_control_client_rejects_selection_outside_offer() {
+        let offer = client_compatibility_offer().unwrap();
+        let selected = NegotiatedC2ControlCompatibility {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION + 1,
+            capabilities: offer.capabilities.clone(),
+            host: HostDescriptor {
+                operating_system: OperatingSystemId::new("windows").unwrap(),
+                architecture: ArchitectureId::new("x86_64").unwrap(),
+            },
+            path_semantics: PathSemantics {
+                style: PathStyle::Windows,
+                encoding: PathEncoding::Utf8,
+            },
+        };
+
+        assert!(matches!(
+            validate_selected_compatibility(&offer, Some(&selected)),
+            Err(C2ControlError::Protocol(_)),
+        ));
+    }
+
+    #[test]
+    fn c2_control_bound_proof_rejects_tampered_selection() {
+        let offer = client_compatibility_offer().unwrap();
+        let selected = NegotiatedC2ControlCompatibility {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            capabilities: offer.capabilities.clone(),
+            host: HostDescriptor {
+                operating_system: OperatingSystemId::new("windows").unwrap(),
+                architecture: ArchitectureId::new("x86_64").unwrap(),
+            },
+            path_semantics: PathSemantics {
+                style: PathStyle::Windows,
+                encoding: PathEncoding::Utf8,
+            },
+        };
+        let expected = c2_proof(
+            "test-token",
+            C2AuthDirection::Server,
+            &[1; C2_AUTH_NONCE_BYTES],
+            &[2; C2_AUTH_NONCE_BYTES],
+            Some((&offer, &selected)),
+        ).unwrap();
+        let mut tampered = selected;
+        tampered.path_semantics.style = PathStyle::Posix;
+        let received = c2_proof(
+            "test-token",
+            C2AuthDirection::Server,
+            &[1; C2_AUTH_NONCE_BYTES],
+            &[2; C2_AUTH_NONCE_BYTES],
+            Some((&offer, &tampered)),
+        ).unwrap();
+
+        assert!(!proofs_match(&received, &expected));
     }
 
     #[tokio::test]

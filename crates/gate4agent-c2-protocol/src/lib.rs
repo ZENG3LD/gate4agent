@@ -1,7 +1,10 @@
 //! Stable, serde-only inventory and control contract for Gate4Agent C2.
 
 pub use gate4agent_node_protocol::{
-    NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest, NodeResponse,
+    ArchitectureId, CapabilityId, ClientCompatibilityOffer, HostDescriptor,
+    NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
+    NodeResponse, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+    ProtocolNegotiationError, ProtocolRange,
 };
 use gate4agent_node_protocol::{
     AgentProvider, ManagedSessionRecord, ManagedSessionState, NodeSnapshot, SessionAddress,
@@ -13,13 +16,17 @@ use gate4agent_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 
 pub const C2_API_VERSION: u16 = 2;
 pub const DEFAULT_C2_API_LISTEN: &str = "127.0.0.1:18320";
 pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 2;
+pub const C2_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const DEFAULT_C2_CONTROL_ENDPOINT: &str = r"\\.\pipe\gate4agent-c2";
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
+pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
+pub const MAX_C2_BOUND_AUTH_TRANSCRIPT_BYTES: usize = 16 * 1024;
 pub const MAX_C2_CLIENT_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_C2_SERVER_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_C2_AUTH_FRAME_BYTES: usize = 8 * 1024;
@@ -640,11 +647,79 @@ pub struct C2RelayFailure {
 pub struct C2ClientHello {
     pub protocol_version: u16,
     pub client_nonce: [u8; C2_AUTH_NONCE_BYTES],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<ClientCompatibilityOffer>,
 }
 
 impl C2ClientHello {
     pub fn new(client_nonce: [u8; C2_AUTH_NONCE_BYTES]) -> Self {
-        Self { protocol_version: C2_CONTROL_PROTOCOL_VERSION, client_nonce }
+        Self {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            client_nonce,
+            compatibility: None,
+        }
+    }
+
+    pub fn negotiating(
+        client_nonce: [u8; C2_AUTH_NONCE_BYTES],
+        compatibility: ClientCompatibilityOffer,
+    ) -> Self {
+        Self {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            client_nonce,
+            compatibility: Some(compatibility),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2ControlCompatibilitySupport {
+    pub protocol_versions: ProtocolRange,
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityId>,
+    pub host: HostDescriptor,
+    pub path_semantics: PathSemantics,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NegotiatedC2ControlCompatibility {
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityId>,
+    pub host: HostDescriptor,
+    pub path_semantics: PathSemantics,
+}
+
+impl C2ControlCompatibilitySupport {
+    pub fn negotiate(
+        &self,
+        hello: &C2ClientHello,
+    ) -> Result<NegotiatedC2ControlCompatibility, ProtocolNegotiationError> {
+        ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)?
+            .highest_common(ProtocolRange::exact(hello.protocol_version)?)?;
+        let legacy;
+        let offer = match hello.compatibility.as_ref() {
+            Some(offer) => offer,
+            None => {
+                legacy = ClientCompatibilityOffer::exact(C2_CONTROL_PROTOCOL_VERSION)?;
+                &legacy
+            }
+        };
+        let active_protocol = ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)?;
+        active_protocol.highest_common(self.protocol_versions)?;
+        active_protocol.highest_common(offer.protocol_versions)?;
+        let capabilities = self
+            .capabilities
+            .iter()
+            .filter(|capability| offer.capabilities.contains(capability))
+            .cloned()
+            .collect();
+        Ok(NegotiatedC2ControlCompatibility {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            capabilities,
+            host: self.host.clone(),
+            path_semantics: self.path_semantics.clone(),
+        })
     }
 }
 
@@ -653,6 +728,8 @@ pub struct C2ServerChallenge {
     pub protocol_version: u16,
     pub server_nonce: [u8; C2_AUTH_NONCE_BYTES],
     pub server_proof: [u8; C2_AUTH_PROOF_BYTES],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<NegotiatedC2ControlCompatibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -665,6 +742,8 @@ pub struct C2Hello {
     pub protocol_version: u16,
     pub connection_id: u64,
     pub status: StatusResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<NegotiatedC2ControlCompatibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -743,6 +822,118 @@ pub fn c2_auth_transcript(
     message.extend_from_slice(client_nonce);
     message.extend_from_slice(server_nonce);
     message
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum C2AuthTranscriptError {
+    TooManyCapabilities {
+        section: &'static str,
+        count: usize,
+        max: usize,
+    },
+    TooLong {
+        len: usize,
+        max: usize,
+    },
+}
+
+impl fmt::Display for C2AuthTranscriptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyCapabilities { section, count, max } => write!(
+                formatter,
+                "{section} contains {count} capabilities, exceeding the {max}-entry authentication limit",
+            ),
+            Self::TooLong { len, max } => write!(
+                formatter,
+                "C2 compatibility authentication transcript is {len} bytes, exceeding the {max}-byte limit",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for C2AuthTranscriptError {}
+
+pub fn c2_bound_auth_transcript(
+    direction: C2AuthDirection,
+    client_nonce: &[u8; C2_AUTH_NONCE_BYTES],
+    server_nonce: &[u8; C2_AUTH_NONCE_BYTES],
+    offer: &ClientCompatibilityOffer,
+    selected: &NegotiatedC2ControlCompatibility,
+) -> Result<Vec<u8>, C2AuthTranscriptError> {
+    validate_auth_capabilities("offer", &offer.capabilities)?;
+    validate_auth_capabilities("selection", &selected.capabilities)?;
+
+    let mut message = Vec::with_capacity(512);
+    message.extend_from_slice(b"gate4agent-c2-control-auth-v2-compatibility\0");
+    message.extend_from_slice(&C2_CONTROL_PROTOCOL_VERSION.to_le_bytes());
+    message.push(match direction { C2AuthDirection::Server => 1, C2AuthDirection::Client => 2 });
+    message.extend_from_slice(client_nonce);
+    message.extend_from_slice(server_nonce);
+
+    message.extend_from_slice(b"offer\0");
+    encode_protocol_range(&mut message, offer.protocol_versions);
+    encode_capabilities(&mut message, &offer.capabilities);
+    match offer.state_schema {
+        Some(state_schema) => {
+            message.push(1);
+            encode_protocol_range(&mut message, state_schema.versions);
+        }
+        None => message.push(0),
+    }
+
+    message.extend_from_slice(b"selected\0");
+    message.extend_from_slice(&selected.protocol_version.to_le_bytes());
+    encode_capabilities(&mut message, &selected.capabilities);
+    encode_bounded_str(&mut message, selected.host.operating_system.as_str());
+    encode_bounded_str(&mut message, selected.host.architecture.as_str());
+    message.push(match selected.path_semantics.style {
+        PathStyle::Windows => 1,
+        PathStyle::Posix => 2,
+    });
+    message.push(match selected.path_semantics.encoding {
+        PathEncoding::Utf8 => 1,
+    });
+
+    if message.len() > MAX_C2_BOUND_AUTH_TRANSCRIPT_BYTES {
+        return Err(C2AuthTranscriptError::TooLong {
+            len: message.len(),
+            max: MAX_C2_BOUND_AUTH_TRANSCRIPT_BYTES,
+        });
+    }
+    Ok(message)
+}
+
+fn validate_auth_capabilities(
+    section: &'static str,
+    capabilities: &[CapabilityId],
+) -> Result<(), C2AuthTranscriptError> {
+    if capabilities.len() > MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES {
+        return Err(C2AuthTranscriptError::TooManyCapabilities {
+            section,
+            count: capabilities.len(),
+            max: MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES,
+        });
+    }
+    Ok(())
+}
+
+fn encode_protocol_range(message: &mut Vec<u8>, range: ProtocolRange) {
+    message.extend_from_slice(&range.minimum().to_le_bytes());
+    message.extend_from_slice(&range.maximum().to_le_bytes());
+}
+
+fn encode_capabilities(message: &mut Vec<u8>, capabilities: &[CapabilityId]) {
+    message.extend_from_slice(&(capabilities.len() as u16).to_le_bytes());
+    for capability in capabilities {
+        encode_bounded_str(message, capability.as_str());
+    }
+}
+
+fn encode_bounded_str(message: &mut Vec<u8>, value: &str) {
+    debug_assert!(value.len() <= u16::MAX as usize);
+    message.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    message.extend_from_slice(value.as_bytes());
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1223,6 +1414,246 @@ mod tests {
                 AdapterVerification::SyntheticFixture,
             ).unwrap(),
         }
+    }
+
+    fn c2_compatibility_support(
+        protocol_versions: ProtocolRange,
+        capabilities: Vec<CapabilityId>,
+    ) -> C2ControlCompatibilitySupport {
+        C2ControlCompatibilitySupport {
+            protocol_versions,
+            capabilities,
+            host: HostDescriptor {
+                operating_system: OperatingSystemId::new("darwin").unwrap(),
+                architecture: ArchitectureId::new("aarch64").unwrap(),
+            },
+            path_semantics: PathSemantics {
+                style: PathStyle::Posix,
+                encoding: PathEncoding::Utf8,
+            },
+        }
+    }
+
+    #[test]
+    fn c2_compatibility_legacy_client_hello_json_is_byte_equivalent() {
+        let hello = C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]);
+        let json = serde_json::to_string(&hello).unwrap();
+        let expected = concat!(
+            r#"{"protocol_version":2,"client_nonce":["#,
+            "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,",
+            "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"
+        );
+
+        assert_eq!(json, expected);
+        assert_eq!(
+            serde_json::from_str::<C2ClientHello>(expected).unwrap(),
+            hello,
+        );
+    }
+
+    #[test]
+    fn c2_compatibility_legacy_server_json_is_byte_equivalent() {
+        #[derive(Serialize)]
+        struct LegacyChallenge {
+            protocol_version: u16,
+            server_nonce: [u8; C2_AUTH_NONCE_BYTES],
+            server_proof: [u8; C2_AUTH_PROOF_BYTES],
+        }
+
+        #[derive(Serialize)]
+        struct LegacyHello<'a> {
+            protocol_version: u16,
+            connection_id: u64,
+            status: &'a StatusResponse,
+        }
+
+        let challenge = C2ServerChallenge {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            server_nonce: [1; C2_AUTH_NONCE_BYTES],
+            server_proof: [2; C2_AUTH_PROOF_BYTES],
+            compatibility: None,
+        };
+        let legacy_challenge = LegacyChallenge {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            server_nonce: [1; C2_AUTH_NONCE_BYTES],
+            server_proof: [2; C2_AUTH_PROOF_BYTES],
+        };
+        assert_eq!(
+            serde_json::to_vec(&challenge).unwrap(),
+            serde_json::to_vec(&legacy_challenge).unwrap(),
+        );
+
+        let status = StatusResponse {
+            api_version: C2_API_VERSION,
+            ready: true,
+            observed_at_unix_ms: 7,
+            nodes: BTreeMap::new(),
+        };
+        let hello = C2Hello {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            connection_id: 11,
+            status: status.clone(),
+            compatibility: None,
+        };
+        let legacy_hello = LegacyHello {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            connection_id: 11,
+            status: &status,
+        };
+        assert_eq!(
+            serde_json::to_vec(&hello).unwrap(),
+            serde_json::to_vec(&legacy_hello).unwrap(),
+        );
+    }
+
+    #[test]
+    fn c2_compatibility_missing_offer_negotiates_exact_v2() {
+        let support = c2_compatibility_support(
+            ProtocolRange::new(1, 4).unwrap(),
+            Vec::new(),
+        );
+
+        let negotiated = support
+            .negotiate(&C2ClientHello::new([1; C2_AUTH_NONCE_BYTES]))
+            .unwrap();
+
+        assert_eq!(negotiated.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
+        assert!(negotiated.capabilities.is_empty());
+    }
+
+    #[test]
+    fn c2_compatibility_selects_active_v2_and_capability_intersection() {
+        let shared = CapabilityId::new("terminal-stream").unwrap();
+        let server_only = CapabilityId::new("server-only").unwrap();
+        let client_only = CapabilityId::new("client-only").unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::new(1, 5).unwrap(),
+            vec![shared.clone(), server_only],
+        );
+        let hello = C2ClientHello::negotiating(
+            [2; C2_AUTH_NONCE_BYTES],
+            ClientCompatibilityOffer {
+                protocol_versions: ProtocolRange::new(2, 4).unwrap(),
+                capabilities: vec![client_only, shared.clone()],
+                state_schema: None,
+            },
+        );
+
+        let negotiated = support.negotiate(&hello).unwrap();
+
+        assert_eq!(negotiated.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
+        assert_eq!(negotiated.capabilities, vec![shared]);
+    }
+
+    #[test]
+    fn c2_compatibility_disjoint_ranges_fail() {
+        let support = c2_compatibility_support(
+            ProtocolRange::new(2, 3).unwrap(),
+            Vec::new(),
+        );
+        let hello = C2ClientHello::negotiating(
+            [3; C2_AUTH_NONCE_BYTES],
+            ClientCompatibilityOffer {
+                protocol_versions: ProtocolRange::new(4, 5).unwrap(),
+                capabilities: Vec::new(),
+                state_schema: None,
+            },
+        );
+
+        assert!(matches!(
+            support.negotiate(&hello),
+            Err(ProtocolNegotiationError::Disjoint { .. }),
+        ));
+    }
+
+    #[test]
+    fn c2_compatibility_bound_auth_transcript_is_exact_and_selection_sensitive() {
+        let capability = CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap();
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = NegotiatedC2ControlCompatibility {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![capability],
+            host: HostDescriptor {
+                operating_system: OperatingSystemId::new("windows").unwrap(),
+                architecture: ArchitectureId::new("x86_64").unwrap(),
+            },
+            path_semantics: PathSemantics {
+                style: PathStyle::Windows,
+                encoding: PathEncoding::Utf8,
+            },
+        };
+        let transcript = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        ).unwrap();
+        let hex = transcript.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+
+        assert_eq!(
+            hex,
+            concat!(
+                "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
+                "020001",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "6f66666572000200020001001600636f6d7061746962696c6974792e6d6574616461746100",
+                "73656c656374656400020001001600636f6d7061746962696c6974792e6d65746164617461",
+                "070077696e646f777306007838365f36340101",
+            ),
+        );
+
+        let mut tampered = selected;
+        tampered.path_semantics.style = PathStyle::Posix;
+        assert_ne!(
+            transcript,
+            c2_bound_auth_transcript(
+                C2AuthDirection::Server,
+                &[0x11; C2_AUTH_NONCE_BYTES],
+                &[0x22; C2_AUTH_NONCE_BYTES],
+                &offer,
+                &tampered,
+            ).unwrap(),
+        );
+    }
+
+    #[test]
+    fn c2_compatibility_preserves_foreign_host_and_opaque_path() {
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            Vec::new(),
+        );
+        let negotiated = support
+            .negotiate(&C2ClientHello::new([4; C2_AUTH_NONCE_BYTES]))
+            .unwrap();
+        let projected = C2NodeSnapshot::from(&NodeSnapshot {
+            node_id: NodeId::new("remote-mac").unwrap(),
+            enabled_providers: Vec::new(),
+            workspaces: vec![WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                canonical_root: "/srv/CaseSensitive/../literal-root".to_owned(),
+                sessions: Vec::new(),
+            }],
+            session_records: Vec::new(),
+        });
+        let json = serde_json::to_string(&(projected, negotiated)).unwrap();
+        let (projected, negotiated) = serde_json::from_str::<(
+            C2NodeSnapshot,
+            NegotiatedC2ControlCompatibility,
+        )>(&json).unwrap();
+
+        assert_eq!(
+            projected.workspaces[0].canonical_root,
+            "/srv/CaseSensitive/../literal-root",
+        );
+        assert_eq!(negotiated.host.operating_system.as_str(), "darwin");
+        assert_eq!(negotiated.host.architecture.as_str(), "aarch64");
+        assert_eq!(negotiated.path_semantics.style, PathStyle::Posix);
     }
 
     #[test]

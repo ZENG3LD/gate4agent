@@ -1,12 +1,17 @@
 #![cfg(windows)]
 
 use gate4agent_node::protocol::{
-    AgentProvider, ClientRole, FrameError, NodeEvent, NodeFailureCode, NodeId, NodeRequest,
-    NodeResponse, NodeSnapshot, ServerFrame, SessionAddress, SessionMode, WorkspaceId,
-    MAX_NODE_TEXT_BYTES, NODE_PROTOCOL_VERSION,
+    read_json_frame_limited_body_timeout, write_json_frame_limited, AgentProvider,
+    ClientAuthentication, ClientFrame, ClientHello, ClientRole, FrameError, LocalTransportKind,
+    NodeEvent, NodeFailureCode, NodeId, NodeRequest, NodeResponse, NodeSnapshot, PathEncoding,
+    PathStyle, ServerFrame, SessionAddress, SessionMode, WorkspaceId,
+    MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES, MAX_NODE_TEXT_BYTES,
+    NODE_PROTOCOL_VERSION,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, NodeServerError, WorkspaceConfig};
-use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
+use gate4agent_node_wire::{
+    auth_proof, proofs_match, random_nonce, AuthDirection, NamedPipeNodeClient, NodeClientError,
+};
 use gate4agent_types::{
     ControlEventKind, SessionGeneration, SessionStatus, TerminalControl, TerminalSize,
 };
@@ -14,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::windows::named_pipe::ServerOptions;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
 use tokio::time::{sleep, timeout, Duration};
 
 fn endpoint() -> String {
@@ -146,6 +151,145 @@ fn assert_git_success(root: &Path, arguments: &[&str]) {
         "git {arguments:?} failed: {}",
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+async fn raw_pipe_client(endpoint: &str) -> NamedPipeClient {
+    for _ in 0..100 {
+        match ClientOptions::new().open(endpoint) {
+            Ok(client) => return client,
+            Err(error)
+                if matches!(error.kind(), std::io::ErrorKind::NotFound)
+                    || error.raw_os_error() == Some(231) =>
+            {
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("raw named-pipe connect failed: {error}"),
+        }
+    }
+    panic!("raw named-pipe endpoint was not available");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility() {
+    let endpoint = endpoint();
+    let token = "fixture-compatibility-token";
+    let server = NodeServer::new_fixture(server_config(&endpoint, token)).unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_task = tokio::spawn(server.run());
+
+    let client = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Observer,
+        token,
+    )
+    .await
+    .unwrap();
+    let compatibility = client
+        .hello()
+        .compatibility
+        .as_ref()
+        .expect("new node omitted negotiated compatibility");
+    assert_eq!(compatibility.protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(
+        compatibility
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        vec!["compatibility.metadata"],
+    );
+    assert_eq!(compatibility.host.operating_system.as_str(), "windows");
+    assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);
+    assert_eq!(compatibility.path_semantics.style, PathStyle::Windows);
+    assert_eq!(compatibility.path_semantics.encoding, PathEncoding::Utf8);
+    assert_eq!(compatibility.local_transport, LocalTransportKind::WindowsNamedPipe);
+    assert_eq!(compatibility.state_schema_version, Some(1));
+    assert!(compatibility.provider_contracts.is_empty());
+
+    drop(client);
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("compatibility node did not shut down")
+        .expect("compatibility node task panicked")
+        .expect("compatibility node failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_raw_legacy_v8_hello_negotiates_without_optional_capabilities() {
+    let endpoint = endpoint();
+    let token = "fixture-legacy-compatibility-token";
+    let server = NodeServer::new_fixture(server_config(&endpoint, token)).unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_task = tokio::spawn(server.run());
+    let mut pipe = raw_pipe_client(&endpoint).await;
+    let client_nonce = random_nonce().unwrap();
+
+    write_json_frame_limited(
+        &mut pipe,
+        &ClientFrame::Hello(ClientHello::new(ClientRole::Observer, client_nonce)),
+        MAX_NODE_HELLO_FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    let ServerFrame::Challenge(challenge) = read_json_frame_limited_body_timeout(
+        &mut pipe,
+        MAX_NODE_HELLO_FRAME_BYTES,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("legacy client did not receive a challenge");
+    };
+    assert_eq!(challenge.protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(challenge.compatibility, None);
+    let expected_server_proof = auth_proof(
+        token.as_bytes(),
+        AuthDirection::Server,
+        ClientRole::Observer,
+        &client_nonce,
+        &challenge.server_nonce,
+    )
+    .unwrap();
+    assert!(proofs_match(&challenge.server_proof, &expected_server_proof));
+    let client_proof = auth_proof(
+        token.as_bytes(),
+        AuthDirection::Client,
+        ClientRole::Observer,
+        &client_nonce,
+        &challenge.server_nonce,
+    )
+    .unwrap();
+    write_json_frame_limited(
+        &mut pipe,
+        &ClientFrame::Authenticate(ClientAuthentication { client_proof }),
+        MAX_NODE_HELLO_FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    let ServerFrame::Hello(hello) = read_json_frame_limited_body_timeout(
+        &mut pipe,
+        MAX_NODE_FRAME_BYTES,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("legacy client did not receive node hello");
+    };
+    assert_eq!(hello.protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(hello.snapshot.node_id, expected_node_id());
+    assert_eq!(hello.compatibility, None);
+
+    drop(pipe);
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("legacy compatibility node did not shut down")
+        .expect("legacy compatibility node task panicked")
+        .expect("legacy compatibility node failed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -15,7 +15,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
 pub const NODE_PROTOCOL_VERSION: u16 = 8;
+pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
+pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
+pub const MAX_PROVIDER_CONTRACT_REVISION_BYTES: usize = 128;
 pub const NODE_INCARNATION_ID_BYTES: usize = 16;
 pub const MAX_NODE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_NODE_CLIENT_FRAME_BYTES: usize = 256 * 1024;
@@ -261,6 +264,410 @@ pub enum NodeIdentifierError {
     InvalidBoundary { label: &'static str, value: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ProtocolRange {
+    minimum: u16,
+    maximum: u16,
+}
+
+impl ProtocolRange {
+    pub fn new(minimum: u16, maximum: u16) -> Result<Self, ProtocolNegotiationError> {
+        if minimum == 0 || maximum == 0 || minimum > maximum {
+            return Err(ProtocolNegotiationError::InvalidRange { minimum, maximum });
+        }
+        Ok(Self { minimum, maximum })
+    }
+
+    pub fn exact(version: u16) -> Result<Self, ProtocolNegotiationError> {
+        Self::new(version, version)
+    }
+
+    pub fn minimum(self) -> u16 {
+        self.minimum
+    }
+
+    pub fn maximum(self) -> u16 {
+        self.maximum
+    }
+
+    pub fn contains(self, version: u16) -> bool {
+        self.minimum <= version && version <= self.maximum
+    }
+
+    pub fn highest_common(self, other: Self) -> Result<u16, ProtocolNegotiationError> {
+        let minimum = self.minimum.max(other.minimum);
+        let maximum = self.maximum.min(other.maximum);
+        if minimum > maximum {
+            return Err(ProtocolNegotiationError::Disjoint {
+                local: self,
+                remote: other,
+            });
+        }
+        Ok(maximum)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtocolRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireRange {
+            minimum: u16,
+            maximum: u16,
+        }
+
+        let wire = WireRange::deserialize(deserializer)?;
+        Self::new(wire.minimum, wire.maximum).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ProtocolNegotiationError {
+    #[error("protocol range {minimum}..={maximum} is invalid")]
+    InvalidRange { minimum: u16, maximum: u16 },
+    #[error("protocol ranges {local:?} and {remote:?} do not overlap")]
+    Disjoint {
+        local: ProtocolRange,
+        remote: ProtocolRange,
+    },
+    #[error("active wire protocol {active} is not contained in both ranges {local:?} and {remote:?}")]
+    ActiveVersionUnsupported {
+        active: u16,
+        local: ProtocolRange,
+        remote: ProtocolRange,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperatingSystemId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArchitectureId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderContractRevision(String);
+
+macro_rules! compatibility_identifier_impl {
+    ($type:ident, $label:literal) => {
+        impl $type {
+            pub fn new(value: impl Into<String>) -> Result<Self, CompatibilityIdentifierError> {
+                let value = value.into();
+                validate_compatibility_identifier($label, &value)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl FromStr for $type {
+            type Err = CompatibilityIdentifierError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl Serialize for $type {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $type {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+compatibility_identifier_impl!(CapabilityId, "capability");
+compatibility_identifier_impl!(OperatingSystemId, "operating system");
+compatibility_identifier_impl!(ArchitectureId, "architecture");
+
+impl ProviderContractRevision {
+    pub fn new(value: impl Into<String>) -> Result<Self, CompatibilityIdentifierError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(CompatibilityIdentifierError::Empty {
+                label: "provider contract revision",
+            });
+        }
+        if value.len() > MAX_PROVIDER_CONTRACT_REVISION_BYTES {
+            return Err(CompatibilityIdentifierError::TooLong {
+                label: "provider contract revision",
+                len: value.len(),
+                max: MAX_PROVIDER_CONTRACT_REVISION_BYTES,
+            });
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(CompatibilityIdentifierError::InvalidCharacters {
+                label: "provider contract revision",
+                value,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderContractRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderContractRevision {
+    type Err = CompatibilityIdentifierError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for ProviderContractRevision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderContractRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_compatibility_identifier(
+    label: &'static str,
+    value: &str,
+) -> Result<(), CompatibilityIdentifierError> {
+    if value.is_empty() {
+        return Err(CompatibilityIdentifierError::Empty { label });
+    }
+    if value.len() > MAX_COMPATIBILITY_IDENTIFIER_BYTES {
+        return Err(CompatibilityIdentifierError::TooLong {
+            label,
+            len: value.len(),
+            max: MAX_COMPATIBILITY_IDENTIFIER_BYTES,
+        });
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'-' | b'_' | b'.')
+    }) || !value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        || !value.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(CompatibilityIdentifierError::InvalidCharacters {
+            label,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CompatibilityIdentifierError {
+    #[error("{label} identifier cannot be empty")]
+    Empty { label: &'static str },
+    #[error("{label} identifier length {len} exceeds the {max}-byte limit")]
+    TooLong {
+        label: &'static str,
+        len: usize,
+        max: usize,
+    },
+    #[error("{label} identifier must be bounded lowercase ASCII: {value}")]
+    InvalidCharacters { label: &'static str, value: String },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathStyle {
+    Windows,
+    Posix,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathEncoding {
+    Utf8,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PathSemantics {
+    pub style: PathStyle,
+    pub encoding: PathEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalTransportKind {
+    WindowsNamedPipe,
+    UnixDomainSocket,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostDescriptor {
+    pub operating_system: OperatingSystemId,
+    pub architecture: ArchitectureId,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateSchemaSupport {
+    pub versions: ProtocolRange,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderContractSupport {
+    pub provider: AgentProvider,
+    pub revision: ProviderContractRevision,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientCompatibilityOffer {
+    pub protocol_versions: ProtocolRange,
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_schema: Option<StateSchemaSupport>,
+}
+
+impl ClientCompatibilityOffer {
+    pub fn exact(protocol_version: u16) -> Result<Self, ProtocolNegotiationError> {
+        Ok(Self {
+            protocol_versions: ProtocolRange::exact(protocol_version)?,
+            capabilities: Vec::new(),
+            state_schema: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeCompatibilitySupport {
+    pub protocol_versions: ProtocolRange,
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityId>,
+    pub host: HostDescriptor,
+    pub path_semantics: PathSemantics,
+    pub local_transport: LocalTransportKind,
+    pub state_schema: StateSchemaSupport,
+    #[serde(default)]
+    pub provider_contracts: Vec<ProviderContractSupport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NegotiatedNodeCompatibility {
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityId>,
+    pub host: HostDescriptor,
+    pub path_semantics: PathSemantics,
+    pub local_transport: LocalTransportKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_schema_version: Option<u16>,
+    #[serde(default)]
+    pub provider_contracts: Vec<ProviderContractSupport>,
+}
+
+impl NodeCompatibilitySupport {
+    pub fn negotiate(
+        &self,
+        active_protocol_version: u16,
+        client: &ClientCompatibilityOffer,
+    ) -> Result<NegotiatedNodeCompatibility, ProtocolNegotiationError> {
+        if !self.protocol_versions.contains(active_protocol_version)
+            || !client.protocol_versions.contains(active_protocol_version)
+        {
+            return Err(ProtocolNegotiationError::ActiveVersionUnsupported {
+                active: active_protocol_version,
+                local: self.protocol_versions,
+                remote: client.protocol_versions,
+            });
+        }
+        let capabilities = self
+            .capabilities
+            .iter()
+            .filter(|capability| client.capabilities.contains(capability))
+            .cloned()
+            .collect();
+        let state_schema_version = match client.state_schema {
+            Some(client_state) => Some(
+                self.state_schema
+                    .versions
+                    .highest_common(client_state.versions)?,
+            ),
+            None => None,
+        };
+        Ok(NegotiatedNodeCompatibility {
+            protocol_version: active_protocol_version,
+            capabilities,
+            host: self.host.clone(),
+            path_semantics: self.path_semantics.clone(),
+            local_transport: self.local_transport,
+            state_schema_version,
+            provider_contracts: self.provider_contracts.clone(),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct NodeCompatibilityAuthBinding<'a> {
+    offer: &'a ClientCompatibilityOffer,
+    selected: &'a NegotiatedNodeCompatibility,
+}
+
+pub fn encode_node_compatibility_auth_binding(
+    offer: &ClientCompatibilityOffer,
+    selected: &NegotiatedNodeCompatibility,
+) -> Result<Vec<u8>, NodeCompatibilityAuthBindingError> {
+    let encoded = serde_json::to_vec(&NodeCompatibilityAuthBinding { offer, selected })?;
+    if encoded.len() > MAX_NODE_HELLO_FRAME_BYTES {
+        return Err(NodeCompatibilityAuthBindingError::TooLarge {
+            len: encoded.len(),
+            max: MAX_NODE_HELLO_FRAME_BYTES,
+        });
+    }
+    Ok(encoded)
+}
+
+#[derive(Debug, Error)]
+pub enum NodeCompatibilityAuthBindingError {
+    #[error("node compatibility authentication binding serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("node compatibility authentication binding length {len} exceeds the {max}-byte limit")]
+    TooLarge { len: usize, max: usize },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct SessionKey {
     pub instance_id: AgentInstanceId,
@@ -379,6 +786,8 @@ pub struct ClientHello {
     pub protocol_version: u16,
     pub role: ClientRole,
     pub client_nonce: [u8; NODE_AUTH_NONCE_BYTES],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<ClientCompatibilityOffer>,
 }
 
 impl ClientHello {
@@ -387,6 +796,20 @@ impl ClientHello {
             protocol_version: NODE_PROTOCOL_VERSION,
             role,
             client_nonce,
+            compatibility: None,
+        }
+    }
+
+    pub fn negotiating(
+        role: ClientRole,
+        client_nonce: [u8; NODE_AUTH_NONCE_BYTES],
+        compatibility: ClientCompatibilityOffer,
+    ) -> Self {
+        Self {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            role,
+            client_nonce,
+            compatibility: Some(compatibility),
         }
     }
 }
@@ -396,6 +819,8 @@ pub struct ServerChallenge {
     pub protocol_version: u16,
     pub server_nonce: [u8; NODE_AUTH_NONCE_BYTES],
     pub server_proof: [u8; NODE_AUTH_PROOF_BYTES],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<NegotiatedNodeCompatibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -424,6 +849,8 @@ pub struct NodeHello {
     pub event_sequence: u64,
     pub controller: Option<ControllerState>,
     pub snapshot: NodeSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<NegotiatedNodeCompatibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -724,6 +1151,171 @@ pub enum FrameError {
 mod tests {
     use super::*;
 
+    fn portable_node_support() -> NodeCompatibilitySupport {
+        NodeCompatibilitySupport {
+            protocol_versions: ProtocolRange::new(7, 9).unwrap(),
+            capabilities: vec![
+                CapabilityId::new("workspace.inspect").unwrap(),
+                CapabilityId::new("session.spawn").unwrap(),
+            ],
+            host: HostDescriptor {
+                operating_system: OperatingSystemId::new("windows").unwrap(),
+                architecture: ArchitectureId::new("x86_64").unwrap(),
+            },
+            path_semantics: PathSemantics {
+                style: PathStyle::Windows,
+                encoding: PathEncoding::Utf8,
+            },
+            local_transport: LocalTransportKind::WindowsNamedPipe,
+            state_schema: StateSchemaSupport {
+                versions: ProtocolRange::new(3, 5).unwrap(),
+            },
+            provider_contracts: vec![ProviderContractSupport {
+                provider: AgentProvider::Codex,
+                revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
+            }],
+        }
+    }
+
+    #[test]
+    fn legacy_hello_json_remains_exactly_protocol_v8() {
+        let client = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
+        assert_eq!(
+            serde_json::to_string(&client).unwrap(),
+            r#"{"protocol_version":8,"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+        );
+
+        let challenge = ServerChallenge {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            server_nonce: [0; NODE_AUTH_NONCE_BYTES],
+            server_proof: [0; NODE_AUTH_PROOF_BYTES],
+            compatibility: None,
+        };
+        let json = serde_json::to_string(&challenge).unwrap();
+        assert!(!json.contains("compatibility"));
+        assert_eq!(serde_json::from_str::<ServerChallenge>(&json).unwrap(), challenge);
+    }
+
+    #[test]
+    fn legacy_hello_omits_compatibility_instead_of_synthesizing_a_selection() {
+        let hello = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
+        assert_eq!(hello.compatibility, None);
+    }
+
+    #[test]
+    fn compatibility_negotiation_keeps_the_active_wire_and_selects_highest_state_schema() {
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::new(8, 10).unwrap(),
+            capabilities: vec![
+                CapabilityId::new("session.spawn").unwrap(),
+                CapabilityId::new("unknown.future").unwrap(),
+            ],
+            state_schema: Some(StateSchemaSupport {
+                versions: ProtocolRange::new(4, 6).unwrap(),
+            }),
+        };
+        let hello = ClientHello::negotiating(
+            ClientRole::Operator,
+            [1; NODE_AUTH_NONCE_BYTES],
+            offer.clone(),
+        );
+        assert_eq!(hello.compatibility, Some(offer.clone()));
+
+        let negotiated = portable_node_support()
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap();
+        assert_eq!(negotiated.protocol_version, NODE_PROTOCOL_VERSION);
+        assert_eq!(negotiated.state_schema_version, Some(5));
+        assert_eq!(
+            negotiated.capabilities,
+            vec![CapabilityId::new("session.spawn").unwrap()],
+        );
+    }
+
+    #[test]
+    fn compatibility_negotiation_rejects_an_active_wire_outside_either_range() {
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::new(9, 10).unwrap(),
+            capabilities: Vec::new(),
+            state_schema: None,
+        };
+        let error = portable_node_support()
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolNegotiationError::ActiveVersionUnsupported {
+                active: NODE_PROTOCOL_VERSION,
+                ..
+            },
+        ));
+    }
+
+    #[test]
+    fn compatibility_auth_binding_has_an_exact_bounded_encoding() {
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::new(8, 10).unwrap(),
+            capabilities: vec![CapabilityId::new("session.spawn").unwrap()],
+            state_schema: Some(StateSchemaSupport {
+                versions: ProtocolRange::new(4, 6).unwrap(),
+            }),
+        };
+        let selected = portable_node_support()
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap();
+        let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":10},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":8,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}]}}"#,
+        );
+    }
+
+    #[test]
+    fn protocol_ranges_reject_invalid_and_disjoint_inputs() {
+        assert!(matches!(
+            ProtocolRange::new(0, 8),
+            Err(ProtocolNegotiationError::InvalidRange { minimum: 0, maximum: 8 }),
+        ));
+        assert!(matches!(
+            ProtocolRange::new(9, 8),
+            Err(ProtocolNegotiationError::InvalidRange { minimum: 9, maximum: 8 }),
+        ));
+        let error = ProtocolRange::new(7, 8)
+            .unwrap()
+            .highest_common(ProtocolRange::new(9, 10).unwrap())
+            .unwrap_err();
+        assert!(matches!(error, ProtocolNegotiationError::Disjoint { .. }));
+        assert!(serde_json::from_str::<ProtocolRange>(
+            r#"{"minimum":10,"maximum":9}"#,
+        )
+        .is_err());
+        assert!(ProviderContractRevision::new(
+            "gate4agent-inline/codex-cli-0.144/v1",
+        )
+        .is_ok());
+        assert!(ProviderContractRevision::new(
+            "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn foreign_path_metadata_round_trips_without_normalization() {
+        #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+        struct ForeignPath {
+            raw: String,
+            semantics: PathSemantics,
+        }
+
+        let foreign = ForeignPath {
+            raw: r"C:\Users\operator\repo\src\lib.rs".to_owned(),
+            semantics: portable_node_support().path_semantics,
+        };
+        let json = serde_json::to_string(&foreign).unwrap();
+        assert!(json.contains(r#""raw":"C:\\Users\\operator\\repo\\src\\lib.rs""#));
+        assert_eq!(serde_json::from_str::<ForeignPath>(&json).unwrap(), foreign);
+    }
+
     #[tokio::test]
     async fn json_frame_round_trips_a_client_hello_without_the_access_token() {
         let expected = ClientFrame::Hello(ClientHello::new(ClientRole::Operator, [7; NODE_AUTH_NONCE_BYTES]));
@@ -991,6 +1583,7 @@ mod tests {
                 workspaces: Vec::new(),
                 session_records: Vec::new(),
             },
+            compatibility: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(

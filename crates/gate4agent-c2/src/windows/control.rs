@@ -1,9 +1,13 @@
 use super::*;
 use crate::protocol::{
-    c2_auth_transcript, C2AuthDirection, C2ClientAuthentication, C2ClientFrame,
-    C2ReplyEnvelope, C2ServerChallenge, C2Topology,
-    C2ServerFrame, C2Hello, C2_CONTROL_PROTOCOL_VERSION, MAX_C2_AUTH_FRAME_BYTES,
-    MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES, MAX_C2_SERVER_FRAME_BYTES,
+    c2_auth_transcript, c2_bound_auth_transcript, ArchitectureId, C2AuthDirection, C2ClientAuthentication,
+    C2ClientFrame, C2ControlCompatibilitySupport, C2Hello, C2ReplyEnvelope,
+    C2ServerChallenge, C2ServerFrame, C2Topology, CapabilityId, ClientCompatibilityOffer,
+    HostDescriptor, NegotiatedC2ControlCompatibility,
+    OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
+    C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
+    MAX_C2_SERVER_FRAME_BYTES,
 };
 use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, FrameError,
@@ -92,8 +96,19 @@ async fn serve_connection(
         .await.map_err(|_| FrameError::PrefixTimedOut)??;
     let C2ClientFrame::Hello(hello) = hello else { return Ok(()); };
     if hello.protocol_version != C2_CONTROL_PROTOCOL_VERSION { return Ok(()); }
+    let negotiated = c2_control_compatibility_support()?
+        .negotiate(&hello)
+        .map_err(|error| authentication_frame_error(error.to_string()))?;
+    let compatibility = hello.compatibility.as_ref().map(|_| negotiated);
     let server_nonce = random_nonce().map_err(authentication_frame_error)?;
-    let server_proof = c2_proof(token, C2AuthDirection::Server, &hello.client_nonce, &server_nonce)
+    let auth_compatibility = hello.compatibility.as_ref().zip(compatibility.as_ref());
+    let server_proof = c2_proof(
+        token,
+        C2AuthDirection::Server,
+        &hello.client_nonce,
+        &server_nonce,
+        auth_compatibility,
+    )
         .map_err(authentication_frame_error)?;
     timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
@@ -101,13 +116,20 @@ async fn serve_connection(
             protocol_version: C2_CONTROL_PROTOCOL_VERSION,
             server_nonce,
             server_proof,
+            compatibility: compatibility.clone(),
         }),
         MAX_C2_AUTH_FRAME_BYTES,
     )).await.map_err(|_| FrameError::BodyTimedOut { length: 0 })??;
     let authentication = timeout(AUTH_DEADLINE, read_client_frame(&mut pipe, MAX_C2_AUTH_FRAME_BYTES))
         .await.map_err(|_| FrameError::PrefixTimedOut)??;
     let C2ClientFrame::Authenticate(C2ClientAuthentication { client_proof }) = authentication else { return Ok(()); };
-    let expected = c2_proof(token, C2AuthDirection::Client, &hello.client_nonce, &server_nonce)
+    let expected = c2_proof(
+        token,
+        C2AuthDirection::Client,
+        &hello.client_nonce,
+        &server_nonce,
+        auth_compatibility,
+    )
         .map_err(authentication_frame_error)?;
     if !proofs_match(&client_proof, &expected) { return Ok(()); }
     drop(preauth_permit);
@@ -156,6 +178,7 @@ async fn serve_connection(
             protocol_version: C2_CONTROL_PROTOCOL_VERSION,
             connection_id,
             status: hello_status,
+            compatibility,
         }),
         MAX_C2_HELLO_FRAME_BYTES,
     )).await.map_err(|_| FrameError::BodyTimedOut { length: 0 }).and_then(|result| result).is_err() {
@@ -496,12 +519,42 @@ fn c2_proof(
     direction: C2AuthDirection,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    compatibility: Option<(&ClientCompatibilityOffer, &NegotiatedC2ControlCompatibility)>,
 ) -> Result<[u8; 32], String> {
-    local_hmac_sha256(token.as_bytes(), &c2_auth_transcript(direction, client_nonce, server_nonce))
+    let transcript = match compatibility {
+        Some((offer, selected)) => c2_bound_auth_transcript(
+            direction,
+            client_nonce,
+            server_nonce,
+            offer,
+            selected,
+        ).map_err(|error| error.to_string())?,
+        None => c2_auth_transcript(direction, client_nonce, server_nonce),
+    };
+    local_hmac_sha256(token.as_bytes(), &transcript)
 }
 
 fn authentication_frame_error(message: String) -> FrameError {
     FrameError::Io(io::Error::new(io::ErrorKind::Other, message))
+}
+
+fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, FrameError> {
+    Ok(C2ControlCompatibilitySupport {
+        protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)
+            .map_err(|error| authentication_frame_error(error.to_string()))?,
+        capabilities: vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
+            .map_err(|error| authentication_frame_error(error.to_string()))?],
+        host: HostDescriptor {
+            operating_system: OperatingSystemId::new("windows")
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            architecture: ArchitectureId::new(std::env::consts::ARCH)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+        },
+        path_semantics: PathSemantics {
+            style: PathStyle::Windows,
+            encoding: PathEncoding::Utf8,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -531,6 +584,24 @@ mod tests {
                 gaps_truncated: 0,
             })]),
         }
+    }
+
+    #[test]
+    fn c2_control_server_support_is_exact_v2_windows_metadata_only() {
+        let support = c2_control_compatibility_support().unwrap();
+
+        assert_eq!(
+            support.protocol_versions,
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+        );
+        assert_eq!(
+            support.capabilities,
+            vec![CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
+        );
+        assert_eq!(support.host.operating_system.as_str(), "windows");
+        assert_eq!(support.host.architecture.as_str(), std::env::consts::ARCH);
+        assert_eq!(support.path_semantics.style, PathStyle::Windows);
+        assert_eq!(support.path_semantics.encoding, PathEncoding::Utf8);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use gate4agent_c2::protocol::{
     C2NodeEvent, C2NodeResponse, C2RelayFailureCode, NodeId, NodeRoute, NodeTransportState,
+    PathStyle, C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
 };
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
@@ -170,6 +171,17 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
 
     let (control, mut events) = connect_local(&control_endpoint, c2_token).await.unwrap();
     assert_eq!(control.hello().status.nodes.len(), 2);
+    let compatibility = control.hello().compatibility.as_ref()
+        .expect("negotiated C2 compatibility metadata");
+    assert_eq!(compatibility.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
+    assert_eq!(compatibility.capabilities.len(), 1);
+    assert_eq!(
+        compatibility.capabilities[0].as_str(),
+        C2_COMPATIBILITY_METADATA_CAPABILITY,
+    );
+    assert_eq!(compatibility.host.operating_system.as_str(), "windows");
+    assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);
+    assert_eq!(compatibility.path_semantics.style, PathStyle::Windows);
     let hello_a_cursor = control.hello().status.nodes[&id_a].cursor.expect("node A hello cursor");
     let event_node_a = id_a.clone();
     let event_drain = tokio::spawn(async move {

@@ -435,7 +435,6 @@ mod tests {
     use std::fs::File;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -445,21 +444,22 @@ mod tests {
     }
 
     impl TestDirectory {
-        fn new(label: &str) -> Self {
+        fn new() -> Self {
             let base = fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
-            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time after Unix epoch")
-                .as_nanos();
-            let path = base.join(format!(
-                "gate4agent-node-wire-{label}-{}-{timestamp}-{sequence}",
-                std::process::id()
-            ));
-            fs::create_dir(&path).expect("create test directory");
-            fs::set_permissions(&path, Permissions::from_mode(0o700))
-                .expect("secure test directory");
-            Self { path }
+            for _ in 0..100 {
+                let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let path = base.join(format!("g{:x}-{sequence:x}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        fs::set_permissions(&path, Permissions::from_mode(0o700))
+                            .expect("secure test directory");
+                        return Self { path };
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create test directory: {error}"),
+                }
+            }
+            panic!("allocate unique short test directory")
         }
 
         fn endpoint(&self, name: &str) -> PathBuf {
@@ -487,12 +487,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn owner_only_socket_has_secure_modes_and_roundtrips() {
-        let directory = TestDirectory::new("roundtrip");
-        let endpoint = directory.endpoint("node.sock");
+        let directory = TestDirectory::new();
+        let endpoint = directory.endpoint("n.sock");
         let lock_path = endpoint_lock_path(&endpoint);
         assert_eq!(
             lock_path.file_name(),
-            Some(std::ffi::OsStr::new(".node.sock.gate4agent.lock"))
+            Some(std::ffi::OsStr::new(".n.sock.gate4agent.lock"))
         );
         let mut listener = OwnerOnlyLocalListener::bind(&endpoint)
             .await
@@ -539,8 +539,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_accept_keeps_listener_usable() {
-        let directory = TestDirectory::new("cancelled-accept");
-        let endpoint = directory.endpoint("node.sock");
+        let directory = TestDirectory::new();
+        let endpoint = directory.endpoint("n.sock");
         let mut listener = OwnerOnlyLocalListener::bind(&endpoint)
             .await
             .expect("bind owner-only socket");
@@ -558,8 +558,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn second_listener_lock_collision_does_not_remove_live_socket() {
-        let directory = TestDirectory::new("live-collision");
-        let endpoint = directory.endpoint("node.sock");
+        let directory = TestDirectory::new();
+        let endpoint = directory.endpoint("n.sock");
         let listener = OwnerOnlyLocalListener::bind(&endpoint)
             .await
             .expect("bind first listener");
@@ -592,9 +592,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn endpoint_specific_locks_allow_two_listeners_in_one_parent() {
-        let directory = TestDirectory::new("endpoint-specific-locks");
-        let node_endpoint = directory.endpoint("node.sock");
-        let c2_endpoint = directory.endpoint("c2.sock");
+        let directory = TestDirectory::new();
+        let node_endpoint = directory.endpoint("n.sock");
+        let c2_endpoint = directory.endpoint("c.sock");
         assert_ne!(
             endpoint_lock_path(&node_endpoint),
             endpoint_lock_path(&c2_endpoint)
@@ -614,8 +614,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn safely_recovers_owned_stale_socket() {
-        let directory = TestDirectory::new("stale-recovery");
-        let endpoint = directory.endpoint("node.sock");
+        let directory = TestDirectory::new();
+        let endpoint = directory.endpoint("n.sock");
         let stale = std::os::unix::net::UnixListener::bind(&endpoint)
             .expect("bind stale socket fixture");
         drop(stale);
@@ -636,7 +636,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refuses_regular_file_and_symlink_endpoints() {
-        let directory = TestDirectory::new("non-socket-refusal");
+        let directory = TestDirectory::new();
         let regular = directory.endpoint("regular");
         File::create(&regular).expect("create regular endpoint fixture");
         let regular_error = OwnerOnlyLocalListener::bind(&regular)
@@ -664,15 +664,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_relative_endpoint_and_insecure_parent_mode() {
-        let relative_error = OwnerOnlyLocalListener::bind(Path::new("node.sock"))
+        let relative_error = OwnerOnlyLocalListener::bind(Path::new("n.sock"))
             .await
             .expect_err("reject relative endpoint");
         assert_eq!(relative_error.kind(), io::ErrorKind::InvalidInput);
 
-        let directory = TestDirectory::new("insecure-parent");
+        let directory = TestDirectory::new();
         fs::set_permissions(&directory.path, Permissions::from_mode(0o750))
             .expect("make parent insecure");
-        let endpoint = directory.endpoint("node.sock");
+        let endpoint = directory.endpoint("n.sock");
         let mode_error = OwnerOnlyLocalListener::bind(&endpoint)
             .await
             .expect_err("reject insecure parent mode");
@@ -684,9 +684,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refuses_symlink_and_nonregular_endpoint_locks() {
-        let directory = TestDirectory::new("malicious-lock");
+        let directory = TestDirectory::new();
 
-        let symlink_endpoint = directory.endpoint("symlink.sock");
+        let symlink_endpoint = directory.endpoint("s.sock");
         let symlink_lock = endpoint_lock_path(&symlink_endpoint);
         let target = directory.endpoint("lock-target");
         File::create(&target).expect("create lock symlink target");
@@ -702,7 +702,7 @@ mod tests {
         );
         assert!(!symlink_endpoint.exists());
 
-        let directory_endpoint = directory.endpoint("directory.sock");
+        let directory_endpoint = directory.endpoint("d.sock");
         let directory_lock = endpoint_lock_path(&directory_endpoint);
         fs::create_dir(&directory_lock).expect("create nonregular lock fixture");
         OwnerOnlyLocalListener::bind(&directory_endpoint)
@@ -714,8 +714,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn drop_preserves_replacement_socket_inode() {
-        let directory = TestDirectory::new("drop-replacement");
-        let endpoint = directory.endpoint("node.sock");
+        let directory = TestDirectory::new();
+        let endpoint = directory.endpoint("n.sock");
         let lock_path = endpoint_lock_path(&endpoint);
         let listener = OwnerOnlyLocalListener::bind(&endpoint)
             .await
@@ -751,8 +751,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn drop_cleans_socket_and_allows_rebind() {
-        let directory = TestDirectory::new("cleanup-rebind");
-        let endpoint = directory.endpoint("node.sock");
+        let directory = TestDirectory::new();
+        let endpoint = directory.endpoint("n.sock");
         let lock_path = endpoint_lock_path(&endpoint);
         let listener = OwnerOnlyLocalListener::bind(&endpoint)
             .await

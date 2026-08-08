@@ -41,7 +41,7 @@ impl PrivateSocketDir {
         for _ in 0..100 {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "gate4agent-node-wire-{}-{id}",
+                "g4n-{:x}-{id:x}",
                 std::process::id()
             ));
             let mut builder = DirBuilder::new();
@@ -60,8 +60,8 @@ impl PrivateSocketDir {
                         }
                     };
                     assert_eq!(permissions, 0o700, "test directory must be private");
-                    let endpoint = path.join("node.sock");
-                    let endpoint_lock = path.join(".node.sock.gate4agent.lock");
+                    let endpoint = path.join("s");
+                    let endpoint_lock = path.join(".s.gate4agent.lock");
                     return Self {
                         path,
                         endpoint,

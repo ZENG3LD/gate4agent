@@ -2906,6 +2906,8 @@ mod tests {
                 endpoint: endpoint.clone(),
                 transport: NodeTransportState::Offline,
                 current_incarnation_id: None,
+                provider_contracts: Vec::new(),
+                provider_adapter_contracts: Vec::new(),
             }],
         };
         let mut routes = BTreeMap::new();
@@ -2935,6 +2937,8 @@ mod tests {
                 endpoint: endpoint.clone(),
                 transport: NodeTransportState::Parked,
                 current_incarnation_id: None,
+                provider_contracts: Vec::new(),
+                provider_adapter_contracts: Vec::new(),
             }],
         };
         let snapshots = reconcile_c2_topology(
@@ -2956,6 +2960,8 @@ mod tests {
                 endpoint: endpoint.clone(),
                 transport: NodeTransportState::Online,
                 current_incarnation_id: Some(incarnation),
+                provider_contracts: Vec::new(),
+                provider_adapter_contracts: Vec::new(),
             }],
         };
         let snapshots = reconcile_c2_topology(

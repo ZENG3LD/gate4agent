@@ -1,10 +1,15 @@
 use crate::protocol::{
     C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
     NodeIncarnationId, NodeRequest, RoutedNodeEvent, RoutedNodeResponse,
-    NodeTransportState, ObservedNode, ReadyResponse, SanitizedError, SlimNodeInventory,
-    StatusResponse, C2_API_VERSION, MAX_C2_ENDPOINT_BYTES, MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
+    NodeTransportState, ObservedNode, ProviderAdapterContractSupport, ProviderContractSupport,
+    ReadyResponse, SanitizedError, SlimNodeInventory, StatusResponse,
+    C2_API_VERSION, C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, MAX_C2_ENDPOINT_BYTES,
+    MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
 };
-use gate4agent_node_protocol::{ClientRole, FrameError, NodeEventEnvelope, NodeFailureCode, NodeResponse, NodeSnapshot};
+use gate4agent_node_protocol::{
+    ClientRole, FrameError, NegotiatedNodeCompatibility, NodeEventEnvelope, NodeFailureCode,
+    NodeResponse, NodeSnapshot,
+};
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -332,7 +337,35 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct ProviderContractManifest {
+    provider_contracts: Vec<ProviderContractSupport>,
+    provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
+}
+
+impl ProviderContractManifest {
+    fn from_compatibility(compatibility: Option<&NegotiatedNodeCompatibility>) -> Self {
+        let Some(compatibility) = compatibility.filter(|compatibility| {
+            compatibility.capabilities.iter().any(|capability| {
+                capability.as_str() == C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY
+            })
+        }) else {
+            return Self::default();
+        };
+        Self {
+            provider_contracts: compatibility.provider_contracts.clone(),
+            provider_adapter_contracts: compatibility.provider_adapter_contracts.clone(),
+        }
+    }
+}
+
 enum AttemptResult {
+    Connected {
+        cursor: NodeCursor,
+        snapshot: NodeSnapshot,
+        gaps: Vec<GapKind>,
+        provider_contract_manifest: ProviderContractManifest,
+    },
     Success { cursor: NodeCursor, snapshot: NodeSnapshot, gaps: Vec<GapKind> },
     Cursor { cursor: NodeCursor, gaps: Vec<GapKind> },
     Failure { error: SanitizedError, hard: bool },
@@ -381,6 +414,8 @@ async fn node_relay_worker(
         };
         failures = 0;
         let hello = client.hello().clone();
+        let provider_contract_manifest =
+            ProviderContractManifest::from_compatibility(hello.compatibility.as_ref());
         let incarnation_id = hello.incarnation_id;
         let connection_id = hello.connection_id;
         let mut controller_owned = hello.controller.as_ref().is_some_and(|controller| controller.connection_id == connection_id);
@@ -422,7 +457,12 @@ async fn node_relay_worker(
                 }
             }
         }
-        ingress_attempt(&ingress, &node.node_id, AttemptResult::Success { cursor, snapshot, gaps }).await?;
+        ingress_attempt(&ingress, &node.node_id, AttemptResult::Connected {
+            cursor,
+            snapshot,
+            gaps,
+            provider_contract_manifest,
+        }).await?;
         if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, did_resync, None).await {
             ingress_attempt(&ingress, &node.node_id, relay_failure_attempt(&error)).await?;
             reject_disconnected_commands(&mut commands, Some(cursor));
@@ -925,12 +965,47 @@ async fn inventory_owner(
                 let node = current.nodes.get_mut(&attempt.node_id).expect("configured poller node exists");
                 node.last_attempt_unix_ms = Some(attempt.at_unix_ms);
                 match attempt.result {
-                    AttemptResult::Success { cursor, snapshot, gaps } => {
+                    AttemptResult::Connected {
+                        cursor,
+                        snapshot,
+                        gaps,
+                        provider_contract_manifest,
+                    } => {
                         let previous = node.cursor;
+                        let mut inventory = SlimNodeInventory::from_snapshot(&snapshot);
+                        inventory.provider_contracts =
+                            provider_contract_manifest.provider_contracts;
+                        inventory.provider_adapter_contracts =
+                            provider_contract_manifest.provider_adapter_contracts;
                         node.transport = NodeTransportState::Online;
                         node.freshness = NodeFreshness::Fresh;
                         node.cursor = Some(cursor);
-                        node.inventory = Some(SlimNodeInventory::from_snapshot(&snapshot));
+                        node.inventory = Some(inventory);
+                        node.last_success_unix_ms = Some(attempt.at_unix_ms);
+                        node.consecutive_failures = 0;
+                        node.last_error = None;
+                        for kind in gaps {
+                            if node.gaps.len() == MAX_C2_GAPS_PER_NODE { node.gaps.remove(0); node.gaps_truncated += 1; }
+                            node.gaps.push(NodeGap { kind, detected_at_unix_ms: attempt.at_unix_ms, previous, observed: cursor });
+                        }
+                    }
+                    AttemptResult::Success { cursor, snapshot, gaps } => {
+                        let previous = node.cursor;
+                        let provider_contract_manifest = node.inventory.as_ref().map(|inventory| {
+                            ProviderContractManifest {
+                                provider_contracts: inventory.provider_contracts.clone(),
+                                provider_adapter_contracts: inventory.provider_adapter_contracts.clone(),
+                            }
+                        }).unwrap_or_default();
+                        let mut inventory = SlimNodeInventory::from_snapshot(&snapshot);
+                        inventory.provider_contracts =
+                            provider_contract_manifest.provider_contracts;
+                        inventory.provider_adapter_contracts =
+                            provider_contract_manifest.provider_adapter_contracts;
+                        node.transport = NodeTransportState::Online;
+                        node.freshness = NodeFreshness::Fresh;
+                        node.cursor = Some(cursor);
+                        node.inventory = Some(inventory);
                         node.last_success_unix_ms = Some(attempt.at_unix_ms);
                         node.consecutive_failures = 0;
                         node.last_error = None;
@@ -1317,9 +1392,31 @@ mod tests {
             session_records: Vec::new(),
         };
         let cursor = NodeCursor { incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([1; 16]), sequence: 0 };
-        ingress_tx.send(Attempt { node_id: node_id.clone(), at_unix_ms: unix_ms(), result: AttemptResult::Success { cursor, snapshot: snapshot.clone(), gaps: Vec::new() } }).await.unwrap();
+        let old_manifest = ProviderContractManifest {
+            provider_contracts: vec![crate::protocol::ProviderContractSupport {
+                provider: gate4agent_node_protocol::AgentProvider::Codex,
+                revision: crate::protocol::ProviderContractRevision::new("old-contract").unwrap(),
+            }],
+            provider_adapter_contracts: vec![crate::protocol::ProviderAdapterContractSupport {
+                provider: gate4agent_node_protocol::AgentProvider::Codex,
+                family: crate::protocol::AdapterFamily::PtySemantic,
+                adapter_id: crate::protocol::AdapterId::new("codex").unwrap(),
+                revision: crate::protocol::AdapterContractRevision::new("old-adapter").unwrap(),
+            }],
+        };
+        ingress_tx.send(Attempt { node_id: node_id.clone(), at_unix_ms: unix_ms(), result: AttemptResult::Connected {
+            cursor,
+            snapshot: snapshot.clone(),
+            gaps: Vec::new(),
+            provider_contract_manifest: old_manifest,
+        } }).await.unwrap();
         status_rx.changed().await.unwrap();
         assert_eq!(status_rx.borrow().nodes[&node_id].freshness, NodeFreshness::Fresh);
+        assert_eq!(
+            status_rx.borrow().nodes[&node_id].inventory.as_ref().unwrap()
+                .provider_contracts[0].revision.as_str(),
+            "old-contract",
+        );
 
         let failure = || AttemptResult::Failure { error: SanitizedError { category: C2ErrorCategory::Transport, message: "node transport unavailable".to_owned() }, hard: false };
         ingress_tx.send(Attempt { node_id: node_id.clone(), at_unix_ms: unix_ms(), result: failure() }).await.unwrap();
@@ -1336,10 +1433,53 @@ mod tests {
             status_rx.changed().await.unwrap();
         }
         assert_eq!(status_rx.borrow().nodes[&node_id].transport, NodeTransportState::Parked);
-        ingress_tx.send(Attempt { node_id: node_id.clone(), at_unix_ms: unix_ms(), result: AttemptResult::Success { cursor, snapshot, gaps: Vec::new() } }).await.unwrap();
+        let replacement_manifest = ProviderContractManifest {
+            provider_contracts: vec![crate::protocol::ProviderContractSupport {
+                provider: gate4agent_node_protocol::AgentProvider::Claude,
+                revision: crate::protocol::ProviderContractRevision::new("new-contract").unwrap(),
+            }],
+            provider_adapter_contracts: Vec::new(),
+        };
+        let replacement_cursor = NodeCursor {
+            incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([2; 16]),
+            sequence: 0,
+        };
+        ingress_tx.send(Attempt { node_id: node_id.clone(), at_unix_ms: unix_ms(), result: AttemptResult::Connected {
+            cursor: replacement_cursor,
+            snapshot,
+            gaps: Vec::new(),
+            provider_contract_manifest: replacement_manifest,
+        } }).await.unwrap();
         status_rx.changed().await.unwrap();
         assert_eq!(status_rx.borrow().nodes[&node_id].transport, NodeTransportState::Online);
         assert_eq!(status_rx.borrow().nodes[&node_id].freshness, NodeFreshness::Fresh);
+        let recovered_inventory = status_rx.borrow().nodes[&node_id].inventory.as_ref().unwrap().clone();
+        assert_eq!(recovered_inventory.provider_contracts.len(), 1);
+        assert_eq!(recovered_inventory.provider_contracts[0].provider, gate4agent_node_protocol::AgentProvider::Claude);
+        assert_eq!(recovered_inventory.provider_contracts[0].revision.as_str(), "new-contract");
+        assert!(recovered_inventory.provider_adapter_contracts.is_empty());
+        ingress_tx.send(Attempt {
+            node_id: node_id.clone(),
+            at_unix_ms: unix_ms(),
+            result: AttemptResult::Connected {
+                cursor: NodeCursor {
+                    incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([3; 16]),
+                    sequence: 0,
+                },
+                snapshot: NodeSnapshot {
+                    node_id: node_id.clone(),
+                    enabled_providers: Vec::new(),
+                    workspaces: Vec::new(),
+                    session_records: Vec::new(),
+                },
+                gaps: Vec::new(),
+                provider_contract_manifest: ProviderContractManifest::default(),
+            },
+        }).await.unwrap();
+        status_rx.changed().await.unwrap();
+        let unpublished = status_rx.borrow().nodes[&node_id].inventory.as_ref().unwrap().clone();
+        assert!(unpublished.provider_contracts.is_empty());
+        assert!(unpublished.provider_adapter_contracts.is_empty());
         shutdown_tx.send(true).unwrap();
         owner.await.unwrap().unwrap();
     }

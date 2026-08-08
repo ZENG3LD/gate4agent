@@ -6,7 +6,7 @@ use gate4agent_c2_protocol::{
     ProtocolRange, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
-    C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -241,6 +241,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
             CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
@@ -883,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn c2_control_client_offer_is_exact_v2_with_authenticated_path_opt_ins() {
+    fn c2_control_client_offer_is_exact_v2_with_authenticated_opt_ins() {
         let offer = client_compatibility_offer().unwrap();
 
         assert_eq!(
@@ -897,6 +899,7 @@ mod tests {
                 CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -1354,6 +1357,8 @@ mod tests {
             endpoint: r"\\.\pipe\node-a".to_owned(),
             transport: NodeTransportState::Offline,
             current_incarnation_id: None,
+            provider_contracts: Vec::new(),
+            provider_adapter_contracts: Vec::new(),
         }] });
         let (topology_tx, mut topology_rx) = watch::channel(offline);
         let owner = tokio::spawn(control_owner(
@@ -1366,6 +1371,8 @@ mod tests {
                 endpoint: r"\\.\pipe\node-a".to_owned(),
                 transport: NodeTransportState::Online,
                 current_incarnation_id: Some(incarnation_id),
+                provider_contracts: Vec::new(),
+                provider_adapter_contracts: Vec::new(),
             }],
         }))).await.unwrap();
 

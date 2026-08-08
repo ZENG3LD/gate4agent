@@ -7,7 +7,7 @@ use crate::protocol::{
     OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
-    C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -109,6 +109,8 @@ async fn serve_connection(
         .negotiate(&hello)
         .map_err(|error| authentication_frame_error(error.to_string()))?;
     let compatibility = hello.compatibility.as_ref().map(|_| negotiated);
+    let include_provider_contracts =
+        provider_contract_manifest_selected(compatibility.as_ref());
     let server_nonce = random_nonce().map_err(authentication_frame_error)?;
     let auth_compatibility = hello.compatibility.as_ref().zip(compatibility.as_ref());
     let server_proof = c2_proof(
@@ -168,7 +170,10 @@ async fn serve_connection(
         budget: Arc::clone(&budget),
         disconnect: disconnect_tx.clone(),
     });
-    let hello_status = refresh_hello_status(connection_id, &relays, &status).await;
+    let mut hello_status = refresh_hello_status(connection_id, &relays, &status).await;
+    if !include_provider_contracts {
+        clear_provider_contract_manifests(&mut hello_status);
+    }
     if !prune_pre_hello_events(
         &hub,
         connection_id,
@@ -180,7 +185,10 @@ async fn serve_connection(
         hub.detach(connection_id);
         return Ok(());
     }
-    let mut last_topology = C2Topology::from_status(&hello_status);
+    let mut last_topology = C2Topology::from_status_with_provider_contracts(
+        &hello_status,
+        include_provider_contracts,
+    );
     let path_capabilities = negotiated_path_capabilities(compatibility.as_ref());
     if timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
@@ -255,7 +263,10 @@ async fn serve_connection(
                 if changed.is_err() { break; }
                 let next_topology = {
                     let latest = status.borrow_and_update();
-                    C2Topology::from_status(latest.as_ref())
+                    C2Topology::from_status_with_provider_contracts(
+                        latest.as_ref(),
+                        include_provider_contracts,
+                    )
                 };
                 if queue_topology_if_changed(
                     &outbound_tx,
@@ -314,12 +325,35 @@ async fn refresh_hello_status(
         let Ok(response) = response else { continue; };
         let Ok(C2NodeResponse::Snapshot { event_sequence, snapshot, .. }) = response.response else { continue; };
         if let Some(observed) = refreshed.nodes.get_mut(&response.node_id) {
+            let provider_contract_manifest = provider_contract_manifest_for_snapshot(
+                observed,
+                response.incarnation_id,
+            );
             observed.cursor = Some(NodeCursor { incarnation_id: response.incarnation_id, sequence: event_sequence });
-            observed.inventory = Some(SlimNodeInventory::from_c2_snapshot(&snapshot));
+            let mut inventory = SlimNodeInventory::from_c2_snapshot(&snapshot);
+            inventory.provider_contracts = provider_contract_manifest.provider_contracts;
+            inventory.provider_adapter_contracts =
+                provider_contract_manifest.provider_adapter_contracts;
+            observed.inventory = Some(inventory);
         }
     }
     refreshed.observed_at_unix_ms = unix_ms();
     refreshed
+}
+
+fn provider_contract_manifest_for_snapshot(
+    observed: &ObservedNode,
+    response_incarnation_id: NodeIncarnationId,
+) -> ProviderContractManifest {
+    if !observed.cursor.is_some_and(|cursor| {
+        cursor.incarnation_id == response_incarnation_id
+    }) {
+        return ProviderContractManifest::default();
+    }
+    observed.inventory.as_ref().map(|inventory| ProviderContractManifest {
+        provider_contracts: inventory.provider_contracts.clone(),
+        provider_adapter_contracts: inventory.provider_adapter_contracts.clone(),
+    }).unwrap_or_default()
 }
 
 fn prune_pre_hello_events(
@@ -785,6 +819,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
             operating_system: OperatingSystemId::new("windows")
@@ -799,15 +835,35 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
     })
 }
 
+fn provider_contract_manifest_selected(
+    compatibility: Option<&NegotiatedC2ControlCompatibility>,
+) -> bool {
+    compatibility.is_some_and(|compatibility| {
+        compatibility.capabilities.iter().any(|capability| {
+            capability.as_str() == C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY
+        })
+    })
+}
+
+fn clear_provider_contract_manifests(status: &mut StatusResponse) {
+    for inventory in status.nodes.values_mut().filter_map(|node| node.inventory.as_mut()) {
+        inventory.provider_contracts.clear();
+        inventory.provider_adapter_contracts.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::{
-        C2ClientHello, C2GitSnapshot, C2WorkspaceInspection, C2_API_VERSION,
-        NodeFreshness, ObservedNode, OpaqueHostPath, RepositoryPath,
-        WorkspaceFileContent, WorkspaceFileRead,
+        AdapterContractRevision, AdapterFamily, AdapterId, C2ClientHello, C2GitSnapshot,
+        C2WorkspaceInspection, C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath,
+        ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
+        RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     };
-    use gate4agent_node_protocol::{GitStatusEntry, WorkspaceEntry, WorkspaceEntryKind};
+    use gate4agent_node_protocol::{
+        AgentProvider, GitStatusEntry, WorkspaceEntry, WorkspaceEntryKind,
+    };
     use tokio::io::AsyncReadExt;
 
     fn status(transport: NodeTransportState, incarnation_id: Option<NodeIncarnationId>) -> StatusResponse {
@@ -834,6 +890,31 @@ mod tests {
         }
     }
 
+    fn status_with_provider_contract_manifest(
+        incarnation_id: NodeIncarnationId,
+    ) -> StatusResponse {
+        let mut value = status(NodeTransportState::Online, Some(incarnation_id));
+        let observed = value.nodes.get_mut(&NodeId::new("node-a").unwrap()).unwrap();
+        let mut inventory = SlimNodeInventory::from_snapshot(&NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![AgentProvider::Codex],
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+        });
+        inventory.provider_contracts = vec![ProviderContractSupport {
+            provider: AgentProvider::Codex,
+            revision: ProviderContractRevision::new("old-contract").unwrap(),
+        }];
+        inventory.provider_adapter_contracts = vec![ProviderAdapterContractSupport {
+            provider: AgentProvider::Codex,
+            family: AdapterFamily::PtySemantic,
+            adapter_id: AdapterId::new("codex").unwrap(),
+            revision: AdapterContractRevision::new("old-adapter-contract").unwrap(),
+        }];
+        observed.inventory = Some(inventory);
+        value
+    }
+
     #[test]
     fn c2_control_server_selects_authenticated_path_opt_ins() {
         let support = c2_control_compatibility_support().unwrap();
@@ -849,6 +930,7 @@ mod tests {
                 CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -871,6 +953,59 @@ mod tests {
             [8; crate::protocol::C2_AUTH_NONCE_BYTES],
         )).unwrap();
         assert!(legacy.capabilities.is_empty());
+    }
+
+    #[test]
+    fn cross_incarnation_snapshot_never_inherits_stale_provider_contract_manifest() {
+        let old_incarnation = NodeIncarnationId::from_bytes([3; 16]);
+        let new_incarnation = NodeIncarnationId::from_bytes([4; 16]);
+        let observed = status_with_provider_contract_manifest(old_incarnation)
+            .nodes
+            .remove(&NodeId::new("node-a").unwrap())
+            .unwrap();
+
+        let same = provider_contract_manifest_for_snapshot(&observed, old_incarnation);
+        assert_eq!(same.provider_contracts.len(), 1);
+        assert_eq!(same.provider_adapter_contracts.len(), 1);
+        let restarted = provider_contract_manifest_for_snapshot(&observed, new_incarnation);
+        assert!(restarted.provider_contracts.is_empty());
+        assert!(restarted.provider_adapter_contracts.is_empty());
+    }
+
+    #[test]
+    fn n_minus_one_control_hello_keeps_exact_legacy_empty_manifest_shape() {
+        #[derive(serde::Serialize)]
+        struct LegacyHello<'a> {
+            protocol_version: u16,
+            connection_id: u64,
+            status: &'a StatusResponse,
+        }
+
+        let mut status = status_with_provider_contract_manifest(
+            NodeIncarnationId::from_bytes([5; 16]),
+        );
+        clear_provider_contract_manifests(&mut status);
+        let inventory = status.nodes.values().next().unwrap().inventory.as_ref().unwrap();
+        assert!(inventory.provider_contracts.is_empty());
+        assert!(inventory.provider_adapter_contracts.is_empty());
+        let hello = C2Hello {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            connection_id: 9,
+            status: status.clone(),
+            compatibility: None,
+        };
+        let legacy = LegacyHello {
+            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            connection_id: 9,
+            status: &status,
+        };
+        assert_eq!(
+            serde_json::to_vec(&hello).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+        );
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(!json.contains("provider_contracts"));
+        assert!(!json.contains("provider_adapter_contracts"));
     }
 
     fn repository_path(value: &str) -> RepositoryPath {

@@ -1,19 +1,22 @@
 #![cfg(windows)]
 
 use gate4agent_node::protocol::{
-    read_json_frame_limited_body_timeout, write_json_frame_limited, AgentProvider,
-    ClientAuthentication, ClientFrame, ClientHello, ClientRole, FrameError, LocalTransportKind,
-    NodeEvent, NodeFailureCode, NodeId, NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath,
-    PathEncoding, PathStyle, ServerFrame, SessionAddress, SessionMode, WorkspaceId,
+    read_json_frame_limited_body_timeout, write_json_frame_limited, AgentProvider, CapabilityId,
+    ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
+    FrameError, LocalTransportKind, NodeEvent, NodeFailureCode, NodeId, NodeRequest, NodeResponse,
+    NodeSnapshot, OpaqueHostPath, PathEncoding, PathStyle, ProtocolRange, ServerFrame,
+    SessionAddress, SessionMode, WorkspaceId,
     MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES, MAX_NODE_TEXT_BYTES,
-    NODE_PROTOCOL_VERSION,
+    NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, NodeServerError, WorkspaceConfig};
 use gate4agent_node_wire::{
-    auth_proof, proofs_match, random_nonce, AuthDirection, NamedPipeNodeClient, NodeClientError,
+    auth_proof, negotiated_auth_proof, proofs_match, random_nonce, AuthDirection,
+    NamedPipeNodeClient, NodeClientError,
 };
 use gate4agent_types::{
-    ControlEventKind, SessionGeneration, SessionStatus, TerminalControl, TerminalSize,
+    AdapterFamily, ControlEventKind, SessionGeneration, SessionStatus, TerminalControl,
+    TerminalSize,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -201,7 +204,11 @@ async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility
             .iter()
             .map(|capability| capability.as_str())
             .collect::<Vec<_>>(),
-        vec!["compatibility.metadata", "workspace-file-read-v1"],
+        vec![
+            "compatibility.metadata",
+            "workspace-file-read-v1",
+            "provider-contract-manifest-v1",
+        ],
     );
     assert_eq!(compatibility.host.operating_system.as_str(), "windows");
     assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);
@@ -209,7 +216,10 @@ async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility
     assert_eq!(compatibility.path_semantics.encoding, PathEncoding::Utf8);
     assert_eq!(compatibility.local_transport, LocalTransportKind::WindowsNamedPipe);
     assert_eq!(compatibility.state_schema_version, Some(2));
-    assert!(compatibility.provider_contracts.is_empty());
+    assert_eq!(compatibility.provider_contracts.len(), 1);
+    assert_eq!(compatibility.provider_contracts[0].provider, AgentProvider::Claude);
+    assert_eq!(compatibility.provider_contracts[0].revision.as_str(), "fixture-r1");
+    assert!(compatibility.provider_adapter_contracts.is_empty());
 
     drop(client);
     shutdown.request_shutdown().await.unwrap();
@@ -218,6 +228,86 @@ async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility
         .expect("compatibility node did not shut down")
         .expect("compatibility node task panicked")
         .expect("compatibility node failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_production_named_pipe_negotiates_exact_provider_contract_manifest() {
+    let endpoint = endpoint();
+    let token = "production-provider-manifest-token";
+    let server = NodeServer::new(server_config(&endpoint, token)).unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_task = tokio::spawn(server.run());
+
+    let client = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Observer,
+        token,
+    )
+    .await
+    .unwrap();
+    let compatibility = client
+        .hello()
+        .compatibility
+        .as_ref()
+        .expect("production node omitted negotiated compatibility");
+    assert_eq!(
+        compatibility
+            .provider_contracts
+            .iter()
+            .map(|contract| (contract.provider, contract.revision.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (AgentProvider::Claude, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            (AgentProvider::Codex, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            (AgentProvider::Kimi, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+        ]
+    );
+    assert_eq!(
+        compatibility
+            .provider_adapter_contracts
+            .iter()
+            .map(|contract| (
+                contract.provider,
+                contract.family,
+                contract.adapter_id.as_str(),
+                contract.revision.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (AgentProvider::Claude, AdapterFamily::PtySemantic, "claude-code", "gate4agent-adapter/v1"),
+            (AgentProvider::Claude, AdapterFamily::Pipe, "claude-code", "gate4agent-adapter/v1"),
+            (AgentProvider::Claude, AdapterFamily::Hook, "claude-code", "gate4agent-adapter/v1"),
+            (AgentProvider::Claude, AdapterFamily::ManagedHook, "claude", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+            (AgentProvider::Claude, AdapterFamily::OneShot, "claude", "gate4agent-inline/claude-code-2.1/v1"),
+            (AgentProvider::Claude, AdapterFamily::History, "claude-code", "gate4agent-adapter/v1"),
+            (AgentProvider::Claude, AdapterFamily::Resume, "claude-code", "gate4agent-adapter/v1"),
+            (AgentProvider::Claude, AdapterFamily::SessionOptions, "claude-code", "gate4agent-session-options/orca-d8629c4/v1"),
+            (AgentProvider::Codex, AdapterFamily::PtySemantic, "codex", "gate4agent-adapter/v1"),
+            (AgentProvider::Codex, AdapterFamily::Pipe, "codex", "gate4agent-adapter/v1"),
+            (AgentProvider::Codex, AdapterFamily::Hook, "codex", "gate4agent-adapter/v1"),
+            (AgentProvider::Codex, AdapterFamily::ManagedHook, "codex", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+            (AgentProvider::Codex, AdapterFamily::OneShot, "codex", "gate4agent-inline/codex-cli-0.144/v1"),
+            (AgentProvider::Codex, AdapterFamily::History, "codex", "gate4agent-adapter/v1"),
+            (AgentProvider::Codex, AdapterFamily::Resume, "codex", "gate4agent-adapter/v1"),
+            (AgentProvider::Codex, AdapterFamily::SessionOptions, "codex", "gate4agent-session-options/orca-d8629c4/v1"),
+            (AgentProvider::Kimi, AdapterFamily::PtySemantic, "kimi", "gate4agent-adapter/v1"),
+            (AgentProvider::Kimi, AdapterFamily::Pipe, "kimi", "gate4agent-adapter/v1"),
+            (AgentProvider::Kimi, AdapterFamily::Hook, "kimi", "gate4agent-adapter/v1"),
+            (AgentProvider::Kimi, AdapterFamily::ManagedHook, "kimi", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+            (AgentProvider::Kimi, AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
+            (AgentProvider::Kimi, AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
+            (AgentProvider::Kimi, AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
+        ]
+    );
+
+    drop(client);
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("production provider manifest node did not shut down")
+        .expect("production provider manifest node task panicked")
+        .expect("production provider manifest node failed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -294,6 +384,102 @@ async fn windows_fixture_raw_legacy_v8_hello_negotiates_without_optional_capabil
         .expect("legacy compatibility node did not shut down")
         .expect("legacy compatibility node task panicked")
         .expect("legacy compatibility node failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_negotiation_without_manifest_capability_returns_empty_manifests() {
+    let endpoint = endpoint();
+    let token = "fixture-no-manifest-capability-token";
+    let server = NodeServer::new_fixture(server_config(&endpoint, token)).unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_task = tokio::spawn(server.run());
+    let mut pipe = raw_pipe_client(&endpoint).await;
+    let client_nonce = random_nonce().unwrap();
+    let offer = ClientCompatibilityOffer {
+        protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+        capabilities: vec![CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
+        state_schema: None,
+    };
+
+    write_json_frame_limited(
+        &mut pipe,
+        &ClientFrame::Hello(ClientHello::negotiating(
+            ClientRole::Observer,
+            client_nonce,
+            offer.clone(),
+        )),
+        MAX_NODE_HELLO_FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    let ServerFrame::Challenge(challenge) = read_json_frame_limited_body_timeout(
+        &mut pipe,
+        MAX_NODE_HELLO_FRAME_BYTES,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("client without manifest capability did not receive a challenge");
+    };
+    let selected = challenge
+        .compatibility
+        .as_ref()
+        .expect("negotiating challenge omitted compatibility");
+    assert!(selected.provider_contracts.is_empty());
+    assert!(selected.provider_adapter_contracts.is_empty());
+    let expected_server_proof = negotiated_auth_proof(
+        token.as_bytes(),
+        AuthDirection::Server,
+        ClientRole::Observer,
+        &client_nonce,
+        &challenge.server_nonce,
+        &offer,
+        selected,
+    )
+    .unwrap();
+    assert!(proofs_match(&challenge.server_proof, &expected_server_proof));
+    let client_proof = negotiated_auth_proof(
+        token.as_bytes(),
+        AuthDirection::Client,
+        ClientRole::Observer,
+        &client_nonce,
+        &challenge.server_nonce,
+        &offer,
+        selected,
+    )
+    .unwrap();
+    write_json_frame_limited(
+        &mut pipe,
+        &ClientFrame::Authenticate(ClientAuthentication { client_proof }),
+        MAX_NODE_HELLO_FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    let ServerFrame::Hello(hello) = read_json_frame_limited_body_timeout(
+        &mut pipe,
+        MAX_NODE_FRAME_BYTES,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("client without manifest capability did not receive node hello");
+    };
+    let selected = hello
+        .compatibility
+        .as_ref()
+        .expect("negotiating hello omitted compatibility");
+    assert!(selected.provider_contracts.is_empty());
+    assert!(selected.provider_adapter_contracts.is_empty());
+
+    drop(pipe);
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("no-manifest compatibility node did not shut down")
+        .expect("no-manifest compatibility node task panicked")
+        .expect("no-manifest compatibility node failed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

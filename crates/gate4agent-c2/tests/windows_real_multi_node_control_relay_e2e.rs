@@ -4,7 +4,8 @@ use gate4agent_c2::protocol::{
     C2NodeEvent, C2NodeResponse, C2RelayFailureCode, NodeId, NodeRoute, NodeTransportState,
     PathStyle, C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
-    C2_WORKSPACE_FILE_READ_CAPABILITY, RepositoryPath, WorkspaceFileContent,
+    C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
+    RepositoryPath, WorkspaceFileContent,
 };
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
@@ -147,6 +148,23 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     let shutdown_b = server_b.shutdown_handle();
     let task_b = tokio::spawn(server_b.run());
 
+    let source_a = NamedPipeNodeClient::connect(
+        &endpoint_a,
+        &id_a,
+        ClientRole::Observer,
+        token_a,
+    ).await.unwrap();
+    let source_a_compatibility = source_a.hello().compatibility.as_ref().unwrap().clone();
+    drop(source_a);
+    let source_b = NamedPipeNodeClient::connect(
+        &endpoint_b,
+        &id_b,
+        ClientRole::Observer,
+        token_b,
+    ).await.unwrap();
+    let source_b_compatibility = source_b.hello().compatibility.as_ref().unwrap().clone();
+    drop(source_b);
+
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let c2_addr = reservation.local_addr().unwrap();
     drop(reservation);
@@ -170,13 +188,27 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     let initial = wait_status(&http, |status| {
         status.ready && status.nodes.values().all(|node| node.transport == NodeTransportState::Online)
     }).await;
+    let initial_a_inventory = initial.nodes[&id_a].inventory.as_ref().unwrap();
+    let initial_b_inventory = initial.nodes[&id_b].inventory.as_ref().unwrap();
+    assert_eq!(initial_a_inventory.provider_contracts, source_a_compatibility.provider_contracts);
+    assert_eq!(
+        initial_a_inventory.provider_adapter_contracts,
+        source_a_compatibility.provider_adapter_contracts,
+    );
+    assert_eq!(initial_b_inventory.provider_contracts, source_b_compatibility.provider_contracts);
+    assert_eq!(
+        initial_b_inventory.provider_adapter_contracts,
+        source_b_compatibility.provider_adapter_contracts,
+    );
+    assert!(!initial_a_inventory.provider_contracts.is_empty());
+    assert!(!initial_b_inventory.provider_contracts.is_empty());
 
     let (control, mut events) = connect_local(&control_endpoint, c2_token).await.unwrap();
     assert_eq!(control.hello().status.nodes.len(), 2);
     let compatibility = control.hello().compatibility.as_ref()
         .expect("negotiated C2 compatibility metadata");
     assert_eq!(compatibility.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
-    assert_eq!(compatibility.capabilities.len(), 4);
+    assert_eq!(compatibility.capabilities.len(), 5);
     assert_eq!(
         compatibility.capabilities[0].as_str(),
         C2_COMPATIBILITY_METADATA_CAPABILITY,
@@ -193,9 +225,53 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
         compatibility.capabilities[3].as_str(),
         C2_WORKSPACE_FILE_READ_CAPABILITY,
     );
+    assert_eq!(
+        compatibility.capabilities[4].as_str(),
+        C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
+    );
     assert_eq!(compatibility.host.operating_system.as_str(), "windows");
     assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);
     assert_eq!(compatibility.path_semantics.style, PathStyle::Windows);
+    let hello_a_inventory = control.hello().status.nodes[&id_a].inventory.as_ref().unwrap();
+    let hello_b_inventory = control.hello().status.nodes[&id_b].inventory.as_ref().unwrap();
+    assert_eq!(hello_a_inventory.provider_contracts, source_a_compatibility.provider_contracts);
+    assert_eq!(
+        hello_a_inventory.provider_adapter_contracts,
+        source_a_compatibility.provider_adapter_contracts,
+    );
+    assert_eq!(hello_b_inventory.provider_contracts, source_b_compatibility.provider_contracts);
+    assert_eq!(
+        hello_b_inventory.provider_adapter_contracts,
+        source_b_compatibility.provider_adapter_contracts,
+    );
+    let topology = control.current_topology();
+    let topology_a = topology.nodes.iter().find(|node| node.node_id == id_a).unwrap();
+    let topology_b = topology.nodes.iter().find(|node| node.node_id == id_b).unwrap();
+    assert_eq!(topology_a.provider_contracts, source_a_compatibility.provider_contracts);
+    assert_eq!(
+        topology_a.provider_adapter_contracts,
+        source_a_compatibility.provider_adapter_contracts,
+    );
+    assert_eq!(topology_b.provider_contracts, source_b_compatibility.provider_contracts);
+    assert_eq!(
+        topology_b.provider_adapter_contracts,
+        source_b_compatibility.provider_adapter_contracts,
+    );
+    let projected_json = serde_json::to_string(&(
+        &initial,
+        control.hello(),
+        topology.as_ref(),
+    )).unwrap();
+    for forbidden in [
+        "installed_cli_version",
+        "executable_path",
+        "auth_state",
+        "canary_verdict",
+        "events",
+        "routed_response",
+    ] {
+        assert!(!projected_json.contains(forbidden), "leaked private field {forbidden}");
+    }
     let hello_a_cursor = control.hello().status.nodes[&id_a].cursor.expect("node A hello cursor");
     let event_node_a = id_a.clone();
     let event_drain = tokio::spawn(async move {

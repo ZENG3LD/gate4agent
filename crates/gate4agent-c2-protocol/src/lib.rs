@@ -1,9 +1,11 @@
 //! Stable, serde-only inventory and control contract for Gate4Agent C2.
 
 pub use gate4agent_node_protocol::{
-    ArchitectureId, CapabilityId, ClientCompatibilityOffer, HostDescriptor,
+    AdapterContractRevision, AdapterFamily, AdapterId, ArchitectureId, CapabilityId,
+    ClientCompatibilityOffer, HostDescriptor,
     NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+    ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
     RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     ProtocolNegotiationError, ProtocolRange,
 };
@@ -29,6 +31,8 @@ pub const C2_REPOSITORY_PATH_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_REPOSITORY_PATH_CAPABILITY;
 pub const C2_WORKSPACE_FILE_READ_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_WORKSPACE_FILE_READ_CAPABILITY;
+pub const C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str =
+    gate4agent_node_protocol::NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -771,6 +775,10 @@ pub struct C2TopologyNode {
     pub endpoint: String,
     pub transport: NodeTransportState,
     pub current_incarnation_id: Option<NodeIncarnationId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_contracts: Vec<ProviderContractSupport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -780,12 +788,28 @@ pub struct C2Topology {
 
 impl C2Topology {
     pub fn from_status(status: &StatusResponse) -> Self {
+        Self::from_status_with_provider_contracts(status, true)
+    }
+
+    pub fn from_status_with_provider_contracts(
+        status: &StatusResponse,
+        include_provider_contracts: bool,
+    ) -> Self {
         let nodes = status.nodes.iter().take(MAX_C2_NODES).map(|(node_id, observed)| {
+            let inventory = include_provider_contracts
+                .then_some(observed.inventory.as_ref())
+                .flatten();
             C2TopologyNode {
                 node_id: node_id.clone(),
                 endpoint: observed.endpoint.clone(),
                 transport: observed.transport,
                 current_incarnation_id: observed.cursor.map(|cursor| cursor.incarnation_id),
+                provider_contracts: inventory
+                    .map(|inventory| inventory.provider_contracts.clone())
+                    .unwrap_or_default(),
+                provider_adapter_contracts: inventory
+                    .map(|inventory| inventory.provider_adapter_contracts.clone())
+                    .unwrap_or_default(),
             }
         }).collect();
         Self { nodes }
@@ -1084,6 +1108,10 @@ pub struct SlimManagedSessionRecord {
 pub struct SlimNodeInventory {
     pub node_id: NodeId,
     pub enabled_providers: Vec<AgentProvider>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_contracts: Vec<ProviderContractSupport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
     pub workspaces: BTreeMap<WorkspaceId, SlimWorkspace>,
     pub workspace_count: usize,
     pub workspaces_truncated: bool,
@@ -1151,6 +1179,8 @@ impl SlimNodeInventory {
         Self {
             node_id: snapshot.node_id.clone(),
             enabled_providers: providers,
+            provider_contracts: Vec::new(),
+            provider_adapter_contracts: Vec::new(),
             workspaces,
             workspace_count,
             workspaces_truncated: workspace_count > MAX_C2_WORKSPACES_PER_NODE,
@@ -1213,6 +1243,8 @@ impl SlimNodeInventory {
         Self {
             node_id: snapshot.node_id.clone(),
             enabled_providers: providers,
+            provider_contracts: Vec::new(),
+            provider_adapter_contracts: Vec::new(),
             workspaces,
             workspace_count,
             workspaces_truncated: workspace_count > MAX_C2_WORKSPACES_PER_NODE,
@@ -1457,6 +1489,24 @@ mod tests {
                 AdapterVerification::SyntheticFixture,
             ).unwrap(),
         }
+    }
+
+    fn provider_contract_manifest() -> (
+        Vec<ProviderContractSupport>,
+        Vec<ProviderAdapterContractSupport>,
+    ) {
+        (
+            vec![ProviderContractSupport {
+                provider: AgentProvider::Codex,
+                revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
+            }],
+            vec![ProviderAdapterContractSupport {
+                provider: AgentProvider::Codex,
+                family: AdapterFamily::PtySemantic,
+                adapter_id: AdapterId::new("codex").unwrap(),
+                revision: AdapterContractRevision::new("pty-semantic.2026-08").unwrap(),
+            }],
+        )
     }
 
     fn c2_compatibility_support(
@@ -1792,6 +1842,49 @@ mod tests {
     }
 
     #[test]
+    fn slim_inventory_provider_contract_projection_is_exact_and_private() {
+        let mut slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![AgentProvider::Codex],
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+        });
+        let (provider_contracts, provider_adapter_contracts) =
+            provider_contract_manifest();
+        slim.provider_contracts = provider_contracts;
+        slim.provider_adapter_contracts = provider_adapter_contracts;
+
+        let value = serde_json::to_value(&slim).unwrap();
+        assert_eq!(
+            value["provider_contracts"],
+            serde_json::json!([{
+                "provider": "codex",
+                "revision": "codex.2026-08",
+            }]),
+        );
+        assert_eq!(
+            value["provider_adapter_contracts"],
+            serde_json::json!([{
+                "provider": "codex",
+                "family": "pty-semantic",
+                "adapter_id": "codex",
+                "revision": "pty-semantic.2026-08",
+            }]),
+        );
+        let json = serde_json::to_string(&value).unwrap();
+        for forbidden in [
+            "installed_cli_version",
+            "executable_path",
+            "auth_state",
+            "canary_verdict",
+            "events",
+            "routed_response",
+        ] {
+            assert!(!json.contains(forbidden), "leaked private field {forbidden}");
+        }
+    }
+
+    #[test]
     fn slim_inventory_reports_sessions_hidden_by_workspace_truncation() {
         let mut workspaces = (0..MAX_C2_WORKSPACES_PER_NODE)
             .map(|index| WorkspaceSnapshot {
@@ -1870,6 +1963,86 @@ mod tests {
         assert!(!json.contains("observed_at_unix_ms"));
         assert!(!json.contains("sequence"));
         assert!(!json.contains("inventory"));
+    }
+
+    #[test]
+    fn topology_provider_contract_projection_is_capability_gated_and_change_sensitive() {
+        let (provider_contracts, provider_adapter_contracts) =
+            provider_contract_manifest();
+        let mut inventory = SlimNodeInventory::from_snapshot(&NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![AgentProvider::Codex],
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+        });
+        inventory.provider_contracts = provider_contracts;
+        inventory.provider_adapter_contracts = provider_adapter_contracts;
+        let status = StatusResponse {
+            api_version: C2_API_VERSION,
+            ready: true,
+            observed_at_unix_ms: 10,
+            nodes: BTreeMap::from([(
+                NodeId::new("node-a").unwrap(),
+                ObservedNode {
+                    endpoint: r"\\.\pipe\node-a".to_owned(),
+                    transport_label: "windows-named-pipe".to_owned(),
+                    transport: NodeTransportState::Online,
+                    freshness: NodeFreshness::Fresh,
+                    cursor: Some(NodeCursor {
+                        incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                        sequence: 9,
+                    }),
+                    inventory: Some(inventory),
+                    last_attempt_unix_ms: Some(10),
+                    last_success_unix_ms: Some(10),
+                    consecutive_failures: 0,
+                    last_error: None,
+                    gaps: Vec::new(),
+                    gaps_truncated: 0,
+                },
+            )]),
+        };
+
+        let projected = C2Topology::from_status_with_provider_contracts(&status, true);
+        assert_eq!(projected.nodes[0].provider_contracts.len(), 1);
+        assert_eq!(projected.nodes[0].provider_adapter_contracts.len(), 1);
+        let legacy = C2Topology::from_status_with_provider_contracts(&status, false);
+        assert!(legacy.nodes[0].provider_contracts.is_empty());
+        assert!(legacy.nodes[0].provider_adapter_contracts.is_empty());
+        #[derive(Serialize)]
+        struct LegacyTopologyNode<'a> {
+            node_id: &'a NodeId,
+            endpoint: &'a str,
+            transport: NodeTransportState,
+            current_incarnation_id: Option<NodeIncarnationId>,
+        }
+        #[derive(Serialize)]
+        struct LegacyTopology<'a> {
+            nodes: Vec<LegacyTopologyNode<'a>>,
+        }
+        let legacy_shape = LegacyTopology {
+            nodes: legacy.nodes.iter().map(|node| LegacyTopologyNode {
+                node_id: &node.node_id,
+                endpoint: &node.endpoint,
+                transport: node.transport,
+                current_incarnation_id: node.current_incarnation_id,
+            }).collect(),
+        };
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&legacy).unwrap(),
+            serde_json::to_vec(&legacy_shape).unwrap(),
+        );
+        assert!(!legacy_json.contains("provider_contracts"));
+        assert!(!legacy_json.contains("provider_adapter_contracts"));
+        assert_ne!(legacy, projected);
+
+        let projected_json = serde_json::to_string(&projected).unwrap();
+        assert!(projected_json.contains("provider_contracts"));
+        assert!(projected_json.contains("provider_adapter_contracts"));
+        assert!(!projected_json.contains("inventory"));
+        assert!(!projected_json.contains("events"));
+        assert!(!projected_json.contains("routed_response"));
     }
 
     #[test]
@@ -2296,9 +2469,14 @@ mod tests {
     fn slim_inventory_defaults_managed_sessions_for_v1_payloads() {
         let legacy = r#"{"node_id":"node-a","enabled_providers":[],"workspaces":{},"workspace_count":0,"workspaces_truncated":false,"session_count":0,"sessions_truncated":false}"#;
         let inventory = serde_json::from_str::<SlimNodeInventory>(legacy).unwrap();
+        assert!(inventory.provider_contracts.is_empty());
+        assert!(inventory.provider_adapter_contracts.is_empty());
         assert!(inventory.managed_sessions.is_empty());
         assert_eq!(inventory.managed_session_count, 0);
         assert!(!inventory.managed_sessions_truncated);
+        let reencoded = serde_json::to_string(&inventory).unwrap();
+        assert!(!reencoded.contains("provider_contracts"));
+        assert!(!reencoded.contains("provider_adapter_contracts"));
     }
 
     #[test]

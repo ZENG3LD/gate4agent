@@ -1,5 +1,6 @@
 //! Bounded wire contract for the local Gate4Agent node.
 
+pub use gate4agent_types::{AdapterFamily, AdapterId};
 use gate4agent_types::{
     AgentInstanceId, ControlEvent, ProviderSessionIdentity, SessionGeneration, SessionSnapshot,
     TerminalControl, TerminalSize,
@@ -24,9 +25,13 @@ pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
 pub const NODE_WORKSPACE_FILE_READ_CAPABILITY: &str = "workspace-file-read-v1";
+pub const NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str = "provider-contract-manifest-v1";
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_PROVIDER_CONTRACT_REVISION_BYTES: usize = 128;
+pub const MAX_ADAPTER_CONTRACT_REVISION_BYTES: usize = 128;
+pub const MAX_PROVIDER_CONTRACTS: usize = 3;
+pub const MAX_PROVIDER_ADAPTER_CONTRACTS: usize = 32;
 pub const NODE_INCARNATION_ID_BYTES: usize = 16;
 pub const MAX_NODE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_NODE_CLIENT_FRAME_BYTES: usize = 256 * 1024;
@@ -346,6 +351,8 @@ pub enum ProtocolNegotiationError {
         local: ProtocolRange,
         remote: ProtocolRange,
     },
+    #[error("provider contract manifest is invalid: {0}")]
+    InvalidProviderContractManifest(ProviderContractManifestError),
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -359,6 +366,9 @@ pub struct ArchitectureId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProviderContractRevision(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AdapterContractRevision(String);
 
 macro_rules! compatibility_identifier_impl {
     ($type:ident, $label:literal) => {
@@ -466,6 +476,68 @@ impl Serialize for ProviderContractRevision {
 }
 
 impl<'de> Deserialize<'de> for ProviderContractRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl AdapterContractRevision {
+    pub fn new(value: impl Into<String>) -> Result<Self, CompatibilityIdentifierError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(CompatibilityIdentifierError::Empty {
+                label: "adapter contract revision",
+            });
+        }
+        if value.len() > MAX_ADAPTER_CONTRACT_REVISION_BYTES {
+            return Err(CompatibilityIdentifierError::TooLong {
+                label: "adapter contract revision",
+                len: value.len(),
+                max: MAX_ADAPTER_CONTRACT_REVISION_BYTES,
+            });
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(CompatibilityIdentifierError::InvalidCharacters {
+                label: "adapter contract revision",
+                value,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AdapterContractRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AdapterContractRevision {
+    type Err = CompatibilityIdentifierError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for AdapterContractRevision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AdapterContractRevision {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -1034,6 +1106,78 @@ pub struct ProviderContractSupport {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderAdapterContractSupport {
+    pub provider: AgentProvider,
+    pub family: AdapterFamily,
+    pub adapter_id: AdapterId,
+    pub revision: AdapterContractRevision,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ProviderContractManifestError {
+    #[error("provider contract count {len} exceeds the {max}-entry limit")]
+    TooManyProviders { len: usize, max: usize },
+    #[error("provider adapter contract count {len} exceeds the {max}-entry limit")]
+    TooManyAdapterContracts { len: usize, max: usize },
+    #[error("provider contract manifest contains duplicate provider {provider:?}")]
+    DuplicateProvider { provider: AgentProvider },
+    #[error("provider adapter contract for {provider:?} has no provider contract")]
+    UnlinkedAdapterProvider { provider: AgentProvider },
+    #[error("provider adapter contract manifest contains duplicate family {family:?} for {provider:?}")]
+    DuplicateProviderFamily {
+        provider: AgentProvider,
+        family: AdapterFamily,
+    },
+}
+
+pub fn validate_provider_contract_manifest(
+    provider_contracts: &[ProviderContractSupport],
+    provider_adapter_contracts: &[ProviderAdapterContractSupport],
+) -> Result<(), ProviderContractManifestError> {
+    if provider_contracts.len() > MAX_PROVIDER_CONTRACTS {
+        return Err(ProviderContractManifestError::TooManyProviders {
+            len: provider_contracts.len(),
+            max: MAX_PROVIDER_CONTRACTS,
+        });
+    }
+    if provider_adapter_contracts.len() > MAX_PROVIDER_ADAPTER_CONTRACTS {
+        return Err(ProviderContractManifestError::TooManyAdapterContracts {
+            len: provider_adapter_contracts.len(),
+            max: MAX_PROVIDER_ADAPTER_CONTRACTS,
+        });
+    }
+    for (index, contract) in provider_contracts.iter().enumerate() {
+        if provider_contracts[..index]
+            .iter()
+            .any(|existing| existing.provider == contract.provider)
+        {
+            return Err(ProviderContractManifestError::DuplicateProvider {
+                provider: contract.provider,
+            });
+        }
+    }
+    for (index, contract) in provider_adapter_contracts.iter().enumerate() {
+        if !provider_contracts
+            .iter()
+            .any(|provider| provider.provider == contract.provider)
+        {
+            return Err(ProviderContractManifestError::UnlinkedAdapterProvider {
+                provider: contract.provider,
+            });
+        }
+        if provider_adapter_contracts[..index].iter().any(|existing| {
+            existing.provider == contract.provider && existing.family == contract.family
+        }) {
+            return Err(ProviderContractManifestError::DuplicateProviderFamily {
+                provider: contract.provider,
+                family: contract.family,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientCompatibilityOffer {
     pub protocol_versions: ProtocolRange,
     #[serde(default)]
@@ -1052,6 +1196,31 @@ impl ClientCompatibilityOffer {
     }
 }
 
+pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer {
+    ClientCompatibilityOffer {
+        protocol_versions: ProtocolRange {
+            minimum: NODE_PROTOCOL_VERSION,
+            maximum: NODE_PROTOCOL_VERSION,
+        },
+        capabilities: [
+            NODE_COMPATIBILITY_METADATA_CAPABILITY,
+            NODE_OPAQUE_UNIX_PATH_CAPABILITY,
+            NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
+            NODE_REPOSITORY_PATH_CAPABILITY,
+            NODE_WORKSPACE_FILE_READ_CAPABILITY,
+        ]
+        .into_iter()
+        .map(|capability| CapabilityId(capability.to_owned()))
+        .collect(),
+        state_schema: Some(StateSchemaSupport {
+            versions: ProtocolRange {
+                minimum: NODE_STATE_SCHEMA_V1,
+                maximum: NODE_STATE_SCHEMA_V2,
+            },
+        }),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeCompatibilitySupport {
     pub protocol_versions: ProtocolRange,
@@ -1063,6 +1232,8 @@ pub struct NodeCompatibilitySupport {
     pub state_schema: StateSchemaSupport,
     #[serde(default)]
     pub provider_contracts: Vec<ProviderContractSupport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1077,6 +1248,8 @@ pub struct NegotiatedNodeCompatibility {
     pub state_schema_version: Option<u16>,
     #[serde(default)]
     pub provider_contracts: Vec<ProviderContractSupport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
 }
 
 impl NodeCompatibilitySupport {
@@ -1094,7 +1267,7 @@ impl NodeCompatibilitySupport {
                 remote: client.protocol_versions,
             });
         }
-        let capabilities = self
+        let capabilities: Vec<CapabilityId> = self
             .capabilities
             .iter()
             .filter(|capability| client.capabilities.contains(capability))
@@ -1108,6 +1281,16 @@ impl NodeCompatibilitySupport {
             ),
             None => None,
         };
+        let provider_manifest_selected = capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY
+        });
+        if provider_manifest_selected {
+            validate_provider_contract_manifest(
+                &self.provider_contracts,
+                &self.provider_adapter_contracts,
+            )
+            .map_err(ProtocolNegotiationError::InvalidProviderContractManifest)?;
+        }
         Ok(NegotiatedNodeCompatibility {
             protocol_version: active_protocol_version,
             capabilities,
@@ -1115,7 +1298,12 @@ impl NodeCompatibilitySupport {
             path_semantics: self.path_semantics.clone(),
             local_transport: self.local_transport,
             state_schema_version,
-            provider_contracts: self.provider_contracts.clone(),
+            provider_contracts: provider_manifest_selected
+                .then(|| self.provider_contracts.clone())
+                .unwrap_or_default(),
+            provider_adapter_contracts: provider_manifest_selected
+                .then(|| self.provider_adapter_contracts.clone())
+                .unwrap_or_default(),
         })
     }
 }
@@ -1146,6 +1334,73 @@ pub enum NodeCompatibilityAuthBindingError {
     Serialization(#[from] serde_json::Error),
     #[error("node compatibility authentication binding length {len} exceeds the {max}-byte limit")]
     TooLarge { len: usize, max: usize },
+}
+
+pub fn validate_node_negotiated_handshake_capacity(
+    support: &NodeCompatibilitySupport,
+    active_protocol_version: u16,
+) -> Result<(), NodeNegotiatedHandshakeCapacityError> {
+    let offer = production_node_client_compatibility_offer();
+    let selected = support.negotiate(active_protocol_version, &offer)?;
+    encode_node_compatibility_auth_binding(&offer, &selected)?;
+    validate_node_handshake_frame_capacity(
+        "negotiated client hello",
+        &ClientFrame::Hello(ClientHello {
+            protocol_version: active_protocol_version,
+            role: ClientRole::Observer,
+            client_nonce: [u8::MAX; NODE_AUTH_NONCE_BYTES],
+            compatibility: Some(offer),
+        }),
+    )?;
+    validate_node_handshake_frame_capacity(
+        "negotiated server challenge",
+        &ServerFrame::Challenge(ServerChallenge {
+            protocol_version: active_protocol_version,
+            server_nonce: [u8::MAX; NODE_AUTH_NONCE_BYTES],
+            server_proof: [u8::MAX; NODE_AUTH_PROOF_BYTES],
+            compatibility: Some(selected),
+        }),
+    )
+}
+
+fn validate_node_handshake_frame_capacity<T>(
+    frame: &'static str,
+    value: &T,
+) -> Result<(), NodeNegotiatedHandshakeCapacityError>
+where
+    T: Serialize,
+{
+    let encoded = serde_json::to_vec(value).map_err(|source| {
+        NodeNegotiatedHandshakeCapacityError::Serialization { frame, source }
+    })?;
+    if encoded.is_empty() || encoded.len() > MAX_NODE_HELLO_FRAME_BYTES {
+        return Err(NodeNegotiatedHandshakeCapacityError::FrameTooLarge {
+            frame,
+            len: encoded.len(),
+            max: MAX_NODE_HELLO_FRAME_BYTES,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum NodeNegotiatedHandshakeCapacityError {
+    #[error(transparent)]
+    Negotiation(#[from] ProtocolNegotiationError),
+    #[error(transparent)]
+    AuthenticationBinding(#[from] NodeCompatibilityAuthBindingError),
+    #[error("{frame} JSON serialization failed: {source}")]
+    Serialization {
+        frame: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{frame} length {len} is outside 1..={max}")]
+    FrameTooLarge {
+        frame: &'static str,
+        len: usize,
+        max: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -1777,6 +2032,12 @@ mod tests {
                 provider: AgentProvider::Codex,
                 revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
             }],
+            provider_adapter_contracts: vec![ProviderAdapterContractSupport {
+                provider: AgentProvider::Codex,
+                family: AdapterFamily::PtySemantic,
+                adapter_id: AdapterId::new("codex-cli").unwrap(),
+                revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
+            }],
         }
     }
 
@@ -1833,6 +2094,8 @@ mod tests {
             negotiated.capabilities,
             vec![CapabilityId::new("session.spawn").unwrap()],
         );
+        assert!(negotiated.provider_contracts.is_empty());
+        assert!(negotiated.provider_adapter_contracts.is_empty());
     }
 
     #[test]
@@ -1869,8 +2132,183 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":10},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":8,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":10},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":8,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}"#,
         );
+    }
+
+    #[test]
+    fn provider_contract_manifest_is_capability_gated_and_auth_bound_exactly() {
+        let manifest_capability =
+            CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
+        let mut support = portable_node_support();
+        support.capabilities.push(manifest_capability.clone());
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![manifest_capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![manifest_capability]);
+        assert_eq!(selected.provider_contracts, support.provider_contracts);
+        assert_eq!(
+            selected.provider_adapter_contracts,
+            support.provider_adapter_contracts,
+        );
+        let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["provider-contract-manifest-v1"]},"selected":{"protocol_version":8,"capabilities":["provider-contract-manifest-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}],"provider_adapter_contracts":[{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}]}}"#,
+        );
+    }
+
+    #[test]
+    fn n_minus_one_selected_json_round_trips_without_manifest_fields() {
+        let json = r#"{"protocol_version":8,"capabilities":["compatibility.metadata"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":1,"provider_contracts":[]}"#;
+        let selected: NegotiatedNodeCompatibility = serde_json::from_str(json).unwrap();
+        assert!(selected.provider_contracts.is_empty());
+        assert!(selected.provider_adapter_contracts.is_empty());
+        assert_eq!(serde_json::to_string(&selected).unwrap(), json);
+    }
+
+    #[test]
+    fn provider_contract_manifest_rejects_bounds_duplicates_and_unlinked_entries() {
+        let provider = ProviderContractSupport {
+            provider: AgentProvider::Codex,
+            revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
+        };
+        let adapter = ProviderAdapterContractSupport {
+            provider: AgentProvider::Codex,
+            family: AdapterFamily::PtySemantic,
+            adapter_id: AdapterId::new("codex-cli").unwrap(),
+            revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
+        };
+        assert!(matches!(
+            validate_provider_contract_manifest(&vec![provider.clone(); 4], &[]),
+            Err(ProviderContractManifestError::TooManyProviders { len: 4, .. }),
+        ));
+        assert!(matches!(
+            validate_provider_contract_manifest(
+                &[provider.clone()],
+                &vec![adapter.clone(); MAX_PROVIDER_ADAPTER_CONTRACTS + 1],
+            ),
+            Err(ProviderContractManifestError::TooManyAdapterContracts { .. }),
+        ));
+        assert!(matches!(
+            validate_provider_contract_manifest(
+                &[provider.clone()],
+                &vec![adapter.clone(); MAX_PROVIDER_ADAPTER_CONTRACTS],
+            ),
+            Err(ProviderContractManifestError::DuplicateProviderFamily { .. }),
+        ));
+        assert!(matches!(
+            validate_provider_contract_manifest(&[provider.clone(), provider.clone()], &[]),
+            Err(ProviderContractManifestError::DuplicateProvider {
+                provider: AgentProvider::Codex,
+            }),
+        ));
+        let mut unlinked = adapter.clone();
+        unlinked.provider = AgentProvider::Claude;
+        assert!(matches!(
+            validate_provider_contract_manifest(&[provider.clone()], &[unlinked]),
+            Err(ProviderContractManifestError::UnlinkedAdapterProvider {
+                provider: AgentProvider::Claude,
+            }),
+        ));
+        let mut duplicate_family = adapter.clone();
+        duplicate_family.adapter_id = AdapterId::new("codex-cli-next").unwrap();
+        assert!(matches!(
+            validate_provider_contract_manifest(
+                &[provider.clone()],
+                &[adapter.clone(), duplicate_family],
+            ),
+            Err(ProviderContractManifestError::DuplicateProviderFamily {
+                provider: AgentProvider::Codex,
+                family: AdapterFamily::PtySemantic,
+            }),
+        ));
+        let mut shared_adapter_id = adapter.clone();
+        shared_adapter_id.family = AdapterFamily::History;
+        assert!(validate_provider_contract_manifest(
+            &[provider],
+            &[adapter, shared_adapter_id],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn provider_contract_manifest_negotiates_all_current_provider_family_tuples() {
+        let providers = [
+            (AgentProvider::Claude, "claude-code", "claude.2026-08"),
+            (AgentProvider::Codex, "codex-cli", "codex.2026-08"),
+            (AgentProvider::Kimi, "kimi-cli", "kimi.2026-08"),
+        ];
+        let families = [
+            AdapterFamily::PtySemantic,
+            AdapterFamily::Pipe,
+            AdapterFamily::OneShot,
+            AdapterFamily::Acp,
+            AdapterFamily::Hook,
+            AdapterFamily::ManagedHook,
+            AdapterFamily::History,
+            AdapterFamily::Resume,
+            AdapterFamily::SessionOptions,
+            AdapterFamily::CapabilityProbe,
+        ];
+        let provider_contracts = providers
+            .iter()
+            .map(|(provider, _, revision)| ProviderContractSupport {
+                provider: *provider,
+                revision: ProviderContractRevision::new(*revision).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let provider_adapter_contracts = providers
+            .iter()
+            .flat_map(|(provider, adapter_id, _)| {
+                families
+                    .iter()
+                    .map(move |family| ProviderAdapterContractSupport {
+                        provider: *provider,
+                        family: *family,
+                        adapter_id: AdapterId::new(*adapter_id).unwrap(),
+                        revision: AdapterContractRevision::new("adapter-contract-v1").unwrap(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(provider_contracts.len(), MAX_PROVIDER_CONTRACTS);
+        assert_eq!(provider_adapter_contracts.len(), 30);
+        assert!(provider_adapter_contracts.len() <= MAX_PROVIDER_ADAPTER_CONTRACTS);
+
+        let manifest_capability =
+            CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
+        let mut support = portable_node_support();
+        support.capabilities.push(manifest_capability.clone());
+        support.provider_contracts = provider_contracts;
+        support.provider_adapter_contracts = provider_adapter_contracts;
+        let selected = support
+            .negotiate(
+                NODE_PROTOCOL_VERSION,
+                &ClientCompatibilityOffer {
+                    protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+                    capabilities: vec![manifest_capability],
+                    state_schema: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(selected.provider_contracts.len(), MAX_PROVIDER_CONTRACTS);
+        assert_eq!(selected.provider_adapter_contracts.len(), 30);
+    }
+
+    #[test]
+    fn adapter_contract_revision_is_bounded_printable_ascii() {
+        assert!(AdapterContractRevision::new("history-jsonl-v1").is_ok());
+        assert!(AdapterContractRevision::new("").is_err());
+        assert!(AdapterContractRevision::new("revision with spaces").is_err());
+        assert!(AdapterContractRevision::new(
+            "x".repeat(MAX_ADAPTER_CONTRACT_REVISION_BYTES + 1),
+        )
+        .is_err());
     }
 
     #[test]

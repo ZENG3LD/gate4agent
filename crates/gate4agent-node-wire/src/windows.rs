@@ -1,17 +1,21 @@
 use gate4agent_node_protocol::{
-    encode_node_compatibility_auth_binding, read_json_frame_limited_body_timeout,
-    write_json_frame_limited, CapabilityId, ClientAuthentication, ClientCompatibilityOffer,
-    ClientFrame, ClientHello, ClientRole, FrameError, NegotiatedNodeCompatibility,
-    NodeEvent, NodeEventEnvelope, NodeFailure, NodeHello, NodeId, NodeIncarnationId, NodeRequest,
-    NodeResponse, NodeSnapshot, ProtocolRange, RequestEnvelope, ServerChallenge, ServerFrame,
-    StateSchemaSupport,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
+    encode_node_compatibility_auth_binding, production_node_client_compatibility_offer,
+    read_json_frame_limited_body_timeout, validate_provider_contract_manifest,
+    write_json_frame_limited, CapabilityId,
+    ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
+    FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure, NodeHello,
+    NodeId, NodeIncarnationId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope,
+    ServerChallenge, ServerFrame,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
-    NODE_REPOSITORY_PATH_CAPABILITY,
+    NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION,
+};
+#[cfg(test)]
+use gate4agent_node_protocol::{
+    ProtocolRange, StateSchemaSupport, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
 };
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -543,30 +547,7 @@ fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
 }
 
 fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, NodeClientError> {
-    Ok(ClientCompatibilityOffer {
-        protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION)
-            .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
-        capabilities: baseline_capabilities()?,
-        state_schema: Some(StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2)
-                .map_err(|error| NodeClientError::Protocol(error.to_string()))?,
-        }),
-    })
-}
-
-fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeClientError> {
-    [
-        NODE_COMPATIBILITY_METADATA_CAPABILITY,
-        NODE_OPAQUE_UNIX_PATH_CAPABILITY,
-        NODE_REPOSITORY_PATH_CAPABILITY,
-        NODE_WORKSPACE_FILE_READ_CAPABILITY,
-    ]
-        .into_iter()
-        .map(|capability| {
-            CapabilityId::new(capability)
-                .map_err(|error| NodeClientError::Protocol(error.to_string()))
-        })
-        .collect()
+    Ok(production_node_client_compatibility_offer())
 }
 
 fn prepare_negotiated_authentication(
@@ -660,6 +641,25 @@ fn validate_selected_compatibility(
         return Err(NodeClientError::Protocol(
             "node omitted the required compatibility metadata capability".to_owned(),
         ));
+    }
+    let provider_manifest_selected = selected.capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY
+    });
+    if !provider_manifest_selected
+        && (!selected.provider_contracts.is_empty()
+            || !selected.provider_adapter_contracts.is_empty())
+    {
+        return Err(NodeClientError::Protocol(
+            "node published a provider contract manifest without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    if provider_manifest_selected {
+        validate_provider_contract_manifest(
+            &selected.provider_contracts,
+            &selected.provider_adapter_contracts,
+        )
+        .map_err(|error| NodeClientError::Protocol(error.to_string()))?;
     }
     if let Some(state_schema_version) = selected.state_schema_version {
         let Some(state_schema) = offer.state_schema else {
@@ -962,11 +962,12 @@ pub enum NodeClientError {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        AgentProvider, ArchitectureId, GitSnapshot, GitStatusEntry, GitWorktreeSnapshot,
-        HostDescriptor,
-        LocalTransportKind, ManagedSessionRecord, ManagedSessionState,
-        NodeCompatibilitySupport, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics,
-        PathStyle, RepositoryPath, ResponseEnvelope, SessionMode, SessionRecordId, WorkspaceEntry,
+        AdapterContractRevision, AdapterFamily, AdapterId, AgentProvider, ArchitectureId,
+        GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, HostDescriptor, LocalTransportKind,
+        ManagedSessionRecord, ManagedSessionState, NodeCompatibilitySupport, OpaqueHostPath,
+        OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+        ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
+        RepositoryPath, ResponseEnvelope, SessionMode, SessionRecordId, WorkspaceEntry,
         WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
         WorkspaceInspection, WorkspaceSnapshot,
     };
@@ -995,6 +996,7 @@ mod tests {
                 versions: ProtocolRange::exact(1).unwrap(),
             },
             provider_contracts: Vec::new(),
+            provider_adapter_contracts: Vec::new(),
         };
         let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
         (offer, selected)
@@ -1097,6 +1099,9 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
             ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2).unwrap(),
@@ -1173,6 +1178,88 @@ mod tests {
             result,
             Err(NodeClientError::Protocol(message))
                 if message.contains("required compatibility metadata capability")
+        ));
+    }
+
+    #[test]
+    fn selected_manifest_requires_capability_and_valid_provider_linkage() {
+        let (offer, mut selected) = negotiated_fixture();
+        selected.provider_contracts.push(ProviderContractSupport {
+            provider: AgentProvider::Codex,
+            revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
+        });
+        assert!(matches!(
+            validate_selected_compatibility(&offer, &selected),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("without negotiating the capability")
+        ));
+
+        let mut offer = offer;
+        let manifest_capability =
+            CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
+        offer.capabilities.push(manifest_capability.clone());
+        selected.capabilities.push(manifest_capability);
+        selected.provider_adapter_contracts.push(ProviderAdapterContractSupport {
+            provider: AgentProvider::Claude,
+            family: AdapterFamily::PtySemantic,
+            adapter_id: AdapterId::new("claude-code").unwrap(),
+            revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
+        });
+        assert!(matches!(
+            validate_selected_compatibility(&offer, &selected),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("has no provider contract")
+        ));
+    }
+
+    #[test]
+    fn authenticated_manifest_revision_tampering_is_rejected() {
+        let (mut offer, mut selected) = negotiated_fixture();
+        let manifest_capability =
+            CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
+        offer.capabilities.push(manifest_capability.clone());
+        selected.capabilities.push(manifest_capability);
+        selected.provider_contracts.push(ProviderContractSupport {
+            provider: AgentProvider::Codex,
+            revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
+        });
+        selected.provider_adapter_contracts.push(ProviderAdapterContractSupport {
+            provider: AgentProvider::Codex,
+            family: AdapterFamily::PtySemantic,
+            adapter_id: AdapterId::new("codex-cli").unwrap(),
+            revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
+        });
+        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
+        let access_token = "strict-negotiation-token";
+        let server_proof = negotiated_auth_proof(
+            access_token.as_bytes(),
+            AuthDirection::Server,
+            ClientRole::Observer,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        selected.provider_adapter_contracts[0].revision =
+            AdapterContractRevision::new("pty-semantic-v2").unwrap();
+        let challenge = ServerChallenge {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            server_nonce,
+            server_proof,
+            compatibility: Some(selected),
+        };
+        assert!(matches!(
+            prepare_negotiated_authentication(
+                &challenge,
+                &offer,
+                ClientRole::Observer,
+                &client_nonce,
+                access_token,
+            ),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("server failed access-token proof")
         ));
     }
 

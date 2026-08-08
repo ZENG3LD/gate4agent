@@ -13,18 +13,22 @@ use crate::workspace_file_windows::{
 };
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
-    AgentProvider, ArchitectureId, CapabilityId, ClientFrame, ClientRole, ControllerState,
+    validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
+    AdapterContractRevision, AgentProvider, ArchitectureId, CapabilityId, ClientFrame, ClientRole,
+    ControllerState,
     FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
     GitWorktreeSnapshot, HostDescriptor, LocalTransportKind, NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
     NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath, OperatingSystemId, PathEncoding,
-    PathSemantics, PathStyle, ProtocolRange, RepositoryPath, RequestEnvelope, ResponseEnvelope,
+    PathSemantics, PathStyle, ProtocolRange, ProviderAdapterContractSupport,
+    ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
+    ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
     ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceFileContent, WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     DEFAULT_CONTROLLER_LEASE_MS,
     MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
-    NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
@@ -37,8 +41,8 @@ use gate4agent_node_wire::{
     AuthDirection,
 };
 use gate4agent_types::{
-    AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
-    ControlEventKind, InputAction, PromptFraming, PromptPayload, ResumeLaunchRequest,
+    AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
+    ControlCommand, ControlEvent, ControlEventKind, InputAction, PromptFraming, PromptPayload, ResumeLaunchRequest,
     ResumeTarget, SessionGeneration, StartRequest, TerminalControl, TerminalText,
     TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
@@ -378,14 +382,20 @@ impl NodeServer {
             .unwrap_or(MUTATION_SETTLE_TIMEOUT_MS)
             .saturating_add(READINESS_SETTLE_HEADROOM_MS)
             .max(MUTATION_SETTLE_TIMEOUT_MS);
-        let enabled_providers = catalog
+        let (provider_contracts, provider_adapter_contracts) =
+            provider_contract_manifest(&catalog)?;
+        let compatibility_support = node_compatibility_support_for_manifest(
+            &provider_contracts,
+            &provider_adapter_contracts,
+        )?;
+        validate_node_negotiated_handshake_capacity(
+            &compatibility_support,
+            NODE_PROTOCOL_VERSION,
+        )
+        .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
+        let enabled_providers = provider_contracts
             .iter()
-            .filter_map(|spec| match spec.id.as_str() {
-                "claude" => Some(AgentProvider::Claude),
-                "codex" => Some(AgentProvider::Codex),
-                "kimi" => Some(AgentProvider::Kimi),
-                _ => None,
-            })
+            .map(|contract| contract.provider)
             .collect();
         let state_path_lock =
             session_registry::StatePathLock::acquire(config.state_path.as_deref())
@@ -407,6 +417,8 @@ impl NodeServer {
             incarnation_id,
             workspaces,
             enabled_providers,
+            provider_contracts,
+            provider_adapter_contracts,
             config.state_path.clone(),
             records,
             persistence_warning,
@@ -594,6 +606,148 @@ fn active_registry() -> Result<AgentRegistry, NodeServerError> {
     AgentRegistry::new(specs).map_err(|error| NodeServerError::Registry(error.to_string()))
 }
 
+fn provider_contract_manifest(
+    catalog: &AgentRegistry,
+) -> Result<
+    (
+        Vec<ProviderContractSupport>,
+        Vec<ProviderAdapterContractSupport>,
+    ),
+    NodeServerError,
+> {
+    let mut provider_contracts = Vec::new();
+    let mut provider_adapter_contracts = Vec::new();
+    for spec in catalog.iter() {
+        let Some(provider) = agent_provider(&spec.id) else {
+            continue;
+        };
+        let revision = ProviderContractRevision::new(spec.revision.clone())
+            .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
+        provider_contracts.push(ProviderContractSupport { provider, revision });
+        for (family, binding) in declared_adapter_bindings(spec)? {
+            let revision = AdapterContractRevision::new(binding.revision.clone())
+                .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
+            provider_adapter_contracts.push(ProviderAdapterContractSupport {
+                provider,
+                family,
+                adapter_id: binding.id.clone(),
+                revision,
+            });
+        }
+    }
+    validate_provider_contract_manifest(&provider_contracts, &provider_adapter_contracts)
+        .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
+    Ok((provider_contracts, provider_adapter_contracts))
+}
+
+fn agent_provider(agent_id: &AgentId) -> Option<AgentProvider> {
+    match agent_id.as_str() {
+        "claude" => Some(AgentProvider::Claude),
+        "codex" => Some(AgentProvider::Codex),
+        "kimi" => Some(AgentProvider::Kimi),
+        _ => None,
+    }
+}
+
+fn declared_adapter_bindings(
+    spec: &AgentSpec,
+) -> Result<Vec<(AdapterFamily, &AdapterBinding)>, NodeServerError> {
+    let mut bindings = Vec::new();
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::PtySemantic,
+        spec.capabilities.transports.pty_adapter.as_ref(),
+    )?;
+    let pipe_transport = spec.capabilities.transports.pipe.as_ref();
+    let pipe_family = pipe_transport.map(|transport| match transport.protocol {
+        gate4agent_types::PipeProtocol::SemanticNdjson
+        | gate4agent_types::PipeProtocol::StructuredJsonl => AdapterFamily::Pipe,
+        gate4agent_types::PipeProtocol::OneShotText => AdapterFamily::OneShot,
+    });
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::Pipe,
+        pipe_transport
+            .filter(|_| pipe_family == Some(AdapterFamily::Pipe))
+            .map(|transport| &transport.adapter),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::Acp,
+        spec.capabilities
+            .transports
+            .acp
+            .as_ref()
+            .map(|transport| &transport.adapter),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::Hook,
+        spec.capabilities.adapters.hook.as_ref(),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::ManagedHook,
+        spec.capabilities.adapters.managed_hook.as_ref(),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::OneShot,
+        pipe_transport
+            .filter(|_| pipe_family == Some(AdapterFamily::OneShot))
+            .map(|transport| &transport.adapter),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::OneShot,
+        spec.capabilities.adapters.one_shot.as_ref(),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::History,
+        spec.capabilities.adapters.history.as_ref(),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::Resume,
+        spec.capabilities.adapters.resume.as_ref(),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::SessionOptions,
+        spec.capabilities.adapters.session_options.as_ref(),
+    )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::CapabilityProbe,
+        spec.capabilities.adapters.capability_probe.as_ref(),
+    )?;
+    Ok(bindings)
+}
+
+fn push_declared_binding<'a>(
+    bindings: &mut Vec<(AdapterFamily, &'a AdapterBinding)>,
+    family: AdapterFamily,
+    binding: Option<&'a AdapterBinding>,
+) -> Result<(), NodeServerError> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    if let Some((_, existing)) = bindings
+        .iter()
+        .find(|(existing_family, _)| *existing_family == family)
+    {
+        if *existing == binding {
+            return Ok(());
+        }
+        return Err(NodeServerError::ProviderContractManifest(format!(
+            "provider declares conflicting {family:?} adapter bindings"
+        )));
+    }
+    bindings.push((family, binding));
+    Ok(())
+}
+
 fn merge_durable_state(
     configured: &[WorkspaceConfig],
     mut loaded: LoadedNodeState,
@@ -682,6 +836,8 @@ struct NodeShared {
     started_at_unix_ms: u64,
     workspaces: RwLock<BTreeMap<WorkspaceId, String>>,
     enabled_providers: Vec<AgentProvider>,
+    provider_contracts: Vec<ProviderContractSupport>,
+    provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
     controller: Mutex<Option<ControllerLease>>,
     history: Mutex<NodeEventHistory>,
     event_tx: broadcast::Sender<NodeEventEnvelope>,
@@ -742,6 +898,8 @@ impl NodeShared {
         incarnation_id: NodeIncarnationId,
         workspaces: Vec<WorkspaceConfig>,
         enabled_providers: Vec<AgentProvider>,
+        provider_contracts: Vec<ProviderContractSupport>,
+        provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
         state_path: Option<PathBuf>,
         records: Vec<ManagedSessionRecord>,
         persistence_warning: Option<String>,
@@ -765,6 +923,8 @@ impl NodeShared {
                     .collect(),
             ),
             enabled_providers,
+            provider_contracts,
+            provider_adapter_contracts,
             controller: Mutex::new(None),
             history: Mutex::new(NodeEventHistory::new()),
             event_tx,
@@ -809,6 +969,8 @@ impl NodeShared {
             NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
             workspaces,
             enabled_providers,
+            Vec::new(),
+            Vec::new(),
             None,
             Vec::new(),
             None,
@@ -3012,7 +3174,7 @@ async fn serve_connection(
     }
     let compatibility = match hello.compatibility.as_ref() {
         Some(offer) => Some(
-            node_compatibility_support()?
+            node_compatibility_support(&shared)?
                 .negotiate(NODE_PROTOCOL_VERSION, offer)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         ),
@@ -3193,7 +3355,19 @@ async fn serve_connection(
     Ok(())
 }
 
-fn node_compatibility_support() -> Result<NodeCompatibilitySupport, NodeServerError> {
+fn node_compatibility_support(
+    shared: &NodeShared,
+) -> Result<NodeCompatibilitySupport, NodeServerError> {
+    node_compatibility_support_for_manifest(
+        &shared.provider_contracts,
+        &shared.provider_adapter_contracts,
+    )
+}
+
+fn node_compatibility_support_for_manifest(
+    provider_contracts: &[ProviderContractSupport],
+    provider_adapter_contracts: &[ProviderAdapterContractSupport],
+) -> Result<NodeCompatibilitySupport, NodeServerError> {
     Ok(NodeCompatibilitySupport {
         protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION)
             .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
@@ -3213,7 +3387,8 @@ fn node_compatibility_support() -> Result<NodeCompatibilitySupport, NodeServerEr
             versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
-        provider_contracts: Vec::new(),
+        provider_contracts: provider_contracts.to_vec(),
+        provider_adapter_contracts: provider_adapter_contracts.to_vec(),
     })
 }
 
@@ -3221,6 +3396,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
     [
         NODE_COMPATIBILITY_METADATA_CAPABILITY,
         NODE_WORKSPACE_FILE_READ_CAPABILITY,
+        NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -4130,6 +4306,8 @@ pub enum NodeServerError {
     },
     #[error("active agent registry failed: {0}")]
     Registry(String),
+    #[error("node provider contract manifest is invalid: {0}")]
+    ProviderContractManifest(String),
     #[error("node hook ingress startup failed: {0}")]
     HookIngressStartup(String),
     #[error("named pipe I/O failed: {0}")]
@@ -4178,6 +4356,220 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.endpoint, DEFAULT_NODE_ENDPOINT);
+    }
+
+    #[test]
+    fn production_registry_provider_contract_manifest_is_exact() {
+        let registry = active_registry().unwrap();
+        let (providers, adapters) = provider_contract_manifest(&registry).unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|contract| (contract.provider, contract.revision.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (AgentProvider::Claude, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+                (AgentProvider::Codex, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+                (AgentProvider::Kimi, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            ]
+        );
+        assert_eq!(
+            adapters
+                .iter()
+                .map(|contract| (
+                    contract.provider,
+                    contract.family,
+                    contract.adapter_id.as_str(),
+                    contract.revision.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (AgentProvider::Claude, AdapterFamily::PtySemantic, "claude-code", "gate4agent-adapter/v1"),
+                (AgentProvider::Claude, AdapterFamily::Pipe, "claude-code", "gate4agent-adapter/v1"),
+                (AgentProvider::Claude, AdapterFamily::Hook, "claude-code", "gate4agent-adapter/v1"),
+                (AgentProvider::Claude, AdapterFamily::ManagedHook, "claude", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+                (AgentProvider::Claude, AdapterFamily::OneShot, "claude", "gate4agent-inline/claude-code-2.1/v1"),
+                (AgentProvider::Claude, AdapterFamily::History, "claude-code", "gate4agent-adapter/v1"),
+                (AgentProvider::Claude, AdapterFamily::Resume, "claude-code", "gate4agent-adapter/v1"),
+                (AgentProvider::Claude, AdapterFamily::SessionOptions, "claude-code", "gate4agent-session-options/orca-d8629c4/v1"),
+                (AgentProvider::Codex, AdapterFamily::PtySemantic, "codex", "gate4agent-adapter/v1"),
+                (AgentProvider::Codex, AdapterFamily::Pipe, "codex", "gate4agent-adapter/v1"),
+                (AgentProvider::Codex, AdapterFamily::Hook, "codex", "gate4agent-adapter/v1"),
+                (AgentProvider::Codex, AdapterFamily::ManagedHook, "codex", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+                (AgentProvider::Codex, AdapterFamily::OneShot, "codex", "gate4agent-inline/codex-cli-0.144/v1"),
+                (AgentProvider::Codex, AdapterFamily::History, "codex", "gate4agent-adapter/v1"),
+                (AgentProvider::Codex, AdapterFamily::Resume, "codex", "gate4agent-adapter/v1"),
+                (AgentProvider::Codex, AdapterFamily::SessionOptions, "codex", "gate4agent-session-options/orca-d8629c4/v1"),
+                (AgentProvider::Kimi, AdapterFamily::PtySemantic, "kimi", "gate4agent-adapter/v1"),
+                (AgentProvider::Kimi, AdapterFamily::Pipe, "kimi", "gate4agent-adapter/v1"),
+                (AgentProvider::Kimi, AdapterFamily::Hook, "kimi", "gate4agent-adapter/v1"),
+                (AgentProvider::Kimi, AdapterFamily::ManagedHook, "kimi", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+                (AgentProvider::Kimi, AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
+                (AgentProvider::Kimi, AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
+                (AgentProvider::Kimi, AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
+            ]
+        );
+    }
+
+    fn construction_test_config(name: &str) -> NodeServerConfig {
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        NodeServerConfig::new(
+            format!(r"\\.\pipe\gate4agent-{name}"),
+            "fixture-token",
+            NodeId::new(name).unwrap(),
+            [workspace],
+        )
+        .unwrap()
+    }
+
+    fn maximum_size_provider_manifest_registry() -> AgentRegistry {
+        let adapter = AdapterBinding::new(
+            gate4agent_types::AdapterId::new("a".repeat(96)).unwrap(),
+            "r".repeat(crate::protocol::MAX_ADAPTER_CONTRACT_REVISION_BYTES),
+            gate4agent_types::AdapterVerification::SyntheticFixture,
+        )
+        .unwrap();
+        let agent_ids = ["claude", "codex", "kimi"]
+            .into_iter()
+            .map(|agent_id| AgentId::new(agent_id).unwrap())
+            .collect::<Vec<_>>();
+        let adapters = gate4agent_catalog::AdapterRegistry::new(
+            [
+                AdapterFamily::PtySemantic,
+                AdapterFamily::Pipe,
+                AdapterFamily::OneShot,
+                AdapterFamily::Acp,
+                AdapterFamily::Hook,
+                AdapterFamily::ManagedHook,
+                AdapterFamily::History,
+                AdapterFamily::Resume,
+                AdapterFamily::SessionOptions,
+                AdapterFamily::CapabilityProbe,
+            ]
+            .into_iter()
+            .map(|family| gate4agent_catalog::AdapterDescriptor {
+                family,
+                binding: adapter.clone(),
+                agents: agent_ids.clone(),
+            }),
+        )
+        .unwrap();
+        let specs = agent_ids
+            .iter()
+            .map(|agent_id| {
+                let agent_id = agent_id.as_str();
+                let mut spec = builtin_registry().get_by_id(agent_id).unwrap().clone();
+                spec.revision =
+                    "r".repeat(crate::protocol::MAX_PROVIDER_CONTRACT_REVISION_BYTES);
+                spec.capabilities.transports.pty_adapter = Some(adapter.clone());
+                spec.capabilities.transports.pipe = Some(gate4agent_types::PipeTransportSpec {
+                    adapter: adapter.clone(),
+                    protocol: gate4agent_types::PipeProtocol::SemanticNdjson,
+                    launch_override: None,
+                    prompt_delivery: gate4agent_types::PipePromptDelivery::None,
+                });
+                spec.capabilities.transports.acp = Some(gate4agent_types::AcpTransportSpec {
+                    adapter: adapter.clone(),
+                    launch_override: None,
+                });
+                spec.capabilities.adapters.hook = Some(adapter.clone());
+                spec.capabilities.adapters.managed_hook = Some(adapter.clone());
+                spec.capabilities.adapters.one_shot = Some(adapter.clone());
+                spec.capabilities.adapters.history = Some(adapter.clone());
+                spec.capabilities.adapters.resume = Some(adapter.clone());
+                spec.capabilities.adapters.session_options = Some(adapter.clone());
+                spec.capabilities.adapters.capability_probe = Some(adapter.clone());
+                spec
+            })
+            .collect::<Vec<_>>();
+        AgentRegistry::new_with_adapters(specs, &adapters).unwrap()
+    }
+
+    #[test]
+    fn node_server_construction_accepts_production_manifest_at_provider_count_limit() {
+        let registry = active_registry().unwrap();
+        let (providers, _) = provider_contract_manifest(&registry).unwrap();
+        assert_eq!(providers.len(), crate::protocol::MAX_PROVIDER_CONTRACTS);
+        let server = NodeServer::new_with_registry(
+            construction_test_config("manifest-production-bound"),
+            registry,
+        )
+        .unwrap();
+        drop(server);
+    }
+
+    #[test]
+    fn node_server_construction_rejects_count_valid_manifest_over_handshake_capacity() {
+        let registry = maximum_size_provider_manifest_registry();
+        let (providers, adapters) = provider_contract_manifest(&registry).unwrap();
+        assert_eq!(providers.len(), crate::protocol::MAX_PROVIDER_CONTRACTS);
+        assert_eq!(adapters.len(), 30);
+        assert!(adapters.len() <= crate::protocol::MAX_PROVIDER_ADAPTER_CONTRACTS);
+        let error = match NodeServer::new_with_registry(
+            construction_test_config("manifest-handshake-overflow"),
+            registry,
+        ) {
+            Ok(_) => panic!("oversized negotiated manifest was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            NodeServerError::ProviderContractManifest(message)
+                if message.contains("authentication binding length")
+                    && message.contains("8192-byte limit")
+        ));
+    }
+
+    #[test]
+    fn provider_contract_manifest_rejects_wire_revision_overflow_before_startup() {
+        let mut spec = builtin_registry().get_by_id("claude").unwrap().clone();
+        spec.revision = "x".repeat(crate::protocol::MAX_PROVIDER_CONTRACT_REVISION_BYTES + 1);
+        let registry = AgentRegistry::new([spec]).unwrap();
+        assert!(matches!(
+            provider_contract_manifest(&registry),
+            Err(NodeServerError::ProviderContractManifest(message))
+                if message.contains("exceeds the 128-byte limit")
+        ));
+    }
+
+    #[test]
+    fn provider_contract_manifest_rejects_invalid_wire_revision_before_startup() {
+        let mut spec = builtin_registry().get_by_id("claude").unwrap().clone();
+        spec.revision = "invalid revision".to_owned();
+        let registry = AgentRegistry::new([spec]).unwrap();
+        assert!(matches!(
+            provider_contract_manifest(&registry),
+            Err(NodeServerError::ProviderContractManifest(message))
+                if message.contains("bounded lowercase ASCII")
+        ));
+    }
+
+    #[test]
+    fn provider_contract_manifest_rejects_conflicting_duplicate_family_before_startup() {
+        let mut spec = builtin_registry().get_by_id("claude").unwrap().clone();
+        let transport_binding = spec.capabilities.adapters.one_shot.clone().unwrap();
+        let conflicting_binding = builtin_registry()
+            .get_by_id("codex")
+            .unwrap()
+            .capabilities
+            .adapters
+            .one_shot
+            .clone()
+            .unwrap();
+        let pipe = spec.capabilities.transports.pipe.as_mut().unwrap();
+        pipe.protocol = gate4agent_types::PipeProtocol::OneShotText;
+        pipe.adapter = transport_binding;
+        spec.capabilities.adapters.one_shot = Some(conflicting_binding);
+        let registry = AgentRegistry::new([spec]).unwrap();
+        assert!(matches!(
+            provider_contract_manifest(&registry),
+            Err(NodeServerError::ProviderContractManifest(message))
+                if message.contains("conflicting OneShot adapter bindings")
+        ));
     }
 
     #[test]
@@ -4680,6 +5072,8 @@ mod tests {
             NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
             vec![workspace.clone()],
             vec![AgentProvider::Claude],
+            Vec::new(),
+            Vec::new(),
             Some(state_path.clone()),
             Vec::new(),
             None,
@@ -4822,6 +5216,8 @@ mod tests {
             NodeIncarnationId::from_bytes([1; crate::protocol::NODE_INCARNATION_ID_BYTES]),
             vec![workspace],
             vec![AgentProvider::Claude],
+            Vec::new(),
+            Vec::new(),
             None,
             loaded.records,
             loaded.warning,

@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use gate4agent_node_protocol::{
-    GitWorktreeSnapshot, ManagedSessionState, OpaqueHostPath, SessionMode, WorkspaceEntryKind, WorkspaceId,
+    GitWorktreeSnapshot, ManagedSessionState, OpaqueHostPath, RepositoryPath, SessionMode,
+    WorkspaceEntryKind, WorkspaceId,
     WorkspaceInspection, MAX_SESSION_DISPLAY_NAME_BYTES,
     MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
 };
@@ -643,7 +644,7 @@ pub struct App {
     pub agents_scroll: usize,
     pub workspaces_scroll: usize,
     pub terminal_scroll_offsets: BTreeMap<SessionAddress, usize>,
-    pub collapsed_directories: BTreeSet<(String, String, String)>,
+    pub collapsed_directories: BTreeSet<(String, String, RepositoryPath)>,
     pub menu_placement: MenuPlacement,
     pub sidebar_presentation: SidebarPresentation,
     pub sidebar_collapsed: bool,
@@ -772,12 +773,12 @@ impl App {
             .collect()
     }
 
-    pub fn directory_is_collapsed(&self, relative_path: &str) -> bool {
+    pub fn directory_is_collapsed(&self, relative_path: &RepositoryPath) -> bool {
         self.selected_workspace_route().is_some_and(|(node_id, workspace_id)| {
             self.collapsed_directories.contains(&(
                 node_id,
                 workspace_id,
-                relative_path.to_owned(),
+                relative_path.clone(),
             ))
         })
     }
@@ -786,24 +787,17 @@ impl App {
         &self,
         node_id: &str,
         workspace_id: &str,
-        relative_path: &str,
+        relative_path: &RepositoryPath,
     ) -> bool {
-        let components = relative_path.split('/').collect::<Vec<_>>();
-        let mut ancestor = String::new();
-        for component in components.iter().take(components.len().saturating_sub(1)) {
-            if !ancestor.is_empty() {
-                ancestor.push('/');
-            }
-            ancestor.push_str(component);
-            if self.collapsed_directories.contains(&(
-                node_id.to_owned(),
-                workspace_id.to_owned(),
-                ancestor.clone(),
-            )) {
-                return true;
-            }
-        }
-        false
+        self.collapsed_directories.iter().any(|(
+            collapsed_node_id,
+            collapsed_workspace_id,
+            collapsed_path,
+        )| {
+            collapsed_node_id == node_id
+                && collapsed_workspace_id == workspace_id
+                && relative_path.is_descendant_of(collapsed_path)
+        })
     }
 
     pub fn workspace_inspection_pending(&self) -> bool {
@@ -3969,8 +3963,20 @@ impl App {
 }
 
 pub(crate) fn host_path_display(path: &OpaqueHostPath) -> String {
+    sanitize_path_display(path.display_text().as_ref())
+}
+
+pub(crate) fn repository_path_display(path: &RepositoryPath) -> String {
+    sanitize_path_display(path.display_text().as_ref())
+}
+
+pub(crate) fn repository_path_file_name_display(path: &RepositoryPath) -> String {
+    sanitize_path_display(path.file_name_display_text().as_ref())
+}
+
+fn sanitize_path_display(display: &str) -> String {
     let mut sanitized = String::new();
-    for ch in path.display_text().chars() {
+    for ch in display.chars() {
         if ch.is_control() {
             sanitized.extend(ch.escape_default());
         } else {
@@ -4327,6 +4333,10 @@ mod tests {
         OpaqueHostPath::utf8(value.into()).unwrap()
     }
 
+    fn repository_path(value: impl Into<String>) -> RepositoryPath {
+        RepositoryPath::utf8(value.into()).unwrap()
+    }
+
     fn fixture() -> App {
         let address = SessionAddress {
             node_id: "node-a".to_owned(),
@@ -4415,19 +4425,19 @@ mod tests {
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             entries: vec![
                 WorkspaceEntry {
-                    relative_path: "src".to_owned(),
+                    relative_path: repository_path("src"),
                     kind: WorkspaceEntryKind::Directory,
                 },
                 WorkspaceEntry {
-                    relative_path: "src/bin".to_owned(),
+                    relative_path: repository_path("src/bin"),
                     kind: WorkspaceEntryKind::Directory,
                 },
                 WorkspaceEntry {
-                    relative_path: "src/bin/main.rs".to_owned(),
+                    relative_path: repository_path("src/bin/main.rs"),
                     kind: WorkspaceEntryKind::File,
                 },
                 WorkspaceEntry {
-                    relative_path: "Cargo.toml".to_owned(),
+                    relative_path: repository_path("Cargo.toml"),
                     kind: WorkspaceEntryKind::File,
                 },
             ],
@@ -4439,12 +4449,14 @@ mod tests {
                     GitStatusEntry {
                         index_status: " ".to_owned(),
                         worktree_status: "M".to_owned(),
-                        path: "src/bin/main.rs".to_owned(),
+                        path: repository_path("src/bin/main.rs"),
+                        previous_path: None,
                     },
                     GitStatusEntry {
                         index_status: "?".to_owned(),
                         worktree_status: "?".to_owned(),
-                        path: "notes.txt".to_owned(),
+                        path: repository_path("notes.txt"),
+                        previous_path: None,
                     },
                 ],
                 recent_commits: Vec::new(),
@@ -4680,13 +4692,47 @@ mod tests {
 
         assert_eq!(app.visible_workspace_entry_indices(), vec![0, 1, 2, 3]);
         assert_eq!(app.click(2, 1), AppAction::None);
-        assert!(app.directory_is_collapsed("src"));
+        assert!(app.directory_is_collapsed(&repository_path("src")));
         assert_eq!(app.visible_workspace_entry_indices(), vec![0, 3]);
         assert_eq!(app.git_cursor, 0);
 
         assert_eq!(app.click(2, 1), AppAction::None);
-        assert!(!app.directory_is_collapsed("src"));
+        assert!(!app.directory_is_collapsed(&repository_path("src")));
         assert_eq!(app.visible_workspace_entry_indices(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn collapsed_directory_keys_use_physical_bytes_and_posix_separators() {
+        let mut app = fixture();
+        let utf8_directory = repository_path(r"src\literal");
+        let tagged_same_bytes = RepositoryPath::unix_bytes(b"src\\literal".to_vec()).unwrap();
+        let child = repository_path(r"src\literal/main.rs");
+        let unrelated = repository_path("src/literal/main.rs");
+        let mut inspection = workspace_inspection();
+        inspection.entries = vec![
+            WorkspaceEntry {
+                relative_path: utf8_directory.clone(),
+                kind: WorkspaceEntryKind::Directory,
+            },
+            WorkspaceEntry {
+                relative_path: child,
+                kind: WorkspaceEntryKind::File,
+            },
+            WorkspaceEntry {
+                relative_path: unrelated,
+                kind: WorkspaceEntryKind::File,
+            },
+        ];
+        app.apply_workspace_inspection("node-a".to_owned(), inspection);
+        app.collapsed_directories.insert((
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            utf8_directory.clone(),
+        ));
+
+        assert!(app.directory_is_collapsed(&utf8_directory));
+        assert!(app.directory_is_collapsed(&tagged_same_bytes));
+        assert_eq!(app.visible_workspace_entry_indices(), vec![0, 2]);
     }
 
     #[test]
@@ -4708,7 +4754,7 @@ mod tests {
             target: HitTarget::SidebarItem(0),
         });
         assert_eq!(app.click(20, 6), AppAction::None);
-        assert!(app.directory_is_collapsed("src"));
+        assert!(app.directory_is_collapsed(&repository_path("src")));
         assert_eq!(app.focus, Focus::Settings);
 
         assert!(matches!(
@@ -4956,12 +5002,12 @@ mod tests {
         app.collapsed_directories.insert((
             "node-a".to_owned(),
             "workspace-a".to_owned(),
-            "src".to_owned(),
+            repository_path("src"),
         ));
         app.collapsed_directories.insert((
             "node-b".to_owned(),
             "workspace-b".to_owned(),
-            "src".to_owned(),
+            repository_path("src"),
         ));
         app.files_cursor = 2;
         app.git_cursor = 2;

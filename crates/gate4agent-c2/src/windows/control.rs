@@ -6,7 +6,7 @@ use crate::protocol::{
     HostDescriptor, NegotiatedC2ControlCompatibility,
     OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
-    C2_OPAQUE_UNIX_PATH_CAPABILITY,
+    C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -26,6 +26,12 @@ const MAX_OUTBOUND_FRAMES: usize = 128;
 const MAX_OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INBOUND_FRAMES: usize = 4;
 const REPLY_QUEUE_DEADLINE: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+struct NegotiatedPathCapabilities {
+    opaque_host_paths: bool,
+    repository_paths: bool,
+}
 
 pub(super) async fn run(
     endpoint: String,
@@ -173,11 +179,7 @@ async fn serve_connection(
         return Ok(());
     }
     let mut last_topology = C2Topology::from_status(&hello_status);
-    let opaque_unix_paths_enabled = compatibility.as_ref().is_some_and(|selected| {
-        selected.capabilities.iter().any(|capability| {
-            capability.as_str() == C2_OPAQUE_UNIX_PATH_CAPABILITY
-        })
-    });
+    let path_capabilities = negotiated_path_capabilities(compatibility.as_ref());
     if timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
         &C2ServerFrame::Hello(C2Hello {
@@ -199,7 +201,7 @@ async fn serve_connection(
         outbound_rx,
         Arc::clone(&budget),
         disconnect_tx.clone(),
-        opaque_unix_paths_enabled,
+        path_capabilities,
     ));
     let mut dispatches = JoinSet::new();
     let mut last_request_id = 0_u64;
@@ -208,7 +210,7 @@ async fn serve_connection(
         tokio::select! {
             incoming = incoming_rx.recv() => {
                 let Some(Ok(C2ClientFrame::Request(request))) = incoming else { break; };
-                if !opaque_unix_paths_enabled
+                if !path_capabilities.opaque_host_paths
                     && node_request_contains_opaque_unix_path(&request.request.request)
                 {
                     break;
@@ -376,12 +378,16 @@ async fn control_writer<W>(
     mut frames: mpsc::Receiver<QueuedFrame>,
     budget: Arc<AtomicUsize>,
     disconnect: watch::Sender<bool>,
-    opaque_unix_paths_enabled: bool,
+    path_capabilities: NegotiatedPathCapabilities,
 ) where
     W: tokio::io::AsyncWrite + Unpin,
 {
     while let Some(queued) = frames.recv().await {
-        if !opaque_unix_paths_enabled && server_frame_contains_opaque_unix_path(&queued.frame) {
+        if (!path_capabilities.opaque_host_paths
+            && server_frame_contains_opaque_unix_path(&queued.frame))
+            || (!path_capabilities.repository_paths
+                && server_frame_contains_unix_repository_path(&queued.frame))
+        {
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
@@ -394,6 +400,22 @@ async fn control_writer<W>(
         if !matches!(result, Ok(Ok(()))) { break; }
     }
     let _ = disconnect.send(true);
+}
+
+fn negotiated_path_capabilities(
+    selected: Option<&NegotiatedC2ControlCompatibility>,
+) -> NegotiatedPathCapabilities {
+    let selected_has = |expected| {
+        selected.is_some_and(|selected| {
+            selected.capabilities.iter().any(|capability| {
+                capability.as_str() == expected
+            })
+        })
+    };
+    NegotiatedPathCapabilities {
+        opaque_host_paths: selected_has(C2_OPAQUE_UNIX_PATH_CAPABILITY),
+        repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
+    }
 }
 
 fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
@@ -433,6 +455,45 @@ fn server_frame_contains_opaque_unix_path(frame: &C2ServerFrame) -> bool {
         C2ServerFrame::Event(event) => c2_event_contains_opaque_unix_path(&event.event),
         C2ServerFrame::Challenge(_)
         | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(|response| {
+                match response {
+                    C2NodeResponse::WorkspaceInspected { inspection } => {
+                        inspection.entries.iter().any(|entry| {
+                            entry.relative_path.as_unix_bytes().is_some()
+                        }) || inspection.git.status.iter().any(|entry| {
+                            entry.path.as_unix_bytes().is_some()
+                                || entry.previous_path.as_ref().is_some_and(|path| {
+                                    path.as_unix_bytes().is_some()
+                                })
+                        })
+                    }
+                    C2NodeResponse::Snapshot { .. }
+                    | C2NodeResponse::Resync { .. }
+                    | C2NodeResponse::Controller { .. }
+                    | C2NodeResponse::SpawnAccepted { .. }
+                    | C2NodeResponse::SessionRecordUpdated { .. }
+                    | C2NodeResponse::SessionRecordResumed { .. }
+                    | C2NodeResponse::SessionRecordForgotten { .. }
+                    | C2NodeResponse::WorkspaceRegistered { .. }
+                    | C2NodeResponse::WorkspaceUnregistered { .. }
+                    | C2NodeResponse::WorktreeCreated { .. }
+                    | C2NodeResponse::WorktreeRemoved { .. }
+                    | C2NodeResponse::Accepted
+                    | C2NodeResponse::ShuttingDown => false,
+                }
+            })
+        }),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Event(_)
         | C2ServerFrame::Topology(_)
         | C2ServerFrame::Rejected(_) => false,
     }
@@ -656,6 +717,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
             operating_system: OperatingSystemId::new("windows")
@@ -673,7 +736,12 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{C2ClientHello, C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath};
+    use crate::protocol::{
+        C2ClientHello, C2GitSnapshot, C2WorkspaceInspection, C2_API_VERSION,
+        NodeFreshness, ObservedNode, OpaqueHostPath, RepositoryPath,
+    };
+    use gate4agent_node_protocol::{GitStatusEntry, WorkspaceEntry, WorkspaceEntryKind};
+    use tokio::io::AsyncReadExt;
 
     fn status(transport: NodeTransportState, incarnation_id: Option<NodeIncarnationId>) -> StatusResponse {
         let node_id = NodeId::new("node-a").unwrap();
@@ -700,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn c2_control_server_selects_authenticated_opaque_unix_path_opt_in() {
+    fn c2_control_server_selects_authenticated_path_opt_ins() {
         let support = c2_control_compatibility_support().unwrap();
 
         assert_eq!(
@@ -712,6 +780,7 @@ mod tests {
             vec![
                 CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -734,6 +803,97 @@ mod tests {
             [8; crate::protocol::C2_AUTH_NONCE_BYTES],
         )).unwrap();
         assert!(legacy.capabilities.is_empty());
+    }
+
+    fn repository_path(value: &str) -> RepositoryPath {
+        RepositoryPath::utf8(value.to_owned()).unwrap()
+    }
+
+    fn tagged_repository_path() -> RepositoryPath {
+        RepositoryPath::unix_bytes(vec![b's', b'r', b'c', b'/', 0xff]).unwrap()
+    }
+
+    fn repository_path_frame(
+        entry_path: RepositoryPath,
+        status_path: RepositoryPath,
+        previous_path: Option<RepositoryPath>,
+    ) -> C2ServerFrame {
+        C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(2),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                response: Ok(C2NodeResponse::WorkspaceInspected {
+                    inspection: C2WorkspaceInspection {
+                        workspace_id: gate4agent_node_protocol::WorkspaceId::new("repo").unwrap(),
+                        entries: vec![WorkspaceEntry {
+                            relative_path: entry_path,
+                            kind: WorkspaceEntryKind::File,
+                        }],
+                        tree_truncated: false,
+                        git: C2GitSnapshot {
+                            is_repository: true,
+                            branch: Some("main".to_owned()),
+                            status: vec![GitStatusEntry {
+                                index_status: " ".to_owned(),
+                                worktree_status: "M".to_owned(),
+                                path: status_path,
+                                previous_path,
+                            }],
+                            recent_commits: Vec::new(),
+                            worktrees: Vec::new(),
+                            truncated: false,
+                            diagnostic_present: false,
+                        },
+                    },
+                }),
+            }),
+        })
+    }
+
+    #[test]
+    fn legacy_control_repository_path_gate_covers_entries_status_and_previous_path() {
+        let utf8 = || repository_path("src/main.rs");
+        let tagged = tagged_repository_path;
+        for frame in [
+            repository_path_frame(tagged(), utf8(), None),
+            repository_path_frame(utf8(), tagged(), None),
+            repository_path_frame(utf8(), utf8(), Some(tagged())),
+        ] {
+            assert!(server_frame_contains_unix_repository_path(&frame));
+        }
+        assert!(!server_frame_contains_unix_repository_path(
+            &repository_path_frame(utf8(), utf8(), Some(utf8())),
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_writer_fails_closed_before_tagged_repository_path_write() {
+        let frame = repository_path_frame(
+            tagged_repository_path(),
+            repository_path("src/main.rs"),
+            None,
+        );
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender.send(queued(frame, &budget).unwrap()).await.unwrap();
+        drop(sender);
+        let (disconnect, _disconnected) = watch::channel(false);
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: false,
+                repository_paths: false,
+            },
+        ).await;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 
     #[test]

@@ -8,7 +8,9 @@ use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::{Borrow, Cow};
+use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::str::FromStr;
 use thiserror::Error;
@@ -20,6 +22,7 @@ pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
+pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_PROVIDER_CONTRACT_REVISION_BYTES: usize = 128;
@@ -30,6 +33,7 @@ pub const MAX_NODE_TEXT_BYTES: usize = 32 * 1024;
 pub const MAX_NODE_TERMINAL_BYTES: usize = 64;
 pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
 pub const MAX_WORKSPACE_ROOT_BYTES: usize = gate4agent_types::WORKING_DIRECTORY_MAX_BYTES;
+pub const MAX_REPOSITORY_PATH_BYTES: usize = 1_024;
 pub const MAX_NODE_HELLO_FRAME_BYTES: usize = 8 * 1024;
 pub const NODE_AUTH_NONCE_BYTES: usize = 32;
 pub const NODE_AUTH_PROOF_BYTES: usize = 32;
@@ -724,6 +728,279 @@ impl<'de> Visitor<'de> for BoundedOpaquePathBytesVisitor {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RepositoryPath(RepositoryPathRepr);
+
+#[derive(Clone, Debug)]
+enum RepositoryPathRepr {
+    Utf8(String),
+    UnixBytes(Vec<u8>),
+}
+
+impl PartialEq for RepositoryPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for RepositoryPath {}
+
+impl Hash for RepositoryPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl PartialOrd for RepositoryPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RepositoryPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl RepositoryPath {
+    pub fn utf8(value: String) -> Result<Self, RepositoryPathError> {
+        validate_repository_path(value.as_bytes())?;
+        Ok(Self(RepositoryPathRepr::Utf8(value)))
+    }
+
+    pub fn unix_bytes(value: Vec<u8>) -> Result<Self, RepositoryPathError> {
+        validate_repository_path(&value)?;
+        Ok(Self(RepositoryPathRepr::UnixBytes(value)))
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    pub fn display_text(&self) -> Cow<'_, str> {
+        match &self.0 {
+            RepositoryPathRepr::Utf8(value) => Cow::Borrowed(value),
+            RepositoryPathRepr::UnixBytes(value) => String::from_utf8_lossy(value),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.0 {
+            RepositoryPathRepr::Utf8(value) => value.as_bytes(),
+            RepositoryPathRepr::UnixBytes(value) => value,
+        }
+    }
+
+    pub fn as_utf8(&self) -> Option<&str> {
+        match &self.0 {
+            RepositoryPathRepr::Utf8(value) => Some(value),
+            RepositoryPathRepr::UnixBytes(_) => None,
+        }
+    }
+
+    pub fn as_unix_bytes(&self) -> Option<&[u8]> {
+        match &self.0 {
+            RepositoryPathRepr::Utf8(_) => None,
+            RepositoryPathRepr::UnixBytes(value) => Some(value),
+        }
+    }
+
+    pub fn is_descendant_of(&self, ancestor: &Self) -> bool {
+        let path = self.as_bytes();
+        let ancestor = ancestor.as_bytes();
+        path.len() > ancestor.len()
+            && path.starts_with(ancestor)
+            && path.get(ancestor.len()) == Some(&b'/')
+    }
+
+    pub fn component_count(&self) -> usize {
+        self.as_bytes().split(|byte| *byte == b'/').count()
+    }
+
+    pub fn depth(&self) -> usize {
+        self.component_count() - 1
+    }
+
+    pub fn file_name_bytes(&self) -> &[u8] {
+        self.as_bytes()
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .expect("validated repository paths have at least one component")
+    }
+
+    pub fn file_name_display_text(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(self.file_name_bytes())
+    }
+}
+
+fn validate_repository_path(value: &[u8]) -> Result<(), RepositoryPathError> {
+    if value.is_empty() {
+        return Err(RepositoryPathError::Empty);
+    }
+    if value.len() > MAX_REPOSITORY_PATH_BYTES {
+        return Err(RepositoryPathError::TooLong {
+            len: value.len(),
+            max: MAX_REPOSITORY_PATH_BYTES,
+        });
+    }
+    if value.contains(&0) {
+        return Err(RepositoryPathError::ContainsNul);
+    }
+    if value.starts_with(b"/") {
+        return Err(RepositoryPathError::Absolute);
+    }
+    for component in value.split(|byte| *byte == b'/') {
+        match component {
+            b"" => return Err(RepositoryPathError::EmptyComponent),
+            b"." => return Err(RepositoryPathError::CurrentDirectoryComponent),
+            b".." => return Err(RepositoryPathError::ParentDirectoryComponent),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum RepositoryPathError {
+    #[error("repository path cannot be empty")]
+    Empty,
+    #[error("repository path length {len} exceeds the {max}-byte limit")]
+    TooLong { len: usize, max: usize },
+    #[error("repository path cannot contain a NUL byte")]
+    ContainsNul,
+    #[error("repository path must be relative")]
+    Absolute,
+    #[error("repository path cannot contain an empty component")]
+    EmptyComponent,
+    #[error("repository path cannot contain a current-directory component")]
+    CurrentDirectoryComponent,
+    #[error("repository path cannot contain a parent-directory component")]
+    ParentDirectoryComponent,
+}
+
+impl Serialize for RepositoryPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match &self.0 {
+            RepositoryPathRepr::Utf8(value) => serializer.serialize_str(value),
+            RepositoryPathRepr::UnixBytes(value) => {
+                let mut state = serializer.serialize_struct("RepositoryPath", 2)?;
+                state.serialize_field("kind", "unix-bytes")?;
+                state.serialize_field("bytes", value)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RepositoryPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(RepositoryPathVisitor)
+    }
+}
+
+struct RepositoryPathVisitor;
+
+impl<'de> Visitor<'de> for RepositoryPathVisitor {
+    type Value = RepositoryPath;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "a bounded canonical relative UTF-8 repository path string or strict unix-bytes object",
+        )
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        RepositoryPath::utf8(value.to_owned()).map_err(E::custom)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        RepositoryPath::utf8(value).map_err(E::custom)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut kind = None;
+        let mut bytes = None;
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "kind" => {
+                    if kind.is_some() {
+                        return Err(serde::de::Error::duplicate_field("kind"));
+                    }
+                    kind = Some(map.next_value::<String>()?);
+                }
+                "bytes" => {
+                    if bytes.is_some() {
+                        return Err(serde::de::Error::duplicate_field("bytes"));
+                    }
+                    bytes = Some(map.next_value::<BoundedRepositoryPathBytes>()?.0);
+                }
+                _ => {
+                    return Err(serde::de::Error::unknown_field(&field, &["kind", "bytes"]));
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+        if kind != "unix-bytes" {
+            return Err(serde::de::Error::unknown_variant(&kind, &["unix-bytes"]));
+        }
+        let bytes = bytes.ok_or_else(|| serde::de::Error::missing_field("bytes"))?;
+        RepositoryPath::unix_bytes(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+struct BoundedRepositoryPathBytes(Vec<u8>);
+
+impl<'de> Deserialize<'de> for BoundedRepositoryPathBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedRepositoryPathBytesVisitor)
+    }
+}
+
+struct BoundedRepositoryPathBytesVisitor;
+
+impl<'de> Visitor<'de> for BoundedRepositoryPathBytesVisitor {
+    type Value = BoundedRepositoryPathBytes;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at most {MAX_REPOSITORY_PATH_BYTES} repository path bytes")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut bytes = Vec::with_capacity(
+            sequence.size_hint().unwrap_or(0).min(MAX_REPOSITORY_PATH_BYTES),
+        );
+        while let Some(byte) = sequence.next_element::<u8>()? {
+            if bytes.len() == MAX_REPOSITORY_PATH_BYTES {
+                return Err(serde::de::Error::invalid_length(bytes.len() + 1, &self));
+            }
+            bytes.push(byte);
+        }
+        Ok(BoundedRepositoryPathBytes(bytes))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PathSemantics {
     pub style: PathStyle,
@@ -922,7 +1199,7 @@ pub enum WorkspaceEntryKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceEntry {
-    pub relative_path: String,
+    pub relative_path: RepositoryPath,
     pub kind: WorkspaceEntryKind,
 }
 
@@ -930,7 +1207,9 @@ pub struct WorkspaceEntry {
 pub struct GitStatusEntry {
     pub index_status: String,
     pub worktree_status: String,
-    pub path: String,
+    pub path: RepositoryPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<RepositoryPath>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1356,6 +1635,10 @@ mod tests {
         OpaqueHostPath::utf8(value.to_owned()).unwrap()
     }
 
+    fn repository_path(value: &str) -> RepositoryPath {
+        RepositoryPath::utf8(value.to_owned()).unwrap()
+    }
+
     fn portable_node_support() -> NodeCompatibilitySupport {
         NodeCompatibilitySupport {
             protocol_versions: ProtocolRange::new(7, 9).unwrap(),
@@ -1563,6 +1846,142 @@ mod tests {
         assert!(OpaqueHostPath::utf8("a\0b".to_owned()).is_err());
         assert!(OpaqueHostPath::utf8("x".repeat(MAX_WORKSPACE_ROOT_BYTES + 1)).is_err());
         assert!(OpaqueHostPath::unix_bytes(vec![b'x'; MAX_WORKSPACE_ROOT_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn repository_path_utf8_preserves_legacy_json_string_shape_and_typed_components() {
+        let path = repository_path(r"src\literal-name/lib.rs");
+        assert_eq!(path.byte_len(), 23);
+        assert_eq!(path.as_utf8(), Some(r"src\literal-name/lib.rs"));
+        assert_eq!(path.as_unix_bytes(), None);
+        assert_eq!(path.display_text(), r"src\literal-name/lib.rs");
+        assert_eq!(path.component_count(), 2);
+        assert_eq!(path.depth(), 1);
+        assert_eq!(path.file_name_bytes(), b"lib.rs");
+        assert_eq!(path.file_name_display_text(), "lib.rs");
+        assert!(path.is_descendant_of(&repository_path(r"src\literal-name")));
+        assert!(!path.is_descendant_of(&repository_path("src")));
+
+        let json = serde_json::to_string(&path).unwrap();
+        assert_eq!(json, r#""src\\literal-name/lib.rs""#);
+        assert_eq!(serde_json::from_str::<RepositoryPath>(&json).unwrap(), path);
+    }
+
+    #[test]
+    fn repository_path_unix_bytes_has_strict_bounded_tagged_wire_shape() {
+        let raw = vec![b's', b'r', b'c', b'/', 0xff, b'/', b'f'];
+        let path = RepositoryPath::unix_bytes(raw.clone()).unwrap();
+        assert_eq!(path.byte_len(), raw.len());
+        assert_eq!(path.as_bytes(), raw);
+        assert_eq!(path.as_utf8(), None);
+        assert_eq!(path.as_unix_bytes(), Some(raw.as_slice()));
+        assert_eq!(path.component_count(), 3);
+        assert_eq!(path.depth(), 2);
+        assert_eq!(path.file_name_bytes(), b"f");
+        assert!(path.is_descendant_of(
+            &RepositoryPath::unix_bytes(vec![b's', b'r', b'c', b'/', 0xff]).unwrap(),
+        ));
+
+        let json = serde_json::to_string(&path).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"unix-bytes","bytes":[115,114,99,47,255,47,102]}"#,
+        );
+        assert_eq!(serde_json::from_str::<RepositoryPath>(&json).unwrap(), path);
+    }
+
+    #[test]
+    fn repository_path_physical_identity_ignores_wire_representation() {
+        use std::collections::{BTreeSet, HashSet};
+
+        let utf8 = repository_path("src/main.rs");
+        let tagged = RepositoryPath::unix_bytes(b"src/main.rs".to_vec()).unwrap();
+        assert_eq!(utf8, tagged);
+        assert_eq!(utf8.cmp(&tagged), Ordering::Equal);
+        assert_eq!(utf8.as_unix_bytes(), None);
+        assert_eq!(tagged.as_unix_bytes(), Some(b"src/main.rs".as_slice()));
+        assert_eq!(serde_json::to_string(&utf8).unwrap(), r#""src/main.rs""#);
+        assert_eq!(
+            serde_json::to_string(&tagged).unwrap(),
+            r#"{"kind":"unix-bytes","bytes":[115,114,99,47,109,97,105,110,46,114,115]}"#,
+        );
+
+        let mut ordered = BTreeSet::new();
+        ordered.insert(utf8.clone());
+        ordered.insert(tagged.clone());
+        assert_eq!(ordered.len(), 1);
+
+        let mut hashed = HashSet::new();
+        hashed.insert(utf8);
+        hashed.insert(tagged);
+        assert_eq!(hashed.len(), 1);
+
+        let backslash = repository_path(r"src\main.rs");
+        let slash = repository_path("src/main.rs");
+        assert_ne!(backslash, slash);
+        assert_ne!(backslash.cmp(&slash), Ordering::Equal);
+    }
+
+    #[test]
+    fn repository_path_rejects_non_canonical_or_unbounded_components() {
+        for invalid in [
+            "",
+            "/",
+            "/src",
+            "src/",
+            "src//lib.rs",
+            ".",
+            "..",
+            "./src",
+            "src/.",
+            "../src",
+            "src/..",
+            "src\0lib.rs",
+        ] {
+            assert!(RepositoryPath::utf8(invalid.to_owned()).is_err(), "{invalid:?}");
+        }
+        assert!(RepositoryPath::utf8("x".repeat(MAX_REPOSITORY_PATH_BYTES + 1)).is_err());
+        assert!(RepositoryPath::unix_bytes(vec![b'x'; MAX_REPOSITORY_PATH_BYTES + 1]).is_err());
+
+        for invalid in [
+            r#"{"kind":"future","bytes":[115]}"#,
+            r#"{"kind":"unix-bytes","bytes":[115],"extra":true}"#,
+            r#"{"kind":"unix-bytes"}"#,
+            r#"{"bytes":[115]}"#,
+            r#"{"kind":"unix-bytes","bytes":[]}"#,
+            r#"{"kind":"unix-bytes","bytes":[47,115]}"#,
+            r#"{"kind":"unix-bytes","bytes":[115,47,46,46]}"#,
+        ] {
+            assert!(serde_json::from_str::<RepositoryPath>(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn repository_path_fields_preserve_legacy_utf8_wire_bytes_and_default_rename_source() {
+        let entry = WorkspaceEntry {
+            relative_path: repository_path("src/lib.rs"),
+            kind: WorkspaceEntryKind::File,
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"relative_path":"src/lib.rs","kind":"file"}"#,
+        );
+
+        let legacy_status =
+            r#"{"index_status":"R","worktree_status":" ","path":"src/new.rs"}"#;
+        let status = serde_json::from_str::<GitStatusEntry>(legacy_status).unwrap();
+        assert_eq!(status.path, repository_path("src/new.rs"));
+        assert_eq!(status.previous_path, None);
+        assert_eq!(serde_json::to_string(&status).unwrap(), legacy_status);
+
+        let renamed = GitStatusEntry {
+            previous_path: Some(repository_path("src/old.rs")),
+            ..status
+        };
+        assert_eq!(
+            serde_json::to_string(&renamed).unwrap(),
+            r#"{"index_status":"R","worktree_status":" ","path":"src/new.rs","previous_path":"src/old.rs"}"#,
+        );
     }
 
     #[tokio::test]
@@ -1943,11 +2362,11 @@ mod tests {
                 workspace_id,
                 entries: vec![
                     WorkspaceEntry {
-                        relative_path: "src".to_owned(),
+                        relative_path: repository_path("src"),
                         kind: WorkspaceEntryKind::Directory,
                     },
                     WorkspaceEntry {
-                        relative_path: "src/lib.rs".to_owned(),
+                        relative_path: repository_path("src/lib.rs"),
                         kind: WorkspaceEntryKind::File,
                     },
                 ],
@@ -1958,7 +2377,8 @@ mod tests {
                     status: vec![GitStatusEntry {
                         index_status: " ".to_owned(),
                         worktree_status: "M".to_owned(),
-                        path: "src/lib.rs".to_owned(),
+                        path: repository_path("src/lib.rs"),
+                        previous_path: None,
                     }],
                     recent_commits: vec![GitCommitSummary {
                         id: "abc1234".to_owned(),

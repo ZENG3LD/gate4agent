@@ -8,6 +8,7 @@ use gate4agent_node_protocol::{
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
+    NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
 use std::collections::VecDeque;
@@ -30,6 +31,7 @@ pub struct NamedPipeNodeClient {
     pipe: NamedPipeClient,
     hello: NodeHello,
     opaque_unix_paths_enabled: bool,
+    repository_paths_enabled: bool,
     next_request_id: u64,
     pending_events: VecDeque<NodeEventEnvelope>,
 }
@@ -156,6 +158,9 @@ impl NamedPipeNodeClient {
         let opaque_unix_paths_enabled = selected_supports_opaque_unix_paths(
             hello.compatibility.as_ref(),
         );
+        let repository_paths_enabled = selected_supports_repository_paths(
+            hello.compatibility.as_ref(),
+        );
         ensure_node_hello_path_capability(&hello, opaque_unix_paths_enabled)?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
@@ -168,6 +173,7 @@ impl NamedPipeNodeClient {
             pipe,
             hello,
             opaque_unix_paths_enabled,
+            repository_paths_enabled,
             next_request_id: 1,
             pending_events: VecDeque::new(),
         })
@@ -203,7 +209,11 @@ impl NamedPipeNodeClient {
             Duration::from_millis(FRAME_BODY_TIMEOUT_MS),
         )
         .await?;
-        ensure_server_frame_path_capability(&frame, self.opaque_unix_paths_enabled)?;
+        ensure_server_frame_path_capability(
+            &frame,
+            self.opaque_unix_paths_enabled,
+            self.repository_paths_enabled,
+        )?;
         Ok(frame)
     }
 
@@ -258,6 +268,16 @@ fn selected_supports_opaque_unix_paths(
     })
 }
 
+fn selected_supports_repository_paths(
+    selected: Option<&NegotiatedNodeCompatibility>,
+) -> bool {
+    selected.is_some_and(|compatibility| {
+        compatibility.capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_REPOSITORY_PATH_CAPABILITY
+        })
+    })
+}
+
 fn ensure_node_hello_path_capability(
     hello: &NodeHello,
     opaque_unix_paths_enabled: bool,
@@ -281,10 +301,15 @@ fn ensure_node_request_path_capability(
 fn ensure_server_frame_path_capability(
     frame: &ServerFrame,
     opaque_unix_paths_enabled: bool,
+    repository_paths_enabled: bool,
 ) -> Result<(), NodeClientError> {
     ensure_opaque_unix_path_capability(
         server_frame_contains_opaque_unix_path(frame),
         opaque_unix_paths_enabled,
+    )?;
+    ensure_repository_path_capability(
+        server_frame_contains_tagged_repository_path(frame),
+        repository_paths_enabled,
     )
 }
 
@@ -295,6 +320,19 @@ fn ensure_opaque_unix_path_capability(
     if contains_opaque_unix_path && !opaque_unix_paths_enabled {
         return Err(NodeClientError::Protocol(
             "node sent or received opaque Unix path bytes without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_repository_path_capability(
+    contains_tagged_repository_path: bool,
+    repository_paths_enabled: bool,
+) -> Result<(), NodeClientError> {
+    if contains_tagged_repository_path && !repository_paths_enabled {
+        return Err(NodeClientError::Protocol(
+            "node sent tagged repository path bytes without negotiating the capability"
                 .to_owned(),
         ));
     }
@@ -340,6 +378,43 @@ fn server_frame_contains_opaque_unix_path(frame: &ServerFrame) -> bool {
         ),
         ServerFrame::Event(event) => node_event_contains_opaque_unix_path(&event.event),
         ServerFrame::Challenge(_) => false,
+    }
+}
+
+fn server_frame_contains_tagged_repository_path(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(
+            node_response_contains_tagged_repository_path,
+        ),
+        ServerFrame::Challenge(_) | ServerFrame::Hello(_) | ServerFrame::Event(_) => false,
+    }
+}
+
+fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> bool {
+    match response {
+        NodeResponse::WorkspaceInspected { inspection } => {
+            inspection.entries.iter().any(|entry| {
+                entry.relative_path.as_unix_bytes().is_some()
+            }) || inspection.git.status.iter().any(|status| {
+                status.path.as_unix_bytes().is_some()
+                    || status.previous_path.as_ref().is_some_and(|path| {
+                        path.as_unix_bytes().is_some()
+                    })
+            })
+        }
+        NodeResponse::Snapshot { .. }
+        | NodeResponse::Resync { .. }
+        | NodeResponse::Controller { .. }
+        | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SessionRecordUpdated { .. }
+        | NodeResponse::SessionRecordResumed { .. }
+        | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::WorkspaceUnregistered { .. }
+        | NodeResponse::WorktreeCreated { .. }
+        | NodeResponse::WorktreeRemoved { .. }
+        | NodeResponse::Accepted
+        | NodeResponse::ShuttingDown => false,
     }
 }
 
@@ -420,6 +495,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeClientError> {
     [
         NODE_COMPATIBILITY_METADATA_CAPABILITY,
         NODE_OPAQUE_UNIX_PATH_CAPABILITY,
+        NODE_REPOSITORY_PATH_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -757,11 +833,12 @@ pub enum NodeClientError {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        AgentProvider, ArchitectureId, GitSnapshot, GitWorktreeSnapshot, HostDescriptor,
+        AgentProvider, ArchitectureId, GitSnapshot, GitStatusEntry, GitWorktreeSnapshot,
+        HostDescriptor,
         LocalTransportKind, ManagedSessionRecord, ManagedSessionState,
-        NodeCompatibilitySupport, OpaqueHostPath, OperatingSystemId, PathEncoding,
-        PathSemantics, PathStyle, ResponseEnvelope, SessionMode, SessionRecordId,
-        WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
+        NodeCompatibilitySupport, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics,
+        PathStyle, RepositoryPath, ResponseEnvelope, SessionMode, SessionRecordId, WorkspaceEntry,
+        WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     };
 
     fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
@@ -799,6 +876,14 @@ mod tests {
 
     fn utf8_path() -> OpaqueHostPath {
         OpaqueHostPath::utf8(r"C:\repo".to_owned()).unwrap()
+    }
+
+    fn tagged_repository_path(value: &[u8]) -> RepositoryPath {
+        RepositoryPath::unix_bytes(value.to_vec()).unwrap()
+    }
+
+    fn utf8_repository_path(value: &str) -> RepositoryPath {
+        RepositoryPath::utf8(value.to_owned()).unwrap()
     }
 
     fn workspace_with_path(canonical_root: OpaqueHostPath) -> WorkspaceSnapshot {
@@ -876,6 +961,9 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_REPOSITORY_PATH_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
             ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2).unwrap(),
@@ -895,6 +983,18 @@ mod tests {
     }
 
     #[test]
+    fn repository_path_gate_requires_explicit_authenticated_selection() {
+        let (_, mut selected) = negotiated_fixture();
+        assert!(!selected_supports_repository_paths(None));
+        assert!(!selected_supports_repository_paths(Some(&selected)));
+
+        selected.capabilities.push(
+            CapabilityId::new(NODE_REPOSITORY_PATH_CAPABILITY).unwrap(),
+        );
+        assert!(selected_supports_repository_paths(Some(&selected)));
+    }
+
+    #[test]
     fn malicious_legacy_hello_with_unix_path_is_rejected_before_exposure() {
         let mut snapshot = empty_snapshot();
         snapshot.workspaces.push(workspace_with_path(unix_path()));
@@ -903,6 +1003,7 @@ mod tests {
         assert!(ensure_node_hello_path_capability(&hello, false).is_err());
         assert!(ensure_server_frame_path_capability(
             &ServerFrame::Hello(hello),
+            false,
             false,
         )
         .is_err());
@@ -927,6 +1028,7 @@ mod tests {
             &response_frame(NodeResponse::WorkspaceRegistered {
                 workspace: workspace_with_path(utf8_path()),
             }),
+            false,
             false,
         )
         .is_ok());
@@ -1012,8 +1114,8 @@ mod tests {
 
         for response in responses {
             let frame = response_frame(response);
-            assert!(ensure_server_frame_path_capability(&frame, false).is_err());
-            assert!(ensure_server_frame_path_capability(&frame, true).is_ok());
+            assert!(ensure_server_frame_path_capability(&frame, false, false).is_err());
+            assert!(ensure_server_frame_path_capability(&frame, true, false).is_ok());
         }
     }
 
@@ -1033,9 +1135,105 @@ mod tests {
                 sequence: 1,
                 event,
             });
-            assert!(ensure_server_frame_path_capability(&frame, false).is_err());
-            assert!(ensure_server_frame_path_capability(&frame, true).is_ok());
+            assert!(ensure_server_frame_path_capability(&frame, false, false).is_err());
+            assert!(ensure_server_frame_path_capability(&frame, true, false).is_ok());
         }
+    }
+
+    #[test]
+    fn inbound_guard_covers_every_tagged_repository_path_location() {
+        let inspections = [
+            WorkspaceInspection {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                entries: vec![WorkspaceEntry {
+                    relative_path: tagged_repository_path(b"src/\xff"),
+                    kind: WorkspaceEntryKind::File,
+                }],
+                tree_truncated: false,
+                git: GitSnapshot {
+                    is_repository: false,
+                    branch: None,
+                    status: Vec::new(),
+                    recent_commits: Vec::new(),
+                    worktrees: Vec::new(),
+                    truncated: false,
+                    diagnostic: None,
+                },
+            },
+            WorkspaceInspection {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                entries: Vec::new(),
+                tree_truncated: false,
+                git: GitSnapshot {
+                    is_repository: true,
+                    branch: None,
+                    status: vec![GitStatusEntry {
+                        index_status: "M".to_owned(),
+                        worktree_status: " ".to_owned(),
+                        path: tagged_repository_path(b"src/\xff"),
+                        previous_path: None,
+                    }],
+                    recent_commits: Vec::new(),
+                    worktrees: Vec::new(),
+                    truncated: false,
+                    diagnostic: None,
+                },
+            },
+            WorkspaceInspection {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                entries: Vec::new(),
+                tree_truncated: false,
+                git: GitSnapshot {
+                    is_repository: true,
+                    branch: None,
+                    status: vec![GitStatusEntry {
+                        index_status: "R".to_owned(),
+                        worktree_status: " ".to_owned(),
+                        path: utf8_repository_path("src/new.rs"),
+                        previous_path: Some(tagged_repository_path(b"src/\xff")),
+                    }],
+                    recent_commits: Vec::new(),
+                    worktrees: Vec::new(),
+                    truncated: false,
+                    diagnostic: None,
+                },
+            },
+        ];
+
+        for inspection in inspections {
+            let frame = response_frame(NodeResponse::WorkspaceInspected { inspection });
+            assert!(ensure_server_frame_path_capability(&frame, false, false).is_err());
+            assert!(ensure_server_frame_path_capability(&frame, false, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_utf8_repository_paths_remain_accepted_without_capability() {
+        let inspection = WorkspaceInspection {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            entries: vec![WorkspaceEntry {
+                relative_path: utf8_repository_path("src/lib.rs"),
+                kind: WorkspaceEntryKind::File,
+            }],
+            tree_truncated: false,
+            git: GitSnapshot {
+                is_repository: true,
+                branch: None,
+                status: vec![GitStatusEntry {
+                    index_status: "R".to_owned(),
+                    worktree_status: " ".to_owned(),
+                    path: utf8_repository_path("src/new.rs"),
+                    previous_path: Some(utf8_repository_path("src/old.rs")),
+                }],
+                recent_commits: Vec::new(),
+                worktrees: Vec::new(),
+                truncated: false,
+                diagnostic: None,
+            },
+        };
+        let frame = response_frame(NodeResponse::WorkspaceInspected { inspection });
+
+        assert!(ensure_server_frame_path_capability(&frame, false, false).is_ok());
     }
 
     #[test]

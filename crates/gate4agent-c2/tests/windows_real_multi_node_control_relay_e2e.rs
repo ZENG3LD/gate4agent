@@ -3,7 +3,7 @@
 use gate4agent_c2::protocol::{
     C2NodeEvent, C2NodeResponse, C2RelayFailureCode, NodeId, NodeRoute, NodeTransportState,
     PathStyle, C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
-    C2_OPAQUE_UNIX_PATH_CAPABILITY,
+    C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY, RepositoryPath,
 };
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
@@ -175,7 +175,7 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     let compatibility = control.hello().compatibility.as_ref()
         .expect("negotiated C2 compatibility metadata");
     assert_eq!(compatibility.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
-    assert_eq!(compatibility.capabilities.len(), 2);
+    assert_eq!(compatibility.capabilities.len(), 3);
     assert_eq!(
         compatibility.capabilities[0].as_str(),
         C2_COMPATIBILITY_METADATA_CAPABILITY,
@@ -183,6 +183,10 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     assert_eq!(
         compatibility.capabilities[1].as_str(),
         C2_OPAQUE_UNIX_PATH_CAPABILITY,
+    );
+    assert_eq!(
+        compatibility.capabilities[2].as_str(),
+        C2_REPOSITORY_PATH_CAPABILITY,
     );
     assert_eq!(compatibility.host.operating_system.as_str(), "windows");
     assert_eq!(compatibility.host.architecture.as_str(), std::env::consts::ARCH);
@@ -244,7 +248,16 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
         route_a.clone(),
         NodeRequest::InspectWorkspace { workspace_id: WorkspaceId::new("primary").unwrap() },
     ).await.unwrap();
-    assert!(matches!(inspected.response, Ok(C2NodeResponse::WorkspaceInspected { .. })));
+    let inspection = match inspected.response {
+        Ok(C2NodeResponse::WorkspaceInspected { inspection }) => inspection,
+        response => panic!("unexpected inspect response: {response:?}"),
+    };
+    let expected_repository_path = RepositoryPath::utf8("Cargo.toml".to_owned()).unwrap();
+    let relayed_repository_path = inspection.entries.iter()
+        .find(|entry| entry.relative_path == expected_repository_path)
+        .expect("real C2 relay inspection omitted Cargo.toml");
+    assert_eq!(relayed_repository_path.relative_path.as_utf8(), Some("Cargo.toml"));
+    assert_eq!(relayed_repository_path.relative_path.as_unix_bytes(), None);
 
     let added_id = WorkspaceId::new("relay-added").unwrap();
     let added = control.request(route_a.clone(), NodeRequest::RegisterWorkspace {

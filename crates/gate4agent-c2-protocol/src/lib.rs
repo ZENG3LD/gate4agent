@@ -4,6 +4,7 @@ pub use gate4agent_node_protocol::{
     ArchitectureId, CapabilityId, ClientCompatibilityOffer, HostDescriptor,
     NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+    RepositoryPath,
     ProtocolNegotiationError, ProtocolRange,
 };
 use gate4agent_node_protocol::{
@@ -24,6 +25,8 @@ pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 2;
 pub const C2_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const C2_OPAQUE_UNIX_PATH_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_OPAQUE_UNIX_PATH_CAPABILITY;
+pub const C2_REPOSITORY_PATH_CAPABILITY: &str =
+    gate4agent_node_protocol::NODE_REPOSITORY_PATH_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -1316,8 +1319,8 @@ pub struct StatusResponse {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        GitSnapshot, GitWorktreeSnapshot, NodeFailureCode, NodeSnapshot, WorkspaceInspection,
-        WorkspaceSnapshot,
+        GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, NodeFailureCode, NodeSnapshot,
+        WorkspaceEntry, WorkspaceEntryKind, WorkspaceInspection, WorkspaceSnapshot,
     };
     use gate4agent_types::{
         AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId, AgentInstanceId,
@@ -1329,6 +1332,10 @@ mod tests {
 
     fn host_path(value: impl Into<String>) -> OpaqueHostPath {
         OpaqueHostPath::utf8(value.into()).unwrap()
+    }
+
+    fn repository_path(value: impl Into<String>) -> RepositoryPath {
+        RepositoryPath::utf8(value.into()).unwrap()
     }
 
     fn fixture_session() -> SessionSnapshot {
@@ -1675,6 +1682,69 @@ mod tests {
         assert_eq!(negotiated.host.operating_system.as_str(), "darwin");
         assert_eq!(negotiated.host.architecture.as_str(), "aarch64");
         assert_eq!(negotiated.path_semantics.style, PathStyle::Posix);
+    }
+
+    #[test]
+    fn c2_workspace_inspection_preserves_legacy_utf8_repository_path_shape() {
+        let inspection = C2WorkspaceInspection {
+            workspace_id: WorkspaceId::new("repo").unwrap(),
+            entries: vec![WorkspaceEntry {
+                relative_path: repository_path(r"src\literal/main.rs"),
+                kind: WorkspaceEntryKind::File,
+            }],
+            tree_truncated: false,
+            git: C2GitSnapshot {
+                is_repository: true,
+                branch: Some("main".to_owned()),
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                worktrees: Vec::new(),
+                truncated: false,
+                diagnostic_present: false,
+            },
+        };
+
+        let json = serde_json::to_string(&inspection).unwrap();
+        assert_eq!(
+            json,
+            r#"{"workspace_id":"repo","entries":[{"relative_path":"src\\literal/main.rs","kind":"file"}],"tree_truncated":false,"git":{"is_repository":true,"branch":"main","status":[],"recent_commits":[],"worktrees":[],"truncated":false,"diagnostic_present":false}}"#,
+        );
+        assert_eq!(serde_json::from_str::<C2WorkspaceInspection>(&json).unwrap(), inspection);
+    }
+
+    #[test]
+    fn c2_workspace_inspection_roundtrips_all_tagged_repository_path_fields() {
+        let entry_path = RepositoryPath::unix_bytes(vec![b's', b'r', b'c', b'/', 0xfe]).unwrap();
+        let status_path = RepositoryPath::unix_bytes(vec![b's', b'r', b'c', b'/', 0xff]).unwrap();
+        let previous_path = RepositoryPath::unix_bytes(vec![b'o', b'l', b'd', b'/', 0xfd]).unwrap();
+        let inspection = C2WorkspaceInspection {
+            workspace_id: WorkspaceId::new("repo").unwrap(),
+            entries: vec![WorkspaceEntry {
+                relative_path: entry_path,
+                kind: WorkspaceEntryKind::File,
+            }],
+            tree_truncated: false,
+            git: C2GitSnapshot {
+                is_repository: true,
+                branch: None,
+                status: vec![GitStatusEntry {
+                    index_status: "R".to_owned(),
+                    worktree_status: " ".to_owned(),
+                    path: status_path,
+                    previous_path: Some(previous_path),
+                }],
+                recent_commits: Vec::new(),
+                worktrees: Vec::new(),
+                truncated: false,
+                diagnostic_present: false,
+            },
+        };
+
+        let json = serde_json::to_string(&inspection).unwrap();
+        assert!(json.contains(r#""relative_path":{"kind":"unix-bytes""#));
+        assert!(json.contains(r#""path":{"kind":"unix-bytes""#));
+        assert!(json.contains(r#""previous_path":{"kind":"unix-bytes""#));
+        assert_eq!(serde_json::from_str::<C2WorkspaceInspection>(&json).unwrap(), inspection);
     }
 
     #[test]

@@ -14,14 +14,14 @@ use crate::protocol::{
     GitWorktreeSnapshot, HostDescriptor, LocalTransportKind, NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
     NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath, OperatingSystemId, PathEncoding,
-    PathSemantics, PathStyle, ProtocolRange, RequestEnvelope, ResponseEnvelope, ServerChallenge,
-    ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
+    PathSemantics, PathStyle, ProtocolRange, RepositoryPath, RequestEnvelope, ResponseEnvelope,
+    ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
     ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceId, WorkspaceInspection, WorkspaceSnapshot, DEFAULT_CONTROLLER_LEASE_MS,
     MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
-    MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1,
-    NODE_STATE_SCHEMA_V2,
+    MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
+    MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
 };
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
@@ -67,7 +67,6 @@ const MANAGED_RESUME_SETTLE_TIMEOUT_MS: u64 = 30_000;
 const WORKSPACE_INSPECTION_MAX_CONCURRENCY: usize = 4;
 const WORKSPACE_TREE_MAX_DEPTH: usize = 6;
 const WORKSPACE_TREE_MAX_ENTRIES: usize = 512;
-const WORKSPACE_RELATIVE_PATH_MAX_BYTES: usize = 1_024;
 const GIT_STATUS_MAX_ENTRIES: usize = 128;
 const GIT_COMMIT_MAX_ENTRIES: usize = 12;
 const GIT_OUTPUT_MAX_BYTES: usize = 64 * 1_024;
@@ -3154,13 +3153,13 @@ impl Drop for AbortTaskOnDrop {
 fn collect_workspace_entries(root: &Path) -> (Vec<WorkspaceEntry>, bool) {
     let mut entries = Vec::new();
     let mut truncated = false;
-    walk_workspace_directory(root, "", 0, &mut entries, &mut truncated);
+    walk_workspace_directory(root, None, 0, &mut entries, &mut truncated);
     (entries, truncated)
 }
 
 fn walk_workspace_directory(
     directory: &Path,
-    relative_directory: &str,
+    relative_directory: Option<&RepositoryPath>,
     depth: usize,
     entries: &mut Vec<WorkspaceEntry>,
     truncated: &mut bool,
@@ -3179,12 +3178,7 @@ fn walk_workspace_directory(
             Err(_) => *truncated = true,
         }
     }
-    children.sort_by(|left, right| {
-        left.file_name()
-            .to_string_lossy()
-            .to_lowercase()
-            .cmp(&right.file_name().to_string_lossy().to_lowercase())
-    });
+    children.sort_by_key(|child| child.file_name());
     for child in children {
         if entries.len() >= WORKSPACE_TREE_MAX_ENTRIES {
             *truncated = true;
@@ -3200,19 +3194,26 @@ fn walk_workspace_directory(
         if file_type.is_symlink() {
             continue;
         }
-        let name = child.file_name().to_string_lossy().into_owned();
+        let name = match child.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => {
+                *truncated = true;
+                continue;
+            }
+        };
         if file_type.is_dir() && is_skipped_workspace_directory(&name) {
             continue;
         }
-        let relative_path = if relative_directory.is_empty() {
-            name
-        } else {
-            format!("{relative_directory}/{name}")
+        let relative_path = match relative_directory {
+            None => windows_repository_path(name),
+            Some(parent) => parent
+                .as_utf8()
+                .and_then(|parent| windows_repository_path(format!("{parent}/{name}"))),
         };
-        if relative_path.len() > WORKSPACE_RELATIVE_PATH_MAX_BYTES {
+        let Some(relative_path) = relative_path else {
             *truncated = true;
             continue;
-        }
+        };
         let kind = if file_type.is_dir() {
             WorkspaceEntryKind::Directory
         } else if file_type.is_file() {
@@ -3228,7 +3229,7 @@ fn walk_workspace_directory(
             if depth + 1 < WORKSPACE_TREE_MAX_DEPTH {
                 walk_workspace_directory(
                     &child.path(),
-                    &relative_path,
+                    Some(&relative_path),
                     depth + 1,
                     entries,
                     truncated,
@@ -3238,6 +3239,17 @@ fn walk_workspace_directory(
             }
         }
     }
+}
+
+fn windows_repository_path(value: String) -> Option<RepositoryPath> {
+    if value.contains('\\') {
+        return None;
+    }
+    RepositoryPath::utf8(value).ok()
+}
+
+fn windows_repository_path_from_bytes(value: &[u8]) -> Option<RepositoryPath> {
+    windows_repository_path(std::str::from_utf8(value).ok()?.to_owned())
 }
 
 fn is_skipped_workspace_directory(name: &str) -> bool {
@@ -3298,7 +3310,7 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
                 if !branch.is_empty() {
                     snapshot.branch = Some(truncate_git_field(
                         &branch,
-                        WORKSPACE_RELATIVE_PATH_MAX_BYTES,
+                        MAX_REPOSITORY_PATH_BYTES,
                         &mut snapshot.truncated,
                     ));
                 }
@@ -3326,6 +3338,8 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
         &[
             "status",
             "--porcelain=v1",
+            "-z",
+            "--renames",
             "--untracked-files=normal",
             "--",
             ".",
@@ -3392,29 +3406,65 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
 }
 
 fn parse_git_status(output: &[u8], snapshot: &mut GitSnapshot) {
-    for line in String::from_utf8_lossy(output).lines() {
-        if line.len() < 3 {
-            continue;
-        }
+    let mut remaining = output;
+    while !remaining.is_empty() {
         if snapshot.status.len() >= GIT_STATUS_MAX_ENTRIES {
             snapshot.truncated = true;
             break;
         }
-        let mut bytes = line.bytes();
-        let index_status = (bytes.next().unwrap_or(b' ') as char).to_string();
-        let worktree_status = (bytes.next().unwrap_or(b' ') as char).to_string();
-        let path = line.get(3..).unwrap_or_default();
-        let path = truncate_git_field(
-            path,
-            WORKSPACE_RELATIVE_PATH_MAX_BYTES,
-            &mut snapshot.truncated,
-        );
+        let Some(record_end) = remaining.iter().position(|byte| *byte == 0) else {
+            snapshot.truncated = true;
+            break;
+        };
+        let record = &remaining[..record_end];
+        remaining = &remaining[record_end + 1..];
+        let has_previous_path = record
+            .get(..2)
+            .is_some_and(|status| status.iter().any(|byte| matches!(*byte, b'R' | b'C')));
+        let previous_path_bytes = if has_previous_path {
+            let Some(previous_end) = remaining.iter().position(|byte| *byte == 0) else {
+                snapshot.truncated = true;
+                break;
+            };
+            let previous = &remaining[..previous_end];
+            remaining = &remaining[previous_end + 1..];
+            Some(previous)
+        } else {
+            None
+        };
+        if record.len() < 4
+            || record[2] != b' '
+            || !is_git_status_code(record[0])
+            || !is_git_status_code(record[1])
+        {
+            snapshot.truncated = true;
+            continue;
+        }
+        let Some(path) = windows_repository_path_from_bytes(&record[3..]) else {
+            snapshot.truncated = true;
+            continue;
+        };
+        let previous_path = match previous_path_bytes {
+            Some(previous) => {
+                let Some(previous) = windows_repository_path_from_bytes(previous) else {
+                    snapshot.truncated = true;
+                    continue;
+                };
+                Some(previous)
+            }
+            None => None,
+        };
         snapshot.status.push(GitStatusEntry {
-            index_status,
-            worktree_status,
+            index_status: (record[0] as char).to_string(),
+            worktree_status: (record[1] as char).to_string(),
             path,
+            previous_path,
         });
     }
+}
+
+fn is_git_status_code(byte: u8) -> bool {
+    matches!(byte, b' ' | b'M' | b'T' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?' | b'!')
 }
 
 fn parse_git_commits(output: &[u8], snapshot: &mut GitSnapshot) {
@@ -3776,13 +3826,13 @@ fn validate_git_revision(field: &str, revision: Option<&str>) -> Result<(), Node
         return Ok(());
     };
     if revision.is_empty()
-        || revision.len() > WORKSPACE_RELATIVE_PATH_MAX_BYTES
+        || revision.len() > MAX_REPOSITORY_PATH_BYTES
         || revision.chars().any(char::is_control)
     {
         return Err(failure(
             NodeFailureCode::InvalidRequest,
             &format!(
-                "{field} must contain 1..={WORKSPACE_RELATIVE_PATH_MAX_BYTES} bytes and no control characters",
+                "{field} must contain 1..={MAX_REPOSITORY_PATH_BYTES} bytes and no control characters",
             ),
         ));
     }
@@ -4925,15 +4975,18 @@ mod tests {
         let (entries, truncated) = collect_workspace_entries(&root);
         assert!(!truncated);
         assert!(entries.iter().any(|entry| {
-            entry.relative_path == "src" && entry.kind == WorkspaceEntryKind::Directory
+            entry.relative_path.as_utf8() == Some("src")
+                && entry.kind == WorkspaceEntryKind::Directory
         }));
         assert!(entries.iter().any(|entry| {
-            entry.relative_path == "src/lib.rs" && entry.kind == WorkspaceEntryKind::File
+            entry.relative_path.as_utf8() == Some("src/lib.rs")
+                && entry.kind == WorkspaceEntryKind::File
         }));
         assert!(entries.iter().all(|entry| {
-            !entry.relative_path.starts_with(".git")
-                && !entry.relative_path.starts_with("target")
-                && !entry.relative_path.starts_with("node_modules")
+            let path = entry.relative_path.as_utf8().unwrap();
+            !path.starts_with(".git")
+                && !path.starts_with("target")
+                && !path.starts_with("node_modules")
         }));
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -4941,19 +4994,12 @@ mod tests {
 
     #[test]
     fn git_parsers_cap_status_and_commit_results() {
-        let status_output = (0..=GIT_STATUS_MAX_ENTRIES)
-            .map(|index| format!(" M src/file-{index}.rs\n"))
-            .collect::<String>();
-        let mut snapshot = GitSnapshot {
-            is_repository: true,
-            branch: Some("main".to_owned()),
-            status: Vec::new(),
-            recent_commits: Vec::new(),
-            worktrees: Vec::new(),
-            truncated: false,
-            diagnostic: None,
-        };
-        parse_git_status(status_output.as_bytes(), &mut snapshot);
+        let mut status_output = Vec::new();
+        for index in 0..=GIT_STATUS_MAX_ENTRIES {
+            status_output.extend_from_slice(format!(" M src/file-{index}.rs\0").as_bytes());
+        }
+        let mut snapshot = git_snapshot_for_parser();
+        parse_git_status(&status_output, &mut snapshot);
         assert_eq!(snapshot.status.len(), GIT_STATUS_MAX_ENTRIES);
         assert!(snapshot.truncated);
         assert_eq!(snapshot.status[0].index_status, " ");
@@ -4966,6 +5012,103 @@ mod tests {
         parse_git_commits(commit_output.as_bytes(), &mut snapshot);
         assert_eq!(snapshot.recent_commits.len(), GIT_COMMIT_MAX_ENTRIES);
         assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn porcelain_v1_z_parser_preserves_current_then_previous_rename_and_copy_order() {
+        let mut snapshot = git_snapshot_for_parser();
+        parse_git_status(
+            b"R  src/current name.rs\0src/previous name.rs\0 C src/copy.rs\0src/original.rs\0?? src/line\nname.rs\0",
+            &mut snapshot,
+        );
+
+        assert!(!snapshot.truncated);
+        assert_eq!(snapshot.status.len(), 3);
+        assert_eq!(snapshot.status[0].index_status, "R");
+        assert_eq!(snapshot.status[0].worktree_status, " ");
+        assert_eq!(snapshot.status[0].path.as_utf8(), Some("src/current name.rs"));
+        assert_eq!(
+            snapshot.status[0]
+                .previous_path
+                .as_ref()
+                .and_then(RepositoryPath::as_utf8),
+            Some("src/previous name.rs"),
+        );
+        assert_eq!(snapshot.status[1].index_status, " ");
+        assert_eq!(snapshot.status[1].worktree_status, "C");
+        assert_eq!(snapshot.status[1].path.as_utf8(), Some("src/copy.rs"));
+        assert_eq!(
+            snapshot.status[1]
+                .previous_path
+                .as_ref()
+                .and_then(RepositoryPath::as_utf8),
+            Some("src/original.rs"),
+        );
+        assert_eq!(snapshot.status[2].path.as_utf8(), Some("src/line\nname.rs"));
+        assert!(snapshot.status[2].previous_path.is_none());
+    }
+
+    #[test]
+    fn porcelain_v1_z_parser_never_invents_invalid_or_incomplete_path_identity() {
+        let mut snapshot = git_snapshot_for_parser();
+        parse_git_status(
+            b"?? valid.rs\0?? invalid-\xff.rs\0?? invalid\\windows.rs\0R  current.rs\0",
+            &mut snapshot,
+        );
+
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.status.len(), 1);
+        assert_eq!(snapshot.status[0].path.as_utf8(), Some("valid.rs"));
+        assert!(snapshot.status[0].previous_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn real_git_inspection_end_to_end_preserves_rename_path_identity() {
+        let root = temporary_workspace_root("git-status-rename-e2e");
+        std::fs::create_dir_all(&root).unwrap();
+        run_git_fixture(&root, &["init", "--quiet"]).await;
+        std::fs::write(root.join("previous name.rs"), b"fn original() {}\n").unwrap();
+        run_git_fixture(&root, &["add", "--", "previous name.rs"]).await;
+        run_git_fixture(
+            &root,
+            &[
+                "-c",
+                "user.name=Gate4Agent Fixture",
+                "-c",
+                "user.email=fixture@gate4agent.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        )
+        .await;
+        std::fs::rename(
+            root.join("previous name.rs"),
+            root.join("current name.rs"),
+        )
+        .unwrap();
+        run_git_fixture(&root, &["add", "-A", "--", "."]).await;
+
+        let snapshot = inspect_git_workspace(root.to_str().unwrap()).await;
+
+        assert!(snapshot.is_repository, "{:?}", snapshot.diagnostic);
+        let rename = snapshot
+            .status
+            .iter()
+            .find(|entry| entry.index_status == "R")
+            .expect("real git inspection did not report the staged rename");
+        assert_eq!(rename.path.as_utf8(), Some("current name.rs"));
+        assert_eq!(
+            rename
+                .previous_path
+                .as_ref()
+                .and_then(RepositoryPath::as_utf8),
+            Some("previous name.rs"),
+        );
+        assert!(!snapshot.truncated, "{:?}", snapshot.diagnostic);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -5000,7 +5143,7 @@ mod tests {
         };
         assert_eq!(inspection.workspace_id, workspace_id);
         assert!(inspection.entries.iter().any(|entry| {
-            entry.relative_path == "src/main.rs"
+            entry.relative_path.as_utf8() == Some("src/main.rs")
         }));
 
         let unknown = process_request_inner(
@@ -5026,5 +5169,30 @@ mod tests {
             "gate4agent-node-{label}-{}-{unique}",
             std::process::id(),
         ))
+    }
+
+    fn git_snapshot_for_parser() -> GitSnapshot {
+        GitSnapshot {
+            is_repository: true,
+            branch: Some("main".to_owned()),
+            status: Vec::new(),
+            recent_commits: Vec::new(),
+            worktrees: Vec::new(),
+            truncated: false,
+            diagnostic: None,
+        }
+    }
+
+    async fn run_git_fixture(root: &Path, arguments: &[&str]) {
+        let output = run_git_bounded(root.to_str().unwrap(), arguments, GIT_OUTPUT_MAX_BYTES)
+            .await
+            .unwrap();
+        assert!(
+            output.success && !output.timed_out,
+            "git {:?} failed (timed_out={}): {}",
+            arguments,
+            output.timed_out,
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

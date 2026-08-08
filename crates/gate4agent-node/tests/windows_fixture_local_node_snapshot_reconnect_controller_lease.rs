@@ -1477,6 +1477,109 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_fixture_named_pipe_inspection_preserves_git_rename_path_identity() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_root = std::env::temp_dir().join(format!(
+        "gate4agent-node-worktree-e2e-status-{}-{unique}",
+        std::process::id(),
+    ));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let _cleanup = RemoveTestDirectoryOnDrop(test_root.clone());
+    let repository = test_root.join("repository");
+    let init = Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repository)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr),
+    );
+    std::fs::write(repository.join("previous name.rs"), b"fn original() {}\n").unwrap();
+    assert_git_success(&repository, &["add", "--", "previous name.rs"]);
+    assert_git_success(
+        &repository,
+        &[
+            "-c",
+            "user.name=Gate4Agent Fixture",
+            "-c",
+            "user.email=fixture@gate4agent.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=NUL",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    );
+    assert_git_success(&repository, &["config", "status.renames", "false"]);
+    std::fs::rename(
+        repository.join("previous name.rs"),
+        repository.join("current name.rs"),
+    )
+    .unwrap();
+    assert_git_success(&repository, &["add", "-A", "--", "."]);
+
+    let endpoint = endpoint();
+    let token = "fixture-git-status-rename-token";
+    let server = NodeServer::new_fixture(git_workspace_server_config(
+        &endpoint,
+        token,
+        &repository,
+    ))
+    .unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_task = tokio::spawn(server.run());
+    let mut observer = NamedPipeNodeClient::connect(
+        &endpoint,
+        &expected_node_id(),
+        ClientRole::Observer,
+        token,
+    )
+    .await
+    .unwrap();
+
+    let NodeResponse::WorkspaceInspected { inspection } = observer
+        .request(NodeRequest::InspectWorkspace {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("named-pipe workspace inspection returned another response");
+    };
+    let rename = inspection
+        .git
+        .status
+        .iter()
+        .find(|entry| entry.index_status == "R")
+        .expect("named-pipe workspace inspection did not return a rename");
+    assert_eq!(rename.path.as_utf8(), Some("current name.rs"));
+    assert_eq!(
+        rename
+            .previous_path
+            .as_ref()
+            .and_then(gate4agent_node::protocol::RepositoryPath::as_utf8),
+        Some("previous name.rs"),
+    );
+    assert!(!inspection.git.truncated, "{:?}", inspection.git.diagnostic);
+
+    drop(observer);
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("git status node did not shut down")
+        .expect("git status node task panicked")
+        .expect("git status node failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn windows_fixture_promptless_resume_advances_generation_through_node() {
     let endpoint = endpoint();
     let token = "fixture-promptless-resume-token";

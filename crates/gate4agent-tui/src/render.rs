@@ -5,7 +5,8 @@ use uzor_tui::{
 use gate4agent_node_protocol::{GitSnapshot, WorkspaceEntryKind, WorkspaceInspection};
 
 use crate::app::{
-    host_path_display, managed_state_label, AddSpaceField, AgentRowKey, App, ConnectionState, ControlSection,
+    host_path_display, managed_state_label, repository_path_display,
+    repository_path_file_name_display, AddSpaceField, AgentRowKey, App, ConnectionState, ControlSection,
     CreateWorktreeField, DragState, Focus, GridAxisKind, GridPaneLayout, GridPreset, HitRegion,
     HitTarget, LayoutRects, MenuPlacement, NodeView, PtyColorMode, RosterMode, SessionView,
     SidebarMode, SidebarPresentation, SurfaceMode, WorkspaceView,
@@ -518,17 +519,8 @@ fn render_workspace_files(
         let y = list.y + visible as u16;
         let selected = visible_index == app.files_cursor;
         let background = if selected { theme.active } else { theme.panel };
-        let depth = entry
-            .relative_path
-            .bytes()
-            .filter(|byte| matches!(byte, b'/' | b'\\'))
-            .count()
-            .min(4);
-        let name = entry
-            .relative_path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(entry.relative_path.as_str());
+        let depth = entry.relative_path.depth().min(4);
+        let name = repository_path_file_name_display(&entry.relative_path);
         let dirty = workspace_entry_dirty(&entry.relative_path, entry.kind, &inspection.git);
         let dirty_color = dirty.map(|severe| if severe { theme.red } else { theme.yellow });
         let (marker, color) = match entry.kind {
@@ -546,7 +538,7 @@ fn render_workspace_files(
         Paragraph::new(Text::from_lines(vec![Line::from_spans(vec![
             Span::styled(prefix, Style::default().fg(color)),
             Span::styled(
-                truncate_cells(name, name_width),
+                truncate_cells(&name, name_width),
                 Style::default().fg(dirty_color.unwrap_or(theme.text)),
             ),
         ])]))
@@ -653,9 +645,19 @@ fn render_git_snapshot(
             let detail_index = index - git.worktrees.len();
             let line = if let Some(entry) = git.status.get(detail_index).filter(|_| !git.status.is_empty()) {
                 let code = format!("{}{}", entry.index_status, entry.worktree_status);
+                let current_path = repository_path_display(&entry.path);
+                let path = entry.previous_path.as_ref().map_or(current_path.clone(), |previous| {
+                    format!("{} -> {current_path}", repository_path_display(previous))
+                });
                 Line::from_spans(vec![
                     Span::styled(format!(" {code} "), Style::default().fg(theme.yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(truncate_cells(&entry.path, area.width.saturating_sub(4) as usize), Style::default().fg(theme.text)),
+                    Span::styled(
+                        truncate_cells(
+                            &path,
+                            area.width.saturating_sub(4) as usize,
+                        ),
+                        Style::default().fg(theme.text),
+                    ),
                 ])
             } else if let Some(commit) = git.recent_commits.get(detail_index) {
                 Line::from_spans(vec![
@@ -1561,7 +1563,7 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
                     indices
                         .iter()
                         .filter_map(|index| inspection.entries.get(*index))
-                        .map(|entry| cell_width(&entry.relative_path) + 8)
+                        .map(|entry| cell_width(&repository_path_display(&entry.relative_path)) + 8)
                         .max()
                         .unwrap_or(24)
                 })
@@ -1577,7 +1579,18 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
                 (
                     git.status
                         .iter()
-                        .map(|entry| cell_width(&entry.path) + 5)
+                        .map(|entry| {
+                            let current = repository_path_display(&entry.path);
+                            let path_width = entry.previous_path.as_ref().map_or_else(
+                                || cell_width(&current),
+                                |previous| {
+                                    cell_width(&repository_path_display(previous))
+                                        + cell_width(" -> ")
+                                        + cell_width(&current)
+                                },
+                            );
+                            path_width + 5
+                        })
                         .max()
                         .unwrap_or(24),
                     git.status.len().saturating_add(2),
@@ -1899,21 +1912,19 @@ fn fill_rect(area: Rect, background: Color, buf: &mut TerminalBuffer) {
 }
 
 fn workspace_entry_dirty(
-    relative_path: &str,
+    relative_path: &gate4agent_node_protocol::RepositoryPath,
     kind: WorkspaceEntryKind,
     git: &GitSnapshot,
 ) -> Option<bool> {
-    let path = relative_path.replace('\\', "/");
-    let directory_prefix = format!("{path}/");
     git.status
         .iter()
         .filter(|entry| {
-            let changed_path = entry.path.replace('\\', "/");
             match kind {
                 WorkspaceEntryKind::Directory => {
-                    changed_path == path || changed_path.starts_with(&directory_prefix)
+                    entry.path == *relative_path
+                        || entry.path.is_descendant_of(relative_path)
                 }
-                WorkspaceEntryKind::File => changed_path == path,
+                WorkspaceEntryKind::File => entry.path == *relative_path,
             }
         })
         .map(|entry| {
@@ -2067,6 +2078,10 @@ mod tests {
         gate4agent_node_protocol::OpaqueHostPath::utf8(value.into()).unwrap()
     }
 
+    fn repository_path(value: impl Into<String>) -> gate4agent_node_protocol::RepositoryPath {
+        gate4agent_node_protocol::RepositoryPath::utf8(value.into()).unwrap()
+    }
+
     fn fixture(mode: PtyColorMode) -> App {
         let address = SessionAddress {
             node_id: "node-a".to_owned(),
@@ -2116,11 +2131,11 @@ mod tests {
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             entries: vec![
                 WorkspaceEntry {
-                    relative_path: "src".to_owned(),
+                    relative_path: repository_path("src"),
                     kind: WorkspaceEntryKind::Directory,
                 },
                 WorkspaceEntry {
-                    relative_path: "src/main.rs".to_owned(),
+                    relative_path: repository_path("src/main.rs"),
                     kind: WorkspaceEntryKind::File,
                 },
             ],
@@ -2131,7 +2146,8 @@ mod tests {
                 status: vec![GitStatusEntry {
                     index_status: " ".to_owned(),
                     worktree_status: "M".to_owned(),
-                    path: "src/main.rs".to_owned(),
+                    path: repository_path("src/main.rs"),
+                    previous_path: None,
                 }],
                 recent_commits: vec![GitCommitSummary {
                     id: "abcdef0".to_owned(),
@@ -2459,7 +2475,7 @@ mod tests {
         app.collapsed_directories.insert((
             "node-a".to_owned(),
             "workspace-a".to_owned(),
-            "src".to_owned(),
+            repository_path("src"),
         ));
         let mut collapsed = TerminalBuffer::new(100, 24);
         let collapsed_layout = render(&app, &mut collapsed);
@@ -2473,6 +2489,62 @@ mod tests {
             .find(|hit| hit.target == HitTarget::SidebarItem(0))
             .expect("collapsed directory row");
         assert_eq!(collapsed.get(directory_hit.rect.x + 1, directory_hit.rect.y).symbol, ">");
+    }
+
+    #[test]
+    fn dirty_matching_uses_physical_bytes_and_preserves_backslashes() {
+        let mut git = inspection().git;
+        git.status[0].path = repository_path(r"src\main.rs");
+        assert_eq!(
+            workspace_entry_dirty(
+                &repository_path("src/main.rs"),
+                WorkspaceEntryKind::File,
+                &git,
+            ),
+            None,
+        );
+
+        git.status[0].path = gate4agent_node_protocol::RepositoryPath::unix_bytes(
+            b"src/main.rs".to_vec(),
+        ).unwrap();
+        assert_eq!(
+            workspace_entry_dirty(
+                &repository_path("src/main.rs"),
+                WorkspaceEntryKind::File,
+                &git,
+            ),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn git_rename_row_renders_sanitized_previous_and_current_repository_paths() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let mut snapshot = inspection();
+        snapshot.git.status[0].index_status = "R".to_owned();
+        snapshot.git.status[0].previous_path = Some(repository_path("old/\n.rs"));
+        snapshot.git.status[0].path = repository_path("new/\u{1b}.rs");
+        app.apply_workspace_inspection("node-a".to_owned(), snapshot);
+        app.sidebar_mode = SidebarMode::Git;
+        let mut buf = TerminalBuffer::new(80, 4);
+        let mut layout = LayoutRects::default();
+        let inspection = app.selected_workspace_inspection().unwrap();
+
+        render_git_snapshot(
+            &app,
+            inspection,
+            Rect::new(0, 0, 80, 4),
+            &mut buf,
+            &mut layout,
+            Theme::for_mode(app.color_mode),
+        );
+        let hit = layout.hits.iter()
+            .find(|hit| hit.target == HitTarget::SidebarItem(0))
+            .expect("git rename row");
+        let row = (hit.rect.x..hit.rect.right())
+            .map(|x| buf.get(x, hit.rect.y).symbol.as_str())
+            .collect::<String>();
+        assert!(row.contains(r"old/\n.rs -> new/\u{1b}.rs"), "{row:?}");
     }
 
     #[test]

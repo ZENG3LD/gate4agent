@@ -1,27 +1,32 @@
 use gate4agent_node_protocol::{
-    encode_node_compatibility_auth_binding, production_node_client_compatibility_offer,
+    production_node_client_compatibility_offer,
     read_json_frame_limited_body_timeout, validate_provider_contract_manifest,
     write_json_frame_limited, CapabilityId,
     ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
     FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure, NodeHello,
-    NodeId, NodeIncarnationId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope,
+    NodeId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope,
     ServerChallenge, ServerFrame,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
-    NODE_AUTH_NONCE_BYTES, NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
+    NODE_AUTH_NONCE_BYTES,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
-use crate::{connect_local_stream, LocalClientStream};
+use crate::{
+    connect_local_stream, negotiated_auth_proof, proofs_match, random_nonce, AuthDirection,
+    LocalClientStream,
+};
 #[cfg(test)]
 use gate4agent_node_protocol::{
-    ProtocolRange, StateSchemaSupport, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
+    NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
 };
+#[cfg(test)]
+use crate::auth_proof;
 use std::collections::VecDeque;
-use std::ffi::c_void;
 use std::io;
-use std::ptr;
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 #[cfg(feature = "fixture")]
@@ -31,7 +36,7 @@ use tokio::time::timeout;
 const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 
-pub struct NamedPipeNodeClient {
+pub struct LocalNodeClient {
     pipe: LocalClientStream,
     hello: NodeHello,
     opaque_unix_paths_enabled: bool,
@@ -41,9 +46,9 @@ pub struct NamedPipeNodeClient {
     pending_events: VecDeque<NodeEventEnvelope>,
 }
 
-impl NamedPipeNodeClient {
+impl LocalNodeClient {
     pub async fn connect(
-        endpoint: &str,
+        endpoint: impl AsRef<Path>,
         expected_node_id: &NodeId,
         role: ClientRole,
         access_token: &str,
@@ -348,6 +353,7 @@ fn ensure_server_frame_path_capability(
 fn ensure_opaque_unix_path_capability(
     contains_opaque_unix_path: bool,
     opaque_unix_paths_enabled: bool,
+
 ) -> Result<(), NodeClientError> {
     if contains_opaque_unix_path && !opaque_unix_paths_enabled {
         return Err(NodeClientError::Protocol(
@@ -674,250 +680,9 @@ fn validate_selected_compatibility(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-pub enum AuthDirection {
-    Server,
-    Client,
-}
-
-pub fn random_nonce() -> Result<[u8; NODE_AUTH_NONCE_BYTES], String> {
-    let mut nonce = [0; NODE_AUTH_NONCE_BYTES];
-    fill_random(&mut nonce)?;
-    Ok(nonce)
-}
-
-pub fn random_incarnation_id() -> Result<NodeIncarnationId, String> {
-    let mut bytes = [0; NODE_INCARNATION_ID_BYTES];
-    fill_random(&mut bytes)?;
-    Ok(NodeIncarnationId::from_bytes(bytes))
-}
-
-fn fill_random(bytes: &mut [u8]) -> Result<(), String> {
-    let status = unsafe {
-        BCryptGenRandom(
-            ptr::null_mut(),
-            bytes.as_mut_ptr(),
-            bytes.len() as u32,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    cng_status("BCryptGenRandom", status)?;
-    Ok(())
-}
-
-pub fn auth_proof(
-    access_token: &[u8],
-    direction: AuthDirection,
-    role: ClientRole,
-    client_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
-    server_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
-) -> Result<[u8; NODE_AUTH_PROOF_BYTES], String> {
-    let mut message = Vec::with_capacity(32 + (NODE_AUTH_NONCE_BYTES * 2));
-    message.extend_from_slice(b"gate4agent-node-auth-v3\0");
-    message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
-    message.push(match direction {
-        AuthDirection::Server => 1,
-        AuthDirection::Client => 2,
-    });
-    message.push(match role {
-        ClientRole::Operator => 1,
-        ClientRole::Observer => 2,
-    });
-    message.extend_from_slice(client_nonce);
-    message.extend_from_slice(server_nonce);
-    local_hmac_sha256(access_token, &message)
-}
-
-pub fn negotiated_auth_proof(
-    access_token: &[u8],
-    direction: AuthDirection,
-    role: ClientRole,
-    client_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
-    server_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
-    offer: &ClientCompatibilityOffer,
-    selected: &NegotiatedNodeCompatibility,
-) -> Result<[u8; NODE_AUTH_PROOF_BYTES], String> {
-    let binding = encode_node_compatibility_auth_binding(offer, selected)
-        .map_err(|error| error.to_string())?;
-    let binding_length = u32::try_from(binding.len())
-        .map_err(|_| "node compatibility authentication binding is too large".to_owned())?;
-    let mut message = Vec::with_capacity(48 + (NODE_AUTH_NONCE_BYTES * 2) + binding.len());
-    message.extend_from_slice(b"gate4agent-node-auth-negotiated-v1\0");
-    message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
-    message.push(match direction {
-        AuthDirection::Server => 1,
-        AuthDirection::Client => 2,
-    });
-    message.push(match role {
-        ClientRole::Operator => 1,
-        ClientRole::Observer => 2,
-    });
-    message.extend_from_slice(client_nonce);
-    message.extend_from_slice(server_nonce);
-    message.extend_from_slice(&binding_length.to_le_bytes());
-    message.extend_from_slice(&binding);
-    local_hmac_sha256(access_token, &message)
-}
-
-pub fn local_hmac_sha256(
-    secret: &[u8],
-    message: &[u8],
-) -> Result<[u8; NODE_AUTH_PROOF_BYTES], String> {
-    let mut algorithm = ptr::null_mut();
-    cng_status(
-        "BCryptOpenAlgorithmProvider",
-        unsafe {
-            BCryptOpenAlgorithmProvider(
-                &mut algorithm,
-                BCRYPT_SHA256_ALGORITHM.as_ptr(),
-                ptr::null(),
-                BCRYPT_ALG_HANDLE_HMAC_FLAG,
-            )
-        },
-    )?;
-    let algorithm = AlgorithmHandle(algorithm);
-
-    let mut object_length = 0_u32;
-    let mut copied = 0_u32;
-    cng_status(
-        "BCryptGetProperty(ObjectLength)",
-        unsafe {
-            BCryptGetProperty(
-                algorithm.0,
-                BCRYPT_OBJECT_LENGTH.as_ptr(),
-                (&mut object_length as *mut u32).cast::<u8>(),
-                std::mem::size_of::<u32>() as u32,
-                &mut copied,
-                0,
-            )
-        },
-    )?;
-    if copied != std::mem::size_of::<u32>() as u32 || object_length == 0 {
-        return Err("BCryptGetProperty(ObjectLength) returned an invalid length".to_owned());
-    }
-    let mut object = vec![0_u8; object_length as usize];
-    let mut hash = ptr::null_mut();
-    cng_status(
-        "BCryptCreateHash",
-        unsafe {
-            BCryptCreateHash(
-                algorithm.0,
-                &mut hash,
-                object.as_mut_ptr(),
-                object.len() as u32,
-                secret.as_ptr().cast_mut(),
-                secret.len() as u32,
-                0,
-            )
-        },
-    )?;
-    let hash = HashHandle(hash);
-    cng_status(
-        "BCryptHashData",
-        unsafe {
-            BCryptHashData(
-                hash.0,
-                message.as_ptr().cast_mut(),
-                message.len() as u32,
-                0,
-            )
-        },
-    )?;
-    let mut proof = [0_u8; NODE_AUTH_PROOF_BYTES];
-    cng_status(
-        "BCryptFinishHash",
-        unsafe { BCryptFinishHash(hash.0, proof.as_mut_ptr(), proof.len() as u32, 0) },
-    )?;
-    Ok(proof)
-}
-
-pub fn proofs_match(
-    actual: &[u8; NODE_AUTH_PROOF_BYTES],
-    expected: &[u8; NODE_AUTH_PROOF_BYTES],
-) -> bool {
-    actual
-        .iter()
-        .zip(expected.iter())
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
-        == 0
-}
-
-fn cng_status(operation: &str, status: i32) -> Result<(), String> {
-    if status >= 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "{operation} failed with NTSTATUS 0x{:08x}",
-            status as u32,
-        ))
-    }
-}
-
-struct AlgorithmHandle(*mut c_void);
-
-impl Drop for AlgorithmHandle {
-    fn drop(&mut self) {
-        unsafe {
-            BCryptCloseAlgorithmProvider(self.0, 0);
-        }
-    }
-}
-
-struct HashHandle(*mut c_void);
-
-impl Drop for HashHandle {
-    fn drop(&mut self) {
-        unsafe {
-            BCryptDestroyHash(self.0);
-        }
-    }
-}
-
-const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
-const BCRYPT_ALG_HANDLE_HMAC_FLAG: u32 = 0x0000_0008;
-const BCRYPT_SHA256_ALGORITHM: [u16; 7] = [83, 72, 65, 50, 53, 54, 0];
-const BCRYPT_OBJECT_LENGTH: [u16; 13] = [79, 98, 106, 101, 99, 116, 76, 101, 110, 103, 116, 104, 0];
-
-#[link(name = "bcrypt")]
-extern "system" {
-    fn BCryptGenRandom(
-        algorithm: *mut c_void,
-        buffer: *mut u8,
-        buffer_length: u32,
-        flags: u32,
-    ) -> i32;
-    fn BCryptOpenAlgorithmProvider(
-        algorithm: *mut *mut c_void,
-        algorithm_id: *const u16,
-        implementation: *const u16,
-        flags: u32,
-    ) -> i32;
-    fn BCryptCloseAlgorithmProvider(algorithm: *mut c_void, flags: u32) -> i32;
-    fn BCryptGetProperty(
-        object: *mut c_void,
-        property: *const u16,
-        output: *mut u8,
-        output_length: u32,
-        result_length: *mut u32,
-        flags: u32,
-    ) -> i32;
-    fn BCryptCreateHash(
-        algorithm: *mut c_void,
-        hash: *mut *mut c_void,
-        hash_object: *mut u8,
-        hash_object_length: u32,
-        secret: *mut u8,
-        secret_length: u32,
-        flags: u32,
-    ) -> i32;
-    fn BCryptHashData(hash: *mut c_void, input: *mut u8, input_length: u32, flags: u32) -> i32;
-    fn BCryptFinishHash(hash: *mut c_void, output: *mut u8, output_length: u32, flags: u32) -> i32;
-    fn BCryptDestroyHash(hash: *mut c_void) -> i32;
-}
-
 #[derive(Debug, Error)]
 pub enum NodeClientError {
-    #[error("named pipe I/O failed: {0}")]
+    #[error("local IPC I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
@@ -1607,128 +1372,4 @@ mod tests {
         assert!(ensure_server_frame_path_capability(&frame, false, false).is_ok());
     }
 
-    #[test]
-    fn windows_cng_hmac_sha256_matches_the_standard_vector() {
-        let actual = local_hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog").unwrap();
-        let expected = [
-            0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24,
-            0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f, 0xb1, 0x43,
-            0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x17, 0x59,
-            0x97, 0x47, 0x9d, 0xbc, 0x2d, 0x1a, 0x3c, 0xd8,
-        ];
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn mutual_auth_proofs_are_direction_and_role_bound() {
-        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
-        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
-        let server = auth_proof(
-            b"local-secret",
-            AuthDirection::Server,
-            ClientRole::Operator,
-            &client_nonce,
-            &server_nonce,
-        )
-        .unwrap();
-        let client = auth_proof(
-            b"local-secret",
-            AuthDirection::Client,
-            ClientRole::Operator,
-            &client_nonce,
-            &server_nonce,
-        )
-        .unwrap();
-        let observer = auth_proof(
-            b"local-secret",
-            AuthDirection::Server,
-            ClientRole::Observer,
-            &client_nonce,
-            &server_nonce,
-        )
-        .unwrap();
-        assert!(!proofs_match(&server, &client));
-        assert!(!proofs_match(&server, &observer));
-        assert!(proofs_match(&server, &server));
-    }
-
-    #[test]
-    fn legacy_v3_auth_proof_remains_byte_exact() {
-        let proof = auth_proof(
-            b"local-secret",
-            AuthDirection::Server,
-            ClientRole::Operator,
-            &[3; NODE_AUTH_NONCE_BYTES],
-            &[7; NODE_AUTH_NONCE_BYTES],
-        )
-        .unwrap();
-        assert_eq!(
-            proof,
-            [
-                3, 223, 60, 233, 83, 165, 237, 88, 37, 4, 161, 140, 80, 94, 154, 41,
-                127, 184, 168, 120, 191, 162, 156, 3, 208, 139, 243, 60, 48, 21, 233, 64,
-            ],
-        );
-    }
-
-    #[test]
-    fn negotiated_auth_proof_is_exact_and_rejects_offer_or_selection_tampering() {
-        let (offer, selected) = negotiated_fixture();
-        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
-        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
-        let proof = negotiated_auth_proof(
-            b"local-secret",
-            AuthDirection::Server,
-            ClientRole::Operator,
-            &client_nonce,
-            &server_nonce,
-            &offer,
-            &selected,
-        )
-        .unwrap();
-        assert_eq!(
-            proof,
-            [
-                193, 68, 218, 167, 15, 163, 252, 198, 158, 232, 189, 176, 101, 170, 37,
-                34, 175, 88, 202, 213, 175, 46, 15, 204, 51, 179, 165, 120, 82, 40, 19,
-                53,
-            ],
-        );
-
-        let mut tampered_offer = offer.clone();
-        tampered_offer.capabilities.clear();
-        let offer_proof = negotiated_auth_proof(
-            b"local-secret",
-            AuthDirection::Server,
-            ClientRole::Operator,
-            &client_nonce,
-            &server_nonce,
-            &tampered_offer,
-            &selected,
-        )
-        .unwrap();
-        assert!(!proofs_match(&proof, &offer_proof));
-
-        let mut tampered_selection = selected.clone();
-        tampered_selection.state_schema_version = None;
-        let selection_proof = negotiated_auth_proof(
-            b"local-secret",
-            AuthDirection::Server,
-            ClientRole::Operator,
-            &client_nonce,
-            &server_nonce,
-            &offer,
-            &tampered_selection,
-        )
-        .unwrap();
-        assert!(!proofs_match(&proof, &selection_proof));
-    }
-
-    #[test]
-    fn windows_cng_generates_a_bounded_incarnation_id() {
-        let incarnation_id = random_incarnation_id().unwrap();
-        let encoded = incarnation_id.to_string();
-        assert_eq!(encoded.len(), NODE_INCARNATION_ID_BYTES * 2);
-        assert_eq!(encoded.parse::<NodeIncarnationId>().unwrap(), incarnation_id);
-    }
 }

@@ -3116,7 +3116,7 @@ async fn accept_connections_inner(
     shared: Arc<NodeShared>,
     connections: &mut JoinSet<Result<(), NodeServerError>>,
 ) -> Result<(), NodeServerError> {
-    let mut listener = OwnerOnlyLocalListener::bind(endpoint)?;
+    let mut listener = OwnerOnlyLocalListener::bind(endpoint).await?;
     loop {
         while connections.try_join_next().is_some() {}
         if shared.shutdown.load(Ordering::Acquire) {

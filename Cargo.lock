@@ -483,6 +483,8 @@ name = "gate4agent-node-wire"
 version = "0.2.37"
 dependencies = [
  "gate4agent-node-protocol",
+ "libc",
+ "ring",
  "thiserror 2.0.18",
  "tokio",
  "windows-sys 0.61.2",

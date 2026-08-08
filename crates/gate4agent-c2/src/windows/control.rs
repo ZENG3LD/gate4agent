@@ -45,7 +45,7 @@ pub(super) async fn run(
     hub: OperatorHub,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let mut listener = OwnerOnlyLocalListener::bind(&endpoint)?;
+    let mut listener = OwnerOnlyLocalListener::bind(&endpoint).await?;
     let preauth = Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS));
     let authenticated = Arc::new(Semaphore::new(1));
     let next_connection_id = Arc::new(AtomicU64::new(1));

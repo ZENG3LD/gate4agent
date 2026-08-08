@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::Duration;
 use tokio::net::windows::named_pipe::{
@@ -28,15 +29,15 @@ pub type LocalServerStream = NamedPipeServer;
 pub type LocalClientStream = NamedPipeClient;
 
 pub struct OwnerOnlyLocalListener {
-    endpoint: String,
+    endpoint: PathBuf,
     pending: Option<LocalServerStream>,
     first_instance: bool,
 }
 
 impl OwnerOnlyLocalListener {
-    pub fn bind(endpoint: &str) -> io::Result<Self> {
+    pub async fn bind(endpoint: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self {
-            endpoint: endpoint.to_owned(),
+            endpoint: endpoint.as_ref().to_owned(),
             pending: None,
             first_instance: true,
         })
@@ -190,9 +191,10 @@ impl CurrentUserPipeSecurity {
 
 /// Creates a local named-pipe server restricted to the current primary-token user and LocalSystem.
 fn create_current_user_pipe_server(
-    endpoint: &str,
+    endpoint: impl AsRef<Path>,
     first_instance: bool,
 ) -> io::Result<NamedPipeServer> {
+    let endpoint = endpoint.as_ref();
     let security = CurrentUserPipeSecurity::new()?;
     let mut attributes = security.attributes();
     let mut options = ServerOptions::new();
@@ -209,7 +211,10 @@ fn create_current_user_pipe_server(
     }
 }
 
-pub async fn connect_local_stream(endpoint: &str) -> io::Result<LocalClientStream> {
+pub async fn connect_local_stream(
+    endpoint: impl AsRef<Path>,
+) -> io::Result<LocalClientStream> {
+    let endpoint = endpoint.as_ref();
     let mut last_error = None;
     for _ in 0..PIPE_CONNECT_RETRIES {
         match ClientOptions::new().open(endpoint) {
@@ -385,6 +390,7 @@ mod tests {
     async fn secure_pipe_accepts_current_owner_client() {
         let endpoint = test_endpoint("owner-connect");
         let mut listener = OwnerOnlyLocalListener::bind(&endpoint)
+            .await
             .expect("bind current-user pipe listener");
         let accept = tokio::spawn(async move {
             listener.accept().await.expect("accept current-user client")
@@ -401,6 +407,7 @@ mod tests {
     async fn listener_creates_only_during_accept_and_survives_cancelled_accept() {
         let endpoint = test_endpoint("accept-cancel");
         let mut listener = OwnerOnlyLocalListener::bind(&endpoint)
+            .await
             .expect("construct owner-only listener");
         let before_accept = ClientOptions::new()
             .open(&endpoint)

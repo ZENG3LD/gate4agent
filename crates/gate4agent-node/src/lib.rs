@@ -2,6 +2,8 @@
 
 mod git_worktree;
 
+mod worktree_service;
+
 mod session_registry;
 
 #[cfg(windows)]
@@ -19,6 +21,7 @@ pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
     NodeShutdownHandle, WorkspaceConfig, WorktreeServiceMode,
 };
+pub use worktree_service::ManagedWorktreeProfile;
 pub use spawn_spec::{
     SpawnProfileRegistry, SpawnProfileRegistryError, DEFAULT_SPAWN_PROFILE_ID,
     MAX_SPAWN_PROFILES,

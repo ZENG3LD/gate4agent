@@ -22,6 +22,7 @@ pub const NODE_PROTOCOL_VERSION: u16 = 8;
 pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_STATE_SCHEMA_V3: u16 = 3;
+pub const NODE_STATE_SCHEMA_V4: u16 = 4;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
@@ -33,6 +34,8 @@ pub const NODE_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = "terminal-frame-events-v
 pub const NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
     "spawn-spec.defaults-overrides-v1";
 pub const NODE_WORKTREE_SELECTION_CAPABILITY: &str = "worktree-selection-v1";
+pub const NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
+    "managed-worktree-lifecycle-v1";
 pub const SPAWN_RUNTIME_RAW_PTY_LIFECYCLE: &str = "raw-pty-lifecycle";
 pub const SPAWN_RUNTIME_SEMANTIC_READINESS: &str = "semantic-readiness";
 pub const SPAWN_RUNTIME_STRUCTURED_PROMPT: &str = "structured-prompt";
@@ -60,6 +63,10 @@ pub const MAX_SPAWN_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_RESOURCE_ID_BYTES: usize = 128;
 pub const MAX_SPAWN_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub const MAX_SPAWN_REQUIRED_CAPABILITIES: usize = 16;
+pub const MAX_WORKTREE_PROFILE_ID_BYTES: usize = 64;
+pub const MAX_WORKTREE_PROFILE_REVISION_BYTES: usize = 128;
+pub const MAX_MANAGED_WORKTREE_LEASE_ID_BYTES: usize = 128;
+pub const MAX_MANAGED_WORKTREE_LEASES: usize = 128;
 pub const MAX_SPAWN_DEADLINE_MS: u64 = 120_000;
 pub const MAX_WORKSPACE_ROOT_BYTES: usize = gate4agent_types::WORKING_DIRECTORY_MAX_BYTES;
 pub const MAX_REPOSITORY_PATH_BYTES: usize = 1_024;
@@ -412,6 +419,85 @@ spawn_identifier_impl!(
     MAX_SPAWN_IDEMPOTENCY_KEY_BYTES
 );
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct WorktreeProfileId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct WorktreeProfileRevision(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ManagedWorktreeLeaseId(String);
+
+macro_rules! managed_worktree_identifier_impl {
+    ($type:ident, $label:literal, $max:ident) => {
+        impl $type {
+            pub fn new(
+                value: impl Into<String>,
+            ) -> Result<Self, ManagedWorktreeIdentifierError> {
+                let value = value.into();
+                validate_spawn_identifier($label, &value, $max).map_err(
+                    |error| ManagedWorktreeIdentifierError { source: error },
+                )?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl FromStr for $type {
+            type Err = ManagedWorktreeIdentifierError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $type {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+managed_worktree_identifier_impl!(
+    WorktreeProfileId,
+    "worktree profile",
+    MAX_WORKTREE_PROFILE_ID_BYTES
+);
+managed_worktree_identifier_impl!(
+    WorktreeProfileRevision,
+    "worktree profile revision",
+    MAX_WORKTREE_PROFILE_REVISION_BYTES
+);
+managed_worktree_identifier_impl!(
+    ManagedWorktreeLeaseId,
+    "managed worktree lease",
+    MAX_MANAGED_WORKTREE_LEASE_ID_BYTES
+);
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("invalid managed worktree identifier: {source}")]
+pub struct ManagedWorktreeIdentifierError {
+    #[source]
+    source: SpawnIdentifierError,
+}
+
 fn validate_spawn_identifier(
     label: &'static str,
     value: &str,
@@ -696,6 +782,170 @@ pub struct SpawnSpec {
     pub idempotency_key: SpawnIdempotencyKey,
     #[serde(default)]
     pub required_capabilities: SpawnRequiredCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedWorktreeRetention {
+    RemoveWhenReleased,
+    Retain,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedWorktreeLeaseState {
+    Allocating,
+    Ready,
+    InUse,
+    Retained,
+    CleanupBlocked,
+    RecoveryRequired,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedWorktreeCleanupFailure {
+    Busy,
+    Dirty,
+    Locked,
+    Prunable,
+    OwnershipConflict,
+    Backend,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeSpawnRequest {
+    pub spawn_spec: SpawnSpec,
+    pub worktree_profile_id: WorktreeProfileId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeLeaseSnapshot {
+    pub lease_id: ManagedWorktreeLeaseId,
+    pub source_workspace_id: WorkspaceId,
+    pub workspace_id: WorkspaceId,
+    pub profile_id: WorktreeProfileId,
+    pub profile_revision: WorktreeProfileRevision,
+    pub retention: ManagedWorktreeRetention,
+    pub state: ManagedWorktreeLeaseState,
+    pub active_session_count: u16,
+    pub managed_record_count: u16,
+    pub cleanup_failure: Option<ManagedWorktreeCleanupFailure>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for ManagedWorktreeLeaseSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireLease {
+            lease_id: ManagedWorktreeLeaseId,
+            source_workspace_id: WorkspaceId,
+            workspace_id: WorkspaceId,
+            profile_id: WorktreeProfileId,
+            profile_revision: WorktreeProfileRevision,
+            retention: ManagedWorktreeRetention,
+            state: ManagedWorktreeLeaseState,
+            active_session_count: u16,
+            managed_record_count: u16,
+            cleanup_failure: Option<ManagedWorktreeCleanupFailure>,
+            created_at_unix_ms: u64,
+            updated_at_unix_ms: u64,
+        }
+
+        let wire = WireLease::deserialize(deserializer)?;
+        if wire.source_workspace_id == wire.workspace_id {
+            return Err(serde::de::Error::custom(
+                "managed worktree workspace cannot alias its source workspace",
+            ));
+        }
+        if wire.updated_at_unix_ms < wire.created_at_unix_ms {
+            return Err(serde::de::Error::custom(
+                "managed worktree update timestamp precedes creation timestamp",
+            ));
+        }
+        let holder_count = u32::from(wire.active_session_count)
+            .saturating_add(u32::from(wire.managed_record_count));
+        let valid_state = match wire.state {
+            ManagedWorktreeLeaseState::Allocating
+            | ManagedWorktreeLeaseState::Ready
+            | ManagedWorktreeLeaseState::Retained
+            | ManagedWorktreeLeaseState::Removed => {
+                holder_count == 0 && wire.cleanup_failure.is_none()
+            }
+            ManagedWorktreeLeaseState::InUse => {
+                holder_count > 0 && wire.cleanup_failure.is_none()
+            }
+            ManagedWorktreeLeaseState::CleanupBlocked => {
+                holder_count == 0 && wire.cleanup_failure.is_some()
+            }
+            ManagedWorktreeLeaseState::RecoveryRequired => wire.cleanup_failure.is_some(),
+        };
+        if !valid_state {
+            return Err(serde::de::Error::custom(
+                "managed worktree state, holder counts, and cleanup failure are inconsistent",
+            ));
+        }
+        Ok(Self {
+            lease_id: wire.lease_id,
+            source_workspace_id: wire.source_workspace_id,
+            workspace_id: wire.workspace_id,
+            profile_id: wire.profile_id,
+            profile_revision: wire.profile_revision,
+            retention: wire.retention,
+            state: wire.state,
+            active_session_count: wire.active_session_count,
+            managed_record_count: wire.managed_record_count,
+            cleanup_failure: wire.cleanup_failure,
+            created_at_unix_ms: wire.created_at_unix_ms,
+            updated_at_unix_ms: wire.updated_at_unix_ms,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeSpawnReceipt {
+    pub spawn: ResolvedSpawnReceipt,
+    pub lease: ManagedWorktreeLeaseSnapshot,
+}
+
+impl<'de> Deserialize<'de> for ManagedWorktreeSpawnReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireReceipt {
+            spawn: ResolvedSpawnReceipt,
+            lease: ManagedWorktreeLeaseSnapshot,
+        }
+
+        let wire = WireReceipt::deserialize(deserializer)?;
+        if wire.lease.source_workspace_id != wire.spawn.target.workspace_id
+            || wire.spawn.target.worktree_id.as_ref() != Some(&wire.lease.workspace_id)
+            || wire.spawn.session.workspace_id != wire.lease.workspace_id
+            || wire.lease.state != ManagedWorktreeLeaseState::InUse
+            || wire.lease.cleanup_failure.is_some()
+            || wire.lease.active_session_count != 1
+        {
+            return Err(serde::de::Error::custom(
+                "managed worktree spawn receipt contains inconsistent lease correlation",
+            ));
+        }
+        Ok(Self {
+            spawn: wire.spawn,
+            lease: wire.lease,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2150,6 +2400,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_PROVIDER_ID_OPEN_CAPABILITY,
             NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
             NODE_REPOSITORY_PATH_CAPABILITY,
+            NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             NODE_WORKSPACE_FILE_READ_CAPABILITY,
@@ -2161,7 +2412,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V3,
+                maximum: NODE_STATE_SCHEMA_V4,
             },
         }),
     }
@@ -2531,6 +2782,67 @@ pub struct NodeSnapshot {
     pub workspaces: Vec<WorkspaceSnapshot>,
     #[serde(default)]
     pub session_records: Vec<ManagedSessionRecord>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_managed_worktree_leases"
+    )]
+    pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
+}
+
+fn deserialize_managed_worktree_leases<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ManagedWorktreeLeaseSnapshot>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ManagedWorktreeLeasesVisitor;
+
+    impl<'de> Visitor<'de> for ManagedWorktreeLeasesVisitor {
+        type Value = Vec<ManagedWorktreeLeaseSnapshot>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_MANAGED_WORKTREE_LEASES} managed worktree leases",
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut leases = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_MANAGED_WORKTREE_LEASES),
+            );
+            while let Some(lease) = sequence.next_element::<ManagedWorktreeLeaseSnapshot>()? {
+                if leases.len() == MAX_MANAGED_WORKTREE_LEASES {
+                    return Err(serde::de::Error::invalid_length(leases.len() + 1, &self));
+                }
+                if leases.iter().any(|existing: &ManagedWorktreeLeaseSnapshot| {
+                    existing.lease_id == lease.lease_id
+                }) {
+                    return Err(serde::de::Error::custom(
+                        "managed worktree snapshot contains a duplicate lease ID",
+                    ));
+                }
+                if leases.iter().any(|existing: &ManagedWorktreeLeaseSnapshot| {
+                    existing.workspace_id == lease.workspace_id
+                }) {
+                    return Err(serde::de::Error::custom(
+                        "managed worktree snapshot contains a duplicate workspace ID",
+                    ));
+                }
+                leases.push(lease);
+            }
+            Ok(leases)
+        }
+    }
+
+    deserializer.deserialize_seq(ManagedWorktreeLeasesVisitor)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2651,6 +2963,12 @@ pub enum NodeRequest {
     SpawnSpec {
         spec: SpawnSpec,
     },
+    SpawnManagedWorktree {
+        request: ManagedWorktreeSpawnRequest,
+    },
+    CleanupManagedWorktree {
+        lease_id: ManagedWorktreeLeaseId,
+    },
     Resume {
         session: SessionAddress,
         terminal_size: TerminalSize,
@@ -2685,6 +3003,10 @@ impl NodeRequest {
         match self {
             Self::ReadWorkspaceFile { .. } => Some(NODE_WORKSPACE_FILE_READ_CAPABILITY),
             Self::SpawnSpec { .. } => Some(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
+            Self::SpawnManagedWorktree { .. }
+            | Self::CleanupManagedWorktree { .. } => {
+                Some(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
+            }
             Self::Snapshot
             | Self::Resync { .. }
             | Self::InspectWorkspace { .. }
@@ -2714,6 +3036,17 @@ impl NodeRequest {
 
     pub fn requires_worktree_selection_capability(&self) -> bool {
         matches!(self, Self::SpawnSpec { spec } if spec.target.worktree_id.is_some())
+            || matches!(
+                self,
+                Self::SpawnManagedWorktree { .. } | Self::CleanupManagedWorktree { .. }
+            )
+    }
+
+    pub fn requires_spawn_spec_defaults_overrides_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::SpawnSpec { .. } | Self::SpawnManagedWorktree { .. }
+        )
     }
 }
 
@@ -2751,6 +3084,12 @@ pub enum NodeResponse {
     SpawnSpecAccepted {
         receipt: ResolvedSpawnReceipt,
     },
+    ManagedWorktreeSpawnAccepted {
+        receipt: ManagedWorktreeSpawnReceipt,
+    },
+    ManagedWorktreeCleanup {
+        lease: ManagedWorktreeLeaseSnapshot,
+    },
     SessionRecordUpdated {
         record: ManagedSessionRecord,
     },
@@ -2783,6 +3122,19 @@ impl NodeResponse {
     pub fn requires_worktree_selection_capability(&self) -> bool {
         matches!(self, Self::SpawnSpecAccepted { receipt }
             if receipt.target.worktree_id.is_some())
+            || matches!(
+                self,
+                Self::ManagedWorktreeSpawnAccepted { .. }
+                    | Self::ManagedWorktreeCleanup { .. }
+            )
+    }
+
+
+    pub fn requires_spawn_spec_defaults_overrides_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::SpawnSpecAccepted { .. } | Self::ManagedWorktreeSpawnAccepted { .. }
+        )
     }
 }
 
@@ -2818,6 +3170,10 @@ pub enum NodeFailureCode {
     WorktreeProtected,
     WorktreeDirty,
     WorktreeLocked,
+    UnknownManagedWorktreeLease,
+    ManagedWorktreeBusy,
+    ManagedWorktreeOwnershipConflict,
+    ManagedWorktreeRecoveryRequired,
     UnknownSpawnProfile,
     SpawnTargetMismatch,
     SpawnIdempotencyConflict,
@@ -2853,6 +3209,8 @@ pub enum NodeEvent {
     WorkspaceRemoved { workspace_id: WorkspaceId },
     SessionRecordUpserted { record: ManagedSessionRecord },
     SessionRecordRemoved { record_id: SessionRecordId },
+    ManagedWorktreeUpserted { lease: ManagedWorktreeLeaseSnapshot },
+    ManagedWorktreeRemoved { lease_id: ManagedWorktreeLeaseId },
     ResyncRequired { oldest_available_sequence: u64 },
 }
 
@@ -4075,6 +4433,7 @@ mod tests {
                 provider_runtime_statuses: ProviderRuntimeStatuses::default(),
                 workspaces: Vec::new(),
                 session_records: Vec::new(),
+                managed_worktrees: Vec::new(),
             },
             compatibility: None,
         };
@@ -4084,6 +4443,175 @@ mod tests {
             r#"{"protocol_version":8,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}"#,
         );
         assert_eq!(serde_json::from_str::<NodeHello>(&json).unwrap(), hello);
+    }
+
+    #[test]
+    fn managed_worktree_contract_is_bounded_dual_gated_and_path_free() {
+        assert_eq!(
+            NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+            "managed-worktree-lifecycle-v1",
+        );
+        assert_eq!(NODE_PROTOCOL_VERSION, 8);
+        assert_eq!(NODE_STATE_SCHEMA_V4, 4);
+        assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES)).is_ok());
+        assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES + 1)).is_err());
+        assert!(WorktreeProfileRevision::new(
+            "r".repeat(MAX_WORKTREE_PROFILE_REVISION_BYTES),
+        )
+        .is_ok());
+        assert!(ManagedWorktreeLeaseId::new(
+            "l".repeat(MAX_MANAGED_WORKTREE_LEASE_ID_BYTES + 1),
+        )
+        .is_err());
+
+        let request = NodeRequest::SpawnManagedWorktree {
+            request: ManagedWorktreeSpawnRequest {
+                spawn_spec: SpawnSpec {
+                    target: SpawnTarget {
+                        node_id: NodeId::new("node-a").unwrap(),
+                        workspace_id: WorkspaceId::new("primary").unwrap(),
+                        worktree_id: None,
+                    },
+                    profile_id: SpawnProfileId::new("default").unwrap(),
+                    overrides: SpawnOverrides::default(),
+                    deadline_ms: SpawnDeadlineMs::new(30_000).unwrap(),
+                    idempotency_key: SpawnIdempotencyKey::new("managed-1").unwrap(),
+                    required_capabilities: SpawnRequiredCapabilities::default(),
+                },
+                worktree_profile_id: WorktreeProfileId::new("review").unwrap(),
+            },
+        };
+        assert_eq!(
+            request.required_capability(),
+            Some(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
+        );
+        assert!(request.requires_worktree_selection_capability());
+        let json = serde_json::to_string(&request).unwrap();
+        for forbidden in ["canonical", "target_root", "gitdir", "branch", "base_commit", "diagnostic"] {
+            assert!(!json.contains(forbidden), "managed request leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn managed_worktree_snapshot_rejects_invalid_time_duplicate_identity_and_overflow() {
+        fn lease(lease_id: &str, workspace_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "lease_id": lease_id,
+                "source_workspace_id": "primary",
+                "workspace_id": workspace_id,
+                "profile_id": "review",
+                "profile_revision": "review.r1",
+                "retention": "remove-when-released",
+                "state": "ready",
+                "active_session_count": 0,
+                "managed_record_count": 0,
+                "cleanup_failure": null,
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 2
+            })
+        }
+        fn snapshot(leases: Vec<serde_json::Value>) -> serde_json::Value {
+            serde_json::json!({
+                "node_id": "node-a",
+                "enabled_providers": [],
+                "workspaces": [],
+                "session_records": [],
+                "managed_worktrees": leases
+            })
+        }
+
+        let mut reversed = lease("lease-a", "managed-a");
+        reversed["updated_at_unix_ms"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<NodeSnapshot>(snapshot(vec![reversed])).is_err());
+        assert!(serde_json::from_value::<NodeSnapshot>(snapshot(vec![lease(
+            "lease-a",
+            "primary",
+        )]))
+        .is_err());
+
+        for (state, active, records, failure) in [
+            ("ready", 1, 0, serde_json::Value::Null),
+            ("in-use", 0, 0, serde_json::Value::Null),
+            ("in-use", 1, 0, serde_json::json!("busy")),
+            ("cleanup-blocked", 0, 0, serde_json::Value::Null),
+            ("cleanup-blocked", 1, 0, serde_json::json!("busy")),
+            ("recovery-required", 0, 0, serde_json::Value::Null),
+            ("removed", 0, 1, serde_json::Value::Null),
+        ] {
+            let mut malformed = lease("lease-a", "managed-a");
+            malformed["state"] = serde_json::json!(state);
+            malformed["active_session_count"] = serde_json::json!(active);
+            malformed["managed_record_count"] = serde_json::json!(records);
+            malformed["cleanup_failure"] = failure;
+            assert!(serde_json::from_value::<NodeSnapshot>(snapshot(vec![malformed])).is_err());
+        }
+        let mut recovery_with_holder = lease("lease-a", "managed-a");
+        recovery_with_holder["state"] = serde_json::json!("recovery-required");
+        recovery_with_holder["managed_record_count"] = serde_json::json!(1);
+        recovery_with_holder["cleanup_failure"] = serde_json::json!("ownership-conflict");
+        assert!(serde_json::from_value::<NodeSnapshot>(snapshot(vec![recovery_with_holder])).is_ok());
+
+        let mut spawn_lease = lease("lease-a", "managed-a");
+        spawn_lease["state"] = serde_json::json!("in-use");
+        spawn_lease["active_session_count"] = serde_json::json!(1);
+        spawn_lease["managed_record_count"] = serde_json::json!(1);
+        let spawn = serde_json::json!({
+            "incarnation_id": "00000000000000000000000000000000",
+            "session": {
+                "workspace_id": "managed-a",
+                "session": { "instance_id": 1, "generation": 1 }
+            },
+            "target": {
+                "node_id": "node-a",
+                "workspace_id": "primary",
+                "worktree_id": "managed-a"
+            },
+            "profile_id": "default",
+            "profile_revision": "default.r1",
+            "provider": "claude",
+            "mode": "pty",
+            "terminal_size": { "rows": 24, "columns": 80 },
+            "prompt": { "present": false, "byte_len": 0 },
+            "bundle_id": null,
+            "context_id": null,
+            "environment_profile_id": null,
+            "deadline_ms": 5000,
+            "idempotency_key": "managed-1",
+            "required_capabilities": [],
+            "provenance": {
+                "provider": "profile",
+                "mode": "profile",
+                "terminal_size": "profile",
+                "prompt": "profile",
+                "bundle_id": "profile",
+                "context_id": "profile",
+                "environment_profile_id": "profile"
+            }
+        });
+        let valid_receipt = serde_json::json!({ "spawn": spawn, "lease": spawn_lease });
+        assert!(serde_json::from_value::<ManagedWorktreeSpawnReceipt>(valid_receipt.clone()).is_ok());
+        let mut wrong_source = valid_receipt.clone();
+        wrong_source["lease"]["source_workspace_id"] = serde_json::json!("other");
+        assert!(serde_json::from_value::<ManagedWorktreeSpawnReceipt>(wrong_source).is_err());
+        let mut wrong_session = valid_receipt;
+        wrong_session["spawn"]["session"]["workspace_id"] = serde_json::json!("other");
+        assert!(serde_json::from_value::<ManagedWorktreeSpawnReceipt>(wrong_session).is_err());
+
+        assert!(serde_json::from_value::<NodeSnapshot>(snapshot(vec![
+            lease("lease-a", "managed-a"),
+            lease("lease-a", "managed-b"),
+        ]))
+        .is_err());
+        assert!(serde_json::from_value::<NodeSnapshot>(snapshot(vec![
+            lease("lease-a", "managed-a"),
+            lease("lease-b", "managed-a"),
+        ]))
+        .is_err());
+
+        let leases = (0..=MAX_MANAGED_WORKTREE_LEASES)
+            .map(|index| lease(&format!("lease-{index}"), &format!("managed-{index}")))
+            .collect();
+        assert!(serde_json::from_value::<NodeSnapshot>(snapshot(leases)).is_err());
     }
 
     #[test]

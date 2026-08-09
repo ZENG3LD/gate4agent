@@ -2,8 +2,9 @@ use crate::protocol::{
     AgentId, ManagedSessionRecord, ManagedSessionState, NodeId, OpaqueHostPath,
     SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3, NODE_STATE_SCHEMA_V4,
 };
+use crate::worktree_service::ManagedWorktreeLeaseRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PERSISTED_WORKSPACES: usize = 256;
+const MAX_PERSISTED_MANAGED_WORKTREE_BRANCH_BYTES: usize = 512;
 pub(crate) const MAX_MANAGED_SESSION_RECORDS: usize = 4_096;
 const BACKUP_ROTATION_WARNING: &str = "durable-state-backup-rotation-failed";
 const CORRUPT_PRIMARY_PRESERVED_WARNING: &str = "durable-state-corrupt-primary-preserved";
@@ -180,6 +182,8 @@ fn acquire_unix_state_lock(path: &Path) -> io::Result<File> {
 pub(crate) struct LoadedNodeState {
     pub workspaces: BTreeMap<WorkspaceId, String>,
     pub records: Vec<ManagedSessionRecord>,
+    pub managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    pub managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
     pub warning: Option<String>,
 }
 
@@ -188,6 +192,8 @@ impl LoadedNodeState {
         Self {
             workspaces: BTreeMap::new(),
             records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            managed_worktree_tombstones: Vec::new(),
             warning: None,
         }
     }
@@ -217,10 +223,22 @@ struct PersistedNodeStateV3 {
     session_records: Vec<PersistedManagedSessionRecordV3>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedNodeStateV4 {
+    version: u16,
+    node_id: NodeId,
+    workspaces: Vec<PersistedWorkspaceV2>,
+    session_records: Vec<PersistedManagedSessionRecordV3>,
+    managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+}
+
 struct DecodedNodeState {
     node_id: NodeId,
     workspaces: Vec<(WorkspaceId, String)>,
     session_records: Vec<ManagedSessionRecord>,
+    managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
 }
 
 #[derive(Deserialize)]
@@ -491,6 +509,8 @@ fn load_one(path: &Path, expected_node_id: &NodeId) -> io::Result<LoadedNodeStat
     Ok(LoadedNodeState {
         workspaces,
         records,
+        managed_worktrees: state.managed_worktrees,
+        managed_worktree_tombstones: state.managed_worktree_tombstones,
         warning: None,
     })
 }
@@ -513,6 +533,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
             let state: PersistedNodeStateV3 = serde_json::from_slice(bytes)
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v3_state(state)
+        }
+        NODE_STATE_SCHEMA_V4 => {
+            let state: PersistedNodeStateV4 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v4_state(state)
         }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -552,6 +577,8 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
                 })
             })
             .collect::<io::Result<_>>()?,
+        managed_worktrees: Vec::new(),
+        managed_worktree_tombstones: Vec::new(),
     })
 }
 
@@ -589,6 +616,8 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
                 })
             })
             .collect::<io::Result<_>>()?,
+        managed_worktrees: Vec::new(),
+        managed_worktree_tombstones: Vec::new(),
     })
 }
 
@@ -626,7 +655,97 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
                 })
             })
             .collect::<io::Result<_>>()?,
+        managed_worktrees: Vec::new(),
+        managed_worktree_tombstones: Vec::new(),
     })
+}
+
+fn decode_v4_state(state: PersistedNodeStateV4) -> io::Result<DecodedNodeState> {
+    let legacy = decode_v3_state(PersistedNodeStateV3 {
+        version: NODE_STATE_SCHEMA_V3,
+        node_id: state.node_id,
+        workspaces: state.workspaces,
+        session_records: state.session_records,
+    })?;
+    validate_managed_worktree_records(&state.managed_worktrees, false)?;
+    validate_managed_worktree_records(&state.managed_worktree_tombstones, true)?;
+    let active_ids = state.managed_worktrees.iter()
+        .map(|lease| lease.lease_id.clone())
+        .collect::<BTreeSet<_>>();
+    if state.managed_worktree_tombstones.iter().any(|lease| active_ids.contains(&lease.lease_id)) {
+        return Err(invalid_data("durable state contains duplicate managed worktree leases"));
+    }
+    Ok(DecodedNodeState {
+        node_id: legacy.node_id,
+        workspaces: legacy.workspaces,
+        session_records: legacy.session_records,
+        managed_worktrees: state.managed_worktrees,
+        managed_worktree_tombstones: state.managed_worktree_tombstones,
+    })
+}
+
+fn validate_managed_worktree_records(
+    records: &[ManagedWorktreeLeaseRecord],
+    tombstones: bool,
+) -> io::Result<()> {
+    if records.len() > crate::protocol::MAX_MANAGED_WORKTREE_LEASES {
+        return Err(invalid_data("durable state contains too many managed worktree leases"));
+    }
+    let mut lease_ids = BTreeSet::new();
+    let mut workspace_ids = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    let mut branches = BTreeSet::new();
+    for lease in records {
+        validate_root(&lease.target_root)?;
+        let mut session_holders = BTreeSet::new();
+        let mut record_holders = BTreeSet::new();
+        if lease.branch.is_empty()
+            || lease.branch.len() > MAX_PERSISTED_MANAGED_WORKTREE_BRANCH_BYTES
+            || !valid_git_object_id(&lease.base_commit)
+            || lease.expected_head.as_ref().is_some_and(|head| !valid_git_object_id(head))
+            || lease.source_workspace_id == lease.workspace_id
+            || lease.branch.chars().any(char::is_control)
+            || lease.base_commit.chars().any(char::is_control)
+            || lease.created_at_unix_ms > lease.updated_at_unix_ms
+            || tombstones != (lease.state == crate::protocol::ManagedWorktreeLeaseState::Removed)
+            || !lease_ids.insert(lease.lease_id.clone())
+            || !workspace_ids.insert(lease.workspace_id.clone())
+            || !roots.insert(crate::platform::root_identity(&lease.target_root))
+            || !branches.insert(lease.branch.clone())
+            || lease.session_holders.len() > gate4agent_types::CONTROL_SESSIONS_MAX
+            || lease.record_holders.len() > MAX_MANAGED_SESSION_RECORDS
+            || lease.session_holders.iter().any(|holder| !session_holders.insert((
+                holder.incarnation_id,
+                holder.instance_id,
+                holder.generation,
+            )))
+            || lease.record_holders.iter().any(|holder| !record_holders.insert(holder.clone()))
+            || (lease.state == crate::protocol::ManagedWorktreeLeaseState::Removed
+                && (!lease.session_holders.is_empty() || !lease.record_holders.is_empty()))
+            || (matches!(
+                lease.state,
+                crate::protocol::ManagedWorktreeLeaseState::Allocating
+                    | crate::protocol::ManagedWorktreeLeaseState::Ready
+                    | crate::protocol::ManagedWorktreeLeaseState::Retained
+                    | crate::protocol::ManagedWorktreeLeaseState::CleanupBlocked
+                    | crate::protocol::ManagedWorktreeLeaseState::Removed
+            ) && (!lease.session_holders.is_empty() || !lease.record_holders.is_empty()))
+            || (lease.state == crate::protocol::ManagedWorktreeLeaseState::InUse
+                && lease.session_holders.is_empty() && lease.record_holders.is_empty())
+            || (matches!(
+                lease.state,
+                crate::protocol::ManagedWorktreeLeaseState::CleanupBlocked
+                    | crate::protocol::ManagedWorktreeLeaseState::RecoveryRequired
+            ) != lease.cleanup_failure.is_some())
+        {
+            return Err(invalid_data("durable managed worktree record is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn require_utf8_state_path(path: &OpaqueHostPath) -> io::Result<&str> {
@@ -647,6 +766,7 @@ pub(crate) fn state_load_refusal(error: &io::Error) -> Option<StateLoadRefusal> 
         .map(StateLoadRefusalError::refusal)
 }
 
+#[cfg(test)]
 pub(crate) fn save(
     path: Option<&Path>,
     node_id: &NodeId,
@@ -708,6 +828,80 @@ pub(crate) fn save(
             .into_iter()
                 .map(persisted_v3_record)
             .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| invalid_data(format!("durable state encoding failed: {error}")))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(invalid_data("refusing to persist oversized durable state"));
+    }
+    let previous_primary_valid = if !path.exists() {
+        true
+    } else {
+        match load_one(path, node_id) {
+            Ok(_) => true,
+            Err(error) if is_authoritative_state_error(&error) => return Err(error),
+            Err(_) => false,
+        }
+    };
+    atomic_write(path, &bytes, previous_primary_valid)
+}
+
+pub(crate) fn save_v4(
+    path: Option<&Path>,
+    node_id: &NodeId,
+    workspaces: &BTreeMap<WorkspaceId, String>,
+    records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+) -> io::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if workspaces.len() > MAX_PERSISTED_WORKSPACES {
+        return Err(invalid_data("refusing to persist too many workspaces"));
+    }
+    if records.len() > MAX_MANAGED_SESSION_RECORDS {
+        return Err(invalid_data("refusing to persist too many session records"));
+    }
+    validate_managed_worktree_records(managed_worktrees, false)?;
+    validate_managed_worktree_records(managed_worktree_tombstones, true)?;
+    let mut persisted_records = Vec::with_capacity(records.len());
+    let mut provider_sessions = BTreeSet::new();
+    for record in records {
+        let mut persisted = record.clone();
+        persisted.active_session = None;
+        if let Some(identity) = &mut persisted.provider_session {
+            if !provider_sessions.insert(provider_session_semantic_key(
+                &persisted.provider,
+                identity,
+            )) {
+                return Err(invalid_data("refusing to persist duplicate provider sessions"));
+            }
+            identity.transcript_path = None;
+        }
+        persisted.last_error = persisted.last_error.as_deref().map(sanitized_record_error_summary);
+        validate_record(&persisted)?;
+        persisted.state = if persisted.provider_session.is_some() {
+            ManagedSessionState::Dormant
+        } else {
+            ManagedSessionState::Unavailable
+        };
+        persisted_records.push(persisted_v3_record(persisted));
+    }
+    let state = PersistedNodeStateV4 {
+        version: NODE_STATE_SCHEMA_V4,
+        node_id: node_id.clone(),
+        workspaces: workspaces.iter().map(|(workspace_id, canonical_root)| {
+            Ok(PersistedWorkspaceV2 {
+                workspace_id: workspace_id.clone(),
+                canonical_root: OpaqueHostPath::utf8(canonical_root.clone()).map_err(|error| {
+                    invalid_data(format!("refusing to persist an invalid workspace path: {error}"))
+                })?,
+            })
+        }).collect::<io::Result<_>>()?,
+        session_records: persisted_records,
+        managed_worktrees: managed_worktrees.to_vec(),
+        managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
     };
     let bytes = serde_json::to_vec_pretty(&state)
         .map_err(|error| invalid_data(format!("durable state encoding failed: {error}")))?;
@@ -1164,6 +1358,91 @@ mod tests {
             last_error: None,
         };
         (node_id, workspaces, record)
+    }
+
+    fn managed_lease(path: &Path, id: &str, workspace: &str, branch: &str) -> ManagedWorktreeLeaseRecord {
+        ManagedWorktreeLeaseRecord {
+            lease_id: crate::protocol::ManagedWorktreeLeaseId::new(id).unwrap(),
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: WorkspaceId::new(workspace).unwrap(),
+            profile_id: crate::protocol::WorktreeProfileId::new("default").unwrap(),
+            profile_revision: crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+            target_root: path.to_string_lossy().into_owned(),
+            branch: branch.to_owned(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            expected_head: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            retention: crate::protocol::ManagedWorktreeRetention::RemoveWhenReleased,
+            state: crate::protocol::ManagedWorktreeLeaseState::Ready,
+            session_holders: Vec::new(),
+            record_holders: Vec::new(),
+            cleanup_failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 11,
+        }
+    }
+
+    #[test]
+    fn v4_roundtrip_preserves_host_only_managed_lease_identity() {
+        let path = temp_path("v4-managed-roundtrip");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, record) = fixture(&path);
+        let lease = managed_lease(
+            &path.parent().unwrap().join("managed-a"),
+            "mw-a",
+            "managed-a",
+            "gate4agent/mw-a",
+        );
+        save_v4(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[lease.clone()],
+            &[],
+        ).unwrap();
+        let header: PersistedNodeStateHeader = serde_json::from_slice(
+            &std::fs::read(&path).unwrap(),
+        ).unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V4);
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.managed_worktrees, vec![lease]);
+        assert!(loaded.managed_worktree_tombstones.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn malformed_v4_duplicate_branch_is_rejected_without_startup_panic() {
+        let path = temp_path("v4-managed-duplicate-branch");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, record) = fixture(&path);
+        let first = managed_lease(
+            &path.parent().unwrap().join("managed-a"),
+            "mw-a",
+            "managed-a",
+            "gate4agent/shared",
+        );
+        let second = managed_lease(
+            &path.parent().unwrap().join("managed-b"),
+            "mw-b",
+            "managed-b",
+            "gate4agent/shared",
+        );
+        let state = PersistedNodeStateV4 {
+            version: NODE_STATE_SCHEMA_V4,
+            node_id: node_id.clone(),
+            workspaces: workspaces.into_iter().map(|(workspace_id, canonical_root)| {
+                PersistedWorkspaceV2 {
+                    workspace_id,
+                    canonical_root: OpaqueHostPath::utf8(canonical_root).unwrap(),
+                }
+            }).collect(),
+            session_records: vec![persisted_v3_record(record)],
+            managed_worktrees: vec![first, second],
+            managed_worktree_tombstones: Vec::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(load(Some(&path), &node_id).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     fn persisted_v1_record(record: ManagedSessionRecord) -> PersistedManagedSessionRecordV1 {

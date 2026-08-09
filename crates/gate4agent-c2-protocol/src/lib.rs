@@ -3,6 +3,9 @@
 pub use gate4agent_node_protocol::{
     AdapterContractRevision, AdapterFamily, AdapterId, AgentId, ArchitectureId, CapabilityId,
     ClientCompatibilityOffer, HostDescriptor,
+    ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
+    ManagedWorktreeLeaseState, ManagedWorktreeRetention, ManagedWorktreeSpawnReceipt,
+    ManagedWorktreeSpawnRequest,
     provider_id_is_legacy, NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
     ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
@@ -13,6 +16,8 @@ pub use gate4agent_node_protocol::{
     SpawnOverrides, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision, SpawnPrompt,
     SpawnPromptMetadata, SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnSpec,
     SpawnTarget,
+    WorktreeProfileId, WorktreeProfileRevision,
+    NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
@@ -27,7 +32,8 @@ use gate4agent_types::{
     AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity, SessionGeneration,
     SessionStatus, TerminalFrame, TerminalSize, TransportKind,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -50,6 +56,8 @@ pub const C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY;
 pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS_CAPABILITY;
 pub const C2_WORKTREE_SELECTION_CAPABILITY: &str = NODE_WORKTREE_SELECTION_CAPABILITY;
+pub const C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
+    NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -64,6 +72,8 @@ pub const MAX_C2_ENDPOINT_BYTES: usize = 1024;
 pub const MAX_C2_WORKSPACES_PER_NODE: usize = 32;
 pub const MAX_C2_SESSIONS_PER_NODE: usize = 128;
 pub const MAX_C2_MANAGED_SESSIONS_PER_NODE: usize = 128;
+pub const MAX_C2_MANAGED_WORKTREES_PER_NODE: usize =
+    gate4agent_node_protocol::MAX_MANAGED_WORKTREE_LEASES;
 pub const MAX_C2_GAPS_PER_NODE: usize = 64;
 pub const MAX_C2_ROOT_BYTES: usize = 1024;
 pub const MAX_C2_SESSION_DISPLAY_NAME_BYTES: usize =
@@ -132,6 +142,14 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::WorktreeProtected => "worktree protected",
             NodeFailureCode::WorktreeDirty => "worktree dirty",
             NodeFailureCode::WorktreeLocked => "worktree locked",
+            NodeFailureCode::UnknownManagedWorktreeLease => "managed worktree unavailable",
+            NodeFailureCode::ManagedWorktreeBusy => "managed worktree busy",
+            NodeFailureCode::ManagedWorktreeOwnershipConflict => {
+                "managed worktree ownership conflict"
+            }
+            NodeFailureCode::ManagedWorktreeRecoveryRequired => {
+                "managed worktree recovery required"
+            }
             NodeFailureCode::SpawnTargetMismatch => "spawn target mismatch",
             NodeFailureCode::UnknownSpawnProfile => "spawn profile unavailable",
             NodeFailureCode::SpawnIdempotencyConflict => "spawn idempotency conflict",
@@ -271,6 +289,61 @@ pub struct C2NodeSnapshot {
     pub provider_runtime_statuses: ProviderRuntimeStatuses,
     pub workspaces: Vec<C2WorkspaceSnapshot>,
     pub session_records: Vec<C2ManagedSessionRecord>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_c2_managed_worktree_leases"
+    )]
+    pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
+}
+
+fn deserialize_c2_managed_worktree_leases<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ManagedWorktreeLeaseSnapshot>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ManagedWorktreesVisitor;
+
+    impl<'de> Visitor<'de> for ManagedWorktreesVisitor {
+        type Value = Vec<ManagedWorktreeLeaseSnapshot>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_C2_MANAGED_WORKTREES_PER_NODE} managed worktrees",
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut leases = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_C2_MANAGED_WORKTREES_PER_NODE),
+            );
+            while let Some(lease) = sequence.next_element::<ManagedWorktreeLeaseSnapshot>()? {
+                if leases.len() == MAX_C2_MANAGED_WORKTREES_PER_NODE {
+                    return Err(serde::de::Error::invalid_length(leases.len() + 1, &self));
+                }
+                if leases.iter().any(|existing: &ManagedWorktreeLeaseSnapshot| {
+                    existing.lease_id == lease.lease_id
+                        || existing.workspace_id == lease.workspace_id
+                }) {
+                    return Err(serde::de::Error::custom(
+                        "C2 managed worktree snapshot contains duplicate identity",
+                    ));
+                }
+                leases.push(lease);
+            }
+            Ok(leases)
+        }
+    }
+
+    deserializer.deserialize_seq(ManagedWorktreesVisitor)
 }
 
 impl From<&NodeSnapshot> for C2NodeSnapshot {
@@ -283,6 +356,7 @@ impl From<&NodeSnapshot> for C2NodeSnapshot {
             session_records: snapshot.session_records.iter()
                 .map(C2ManagedSessionRecord::from)
                 .collect(),
+            managed_worktrees: snapshot.managed_worktrees.clone(),
         }
     }
 }
@@ -473,6 +547,8 @@ pub enum C2NodeEvent {
     WorkspaceRemoved { workspace_id: WorkspaceId },
     SessionRecordUpserted { record: C2ManagedSessionRecord },
     SessionRecordRemoved { record_id: SessionRecordId },
+    ManagedWorktreeUpserted { lease: ManagedWorktreeLeaseSnapshot },
+    ManagedWorktreeRemoved { lease_id: ManagedWorktreeLeaseId },
     ResyncRequired { oldest_available_sequence: u64 },
 }
 
@@ -501,6 +577,12 @@ impl From<&NodeEvent> for C2NodeEvent {
             },
             NodeEvent::SessionRecordRemoved { record_id } => Self::SessionRecordRemoved {
                 record_id: record_id.clone(),
+            },
+            NodeEvent::ManagedWorktreeUpserted { lease } => Self::ManagedWorktreeUpserted {
+                lease: lease.clone(),
+            },
+            NodeEvent::ManagedWorktreeRemoved { lease_id } => Self::ManagedWorktreeRemoved {
+                lease_id: lease_id.clone(),
             },
             NodeEvent::ResyncRequired { oldest_available_sequence } => Self::ResyncRequired {
                 oldest_available_sequence: *oldest_available_sequence,
@@ -604,6 +686,8 @@ pub enum C2NodeResponse {
     },
     SpawnAccepted { session: SessionAddress },
     SpawnSpecAccepted { receipt: ResolvedSpawnReceipt },
+    ManagedWorktreeSpawnAccepted { receipt: ManagedWorktreeSpawnReceipt },
+    ManagedWorktreeCleanup { lease: ManagedWorktreeLeaseSnapshot },
     SessionRecordUpdated { record: C2ManagedSessionRecord },
     SessionRecordResumed {
         record: C2ManagedSessionRecord,
@@ -651,6 +735,14 @@ impl From<&NodeResponse> for C2NodeResponse {
             NodeResponse::SpawnAccepted { session } => Self::SpawnAccepted { session: session.clone() },
             NodeResponse::SpawnSpecAccepted { receipt } => Self::SpawnSpecAccepted {
                 receipt: receipt.clone(),
+            },
+            NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
+                Self::ManagedWorktreeSpawnAccepted {
+                    receipt: receipt.clone(),
+                }
+            }
+            NodeResponse::ManagedWorktreeCleanup { lease } => Self::ManagedWorktreeCleanup {
+                lease: lease.clone(),
             },
             NodeResponse::SessionRecordUpdated { record } => Self::SessionRecordUpdated {
                 record: C2ManagedSessionRecord::from(record),
@@ -1187,7 +1279,17 @@ pub struct SlimNodeInventory {
     pub managed_session_count: usize,
     #[serde(default)]
     pub managed_sessions_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub managed_worktree_count: usize,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub managed_worktrees_truncated: bool,
 }
+
+fn usize_is_zero(value: &usize) -> bool { *value == 0 }
+
+fn bool_is_false(value: &bool) -> bool { !*value }
 
 impl SlimNodeInventory {
     pub fn from_snapshot(snapshot: &NodeSnapshot) -> Self {
@@ -1240,6 +1342,10 @@ impl SlimNodeInventory {
             .take(MAX_C2_MANAGED_SESSIONS_PER_NODE)
             .map(SlimManagedSessionRecord::from)
             .collect::<Vec<_>>();
+        let managed_worktree_count = snapshot.managed_worktrees.len();
+        let mut managed_worktrees = snapshot.managed_worktrees.clone();
+        managed_worktrees.sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+        managed_worktrees.truncate(MAX_C2_MANAGED_WORKTREES_PER_NODE);
         Self {
             node_id: snapshot.node_id.clone(),
             enabled_providers: providers,
@@ -1254,6 +1360,10 @@ impl SlimNodeInventory {
             managed_sessions_truncated: managed_sessions.len() < managed_session_count,
             managed_sessions,
             managed_session_count,
+            managed_worktrees_truncated:
+                managed_worktrees.len() < managed_worktree_count,
+            managed_worktrees,
+            managed_worktree_count,
         }
     }
 
@@ -1305,6 +1415,10 @@ impl SlimNodeInventory {
             .take(MAX_C2_MANAGED_SESSIONS_PER_NODE)
             .map(SlimManagedSessionRecord::from)
             .collect::<Vec<_>>();
+        let managed_worktree_count = snapshot.managed_worktrees.len();
+        let mut managed_worktrees = snapshot.managed_worktrees.clone();
+        managed_worktrees.sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+        managed_worktrees.truncate(MAX_C2_MANAGED_WORKTREES_PER_NODE);
         Self {
             node_id: snapshot.node_id.clone(),
             enabled_providers: providers,
@@ -1319,6 +1433,10 @@ impl SlimNodeInventory {
             managed_sessions_truncated: managed_sessions.len() < managed_session_count,
             managed_sessions,
             managed_session_count,
+            managed_worktrees_truncated:
+                managed_worktrees.len() < managed_worktree_count,
+            managed_worktrees,
+            managed_worktree_count,
         }
     }
 }
@@ -1888,6 +2006,49 @@ mod tests {
     }
 
     #[test]
+    fn c2_managed_worktree_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(
+            C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+            "managed-worktree-lifecycle-v1",
+        );
+        let capability =
+            CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        let bound = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        assert!(bound
+            .windows(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY.len())
+            .any(|window| {
+                window == C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY.as_bytes()
+            }));
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+    }
+
+    #[test]
     fn c2_legacy_node_event_bytes_remain_exact_after_terminal_frame_addition() {
         assert_eq!(
             serde_json::to_vec(&C2NodeEvent::ResyncRequired {
@@ -2033,6 +2194,7 @@ mod tests {
                 sessions: Vec::new(),
             }],
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         });
         let json = serde_json::to_string(&(projected, negotiated)).unwrap();
         let (projected, negotiated) = serde_json::from_str::<(
@@ -2127,6 +2289,7 @@ mod tests {
                 },
             ],
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         };
         let slim = SlimNodeInventory::from_snapshot(&snapshot);
         assert_eq!(slim.enabled_providers, vec![provider("claude"), provider("codex")]);
@@ -2150,6 +2313,7 @@ mod tests {
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         });
         let (provider_contracts, provider_adapter_contracts) =
             provider_contract_manifest();
@@ -2201,6 +2365,7 @@ mod tests {
             provider_runtime_statuses: runtime_statuses.clone(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         };
         let projected = C2NodeSnapshot::from(&snapshot);
         let inventory = SlimNodeInventory::from_snapshot(&snapshot);
@@ -2240,6 +2405,7 @@ mod tests {
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces,
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         });
         assert!(slim.workspaces_truncated);
         assert_eq!(slim.session_count, 1);
@@ -2300,6 +2466,7 @@ mod tests {
         assert!(!json.contains("observed_at_unix_ms"));
         assert!(!json.contains("sequence"));
         assert!(!json.contains("inventory"));
+        assert!(!json.contains("managed_worktrees"));
     }
 
     #[test]
@@ -2312,6 +2479,7 @@ mod tests {
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         });
         inventory.provider_contracts = provider_contracts;
         inventory.provider_adapter_contracts = provider_adapter_contracts;
@@ -2397,6 +2565,7 @@ mod tests {
                     provider_runtime_statuses: ProviderRuntimeStatuses::default(),
                     workspaces: Vec::new(),
                     session_records: vec![record.clone()],
+                    managed_worktrees: Vec::new(),
                 },
             },
             NodeResponse::SessionRecordUpdated { record: record.clone() },
@@ -2412,6 +2581,7 @@ mod tests {
                     provider_runtime_statuses: ProviderRuntimeStatuses::default(),
                     workspaces: Vec::new(),
                     session_records: vec![record.clone()],
+                    managed_worktrees: Vec::new(),
                 },
                 events: vec![gate4agent_node_protocol::NodeEventEnvelope {
                     sequence: 5,
@@ -2591,6 +2761,7 @@ mod tests {
                 sessions: Vec::new(),
             }],
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         });
 
         let encoded = serde_json::to_string(&projected).unwrap();
@@ -2729,6 +2900,7 @@ mod tests {
                     sessions: vec![session],
                 }],
                 session_records: Vec::new(),
+                managed_worktrees: Vec::new(),
             },
         });
 
@@ -2786,6 +2958,7 @@ mod tests {
                 make_record("session-z", "z".to_owned()),
                 make_record("session-a", long_name),
             ],
+            managed_worktrees: Vec::new(),
         };
 
         let slim = SlimNodeInventory::from_snapshot(&snapshot);
@@ -2846,9 +3019,57 @@ mod tests {
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records,
+            managed_worktrees: Vec::new(),
         });
         assert_eq!(slim.managed_session_count, MAX_C2_MANAGED_SESSIONS_PER_NODE + 1);
         assert_eq!(slim.managed_sessions.len(), MAX_C2_MANAGED_SESSIONS_PER_NODE);
         assert!(slim.managed_sessions_truncated);
+    }
+
+    #[test]
+    fn managed_worktree_projection_is_bounded_and_contains_no_git_or_path_details() {
+        fn lease(index: usize) -> ManagedWorktreeLeaseSnapshot {
+            ManagedWorktreeLeaseSnapshot {
+                lease_id: ManagedWorktreeLeaseId::new(format!("lease-{index}")).unwrap(),
+                source_workspace_id: WorkspaceId::new("primary").unwrap(),
+                workspace_id: WorkspaceId::new(format!("managed-{index}")).unwrap(),
+                profile_id: WorktreeProfileId::new("review").unwrap(),
+                profile_revision: WorktreeProfileRevision::new("review.r1").unwrap(),
+                retention: ManagedWorktreeRetention::RemoveWhenReleased,
+                state: ManagedWorktreeLeaseState::Ready,
+                active_session_count: 0,
+                managed_record_count: 0,
+                cleanup_failure: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 2,
+            }
+        }
+
+        let projected = C2NodeSnapshot::from(&NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: vec![lease(0)],
+        });
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(json.contains("managed_worktrees"));
+        for forbidden in ["canonical", "path", "gitdir", "branch", "base_commit", "diagnostic"] {
+            assert!(!json.contains(forbidden), "managed projection leaked {forbidden}");
+        }
+
+        let overflow = C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: (0..=MAX_C2_MANAGED_WORKTREES_PER_NODE)
+                .map(lease)
+                .collect(),
+        };
+        let encoded = serde_json::to_value(overflow).unwrap();
+        assert!(serde_json::from_value::<C2NodeSnapshot>(encoded).is_err());
     }
 }

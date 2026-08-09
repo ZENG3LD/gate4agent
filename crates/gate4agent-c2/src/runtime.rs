@@ -1,7 +1,7 @@
 use crate::protocol::{
     C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
     NodeIncarnationId, NodeRequest, ResolvedSpawnReceipt, RoutedNodeEvent, RoutedNodeResponse,
-    SpawnOverride, SpawnSpec,
+    ManagedWorktreeLeaseState, ManagedWorktreeSpawnRequest, SpawnOverride, SpawnSpec,
     NodeTransportState, ObservedNode, ProviderAdapterContractSupport, ProviderContractSupport,
     ReadyResponse, SanitizedError, SlimNodeInventory, StatusResponse,
     C2_API_VERSION, C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
@@ -10,7 +10,7 @@ use crate::protocol::{
 #[cfg(windows)]
 use crate::protocol::MAX_C2_ENDPOINT_BYTES;
 use gate4agent_node_protocol::{
-    ClientRole, FrameError, NegotiatedNodeCompatibility, NodeEventEnvelope, NodeFailureCode,
+    ClientRole, FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailureCode,
     NodeResponse, NodeSnapshot, ServerFrame,
 };
 use gate4agent_node_wire::{LocalNodeClient, NodeClientError};
@@ -497,7 +497,11 @@ enum AttemptResult {
         provider_contract_manifest: ProviderContractManifest,
     },
     Success { cursor: NodeCursor, snapshot: NodeSnapshot, gaps: Vec<GapKind> },
-    Cursor { cursor: NodeCursor, gaps: Vec<GapKind> },
+    Cursor {
+        cursor: NodeCursor,
+        gaps: Vec<GapKind>,
+        managed_worktree_events: Vec<NodeEvent>,
+    },
     Failure { error: SanitizedError, hard: bool },
 }
 
@@ -753,12 +757,16 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. } => Duration::from_secs(5),
         NodeRequest::CreateWorktree { .. }
-        | NodeRequest::RemoveWorktree { .. } => Duration::from_secs(240),
+        | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. } => Duration::from_secs(240),
         NodeRequest::Spawn { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::Stop { .. } => Duration::from_secs(15),
         NodeRequest::SpawnSpec { spec } =>
             Duration::from_millis(spec.deadline_ms.get()) + NODE_REQUEST_IO_HEADROOM,
+        NodeRequest::SpawnManagedWorktree { request } =>
+            Duration::from_millis(request.spawn_spec.deadline_ms.get())
+                + NODE_REQUEST_IO_HEADROOM,
         NodeRequest::ResumeSessionRecord { .. } =>
             MANAGED_RESUME_SETTLE_DEADLINE + NODE_REQUEST_IO_HEADROOM,
         _ => Duration::from_secs(10),
@@ -820,8 +828,11 @@ async fn handle_relay_command(
     match command {
         RelayCommand::Request { operator_connection_id, expected_incarnation_id, request, reply } => {
             let relay_deadline = relay_request_deadline(&request, Instant::now());
-            let expected_spawn_spec = match &request {
-                NodeRequest::SpawnSpec { spec } => Some(spec.clone()),
+            let expected_spawn = match &request {
+                NodeRequest::SpawnSpec { spec } => Some(ExpectedSpawnRequest::Spec(spec.clone())),
+                NodeRequest::SpawnManagedWorktree { request } => {
+                    Some(ExpectedSpawnRequest::Managed(request.clone()))
+                }
                 _ => None,
             };
             if !hub.is_active(operator_connection_id) {
@@ -874,7 +885,7 @@ async fn handle_relay_command(
                 }
             };
             if let Err(message) = validate_spawn_spec_response(
-                expected_spawn_spec.as_ref(),
+                expected_spawn.as_ref(),
                 &response,
                 incarnation_id,
             ) {
@@ -897,21 +908,54 @@ async fn handle_relay_command(
     Ok(())
 }
 
+enum ExpectedSpawnRequest {
+    Spec(SpawnSpec),
+    Managed(ManagedWorktreeSpawnRequest),
+}
+
 fn validate_spawn_spec_response(
-    expected: Option<&SpawnSpec>,
+    expected: Option<&ExpectedSpawnRequest>,
     response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
     relay_incarnation_id: NodeIncarnationId,
 ) -> Result<(), &'static str> {
-    let receipt = match (expected, response) {
-        (Some(spec), Ok(NodeResponse::SpawnSpecAccepted { receipt })) => (spec, receipt),
+    match (expected, response) {
+        (Some(ExpectedSpawnRequest::Spec(spec)), Ok(NodeResponse::SpawnSpecAccepted { receipt })) => {
+            validate_spawn_receipt(spec, receipt, relay_incarnation_id)
+        }
+        (
+            Some(ExpectedSpawnRequest::Managed(request)),
+            Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt }),
+        ) => validate_managed_spawn_receipt(request, receipt, relay_incarnation_id),
         (Some(_), Ok(_)) => return Err("spawn spec request returned a different response"),
         (Some(_), Err(_)) => return Ok(()),
-        (None, Ok(NodeResponse::SpawnSpecAccepted { .. })) => {
+        (None, Ok(NodeResponse::SpawnSpecAccepted { .. }
+            | NodeResponse::ManagedWorktreeSpawnAccepted { .. })) => {
             return Err("unexpected spawn receipt for a different node request");
         }
         (None, _) => return Ok(()),
-    };
-    validate_spawn_receipt(receipt.0, receipt.1, relay_incarnation_id)
+    }
+}
+
+fn validate_managed_spawn_receipt(
+    request: &ManagedWorktreeSpawnRequest,
+    receipt: &gate4agent_node_protocol::ManagedWorktreeSpawnReceipt,
+    relay_incarnation_id: NodeIncarnationId,
+) -> Result<(), &'static str> {
+    if receipt.lease.source_workspace_id != request.spawn_spec.target.workspace_id
+        || receipt.lease.profile_id != request.worktree_profile_id
+        || receipt.lease.state != ManagedWorktreeLeaseState::InUse
+        || receipt.lease.cleanup_failure.is_some()
+        || receipt.lease.active_session_count != 1
+        || receipt.spawn.target.node_id != request.spawn_spec.target.node_id
+        || receipt.spawn.target.workspace_id != request.spawn_spec.target.workspace_id
+        || receipt.spawn.target.worktree_id.as_ref() != Some(&receipt.lease.workspace_id)
+        || receipt.spawn.session.workspace_id != receipt.lease.workspace_id
+    {
+        return Err("managed spawn receipt does not match routed request");
+    }
+    let mut resolved_spec = request.spawn_spec.clone();
+    resolved_spec.target.worktree_id = Some(receipt.lease.workspace_id.clone());
+    validate_spawn_receipt(&resolved_spec, &receipt.spawn, relay_incarnation_id)
 }
 
 fn validate_spawn_receipt(
@@ -1080,6 +1124,7 @@ async fn drain_pending_events(
     let mut skip_replayed = skip_replayed;
     for repair_pass in 0..=1 {
         let mut gaps = Vec::new();
+        let mut managed_worktree_events = Vec::new();
         let mut changed = false;
         let mut repair = false;
         while let Some(envelope) = client.take_event() {
@@ -1097,6 +1142,13 @@ async fn drain_pending_events(
                 continue;
             }
             let event_cursor = NodeCursor { incarnation_id: cursor.incarnation_id, sequence: envelope.sequence };
+            if matches!(
+                &envelope.event,
+                NodeEvent::ManagedWorktreeUpserted { .. }
+                    | NodeEvent::ManagedWorktreeRemoved { .. }
+            ) {
+                managed_worktree_events.push(envelope.event.clone());
+            }
             hub.publish(RoutedNodeEvent {
                 node_id: node_id.clone(),
                 cursor: event_cursor,
@@ -1107,13 +1159,21 @@ async fn drain_pending_events(
         }
         if !repair {
             if changed || !gaps.is_empty() {
-                ingress_attempt(ingress, node_id, AttemptResult::Cursor { cursor: *cursor, gaps }).await
+                ingress_attempt(ingress, node_id, AttemptResult::Cursor {
+                    cursor: *cursor,
+                    gaps,
+                    managed_worktree_events,
+                }).await
                     .map_err(NodeClientError::Io)?;
             }
             return Ok(());
         }
         if repair_pass == 1 {
-            ingress_attempt(ingress, node_id, AttemptResult::Cursor { cursor: *cursor, gaps }).await
+            ingress_attempt(ingress, node_id, AttemptResult::Cursor {
+                cursor: *cursor,
+                gaps,
+                managed_worktree_events,
+            }).await
                 .map_err(NodeClientError::Io)?;
             return Err(NodeClientError::Protocol("node event stream remained noncontiguous after resync".to_owned()));
         }
@@ -1214,6 +1274,13 @@ async fn handle_live_node_event(
     }
 
     cursor.sequence = envelope.sequence;
+    let managed_worktree_events = matches!(
+        &envelope.event,
+        NodeEvent::ManagedWorktreeUpserted { .. }
+            | NodeEvent::ManagedWorktreeRemoved { .. }
+    )
+    .then(|| vec![envelope.event.clone()])
+    .unwrap_or_default();
     hub.publish(RoutedNodeEvent {
         node_id: node_id.clone(),
         cursor: *cursor,
@@ -1222,7 +1289,11 @@ async fn handle_live_node_event(
     ingress_attempt(
         ingress,
         node_id,
-        AttemptResult::Cursor { cursor: *cursor, gaps: Vec::new() },
+        AttemptResult::Cursor {
+            cursor: *cursor,
+            gaps: Vec::new(),
+            managed_worktree_events,
+        },
     ).await.map_err(NodeClientError::Io)
 }
 
@@ -1360,15 +1431,20 @@ async fn inventory_owner(
                             node.gaps.push(NodeGap { kind, detected_at_unix_ms: attempt.at_unix_ms, previous, observed: cursor });
                         }
                     }
-                    AttemptResult::Cursor { cursor, gaps } => {
+                    AttemptResult::Cursor {
+                        cursor,
+                        gaps,
+                        managed_worktree_events,
+                    } => {
                         let previous = node.cursor;
-                        if previous.is_some_and(|previous| {
+                        let incarnation_changed = previous.is_some_and(|previous| {
                             previous.incarnation_id != cursor.incarnation_id
-                        }) {
-                            if let Some(inventory) = node.inventory.as_mut() {
-                                inventory.provider_runtime_statuses.clear();
-                            }
-                        }
+                        });
+                        apply_managed_worktree_cursor(
+                            node.inventory.as_mut(),
+                            incarnation_changed,
+                            &managed_worktree_events,
+                        );
                         node.transport = NodeTransportState::Online;
                         node.freshness = NodeFreshness::Fresh;
                         node.cursor = Some(cursor);
@@ -1397,6 +1473,56 @@ async fn inventory_owner(
                 status.send_replace(Arc::new(current.clone()));
             }
             changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return Ok(()); },
+        }
+    }
+}
+
+fn apply_managed_worktree_cursor(
+    inventory: Option<&mut SlimNodeInventory>,
+    incarnation_changed: bool,
+    events: &[NodeEvent],
+) {
+    let Some(inventory) = inventory else { return; };
+    if incarnation_changed {
+        inventory.provider_runtime_statuses.clear();
+        inventory.managed_worktrees.clear();
+        inventory.managed_worktree_count = 0;
+        inventory.managed_worktrees_truncated = false;
+        return;
+    }
+    for event in events {
+        match event {
+            NodeEvent::ManagedWorktreeUpserted { lease } => {
+                inventory.managed_worktrees.retain(|existing| {
+                    existing.lease_id != lease.lease_id
+                        && existing.workspace_id != lease.workspace_id
+                });
+                inventory.managed_worktrees.push(lease.clone());
+                inventory.managed_worktrees.sort_by(|left, right| {
+                    left.lease_id.cmp(&right.lease_id)
+                });
+                inventory.managed_worktree_count = inventory.managed_worktrees.len();
+                inventory.managed_worktrees.truncate(
+                    crate::protocol::MAX_C2_MANAGED_WORKTREES_PER_NODE,
+                );
+                inventory.managed_worktrees_truncated =
+                    inventory.managed_worktrees.len() < inventory.managed_worktree_count;
+            }
+            NodeEvent::ManagedWorktreeRemoved { lease_id } => {
+                let before = inventory.managed_worktrees.len();
+                inventory
+                    .managed_worktrees
+                    .retain(|lease| &lease.lease_id != lease_id);
+                if inventory.managed_worktrees.len() < before
+                    || inventory.managed_worktrees_truncated
+                {
+                    inventory.managed_worktree_count =
+                        inventory.managed_worktree_count.saturating_sub(1);
+                }
+                inventory.managed_worktrees_truncated =
+                    inventory.managed_worktrees.len() < inventory.managed_worktree_count;
+            }
+            _ => {}
         }
     }
 }
@@ -1594,12 +1720,37 @@ mod tests {
         SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
         SpawnProfileId, SpawnProfileRevision, SpawnPrompt, SpawnPromptMetadata,
         SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnTarget, WorkspaceId,
+        ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
+        ManagedWorktreeLeaseSnapshot, ManagedWorktreeRetention, ManagedWorktreeSpawnReceipt,
+        WorktreeProfileId, WorktreeProfileRevision,
     };
     use gate4agent_types::{AgentInstanceId, SessionGeneration, TerminalSize};
     use std::collections::BTreeMap;
 
     fn agent(value: &str) -> gate4agent_node_protocol::AgentId {
         gate4agent_node_protocol::AgentId::new(value).unwrap()
+    }
+
+    fn managed_lease(
+        lease_id: &str,
+        workspace_id: &str,
+        state: ManagedWorktreeLeaseState,
+    ) -> ManagedWorktreeLeaseSnapshot {
+        let in_use = state == ManagedWorktreeLeaseState::InUse;
+        ManagedWorktreeLeaseSnapshot {
+            lease_id: ManagedWorktreeLeaseId::new(lease_id).unwrap(),
+            source_workspace_id: WorkspaceId::new("repo").unwrap(),
+            workspace_id: WorkspaceId::new(workspace_id).unwrap(),
+            profile_id: WorktreeProfileId::new("review").unwrap(),
+            profile_revision: WorktreeProfileRevision::new("review.r1").unwrap(),
+            retention: ManagedWorktreeRetention::RemoveWhenReleased,
+            state,
+            active_session_count: u16::from(in_use),
+            managed_record_count: u16::from(in_use),
+            cleanup_failure: None::<ManagedWorktreeCleanupFailure>,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        }
     }
 
     #[test]
@@ -1663,8 +1814,9 @@ mod tests {
             },
         };
         let response = |receipt| Ok(NodeResponse::SpawnSpecAccepted { receipt });
+        let expected = ExpectedSpawnRequest::Spec(spec.clone());
         assert!(validate_spawn_spec_response(
-            Some(&spec),
+            Some(&expected),
             &response(receipt.clone()),
             incarnation_id,
         ).is_ok());
@@ -1700,10 +1852,110 @@ mod tests {
 
         for mismatch in mismatches {
             assert!(validate_spawn_spec_response(
-                Some(&spec),
+                Some(&expected),
                 &response(mismatch),
                 incarnation_id,
             ).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_spawn_receipt_correlation_rejects_non_in_use_or_mismatched_leases() {
+        let incarnation_id = NodeIncarnationId::from_bytes([7; 16]);
+        let spec = SpawnSpec {
+            target: SpawnTarget {
+                node_id: NodeId::new("node-a").unwrap(),
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            overrides: SpawnOverrides::default(),
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("managed-1").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+        };
+        let managed = ManagedWorktreeSpawnRequest {
+            spawn_spec: spec.clone(),
+            worktree_profile_id: WorktreeProfileId::new("review").unwrap(),
+        };
+        let workspace_id = WorkspaceId::new("managed-a").unwrap();
+        let spawn = ResolvedSpawnReceipt {
+            incarnation_id,
+            session: SessionAddress {
+                workspace_id: workspace_id.clone(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(8),
+                    generation: SessionGeneration(1),
+                },
+            },
+            target: SpawnTarget {
+                node_id: spec.target.node_id.clone(),
+                workspace_id: spec.target.workspace_id.clone(),
+                worktree_id: Some(workspace_id.clone()),
+            },
+            profile_id: spec.profile_id.clone(),
+            profile_revision: SpawnProfileRevision::new("default.r1").unwrap(),
+            provider: AgentId::new("claude").unwrap(),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize { rows: 24, columns: 80 },
+            prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
+            bundle_id: None,
+            context_id: None,
+            environment_profile_id: None,
+            deadline_ms: spec.deadline_ms,
+            idempotency_key: spec.idempotency_key.clone(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+            provenance: SpawnResolutionProvenance {
+                provider: SpawnFieldProvenance::Profile,
+                mode: SpawnFieldProvenance::Profile,
+                terminal_size: SpawnFieldProvenance::Profile,
+                prompt: SpawnFieldProvenance::Profile,
+                bundle_id: SpawnFieldProvenance::Profile,
+                context_id: SpawnFieldProvenance::Profile,
+                environment_profile_id: SpawnFieldProvenance::Profile,
+            },
+        };
+        let receipt = ManagedWorktreeSpawnReceipt {
+            spawn,
+            lease: managed_lease(
+                "lease-a",
+                "managed-a",
+                ManagedWorktreeLeaseState::InUse,
+            ),
+        };
+        let expected = ExpectedSpawnRequest::Managed(managed);
+        let response = |receipt| Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt });
+        assert!(validate_spawn_spec_response(
+            Some(&expected),
+            &response(receipt.clone()),
+            incarnation_id,
+        )
+        .is_ok());
+
+        let mut mismatches = Vec::new();
+        let mut changed = receipt.clone();
+        changed.lease.state = ManagedWorktreeLeaseState::Ready;
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.lease.cleanup_failure = Some(ManagedWorktreeCleanupFailure::Busy);
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.lease.active_session_count = 0;
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.lease.profile_id = WorktreeProfileId::new("other").unwrap();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.lease.source_workspace_id = WorkspaceId::new("other").unwrap();
+        mismatches.push(changed);
+
+        for mismatch in mismatches {
+            assert!(validate_spawn_spec_response(
+                Some(&expected),
+                &response(mismatch),
+                incarnation_id,
+            )
+            .is_err());
         }
     }
 
@@ -1935,6 +2187,7 @@ mod tests {
             provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         };
         let cursor = NodeCursor { incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([1; 16]), sequence: 0 };
         let old_manifest = ProviderContractManifest {
@@ -2017,6 +2270,7 @@ mod tests {
                     provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
                     workspaces: Vec::new(),
                     session_records: Vec::new(),
+                    managed_worktrees: Vec::new(),
                 },
                 gaps: Vec::new(),
                 provider_contract_manifest: ProviderContractManifest::default(),
@@ -2112,6 +2366,7 @@ mod tests {
                             provider_runtime_statuses: runtime_statuses(provider, version),
                             workspaces: Vec::new(),
                             session_records: Vec::new(),
+                            managed_worktrees: Vec::new(),
                         },
                         gaps: Vec::new(),
                         provider_contract_manifest: ProviderContractManifest::default(),
@@ -2160,6 +2415,7 @@ mod tests {
                         ),
                         workspaces: Vec::new(),
                         session_records: Vec::new(),
+                        managed_worktrees: Vec::new(),
                     },
                     gaps: Vec::new(),
                     provider_contract_manifest: ProviderContractManifest::default(),
@@ -2180,6 +2436,7 @@ mod tests {
                         sequence: 0,
                     },
                     gaps: vec![GapKind::IncarnationChanged],
+                    managed_worktree_events: Vec::new(),
                 },
             })
             .await
@@ -2193,5 +2450,72 @@ mod tests {
             .is_empty());
         shutdown.send(true).unwrap();
         owner.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn managed_worktree_inventory_events_are_exact_bounded_and_incarnation_fenced() {
+        let mut inventory = SlimNodeInventory::from_snapshot(&NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: vec![managed_lease(
+                "lease-a",
+                "managed-a",
+                ManagedWorktreeLeaseState::Ready,
+            )],
+        });
+        apply_managed_worktree_cursor(
+            Some(&mut inventory),
+            false,
+            &[
+                NodeEvent::ManagedWorktreeUpserted {
+                    lease: managed_lease(
+                        "lease-b",
+                        "managed-b",
+                        ManagedWorktreeLeaseState::Ready,
+                    ),
+                },
+                NodeEvent::ManagedWorktreeUpserted {
+                    lease: managed_lease(
+                        "lease-a",
+                        "managed-a",
+                        ManagedWorktreeLeaseState::InUse,
+                    ),
+                },
+            ],
+        );
+        assert_eq!(inventory.managed_worktree_count, 2);
+        assert_eq!(inventory.managed_worktrees[0].lease_id.as_str(), "lease-a");
+        assert_eq!(
+            inventory.managed_worktrees[0].state,
+            ManagedWorktreeLeaseState::InUse,
+        );
+
+        apply_managed_worktree_cursor(
+            Some(&mut inventory),
+            false,
+            &[NodeEvent::ManagedWorktreeRemoved {
+                lease_id: ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+            }],
+        );
+        assert_eq!(inventory.managed_worktree_count, 1);
+        assert_eq!(inventory.managed_worktrees[0].lease_id.as_str(), "lease-b");
+
+        apply_managed_worktree_cursor(
+            Some(&mut inventory),
+            true,
+            &[NodeEvent::ManagedWorktreeUpserted {
+                lease: managed_lease(
+                    "lease-c",
+                    "managed-c",
+                    ManagedWorktreeLeaseState::Ready,
+                ),
+            }],
+        );
+        assert!(inventory.managed_worktrees.is_empty());
+        assert_eq!(inventory.managed_worktree_count, 0);
+        assert!(!inventory.managed_worktrees_truncated);
     }
 }

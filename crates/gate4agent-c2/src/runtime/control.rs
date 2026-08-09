@@ -8,6 +8,7 @@ use crate::protocol::{
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
+    C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -44,6 +45,7 @@ struct NegotiatedPathCapabilities {
     provider_ids_open: bool,
     spawn_spec_defaults_overrides: bool,
     worktree_selection: bool,
+    managed_worktree_lifecycle: bool,
     terminal_frame_events: bool,
 }
 
@@ -488,6 +490,12 @@ async fn control_writer<W>(
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
+        if !path_capabilities.managed_worktree_lifecycle
+            && server_frame_contains_managed_worktree(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
         }
@@ -547,6 +555,8 @@ fn negotiated_path_capabilities(
         spawn_spec_defaults_overrides:
             selected_has(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
         worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
+        managed_worktree_lifecycle:
+            selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -572,6 +582,8 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
                     | C2NodeResponse::Controller { .. }
                     | C2NodeResponse::SpawnAccepted { .. }
                     | C2NodeResponse::SpawnSpecAccepted { .. }
+                    | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+                    | C2NodeResponse::ManagedWorktreeCleanup { .. }
                     | C2NodeResponse::SessionRecordUpdated { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
@@ -605,6 +617,8 @@ fn c2_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::WorkspaceRemoved { .. }
         | C2NodeEvent::SessionRecordUpserted { .. }
         | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ManagedWorktreeUpserted { .. }
+        | C2NodeEvent::ManagedWorktreeRemoved { .. }
         | C2NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -619,12 +633,24 @@ fn unnegotiated_request_failure(
         Some(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY) => {
             capabilities.spawn_spec_defaults_overrides
         }
+        Some(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY) => {
+            capabilities.managed_worktree_lifecycle
+        }
         Some(_) => false,
     };
     if !required_capability_available {
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
             "request capability was not negotiated with C2",
+            None,
+        ));
+    }
+    if request.requires_spawn_spec_defaults_overrides_capability()
+        && !capabilities.spawn_spec_defaults_overrides
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "spawn spec capability was not negotiated with C2",
             None,
         ));
     }
@@ -661,8 +687,10 @@ fn unnegotiated_request_failure(
 }
 
 fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
-    let NodeRequest::SpawnSpec { spec } = request else {
-        return false;
+    let spec = match request {
+        NodeRequest::SpawnSpec { spec } => spec,
+        NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
+        _ => return false,
     };
     match &spec.overrides.provider {
         gate4agent_node_protocol::SpawnOverride::Set { value } => {
@@ -687,6 +715,8 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
+        | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -740,6 +770,8 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                     | C2NodeResponse::Controller { .. }
                     | C2NodeResponse::SpawnAccepted { .. }
                     | C2NodeResponse::SpawnSpecAccepted { .. }
+                    | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+                    | C2NodeResponse::ManagedWorktreeCleanup { .. }
                     | C2NodeResponse::SessionRecordUpdated { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
@@ -779,7 +811,10 @@ fn server_frame_contains_spawn_spec_response(frame: &C2ServerFrame) -> bool {
     match frame {
         C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
             routed.response.as_ref().ok().is_some_and(|response| {
-                matches!(response, C2NodeResponse::SpawnSpecAccepted { .. })
+                matches!(response,
+                    C2NodeResponse::SpawnSpecAccepted { .. }
+                    | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+                )
             })
         }),
         C2ServerFrame::Challenge(_)
@@ -796,14 +831,63 @@ fn server_frame_contains_worktree_selection_response(frame: &C2ServerFrame) -> b
             routed.response.as_ref().ok().is_some_and(|response| {
                 matches!(response, C2NodeResponse::SpawnSpecAccepted { receipt }
                     if receipt.target.worktree_id.is_some())
+                    || c2_response_contains_managed_worktree(response)
             })
         }),
+        C2ServerFrame::Hello(hello) => hello.status.nodes.values().any(|node| {
+            node.inventory.as_ref().is_some_and(|inventory| {
+                !inventory.managed_worktrees.is_empty()
+            })
+        }),
+        C2ServerFrame::Event(event) => c2_event_is_managed_worktree(&event.event),
         C2ServerFrame::Challenge(_)
-        | C2ServerFrame::Hello(_)
-        | C2ServerFrame::Event(_)
         | C2ServerFrame::Topology(_)
         | C2ServerFrame::Rejected(_) => false,
     }
+}
+
+fn server_frame_contains_managed_worktree(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed
+                .response
+                .as_ref()
+                .ok()
+                .is_some_and(c2_response_contains_managed_worktree)
+        }),
+        C2ServerFrame::Hello(hello) => hello.status.nodes.values().any(|node| {
+            node.inventory.as_ref().is_some_and(|inventory| {
+                !inventory.managed_worktrees.is_empty()
+            })
+        }),
+        C2ServerFrame::Event(event) => c2_event_is_managed_worktree(&event.event),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn c2_response_contains_managed_worktree(response: &C2NodeResponse) -> bool {
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. } => !snapshot.managed_worktrees.is_empty(),
+        C2NodeResponse::Resync { snapshot, events, .. } => {
+            !snapshot.managed_worktrees.is_empty()
+                || events
+                    .iter()
+                    .any(|event| c2_event_is_managed_worktree(&event.event))
+        }
+        C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeCleanup { .. } => true,
+        _ => false,
+    }
+}
+
+fn c2_event_is_managed_worktree(event: &C2NodeEvent) -> bool {
+    matches!(
+        event,
+        C2NodeEvent::ManagedWorktreeUpserted { .. }
+            | C2NodeEvent::ManagedWorktreeRemoved { .. }
+    )
 }
 
 fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
@@ -828,6 +912,8 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
         | C2NodeResponse::SpawnSpecAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
@@ -850,6 +936,8 @@ fn c2_event_contains_opaque_unix_path(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::WorkspaceRemoved { .. }
         | C2NodeEvent::SessionRecordUpserted { .. }
         | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ManagedWorktreeUpserted { .. }
+        | C2NodeEvent::ManagedWorktreeRemoved { .. }
         | C2NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -931,6 +1019,8 @@ fn dispatch_start(
     }
     if matches!(&request.request, NodeRequest::SpawnSpec { spec }
         if spec.target.node_id != request.route.node_id)
+        || matches!(&request.request, NodeRequest::SpawnManagedWorktree { request: managed }
+            if managed.spawn_spec.target.node_id != request.route.node_id)
     {
         return DispatchStart::Immediate(Err(relay_failure(
             C2RelayFailureCode::RequestForbidden,
@@ -1052,6 +1142,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
             operating_system: OperatingSystemId::new(std::env::consts::OS)
@@ -1147,6 +1239,8 @@ fn request_targets_unavailable_provider(
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
+        | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -1295,6 +1389,9 @@ fn project_legacy_response(
         C2NodeResponse::SpawnSpecAccepted { receipt } => {
             provider_id_is_legacy(&receipt.provider)
         }
+        C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
+            provider_id_is_legacy(&receipt.spawn.provider)
+        }
         C2NodeResponse::WorkspaceRegistered { workspace }
         | C2NodeResponse::WorktreeCreated { workspace, .. } => {
             retain_legacy_workspace(workspace);
@@ -1304,6 +1401,7 @@ fn project_legacy_response(
         | C2NodeResponse::WorkspaceFileRead { .. }
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::WorktreeRemoved { .. }
@@ -1335,6 +1433,8 @@ fn project_legacy_event(
         }
         C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::ManagedWorktreeUpserted { .. }
+        | C2NodeEvent::ManagedWorktreeRemoved { .. }
         | C2NodeEvent::ResyncRequired { .. } => true,
     }
 }
@@ -1411,6 +1511,8 @@ fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
         | C2NodeResponse::SpawnSpecAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
@@ -1482,6 +1584,7 @@ mod tests {
             provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         });
         inventory.provider_contracts = vec![ProviderContractSupport {
             provider: AgentId::new("codex").unwrap(),
@@ -1612,6 +1715,7 @@ mod tests {
                         provider_runtime_statuses: Default::default(),
                         workspaces: Vec::new(),
                         session_records: Vec::new(),
+                        managed_worktrees: Vec::new(),
                     },
                     events: vec![crate::protocol::C2NodeEventEnvelope {
                         sequence,
@@ -1665,6 +1769,7 @@ mod tests {
                 CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -1700,6 +1805,7 @@ mod tests {
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
+            managed_worktree_lifecycle: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_none());
@@ -1747,6 +1853,56 @@ mod tests {
                 ..
             }) if message == "worktree selection capability was not negotiated with C2"
         ));
+    }
+
+    #[test]
+    fn managed_worktree_partial_capability_intersections_fail_closed() {
+        let request = NodeRequest::SpawnManagedWorktree {
+            request: crate::protocol::ManagedWorktreeSpawnRequest {
+                spawn_spec: spawn_spec("node-a"),
+                worktree_profile_id:
+                    crate::protocol::WorktreeProfileId::new("review").unwrap(),
+            },
+        };
+        let mut capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: false,
+            terminal_frame_events: true,
+        };
+        assert!(unnegotiated_request_failure(&request, capabilities).is_some());
+        capabilities.managed_worktree_lifecycle = true;
+        capabilities.worktree_selection = false;
+        assert!(unnegotiated_request_failure(&request, capabilities).is_some());
+        capabilities.worktree_selection = true;
+        capabilities.spawn_spec_defaults_overrides = false;
+        assert!(unnegotiated_request_failure(&request, capabilities).is_some());
+
+        let cleanup = NodeRequest::CleanupManagedWorktree {
+            lease_id: crate::protocol::ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+        };
+        capabilities.spawn_spec_defaults_overrides = false;
+        assert!(unnegotiated_request_failure(&cleanup, capabilities).is_none());
+        capabilities.worktree_selection = false;
+        assert!(unnegotiated_request_failure(&cleanup, capabilities).is_some());
+
+        let event = C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                sequence: 1,
+            },
+            event: C2NodeEvent::ManagedWorktreeRemoved {
+                lease_id: crate::protocol::ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+            },
+        });
+        assert!(server_frame_contains_managed_worktree(&event));
+        assert!(server_frame_contains_worktree_selection_response(&event));
     }
 
     #[test]
@@ -1806,6 +1962,7 @@ mod tests {
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: false,
                 worktree_selection: true,
+                managed_worktree_lifecycle: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -1849,6 +2006,7 @@ mod tests {
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: false,
+                managed_worktree_lifecycle: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -1933,6 +2091,7 @@ mod tests {
                 sessions: vec![c2_session("codex", 1), c2_session("qwen-code", 2)],
             }],
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         };
         let empty_status = status(NodeTransportState::Offline, None);
         let mut legacy = C2NodeEvent::TerminalFrame {
@@ -2025,6 +2184,7 @@ mod tests {
             provider_ids_open: false,
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
+            managed_worktree_lifecycle: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2212,6 +2372,7 @@ mod tests {
                 provider_ids_open: false,
                 spawn_spec_defaults_overrides: false,
                 worktree_selection: false,
+                managed_worktree_lifecycle: false,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2246,6 +2407,7 @@ mod tests {
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
+                managed_worktree_lifecycle: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2280,6 +2442,7 @@ mod tests {
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
+                managed_worktree_lifecycle: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2332,6 +2495,7 @@ mod tests {
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
+            managed_worktree_lifecycle: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2346,6 +2510,7 @@ mod tests {
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
+            managed_worktree_lifecycle: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2360,6 +2525,7 @@ mod tests {
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
+            managed_worktree_lifecycle: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
@@ -2393,6 +2559,7 @@ mod tests {
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
+                managed_worktree_lifecycle: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,

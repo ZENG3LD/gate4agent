@@ -1,8 +1,16 @@
 use crate::git_worktree::{
-    create_worktree as create_git_worktree, list_worktrees as list_git_worktrees,
+    create_worktree as create_git_worktree,
+    create_worktree_with_timeout as create_git_worktree_with_timeout,
+    list_worktrees as list_git_worktrees,
     paths_equal as worktree_paths_equal, remove_worktree as remove_git_worktree,
-    removal_lookup_path as normalize_worktree_removal_target, run_git_read_bounded,
-    GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind, NativeGitWorktreeSnapshot,
+    removal_lookup_path as normalize_worktree_removal_target,
+    resolve_base_commit_with_timeout,
+    run_git_read_bounded, GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind,
+    NativeGitWorktreeSnapshot,
+};
+use crate::worktree_service::{
+    exact_created_worktree, exact_owned_worktree, ManagedWorktreeLeaseRecord,
+    ManagedWorktreeProfile, ManagedWorktreeRegistry, ManagedWorktreeSessionHolder,
 };
 use crate::session_registry::{
     self, validate_display_name, LoadedNodeState, MAX_MANAGED_SESSION_RECORDS,
@@ -37,7 +45,10 @@ use crate::protocol::{
     ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
     ProviderRuntimeStatuses, ResolvedSpawnReceipt, ResolvedSpawnSpec, ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
-    ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind,
+    ManagedSessionState, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
+    ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
+    ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest, SessionRecordId,
+    StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnIdempotencyKey, SpawnRequiredCapabilities, SpawnSpec, WorkspaceFileContent,
     WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     DEFAULT_CONTROLLER_LEASE_MS,
@@ -45,11 +56,12 @@ use crate::protocol::{
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY, NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
-    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3,
+    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4,
     SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
     SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
     SPAWN_RUNTIME_STRUCTURED_PROMPT,
@@ -164,6 +176,7 @@ pub struct WorkspaceConfig {
     workspace_id: WorkspaceId,
     canonical_root: String,
     worktree_service_mode: WorktreeServiceMode,
+    managed_worktree_profiles: BTreeMap<WorktreeProfileId, ManagedWorktreeProfile>,
 }
 
 impl WorkspaceConfig {
@@ -206,6 +219,7 @@ impl WorkspaceConfig {
             workspace_id,
             canonical_root,
             worktree_service_mode: WorktreeServiceMode::Manual,
+            managed_worktree_profiles: BTreeMap::new(),
         })
     }
 
@@ -220,6 +234,29 @@ impl WorkspaceConfig {
     pub fn with_worktree_service_mode(mut self, mode: WorktreeServiceMode) -> Self {
         self.worktree_service_mode = mode;
         self
+    }
+
+    pub fn with_managed_worktree_profile(
+        mut self,
+        profile: ManagedWorktreeProfile,
+    ) -> Result<Self, NodeServerError> {
+        profile.validate_for_workspace(&self.canonical_root).map_err(|message| {
+            NodeServerError::InvalidManagedWorktreeProfile {
+                workspace_id: self.workspace_id.clone(),
+                profile_id: profile.profile_id().clone(),
+                message,
+            }
+        })?;
+        if self.managed_worktree_profiles
+            .insert(profile.profile_id().clone(), profile.clone())
+            .is_some()
+        {
+            return Err(NodeServerError::DuplicateManagedWorktreeProfile {
+                workspace_id: self.workspace_id,
+                profile_id: profile.profile_id().clone(),
+            });
+        }
+        Ok(self)
     }
 }
 
@@ -264,6 +301,20 @@ impl NodeServerConfig {
         let mut workspace_ids = BTreeMap::new();
         let mut workspace_roots = BTreeMap::new();
         for workspace in &workspaces {
+            if workspace.worktree_service_mode == WorktreeServiceMode::Managed
+                && workspace.managed_worktree_profiles.is_empty()
+            {
+                return Err(NodeServerError::ManagedWorktreeProfileRequired(
+                    workspace.workspace_id.clone(),
+                ));
+            }
+            if workspace.worktree_service_mode != WorktreeServiceMode::Managed
+                && !workspace.managed_worktree_profiles.is_empty()
+            {
+                return Err(NodeServerError::ManagedWorktreeProfileModeMismatch(
+                    workspace.workspace_id.clone(),
+                ));
+            }
             if workspace_ids
                 .insert(workspace.workspace_id.clone(), ())
                 .is_some()
@@ -503,8 +554,11 @@ impl NodeServer {
         let events = handle.subscribe(CONTROL_EVENT_SUBSCRIPTION_CAPACITY);
         let incarnation_id = random_incarnation_id()
             .map_err(NodeServerError::IncarnationIdentity)?;
-        let loaded = session_registry::load(config.state_path.as_deref(), &config.node_id)
+        let mut loaded = session_registry::load(config.state_path.as_deref(), &config.node_id)
             .map_err(durable_state_load_error)?;
+        let managed_worktrees = std::mem::take(&mut loaded.managed_worktrees);
+        let managed_worktree_tombstones =
+            std::mem::take(&mut loaded.managed_worktree_tombstones);
         let (workspaces, records, persistence_warning) =
             merge_durable_state(&config.workspaces, loaded)?;
         let shared = Arc::new(NodeShared::new_with_incarnation(
@@ -521,6 +575,8 @@ impl NodeServer {
             config.spawn_profiles.clone(),
             config.state_path.clone(),
             records,
+            managed_worktrees,
+            managed_worktree_tombstones,
             persistence_warning,
             input_settle_timeout_ms,
         ));
@@ -567,6 +623,7 @@ impl NodeServer {
             events,
             state_path_lock: _state_path_lock,
         } = self;
+        shared.reconcile_managed_worktrees().await;
         runtime
             .start_hook_ingress(HookIngressConfig::default())
             .await
@@ -947,6 +1004,9 @@ struct NodeShared {
     started_at_unix_ms: u64,
     workspaces: RwLock<BTreeMap<WorkspaceId, String>>,
     worktree_service_modes: BTreeMap<WorkspaceId, WorktreeServiceMode>,
+    managed_worktree_profiles:
+        BTreeMap<WorkspaceId, BTreeMap<WorktreeProfileId, ManagedWorktreeProfile>>,
+    managed_worktrees: Mutex<ManagedWorktreeRegistry>,
     enabled_providers: Vec<AgentId>,
     provider_runtime_statuses: ProviderRuntimeStatuses,
     provider_runtime_status_updates:
@@ -986,6 +1046,7 @@ struct SessionBinding {
     runtime_policy: ProviderRuntimePolicy,
     pending_resume: Option<(SessionGeneration, CommandId, ProviderRuntimePolicy)>,
     record_id: Option<SessionRecordId>,
+    managed_worktree_lease_id: Option<ManagedWorktreeLeaseId>,
 }
 
 struct SessionRecords {
@@ -997,9 +1058,19 @@ struct SpawnIdempotencyCache {
 }
 
 struct SpawnIdempotencyEntry {
-    spec: SpawnSpec,
-    result: Result<ResolvedSpawnReceipt, NodeFailure>,
+    value: SpawnIdempotencyValue,
     expires_at: Instant,
+}
+
+enum SpawnIdempotencyValue {
+    Standard {
+        spec: SpawnSpec,
+        result: Result<ResolvedSpawnReceipt, NodeFailure>,
+    },
+    Managed {
+        request: ManagedWorktreeSpawnRequest,
+        result: Result<ManagedWorktreeSpawnReceipt, NodeFailure>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1041,6 +1112,8 @@ impl NodeShared {
         spawn_profiles: SpawnProfileRegistry,
         state_path: Option<PathBuf>,
         records: Vec<ManagedSessionRecord>,
+        managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+        managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
         persistence_warning: Option<String>,
         input_settle_timeout_ms: u64,
     ) -> Self {
@@ -1050,12 +1123,31 @@ impl NodeShared {
             .iter()
             .map(|record| (record.record_id.clone(), record.provider.clone()))
             .collect();
-        let worktree_service_modes = workspaces
+        let mut worktree_service_modes: BTreeMap<WorkspaceId, WorktreeServiceMode> = workspaces
             .iter()
             .map(|workspace| {
                 (workspace.workspace_id.clone(), workspace.worktree_service_mode)
             })
             .collect();
+        for lease in &managed_worktrees {
+            worktree_service_modes.insert(lease.workspace_id.clone(), WorktreeServiceMode::Off);
+        }
+        let managed_worktree_profiles = workspaces.iter()
+            .map(|workspace| (
+                workspace.workspace_id.clone(),
+                workspace.managed_worktree_profiles.clone(),
+            ))
+            .collect();
+        let mut managed_worktrees = ManagedWorktreeRegistry::from_records(
+            managed_worktrees,
+            managed_worktree_tombstones,
+        ).expect("durable managed worktree registry was validated while loading");
+        managed_worktrees.clear_stale_session_holders(incarnation_id, unix_time_ms());
+        managed_worktrees.reattach_record_holders(
+            &records.iter().map(|record| (record.record_id.clone(), record.workspace_id.clone()))
+                .collect::<Vec<_>>(),
+            unix_time_ms(),
+        );
         Self {
             handle,
             access_token,
@@ -1073,6 +1165,8 @@ impl NodeShared {
                     .collect(),
             ),
             worktree_service_modes,
+            managed_worktree_profiles,
+            managed_worktrees: Mutex::new(managed_worktrees),
             enabled_providers,
             provider_runtime_statuses,
             provider_runtime_status_updates: RwLock::new(BTreeMap::new()),
@@ -1135,6 +1229,8 @@ impl NodeShared {
             Vec::new(),
             SpawnProfileRegistry::default(),
             None,
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             None,
             MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
@@ -1213,13 +1309,19 @@ impl NodeShared {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.entries.retain(|_, entry| entry.expires_at > now);
         if let Some(entry) = cache.entries.get(&spec.idempotency_key) {
-            if entry.spec != *spec {
+            let SpawnIdempotencyValue::Standard { spec: existing, result } = &entry.value else {
+                return Err(failure(
+                    NodeFailureCode::SpawnIdempotencyConflict,
+                    "spawn idempotency key was reused across spawn kinds",
+                ));
+            };
+            if existing != spec {
                 return Err(failure(
                     NodeFailureCode::SpawnIdempotencyConflict,
                     "spawn idempotency key was reused with a different specification",
                 ));
             }
-            return Ok(Some(entry.result.clone()));
+            return Ok(Some(result.clone()));
         }
         if cache.entries.len() >= SPAWN_IDEMPOTENCY_MAX_ENTRIES {
             return Err(failure(
@@ -1244,8 +1346,57 @@ impl NodeShared {
             .insert(
                 spec.idempotency_key.clone(),
                 SpawnIdempotencyEntry {
-                    spec,
-                    result,
+                    value: SpawnIdempotencyValue::Standard { spec, result },
+                    expires_at: accepted_at + Duration::from_millis(SPAWN_IDEMPOTENCY_TTL_MS),
+                },
+            );
+    }
+
+    fn replay_managed_spawn(
+        &self,
+        request: &ManagedWorktreeSpawnRequest,
+        now: Instant,
+    ) -> Result<Option<Result<ManagedWorktreeSpawnReceipt, NodeFailure>>, NodeFailure> {
+        let mut cache = self.spawn_idempotency.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.entries.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.entries.get(&request.spawn_spec.idempotency_key) {
+            let SpawnIdempotencyValue::Managed { request: existing, result } = &entry.value else {
+                return Err(failure(
+                    NodeFailureCode::SpawnIdempotencyConflict,
+                    "spawn idempotency key was reused across spawn kinds",
+                ));
+            };
+            if existing != request {
+                return Err(failure(
+                    NodeFailureCode::SpawnIdempotencyConflict,
+                    "spawn idempotency key was reused with a different managed specification",
+                ));
+            }
+            return Ok(Some(result.clone()));
+        }
+        if cache.entries.len() >= SPAWN_IDEMPOTENCY_MAX_ENTRIES {
+            return Err(failure(
+                NodeFailureCode::SpawnIdempotencyCapacity,
+                "spawn idempotency cache reached its bounded capacity",
+            ));
+        }
+        Ok(None)
+    }
+
+    fn remember_managed_spawn(
+        &self,
+        request: ManagedWorktreeSpawnRequest,
+        result: Result<ManagedWorktreeSpawnReceipt, NodeFailure>,
+        accepted_at: Instant,
+    ) {
+        self.spawn_idempotency.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .insert(
+                request.spawn_spec.idempotency_key.clone(),
+                SpawnIdempotencyEntry {
+                    value: SpawnIdempotencyValue::Managed { request, result },
                     expires_at: accepted_at + Duration::from_millis(SPAWN_IDEMPOTENCY_TTL_MS),
                 },
             );
@@ -1293,6 +1444,16 @@ impl NodeShared {
         let Some(worktree_id) = resolved.target.worktree_id.as_ref() else {
             return Ok(resolved.target.workspace_id.clone());
         };
+        if self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_for_workspace(worktree_id)
+            .is_some()
+        {
+            return Err(failure(
+                NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                "managed worktree targets may only be spawned through their lease request",
+            ));
+        }
         self.require_worktree_service(&resolved.target.workspace_id)?;
         let source_root = self.workspace_root(&resolved.target.workspace_id)?;
         let selected_root = self.workspace_root(worktree_id)?;
@@ -1330,6 +1491,18 @@ impl NodeShared {
                 return result;
             }
         };
+        if self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_for_workspace(&spawn_workspace_id)
+            .is_some()
+        {
+            let result = Err(failure(
+                NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                "managed worktree targets may only be spawned through their lease request",
+            ));
+            self.remember_spawn_spec(spec, result.clone(), accepted_at);
+            return result;
+        }
         let result = self
             .spawn_session_with_deadline(
                 spawn_workspace_id,
@@ -1337,6 +1510,8 @@ impl NodeShared {
                 resolved.mode,
                 resolved.terminal_size,
                 resolved.prompt.as_ref().map(|prompt| prompt.as_str().to_owned()),
+                None,
+                None,
                 Some(deadline),
                 &required_capabilities,
             )
@@ -1344,6 +1519,441 @@ impl NodeShared {
             .map(|session| resolved.receipt(self.incarnation_id, session));
         self.remember_spawn_spec(spec, result.clone(), accepted_at);
         result
+    }
+
+    async fn spawn_managed_worktree(
+        &self,
+        request: ManagedWorktreeSpawnRequest,
+    ) -> Result<ManagedWorktreeSpawnReceipt, NodeFailure> {
+        let accepted_at = Instant::now();
+        if let Some(replayed) = self.replay_managed_spawn(&request, accepted_at)? {
+            return replayed;
+        }
+        if request.spawn_spec.target.worktree_id.is_some() {
+            let result = Err(failure(
+                NodeFailureCode::InvalidRequest,
+                "managed worktree spawn must not select a caller-provided worktree",
+            ));
+            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            return result;
+        }
+        let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
+        let source_workspace_id = resolved.target.workspace_id.clone();
+        let profile = self.managed_profile(&source_workspace_id, &request.worktree_profile_id)?;
+        let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
+        let required_capabilities = spawn_runtime_capabilities(&resolved.required_capabilities)?;
+        let runtime_requirement = match (resolved.mode, resolved.prompt.is_some()) {
+            (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
+            (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPrompt,
+            (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
+        };
+        let runtime_policy = timeout(
+            spawn_deadline_remaining(deadline)?,
+            self.admit_provider_runtime(&resolved.provider, runtime_requirement),
+        ).await.map_err(|_| failure(
+            NodeFailureCode::SpawnDeadlineExceeded,
+            "provider admission exceeded the managed spawn deadline",
+        ))??;
+        if required_capabilities.iter().any(|capability| !runtime_policy.admits(*capability)) {
+            return Err(failure(
+                NodeFailureCode::UnsupportedSpawnCapability,
+                "provider runtime does not admit a required spawn capability",
+            ));
+        }
+        self.ensure_binding_capacity()?;
+        let source_root = self.workspace_root(&source_workspace_id)?;
+        profile.validate_for_workspace(&source_root)
+            .map_err(|message| failure(NodeFailureCode::ManagedWorktreeOwnershipConflict, &message))?;
+        let base_timeout_ms = u64::try_from(
+            spawn_deadline_remaining(deadline)?.as_millis(),
+        ).unwrap_or(u64::MAX).max(1);
+        let base_commit = resolve_base_commit_with_timeout(
+            &source_root,
+            profile.base(),
+            base_timeout_ms,
+        ).await.map_err(|error| {
+            if Instant::now() >= deadline || error.message.contains("timed out") {
+                failure(
+                    NodeFailureCode::SpawnDeadlineExceeded,
+                    "managed worktree base resolution exceeded the spawn deadline",
+                )
+            } else {
+                managed_git_worktree_failure(error)
+            }
+        })?;
+
+        let lease = {
+            let _transaction = self.state_transaction.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            let lease = self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .allocate(source_workspace_id.clone(), &profile, base_commit.clone(), unix_time_ms())
+                .map_err(|message| failure(NodeFailureCode::BackendBusy, &message))?;
+            if let Err(error) = self.persist_state_locked() {
+                *self.managed_worktrees.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
+                return Err(persistence_failure(error));
+            }
+            lease
+        };
+        self.publish(NodeEvent::ManagedWorktreeUpserted { lease: lease.snapshot() });
+        if let Err(message) = profile.validate_target_authority(&lease.lease_id, &lease.target_root) {
+            self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove_unmutated(&lease.lease_id);
+            if self.persist_state().is_err() {
+                self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+            }
+            let result = Err(failure(NodeFailureCode::ManagedWorktreeOwnershipConflict, &message));
+            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            return result;
+        }
+        let mutation_timeout_ms = match spawn_deadline_remaining(deadline) {
+            Ok(remaining) => u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX).max(1),
+            Err(error) => {
+                self.reconcile_failed_allocation(&lease, &source_root).await;
+                let result = Err(error);
+                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                return result;
+            }
+        };
+        let created = match create_git_worktree_with_timeout(
+                &source_root,
+                &lease.target_root,
+                &lease.branch,
+                Some(&base_commit),
+                mutation_timeout_ms,
+            ).await {
+            Ok(created) => created,
+            Err(error) => {
+                self.reconcile_failed_allocation(&lease, &source_root).await;
+                let result = Err(if Instant::now() >= deadline
+                    || error.message.contains("timed out")
+                    || error.message.contains("deadline")
+                {
+                    failure(
+                        NodeFailureCode::SpawnDeadlineExceeded,
+                        "managed worktree creation exceeded the spawn deadline",
+                    )
+                } else {
+                    managed_git_worktree_failure(error)
+                });
+                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                return result;
+            }
+        };
+        if !exact_created_worktree(&lease, &created.path, created.branch.as_deref(), &created.head) {
+            self.mark_managed_recovery_required(&lease.lease_id, ManagedWorktreeCleanupFailure::OwnershipConflict);
+            let result = Err(failure(
+                NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                "created worktree identity did not match its durable lease",
+            ));
+            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            return result;
+        }
+        {
+            let mut registry = self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = registry.get_mut(&lease.lease_id)
+                .expect("allocated managed worktree lease remains present");
+            current.expected_head = Some(created.head.clone());
+            current.state = ManagedWorktreeLeaseState::Ready;
+            current.updated_at_unix_ms = unix_time_ms();
+        }
+        if let Err(error) = self.persist_state() {
+            self.mark_managed_recovery_required(
+                &lease.lease_id,
+                ManagedWorktreeCleanupFailure::Backend,
+            );
+            let result = Err(persistence_failure(error));
+            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            return result;
+        }
+        let ready = self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&lease.lease_id)
+            .expect("ready managed worktree lease remains present")
+            .snapshot();
+        self.publish(NodeEvent::ManagedWorktreeUpserted { lease: ready });
+        if let Err(error) = self.register_workspace(lease.workspace_id.clone(), created.path.clone()).await {
+            let _ = self.cleanup_managed_worktree(&lease.lease_id, true).await;
+            let result = Err(error);
+            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            return result;
+        }
+        let spawn = self.spawn_session_with_deadline(
+            lease.workspace_id.clone(),
+            resolved.provider.clone(),
+            resolved.mode,
+            resolved.terminal_size,
+            resolved.prompt.as_ref().map(|prompt| prompt.as_str().to_owned()),
+            Some(lease.lease_id.clone()),
+            Some(runtime_policy),
+            Some(deadline),
+            &required_capabilities,
+        ).await;
+        let session = match spawn {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self.cleanup_managed_worktree(&lease.lease_id, true).await;
+                let result = Err(error);
+                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                return result;
+            }
+        };
+        let record_id = {
+            let mut bindings = self.session_bindings.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let binding = bindings.get_mut(&session.session.instance_id)
+                .expect("successful spawn retains its session binding");
+            binding.managed_worktree_lease_id = Some(lease.lease_id.clone());
+            binding.record_id.clone()
+        };
+        let bound = self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bind_session(
+                &lease.lease_id,
+                ManagedWorktreeSessionHolder {
+                    incarnation_id: self.incarnation_id,
+                    instance_id: session.session.instance_id,
+                    generation: session.session.generation,
+                },
+                record_id,
+                unix_time_ms(),
+            )
+            .map_err(|message| failure(NodeFailureCode::ManagedWorktreeRecoveryRequired, &message));
+        let snapshot = match bound {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = self.remove_session(&session).await;
+                self.mark_managed_recovery_required(
+                    &lease.lease_id,
+                    ManagedWorktreeCleanupFailure::Backend,
+                );
+                let result = Err(error);
+                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                return result;
+            }
+        };
+        if let Err(error) = self.persist_state() {
+            let _ = self.remove_session(&session).await;
+            let _ = self.cleanup_managed_worktree(&lease.lease_id, true).await;
+            let result = Err(persistence_failure(error));
+            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            return result;
+        }
+        self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot.clone() });
+        let receipt = managed_spawn_receipt(&resolved, self.incarnation_id, session, snapshot);
+        let result = Ok(receipt);
+        self.remember_managed_spawn(request, result.clone(), accepted_at);
+        result
+    }
+
+    fn managed_profile(
+        &self,
+        workspace_id: &WorkspaceId,
+        profile_id: &WorktreeProfileId,
+    ) -> Result<ManagedWorktreeProfile, NodeFailure> {
+        if self.worktree_service_modes.get(workspace_id).copied()
+            != Some(WorktreeServiceMode::Managed)
+        {
+            return Err(failure(
+                NodeFailureCode::UnsupportedSpawnCapability,
+                "workspace does not enable managed worktrees",
+            ));
+        }
+        self.managed_worktree_profiles.get(workspace_id)
+            .and_then(|profiles| profiles.get(profile_id))
+            .cloned()
+            .ok_or_else(|| failure(
+                NodeFailureCode::InvalidRequest,
+                "managed worktree profile is unavailable for this workspace",
+            ))
+    }
+
+    async fn reconcile_failed_allocation(
+        &self,
+        lease: &ManagedWorktreeLeaseRecord,
+        source_root: &str,
+    ) {
+        match list_git_worktrees(source_root).await {
+            Ok(worktrees) => {
+                match worktrees.iter().find(|item| worktree_paths_equal(&item.path, &lease.target_root)) {
+                    None => {
+                        match std::fs::symlink_metadata(&lease.target_root) {
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                self.managed_worktrees.lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .remove_unmutated(&lease.lease_id);
+                                let _ = self.persist_state();
+                            }
+                            _ => self.mark_managed_recovery_required(
+                                &lease.lease_id,
+                                ManagedWorktreeCleanupFailure::OwnershipConflict,
+                            ),
+                        }
+                    }
+                    Some(item) if exact_owned_worktree(
+                        lease,
+                        &item.path,
+                        item.branch.as_deref(),
+                        &item.head,
+                    ) => {
+                        let _ = self.cleanup_managed_worktree(&lease.lease_id, true).await;
+                    }
+                    Some(_) => self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::OwnershipConflict,
+                    ),
+                }
+            }
+            Err(_) => self.mark_managed_recovery_required(
+                &lease.lease_id,
+                ManagedWorktreeCleanupFailure::Backend,
+            ),
+        }
+    }
+
+    async fn reconcile_managed_worktrees(&self) {
+        let leases = self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_records()
+            .cloned()
+            .collect::<Vec<_>>();
+        for lease in leases {
+            let profile = match self.managed_profile(&lease.source_workspace_id, &lease.profile_id) {
+                Ok(profile) if profile.revision() == &lease.profile_revision => profile,
+                _ => {
+                    self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::OwnershipConflict,
+                    );
+                    continue;
+                }
+            };
+            if profile.validate_target_authority(&lease.lease_id, &lease.target_root).is_err() {
+                self.mark_managed_recovery_required(
+                    &lease.lease_id,
+                    ManagedWorktreeCleanupFailure::OwnershipConflict,
+                );
+                continue;
+            }
+            let source_root = match self.workspace_root(&lease.source_workspace_id) {
+                Ok(root) => root,
+                Err(_) => {
+                    self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::OwnershipConflict,
+                    );
+                    continue;
+                }
+            };
+            let worktrees = match list_git_worktrees(&source_root).await {
+                Ok(worktrees) => worktrees,
+                Err(_) => {
+                    self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::Backend,
+                    );
+                    continue;
+                }
+            };
+            let listed = worktrees.iter()
+                .find(|item| worktree_paths_equal(&item.path, &lease.target_root));
+            let Some(listed) = listed else {
+                match std::fs::symlink_metadata(&lease.target_root) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound
+                        && lease.state == ManagedWorktreeLeaseState::Allocating
+                        && !lease.has_holders() => {
+                            let removed = self.managed_worktrees.lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .tombstone(&lease.lease_id, unix_time_ms());
+                            if self.persist_state().is_ok() && removed.is_some() {
+                                self.publish(NodeEvent::ManagedWorktreeRemoved {
+                                    lease_id: lease.lease_id.clone(),
+                                });
+                            }
+                        }
+                    _ => self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::OwnershipConflict,
+                    ),
+                }
+                continue;
+            };
+            if listed.is_main || listed.is_bare || !exact_owned_worktree(
+                &lease,
+                &listed.path,
+                listed.branch.as_deref(),
+                &listed.head,
+            ) {
+                self.mark_managed_recovery_required(
+                    &lease.lease_id,
+                    ManagedWorktreeCleanupFailure::OwnershipConflict,
+                );
+                continue;
+            }
+            if !self.workspaces.read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&lease.workspace_id)
+            {
+                if self.register_workspace(lease.workspace_id.clone(), listed.path.clone()).await.is_err() {
+                    self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::Backend,
+                    );
+                    continue;
+                }
+            }
+            let snapshot = {
+                let mut registry = self.managed_worktrees.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let current = registry.get_mut(&lease.lease_id)
+                    .expect("reconciled managed lease remains present");
+                current.expected_head = Some(listed.head.clone());
+                current.cleanup_failure = None;
+                current.state = if current.has_holders() {
+                    ManagedWorktreeLeaseState::InUse
+                } else if current.retention == ManagedWorktreeRetention::Retain {
+                    ManagedWorktreeLeaseState::Retained
+                } else {
+                    ManagedWorktreeLeaseState::Ready
+                };
+                current.updated_at_unix_ms = unix_time_ms();
+                current.snapshot()
+            };
+            if self.persist_state().is_err() {
+                self.mark_managed_recovery_required(
+                    &lease.lease_id,
+                    ManagedWorktreeCleanupFailure::Backend,
+                );
+                continue;
+            }
+            self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot.clone() });
+            if snapshot.state == ManagedWorktreeLeaseState::Ready {
+                let _ = self.cleanup_managed_worktree(&lease.lease_id, false).await;
+            }
+        }
+    }
+
+    fn mark_managed_recovery_required(
+        &self,
+        lease_id: &ManagedWorktreeLeaseId,
+        failure_kind: ManagedWorktreeCleanupFailure,
+    ) {
+        let snapshot = {
+            let mut registry = self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(lease) = registry.get_mut(lease_id) else { return };
+            lease.state = ManagedWorktreeLeaseState::RecoveryRequired;
+            lease.cleanup_failure = Some(failure_kind);
+            lease.updated_at_unix_ms = unix_time_ms();
+            lease.snapshot()
+        };
+        let _ = self.persist_state();
+        self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot });
     }
 
     fn set_persistence_error(&self, error: Option<String>) {
@@ -1376,11 +1986,21 @@ impl NodeShared {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let result = session_registry::save(
+        let mut managed = self.managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        managed.reattach_record_holders(
+            &records.iter().map(|record| (record.record_id.clone(), record.workspace_id.clone()))
+                .collect::<Vec<_>>(),
+            unix_time_ms(),
+        );
+        let result = session_registry::save_v4(
             self.state_path.as_deref(),
             &self.node_id,
             &workspaces,
             &records,
+            &managed.records(),
+            &managed.tombstones(),
         );
         match &result {
             Ok(warning) => self.set_persistence_error(warning.clone()),
@@ -1476,6 +2096,7 @@ impl NodeShared {
             runtime_policy,
             pending_resume: None,
             record_id: None,
+            managed_worktree_lease_id: None,
         });
     }
 
@@ -1499,6 +2120,7 @@ impl NodeShared {
                 runtime_policy,
                 pending_resume: None,
                 record_id: Some(record_id),
+                managed_worktree_lease_id: None,
             },
         );
     }
@@ -1795,6 +2417,9 @@ impl NodeShared {
         record_id: &SessionRecordId,
     ) -> Result<(), NodeFailure> {
         let record = self.record(record_id)?;
+        let managed_lease_id = self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_for_workspace(&record.workspace_id);
         if record.active_session.is_some()
             || matches!(
                 record.state,
@@ -1827,6 +2452,16 @@ impl NodeShared {
         self.publish(NodeEvent::SessionRecordRemoved {
             record_id: record_id.clone(),
         });
+        if let Some(lease_id) = managed_lease_id {
+            if let Some(snapshot) = self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&lease_id)
+                .map(ManagedWorktreeLeaseRecord::snapshot)
+            {
+                self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot });
+            }
+            let _ = self.cleanup_managed_worktree(&lease_id, false).await;
+        }
         Ok(())
     }
 
@@ -1980,7 +2615,52 @@ impl NodeShared {
             .wait_for_record_resume(&address, started_after)
             .await
         {
-            Ok(settled_address) => Ok((self.record(record_id)?, settled_address)),
+            Ok(settled_address) => {
+                let managed_lease_id = {
+                    self.managed_worktrees.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .lease_for_workspace(&record.workspace_id)
+                };
+                if let Some(lease_id) = managed_lease_id {
+                    {
+                        let mut bindings = self.session_bindings.lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let binding = bindings.get_mut(&settled_address.session.instance_id)
+                            .ok_or_else(|| failure(
+                                NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                                "resumed managed session lost its exact binding",
+                            ))?;
+                        if binding.generation != settled_address.session.generation {
+                            return Err(failure(
+                                NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                                "resumed managed session generation diverged",
+                            ));
+                        }
+                        binding.managed_worktree_lease_id = Some(lease_id.clone());
+                    }
+                    let snapshot = self.managed_worktrees.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .bind_session(
+                            &lease_id,
+                            ManagedWorktreeSessionHolder {
+                                incarnation_id: self.incarnation_id,
+                                instance_id: settled_address.session.instance_id,
+                                generation: settled_address.session.generation,
+                            },
+                            Some(record_id.clone()),
+                            unix_time_ms(),
+                        ).map_err(|message| failure(
+                            NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                            &message,
+                        ))?;
+                    if let Err(error) = self.persist_state() {
+                        let _ = self.remove_session(&settled_address).await;
+                        return Err(persistence_failure(error));
+                    }
+                    self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot });
+                }
+                Ok((self.record(record_id)?, settled_address))
+            }
             Err(error) => {
                 if matches!(
                     error.code,
@@ -2487,10 +3167,186 @@ impl NodeShared {
         Ok(registered_workspace_id)
     }
 
+    async fn cleanup_managed_worktree(
+        &self,
+        lease_id: &ManagedWorktreeLeaseId,
+        explicit: bool,
+    ) -> Result<ManagedWorktreeLeaseSnapshot, NodeFailure> {
+        let lease = self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| failure(
+                NodeFailureCode::UnknownManagedWorktreeLease,
+                "managed worktree lease does not exist",
+            ))?;
+        if lease.state == ManagedWorktreeLeaseState::Removed {
+            return Ok(lease.snapshot());
+        }
+        if lease.has_holders() {
+            return Err(failure(
+                NodeFailureCode::ManagedWorktreeBusy,
+                "managed worktree lease still has a session or durable-record holder",
+            ));
+        }
+        if !explicit && lease.retention == ManagedWorktreeRetention::Retain {
+            let snapshot = {
+                let mut registry = self.managed_worktrees.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let current = registry.get_mut(lease_id)
+                    .expect("managed worktree lease remains present");
+                current.state = ManagedWorktreeLeaseState::Retained;
+                current.cleanup_failure = None;
+                current.updated_at_unix_ms = unix_time_ms();
+                current.snapshot()
+            };
+            if self.persist_state().is_err() {
+                self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+            }
+            self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot.clone() });
+            return Ok(snapshot);
+        }
+        let profile = self.managed_profile(&lease.source_workspace_id, &lease.profile_id)?;
+        if profile.revision() != &lease.profile_revision {
+            self.mark_managed_recovery_required(
+                lease_id,
+                ManagedWorktreeCleanupFailure::OwnershipConflict,
+            );
+            return Err(failure(
+                NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                "managed worktree profile revision changed",
+            ));
+        }
+        profile.validate_target_authority(&lease.lease_id, &lease.target_root).map_err(|message| {
+            self.mark_managed_recovery_required(
+                lease_id,
+                ManagedWorktreeCleanupFailure::OwnershipConflict,
+            );
+            failure(NodeFailureCode::ManagedWorktreeOwnershipConflict, &message)
+        })?;
+        let source_root = self.workspace_root(&lease.source_workspace_id)?;
+        let listed = list_git_worktrees(&source_root).await.map_err(|error| {
+            self.mark_managed_cleanup_blocked(lease_id, ManagedWorktreeCleanupFailure::Backend);
+            managed_git_worktree_failure(error)
+        })?;
+        let target = listed.iter()
+            .find(|item| worktree_paths_equal(&item.path, &lease.target_root));
+        if let Some(target) = target {
+            if target.is_main || target.is_bare || !exact_owned_worktree(
+                &lease,
+                &target.path,
+                target.branch.as_deref(),
+                &target.head,
+            ) {
+                self.mark_managed_recovery_required(
+                    lease_id,
+                    ManagedWorktreeCleanupFailure::OwnershipConflict,
+                );
+                return Err(failure(
+                    NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                    "Git worktree identity no longer matches the managed lease",
+                ));
+            }
+            if target.prunable {
+                self.mark_managed_cleanup_blocked(
+                    lease_id,
+                    ManagedWorktreeCleanupFailure::Prunable,
+                );
+                return Err(failure(
+                    NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                    "managed worktree is prunable and requires recovery",
+                ));
+            }
+            if let Err(error) = remove_git_worktree(&source_root, &target.path).await {
+                let failure_kind = match error.kind {
+                    GitWorktreeErrorKind::Dirty => ManagedWorktreeCleanupFailure::Dirty,
+                    GitWorktreeErrorKind::Locked => ManagedWorktreeCleanupFailure::Locked,
+                    GitWorktreeErrorKind::Protected => ManagedWorktreeCleanupFailure::OwnershipConflict,
+                    GitWorktreeErrorKind::Conflict => ManagedWorktreeCleanupFailure::Busy,
+                    GitWorktreeErrorKind::Invalid | GitWorktreeErrorKind::NotRepository
+                    | GitWorktreeErrorKind::Failed => ManagedWorktreeCleanupFailure::Backend,
+                };
+                if failure_kind == ManagedWorktreeCleanupFailure::OwnershipConflict {
+                    self.mark_managed_recovery_required(lease_id, failure_kind);
+                } else {
+                    self.mark_managed_cleanup_blocked(lease_id, failure_kind);
+                }
+                return Err(managed_git_worktree_failure(error));
+            }
+        } else {
+            match std::fs::symlink_metadata(&lease.target_root) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    self.mark_managed_recovery_required(
+                        lease_id,
+                        ManagedWorktreeCleanupFailure::OwnershipConflict,
+                    );
+                    return Err(failure(
+                        NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                        "managed target exists but is not owned by Git",
+                    ));
+                }
+                Err(_) => {
+                    self.mark_managed_cleanup_blocked(
+                        lease_id,
+                        ManagedWorktreeCleanupFailure::Backend,
+                    );
+                    return Err(failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed target identity could not be inspected",
+                    ));
+                }
+            }
+        }
+        let registered = self.workspaces.read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&lease.workspace_id);
+        if registered {
+            self.unregister_workspace(&lease.workspace_id)?;
+        }
+        let removed = {
+            self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tombstone(lease_id, unix_time_ms())
+                .expect("managed worktree lease remains present during cleanup")
+        };
+        self.persist_state().map_err(persistence_failure)?;
+        self.publish(NodeEvent::ManagedWorktreeRemoved { lease_id: lease_id.clone() });
+        Ok(removed.snapshot())
+    }
+
+    fn mark_managed_cleanup_blocked(
+        &self,
+        lease_id: &ManagedWorktreeLeaseId,
+        failure_kind: ManagedWorktreeCleanupFailure,
+    ) {
+        let snapshot = {
+            let mut registry = self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(lease) = registry.get_mut(lease_id) else { return };
+            lease.state = ManagedWorktreeLeaseState::CleanupBlocked;
+            lease.cleanup_failure = Some(failure_kind);
+            lease.updated_at_unix_ms = unix_time_ms();
+            lease.snapshot()
+        };
+        let _ = self.persist_state();
+        self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot });
+    }
+
     fn require_worktree_service(
         &self,
         source_workspace_id: &WorkspaceId,
     ) -> Result<(), NodeFailure> {
+        if self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_for_workspace(source_workspace_id)
+            .is_some()
+        {
+            return Err(failure(
+                NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                "managed worktree targets are internal-only workspaces",
+            ));
+        }
         match self
             .worktree_service_modes
             .get(source_workspace_id)
@@ -2502,6 +3358,37 @@ impl NodeShared {
                 NodeFailureCode::UnsupportedSpawnCapability,
                 "Git worktree service mode is unavailable in this node build",
             )),
+        }
+    }
+
+    fn managed_reservation_conflict(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+        root: Option<&str>,
+    ) -> bool {
+        self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_records()
+            .any(|lease| {
+                workspace_id.is_some_and(|workspace_id| {
+                    workspace_id == &lease.source_workspace_id
+                        || workspace_id == &lease.workspace_id
+                }) || root.is_some_and(|root| worktree_paths_equal(root, &lease.target_root))
+            })
+    }
+
+    fn reject_managed_reservation(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+        root: Option<&str>,
+    ) -> Result<(), NodeFailure> {
+        if self.managed_reservation_conflict(workspace_id, root) {
+            Err(failure(
+                NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                "managed worktree ownership may only be mutated through its lease cleanup",
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -2539,7 +3426,7 @@ impl NodeShared {
             ))
     }
 
-    fn remove_binding(&self, address: &SessionAddress) {
+    fn remove_binding(&self, address: &SessionAddress) -> Option<SessionBinding> {
         let mut bindings = self
             .session_bindings
             .lock()
@@ -2548,9 +3435,11 @@ impl NodeShared {
             binding.workspace_id == address.workspace_id
                 && binding.generation == address.session.generation
         }) {
-            bindings.remove(&address.session.instance_id);
+            let removed = bindings.remove(&address.session.instance_id);
             self.clear_terminal_frame_watermark(address);
+            return removed;
         }
+        None
     }
 
     fn clear_terminal_frame_watermark(&self, address: &SessionAddress) {
@@ -3046,6 +3935,10 @@ impl NodeShared {
                 .values()
                 .cloned()
                 .collect(),
+            managed_worktrees: self.managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshots(),
         }
     }
 
@@ -3075,7 +3968,9 @@ impl NodeShared {
                     history.removed_record_providers.insert(sequence, provider);
                 }
             }
-            NodeEvent::Control { .. }
+            NodeEvent::ManagedWorktreeUpserted { .. }
+            | NodeEvent::ManagedWorktreeRemoved { .. }
+            | NodeEvent::Control { .. }
             | NodeEvent::ControllerChanged { .. }
             | NodeEvent::WorkspaceAdded { .. }
             | NodeEvent::WorkspaceRemoved { .. }
@@ -3512,6 +4407,16 @@ impl NodeShared {
         terminal_size: gate4agent_types::TerminalSize,
         initial_prompt: Option<String>,
     ) -> Result<SessionAddress, NodeFailure> {
+        if self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_for_workspace(&workspace_id)
+            .is_some()
+        {
+            return Err(failure(
+                NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                "managed worktree targets may only be spawned through their lease request",
+            ));
+        }
         self
             .spawn_session_with_deadline(
                 workspace_id,
@@ -3519,6 +4424,8 @@ impl NodeShared {
                 mode,
                 terminal_size,
                 initial_prompt,
+                None,
+                None,
                 None,
                 &[],
             )
@@ -3532,15 +4439,36 @@ impl NodeShared {
         mode: SessionMode,
         terminal_size: gate4agent_types::TerminalSize,
         initial_prompt: Option<String>,
+        managed_authority: Option<ManagedWorktreeLeaseId>,
+        admitted_runtime_policy: Option<ProviderRuntimePolicy>,
         deadline: Option<Instant>,
         required_capabilities: &[ProviderRuntimeCapability],
     ) -> Result<SessionAddress, NodeFailure> {
+        let reserved_lease = self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_for_workspace(&workspace_id);
+        match (reserved_lease.as_ref(), managed_authority.as_ref()) {
+            (Some(expected), Some(provided)) if expected == provided => {}
+            (None, None) => {}
+            _ => {
+                return Err(failure(
+                    NodeFailureCode::ManagedWorktreeOwnershipConflict,
+                    "spawn lacks exact managed worktree lease authority",
+                ));
+            }
+        }
         let runtime_requirement = match (mode, initial_prompt.is_some()) {
             (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
             (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPrompt,
             (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
         };
-        let runtime_policy = if let Some(deadline) = deadline {
+        let runtime_policy = if let Some(runtime_policy) = admitted_runtime_policy {
+            require_policy(runtime_policy, runtime_requirement).map_err(|_| failure(
+                NodeFailureCode::UnsupportedSpawnCapability,
+                "pre-admitted provider runtime no longer satisfies spawn requirements",
+            ))?;
+            runtime_policy
+        } else if let Some(deadline) = deadline {
             let remaining = spawn_deadline_remaining(deadline)?;
             timeout(
                 remaining,
@@ -3749,7 +4677,25 @@ impl NodeShared {
         )
             .await?;
         self.wait_until_removed(address, commit_timeout).await?;
-        self.remove_binding(address);
+        let removed = self.remove_binding(address);
+        if let Some(lease_id) = removed.and_then(|binding| binding.managed_worktree_lease_id) {
+            let snapshot = self.managed_worktrees.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .release_session(
+                    &lease_id,
+                    self.incarnation_id,
+                    address.session.instance_id,
+                    address.session.generation,
+                    unix_time_ms(),
+                );
+            if self.persist_state().is_err() {
+                self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+            }
+            if let Some(snapshot) = snapshot {
+                self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot });
+            }
+            let _ = self.cleanup_managed_worktree(&lease_id, false).await;
+        }
         Ok(())
     }
 
@@ -3957,6 +4903,11 @@ async fn serve_connection(
     let include_terminal_frame_events = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY
     });
+    let include_managed_worktrees = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY
+    }) && selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY
+    });
     let authenticated_permit = Arc::clone(&shared.authenticated_slots)
         .try_acquire_owned()
         .map_err(|_| NodeServerError::AuthenticatedConnectionLimit)?;
@@ -3985,6 +4936,7 @@ async fn serve_connection(
                 &shared,
                 include_provider_runtime_status,
                 include_open_provider_ids,
+                include_managed_worktrees,
             ),
             compatibility,
         }),
@@ -4057,11 +5009,16 @@ async fn serve_connection(
             pending_events.sort_unstable_by_key(|event| event.sequence);
             let burst_len = connection_event_burst_len(pending_events.len());
             for event in pending_events.drain(..burst_len) {
-                let event = if include_open_provider_ids {
+                let event = if include_managed_worktrees {
+                    Some(event)
+                } else {
+                    project_event_without_managed_worktrees(event)
+                };
+                let event = event.and_then(|event| if include_open_provider_ids {
                     Some(event)
                 } else {
                     project_event_legacy_provider_ids(&shared, event)
-                };
+                });
                 if let Some(event) = event {
                     write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
                 }
@@ -4109,6 +5066,9 @@ async fn serve_connection(
                 };
                 if !include_provider_runtime_status {
                     clear_response_provider_runtime_status(&mut reply);
+                }
+                if !include_managed_worktrees {
+                    project_response_without_managed_worktrees(&mut reply);
                 }
                 if !include_open_provider_ids {
                     project_response_legacy_provider_ids(&shared, &mut reply);
@@ -4246,7 +5206,7 @@ fn node_compatibility_support_for_manifest(
         path_semantics: platform::path_semantics(),
         local_transport: platform::local_transport(),
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: provider_contracts.to_vec(),
@@ -4265,6 +5225,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
         NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
         NODE_WORKTREE_SELECTION_CAPABILITY,
+        NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -4288,12 +5249,15 @@ fn request_uses_unnegotiated_capability(
         .is_some_and(|required| !selected(required))
         || (request.requires_worktree_selection_capability()
             && !selected(NODE_WORKTREE_SELECTION_CAPABILITY))
+        || (request.requires_spawn_spec_defaults_overrides_capability()
+            && !selected(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY))
 }
 
 fn snapshot_for_wire(
     shared: &NodeShared,
     include_provider_runtime_status: bool,
     include_open_provider_ids: bool,
+    include_managed_worktrees: bool,
 ) -> NodeSnapshot {
     let mut snapshot = shared.snapshot();
     if !include_provider_runtime_status {
@@ -4302,7 +5266,47 @@ fn snapshot_for_wire(
     if !include_open_provider_ids {
         project_snapshot_legacy_provider_ids(&mut snapshot);
     }
+    if !include_managed_worktrees {
+        snapshot.managed_worktrees.clear();
+    }
     snapshot
+}
+
+fn project_event_without_managed_worktrees(
+    envelope: NodeEventEnvelope,
+) -> Option<NodeEventEnvelope> {
+    (!matches!(
+        envelope.event,
+        NodeEvent::ManagedWorktreeUpserted { .. }
+            | NodeEvent::ManagedWorktreeRemoved { .. }
+    )).then_some(envelope)
+}
+
+fn project_response_without_managed_worktrees(reply: &mut ResponseEnvelope) {
+    if matches!(
+        reply.result,
+        Ok(NodeResponse::ManagedWorktreeSpawnAccepted { .. })
+            | Ok(NodeResponse::ManagedWorktreeCleanup { .. })
+    ) {
+        reply.result = Err(failure(
+            NodeFailureCode::UnsupportedCapability,
+            "managed worktree capability was not negotiated",
+        ));
+        return;
+    }
+    let Ok(response) = reply.result.as_mut() else { return };
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => snapshot.managed_worktrees.clear(),
+        NodeResponse::Resync { snapshot, events, .. } => {
+            snapshot.managed_worktrees.clear();
+            events.retain(|event| !matches!(
+                event.event,
+                NodeEvent::ManagedWorktreeUpserted { .. }
+                    | NodeEvent::ManagedWorktreeRemoved { .. }
+            ));
+        }
+        _ => {}
+    }
 }
 
 fn project_negotiated_provider_ids(compatibility: &mut NegotiatedNodeCompatibility) {
@@ -4321,7 +5325,11 @@ fn project_negotiated_provider_ids(compatibility: &mut NegotiatedNodeCompatibili
 }
 
 fn request_requires_open_provider_ids(shared: &NodeShared, request: &NodeRequest) -> bool {
-    if let NodeRequest::SpawnSpec { spec } = request {
+    if let Some(spec) = match request {
+        NodeRequest::SpawnSpec { spec } => Some(spec),
+        NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
+        _ => None,
+    } {
         return shared
             .resolve_spawn_spec(spec)
             .is_ok_and(|resolved| !provider_id_is_legacy(&resolved.provider));
@@ -4341,6 +5349,7 @@ fn request_requires_open_provider_ids_with(
     match request {
         NodeRequest::Spawn { provider, .. } => !provider_id_is_legacy(provider),
         NodeRequest::SpawnSpec { .. } => false,
+        NodeRequest::SpawnManagedWorktree { .. } => false,
         NodeRequest::Resume { session, .. }
         | NodeRequest::Prompt { session, .. }
         | NodeRequest::Paste { session, .. }
@@ -4366,6 +5375,7 @@ fn request_requires_open_provider_ids_with(
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -4399,6 +5409,9 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
         }
         Ok(NodeResponse::SpawnSpecAccepted { receipt }) => {
             !provider_id_is_legacy(&receipt.provider)
+        }
+        Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt }) => {
+            !provider_id_is_legacy(&receipt.spawn.provider)
         }
         _ => false,
     };
@@ -4434,6 +5447,8 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
+        | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -4470,6 +5485,8 @@ fn project_event_legacy_provider_ids(
             .get(&envelope.sequence)
             .is_some_and(provider_id_is_legacy),
         NodeEvent::ControllerChanged { .. }
+        | NodeEvent::ManagedWorktreeUpserted { .. }
+        | NodeEvent::ManagedWorktreeRemoved { .. }
         | NodeEvent::WorkspaceRemoved { .. }
         | NodeEvent::ResyncRequired { .. } => true,
     };
@@ -4489,6 +5506,8 @@ fn clear_response_provider_runtime_status(reply: &mut ResponseEnvelope) {
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
+        | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -4940,11 +5959,13 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         NodeRequest::RegisterWorkspace { workspace_id, root } => {
             shared.require_controller(connection_id, role)?;
             let root = require_windows_path(root)?;
+            shared.reject_managed_reservation(Some(&workspace_id), Some(&root))?;
             let workspace = shared.register_workspace(workspace_id, root).await?;
             Ok(NodeResponse::WorkspaceRegistered { workspace })
         }
         NodeRequest::UnregisterWorkspace { workspace_id } => {
             shared.require_controller(connection_id, role)?;
+            shared.reject_managed_reservation(Some(&workspace_id), None)?;
             shared.unregister_workspace(&workspace_id)?;
             Ok(NodeResponse::WorkspaceUnregistered { workspace_id })
         }
@@ -4957,6 +5978,7 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         } => {
             shared.require_controller(connection_id, role)?;
             let target_root = require_windows_path(target_root)?;
+            shared.reject_managed_reservation(Some(&workspace_id), Some(&target_root))?;
             let (worktree, workspace) = shared
                 .create_worktree(
                     source_workspace_id,
@@ -4974,6 +5996,7 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         } => {
             shared.require_controller(connection_id, role)?;
             let native_target_root = require_windows_path(target_root.clone())?;
+            shared.reject_managed_reservation(None, Some(&native_target_root))?;
             let workspace_id = shared
                 .remove_worktree(source_workspace_id, native_target_root)
                 .await?;
@@ -4999,6 +6022,16 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             shared.require_controller(connection_id, role)?;
             let receipt = shared.spawn_from_spec(spec).await?;
             Ok(NodeResponse::SpawnSpecAccepted { receipt })
+        }
+        NodeRequest::SpawnManagedWorktree { request } => {
+            shared.require_controller(connection_id, role)?;
+            let receipt = shared.spawn_managed_worktree(request).await?;
+            Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt })
+        }
+        NodeRequest::CleanupManagedWorktree { lease_id } => {
+            shared.require_controller(connection_id, role)?;
+            let lease = shared.cleanup_managed_worktree(&lease_id, true).await?;
+            Ok(NodeResponse::ManagedWorktreeCleanup { lease })
         }
         NodeRequest::Resume { session, terminal_size, initial_prompt } => {
             let provider = controlled_session(shared, connection_id, role, &session)?;
@@ -5250,6 +6283,54 @@ fn git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
     failure(code, &error.message)
 }
 
+fn managed_git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
+    let (code, message) = match error.kind {
+        GitWorktreeErrorKind::Invalid => (
+            NodeFailureCode::InvalidRequest,
+            "managed Git input is invalid",
+        ),
+        GitWorktreeErrorKind::NotRepository => (
+            NodeFailureCode::NotGitRepository,
+            "managed source is not a Git repository",
+        ),
+        GitWorktreeErrorKind::Conflict => (
+            NodeFailureCode::WorktreeConflict,
+            "managed Git identity conflicts with existing repository state",
+        ),
+        GitWorktreeErrorKind::Protected => (
+            NodeFailureCode::ManagedWorktreeOwnershipConflict,
+            "managed worktree ownership validation failed",
+        ),
+        GitWorktreeErrorKind::Dirty => (
+            NodeFailureCode::WorktreeDirty,
+            "managed worktree contains uncommitted changes",
+        ),
+        GitWorktreeErrorKind::Locked => (
+            NodeFailureCode::WorktreeLocked,
+            "managed worktree is locked",
+        ),
+        GitWorktreeErrorKind::Failed => (
+            NodeFailureCode::BackendOperationFailed,
+            "managed Git operation failed",
+        ),
+    };
+    NodeFailure { code, message: message.to_owned() }
+}
+
+fn managed_spawn_receipt(
+    resolved: &ResolvedSpawnSpec,
+    incarnation_id: NodeIncarnationId,
+    session: SessionAddress,
+    lease: ManagedWorktreeLeaseSnapshot,
+) -> ManagedWorktreeSpawnReceipt {
+    let mut managed = resolved.clone();
+    managed.target.worktree_id = Some(lease.workspace_id.clone());
+    ManagedWorktreeSpawnReceipt {
+        spawn: managed.receipt(incarnation_id, session),
+        lease,
+    }
+}
+
 fn validate_selected_worktree(
     source_root: &str,
     selected_root: &str,
@@ -5416,6 +6497,10 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::WorktreeProtected => "worktree-protected",
         NodeFailureCode::WorktreeDirty => "worktree-dirty",
         NodeFailureCode::WorktreeLocked => "worktree-locked",
+        NodeFailureCode::UnknownManagedWorktreeLease => "unknown-managed-worktree-lease",
+        NodeFailureCode::ManagedWorktreeBusy => "managed-worktree-busy",
+        NodeFailureCode::ManagedWorktreeOwnershipConflict => "managed-worktree-ownership-conflict",
+        NodeFailureCode::ManagedWorktreeRecoveryRequired => "managed-worktree-recovery-required",
         NodeFailureCode::UnknownSession => "unknown-session",
         NodeFailureCode::UnknownSessionRecord => "unknown-session-record",
         NodeFailureCode::SessionRecordNotResumable => "session-record-not-resumable",
@@ -5497,6 +6582,21 @@ pub enum NodeServerError {
         first: WorkspaceId,
         second: WorkspaceId,
         root: String,
+    },
+    #[error("workspace '{0}' uses managed worktrees but has no local profile")]
+    ManagedWorktreeProfileRequired(WorkspaceId),
+    #[error("workspace '{0}' has managed worktree profiles but is not in managed mode")]
+    ManagedWorktreeProfileModeMismatch(WorkspaceId),
+    #[error("workspace '{workspace_id}' has duplicate managed worktree profile '{profile_id}'")]
+    DuplicateManagedWorktreeProfile {
+        workspace_id: WorkspaceId,
+        profile_id: WorktreeProfileId,
+    },
+    #[error("workspace '{workspace_id}' managed worktree profile '{profile_id}' is invalid: {message}")]
+    InvalidManagedWorktreeProfile {
+        workspace_id: WorkspaceId,
+        profile_id: WorktreeProfileId,
+        message: String,
     },
     #[error("active agent registry failed: {0}")]
     Registry(String),
@@ -5585,6 +6685,229 @@ mod tests {
         }
     }
 
+    fn install_managed_lease(shared: &NodeShared) -> ManagedWorktreeLeaseRecord {
+        let root = std::env::current_dir().unwrap()
+            .join("managed-test-target")
+            .to_string_lossy()
+            .into_owned();
+        let lease = ManagedWorktreeLeaseRecord {
+            lease_id: ManagedWorktreeLeaseId::new("mw-test").unwrap(),
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: WorkspaceId::new("managed-test").unwrap(),
+            profile_id: WorktreeProfileId::new("default").unwrap(),
+            profile_revision: crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+            target_root: root.clone(),
+            branch: "gate4agent/mw-test".to_owned(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            expected_head: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            retention: ManagedWorktreeRetention::RemoveWhenReleased,
+            state: ManagedWorktreeLeaseState::Ready,
+            session_holders: Vec::new(),
+            record_holders: Vec::new(),
+            cleanup_failure: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        shared.workspaces.write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(lease.workspace_id.clone(), root);
+        *shared.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ManagedWorktreeRegistry::from_records(vec![lease.clone()], Vec::new()).unwrap();
+        lease
+    }
+
+    #[test]
+    fn managed_spawn_receipt_rebinds_allocated_worktree_and_roundtrips_wire() {
+        let shared = terminal_test_shared();
+        let mut lease = install_managed_lease(&shared);
+        let session = SessionAddress {
+            workspace_id: lease.workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(73),
+                generation: SessionGeneration(4),
+            },
+        };
+        lease.state = ManagedWorktreeLeaseState::InUse;
+        lease.session_holders.push(ManagedWorktreeSessionHolder {
+            incarnation_id: shared.incarnation_id,
+            instance_id: session.session.instance_id,
+            generation: session.session.generation,
+        });
+        let resolved = shared.resolve_spawn_spec(&spawn_spec_fixture()).unwrap();
+        assert!(resolved.target.worktree_id.is_none());
+
+        let receipt = managed_spawn_receipt(
+            &resolved,
+            shared.incarnation_id,
+            session.clone(),
+            lease.snapshot(),
+        );
+        assert!(resolved.target.worktree_id.is_none());
+        assert_eq!(receipt.spawn.target.workspace_id, lease.source_workspace_id);
+        assert_eq!(receipt.spawn.target.worktree_id.as_ref(), Some(&lease.workspace_id));
+        assert_eq!(receipt.spawn.session, session);
+        assert_eq!(receipt.lease.workspace_id, lease.workspace_id);
+        let encoded = serde_json::to_vec(&receipt).unwrap();
+        let decoded: ManagedWorktreeSpawnReceipt = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, receipt);
+    }
+
+    #[tokio::test]
+    async fn ordinary_spawn_and_spawn_spec_cannot_bypass_managed_lease_holder_fence() {
+        let shared = terminal_test_shared();
+        let lease = install_managed_lease(&shared);
+        let raw = shared.spawn_session(
+            lease.workspace_id.clone(),
+            agent("claude"),
+            SessionMode::Pty,
+            gate4agent_types::TerminalSize { rows: 24, columns: 80 },
+            None,
+        ).await.unwrap_err();
+        assert_eq!(raw.code, NodeFailureCode::ManagedWorktreeOwnershipConflict);
+        let mut spec = spawn_spec_fixture();
+        spec.target.workspace_id = lease.workspace_id.clone();
+        let specified = shared.spawn_from_spec(spec).await.unwrap_err();
+        assert_eq!(specified.code, NodeFailureCode::ManagedWorktreeOwnershipConflict);
+        let mut selected = spawn_spec_fixture();
+        selected.idempotency_key = SpawnIdempotencyKey::new("managed-selected-bypass").unwrap();
+        selected.target.worktree_id = Some(lease.workspace_id);
+        let selected = shared.spawn_from_spec(selected).await.unwrap_err();
+        assert_eq!(selected.code, NodeFailureCode::ManagedWorktreeOwnershipConflict);
+        assert!(shared.handle.snapshot().sessions.is_empty());
+    }
+
+    #[test]
+    fn legacy_projection_omits_managed_snapshot_events_and_path_bearing_diagnostics() {
+        let shared = terminal_test_shared();
+        let lease = install_managed_lease(&shared);
+        let snapshot = snapshot_for_wire(&shared, true, true, false);
+        assert!(snapshot.managed_worktrees.is_empty());
+        let mut reply = ResponseEnvelope {
+            request_id: 1,
+            result: Ok(NodeResponse::Resync {
+                event_sequence: 1,
+                snapshot: shared.snapshot(),
+                events: vec![NodeEventEnvelope {
+                    sequence: 1,
+                    event: NodeEvent::ManagedWorktreeUpserted { lease: lease.snapshot() },
+                }],
+            }),
+        };
+        project_response_without_managed_worktrees(&mut reply);
+        let Ok(NodeResponse::Resync { snapshot, events, .. }) = reply.result else {
+            panic!("projection changed the response kind");
+        };
+        assert!(snapshot.managed_worktrees.is_empty());
+        assert!(events.is_empty());
+        let failure = managed_git_worktree_failure(GitWorktreeError {
+            kind: GitWorktreeErrorKind::Failed,
+            message: r"git failed at C:\private\managed-target".to_owned(),
+        });
+        assert!(!failure.message.contains("private"));
+        assert!(!failure.message.contains("managed-target"));
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_retains_exact_owned_worktree_and_explicit_cleanup_removes_it() {
+        let root = temporary_workspace_root("managed-restart");
+        let source = root.join("source");
+        let allocation = root.join("allocation");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&allocation).unwrap();
+        run_test_git(&source, &["init"]);
+        run_test_git(&source, &["config", "user.email", "gate4agent@example.invalid"]);
+        run_test_git(&source, &["config", "user.name", "Gate4Agent Test"]);
+        std::fs::write(source.join("seed.txt"), "seed\n").unwrap();
+        run_test_git(&source, &["add", "seed.txt"]);
+        run_test_git(&source, &["commit", "-m", "seed"]);
+        let profile = ManagedWorktreeProfile::new(
+            WorktreeProfileId::new("default").unwrap(),
+            crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+            &allocation,
+            "gate4agent",
+            "HEAD",
+            ManagedWorktreeRetention::Retain,
+        ).unwrap();
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            &source,
+        ).unwrap()
+            .with_worktree_service_mode(WorktreeServiceMode::Managed)
+            .with_managed_worktree_profile(profile.clone()).unwrap();
+        let target = PathBuf::from(profile.allocation_root()).join("mw-restart");
+        let source_text = workspace.canonical_root().to_owned();
+        let target_text = target.to_string_lossy().into_owned();
+        let created = create_git_worktree(
+            &source_text,
+            &target_text,
+            "gate4agent/mw-restart",
+            Some("HEAD"),
+        ).await.unwrap();
+        let lease = ManagedWorktreeLeaseRecord {
+            lease_id: ManagedWorktreeLeaseId::new("mw-restart").unwrap(),
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: WorkspaceId::new("managed-restart").unwrap(),
+            profile_id: profile.profile_id().clone(),
+            profile_revision: profile.revision().clone(),
+            target_root: created.path.clone(),
+            branch: "gate4agent/mw-restart".to_owned(),
+            base_commit: created.head.clone(),
+            expected_head: None,
+            retention: ManagedWorktreeRetention::Retain,
+            state: ManagedWorktreeLeaseState::Allocating,
+            session_holders: Vec::new(),
+            record_holders: Vec::new(),
+            cleanup_failure: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let shared = NodeShared::new_with_incarnation(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-managed-restart").unwrap(),
+            NodeIncarnationId::from_bytes([7; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            SpawnProfileRegistry::default(),
+            None,
+            Vec::new(),
+            vec![lease.clone()],
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+        shared.reconcile_managed_worktrees().await;
+        let retained = shared.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&lease.lease_id).unwrap().clone();
+        assert_eq!(retained.state, ManagedWorktreeLeaseState::Retained);
+        assert!(shared.workspaces.read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&lease.workspace_id));
+        let removed = shared.cleanup_managed_worktree(&lease.lease_id, true).await.unwrap();
+        assert_eq!(removed.state, ManagedWorktreeLeaseState::Removed);
+        assert!(!Path::new(&created.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn run_test_git(root: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C").arg(root).args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[tokio::test]
     async fn spawn_spec_validation_fails_before_session_mutation() {
         let shared = terminal_test_shared();
@@ -5627,6 +6950,8 @@ mod tests {
                     rows: 24,
                     columns: 80,
                 },
+                None,
+                None,
                 None,
                 Some(Instant::now()),
                 &[],
@@ -7180,6 +8505,8 @@ mod tests {
             SpawnProfileRegistry::default(),
             Some(state_path.clone()),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             None,
             MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
         );
@@ -7331,6 +8658,8 @@ mod tests {
             SpawnProfileRegistry::default(),
             None,
             loaded.records,
+            loaded.managed_worktrees,
+            loaded.managed_worktree_tombstones,
             loaded.warning,
             MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
         );

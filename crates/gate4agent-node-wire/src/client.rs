@@ -12,6 +12,7 @@ use gate4agent_node_protocol::{
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
+    NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
@@ -24,7 +25,7 @@ use crate::{
 #[cfg(test)]
 use gate4agent_node_protocol::{
     NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4,
 };
 #[cfg(test)]
 use crate::auth_proof;
@@ -538,6 +539,16 @@ fn ensure_node_request_required_capability(
             return Err(NodeClientError::UnsupportedCapability(required.to_owned()));
         }
     }
+    if request.requires_spawn_spec_defaults_overrides_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.to_owned(),
+        ));
+    }
     if request.requires_worktree_selection_capability()
         && !negotiated_capabilities.iter().any(|capability| {
             capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY
@@ -559,7 +570,7 @@ fn ensure_server_frame_required_capability(
             Ok(NodeResponse::WorkspaceFileRead { .. }) => {
                 Some(NODE_WORKSPACE_FILE_READ_CAPABILITY)
             }
-            Ok(NodeResponse::SpawnSpecAccepted { .. }) => {
+            Ok(response) if response.requires_spawn_spec_defaults_overrides_capability() => {
                 Some(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY)
             }
             _ => None,
@@ -574,7 +585,18 @@ fn ensure_server_frame_required_capability(
             return Err(NodeClientError::UnsupportedCapability(required.to_owned()));
         }
     }
-    let requires_worktree_selection = match frame {
+    let contains_managed_worktree = server_frame_contains_managed_worktree(frame);
+    if contains_managed_worktree
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY.to_owned(),
+        ));
+    }
+    let requires_worktree_selection = contains_managed_worktree || match frame {
         ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(
             NodeResponse::requires_worktree_selection_capability,
         ),
@@ -590,6 +612,48 @@ fn ensure_server_frame_required_capability(
         ));
     }
     Ok(())
+}
+
+fn has_capability(capabilities: &[CapabilityId], required: &str) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == required)
+}
+
+fn server_frame_contains_managed_worktree(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Hello(hello) => !hello.snapshot.managed_worktrees.is_empty(),
+        ServerFrame::Reply(reply) => reply
+            .result
+            .as_ref()
+            .ok()
+            .is_some_and(node_response_contains_managed_worktree),
+        ServerFrame::Event(event) => node_event_is_managed_worktree(&event.event),
+        ServerFrame::Challenge(_) => false,
+    }
+}
+
+fn node_response_contains_managed_worktree(response: &NodeResponse) -> bool {
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => !snapshot.managed_worktrees.is_empty(),
+        NodeResponse::Resync { snapshot, events, .. } => {
+            !snapshot.managed_worktrees.is_empty()
+                || events
+                    .iter()
+                    .any(|event| node_event_is_managed_worktree(&event.event))
+        }
+        NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. } => true,
+        _ => false,
+    }
+}
+
+fn node_event_is_managed_worktree(event: &NodeEvent) -> bool {
+    matches!(
+        event,
+        NodeEvent::ManagedWorktreeUpserted { .. }
+            | NodeEvent::ManagedWorktreeRemoved { .. }
+    )
 }
 
 fn ensure_server_frame_terminal_capability(
@@ -675,7 +739,13 @@ fn ensure_node_request_provider_capability(
         NodeRequest::Spawn { provider, .. } => {
             ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
         }
-        NodeRequest::SpawnSpec { spec } => {
+        NodeRequest::SpawnSpec { spec }
+        | NodeRequest::SpawnManagedWorktree {
+            request: gate4agent_node_protocol::ManagedWorktreeSpawnRequest {
+                spawn_spec: spec,
+                ..
+            },
+        } => {
             if let gate4agent_node_protocol::SpawnOverride::Set { value: provider } =
                 &spec.overrides.provider
             {
@@ -764,6 +834,8 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
+        | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -814,10 +886,14 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
         NodeResponse::SpawnSpecAccepted { receipt } => {
             !provider_id_is_legacy(&receipt.provider)
         }
+        NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
+            !provider_id_is_legacy(&receipt.spawn.provider)
+        }
         NodeResponse::WorkspaceInspected { .. }
         | NodeResponse::WorkspaceFileRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeRemoved { .. }
@@ -855,6 +931,8 @@ fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }
         | NodeEvent::SessionRecordRemoved { .. }
+        | NodeEvent::ManagedWorktreeUpserted { .. }
+        | NodeEvent::ManagedWorktreeRemoved { .. }
         | NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -873,6 +951,8 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
+        | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -928,6 +1008,8 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
+        | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -972,6 +1054,8 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
+        | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::Accepted
@@ -1000,6 +1084,8 @@ fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }
         | NodeEvent::SessionRecordRemoved { .. }
+        | NodeEvent::ManagedWorktreeUpserted { .. }
+        | NodeEvent::ManagedWorktreeRemoved { .. }
         | NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -1175,6 +1261,9 @@ mod tests {
         AdapterContractRevision, AdapterFamily, AdapterId, AgentId, ArchitectureId,
         GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, HostDescriptor, LocalTransportKind,
         ManagedSessionRecord, ManagedSessionState, NodeCompatibilitySupport, OpaqueHostPath,
+        ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
+        ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
+        ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest,
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
@@ -1184,6 +1273,7 @@ mod tests {
         SpawnResolutionProvenance, SpawnSpec, SpawnTarget, WorkspaceEntry,
         WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
         WorkspaceInspection, WorkspaceSnapshot,
+        WorktreeProfileId, WorktreeProfileRevision,
     };
     use gate4agent_types::{
         AgentInstanceId, CapabilitySnapshot, ForegroundSnapshot, HistorySnapshot,
@@ -1310,6 +1400,7 @@ mod tests {
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         }
     }
 
@@ -1423,9 +1514,12 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
-            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3).unwrap(),
+            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4).unwrap(),
         );
     }
 
@@ -2181,6 +2275,118 @@ mod tests {
         assert!(ensure_server_frame_required_capability(
             &worktree_frame,
             &worktree_capabilities,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn managed_worktree_partial_capability_intersections_fail_closed() {
+        let NodeRequest::SpawnSpec { spec } = spawn_spec_request() else {
+            unreachable!("spawn spec helper changed variant");
+        };
+        let request = NodeRequest::SpawnManagedWorktree {
+            request: ManagedWorktreeSpawnRequest {
+                spawn_spec: spec,
+                worktree_profile_id: WorktreeProfileId::new("review").unwrap(),
+            },
+        };
+        let managed = CapabilityId::new(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap();
+        let spawn = CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        let worktree = CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
+        let mut next_request_id = 91;
+        assert!(matches!(
+            reserve_request_id(&mut next_request_id, &request, false, false, false, &[]),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY
+        ));
+        assert!(matches!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &[managed.clone()],
+            ),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+        ));
+        assert!(matches!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &[managed.clone(), spawn.clone()],
+            ),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_WORKTREE_SELECTION_CAPABILITY
+        ));
+        assert!(reserve_request_id(
+            &mut next_request_id,
+            &request,
+            false,
+            false,
+            false,
+            &[managed.clone(), spawn.clone(), worktree.clone()],
+        )
+        .is_ok());
+
+        let cleanup = NodeRequest::CleanupManagedWorktree {
+            lease_id: ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+        };
+        assert!(ensure_node_request_required_capability(&cleanup, &[managed.clone()]).is_err());
+        assert!(ensure_node_request_required_capability(
+            &cleanup,
+            &[managed.clone(), worktree.clone()],
+        )
+        .is_ok());
+
+        let event = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 4,
+            event: NodeEvent::ManagedWorktreeRemoved {
+                lease_id: ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+            },
+        });
+        assert!(ensure_server_frame_required_capability(&event, &[managed.clone()]).is_err());
+        assert!(ensure_server_frame_required_capability(&event, &[worktree.clone()]).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &event,
+            &[managed.clone(), worktree.clone()],
+        )
+        .is_ok());
+
+        let mut spawn_receipt = spawn_spec_receipt();
+        let workspace_id = WorkspaceId::new("managed-a").unwrap();
+        spawn_receipt.target.worktree_id = Some(workspace_id.clone());
+        spawn_receipt.session.workspace_id = workspace_id.clone();
+        let receipt = ManagedWorktreeSpawnReceipt {
+            spawn: spawn_receipt,
+            lease: ManagedWorktreeLeaseSnapshot {
+                lease_id: ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+                source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                workspace_id,
+                profile_id: WorktreeProfileId::new("review").unwrap(),
+                profile_revision: WorktreeProfileRevision::new("review.r1").unwrap(),
+                retention: ManagedWorktreeRetention::RemoveWhenReleased,
+                state: ManagedWorktreeLeaseState::InUse,
+                active_session_count: 1,
+                managed_record_count: 1,
+                cleanup_failure: None::<ManagedWorktreeCleanupFailure>,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 2,
+            },
+        };
+        let reply = response_frame(NodeResponse::ManagedWorktreeSpawnAccepted { receipt });
+        assert!(ensure_server_frame_required_capability(
+            &reply,
+            &[managed.clone(), worktree.clone()],
+        )
+        .is_err());
+        assert!(ensure_server_frame_required_capability(
+            &reply,
+            &[managed, worktree, spawn],
         )
         .is_ok());
     }

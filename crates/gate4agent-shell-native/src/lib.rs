@@ -52,6 +52,21 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+const INSTANCE_LAUNCH_ARGS_MAX: usize = 128;
+const INSTANCE_LAUNCH_ARG_MAX_BYTES: usize = 65_536;
+const INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES: usize = 262_144;
+const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
+    "--continue",
+    "--print",
+    "--prompt",
+    "--prompt-interactive",
+    "--resume",
+    "--session-id",
+    "-c",
+    "-p",
+    "-r",
+];
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct NativeSessionKey {
     pub instance_id: AgentInstanceId,
@@ -64,6 +79,7 @@ struct NativeSpawnRequest {
     request: StartRequest,
     runtime_policy: ProviderRuntimePolicy,
     launch_extra_args: Vec<OsString>,
+    instance_extra_args: Vec<OsString>,
     resumed_provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
 }
 
@@ -220,6 +236,18 @@ impl NativeEffectShell {
         envelope: EffectEnvelope,
         environment: Vec<EnvMutation>,
     ) -> ObservationEnvelope {
+        self.execute_with_launch_overlay(envelope, environment, Vec::new())
+            .await
+    }
+
+    /// Execute an effect with host-only environment and optional PTY argv
+    /// applied only to a newly spawned provider process.
+    pub async fn execute_with_launch_overlay(
+        &mut self,
+        envelope: EffectEnvelope,
+        environment: Vec<EnvMutation>,
+        extra_args: Vec<OsString>,
+    ) -> ObservationEnvelope {
         let EffectEnvelope {
             protocol_version,
             operation_id,
@@ -256,6 +284,7 @@ impl NativeEffectShell {
                             request,
                             runtime_policy,
                             launch_extra_args: Vec::new(),
+                            instance_extra_args: extra_args,
                             resumed_provider_session: None,
                         },
                         environment,
@@ -278,6 +307,7 @@ impl NativeEffectShell {
                         runtime_policy,
                         request,
                         environment,
+                        extra_args,
                     )
                     .await
                 }
@@ -491,8 +521,14 @@ impl NativeEffectShell {
             request,
             runtime_policy,
             mut launch_extra_args,
+            instance_extra_args,
             resumed_provider_session,
         } = spawn;
+        if let Err(message) =
+            validate_instance_launch_arguments(&agent_id, transport, &instance_extra_args)
+        {
+            return ControlObservation::SpawnFailed { message };
+        }
         if let Err(message) = validate_spawn_runtime_policy(
             runtime_policy,
             transport,
@@ -542,6 +578,7 @@ impl NativeEffectShell {
                     runtime_policy.provider_session_identity,
                     &mut launch_extra_args,
                 );
+                launch_extra_args.extend(instance_extra_args);
                 let mut authoritative_provider_session = resumed_provider_session
                     .clone()
                     .or(fresh_provider_session);
@@ -914,6 +951,7 @@ impl NativeEffectShell {
         runtime_policy: ProviderRuntimePolicy,
         request: ResumeLaunchRequest,
         pty_env: Vec<EnvMutation>,
+        instance_extra_args: Vec<OsString>,
     ) -> ControlObservation {
         if let Err(message) = validate_spawn_runtime_policy(
             runtime_policy,
@@ -984,6 +1022,7 @@ impl NativeEffectShell {
                 } else {
                     Vec::new()
                 },
+                instance_extra_args,
                 resumed_provider_session: Some(provider_session),
             },
             pty_env,
@@ -1192,6 +1231,57 @@ fn validate_spawn_runtime_policy(
     if is_resume {
         require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
         require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
+    }
+    Ok(())
+}
+
+fn validate_instance_launch_arguments(
+    agent_id: &AgentId,
+    transport: TransportKind,
+    arguments: &[OsString],
+) -> Result<(), String> {
+    if arguments.is_empty() {
+        return Ok(());
+    }
+    if transport != TransportKind::Pty {
+        return Err("native instance launch arguments require PTY transport".to_owned());
+    }
+    if arguments.len() > INSTANCE_LAUNCH_ARGS_MAX {
+        return Err("native instance launch argument count exceeds its bound".to_owned());
+    }
+    let mut total_bytes = 0usize;
+    for argument in arguments {
+        let argument = argument.to_string_lossy();
+        if argument.contains('\0') {
+            return Err("native instance launch argument is invalid".to_owned());
+        }
+        if argument.len() > INSTANCE_LAUNCH_ARG_MAX_BYTES {
+            return Err("native instance launch argument exceeds its bound".to_owned());
+        }
+        total_bytes = total_bytes.saturating_add(argument.len());
+        if total_bytes > INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES {
+            return Err("native instance launch argument payload exceeds its bound".to_owned());
+        }
+        if agent_id.as_str() == "claude"
+            && RESERVED_CLAUDE_LAUNCH_FLAGS.iter().any(|reserved| {
+                argument == *reserved
+                    || (reserved.starts_with("--")
+                        && argument
+                            .strip_prefix(reserved)
+                            .is_some_and(|suffix| suffix.starts_with('=')))
+                    || (reserved.len() == 2
+                        && argument
+                            .strip_prefix(reserved)
+                            .is_some_and(|suffix| {
+                                !suffix.is_empty() && !suffix.starts_with('-')
+                            }))
+            })
+        {
+            return Err(
+                "native instance launch arguments conflict with Claude session, resume, or prompt authority"
+                    .to_owned(),
+            );
+        }
     }
     Ok(())
 }
@@ -2504,12 +2594,14 @@ mod tests {
     use super::{
         prepare_fresh_pty_provider_session, prompt_render_probe, prompt_rendered,
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
-        terminal_frame, validate_spawn_runtime_policy, ReadinessDiagnostics, Utf8ChunkDecoder,
+        terminal_frame, validate_instance_launch_arguments, validate_spawn_runtime_policy,
+        ReadinessDiagnostics, Utf8ChunkDecoder,
     };
     use gate4agent_adapters::builtin_adapter_registry;
     use gate4agent::pty::event::PtyMouseProtocolEncoding;
     use gate4agent_types::{
-        AdapterFamily, ProviderRuntimePolicy, TerminalMouseProtocolEncoding, TransportKind,
+        AdapterFamily, AgentId, ProviderRuntimePolicy, TerminalMouseProtocolEncoding,
+        TransportKind,
     };
     use std::ffi::OsString;
 
@@ -2544,6 +2636,38 @@ mod tests {
         assert!(frame.alternate_screen);
         assert!(frame.mouse_protocol_enabled);
         assert_eq!(frame.mouse_protocol_encoding, TerminalMouseProtocolEncoding::Sgr);
+    }
+
+    #[test]
+    fn native_instance_launch_arguments_fail_closed_before_shell_spawn() {
+        let claude = AgentId::new("claude").unwrap();
+        assert_eq!(
+            validate_instance_launch_arguments(
+                &claude,
+                TransportKind::Pipe,
+                &[OsString::from("--bundle-mode")],
+            )
+            .unwrap_err(),
+            "native instance launch arguments require PTY transport"
+        );
+        assert_eq!(
+            validate_instance_launch_arguments(
+                &claude,
+                TransportKind::Pty,
+                &[OsString::from("--resume=session-secret")],
+            )
+            .unwrap_err(),
+            "native instance launch arguments conflict with Claude session, resume, or prompt authority"
+        );
+        assert!(validate_instance_launch_arguments(
+            &claude,
+            TransportKind::Pty,
+            &[
+                OsString::from("--permission-mode"),
+                OsString::from("default"),
+            ],
+        )
+        .is_ok());
     }
 
     #[test]

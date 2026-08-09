@@ -6,8 +6,9 @@ use std::time::Duration;
 use gate4agent_catalog::{AgentRegistry, EnvMutation};
 use gate4agent_runtime_native::{
     HookIngressConfig, NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
-    NativeLaunchEnvironmentOverlay, NativeLaunchProfile, NativeLaunchProfileControl,
-    NativeLaunchProfileError, NativeLaunchProfileId, NativeRuntime, NativeRuntimeConfig,
+    NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay, NativeLaunchProfile,
+    NativeLaunchProfileControl, NativeLaunchProfileError, NativeLaunchProfileId, NativeRuntime,
+    NativeRuntimeConfig,
     ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
     ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
     ZAI_GLM_CLAUDE_PROFILE_REVISION,
@@ -1396,13 +1397,13 @@ async fn clearing_native_launch_profile_selection_discards_environment_overlay()
     #[cfg(windows)]
     {
         *original_script = format!(
-            "[Console]::Write('profile=' + $env:{PROFILE_SENTINEL} + ';overlay=' + $env:{OVERLAY_SENTINEL} + ';'); {original_script}"
+            "[Console]::Write('profile=' + $env:{PROFILE_SENTINEL} + ';overlay=' + $env:{OVERLAY_SENTINEL} + ';argv=' + ($args -join '|') + ';'); {original_script}"
         );
     }
     #[cfg(not(windows))]
     {
         *original_script = format!(
-            "printf 'profile=%s;overlay=%s;' \"${PROFILE_SENTINEL}\" \"${OVERLAY_SENTINEL}\"; {original_script}"
+            "printf 'profile=%s;overlay=%s;argv=%s;' \"${PROFILE_SENTINEL}\" \"${OVERLAY_SENTINEL}\" \"$0\"; {original_script}"
         );
     }
 
@@ -1439,15 +1440,16 @@ async fn clearing_native_launch_profile_selection_discards_environment_overlay()
         .select_native_launch_profile(instance_id, profile_id())
         .unwrap();
     control
-        .install_native_launch_environment_overlay(
+        .install_native_instance_launch_overlay(
             instance_id,
-            NativeLaunchEnvironmentOverlay::new(
+            NativeInstanceLaunchOverlay::new(
                 AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
                 TransportKind::Pty,
                 vec![EnvMutation {
                     key: OsString::from(OVERLAY_SENTINEL),
                     value: Some(OsString::from("must-be-cleared")),
                 }],
+                vec![OsString::from("must-be-cleared-argv")],
             )
             .unwrap(),
         )
@@ -1470,6 +1472,7 @@ async fn clearing_native_launch_profile_selection_discards_environment_overlay()
                     frame
                         .contents
                         .contains("profile=profile-value-2;overlay=;")
+                        && !frame.contents.contains("must-be-cleared-argv")
                 })
         })
     })
@@ -1533,4 +1536,300 @@ fn native_launch_environment_overlay_debug_surfaces_never_expose_values() {
     );
     assert!(!debug_error.contains(SECRET_VALUE));
     assert!(!debug_mutation.contains(SECRET_VALUE));
+}
+
+#[tokio::test]
+async fn native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
+    let mut spec = interactive_agent_spec();
+    let original_script = spec
+        .launch
+        .fixed_args
+        .last()
+        .expect("interactive fixture script")
+        .clone();
+    #[cfg(windows)]
+    let _script_guard = {
+        struct ScriptGuard(std::path::PathBuf);
+
+        impl Drop for ScriptGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let script = format!(
+            "[Console]::Write('argv=' + ($args -join '|') + ';'); {original_script}"
+        );
+        let directory = std::env::current_dir()
+            .expect("fixture working directory")
+            .join("target")
+            .join("native-launch-overlay-tests");
+        std::fs::create_dir_all(&directory).expect("create argv fixture directory");
+        let path = directory.join(format!(
+            "argv-{}-8505.ps1",
+            std::process::id()
+        ));
+        std::fs::write(&path, script).expect("write argv fixture script");
+        spec.launch.fixed_args = vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-ExecutionPolicy".to_owned(),
+            "Bypass".to_owned(),
+            "-File".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+        ScriptGuard(path)
+    };
+    #[cfg(not(windows))]
+    {
+        let original_script = spec
+            .launch
+            .fixed_args
+            .last_mut()
+            .expect("interactive fixture script");
+        *original_script = format!(
+            "printf 'argv=%s|%s;' \"$0\" \"$1\"; {original_script}"
+        );
+    }
+
+    let (handle, mut runtime) = NativeRuntime::new(
+        AgentRegistry::new([spec]).expect("fixture registry"),
+        NativeRuntimeConfig {
+            worker_poll_interval_ms: 5,
+            ..NativeRuntimeConfig::default()
+        },
+    );
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                profile_id(),
+                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                vec![
+                    OsString::from(PROFILE_SENTINEL),
+                    OsString::from(REMOVE_SENTINEL),
+                    OsString::from(CHILD_SENTINEL),
+                ],
+                Arc::new(SentinelResolver {
+                    generation: Arc::new(AtomicUsize::new(3)),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let control = runtime.native_launch_profile_control();
+    let selected_instance = AgentInstanceId(8505);
+    let default_instance = AgentInstanceId(8506);
+    control
+        .select_native_launch_profile(selected_instance, profile_id())
+        .unwrap();
+    assert_eq!(
+        control
+            .install_native_instance_launch_overlay(
+            selected_instance,
+            NativeInstanceLaunchOverlay::new(
+                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                vec![EnvMutation {
+                    key: OsString::from(PROFILE_SENTINEL),
+                    value: Some(OsString::from("overlay-profile")),
+                }],
+                vec![
+                    OsString::from("--bundle-mode"),
+                    OsString::from("portable"),
+                ],
+            )
+            .unwrap(),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlayKeyConflict
+    );
+
+    control
+        .install_native_instance_launch_overlay(
+            selected_instance,
+            NativeInstanceLaunchOverlay::new(
+                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                Vec::new(),
+                vec![
+                    OsString::from("--bundle-mode"),
+                    OsString::from("portable"),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    register_and_start_agent(
+        &handle,
+        110,
+        selected_instance,
+        AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+    );
+    register_and_start_agent(
+        &handle,
+        112,
+        default_instance,
+        AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+    );
+    drive_until(&mut runtime, |_| {
+        let snapshot = handle.snapshot();
+        let selected_ready = snapshot.sessions.iter().any(|session| {
+            session.instance_id == selected_instance
+                && session.terminal_frame.as_ref().is_some_and(|frame| {
+                    frame.contents.contains("argv=--bundle-mode|portable;")
+                })
+        });
+        let default_ready = snapshot.sessions.iter().any(|session| {
+            session.instance_id == default_instance
+                && session.terminal_frame.as_ref().is_some_and(|frame| {
+                    frame.contents.contains("fixture-ready>")
+                        && !frame.contents.contains("portable")
+                })
+        });
+        selected_ready && default_ready
+    })
+    .await;
+
+    for (command_id, instance_id) in [(114, selected_instance), (115, default_instance)] {
+        handle
+            .dispatch(command(
+                command_id,
+                ControlCommand::Stop {
+                    instance_id,
+                    force: true,
+                },
+            ))
+            .unwrap();
+    }
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().all(|session| {
+            matches!(session.status, SessionStatus::Exited { .. })
+        })
+    })
+    .await;
+}
+
+#[test]
+fn native_instance_launch_overlay_rejects_unbounded_or_authority_conflicting_argv() {
+    assert_eq!(
+        NativeInstanceLaunchOverlay::new(
+            AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+            TransportKind::Pipe,
+            Vec::new(),
+            vec![OsString::from("--bundle-mode")],
+        )
+        .err()
+        .expect("Pipe argv overlay must fail"),
+        NativeLaunchProfileError::InstanceOverlayUnsupportedTransport
+    );
+    assert_eq!(
+        NativeInstanceLaunchOverlay::new(
+            AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+            TransportKind::Pty,
+            Vec::new(),
+            vec![OsString::from("x"); 129],
+        )
+        .err()
+        .expect("unbounded argv overlay must fail"),
+        NativeLaunchProfileError::TooManyLaunchArguments {
+            count: 129,
+            max: 128,
+        }
+    );
+    for argument in [
+        "--session-id",
+        "--resume",
+        "--resume=session-secret",
+        "--continue",
+        "--print",
+        "--prompt",
+        "--prompt-interactive",
+        "-c",
+        "-p",
+        "-r",
+    ] {
+        assert_eq!(
+            NativeInstanceLaunchOverlay::new(
+                AgentId::new("claude").unwrap(),
+                TransportKind::Pty,
+                Vec::new(),
+                vec![OsString::from(argument)],
+            )
+            .err()
+            .expect("reserved Claude argv overlay must fail"),
+            NativeLaunchProfileError::ReservedClaudeLaunchArgument { index: 0 },
+            "reserved Claude argument {argument} must fail closed"
+        );
+    }
+
+    let (_handle, mut runtime) = NativeRuntime::new(
+        AgentRegistry::new([interactive_agent_spec()]).expect("fixture registry"),
+        NativeRuntimeConfig::default(),
+    );
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                profile_id(),
+                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                vec![OsString::from(PROFILE_SENTINEL)],
+                Arc::new(EmptyResolver),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let control = runtime.native_launch_profile_control();
+    let instance_id = AgentInstanceId(8508);
+    control
+        .select_native_launch_profile(instance_id, profile_id())
+        .unwrap();
+    assert_eq!(
+        control
+            .install_native_instance_launch_overlay(
+                instance_id,
+                NativeInstanceLaunchOverlay::new(
+                    AgentId::new(HOOK_POSTING_FIXTURE_ID).unwrap(),
+                    TransportKind::Pty,
+                    Vec::new(),
+                    vec![OsString::from("--bundle-mode")],
+                )
+                .unwrap(),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlayBindingMismatch
+    );
+}
+
+#[test]
+fn native_instance_launch_overlay_debug_surfaces_never_expose_argv() {
+    const SECRET_ARG: &str = "argv-secret-must-never-reach-debug";
+
+    trait AmbiguousIfDebug<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfDebug<()> for T {}
+    impl<T: ?Sized + std::fmt::Debug> AmbiguousIfDebug<u8> for T {}
+
+    let _ = <NativeInstanceLaunchOverlay as AmbiguousIfDebug<_>>::marker;
+    let overlay = NativeInstanceLaunchOverlay::new(
+        AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+        TransportKind::Pty,
+        Vec::new(),
+        vec![OsString::from(SECRET_ARG)],
+    )
+    .unwrap();
+    let (_handle, runtime) = NativeRuntime::new(
+        AgentRegistry::new([interactive_agent_spec()]).expect("fixture registry"),
+        NativeRuntimeConfig::default(),
+    );
+    let error = runtime
+        .native_launch_profile_control()
+        .install_native_instance_launch_overlay(AgentInstanceId(8507), overlay)
+        .unwrap_err();
+    assert!(!format!("{error:?}").contains(SECRET_ARG));
 }

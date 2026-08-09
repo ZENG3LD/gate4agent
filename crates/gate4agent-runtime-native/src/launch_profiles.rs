@@ -13,7 +13,21 @@ const NATIVE_LAUNCH_PROFILE_ENV_MUTATIONS_MAX: usize = 128;
 const NATIVE_LAUNCH_PROFILE_ENV_KEY_MAX_BYTES: usize = 1_024;
 const NATIVE_LAUNCH_PROFILE_ENV_VALUE_MAX_BYTES: usize = 65_536;
 const NATIVE_LAUNCH_PROFILE_ENV_TOTAL_MAX_BYTES: usize = 1_048_576;
+const NATIVE_INSTANCE_LAUNCH_ARGS_MAX: usize = 128;
+const NATIVE_INSTANCE_LAUNCH_ARG_MAX_BYTES: usize = 65_536;
+const NATIVE_INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES: usize = 262_144;
 const RESERVED_HOOK_ENV_PREFIX: &str = "GATE4AGENT_HOOK_";
+const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
+    "--continue",
+    "--print",
+    "--prompt",
+    "--prompt-interactive",
+    "--resume",
+    "--session-id",
+    "-c",
+    "-p",
+    "-r",
+];
 
 pub const ZAI_GLM_CLAUDE_PROFILE_ID: &str = "zai-glm";
 pub const ZAI_GLM_CLAUDE_PROFILE_REVISION: &str = "zai-claude-env-2026-07-21";
@@ -186,11 +200,43 @@ pub struct NativeLaunchProfile {
     contract: NativeLaunchProfileContract,
 }
 
-/// Host-only, instance-bound environment applied after one exact native profile.
+/// Host-only launch mutations applied to one exact native PTY instance.
 ///
-/// The overlay does not implement `Debug` because its values may contain secret
-/// material. It is validated and retained without crossing the wire or durable
-/// state boundaries.
+/// The overlay does not implement `Debug` because environment values and argv
+/// may contain secret material. It is validated and retained without crossing
+/// the wire or durable state boundaries.
+pub struct NativeInstanceLaunchOverlay {
+    agent_id: AgentId,
+    transport: TransportKind,
+    environment: Vec<EnvMutation>,
+    extra_args: Vec<OsString>,
+}
+
+impl NativeInstanceLaunchOverlay {
+    pub fn new(
+        agent_id: AgentId,
+        transport: TransportKind,
+        environment: Vec<EnvMutation>,
+        extra_args: Vec<OsString>,
+    ) -> Result<Self, NativeLaunchProfileError> {
+        if transport != TransportKind::Pty {
+            return Err(NativeLaunchProfileError::InstanceOverlayUnsupportedTransport);
+        }
+        validate_environment_mutations(&environment)?;
+        validate_launch_arguments(&agent_id, &extra_args)?;
+        Ok(Self {
+            agent_id,
+            transport,
+            environment,
+            extra_args,
+        })
+    }
+}
+
+/// Backward-compatible environment-only overlay used by existing node flows.
+///
+/// This type also intentionally omits `Debug`. New PTY feature bundles should
+/// use [`NativeInstanceLaunchOverlay`] when they need child argv.
 pub struct NativeLaunchEnvironmentOverlay {
     agent_id: AgentId,
     transport: TransportKind,
@@ -212,6 +258,15 @@ impl NativeLaunchEnvironmentOverlay {
             transport,
             environment,
         })
+    }
+
+    fn into_instance_overlay(self) -> NativeInstanceLaunchOverlay {
+        NativeInstanceLaunchOverlay {
+            agent_id: self.agent_id,
+            transport: self.transport,
+            environment: self.environment,
+            extra_args: Vec::new(),
+        }
     }
 }
 
@@ -342,6 +397,8 @@ pub enum NativeLaunchProfileError {
     UnknownProfile { profile_id: NativeLaunchProfileId },
     #[error("native launch profile does not match the exact agent and transport binding")]
     BindingMismatch,
+    #[error("native instance launch overlay supports PTY transport only")]
+    InstanceOverlayUnsupportedTransport,
     #[error("native launch profile selection capacity is {max}")]
     SelectionCapacityExceeded { max: usize },
     #[error("native launch environment overlay requires an existing profile selection")]
@@ -352,6 +409,16 @@ pub enum NativeLaunchProfileError {
     EnvironmentOverlayKeyConflict,
     #[error("native launch environment overlay capacity is {max}")]
     EnvironmentOverlayCapacityExceeded { max: usize },
+    #[error("native instance launch overlay has {count} arguments; maximum is {max}")]
+    TooManyLaunchArguments { count: usize, max: usize },
+    #[error("native instance launch overlay argument {index} is invalid")]
+    InvalidLaunchArgument { index: usize },
+    #[error("native instance launch overlay argument {index} exceeds {max} bytes")]
+    LaunchArgumentTooLong { index: usize, max: usize },
+    #[error("native instance launch overlay argument payload exceeds {max} bytes")]
+    LaunchArgumentsPayloadTooLarge { max: usize },
+    #[error("native instance launch overlay argument {index} conflicts with Claude session, resume, or prompt authority")]
+    ReservedClaudeLaunchArgument { index: usize },
     #[error("native launch profile is selected by an instance; clear the selection first")]
     ProfileInUse,
     #[error(transparent)]
@@ -361,7 +428,7 @@ pub enum NativeLaunchProfileError {
 pub(crate) struct NativeLaunchProfiles {
     profiles: BTreeMap<NativeLaunchProfileId, NativeLaunchProfile>,
     selections: BTreeMap<AgentInstanceId, NativeLaunchProfileId>,
-    environment_overlays: BTreeMap<AgentInstanceId, Arc<NativeLaunchEnvironmentOverlay>>,
+    instance_overlays: BTreeMap<AgentInstanceId, Arc<NativeInstanceLaunchOverlay>>,
 }
 
 impl NativeLaunchProfiles {
@@ -369,7 +436,7 @@ impl NativeLaunchProfiles {
         Self {
             profiles: BTreeMap::new(),
             selections: BTreeMap::new(),
-            environment_overlays: BTreeMap::new(),
+            instance_overlays: BTreeMap::new(),
         }
     }
 
@@ -386,8 +453,8 @@ impl NativeLaunchProfiles {
         }
         for (instance_id, selected_profile_id) in &self.selections {
             if selected_profile_id == profile.id() {
-                if let Some(overlay) = self.environment_overlays.get(instance_id) {
-                    validate_environment_overlay_binding(&profile, overlay)?;
+                if let Some(overlay) = self.instance_overlays.get(instance_id) {
+                    validate_instance_overlay_binding(&profile, overlay)?;
                 }
             }
         }
@@ -419,8 +486,8 @@ impl NativeLaunchProfiles {
                 profile_id: profile_id.clone(),
             }
         })?;
-        if let Some(overlay) = self.environment_overlays.get(&instance_id) {
-            validate_environment_overlay_binding(profile, overlay)?;
+        if let Some(overlay) = self.instance_overlays.get(&instance_id) {
+            validate_instance_overlay_binding(profile, overlay)?;
         }
         if !self.selections.contains_key(&instance_id)
             && self.selections.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
@@ -435,7 +502,7 @@ impl NativeLaunchProfiles {
 
     pub(crate) fn clear_selection(&mut self, instance_id: AgentInstanceId) -> bool {
         let removed = self.selections.remove(&instance_id).is_some();
-        self.environment_overlays.remove(&instance_id);
+        self.instance_overlays.remove(&instance_id);
         removed
     }
 
@@ -443,6 +510,14 @@ impl NativeLaunchProfiles {
         &mut self,
         instance_id: AgentInstanceId,
         overlay: NativeLaunchEnvironmentOverlay,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.install_instance_overlay(instance_id, overlay.into_instance_overlay())
+    }
+
+    pub(crate) fn install_instance_overlay(
+        &mut self,
+        instance_id: AgentInstanceId,
+        overlay: NativeInstanceLaunchOverlay,
     ) -> Result<(), NativeLaunchProfileError> {
         let profile_id = self
             .selections
@@ -454,9 +529,9 @@ impl NativeLaunchProfiles {
             .ok_or_else(|| NativeLaunchProfileError::UnknownProfile {
                 profile_id: profile_id.clone(),
             })?;
-        validate_environment_overlay_binding(profile, &overlay)?;
-        if !self.environment_overlays.contains_key(&instance_id)
-            && self.environment_overlays.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
+        validate_instance_overlay_binding(profile, &overlay)?;
+        if !self.instance_overlays.contains_key(&instance_id)
+            && self.instance_overlays.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
         {
             return Err(
                 NativeLaunchProfileError::EnvironmentOverlayCapacityExceeded {
@@ -464,7 +539,7 @@ impl NativeLaunchProfiles {
                 },
             );
         }
-        self.environment_overlays
+        self.instance_overlays
             .insert(instance_id, Arc::new(overlay));
         Ok(())
     }
@@ -491,9 +566,9 @@ impl NativeLaunchProfiles {
         if transport == TransportKind::Pipe && !pipe_binding_is_exact_one_shot {
             return Err(NativeLaunchProfileError::UnsupportedTransport);
         }
-        let overlay = self.environment_overlays.get(&instance_id).cloned();
+        let overlay = self.instance_overlays.get(&instance_id).cloned();
         if let Some(overlay) = &overlay {
-            validate_environment_overlay_binding(profile, overlay)?;
+            validate_instance_overlay_binding(profile, overlay)?;
         }
         Ok(Some(NativeLaunchSpawnEnvironment {
             profile: profile.clone(),
@@ -504,7 +579,12 @@ impl NativeLaunchProfiles {
 
 struct NativeLaunchSpawnEnvironment {
     profile: NativeLaunchProfile,
-    overlay: Option<Arc<NativeLaunchEnvironmentOverlay>>,
+    overlay: Option<Arc<NativeInstanceLaunchOverlay>>,
+}
+
+pub(crate) struct ResolvedNativeLaunchOverlay {
+    pub(crate) environment: Vec<EnvMutation>,
+    pub(crate) extra_args: Vec<OsString>,
 }
 
 /// Clonable host-local control for selecting profiles without mutable runtime access.
@@ -563,13 +643,22 @@ impl NativeLaunchProfileControl {
         self.lock().install_environment_overlay(instance_id, overlay)
     }
 
-    pub(crate) fn resolve_environment(
+    /// Installs or replaces one host-only PTY launch overlay for an exact selection.
+    pub fn install_native_instance_launch_overlay(
+        &self,
+        instance_id: AgentInstanceId,
+        overlay: NativeInstanceLaunchOverlay,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.lock().install_instance_overlay(instance_id, overlay)
+    }
+
+    pub(crate) fn resolve_launch_overlay(
         &self,
         instance_id: AgentInstanceId,
         agent_id: &AgentId,
         transport: TransportKind,
         pipe_binding_is_exact_one_shot: bool,
-    ) -> Result<Vec<EnvMutation>, NativeLaunchProfileError> {
+    ) -> Result<ResolvedNativeLaunchOverlay, NativeLaunchProfileError> {
         let spawn_environment = {
             self.lock().profile_for_spawn(
                 instance_id,
@@ -578,15 +667,25 @@ impl NativeLaunchProfileControl {
                 pipe_binding_is_exact_one_shot,
             )?
         };
-        spawn_environment.map_or_else(|| Ok(Vec::new()), |spawn_environment| {
-            let mut environment = spawn_environment
-                .profile
-                .resolve_environment(agent_id, transport)?;
-            if let Some(overlay) = spawn_environment.overlay {
-                environment.extend(overlay.environment.iter().cloned());
-            }
-            validate_environment_mutations(&environment)?;
-            Ok(environment)
+        let Some(spawn_environment) = spawn_environment else {
+            return Ok(ResolvedNativeLaunchOverlay {
+                environment: Vec::new(),
+                extra_args: Vec::new(),
+            });
+        };
+        let mut environment = spawn_environment
+            .profile
+            .resolve_environment(agent_id, transport)?;
+        let mut extra_args = Vec::new();
+        if let Some(overlay) = spawn_environment.overlay {
+            environment.extend(overlay.environment.iter().cloned());
+            extra_args.extend(overlay.extra_args.iter().cloned());
+        }
+        validate_environment_mutations(&environment)?;
+        validate_launch_arguments(agent_id, &extra_args)?;
+        Ok(ResolvedNativeLaunchOverlay {
+            environment,
+            extra_args,
         })
     }
 
@@ -704,9 +803,9 @@ fn validate_environment_mutations(
     Ok(())
 }
 
-fn validate_environment_overlay_binding(
+fn validate_instance_overlay_binding(
     profile: &NativeLaunchProfile,
-    overlay: &NativeLaunchEnvironmentOverlay,
+    overlay: &NativeInstanceLaunchOverlay,
 ) -> Result<(), NativeLaunchProfileError> {
     if profile.agent_id() != &overlay.agent_id || profile.transport() != overlay.transport {
         return Err(NativeLaunchProfileError::EnvironmentOverlayBindingMismatch);
@@ -726,6 +825,58 @@ fn validate_environment_overlay_binding(
         return Err(NativeLaunchProfileError::EnvironmentOverlayKeyConflict);
     }
     Ok(())
+}
+
+fn validate_launch_arguments(
+    agent_id: &AgentId,
+    arguments: &[OsString],
+) -> Result<(), NativeLaunchProfileError> {
+    if arguments.len() > NATIVE_INSTANCE_LAUNCH_ARGS_MAX {
+        return Err(NativeLaunchProfileError::TooManyLaunchArguments {
+            count: arguments.len(),
+            max: NATIVE_INSTANCE_LAUNCH_ARGS_MAX,
+        });
+    }
+    let mut total_bytes = 0usize;
+    for (index, argument) in arguments.iter().enumerate() {
+        if contains_nul(argument) {
+            return Err(NativeLaunchProfileError::InvalidLaunchArgument { index });
+        }
+        let argument_bytes = os_string_bytes(argument);
+        if argument_bytes > NATIVE_INSTANCE_LAUNCH_ARG_MAX_BYTES {
+            return Err(NativeLaunchProfileError::LaunchArgumentTooLong {
+                index,
+                max: NATIVE_INSTANCE_LAUNCH_ARG_MAX_BYTES,
+            });
+        }
+        total_bytes = total_bytes.saturating_add(argument_bytes);
+        if total_bytes > NATIVE_INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES {
+            return Err(NativeLaunchProfileError::LaunchArgumentsPayloadTooLarge {
+                max: NATIVE_INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES,
+            });
+        }
+        if agent_id.as_str() == "claude" && is_reserved_claude_launch_argument(argument) {
+            return Err(NativeLaunchProfileError::ReservedClaudeLaunchArgument { index });
+        }
+    }
+    Ok(())
+}
+
+fn is_reserved_claude_launch_argument(argument: &OsStr) -> bool {
+    let Some(argument) = argument.to_str() else {
+        return false;
+    };
+    RESERVED_CLAUDE_LAUNCH_FLAGS.iter().any(|reserved| {
+        argument == *reserved
+            || (reserved.starts_with("--")
+                && argument
+                    .strip_prefix(reserved)
+                    .is_some_and(|suffix| suffix.starts_with('=')))
+            || (reserved.len() == 2
+                && argument
+                    .strip_prefix(reserved)
+                    .is_some_and(|suffix| !suffix.is_empty() && !suffix.starts_with('-')))
+    })
 }
 
 fn validate_zai_glm_claude_environment(

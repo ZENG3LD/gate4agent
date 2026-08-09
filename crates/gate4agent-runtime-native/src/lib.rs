@@ -5,8 +5,8 @@ mod vendor_contract;
 
 pub use launch_profiles::{
     NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
-    NativeLaunchEnvironmentOverlay, NativeLaunchProfileControl, NativeLaunchProfileDescriptor,
-    NativeLaunchProfileError, NativeLaunchProfileId,
+    NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay, NativeLaunchProfileControl,
+    NativeLaunchProfileDescriptor, NativeLaunchProfileError, NativeLaunchProfileId,
     ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
     ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
     ZAI_GLM_CLAUDE_PROFILE_REVISION, ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
@@ -60,6 +60,7 @@ use gate4agent_types::{
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -619,9 +620,16 @@ struct EffectWorker {
     sender: Sender<NativeEffectRequest>,
 }
 
+#[derive(Default)]
+struct NativeSpawnOverlay {
+    environment: Vec<EnvMutation>,
+    extra_args: Vec<OsString>,
+}
+
 struct NativeEffectRequest {
     effect: EffectEnvelope,
     spawn_env: Vec<EnvMutation>,
+    spawn_extra_args: Vec<OsString>,
 }
 
 #[derive(Clone)]
@@ -702,15 +710,19 @@ impl NativeEffectDispatcher {
             return;
         }
         let instance_id = effect.instance_id;
-        let spawn_env = match self.compose_spawn_environment(&effect) {
-            Ok(environment) => environment,
+        let spawn_overlay = match self.compose_spawn_overlay(&effect) {
+            Ok(overlay) => overlay,
             Err(message) => {
                 self.pending_failures
                     .push_back(effect_failure(effect, message));
                 return;
             }
         };
-        let mut pending = NativeEffectRequest { effect, spawn_env };
+        let mut pending = NativeEffectRequest {
+            effect,
+            spawn_env: spawn_overlay.environment,
+            spawn_extra_args: spawn_overlay.extra_args,
+        };
         for _ in 0..2 {
             let sender = self.worker_sender(instance_id);
             match sender.try_send(pending) {
@@ -740,6 +752,7 @@ impl NativeEffectDispatcher {
         let mut pending = NativeEffectRequest {
             effect,
             spawn_env: Vec::new(),
+            spawn_extra_args: Vec::new(),
         };
         for _ in 0..2 {
             let sender = self.capability_sender();
@@ -798,6 +811,7 @@ impl NativeEffectDispatcher {
         let mut pending = NativeEffectRequest {
             effect,
             spawn_env: Vec::new(),
+            spawn_extra_args: Vec::new(),
         };
         for _ in 0..2 {
             let sender = self.authority_sender();
@@ -885,16 +899,16 @@ impl NativeEffectDispatcher {
             .collect())
     }
 
-    fn compose_spawn_environment(
+    fn compose_spawn_overlay(
         &self,
         effect: &EffectEnvelope,
-    ) -> Result<Vec<EnvMutation>, String> {
-        let mut environment = self.profile_spawn_env(effect)?;
-        environment.extend(self.hook_pty_env(effect)?);
-        Ok(environment)
+    ) -> Result<NativeSpawnOverlay, String> {
+        let mut overlay = self.profile_spawn_overlay(effect)?;
+        overlay.environment.extend(self.hook_pty_env(effect)?);
+        Ok(overlay)
     }
 
-    fn profile_spawn_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
+    fn profile_spawn_overlay(&self, effect: &EffectEnvelope) -> Result<NativeSpawnOverlay, String> {
         let (agent_id, transport) = match &effect.effect {
             ControlEffect::Spawn {
                 agent_id,
@@ -906,7 +920,7 @@ impl NativeEffectDispatcher {
                 transport,
                 ..
             } => (agent_id, *transport),
-            _ => return Ok(Vec::new()),
+            _ => return Ok(NativeSpawnOverlay::default()),
         };
         let pipe_binding_is_exact_one_shot = transport != TransportKind::Pipe
             || self.catalog.get(agent_id).is_some_and(|spec| {
@@ -916,12 +930,16 @@ impl NativeEffectDispatcher {
                 })
             });
         self.launch_profiles
-            .resolve_environment(
+            .resolve_launch_overlay(
                 effect.instance_id,
                 agent_id,
                 transport,
                 pipe_binding_is_exact_one_shot,
             )
+            .map(|overlay| NativeSpawnOverlay {
+                environment: overlay.environment,
+                extra_args: overlay.extra_args,
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -1400,7 +1418,11 @@ async fn run_effect_worker(
                 last_effect = Instant::now();
                 let before = shell.active_session_count();
                 let completion = shell
-                    .execute_with_pty_env(request.effect, request.spawn_env)
+                    .execute_with_launch_overlay(
+                        request.effect,
+                        request.spawn_env,
+                        request.spawn_extra_args,
+                    )
                     .await;
                 update_active_count(&context.active_sessions, before, shell.active_session_count());
                 remove_hook_route_for_observation(&context.hook_ingress, &completion);

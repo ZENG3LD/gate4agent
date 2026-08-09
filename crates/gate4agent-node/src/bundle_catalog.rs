@@ -1310,9 +1310,7 @@ mod tests {
 
     impl TestRoot {
         fn new() -> Self {
-            let base = std::env::current_dir()
-                .unwrap()
-                .join("target/bundle-catalog-tests");
+            let base = std::env::temp_dir().join("gate4agent-bundle-catalog-tests");
             fs::create_dir_all(&base).unwrap();
             let path = base.join(format!(
                 "gate4agent-bundle-catalog-{}-{}",
@@ -1417,15 +1415,6 @@ mod tests {
         let error = bundle(&mcp, zero_digest()).unwrap_err();
         assert!(matches!(error, NodeBundleError::McpUnsupported));
 
-        #[cfg(unix)]
-        {
-            let collision = TestRoot::valid();
-            collision.write("skills/review-code/references/A.txt", b"upper");
-            collision.write("skills/review-code/references/a.txt", b"lower");
-            let error = bundle(&collision, zero_digest()).unwrap_err();
-            assert!(matches!(error, NodeBundleError::CaseFoldCollision { .. }));
-        }
-
         let linked = TestRoot::valid();
         let target = linked.path().join("skills/review-code/target.txt");
         fs::write(&target, b"target").unwrap();
@@ -1475,6 +1464,27 @@ mod tests {
             .unwrap_err();
             assert!(matches!(error, NodeBundleError::InsecurePermissions { .. }));
         }
+    }
+
+    #[test]
+    fn node_bundle_rejects_case_fold_collision_when_source_can_represent_it() {
+        let collision = TestRoot::valid();
+        let references = collision.path().join("skills/review-code/references");
+        collision.write("skills/review-code/references/A.txt", b"upper");
+        collision.write("skills/review-code/references/a.txt", b"lower");
+
+        let names = fs::read_dir(references)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        if !names.contains(std::ffi::OsStr::new("A.txt"))
+            || !names.contains(std::ffi::OsStr::new("a.txt"))
+        {
+            return;
+        }
+
+        let error = bundle(&collision, zero_digest()).unwrap_err();
+        assert!(matches!(error, NodeBundleError::CaseFoldCollision { .. }));
     }
 
     #[test]

@@ -21,10 +21,10 @@ use gate4agent_c2_protocol::{
     NodeTransportState, C2WorkspaceInspection,
 };
 use gate4agent_node_protocol::{
-    ClientRole, ControllerState, ManagedSessionRecord, NodeEvent, NodeFailureCode,
-    NodeId, NodeRequest, NodeResponse, NodeSnapshot, SessionAddress as WireSessionAddress,
-    SessionKey, SessionMode, SessionRecordId, WorkspaceId, MAX_CONTROLLER_LEASE_MS,
-    MAX_NODE_TEXT_BYTES,
+    ClientRole, ControllerState, ManagedSessionRecord, ManagedWorktreeLeaseState, NodeEvent,
+    NodeFailureCode, NodeId, NodeRequest, NodeResponse, NodeSnapshot,
+    SessionAddress as WireSessionAddress, SessionKey, SessionMode, SessionRecordId, WorkspaceId,
+    MAX_CONTROLLER_LEASE_MS, MAX_NODE_TEXT_BYTES,
 };
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
 use gate4agent_types::{
@@ -1194,6 +1194,40 @@ async fn publish_c2_response(
         C2NodeResponse::SpawnAccepted { session } => {
             send_update(updates, WorkerUpdate::OpenSession(project_wire_address(node_id, session))).await;
         }
+        C2NodeResponse::SpawnSpecAccepted { receipt } => {
+            send_update(
+                updates,
+                WorkerUpdate::OpenSession(project_wire_address(node_id, receipt.session)),
+            )
+            .await;
+        }
+        C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
+            let workspace_id = receipt.lease.workspace_id.to_string();
+            send_update(
+                updates,
+                WorkerUpdate::SelectWorkspace {
+                    node_id: node_id.to_owned(),
+                    workspace_id,
+                },
+            )
+            .await;
+            send_update(
+                updates,
+                WorkerUpdate::OpenSession(project_wire_address(node_id, receipt.spawn.session)),
+            )
+            .await;
+        }
+        C2NodeResponse::ManagedWorktreeCleanup { lease } => {
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{node_id}: managed worktree {} is {}",
+                    lease.workspace_id,
+                    managed_worktree_state_label(lease.state)
+                )),
+            )
+            .await;
+        }
         C2NodeResponse::SessionRecordUpdated { record } => {
             send_update(
                 updates,
@@ -1302,7 +1336,9 @@ async fn publish_c2_event(
         C2NodeEvent::ResyncRequired { .. } => Some(C2EventUpdate::ResyncRequired),
         C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
-        | C2NodeEvent::WorkspaceRemoved { .. } => Some(C2EventUpdate::Ignored),
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::ManagedWorktreeUpserted { .. }
+        | C2NodeEvent::ManagedWorktreeRemoved { .. } => Some(C2EventUpdate::Ignored),
     };
     send_update(updates, WorkerUpdate::C2Event {
         node_id: node_id.to_owned(),
@@ -1843,6 +1879,62 @@ async fn request_and_publish(
             )
             .await;
         }
+        NodeResponse::SpawnSpecAccepted { receipt } => {
+            let address = project_wire_address(
+                endpoint.expected_node_id.as_str(),
+                receipt.session,
+            );
+            send_update(updates, WorkerUpdate::OpenSession(address.clone())).await;
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{}: spawn accepted in {} as #{}:{}",
+                    endpoint.expected_node_id,
+                    address.workspace_id,
+                    address.instance_id,
+                    address.generation
+                )),
+            )
+            .await;
+        }
+        NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
+            let workspace_id = receipt.lease.workspace_id.to_string();
+            let address = project_wire_address(
+                endpoint.expected_node_id.as_str(),
+                receipt.spawn.session,
+            );
+            send_update(
+                updates,
+                WorkerUpdate::SelectWorkspace {
+                    node_id: endpoint.expected_node_id.to_string(),
+                    workspace_id: workspace_id.clone(),
+                },
+            )
+            .await;
+            send_update(updates, WorkerUpdate::OpenSession(address.clone())).await;
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{}: managed worktree spawn accepted in {workspace_id} as #{}:{}",
+                    endpoint.expected_node_id,
+                    address.instance_id,
+                    address.generation
+                )),
+            )
+            .await;
+        }
+        NodeResponse::ManagedWorktreeCleanup { lease } => {
+            send_update(
+                updates,
+                WorkerUpdate::Notice(format!(
+                    "{}: managed worktree {} is {}",
+                    endpoint.expected_node_id,
+                    lease.workspace_id,
+                    managed_worktree_state_label(lease.state)
+                )),
+            )
+            .await;
+        }
         NodeResponse::SessionRecordUpdated { record } => {
             let name = record.display_name.clone();
             send_update(
@@ -2146,7 +2238,10 @@ async fn publish_node_event(
             )
             .await;
         }
-        NodeEvent::WorkspaceAdded { .. } | NodeEvent::WorkspaceRemoved { .. } => {}
+        NodeEvent::WorkspaceAdded { .. }
+        | NodeEvent::WorkspaceRemoved { .. }
+        | NodeEvent::ManagedWorktreeUpserted { .. }
+        | NodeEvent::ManagedWorktreeRemoved { .. } => {}
     }
 }
 
@@ -2733,6 +2828,21 @@ fn safe_node_failure_code(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::WorktreeProtected => "protected worktree cannot be removed",
         NodeFailureCode::WorktreeDirty => "worktree has uncommitted changes",
         NodeFailureCode::WorktreeLocked => "worktree is locked",
+        NodeFailureCode::UnknownManagedWorktreeLease => "managed worktree lease unavailable",
+        NodeFailureCode::ManagedWorktreeBusy => "managed worktree is busy",
+        NodeFailureCode::ManagedWorktreeOwnershipConflict => "managed worktree ownership conflicts",
+        NodeFailureCode::ManagedWorktreeRecoveryRequired => "managed worktree requires recovery",
+        NodeFailureCode::UnknownSpawnProfile => "spawn profile unavailable",
+        NodeFailureCode::UnknownBundle => "session bundle unavailable",
+        NodeFailureCode::UnknownEnvironmentProfile => "environment profile unavailable",
+        NodeFailureCode::BundleBindingMismatch => "session bundle binding mismatch",
+        NodeFailureCode::EnvironmentProfileBindingMismatch => "environment profile binding mismatch",
+        NodeFailureCode::BundleMaterializationFailed => "session bundle materialization failed",
+        NodeFailureCode::SpawnTargetMismatch => "spawn target mismatch",
+        NodeFailureCode::SpawnIdempotencyConflict => "spawn request conflicts with an earlier request",
+        NodeFailureCode::SpawnIdempotencyCapacity => "spawn request capacity exhausted",
+        NodeFailureCode::SpawnDeadlineExceeded => "spawn deadline exceeded",
+        NodeFailureCode::UnsupportedSpawnCapability => "required spawn capability unavailable",
         NodeFailureCode::UnknownSession => "session unavailable",
         NodeFailureCode::UnknownSessionRecord => "managed session record unavailable",
         NodeFailureCode::SessionRecordNotResumable => "managed session cannot resume",
@@ -2744,6 +2854,18 @@ fn safe_node_failure_code(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::BackendDisconnected => "node backend disconnected",
         NodeFailureCode::BackendOperationFailed => "node backend operation failed",
         NodeFailureCode::ShuttingDown => "node shutting down",
+    }
+}
+
+fn managed_worktree_state_label(state: ManagedWorktreeLeaseState) -> &'static str {
+    match state {
+        ManagedWorktreeLeaseState::Allocating => "allocating",
+        ManagedWorktreeLeaseState::Ready => "ready",
+        ManagedWorktreeLeaseState::InUse => "in use",
+        ManagedWorktreeLeaseState::Retained => "retained",
+        ManagedWorktreeLeaseState::CleanupBlocked => "cleanup blocked",
+        ManagedWorktreeLeaseState::RecoveryRequired => "awaiting recovery",
+        ManagedWorktreeLeaseState::Removed => "removed",
     }
 }
 
@@ -2951,6 +3073,7 @@ mod tests {
                     sessions: Vec::new(),
                 }],
                 session_records: Vec::new(),
+                managed_worktrees: Vec::new(),
             },
             7,
         );
@@ -3523,6 +3646,7 @@ mod tests {
             active_session: None,
             provider_identity_present: true,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         }
@@ -3535,6 +3659,7 @@ mod tests {
             provider_runtime_statuses: Default::default(),
             workspaces: Vec::new(),
             session_records: vec![c2_test_record(display_name)],
+            managed_worktrees: Vec::new(),
         }
     }
 
@@ -3578,6 +3703,7 @@ mod tests {
                 }],
             }],
             session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         }
     }
 
@@ -3794,6 +3920,7 @@ mod tests {
             active_session: None,
             provider_identity_present: true,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         };
@@ -3803,6 +3930,7 @@ mod tests {
             provider_runtime_statuses: Default::default(),
             workspaces: Vec::new(),
             session_records: vec![record.clone()],
+            managed_worktrees: Vec::new(),
         };
         let (updates, mut receiver) = mpsc::channel(8);
         publish_c2_response(

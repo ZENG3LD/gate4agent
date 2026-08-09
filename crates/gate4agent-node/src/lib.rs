@@ -2,6 +2,8 @@
 
 mod bundle_catalog;
 
+mod bundle_provider;
+
 mod git_worktree;
 
 mod environment_profiles;

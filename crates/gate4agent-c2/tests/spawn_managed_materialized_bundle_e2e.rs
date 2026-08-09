@@ -21,14 +21,14 @@ use gate4agent_node::{
     NodeSecretResolveError, NodeSecretResolver, NodeSecretValue, NodeServer, NodeServerConfig,
     SpawnProfileRegistry, WorkspaceConfig, WorktreeServiceMode,
 };
-use gate4agent_types::{AgentId, TerminalControl, TerminalFrame, TerminalSize};
+use gate4agent_types::{AgentId, TerminalFrame, TerminalSize};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -86,7 +86,7 @@ fn endpoint(label: &str) -> String {
         .unwrap()
         .as_nanos();
     format!(
-        r"\\.\pipe\gate4agent-f61-bundle-{label}-{}-{nonce}-{}",
+        r"\\.\pipe\gate4agent-f62-bundle-{label}-{}-{nonce}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed),
     )
@@ -94,15 +94,6 @@ fn endpoint(label: &str) -> String {
 
 fn agent(value: &str) -> AgentId {
     AgentId::new(value).unwrap()
-}
-
-fn exact_cmd_launcher() -> String {
-    let configured = std::env::var_os("ComSpec").expect("Windows ComSpec is unavailable");
-    std::fs::canonicalize(Path::new(&configured))
-        .expect("Windows command processor is unavailable")
-        .into_os_string()
-        .into_string()
-        .expect("Windows command processor path is not Unicode")
 }
 
 fn git_command(root: &Path, arguments: &[&str]) -> std::process::Output {
@@ -132,7 +123,7 @@ impl Drop for RemoveFixtureDirectory {
             .0
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("gate4agent-f61-bundle-e2e-"));
+            .is_some_and(|name| name.starts_with("gate4agent-f62-bundle-e2e-"));
         if safe {
             let _ = std::fs::remove_dir_all(&self.0);
         }
@@ -145,7 +136,7 @@ fn fixture_root() -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "gate4agent-f61-bundle-e2e-{}-{nonce}",
+        "gate4agent-f62-bundle-e2e-{}-{nonce}",
         std::process::id(),
     ))
 }
@@ -302,10 +293,32 @@ fn assert_redacted<T: Serialize>(value: &T, forbidden: &[&str], context: &str) {
     );
 }
 
-fn assert_state_v7_bundle_correlation(state_path: &Path, expected_materializations: usize) {
+fn count_exact_json_string(value: &Value, expected: &str) -> usize {
+    match value {
+        Value::String(value) => usize::from(value == expected),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| count_exact_json_string(value, expected))
+            .sum(),
+        Value::Object(values) => values
+            .values()
+            .map(|value| count_exact_json_string(value, expected))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn assert_state_v7_bundle_correlation(
+    state_path: &Path,
+    expected_materializations: usize,
+    expected_bundle_root: Option<&Path>,
+) {
     let encoded = std::fs::read_to_string(state_path).expect("durable state is unavailable");
     assert!(!encoded.contains(std::str::from_utf8(SKILL).unwrap()));
     assert!(!encoded.contains(std::str::from_utf8(ROOT_MANIFEST).unwrap()));
+    assert!(!encoded.contains("--plugin-dir"));
+    assert!(!encoded.contains("--skills-dir"));
+    assert!(!encoded.contains("argv"));
     let state: Value = serde_json::from_str(&encoded).expect("durable state is invalid JSON");
     assert_eq!(state["version"], 7);
     let materializations = state["materializations"]
@@ -323,6 +336,19 @@ fn assert_state_v7_bundle_correlation(state_path: &Path, expected_materializatio
             }),
         );
         assert_eq!(materialization["owner"]["kind"], "session");
+    }
+    match expected_bundle_root {
+        Some(expected) => {
+            assert_eq!(materializations.len(), 1);
+            let expected = expected.to_string_lossy();
+            assert_eq!(materializations[0]["bundle_root"], expected.as_ref());
+            assert_eq!(
+                count_exact_json_string(&state, expected.as_ref()),
+                1,
+                "durable state retained a second provider argv/path copy",
+            );
+        }
+        None => assert_eq!(expected_materializations, 0),
     }
 }
 
@@ -454,43 +480,7 @@ async fn wait_stopped(
     .expect("cmd.exe raw PTY did not stop through C2");
 }
 
-async fn send_terminal_line(
-    control: &C2ControlHandle,
-    route: &NodeRoute,
-    address: &SessionAddress,
-    text: &str,
-) {
-    assert!(matches!(
-        control
-            .request(
-                route.clone(),
-                NodeRequest::Input {
-                    session: address.clone(),
-                    text: text.to_owned(),
-                },
-            )
-            .await
-            .unwrap()
-            .response,
-        Ok(C2NodeResponse::Accepted)
-    ));
-    assert!(matches!(
-        control
-            .request(
-                route.clone(),
-                NodeRequest::TerminalControl {
-                    session: address.clone(),
-                    control: TerminalControl::Enter,
-                },
-            )
-            .await
-            .unwrap()
-            .response,
-        Ok(C2NodeResponse::Accepted)
-    ));
-}
-
-async fn wait_terminal_line(
+async fn wait_terminal_marker(
     events: &mut mpsc::UnboundedReceiver<RoutedNodeEvent>,
     route: &NodeRoute,
     address: &SessionAddress,
@@ -522,7 +512,7 @@ async fn wait_terminal_line(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("exact {expected} line did not reach a routed TerminalFrame"));
+    .unwrap_or_else(|_| panic!("exact {expected} marker did not reach a routed TerminalFrame"));
 }
 
 async fn wait_managed_cleanup_events(
@@ -589,6 +579,7 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     let materialization_root = test_root.join("private-session-bundles");
     let bundle_source = test_root.join("bundle-source");
     let state_path = test_root.join("node-state.json");
+    let argv_proof_path = test_root.join("provider-argv.proof");
     std::fs::create_dir_all(&allocation_root).unwrap();
     write_bundle_fixture(&bundle_source);
     protect_bundle_tree(&bundle_source);
@@ -647,10 +638,10 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         &materialization_root,
         &spawn_profile_id,
     );
-    let mut server = NodeServer::new_exact_launcher_fixture(
+    let mut server = NodeServer::new_provider_bundle_argv_fixture(
         config,
         agent("claude"),
-        exact_cmd_launcher(),
+        argv_proof_path.clone(),
     )
     .unwrap();
     server.install_bundle(bundle).unwrap();
@@ -694,8 +685,14 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         assert!(capabilities.iter().any(|capability| capability.as_str() == required));
     }
     let (event_tx, mut collected_events) = mpsc::unbounded_channel();
+    let event_log = Arc::new(Mutex::new(Vec::new()));
+    let event_log_writer = Arc::clone(&event_log);
     let event_collector = tokio::spawn(async move {
         while let Some(event) = events.recv().await {
+            event_log_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event.clone());
             if event_tx.send(event).is_err() {
                 return;
             }
@@ -726,6 +723,36 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     assert_eq!(session_count(&after_unknown), 0);
     assert!(after_unknown.managed_worktrees.is_empty());
     assert!(materialization_directories(&materialization_root).is_empty());
+    assert_eq!(git_worktree_count(&repository), 1);
+
+    let mut unsupported_request = spawn_request(
+        &node_id,
+        &workspace_id,
+        &spawn_profile_id,
+        BUNDLE_ID,
+        "unsupported-provider-once",
+    );
+    unsupported_request.spawn_spec.overrides.provider = SpawnOverride::Set {
+        value: agent("codex"),
+    };
+    let unsupported = control
+        .request(
+            route.clone(),
+            NodeRequest::SpawnManagedWorktree {
+                request: unsupported_request,
+            },
+        )
+        .await
+        .expect("typed unsupported-provider failure closed the C2 connection");
+    match unsupported.response {
+        Err(failure) => assert_eq!(failure.code, NodeFailureCode::BundleBindingMismatch),
+        response => panic!("unsupported provider unexpectedly received a bundle: {response:?}"),
+    }
+    let after_unsupported = snapshot(&control, &route).await;
+    assert_eq!(session_count(&after_unsupported), 0);
+    assert!(after_unsupported.managed_worktrees.is_empty());
+    assert!(materialization_directories(&materialization_root).is_empty());
+    assert!(!argv_proof_path.exists());
     assert_eq!(git_worktree_count(&repository), 1);
 
     let request = spawn_request(
@@ -781,33 +808,42 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         std::fs::read(private_bundle.join("skills/review-code/SKILL.md")).unwrap(),
         SKILL,
     );
-    assert_state_v7_bundle_correlation(&state_path, 1);
+    wait_terminal_marker(
+        &mut collected_events,
+        &route,
+        &receipt.spawn.session,
+        "F62_BUNDLE_ARGV_VALIDATED",
+    )
+    .await;
+    let argv_proof = std::fs::read_to_string(&argv_proof_path)
+        .expect("validated provider child omitted its private argv proof");
+    let argv: Vec<_> = argv_proof.lines().collect();
+    assert_eq!(argv.len(), 2, "provider child received a non-exact argv pair");
+    assert_eq!(argv[0], "--plugin-dir");
+    assert_eq!(Path::new(argv[1]), private_bundle);
+    assert_state_v7_bundle_correlation(&state_path, 1, Some(&private_bundle));
 
     let source_text = bundle_source.to_string_lossy().into_owned();
     let private_text = materialized.to_string_lossy().into_owned();
+    let proof_text = argv_proof_path.to_string_lossy().into_owned();
+    let root_manifest_text = std::str::from_utf8(ROOT_MANIFEST).unwrap();
+    let claude_manifest_text = std::str::from_utf8(CLAUDE_MANIFEST).unwrap();
     let skill_text = std::str::from_utf8(SKILL).unwrap();
-    let forbidden = [source_text.as_str(), private_text.as_str(), skill_text];
+    let forbidden = [
+        source_text.as_str(),
+        private_text.as_str(),
+        proof_text.as_str(),
+        "--plugin-dir",
+        root_manifest_text,
+        claude_manifest_text,
+        skill_text,
+    ];
     assert_redacted(&request, &forbidden, "managed spawn request");
     assert_redacted(&receipt, &forbidden, "managed spawn receipt");
     let active_snapshot = snapshot(&control, &route).await;
     assert_eq!(session_count(&active_snapshot), 1);
     assert_redacted(&active_snapshot, &forbidden, "public C2 snapshot");
     assert_redacted(&http.status().await.unwrap(), &forbidden, "public C2 status");
-
-    send_terminal_line(
-        &control,
-        &route,
-        &receipt.spawn.session,
-        "echo F61_RUNTIME_READY",
-    )
-    .await;
-    wait_terminal_line(
-        &mut collected_events,
-        &route,
-        &receipt.spawn.session,
-        "F61_RUNTIME_READY",
-    )
-    .await;
 
     let replay = control
         .request(
@@ -846,7 +882,7 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     let stopped_lease = find_lease(&stopped_snapshot, &receipt.lease)
         .expect("Stop removed the managed worktree lease");
     assert_eq!(stopped_lease.active_session_count, 1);
-    assert_state_v7_bundle_correlation(&state_path, 1);
+    assert_state_v7_bundle_correlation(&state_path, 1, Some(&private_bundle));
 
     assert!(matches!(
         control
@@ -870,7 +906,72 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     assert!(!materialized.exists(), "Remove retained session-owned bundle bytes");
     assert!(!managed_worktree.exists(), "Remove retained the managed worktree");
     assert_eq!(git_worktree_count(&repository), 1);
-    assert_state_v7_bundle_correlation(&state_path, 0);
+    assert_state_v7_bundle_correlation(&state_path, 0, None);
+
+    let unbundled = control
+        .request(
+            route.clone(),
+            NodeRequest::Spawn {
+                workspace_id: workspace_id.clone(),
+                provider: agent("claude"),
+                mode: SessionMode::Pty,
+                terminal_size: TerminalSize {
+                    rows: 40,
+                    columns: 160,
+                },
+                initial_prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+    let unbundled_session = match unbundled.response {
+        Ok(C2NodeResponse::SpawnAccepted { session }) => session,
+        response => panic!("unbundled follow-up spawn failed: {response:?}"),
+    };
+    wait_running(&control, &route, &unbundled_session).await;
+    wait_terminal_marker(
+        &mut collected_events,
+        &route,
+        &unbundled_session,
+        "F62_NO_BUNDLE_ARGV",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(&argv_proof_path).unwrap(),
+        b"",
+        "unbundled provider child inherited bundle argv",
+    );
+    assert!(materialization_directories(&materialization_root).is_empty());
+    assert_eq!(git_worktree_count(&repository), 1);
+    assert!(matches!(
+        control
+            .request(
+                route.clone(),
+                NodeRequest::Stop {
+                    session: unbundled_session.clone(),
+                    force: true,
+                },
+            )
+            .await
+            .unwrap()
+            .response,
+        Ok(C2NodeResponse::Accepted)
+    ));
+    wait_stopped(&control, &route, &unbundled_session).await;
+    assert!(matches!(
+        control
+            .request(
+                route.clone(),
+                NodeRequest::Remove {
+                    session: unbundled_session,
+                },
+            )
+            .await
+            .unwrap()
+            .response,
+        Ok(C2NodeResponse::Accepted)
+    ));
+
     let final_snapshot = snapshot(&control, &route).await;
     assert_eq!(session_count(&final_snapshot), 0);
     assert!(final_snapshot.managed_worktrees.is_empty());
@@ -888,6 +989,13 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         .await
         .expect("C2 event stream did not close")
         .expect("C2 event collector failed");
+    let public_events = event_log
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(!public_events.is_empty(), "C2 event drain observed no production events");
+    for event in public_events.iter() {
+        assert_redacted(event, &forbidden, "public C2 event");
+    }
     node_shutdown.request_shutdown().await.unwrap();
     timeout(Duration::from_secs(10), node_task)
         .await

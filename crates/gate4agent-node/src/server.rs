@@ -12,6 +12,7 @@ use crate::environment_profiles::{
     EnvironmentProfileBinding, NodeEnvironmentProfile, MAX_NODE_ENVIRONMENT_PROFILES,
 };
 use crate::bundle_catalog::{BundleCatalog, NodeBundle};
+use crate::bundle_provider::{bundle_launch_arguments, validate_bundle_binding};
 use crate::session_environment::{
     MaterializationId, MaterializationOwner, MaterializationOwnershipRecord,
     MaterializationState, NodeSecretResolver, NodeSessionMaterializationProfile,
@@ -82,8 +83,8 @@ use crate::protocol::{
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
 use gate4agent_runtime_native::{
-    HookIngressConfig, NativeLaunchEnvironmentOverlay, NativeLaunchProfileControl,
-    NativeRuntime, NativeRuntimeConfig,
+    HookIngressConfig, NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay,
+    NativeLaunchProfileControl, NativeRuntime, NativeRuntimeConfig,
 };
 use gate4agent_node_wire::{
     auth_proof, negotiated_auth_proof, proofs_match, random_incarnation_id, random_nonce,
@@ -443,6 +444,56 @@ impl NodeServer {
         let mut spec = gate4agent_testkit::interactive_agent_spec();
         spec.id = AgentId::new("claude").map_err(|error| NodeServerError::Registry(error.to_string()))?;
         spec.display_name = "Controlled Claude PTY fixture".to_owned();
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    pub fn new_provider_bundle_argv_fixture(
+        config: NodeServerConfig,
+        agent_id: AgentId,
+        proof_path: PathBuf,
+    ) -> Result<Self, NodeServerError> {
+        let expected_flag = match agent_id.as_str() {
+            "claude" => "--plugin-dir",
+            "kimi" => "--skills-dir",
+            _ => {
+                return Err(NodeServerError::Registry(
+                    "provider bundle argv fixture requires Claude or Kimi".to_owned(),
+                ));
+            }
+        };
+        let mut spec = gate4agent_testkit::interactive_agent_spec();
+        spec.id = agent_id.clone();
+        spec.display_name = format!("Controlled {agent_id} bundle argv fixture");
+        if !proof_path.is_absolute()
+            || !proof_path
+                .parent()
+                .is_some_and(|parent| parent.is_dir())
+        {
+            return Err(NodeServerError::Registry(
+                "provider bundle argv proof path requires an existing absolute parent"
+                    .to_owned(),
+            ));
+        }
+        let proof_path = proof_path.into_os_string().into_string().map_err(|_| {
+            NodeServerError::Registry(
+                "provider bundle argv proof path is not valid Unicode".to_owned(),
+            )
+        })?;
+        let script = spec
+            .launch
+            .fixed_args
+            .pop()
+            .ok_or_else(|| NodeServerError::Registry("PTY fixture script is unavailable".to_owned()))?;
+        let provider_validation = if agent_id.as_str() == "claude" {
+            "if (-not (Test-Path -LiteralPath (Join-Path $bundleArgs[1] '.claude-plugin/plugin.json') -PathType Leaf)) { exit 92 }"
+        } else {
+            "if ((Split-Path -Leaf $bundleArgs[1]) -ne 'skills') { exit 93 }"
+        };
+        spec.launch.fixed_args.push(format!(
+            "& {{ param([string]$proofPath, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) if ($bundleArgs.Count -eq 0) {{ [IO.File]::WriteAllLines($proofPath, [string[]]@()); [Console]::Out.WriteLine('F62_NO_BUNDLE_ARGV') }} elseif ($bundleArgs.Count -eq 2 -and $bundleArgs[0] -ceq '{expected_flag}' -and [IO.Path]::IsPathRooted($bundleArgs[1]) -and (Test-Path -LiteralPath $bundleArgs[1] -PathType Container)) {{ {provider_validation}; [IO.File]::WriteAllLines($proofPath, [string[]]@($bundleArgs[0], $bundleArgs[1])); [Console]::Out.WriteLine('F62_BUNDLE_ARGV_VALIDATED') }} else {{ exit 91 }}; {script} }}",
+        ));
+        spec.launch.fixed_args.push(proof_path);
         Self::new_fixture_with_spec(config, spec)
     }
 
@@ -1200,6 +1251,30 @@ struct NativeEnvironmentSelectionGuard {
     instance_id: AgentInstanceId,
 }
 
+struct NativeInstanceOverlayGuard {
+    control: Option<NativeLaunchProfileControl>,
+    instance_id: AgentInstanceId,
+}
+
+impl NativeInstanceOverlayGuard {
+    fn retain(mut self) {
+        self.control = None;
+    }
+}
+
+impl Drop for NativeInstanceOverlayGuard {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.as_ref() {
+            control.clear_native_instance_launch_overlay(self.instance_id);
+        }
+    }
+}
+
+enum PreparedNativeLaunchOverlay {
+    Environment(NativeLaunchEnvironmentOverlay),
+    Instance(NativeInstanceLaunchOverlay),
+}
+
 impl NativeEnvironmentSelectionGuard {
     fn retain(mut self) {
         self.control = None;
@@ -1541,18 +1616,22 @@ impl NodeShared {
         let Some(bundle_id) = resolved.bundle_id.as_ref() else {
             return Ok(None);
         };
-        self.bundle_catalog
+        let catalog = self.bundle_catalog
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(bundle_id)
-            .map(NodeBundle::receipt)
-            .ok_or_else(|| {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bundle = catalog.get(bundle_id).ok_or_else(|| {
                 failure(
                     NodeFailureCode::UnknownBundle,
                     "spawn bundle is unavailable on this node",
                 )
-            })
-            .map(Some)
+            })?;
+        validate_bundle_binding(&resolved.provider, resolved.mode, bundle).map_err(|_| {
+            failure(
+                NodeFailureCode::BundleBindingMismatch,
+                "spawn bundle does not match the provider and mode",
+            )
+        })?;
+        Ok(Some(bundle.receipt()))
     }
 
     fn select_environment_profile(
@@ -1613,6 +1692,42 @@ impl NodeShared {
         }))
     }
 
+    fn install_prepared_launch_overlay(
+        &self,
+        instance_id: AgentInstanceId,
+        overlay: PreparedNativeLaunchOverlay,
+    ) -> Result<Option<NativeInstanceOverlayGuard>, NodeFailure> {
+        let control = self.native_launch_profile_control.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                "native launch profile controller is unavailable",
+            )
+        })?;
+        match overlay {
+            PreparedNativeLaunchOverlay::Environment(overlay) => {
+                control
+                    .install_native_launch_environment_overlay(instance_id, overlay)
+                    .map_err(|_| failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "session environment overlay installation failed",
+                    ))?;
+                Ok(None)
+            }
+            PreparedNativeLaunchOverlay::Instance(overlay) => {
+                control
+                    .install_native_instance_launch_overlay(instance_id, overlay)
+                    .map_err(|_| failure(
+                        NodeFailureCode::BundleBindingMismatch,
+                        "session bundle launch overlay installation failed",
+                    ))?;
+                Ok(Some(NativeInstanceOverlayGuard {
+                    control: Some(control),
+                    instance_id,
+                }))
+            }
+        }
+    }
+
     fn environment_materialization_profile(
         &self,
         environment_profile: &ResolvedEnvironmentProfileReceipt,
@@ -1626,6 +1741,8 @@ impl NodeShared {
 
     fn materialization_profile(
         &self,
+        provider: &AgentId,
+        mode: SessionMode,
         environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
         bundle: Option<&ResolvedBundleReceipt>,
     ) -> Result<Option<(NodeSessionMaterializationProfile, bool)>, NodeFailure> {
@@ -1645,6 +1762,12 @@ impl NodeShared {
                         "session bundle revision or digest changed",
                     ));
                 }
+                validate_bundle_binding(provider, mode, installed).map_err(|_| {
+                    failure(
+                        NodeFailureCode::BundleBindingMismatch,
+                        "session bundle does not match the provider and mode",
+                    )
+                })?;
                 Some(installed.clone())
             }
             None => None,
@@ -1671,9 +1794,9 @@ impl NodeShared {
         environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
         bundle: Option<&ResolvedBundleReceipt>,
         managed_lease_id: Option<ManagedWorktreeLeaseId>,
-    ) -> Result<Option<(Option<NativeLaunchEnvironmentOverlay>, SessionMaterializationGuard<'a>)>, NodeFailure> {
+    ) -> Result<Option<(Option<PreparedNativeLaunchOverlay>, SessionMaterializationGuard<'a>)>, NodeFailure> {
         let Some((profile, has_environment_materialization)) =
-            self.materialization_profile(environment_profile, bundle)?
+            self.materialization_profile(provider, mode, environment_profile, bundle)?
         else {
             return Ok(None);
         };
@@ -1777,23 +1900,74 @@ impl NodeShared {
             self.materializations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(id.clone(), ownership);
+                .insert(id.clone(), ownership.clone());
             if let Err(error) = self.persist_state_locked() {
                 drop(_transaction);
                 let _ = self.cleanup_materialization(&id);
                 return Err(persistence_failure(error));
             }
         }
-        let transport = match mode {
-            SessionMode::Pty => TransportKind::Pty,
-            SessionMode::Inline => TransportKind::Pipe,
-        };
         let guard = SessionMaterializationGuard {
             shared: self,
             id: Some(id),
         };
-        let overlay = if has_environment_materialization {
-            Some(NativeLaunchEnvironmentOverlay::new(
+        let bundle_arguments = match bundle {
+            Some(receipt) => {
+                let catalog = self.bundle_catalog.read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let installed = catalog.get(&receipt.id).ok_or_else(|| failure(
+                    NodeFailureCode::UnknownBundle,
+                    "session bundle is unavailable on this node",
+                ))?;
+                if installed.receipt() != *receipt {
+                    return Err(failure(
+                        NodeFailureCode::BundleBindingMismatch,
+                        "session bundle revision or digest changed",
+                    ));
+                }
+                materializer.revalidate_bundle(&ownership, installed).map_err(|_| {
+                    failure(
+                        NodeFailureCode::BundleMaterializationFailed,
+                        "session bundle byte revalidation failed",
+                    )
+                })?;
+                Some(bundle_launch_arguments(
+                    provider,
+                    mode,
+                    installed,
+                    ownership.bundle_root(),
+                ).map_err(|_| failure(
+                    NodeFailureCode::BundleBindingMismatch,
+                    "session bundle launch binding is invalid",
+                ))?)
+            }
+            None => None,
+        };
+        let transport = match mode {
+            SessionMode::Pty => TransportKind::Pty,
+            SessionMode::Inline => TransportKind::Pipe,
+        };
+        let overlay = if let Some(extra_args) = bundle_arguments {
+            Some(PreparedNativeLaunchOverlay::Instance(
+                NativeInstanceLaunchOverlay::new(
+                    provider.clone(),
+                    transport,
+                    if has_environment_materialization {
+                        environment
+                    } else {
+                        Vec::new()
+                    },
+                    extra_args,
+                )
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::BundleBindingMismatch,
+                        "session bundle launch overlay is invalid",
+                    )
+                })?,
+            ))
+        } else if has_environment_materialization {
+            Some(PreparedNativeLaunchOverlay::Environment(NativeLaunchEnvironmentOverlay::new(
                 provider.clone(),
                 transport,
                 environment,
@@ -1803,7 +1977,7 @@ impl NodeShared {
                     NodeFailureCode::BackendOperationFailed,
                     "session environment overlay is invalid",
                 )
-            })?)
+            })?))
         } else {
             None
         };
@@ -1893,7 +2067,7 @@ impl NodeShared {
         mode: SessionMode,
         environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
         bundle: Option<&ResolvedBundleReceipt>,
-    ) -> Result<Option<(MaterializationId, Option<NativeLaunchEnvironmentOverlay>)>, NodeFailure> {
+    ) -> Result<Option<(MaterializationId, Option<PreparedNativeLaunchOverlay>)>, NodeFailure> {
         let ownership = {
             let materializations = self
                 .materializations
@@ -1914,7 +2088,12 @@ impl NodeShared {
             }
             ownership
         };
-        let materialization = self.materialization_profile(environment_profile, bundle)?;
+        let materialization = self.materialization_profile(
+            provider,
+            mode,
+            environment_profile,
+            bundle,
+        )?;
         match (ownership, materialization) {
             (None, None) => Ok(None),
             (None, Some(_)) | (Some(_), None) => Err(failure(
@@ -1945,7 +2124,7 @@ impl NodeShared {
                         "managed session environment revalidation failed",
                     ));
                 }
-                if let Some(bundle_receipt) = bundle {
+                let bundle_arguments = if let Some(bundle_receipt) = bundle {
                     let catalog = self.bundle_catalog.read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let Some(installed) = catalog.get(&bundle_receipt.id) else {
@@ -1962,9 +2141,33 @@ impl NodeShared {
                             "managed session bundle revalidation failed",
                         ));
                     }
-                }
+                    Some(bundle_launch_arguments(
+                        provider,
+                        mode,
+                        installed,
+                        ownership.bundle_root(),
+                    ).map_err(|_| failure(
+                        NodeFailureCode::BundleBindingMismatch,
+                        "managed session bundle launch binding is invalid",
+                    ))?)
+                } else {
+                    None
+                };
                 if !has_environment_materialization {
-                    return Ok(Some((ownership.id().clone(), None)));
+                    let overlay = bundle_arguments.map(|extra_args| {
+                        NativeInstanceLaunchOverlay::new(
+                            provider.clone(),
+                            TransportKind::Pty,
+                            Vec::new(),
+                            extra_args,
+                        )
+                        .map(PreparedNativeLaunchOverlay::Instance)
+                        .map_err(|_| failure(
+                            NodeFailureCode::BundleBindingMismatch,
+                            "managed session bundle launch overlay is invalid",
+                        ))
+                    }).transpose()?;
+                    return Ok(Some((ownership.id().clone(), overlay)));
                 }
                 let environment = match materializer.resolve_environment(&ownership, &profile) {
                     Ok(environment) => environment,
@@ -1995,17 +2198,33 @@ impl NodeShared {
                     SessionMode::Pty => TransportKind::Pty,
                     SessionMode::Inline => TransportKind::Pipe,
                 };
-                let overlay = NativeLaunchEnvironmentOverlay::new(
-                    provider.clone(),
-                    transport,
-                    environment,
-                )
-                .map_err(|_| {
-                    failure(
-                        NodeFailureCode::BackendOperationFailed,
-                        "managed session environment overlay is invalid",
-                    )
-                })?;
+                let overlay = match bundle_arguments {
+                    Some(extra_args) => PreparedNativeLaunchOverlay::Instance(
+                        NativeInstanceLaunchOverlay::new(
+                            provider.clone(),
+                            transport,
+                            environment,
+                            extra_args,
+                        )
+                        .map_err(|_| failure(
+                            NodeFailureCode::BundleBindingMismatch,
+                            "managed session bundle launch overlay is invalid",
+                        ))?,
+                    ),
+                    None => PreparedNativeLaunchOverlay::Environment(
+                        NativeLaunchEnvironmentOverlay::new(
+                            provider.clone(),
+                            transport,
+                            environment,
+                        )
+                        .map_err(|_| {
+                            failure(
+                                NodeFailureCode::BackendOperationFailed,
+                                "managed session environment overlay is invalid",
+                            )
+                        })?,
+                    ),
+                };
                 Ok(Some((ownership.id().clone(), Some(overlay))))
             }
         }
@@ -3697,7 +3916,6 @@ impl NodeShared {
             .validate()
             .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
         self.ensure_binding_capacity()?;
-        let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
         let resolved_materialization = match self.resolve_record_materialization(
             record_id,
             &record.provider,
@@ -3721,6 +3939,7 @@ impl NodeShared {
             Some((id, overlay)) => (Some(id), overlay),
             None => (None, None),
         };
+        let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
         let mut environment_selection = match self.select_environment_profile(
             instance_id,
             &record.provider,
@@ -3733,23 +3952,10 @@ impl NodeShared {
                 return Err(error);
             }
         };
-        if let Some(overlay) = environment_overlay {
-            self.native_launch_profile_control
-                .as_ref()
-                .ok_or_else(|| {
-                    failure(
-                        NodeFailureCode::BackendOperationFailed,
-                        "native environment profile controller is unavailable",
-                    )
-                })?
-                .install_native_launch_environment_overlay(instance_id, overlay)
-                .map_err(|_| {
-                    failure(
-                        NodeFailureCode::BackendOperationFailed,
-                        "managed session environment overlay installation failed",
-                    )
-                })?;
-        }
+        let mut instance_overlay = environment_overlay
+            .map(|overlay| self.install_prepared_launch_overlay(instance_id, overlay))
+            .transpose()?
+            .flatten();
         if let Some(stale_address) = self.bound_address_for_record(record_id) {
             self.remove_session(&stale_address).await?;
         }
@@ -3786,6 +3992,9 @@ impl NodeShared {
         );
         if let Some(selection) = environment_selection.take() {
             selection.retain();
+        }
+        if let Some(overlay) = instance_overlay.take() {
+            overlay.retain();
         }
         drop(transaction);
 
@@ -4667,10 +4876,15 @@ impl NodeShared {
             self.clear_terminal_frame_watermark(address);
             if removed
                 .as_ref()
-                .is_some_and(|binding| binding.environment_profile.is_some())
+                .is_some_and(|binding| {
+                    binding.environment_profile.is_some() || binding.bundle.is_some()
+                })
             {
                 if let Some(control) = self.native_launch_profile_control.as_ref() {
                     control.clear_native_launch_profile_selection(
+                        address.session.instance_id,
+                    );
+                    control.clear_native_instance_launch_overlay(
                         address.session.instance_id,
                     );
                 }
@@ -5904,23 +6118,11 @@ impl NodeShared {
             mode,
             environment_profile.as_ref(),
         )?;
-        if let Some(overlay) = environment_overlay.flatten() {
-            self.native_launch_profile_control
-                .as_ref()
-                .ok_or_else(|| {
-                    failure(
-                        NodeFailureCode::BackendOperationFailed,
-                        "native environment profile controller is unavailable",
-                    )
-                })?
-                .install_native_launch_environment_overlay(instance_id, overlay)
-                .map_err(|_| {
-                    failure(
-                        NodeFailureCode::BackendOperationFailed,
-                        "session environment overlay installation failed",
-                    )
-                })?;
-        }
+        let mut instance_overlay = environment_overlay
+            .flatten()
+            .map(|overlay| self.install_prepared_launch_overlay(instance_id, overlay))
+            .transpose()?
+            .flatten();
         let dispatch_timeout = spawn_dispatch_timeout(deadline)?;
         let record_id = self.bind_spawn_session_with_materialization(
             &address,
@@ -5933,6 +6135,9 @@ impl NodeShared {
         )?;
         if let Some(selection) = environment_selection.take() {
             selection.retain();
+        }
+        if let Some(overlay) = instance_overlay.take() {
+            overlay.retain();
         }
         if let Some(guard) = materialization_guard.take() {
             guard.retain();
@@ -8762,12 +8967,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        shared
-            .native_launch_profile_control
-            .as_ref()
+        assert!(shared
+            .install_prepared_launch_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
-            .unwrap();
+            .is_none());
         let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
         let record_id = shared
             .bind_spawn_session_with_materialization(
@@ -8978,6 +9181,72 @@ mod tests {
     }
 
     #[test]
+    fn combined_environment_and_bundle_overlay_clears_with_its_binding() {
+        let (shared, mut runtime, environment_profile) = environment_profile_test_shared();
+        let address = terminal_address(1);
+        let selection = shared
+            .select_environment_profile(
+                address.session.instance_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&environment_profile),
+            )
+            .unwrap()
+            .unwrap();
+        let overlay = NativeInstanceLaunchOverlay::new(
+            agent("claude"),
+            TransportKind::Pty,
+            vec![EnvMutation {
+                key: OsString::from("GATE4AGENT_SESSION_TOKEN"),
+                value: Some(OsString::from("fixture-secret")),
+            }],
+            vec![
+                OsString::from("--plugin-dir"),
+                std::env::current_dir().unwrap().into_os_string(),
+            ],
+        )
+        .unwrap();
+        let instance_overlay = shared
+            .install_prepared_launch_overlay(
+                address.session.instance_id,
+                PreparedNativeLaunchOverlay::Instance(overlay),
+            )
+            .unwrap()
+            .unwrap();
+        let bundle = ResolvedBundleReceipt {
+            id: crate::protocol::SpawnBundleId::new("combined-bundle").unwrap(),
+            revision: crate::protocol::SpawnBundleRevision::new("combined-r1").unwrap(),
+            digest: crate::protocol::SpawnBundleDigest::new(format!(
+                "sha256:{}",
+                "0".repeat(64),
+            ))
+            .unwrap(),
+        };
+        shared.bind_session_with_materialization(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            Some(environment_profile),
+            Some(bundle),
+            None,
+        );
+        selection.retain();
+        instance_overlay.retain();
+
+        let native_id = NativeLaunchProfileId::new("local-claude-pty").unwrap();
+        assert!(matches!(
+            runtime.remove_native_launch_profile(&native_id),
+            Err(gate4agent_runtime_native::NativeLaunchProfileError::ProfileInUse),
+        ));
+        assert!(shared.remove_binding(&address).is_some());
+        assert!(!shared
+            .native_launch_profile_control
+            .as_ref()
+            .unwrap()
+            .clear_native_instance_launch_overlay(address.session.instance_id));
+        assert_eq!(runtime.remove_native_launch_profile(&native_id), Ok(true));
+    }
+
+    #[test]
     fn session_environment_materialization_failure_is_pre_child_and_durable() {
         let (shared, runtime, receipt, root, _deny) = materialization_test_shared(true);
         let address = SessionAddress {
@@ -9054,12 +9323,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        shared
-            .native_launch_profile_control
-            .as_ref()
+        assert!(shared
+            .install_prepared_launch_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
-            .unwrap();
+            .is_none());
         shared.bind_session_with_materialization(
             &address,
             ProviderRuntimePolicy::raw_pty(),
@@ -9131,12 +9398,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        shared
-            .native_launch_profile_control
-            .as_ref()
+        assert!(shared
+            .install_prepared_launch_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
-            .unwrap();
+            .is_none());
         let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
         let record_id = shared
             .bind_spawn_session_with_materialization(
@@ -9361,12 +9626,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        shared
-            .native_launch_profile_control
-            .as_ref()
+        assert!(shared
+            .install_prepared_launch_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
-            .unwrap();
+            .is_none());
         shared.bind_session_with_materialization(
             &address,
             ProviderRuntimePolicy::raw_pty(),

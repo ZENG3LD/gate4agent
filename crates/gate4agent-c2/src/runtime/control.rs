@@ -9,6 +9,7 @@ use crate::protocol::{
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_WORKSPACE_FILE_READ_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
@@ -39,6 +40,7 @@ struct NegotiatedPathCapabilities {
     workspace_file_read: bool,
     provider_runtime_status: bool,
     provider_ids_open: bool,
+    terminal_frame_events: bool,
 }
 
 pub(super) async fn run(
@@ -457,6 +459,19 @@ async fn control_writer<W>(
 {
     while let Some(queued) = frames.recv().await {
         let mut frame = queued.frame;
+        if !path_capabilities.terminal_frame_events {
+            match server_frame_terminal_frame_payload(&frame) {
+                TerminalFramePayload::DirectEvent => {
+                    budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+                    continue;
+                }
+                TerminalFramePayload::NestedReply => {
+                    budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+                    break;
+                }
+                TerminalFramePayload::None => {}
+            }
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
         }
@@ -513,6 +528,64 @@ fn negotiated_path_capabilities(
         workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
         provider_runtime_status: selected_has(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY),
         provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
+        terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalFramePayload {
+    None,
+    DirectEvent,
+    NestedReply,
+}
+
+fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePayload {
+    match frame {
+        C2ServerFrame::Reply(reply) if reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(|response| {
+                match response {
+                    C2NodeResponse::Resync { events, .. } => events.iter().any(|event| {
+                        c2_event_is_terminal_frame(&event.event)
+                    }),
+                    C2NodeResponse::Snapshot { .. }
+                    | C2NodeResponse::WorkspaceInspected { .. }
+                    | C2NodeResponse::WorkspaceFileRead { .. }
+                    | C2NodeResponse::Controller { .. }
+                    | C2NodeResponse::SpawnAccepted { .. }
+                    | C2NodeResponse::SessionRecordUpdated { .. }
+                    | C2NodeResponse::SessionRecordResumed { .. }
+                    | C2NodeResponse::SessionRecordForgotten { .. }
+                    | C2NodeResponse::WorkspaceRegistered { .. }
+                    | C2NodeResponse::WorkspaceUnregistered { .. }
+                    | C2NodeResponse::WorktreeCreated { .. }
+                    | C2NodeResponse::WorktreeRemoved { .. }
+                    | C2NodeResponse::Accepted
+                    | C2NodeResponse::ShuttingDown => false,
+                }
+            })
+        }) => TerminalFramePayload::NestedReply,
+        C2ServerFrame::Event(event) if c2_event_is_terminal_frame(&event.event) => {
+            TerminalFramePayload::DirectEvent
+        }
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Reply(_)
+        | C2ServerFrame::Event(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => TerminalFramePayload::None,
+    }
+}
+
+fn c2_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
+    match event {
+        C2NodeEvent::TerminalFrame { .. } => true,
+        C2NodeEvent::Control { .. }
+        | C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceAdded { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::SessionRecordUpserted { .. }
+        | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ResyncRequired { .. } => false,
     }
 }
 
@@ -692,6 +765,7 @@ fn c2_event_contains_opaque_unix_path(event: &C2NodeEvent) -> bool {
     match event {
         C2NodeEvent::WorkspaceAdded { workspace } => workspace.canonical_root.as_unix_bytes().is_some(),
         C2NodeEvent::Control { .. }
+        | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
         | C2NodeEvent::SessionRecordUpserted { .. }
@@ -882,6 +956,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
             CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
@@ -1146,7 +1222,8 @@ fn project_legacy_event(
     snapshot: Option<&crate::protocol::C2NodeSnapshot>,
 ) -> bool {
     match event {
-        C2NodeEvent::Control { address, .. } => {
+        C2NodeEvent::Control { address, .. }
+        | C2NodeEvent::TerminalFrame { address, .. } => {
             address_is_legacy(status, node_id, snapshot, address)
         }
         C2NodeEvent::WorkspaceAdded { workspace } => {
@@ -1253,7 +1330,8 @@ mod tests {
     use super::*;
     use crate::protocol::{
         AdapterContractRevision, AdapterFamily, AdapterId, C2ClientHello, C2GitSnapshot,
-        C2WorkspaceInspection, C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath,
+        C2SessionSnapshot, C2SessionStatus, C2WorkspaceInspection, C2WorkspaceSnapshot,
+        C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         RepositoryPath, SlimManagedSessionRecord, WorkspaceFileContent, WorkspaceFileRead,
     };
@@ -1261,7 +1339,10 @@ mod tests {
         GitStatusEntry, ManagedSessionState, SessionAddress, SessionKey, SessionMode,
         SessionRecordId, WorkspaceEntry, WorkspaceEntryKind, WorkspaceId,
     };
-    use gate4agent_types::{AgentInstanceId, SessionGeneration, TerminalSize};
+    use gate4agent_types::{
+        AgentInstanceId, ProviderActivity, SessionGeneration, TerminalFrame, TerminalSize,
+        TransportKind,
+    };
     use tokio::io::AsyncReadExt;
 
     fn status(transport: NodeTransportState, incarnation_id: Option<NodeIncarnationId>) -> StatusResponse {
@@ -1324,6 +1405,80 @@ mod tests {
         }
     }
 
+    fn terminal_frame(sequence: u64) -> TerminalFrame {
+        TerminalFrame {
+            sequence,
+            size: TerminalSize { rows: 24, columns: 80 },
+            cursor_row: 1,
+            cursor_column: 2,
+            contents: "ready".to_owned(),
+            formatted: b"ready".to_vec(),
+            scrollback_formatted: Vec::new(),
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: Default::default(),
+        }
+    }
+
+    fn c2_session(provider: &str, instance_id: u64) -> C2SessionSnapshot {
+        C2SessionSnapshot {
+            instance_id: AgentInstanceId(instance_id),
+            agent_id: AgentId::new(provider).unwrap(),
+            transport: TransportKind::Pty,
+            generation: SessionGeneration(1),
+            status: C2SessionStatus::Running,
+            pending_operation: None,
+            pending_input: None,
+            process_id: Some(7),
+            terminal_size: Some(TerminalSize { rows: 24, columns: 80 }),
+            terminal_frame: Some(terminal_frame(1)),
+            provider_activity: ProviderActivity::Idle,
+            provider_interaction_pending: false,
+            provider_identity_present: true,
+        }
+    }
+
+    fn terminal_event_frame(instance_id: u64, sequence: u64) -> C2ServerFrame {
+        C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                sequence,
+            },
+            event: C2NodeEvent::TerminalFrame {
+                address: address(instance_id),
+                frame: terminal_frame(sequence),
+            },
+        })
+    }
+
+    fn terminal_resync_frame(instance_id: u64, sequence: u64) -> C2ServerFrame {
+        C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(4),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                response: Ok(C2NodeResponse::Resync {
+                    event_sequence: sequence,
+                    snapshot: crate::protocol::C2NodeSnapshot {
+                        node_id: NodeId::new("node-a").unwrap(),
+                        enabled_providers: Vec::new(),
+                        provider_runtime_statuses: Default::default(),
+                        workspaces: Vec::new(),
+                        session_records: Vec::new(),
+                    },
+                    events: vec![crate::protocol::C2NodeEventEnvelope {
+                        sequence,
+                        event: C2NodeEvent::TerminalFrame {
+                            address: address(instance_id),
+                            frame: terminal_frame(sequence),
+                        },
+                    }],
+                }),
+            }),
+        })
+    }
+
     fn managed_record(
         record_id: &str,
         provider: &str,
@@ -1361,6 +1516,7 @@ mod tests {
                 CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -1446,6 +1602,44 @@ mod tests {
     }
 
     #[test]
+    fn terminal_frame_legacy_projection_uses_exact_session_provider() {
+        let node_id = NodeId::new("node-a").unwrap();
+        let snapshot = crate::protocol::C2NodeSnapshot {
+            node_id: node_id.clone(),
+            enabled_providers: vec![AgentId::new("codex").unwrap()],
+            provider_runtime_statuses: Default::default(),
+            workspaces: vec![C2WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                canonical_root: OpaqueHostPath::utf8(r"C:\repo".to_owned()).unwrap(),
+                sessions: vec![c2_session("codex", 1), c2_session("qwen-code", 2)],
+            }],
+            session_records: Vec::new(),
+        };
+        let empty_status = status(NodeTransportState::Offline, None);
+        let mut legacy = C2NodeEvent::TerminalFrame {
+            address: address(1),
+            frame: terminal_frame(2),
+        };
+        let mut open = C2NodeEvent::TerminalFrame {
+            address: address(2),
+            frame: terminal_frame(2),
+        };
+
+        assert!(project_legacy_event(
+            &mut legacy,
+            &node_id,
+            &empty_status,
+            Some(&snapshot),
+        ));
+        assert!(!project_legacy_event(
+            &mut open,
+            &node_id,
+            &empty_status,
+            Some(&snapshot),
+        ));
+    }
+
+    #[test]
     fn legacy_provider_gate_blocks_open_and_unknown_session_mutations_before_dispatch() {
         let incarnation = NodeIncarnationId::from_bytes([12; 16]);
         let mut status = status_with_provider_contract_manifest(incarnation);
@@ -1510,6 +1704,7 @@ mod tests {
             workspace_file_read: true,
             provider_runtime_status: true,
             provider_ids_open: false,
+            terminal_frame_events: true,
         };
         assert!(matches!(
             unnegotiated_request_failure(&request, capabilities),
@@ -1694,9 +1889,78 @@ mod tests {
                 workspace_file_read: false,
                 provider_runtime_status: false,
                 provider_ids_open: false,
+                terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn control_writer_drops_unnegotiated_terminal_frame_event() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender
+            .send(queued(terminal_event_frame(1, 8), &budget).unwrap())
+            .await
+            .unwrap();
+        drop(sender);
+        let (disconnect, _disconnected) = watch::channel(false);
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: true,
+                repository_paths: true,
+                workspace_file_read: true,
+                provider_runtime_status: true,
+                provider_ids_open: true,
+                terminal_frame_events: false,
+            },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        ).await;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn control_writer_disconnects_on_unnegotiated_terminal_frame_resync_reply() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender
+            .send(queued(terminal_resync_frame(1, 8), &budget).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(budget.load(Ordering::Acquire), 0);
+        let (disconnect, disconnected) = watch::channel(false);
+        let writer = tokio::spawn(control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: true,
+                repository_paths: true,
+                workspace_file_read: true,
+                provider_runtime_status: true,
+                provider_ids_open: true,
+                terminal_frame_events: false,
+            },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        ));
+
+        timeout(Duration::from_secs(1), writer).await.unwrap().unwrap();
+        assert!(*disconnected.borrow());
+        assert!(sender.is_closed());
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
         assert!(bytes.is_empty());
@@ -1739,6 +2003,7 @@ mod tests {
             workspace_file_read: false,
             provider_runtime_status: true,
             provider_ids_open: true,
+            terminal_frame_events: true,
         };
         assert!(matches!(
             unnegotiated_request_failure(&utf8_request, no_file_read),
@@ -1750,6 +2015,7 @@ mod tests {
             workspace_file_read: true,
             provider_runtime_status: true,
             provider_ids_open: true,
+            terminal_frame_events: true,
         };
         assert!(matches!(
             unnegotiated_request_failure(&tagged_request, no_repository_path),
@@ -1761,6 +2027,7 @@ mod tests {
             workspace_file_read: true,
             provider_runtime_status: true,
             provider_ids_open: true,
+            terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
         assert!(server_frame_contains_workspace_file_read(
@@ -1791,6 +2058,7 @@ mod tests {
                 workspace_file_read: false,
                 provider_runtime_status: true,
                 provider_ids_open: true,
+                terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;

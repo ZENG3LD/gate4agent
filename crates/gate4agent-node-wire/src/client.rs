@@ -12,6 +12,7 @@ use gate4agent_node_protocol::{
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
+    NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
@@ -29,30 +30,133 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
 #[cfg(feature = "fixture")]
 use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
 const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
+const SERVER_FRAME_QUEUE_CAPACITY: usize = 1;
+const PENDING_EVENTS_MAX: usize = 1_024;
+const PENDING_EVENT_WIRE_BYTES_MAX: usize = 16 * 1024 * 1024;
 
 trait NodeClientStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> NodeClientStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
-pub struct LocalNodeClient {
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: usize,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, bytes_read: 0 }
+    }
+
+    fn take_bytes_read(&mut self) -> usize {
+        let bytes_read = self.bytes_read;
+        self.bytes_read = 0;
+        bytes_read
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buffer.filled().len();
+        match Pin::new(&mut self.inner).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                self.bytes_read = self
+                    .bytes_read
+                    .saturating_add(buffer.filled().len().saturating_sub(before));
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+struct ReceivedServerFrame {
+    frame: ServerFrame,
+    wire_bytes: usize,
+}
+
+struct PendingNodeEvent {
+    envelope: NodeEventEnvelope,
+    wire_bytes: usize,
+}
+
+struct AbortReaderOnDrop(AbortHandle);
+
+impl Drop for AbortReaderOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn start_server_frame_reader(
     pipe: Box<dyn NodeClientStream>,
+) -> (
+    WriteHalf<Box<dyn NodeClientStream>>,
+    mpsc::Receiver<Result<ReceivedServerFrame, FrameError>>,
+    AbortReaderOnDrop,
+) {
+    let (reader, writer) = tokio::io::split(pipe);
+    let mut reader = CountingReader::new(reader);
+    let (frame_tx, frame_rx) = mpsc::channel(SERVER_FRAME_QUEUE_CAPACITY);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let frame = read_json_frame_limited_body_timeout(
+                &mut reader,
+                MAX_NODE_FRAME_BYTES,
+                Duration::from_millis(FRAME_BODY_TIMEOUT_MS),
+            )
+            .await
+            .map(|frame| ReceivedServerFrame {
+                frame,
+                wire_bytes: reader.take_bytes_read(),
+            });
+            if frame.is_err() {
+                let _ = reader.take_bytes_read();
+            }
+            let terminal = frame.is_err();
+            if frame_tx.send(frame).await.is_err() || terminal {
+                break;
+            }
+        }
+    });
+    (
+        writer,
+        frame_rx,
+        AbortReaderOnDrop(reader_task.abort_handle()),
+    )
+}
+
+pub struct LocalNodeClient {
+    writer: WriteHalf<Box<dyn NodeClientStream>>,
+    frame_rx: mpsc::Receiver<Result<ReceivedServerFrame, FrameError>>,
+    _reader_abort: AbortReaderOnDrop,
     hello: NodeHello,
     opaque_unix_paths_enabled: bool,
     repository_paths_enabled: bool,
     open_provider_ids_enabled: bool,
+    terminal_frame_events_enabled: bool,
     negotiated_capabilities: Vec<CapabilityId>,
     next_request_id: u64,
-    pending_events: VecDeque<NodeEventEnvelope>,
+    pending_events: VecDeque<PendingNodeEvent>,
+    pending_event_wire_bytes: usize,
 }
 
 impl LocalNodeClient {
@@ -174,6 +278,9 @@ impl LocalNodeClient {
         let open_provider_ids_enabled = selected_supports_open_provider_ids(
             hello.compatibility.as_ref(),
         );
+        let terminal_frame_events_enabled = selected_supports_terminal_frame_events(
+            hello.compatibility.as_ref(),
+        );
         ensure_node_hello_path_capability(&hello, opaque_unix_paths_enabled)?;
         ensure_node_hello_provider_capability(&hello, open_provider_ids_enabled)?;
         if &hello.snapshot.node_id != expected_node_id {
@@ -183,15 +290,20 @@ impl LocalNodeClient {
                 hello.snapshot.node_id,
             )));
         }
+        let (writer, frame_rx, reader_abort) = start_server_frame_reader(pipe);
         Ok(Self {
-            pipe,
+            writer,
+            frame_rx,
+            _reader_abort: reader_abort,
             hello,
             opaque_unix_paths_enabled,
             repository_paths_enabled,
             open_provider_ids_enabled,
+            terminal_frame_events_enabled,
             negotiated_capabilities,
             next_request_id: 1,
             pending_events: VecDeque::new(),
+            pending_event_wire_bytes: 0,
         })
     }
 
@@ -209,7 +321,7 @@ impl LocalNodeClient {
             &self.negotiated_capabilities,
         )?;
         write_json_frame_limited(
-            &mut self.pipe,
+            &mut self.writer,
             &ClientFrame::Request(RequestEnvelope {
                 request_id,
                 request,
@@ -221,26 +333,33 @@ impl LocalNodeClient {
     }
 
     pub async fn recv(&mut self) -> Result<ServerFrame, NodeClientError> {
-        let frame = read_json_frame_limited_body_timeout(
-            &mut self.pipe,
-            MAX_NODE_FRAME_BYTES,
-            Duration::from_millis(FRAME_BODY_TIMEOUT_MS),
-        )
-        .await?;
-        ensure_server_frame_required_capability(&frame, &self.negotiated_capabilities)?;
+        Ok(self.recv_received().await?.frame)
+    }
+
+    async fn recv_received(&mut self) -> Result<ReceivedServerFrame, NodeClientError> {
+        let received = self.frame_rx.recv().await.ok_or_else(|| {
+            NodeClientError::Protocol("node frame reader closed".to_owned())
+        })??;
+        let frame = &received.frame;
+        ensure_server_frame_required_capability(frame, &self.negotiated_capabilities)?;
+        ensure_server_frame_terminal_capability(
+            frame,
+            self.terminal_frame_events_enabled,
+        )?;
         ensure_server_frame_path_capability(
-            &frame,
+            frame,
             self.opaque_unix_paths_enabled,
             self.repository_paths_enabled,
         )?;
-        ensure_server_frame_provider_capability(&frame, self.open_provider_ids_enabled)?;
-        Ok(frame)
+        ensure_server_frame_provider_capability(frame, self.open_provider_ids_enabled)?;
+        Ok(received)
     }
 
     pub async fn request(&mut self, request: NodeRequest) -> Result<NodeResponse, NodeClientError> {
         let request_id = self.send(request).await?;
         loop {
-            match self.recv().await? {
+            let received = self.recv_received().await?;
+            match received.frame {
                 ServerFrame::Reply(reply) if reply.request_id == request_id => {
                     return reply.result.map_err(NodeClientError::Node);
                 }
@@ -250,7 +369,14 @@ impl LocalNodeClient {
                         reply.request_id,
                     )));
                 }
-                ServerFrame::Event(event) => self.pending_events.push_back(event),
+                ServerFrame::Event(event) => queue_pending_event_bounded(
+                    &mut self.pending_events,
+                    &mut self.pending_event_wire_bytes,
+                    event,
+                    received.wire_bytes,
+                    PENDING_EVENTS_MAX,
+                    PENDING_EVENT_WIRE_BYTES_MAX,
+                )?,
                 ServerFrame::Challenge(_) => {
                     return Err(NodeClientError::Protocol(
                         "duplicate server challenge".to_owned(),
@@ -266,16 +392,77 @@ impl LocalNodeClient {
     }
 
     pub fn take_event(&mut self) -> Option<NodeEventEnvelope> {
-        self.pending_events.pop_front()
+        let pending = self.pending_events.pop_front()?;
+        self.pending_event_wire_bytes = self
+            .pending_event_wire_bytes
+            .checked_sub(pending.wire_bytes)
+            .expect("pending node event wire byte accounting diverged");
+        Some(pending.envelope)
     }
 
     #[cfg(feature = "fixture")]
     pub async fn send_malformed_json_frame_for_fixture(&mut self) -> Result<(), NodeClientError> {
-        self.pipe.write_u32_le(1).await?;
-        self.pipe.write_all(b"{").await?;
-        self.pipe.flush().await?;
+        self.writer.write_u32_le(1).await?;
+        self.writer.write_all(b"{").await?;
+        self.writer.flush().await?;
         Ok(())
     }
+}
+
+fn queue_pending_event_bounded(
+    pending: &mut VecDeque<PendingNodeEvent>,
+    pending_wire_bytes: &mut usize,
+    event: NodeEventEnvelope,
+    wire_bytes: usize,
+    max_events: usize,
+    max_wire_bytes: usize,
+) -> Result<(), NodeClientError> {
+    let replacement = if let NodeEvent::TerminalFrame { address, .. } = &event.event {
+        pending.iter().position(|current| {
+            matches!(
+                &current.envelope.event,
+                NodeEvent::TerminalFrame {
+                    address: current_address,
+                    ..
+                } if current_address == address
+            )
+        })
+    } else {
+        None
+    };
+    let replaced_wire_bytes = replacement
+        .and_then(|index| pending.get(index))
+        .map(|pending| pending.wire_bytes)
+        .unwrap_or(0);
+    let retained_wire_bytes = pending_wire_bytes
+        .checked_sub(replaced_wire_bytes)
+        .expect("pending node event wire byte accounting diverged");
+    let next_wire_bytes = retained_wire_bytes
+        .checked_add(wire_bytes)
+        .ok_or_else(|| {
+            NodeClientError::Protocol(
+                "pending node event wire byte accounting overflowed".to_owned(),
+            )
+        })?;
+    if next_wire_bytes > max_wire_bytes {
+        return Err(NodeClientError::Protocol(
+            "pending node events exceeded the bounded wire byte capacity".to_owned(),
+        ));
+    }
+    if replacement.is_none() && pending.len() >= max_events {
+        return Err(NodeClientError::Protocol(
+            "pending node events exceeded the bounded event capacity".to_owned(),
+        ));
+    }
+    if let Some(index) = replacement {
+        pending.remove(index);
+    }
+    pending.push_back(PendingNodeEvent {
+        envelope: event,
+        wire_bytes,
+    });
+    *pending_wire_bytes = next_wire_bytes;
+    Ok(())
 }
 
 fn selected_supports_opaque_unix_paths(
@@ -304,6 +491,16 @@ fn selected_supports_open_provider_ids(
     selected.is_some_and(|compatibility| {
         compatibility.capabilities.iter().any(|capability| {
             capability.as_str() == NODE_PROVIDER_ID_OPEN_CAPABILITY
+        })
+    })
+}
+
+fn selected_supports_terminal_frame_events(
+    selected: Option<&NegotiatedNodeCompatibility>,
+) -> bool {
+    selected.is_some_and(|compatibility| {
+        compatibility.capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY
         })
     })
 }
@@ -358,6 +555,31 @@ fn ensure_server_frame_required_capability(
     {
         return Err(NodeClientError::UnsupportedCapability(
             NODE_WORKSPACE_FILE_READ_CAPABILITY.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_server_frame_terminal_capability(
+    frame: &ServerFrame,
+    terminal_frame_events_enabled: bool,
+) -> Result<(), NodeClientError> {
+    let contains_terminal_frame_event = match frame {
+        ServerFrame::Event(NodeEventEnvelope {
+            event: NodeEvent::TerminalFrame { .. },
+            ..
+        }) => true,
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|response| {
+            matches!(response, NodeResponse::Resync { events, .. }
+                if events.iter().any(|event| {
+                    matches!(&event.event, NodeEvent::TerminalFrame { .. })
+                }))
+        }),
+        ServerFrame::Challenge(_) | ServerFrame::Hello(_) | ServerFrame::Event(_) => false,
+    };
+    if contains_terminal_frame_event && !terminal_frame_events_enabled {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_TERMINAL_FRAME_EVENTS_CAPABILITY.to_owned(),
         ));
     }
     Ok(())
@@ -583,6 +805,7 @@ fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
             !provider_id_is_legacy(&record.provider)
         }
         NodeEvent::Control { .. }
+        | NodeEvent::TerminalFrame { .. }
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }
         | NodeEvent::SessionRecordRemoved { .. }
@@ -724,6 +947,7 @@ fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
             record.canonical_root.as_unix_bytes().is_some()
         }
         NodeEvent::Control { .. }
+        | NodeEvent::TerminalFrame { .. }
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }
         | NodeEvent::SessionRecordRemoved { .. }
@@ -905,14 +1129,14 @@ mod tests {
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
-        SessionMode, SessionRecordId, WorkspaceEntry,
+        SessionAddress, SessionKey, SessionMode, SessionRecordId, WorkspaceEntry,
         WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
         WorkspaceInspection, WorkspaceSnapshot,
     };
     use gate4agent_types::{
         AgentInstanceId, CapabilitySnapshot, ForegroundSnapshot, HistorySnapshot,
         ProviderSnapshot, ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
-        TransportKind,
+        TerminalFrame, TerminalSize, TransportKind,
     };
 
     fn agent(value: &str) -> AgentId {
@@ -1078,6 +1302,9 @@ mod tests {
         ));
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+        ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
         ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
@@ -1300,6 +1527,230 @@ mod tests {
             CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
         );
         assert!(selected_supports_open_provider_ids(Some(&selected)));
+    }
+
+    #[test]
+    fn inbound_terminal_frame_events_require_authenticated_selection() {
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(2),
+            },
+        };
+        let event = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 11,
+            event: NodeEvent::TerminalFrame {
+                address,
+                frame: TerminalFrame {
+                    sequence: 3,
+                    size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    cursor_row: 4,
+                    cursor_column: 5,
+                    contents: "ready".to_owned(),
+                    formatted: vec![1, 2, 3],
+                    scrollback_formatted: Vec::new(),
+                    alternate_screen: false,
+                    mouse_protocol_enabled: false,
+                    mouse_protocol_encoding: Default::default(),
+                },
+            },
+        });
+
+        assert!(matches!(
+            ensure_server_frame_terminal_capability(&event, false),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY
+        ));
+        assert!(ensure_server_frame_terminal_capability(&event, true).is_ok());
+
+        let (_, mut selected) = negotiated_fixture();
+        assert!(!selected_supports_terminal_frame_events(Some(&selected)));
+        selected.capabilities.push(
+            CapabilityId::new(NODE_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
+        );
+        assert!(selected_supports_terminal_frame_events(Some(&selected)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_recv_preserves_the_next_complete_server_frame() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4_096);
+        let (writer, frame_rx, reader_abort) =
+            start_server_frame_reader(Box::new(client_stream));
+        let mut client = LocalNodeClient {
+            writer,
+            frame_rx,
+            _reader_abort: reader_abort,
+            hello: hello_with_snapshot(empty_snapshot()),
+            opaque_unix_paths_enabled: false,
+            repository_paths_enabled: false,
+            open_provider_ids_enabled: false,
+            terminal_frame_events_enabled: false,
+            negotiated_capabilities: Vec::new(),
+            next_request_id: 1,
+            pending_events: VecDeque::new(),
+            pending_event_wire_bytes: 0,
+        };
+
+        tokio::select! {
+            _ = async { tokio::task::yield_now().await } => {}
+            result = client.recv() => panic!("empty receive completed unexpectedly: {result:?}"),
+        }
+
+        let expected = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 1,
+            event: NodeEvent::ControllerChanged { controller: None },
+        });
+        write_json_frame_limited(
+            &mut server_stream,
+            &expected,
+            MAX_NODE_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.recv().await.unwrap(), expected);
+    }
+
+    #[test]
+    fn pending_events_coalesce_exact_terminal_address_and_enforce_wire_byte_bound() {
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(2),
+            },
+        };
+        let terminal_event = |event_sequence, address: SessionAddress, frame_sequence| {
+            NodeEventEnvelope {
+                sequence: event_sequence,
+                event: NodeEvent::TerminalFrame {
+                    address,
+                    frame: TerminalFrame {
+                        sequence: frame_sequence,
+                        size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        cursor_row: 0,
+                        cursor_column: 0,
+                        contents: format!("frame-{frame_sequence}"),
+                        formatted: vec![frame_sequence as u8],
+                        scrollback_formatted: Vec::new(),
+                        alternate_screen: false,
+                        mouse_protocol_enabled: false,
+                        mouse_protocol_encoding: Default::default(),
+                    },
+                },
+            }
+        };
+        let mut pending = VecDeque::new();
+        let mut wire_bytes = 0;
+        queue_pending_event_bounded(
+            &mut pending,
+            &mut wire_bytes,
+            terminal_event(1, address.clone(), 1),
+            4,
+            4,
+            9,
+        )
+        .unwrap();
+        queue_pending_event_bounded(
+            &mut pending,
+            &mut wire_bytes,
+            NodeEventEnvelope {
+                sequence: 2,
+                event: NodeEvent::ControllerChanged { controller: None },
+            },
+            1,
+            4,
+            9,
+        )
+        .unwrap();
+        queue_pending_event_bounded(
+            &mut pending,
+            &mut wire_bytes,
+            terminal_event(3, address.clone(), 2),
+            5,
+            4,
+            9,
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(wire_bytes, 6);
+        assert_eq!(pending[0].envelope.sequence, 2);
+        assert_eq!(pending[1].envelope.sequence, 3);
+
+        let mut next_generation = address.clone();
+        next_generation.session.generation = SessionGeneration(3);
+        queue_pending_event_bounded(
+            &mut pending,
+            &mut wire_bytes,
+            terminal_event(4, next_generation, 1),
+            3,
+            4,
+            9,
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(wire_bytes, 9);
+        let mut third_address = address.clone();
+        third_address.session.instance_id = AgentInstanceId(8);
+        assert!(matches!(
+            queue_pending_event_bounded(
+                &mut pending,
+                &mut wire_bytes,
+                terminal_event(5, third_address, 1),
+                1,
+                4,
+                9,
+            ),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("wire byte capacity")
+        ));
+        assert_eq!(pending.len(), 3);
+        assert_eq!(wire_bytes, 9);
+
+        let mut regular = VecDeque::new();
+        let mut regular_bytes = 0;
+        for sequence in 1..=2 {
+            queue_pending_event_bounded(
+                &mut regular,
+                &mut regular_bytes,
+                NodeEventEnvelope {
+                    sequence,
+                    event: NodeEvent::ControllerChanged { controller: None },
+                },
+                1,
+                2,
+                8,
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            queue_pending_event_bounded(
+                &mut regular,
+                &mut regular_bytes,
+                NodeEventEnvelope {
+                    sequence: 3,
+                    event: NodeEvent::ControllerChanged { controller: None },
+                },
+                1,
+                2,
+                8,
+            ),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("event capacity")
+        ));
+        assert_eq!(
+            regular
+                .iter()
+                .map(|pending| pending.envelope.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+        );
     }
 
     #[test]

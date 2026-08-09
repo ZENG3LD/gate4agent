@@ -8,7 +8,7 @@ pub use gate4agent_node_protocol::{
     ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
     ProviderRuntimeContractId, ProviderRuntimeMode, ProviderRuntimeStatus,
     ProviderRuntimeStatuses, ProviderRuntimeVersion,
-    NODE_PROVIDER_ID_OPEN_CAPABILITY,
+    NODE_PROVIDER_ID_OPEN_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     ProtocolNegotiationError, ProtocolRange,
 };
@@ -39,6 +39,7 @@ pub const C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str =
 pub const C2_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY;
 pub const C2_PROVIDER_ID_OPEN_CAPABILITY: &str = NODE_PROVIDER_ID_OPEN_CAPABILITY;
+pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -443,6 +444,10 @@ pub enum C2NodeEvent {
         address: SessionAddress,
         event: C2ControlEvent,
     },
+    TerminalFrame {
+        address: SessionAddress,
+        frame: TerminalFrame,
+    },
     ControllerChanged {
         controller: Option<gate4agent_node_protocol::ControllerState>,
     },
@@ -461,6 +466,10 @@ impl From<&NodeEvent> for C2NodeEvent {
             NodeEvent::Control { address, event } => Self::Control {
                 address: address.clone(),
                 event: C2ControlEvent::from(event),
+            },
+            NodeEvent::TerminalFrame { address, frame } => Self::TerminalFrame {
+                address: address.clone(),
+                frame: frame.clone(),
             },
             NodeEvent::ControllerChanged { controller } => Self::ControllerChanged {
                 controller: controller.clone(),
@@ -1637,6 +1646,109 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&hello).unwrap(),
             serde_json::to_vec(&legacy_hello).unwrap(),
+        );
+    }
+
+    #[test]
+    fn c2_terminal_frame_event_projection_wire_contract_is_exact() {
+        let source = NodeEvent::TerminalFrame {
+            address: SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: gate4agent_node_protocol::SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(3),
+                },
+            },
+            frame: TerminalFrame {
+                sequence: 11,
+                size: TerminalSize { rows: 24, columns: 80 },
+                cursor_row: 2,
+                cursor_column: 4,
+                contents: "ready".to_owned(),
+                formatted: b"ready".to_vec(),
+                scrollback_formatted: vec![b"previous".to_vec()],
+                alternate_screen: false,
+                mouse_protocol_enabled: false,
+                mouse_protocol_encoding:
+                    gate4agent_types::TerminalMouseProtocolEncoding::Default,
+            },
+        };
+        let event = C2NodeEvent::from(&source);
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"terminal-frame","address":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"frame":{"sequence":11,"size":{"rows":24,"columns":80},"cursor_row":2,"cursor_column":4,"contents":"ready","formatted":[114,101,97,100,121],"scrollback_formatted":[[112,114,101,118,105,111,117,115]],"alternate_screen":false,"mouse_protocol_enabled":false,"mouse_protocol_encoding":"default"}}"#,
+        );
+        assert_eq!(serde_json::from_str::<C2NodeEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn c2_terminal_frame_events_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(
+            C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
+            "terminal-frame-events-v1",
+        );
+        assert_eq!(
+            C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
+            NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+        );
+        let capability = CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let transcript = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        let hex = transcript
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            concat!(
+                "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
+                "020001",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "6f666665720002000200010018007465726d696e616c2d6672616d652d6576656e74732d763100",
+                "73656c6563746564000200010018007465726d696e616c2d6672616d652d6576656e74732d7631",
+                "060064617277696e0700616172636836340201",
+            ),
+        );
+    }
+
+    #[test]
+    fn c2_legacy_node_event_bytes_remain_exact_after_terminal_frame_addition() {
+        assert_eq!(
+            serde_json::to_vec(&C2NodeEvent::ResyncRequired {
+                oldest_available_sequence: 7,
+            })
+            .unwrap(),
+            br#"{"kind":"resync-required","oldest_available_sequence":7}"#,
         );
     }
 

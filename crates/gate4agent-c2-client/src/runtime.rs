@@ -8,6 +8,7 @@ use gate4agent_c2_protocol::{
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
@@ -43,6 +44,8 @@ const WORKSPACE_FILE_READ_NOT_NEGOTIATED: &str =
     "workspace file reads require negotiated C2 capability";
 const OPEN_PROVIDER_ID_NOT_NEGOTIATED: &str =
     "open provider IDs require negotiated C2 capability";
+const TERMINAL_FRAME_EVENTS_NOT_NEGOTIATED: &str =
+    "terminal frame events require negotiated C2 capability";
 
 #[derive(Clone, Copy)]
 struct NegotiatedPathCapabilities {
@@ -50,6 +53,7 @@ struct NegotiatedPathCapabilities {
     repository_paths: bool,
     workspace_file_read: bool,
     provider_ids_open: bool,
+    terminal_frame_events: bool,
 }
 
 #[derive(Clone)]
@@ -57,6 +61,7 @@ pub struct C2ControlHandle {
     commands: mpsc::Sender<ControlCommand>,
     hello: Arc<C2Hello>,
     topology: watch::Receiver<Arc<C2Topology>>,
+    terminal_frame_events: bool,
 }
 
 impl C2ControlHandle {
@@ -67,6 +72,8 @@ impl C2ControlHandle {
     pub fn subscribe_topology(&self) -> watch::Receiver<Arc<C2Topology>> {
         self.topology.clone()
     }
+
+    pub fn terminal_frame_events_enabled(&self) -> bool { self.terminal_frame_events }
 
     pub async fn request(
         &self,
@@ -236,6 +243,7 @@ pub async fn connect_local(
         commands: commands_tx,
         hello: Arc::new(hello),
         topology: topology_rx,
+        terminal_frame_events: path_capabilities.terminal_frame_events,
     }, C2EventReceiver { events: events_rx }))
 }
 
@@ -257,6 +265,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
             CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
@@ -321,6 +331,7 @@ fn negotiated_path_capabilities(
         repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
         workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
         provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
+        terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
 
@@ -427,6 +438,48 @@ fn routed_response_has_unix_bytes(response: &RoutedNodeResponse) -> bool {
         .is_ok_and(c2_node_response_has_unix_bytes)
 }
 
+fn routed_response_has_terminal_frame_event(response: &RoutedNodeResponse) -> bool {
+    response
+        .response
+        .as_ref()
+        .is_ok_and(c2_node_response_has_terminal_frame_event)
+}
+
+fn c2_node_response_has_terminal_frame_event(response: &C2NodeResponse) -> bool {
+    match response {
+        C2NodeResponse::Resync { events, .. } => events
+            .iter()
+            .any(|event| c2_node_event_is_terminal_frame(&event.event)),
+        C2NodeResponse::Snapshot { .. }
+        | C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SessionRecordUpdated { .. }
+        | C2NodeResponse::SessionRecordResumed { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::WorkspaceRegistered { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::WorktreeCreated { .. }
+        | C2NodeResponse::WorktreeRemoved { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => false,
+    }
+}
+
+fn c2_node_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
+    match event {
+        C2NodeEvent::TerminalFrame { .. } => true,
+        C2NodeEvent::Control { .. }
+        | C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceAdded { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::SessionRecordUpserted { .. }
+        | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ResyncRequired { .. } => false,
+    }
+}
+
 fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
     match response {
         C2NodeResponse::Snapshot { snapshot, .. } => node_snapshot_has_unix_bytes(snapshot),
@@ -522,6 +575,7 @@ fn c2_node_event_has_unix_bytes(event: &C2NodeEvent) -> bool {
             workspace.canonical_root.as_unix_bytes().is_some()
         }
         C2NodeEvent::Control { .. }
+        | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
         | C2NodeEvent::SessionRecordUpserted { .. }
@@ -589,6 +643,7 @@ fn c2_event_has_open_provider_id(event: &C2NodeEvent) -> bool {
             !provider_id_is_legacy(&record.provider)
         }
         C2NodeEvent::Control { .. }
+        | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
         | C2NodeEvent::SessionRecordRemoved { .. }
@@ -711,6 +766,17 @@ async fn control_owner(
                 match input {
                     Some(OwnerInput::Frame(C2ServerFrame::Reply(reply))) => {
                         let Some(waiter) = pending.remove(&reply.request_id) else { break; };
+                        if !path_capabilities.terminal_frame_events
+                            && reply
+                                .result
+                                .as_ref()
+                                .is_ok_and(routed_response_has_terminal_frame_event)
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                TERMINAL_FRAME_EVENTS_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         if !path_capabilities.provider_ids_open
                             && reply
                                 .result
@@ -758,6 +824,11 @@ async fn control_owner(
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
+                        if !path_capabilities.terminal_frame_events
+                            && c2_node_event_is_terminal_frame(&event.event)
+                        {
+                            break;
+                        }
                         if !path_capabilities.provider_ids_open
                             && routed_event_has_open_provider_id(&event)
                         {
@@ -768,7 +839,13 @@ async fn control_owner(
                         {
                             break;
                         }
-                        if events.try_send(event).is_err() { break; }
+                        let terminal_frame = c2_node_event_is_terminal_frame(&event.event);
+                        match events.try_send(event) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) if terminal_frame => {}
+                            Err(mpsc::error::TrySendError::Full(_)
+                                | mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Topology(next))) => {
                         if !path_capabilities.provider_ids_open
@@ -877,7 +954,9 @@ mod tests {
         GitStatusEntry, NodeIncarnationId, SessionMode, WorkspaceEntry, WorkspaceEntryKind,
         WorkspaceId,
     };
-    use gate4agent_types::TerminalSize;
+    use gate4agent_types::{
+        AgentInstanceId, SessionGeneration, TerminalFrame, TerminalSize,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -908,6 +987,41 @@ mod tests {
         }))
     }
 
+    fn terminal_event(sequence: u64) -> OwnerInput {
+        OwnerInput::Frame(C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                sequence,
+            },
+            event: terminal_node_event(sequence),
+        }))
+    }
+
+    fn terminal_node_event(sequence: u64) -> C2NodeEvent {
+        C2NodeEvent::TerminalFrame {
+            address: gate4agent_node_protocol::SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: gate4agent_node_protocol::SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(2),
+                },
+            },
+            frame: TerminalFrame {
+                sequence,
+                size: TerminalSize { rows: 24, columns: 80 },
+                cursor_row: 1,
+                cursor_column: 2,
+                contents: "ready".to_owned(),
+                formatted: b"ready".to_vec(),
+                scrollback_formatted: Vec::new(),
+                alternate_screen: false,
+                mouse_protocol_enabled: false,
+                mouse_protocol_encoding: Default::default(),
+            },
+        }
+    }
+
     fn route() -> NodeRoute {
         NodeRoute {
             node_id: NodeId::new("node-a").unwrap(),
@@ -921,6 +1035,7 @@ mod tests {
             repository_paths: false,
             workspace_file_read: false,
             provider_ids_open: false,
+            terminal_frame_events: false,
         }
     }
 
@@ -930,6 +1045,7 @@ mod tests {
             repository_paths: true,
             workspace_file_read: true,
             provider_ids_open: true,
+            terminal_frame_events: true,
         }
     }
 
@@ -940,6 +1056,30 @@ mod tests {
                 node_id: NodeId::new("node-a").unwrap(),
                 incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
                 response: Ok(gate4agent_c2_protocol::C2NodeResponse::Accepted),
+            }),
+        }))
+    }
+
+    fn terminal_resync_reply(request_id: u64, sequence: u64) -> OwnerInput {
+        OwnerInput::Frame(C2ServerFrame::Reply(gate4agent_c2_protocol::C2ReplyEnvelope {
+            request_id: C2RequestId(request_id),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Ok(C2NodeResponse::Resync {
+                    event_sequence: sequence,
+                    snapshot: gate4agent_c2_protocol::C2NodeSnapshot {
+                        node_id: NodeId::new("node-a").unwrap(),
+                        enabled_providers: Vec::new(),
+                        provider_runtime_statuses: Default::default(),
+                        workspaces: Vec::new(),
+                        session_records: Vec::new(),
+                    },
+                    events: vec![gate4agent_c2_protocol::C2NodeEventEnvelope {
+                        sequence,
+                        event: terminal_node_event(sequence),
+                    }],
+                }),
             }),
         }))
     }
@@ -1051,6 +1191,7 @@ mod tests {
                 CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -1058,6 +1199,119 @@ mod tests {
             validate_selected_compatibility(&offer, None),
             Err(C2ControlError::Protocol(_)),
         ));
+    }
+
+    #[tokio::test]
+    async fn control_owner_fails_closed_on_unnegotiated_terminal_frame_event() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx,
+            events_tx,
+            topology_tx,
+            writer_tx,
+            incoming_rx,
+            no_path_capabilities(),
+        ));
+
+        incoming_tx.send(terminal_event(8)).await.unwrap();
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+
+        assert!(commands_tx.is_closed());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_terminal_frame_resync_reply_and_closes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx,
+            events_tx,
+            topology_tx,
+            writer_tx,
+            incoming_rx,
+            no_path_capabilities(),
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Resync { after_sequence: 7 },
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+
+        incoming_tx.send(terminal_resync_reply(1, 8)).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == TERMINAL_FRAME_EVENTS_NOT_NEGOTIATED
+        ));
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+
+        assert!(commands_tx.is_closed());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_terminal_event_channel_does_not_block_following_reply() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx,
+            events_tx,
+            topology_tx,
+            writer_tx,
+            incoming_rx,
+            all_path_capabilities(),
+        ));
+
+        incoming_tx.send(terminal_event(8)).await.unwrap();
+        incoming_tx.send(terminal_event(9)).await.unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(reply(1)).await.unwrap();
+
+        let response = timeout(Duration::from_secs(1), reply_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(response.response, Ok(C2NodeResponse::Accepted)));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(RoutedNodeEvent {
+                event: C2NodeEvent::TerminalFrame { .. },
+                ..
+            })
+        ));
+
+        drop(commands_tx);
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
     }
 
     #[test]
@@ -1400,6 +1654,7 @@ mod tests {
             repository_paths: false,
             workspace_file_read: true,
             provider_ids_open: true,
+            terminal_frame_events: true,
         };
         assert!(matches!(
             reject_unnegotiated_outbound_path(&request, missing_repository),
@@ -1411,6 +1666,7 @@ mod tests {
             repository_paths: true,
             workspace_file_read: false,
             provider_ids_open: true,
+            terminal_frame_events: true,
         };
         assert!(matches!(
             reject_unnegotiated_outbound_path(&request, missing_file_read),

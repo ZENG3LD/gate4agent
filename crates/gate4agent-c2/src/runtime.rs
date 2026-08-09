@@ -10,7 +10,7 @@ use crate::protocol::{
 use crate::protocol::MAX_C2_ENDPOINT_BYTES;
 use gate4agent_node_protocol::{
     ClientRole, FrameError, NegotiatedNodeCompatibility, NodeEventEnvelope, NodeFailureCode,
-    NodeResponse, NodeSnapshot,
+    NodeResponse, NodeSnapshot, ServerFrame,
 };
 use gate4agent_node_wire::{LocalNodeClient, NodeClientError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -631,6 +631,30 @@ async fn node_relay_worker(
                     let _ = changed;
                     break NodeClientError::Io(io::Error::new(io::ErrorKind::ConnectionAborted, "node relay cleanup forced reconnect"));
                 }
+                frame = client.recv() => {
+                    match frame {
+                        Ok(ServerFrame::Event(envelope)) => {
+                            if let Err(error) = handle_live_node_event(
+                                &mut client,
+                                &node.node_id,
+                                envelope,
+                                &mut cursor,
+                                &hub,
+                                &ingress,
+                            ).await {
+                                break error;
+                            }
+                        }
+                        Ok(ServerFrame::Reply(_)
+                            | ServerFrame::Challenge(_)
+                            | ServerFrame::Hello(_)) => {
+                            break NodeClientError::Protocol(
+                                "node sent an unexpected idle frame".to_owned(),
+                            );
+                        }
+                        Err(error) => break error,
+                    }
+                }
                 _ = snapshot_tick.tick() => {
                     match bounded_node_request(&mut client, NodeRequest::Snapshot).await {
                         Ok(NodeResponse::Snapshot { event_sequence, snapshot, .. }) => {
@@ -1028,6 +1052,92 @@ async fn drain_pending_events(
         skip_replayed = true;
     }
     Ok(())
+}
+
+async fn handle_live_node_event(
+    client: &mut LocalNodeClient,
+    node_id: &NodeId,
+    envelope: NodeEventEnvelope,
+    cursor: &mut NodeCursor,
+    hub: &OperatorHub,
+    ingress: &mpsc::Sender<Attempt>,
+) -> Result<(), NodeClientError> {
+    if let Some(gap) = live_event_gap(cursor.sequence, &envelope) {
+        let after_sequence = cursor.sequence;
+        let response = bounded_node_request(
+            client,
+            NodeRequest::Resync { after_sequence },
+        ).await?;
+        let NodeResponse::Resync { event_sequence, snapshot, events } = response else {
+            return Err(NodeClientError::Protocol(
+                "live event repair resync returned a different response".to_owned(),
+            ));
+        };
+        let mut gaps = vec![gap];
+        let repair_gaps = validate_events(after_sequence, event_sequence, &events);
+        if repair_gaps.is_empty() {
+            publish_recovered_events(node_id, cursor.incarnation_id, &events, hub);
+        } else {
+            hub.publish(RoutedNodeEvent {
+                node_id: node_id.clone(),
+                cursor: NodeCursor {
+                    incarnation_id: cursor.incarnation_id,
+                    sequence: event_sequence,
+                },
+                event: C2NodeEvent::ResyncRequired {
+                    oldest_available_sequence: events
+                        .first()
+                        .map_or(event_sequence, |event| event.sequence),
+                },
+            });
+        }
+        gaps.extend(repair_gaps);
+        cursor.sequence = event_sequence;
+        ingress_attempt(
+            ingress,
+            node_id,
+            AttemptResult::Success {
+                cursor: *cursor,
+                snapshot,
+                gaps,
+            },
+        ).await.map_err(NodeClientError::Io)?;
+        return drain_pending_events(
+            client,
+            node_id,
+            cursor,
+            hub,
+            ingress,
+            true,
+            None,
+        ).await;
+    }
+
+    cursor.sequence = envelope.sequence;
+    hub.publish(RoutedNodeEvent {
+        node_id: node_id.clone(),
+        cursor: *cursor,
+        event: C2NodeEvent::from(&envelope.event),
+    });
+    ingress_attempt(
+        ingress,
+        node_id,
+        AttemptResult::Cursor { cursor: *cursor, gaps: Vec::new() },
+    ).await.map_err(NodeClientError::Io)
+}
+
+fn live_event_gap(previous: u64, envelope: &NodeEventEnvelope) -> Option<GapKind> {
+    if matches!(
+        &envelope.event,
+        gate4agent_node_protocol::NodeEvent::ResyncRequired { .. }
+    ) {
+        return Some(GapKind::HistoryEvicted);
+    }
+    if envelope.sequence <= previous {
+        return Some(GapKind::CursorRegression);
+    }
+    (envelope.sequence != previous.saturating_add(1))
+        .then_some(GapKind::NonContiguousEvents)
 }
 
 fn reject_disconnected_commands(commands: &mut mpsc::Receiver<RelayCommand>, cursor: Option<NodeCursor>) {
@@ -1433,6 +1543,31 @@ mod tests {
         assert_eq!(validate_events(4, 7, &[event(5), event(7)]), vec![GapKind::NonContiguousEvents]);
         assert_eq!(validate_events(7, 6, &[]), vec![GapKind::CursorRegression]);
         assert_eq!(validate_resync(4, 6, 4, &[]), vec![GapKind::CursorRegression]);
+    }
+
+    #[test]
+    fn live_event_gap_preserves_cursor_and_resync_rules() {
+        use gate4agent_node_protocol::{NodeEvent, WorkspaceId};
+        let event = |sequence, event| NodeEventEnvelope { sequence, event };
+        let removed = || NodeEvent::WorkspaceRemoved {
+            workspace_id: WorkspaceId::new("work").unwrap(),
+        };
+
+        assert_eq!(live_event_gap(4, &event(5, removed())), None);
+        assert_eq!(
+            live_event_gap(4, &event(4, removed())),
+            Some(GapKind::CursorRegression),
+        );
+        assert_eq!(
+            live_event_gap(4, &event(7, removed())),
+            Some(GapKind::NonContiguousEvents),
+        );
+        assert_eq!(
+            live_event_gap(4, &event(5, NodeEvent::ResyncRequired {
+                oldest_available_sequence: 3,
+            })),
+            Some(GapKind::HistoryEvicted),
+        );
     }
 
     #[test]

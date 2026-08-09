@@ -42,6 +42,7 @@ use crate::protocol::{
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
@@ -58,7 +59,8 @@ use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
     ControlCommand, ControlEvent, ControlEventKind, InputAction, PromptFraming, PromptPayload, ResumeLaunchRequest,
     ResumeTarget, SessionGeneration, StartRequest, TerminalControl, TerminalText,
-    TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX, WORKING_DIRECTORY_MAX_BYTES,
+    TerminalFrame, TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
+    WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -78,6 +80,8 @@ pub use crate::platform::DEFAULT_NODE_ENDPOINT;
 
 const NODE_EVENT_HISTORY_MAX: usize = 4_096;
 const NODE_BROADCAST_CAPACITY: usize = 1_024;
+const NODE_TERMINAL_BROADCAST_CAPACITY: usize = 1;
+const NODE_CONNECTION_EVENT_BURST_MAX: usize = 16;
 const CONTROL_EVENT_SUBSCRIPTION_CAPACITY: usize = 1_024;
 const MAX_PREAUTH_CONNECTIONS: usize = 32;
 const MAX_AUTHENTICATED_CONNECTIONS: usize = 16;
@@ -608,6 +612,7 @@ async fn drive_runtime_until_shutdown(
         while let Ok(event) = events.try_recv() {
             shared.publish_control(event);
         }
+        shared.publish_terminal_frames();
         if shared.shutdown.load(Ordering::Acquire) {
             let started = *shutdown_started.get_or_insert_with(Instant::now);
             let snapshot = shared.handle.snapshot();
@@ -913,6 +918,9 @@ struct NodeShared {
     controller: Mutex<Option<ControllerLease>>,
     history: Mutex<NodeEventHistory>,
     event_tx: broadcast::Sender<NodeEventEnvelope>,
+    terminal_event_tx: broadcast::Sender<Arc<Vec<NodeEventEnvelope>>>,
+    terminal_frame_watermarks:
+        Mutex<BTreeMap<AgentInstanceId, (SessionAddress, u64)>>,
     next_connection_id: AtomicU64,
     next_instance_id: AtomicU64,
     next_command_id: AtomicU64,
@@ -984,6 +992,7 @@ impl NodeShared {
         input_settle_timeout_ms: u64,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(NODE_BROADCAST_CAPACITY);
+        let (terminal_event_tx, _) = broadcast::channel(NODE_TERMINAL_BROADCAST_CAPACITY);
         let record_providers = records
             .iter()
             .map(|record| (record.record_id.clone(), record.provider.clone()))
@@ -1013,6 +1022,8 @@ impl NodeShared {
             controller: Mutex::new(None),
             history: Mutex::new(NodeEventHistory::new(record_providers)),
             event_tx,
+            terminal_event_tx,
+            terminal_frame_watermarks: Mutex::new(BTreeMap::new()),
             next_connection_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
             next_command_id: AtomicU64::new(1),
@@ -2223,6 +2234,20 @@ impl NodeShared {
                 && binding.generation == address.session.generation
         }) {
             bindings.remove(&address.session.instance_id);
+            self.clear_terminal_frame_watermark(address);
+        }
+    }
+
+    fn clear_terminal_frame_watermark(&self, address: &SessionAddress) {
+        let mut watermarks = self
+            .terminal_frame_watermarks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if watermarks
+            .get(&address.session.instance_id)
+            .is_some_and(|(current, _)| current == address)
+        {
+            watermarks.remove(&address.session.instance_id);
         }
     }
 
@@ -2283,13 +2308,20 @@ impl NodeShared {
     }
 
     fn publish_control(&self, event: ControlEvent) {
-        let (address, record_id, resume_command_rejected) = {
+        let (address, previous_address, record_id, resume_command_rejected) = {
             let mut bindings = self
                 .session_bindings
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(binding) = bindings.get_mut(&event.instance_id) else {
                 return;
+            };
+            let previous_address = SessionAddress {
+                workspace_id: binding.workspace_id.clone(),
+                session: SessionKey {
+                    instance_id: event.instance_id,
+                    generation: binding.generation,
+                },
             };
             let mut resume_command_rejected = false;
             if binding.generation == event.generation {
@@ -2332,10 +2364,15 @@ impl NodeShared {
                         generation: event.generation,
                     },
                 },
+                (previous_address.session.generation != event.generation)
+                    .then_some(previous_address),
                 binding.record_id.clone(),
                 resume_command_rejected,
             )
         };
+        if let Some(previous_address) = previous_address.as_ref() {
+            self.clear_terminal_frame_watermark(previous_address);
+        }
         if let Some(record_id) = record_id {
             self.reconcile_managed_record(
                 &record_id,
@@ -2690,6 +2727,10 @@ impl NodeShared {
     }
 
     fn publish(&self, event: NodeEvent) -> NodeEventEnvelope {
+        assert!(
+            !matches!(&event, NodeEvent::TerminalFrame { .. }),
+            "terminal frame events must use the replaceable live channel",
+        );
         let mut history = self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let sequence = history
             .last_sequence
@@ -2715,14 +2756,91 @@ impl NodeShared {
             | NodeEvent::ControllerChanged { .. }
             | NodeEvent::WorkspaceAdded { .. }
             | NodeEvent::WorkspaceRemoved { .. }
-            | NodeEvent::ResyncRequired { .. } => {}
+            | NodeEvent::ResyncRequired { .. }
+            | NodeEvent::TerminalFrame { .. } => {}
         }
         let envelope = NodeEventEnvelope { sequence, event };
         history.events.push_back(envelope.clone());
         history.last_sequence = sequence;
-        drop(history);
         let _ = self.event_tx.send(envelope.clone());
+        drop(history);
         envelope
+    }
+
+    fn publish_terminal_frames(&self) {
+        let snapshot = self.handle.snapshot();
+        let bindings = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let candidates = snapshot
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let binding = bindings.get(&session.instance_id)?;
+                if binding.generation != session.generation {
+                    return None;
+                }
+                let frame = session.terminal_frame.clone()?;
+                Some((
+                    SessionAddress {
+                        workspace_id: binding.workspace_id.clone(),
+                        session: SessionKey {
+                            instance_id: session.instance_id,
+                            generation: session.generation,
+                        },
+                    },
+                    frame,
+                ))
+            })
+            .collect();
+        drop(bindings);
+        self.publish_terminal_frame_candidates(candidates);
+    }
+
+    fn publish_terminal_frame_candidates(
+        &self,
+        candidates: Vec<(SessionAddress, TerminalFrame)>,
+    ) {
+        let mut watermarks = self
+            .terminal_frame_watermarks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut events = Vec::with_capacity(candidates.len());
+        for (address, frame) in candidates {
+            let advanced = watermarks
+                .get(&address.session.instance_id)
+                .map_or(true, |(current_address, sequence)| {
+                    current_address != &address || frame.sequence > *sequence
+                });
+            if !advanced {
+                continue;
+            }
+            watermarks.insert(
+                address.session.instance_id,
+                (address.clone(), frame.sequence),
+            );
+            events.push(NodeEvent::TerminalFrame { address, frame });
+        }
+        drop(watermarks);
+        if events.is_empty() {
+            return;
+        }
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut envelopes = Vec::with_capacity(events.len());
+        for event in events {
+            let sequence = history
+                .last_sequence
+                .checked_add(1)
+                .expect("node event sequence exhausted");
+            history.last_sequence = sequence;
+            envelopes.push(NodeEventEnvelope { sequence, event });
+        }
+        let _ = self.terminal_event_tx.send(Arc::new(envelopes));
+        drop(history);
     }
 
     fn current_sequence(&self) -> u64 {
@@ -3428,6 +3546,9 @@ async fn serve_connection(
     let include_open_provider_ids = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_PROVIDER_ID_OPEN_CAPABILITY
     });
+    let include_terminal_frame_events = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY
+    });
     let authenticated_permit = Arc::clone(&shared.authenticated_slots)
         .try_acquire_owned()
         .map_err(|_| NodeServerError::AuthenticatedConnectionLimit)?;
@@ -3439,6 +3560,10 @@ async fn serve_connection(
     drop(preauth_permit);
     let _authenticated_permit = authenticated_permit;
     let mut event_rx = shared.event_tx.subscribe();
+    let mut terminal_event_rx = terminal_event_subscription(
+        &shared,
+        include_terminal_frame_events,
+    );
     write_json_frame(
         &mut pipe,
         &ServerFrame::Hello(NodeHello {
@@ -3474,8 +3599,68 @@ async fn serve_connection(
         }
     });
     let _reader_abort = AbortTaskOnDrop(reader_task.abort_handle());
+    let mut pending_events = Vec::new();
+    let mut resync_required = false;
+    let mut discard_events_through = 0_u64;
     loop {
+        let durable_drain_budget = NODE_CONNECTION_EVENT_BURST_MAX
+            .saturating_sub(pending_events.len().min(NODE_CONNECTION_EVENT_BURST_MAX));
+        for _ in 0..durable_drain_budget {
+            match event_rx.try_recv() {
+                Ok(event) => queue_connection_event(
+                    &mut pending_events,
+                    event,
+                    discard_events_through,
+                ),
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    resync_required = true;
+                    break;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
+            }
+        }
+        if let Some(receiver) = terminal_event_rx.as_mut() {
+            match receiver.try_recv() {
+                Ok(events) => queue_connection_event_batch(
+                    &mut pending_events,
+                    &events,
+                    discard_events_through,
+                ),
+                Err(broadcast::error::TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    resync_required = true;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
+            }
+        }
+        if resync_required {
+            let event = resync_required_event(&shared);
+            apply_connection_resync_watermark(
+                &mut pending_events,
+                &mut discard_events_through,
+                event.sequence,
+            );
+            write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
+            resync_required = false;
+            continue;
+        }
+        if !pending_events.is_empty() {
+            pending_events.sort_unstable_by_key(|event| event.sequence);
+            let burst_len = connection_event_burst_len(pending_events.len());
+            for event in pending_events.drain(..burst_len) {
+                let event = if include_open_provider_ids {
+                    Some(event)
+                } else {
+                    project_event_legacy_provider_ids(&shared, event)
+                };
+                if let Some(event) = event {
+                    write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
+                }
+            }
+        }
         tokio::select! {
+            biased;
             frame = frame_rx.recv() => {
                 let frame = match frame {
                     Some(frame) => frame,
@@ -3526,31 +3711,26 @@ async fn serve_connection(
                 }
                 write_json_frame(&mut writer, &ServerFrame::Reply(reply)).await?;
             }
+            _ = tokio::task::yield_now(), if !pending_events.is_empty() => {}
             event = event_rx.recv() => {
                 match event {
-                    Ok(event) => {
-                        let event = if include_open_provider_ids {
-                            Some(event)
-                        } else {
-                            project_event_legacy_provider_ids(&shared, event)
-                        };
-                        if let Some(event) = event {
-                            write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let (sequence, oldest) = {
-                            let history = shared.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let sequence = history.last_sequence;
-                            let oldest = history.events.front().map_or(sequence, |event| event.sequence);
-                            (sequence, oldest)
-                        };
-                        let event = NodeEventEnvelope {
-                            sequence,
-                            event: NodeEvent::ResyncRequired { oldest_available_sequence: oldest },
-                        };
-                        write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
-                    }
+                    Ok(event) => queue_connection_event(
+                        &mut pending_events,
+                        event,
+                        discard_events_through,
+                    ),
+                    Err(broadcast::error::RecvError::Lagged(_)) => resync_required = true,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            events = receive_terminal_event_batch(&mut terminal_event_rx) => {
+                match events {
+                    Ok(events) => queue_connection_event_batch(
+                        &mut pending_events,
+                        &events,
+                        discard_events_through,
+                    ),
+                    Err(broadcast::error::RecvError::Lagged(_)) => resync_required = true,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -3558,6 +3738,87 @@ async fn serve_connection(
         }
     }
     Ok(())
+}
+
+async fn receive_terminal_event_batch(
+    receiver: &mut Option<broadcast::Receiver<Arc<Vec<NodeEventEnvelope>>>>,
+) -> Result<Arc<Vec<NodeEventEnvelope>>, broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn terminal_event_subscription(
+    shared: &NodeShared,
+    enabled: bool,
+) -> Option<broadcast::Receiver<Arc<Vec<NodeEventEnvelope>>>> {
+    enabled.then(|| shared.terminal_event_tx.subscribe())
+}
+
+fn queue_connection_event(
+    pending: &mut Vec<NodeEventEnvelope>,
+    event: NodeEventEnvelope,
+    discard_through: u64,
+) {
+    if event.sequence <= discard_through {
+        return;
+    }
+    if let NodeEvent::TerminalFrame { address, .. } = &event.event {
+        if let Some(index) = pending.iter().position(|current| {
+            matches!(
+                &current.event,
+                NodeEvent::TerminalFrame {
+                    address: current_address,
+                    ..
+                } if current_address == address
+            )
+        }) {
+            pending.remove(index);
+        }
+    }
+    pending.push(event);
+}
+
+fn queue_connection_event_batch(
+    pending: &mut Vec<NodeEventEnvelope>,
+    events: &[NodeEventEnvelope],
+    discard_through: u64,
+) {
+    for event in events {
+        queue_connection_event(pending, event.clone(), discard_through);
+    }
+}
+
+fn apply_connection_resync_watermark(
+    pending: &mut Vec<NodeEventEnvelope>,
+    discard_through: &mut u64,
+    marker_sequence: u64,
+) {
+    *discard_through = (*discard_through).max(marker_sequence);
+    pending.retain(|event| event.sequence > *discard_through);
+}
+
+fn connection_event_burst_len(pending_len: usize) -> usize {
+    pending_len.min(NODE_CONNECTION_EVENT_BURST_MAX)
+}
+
+fn resync_required_event(shared: &NodeShared) -> NodeEventEnvelope {
+    let history = shared
+        .history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let sequence = history.last_sequence;
+    let oldest_available_sequence = history
+        .events
+        .front()
+        .map_or(sequence, |event| event.sequence);
+    NodeEventEnvelope {
+        sequence,
+        event: NodeEvent::ResyncRequired {
+            oldest_available_sequence,
+        },
+    }
 }
 
 fn node_compatibility_support(
@@ -3597,6 +3858,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
         NODE_PROVIDER_ID_OPEN_CAPABILITY,
         NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+        NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -3755,7 +4017,8 @@ fn project_event_legacy_provider_ids(
     mut envelope: NodeEventEnvelope,
 ) -> Option<NodeEventEnvelope> {
     let include = match &mut envelope.event {
-        NodeEvent::Control { address, .. } => shared
+        NodeEvent::Control { address, .. }
+        | NodeEvent::TerminalFrame { address, .. } => shared
             .validate_address(address)
             .is_ok_and(|provider| provider_id_is_legacy(&provider)),
         NodeEvent::WorkspaceAdded { workspace } => {
@@ -4737,6 +5000,233 @@ mod tests {
 
     fn agent(value: &str) -> AgentId {
         AgentId::new(value).unwrap()
+    }
+
+    fn terminal_test_shared() -> NodeShared {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-terminal-test").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        )
+    }
+
+    fn terminal_address(generation: u64) -> SessionAddress {
+        SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(generation),
+            },
+        }
+    }
+
+    fn terminal_frame(sequence: u64) -> TerminalFrame {
+        TerminalFrame {
+            sequence,
+            size: gate4agent_types::TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            cursor_row: 2,
+            cursor_column: 3,
+            contents: format!("frame-{sequence}"),
+            formatted: vec![1, 2, 3],
+            scrollback_formatted: Vec::new(),
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: Default::default(),
+        }
+    }
+
+    #[test]
+    fn terminal_frame_watermark_coalesces_and_resets_for_exact_session_address() {
+        let shared = terminal_test_shared();
+        let mut receiver = shared.terminal_event_tx.subscribe();
+        let original = terminal_address(1);
+
+        shared.publish_terminal_frame_candidates(vec![(original.clone(), terminal_frame(7))]);
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            &first[0].event,
+            NodeEvent::TerminalFrame { address, frame }
+                if address == &original && frame.sequence == 7
+        ));
+
+        shared.publish_terminal_frame_candidates(vec![(original.clone(), terminal_frame(7))]);
+        shared.publish_terminal_frame_candidates(vec![(original.clone(), terminal_frame(6))]);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        shared.publish_terminal_frame_candidates(vec![(original.clone(), terminal_frame(8))]);
+        let advanced = receiver.try_recv().unwrap();
+        assert_eq!(advanced[0].sequence, 2);
+
+        let resumed = terminal_address(2);
+        shared.publish_terminal_frame_candidates(vec![(resumed.clone(), terminal_frame(1))]);
+        let reset = receiver.try_recv().unwrap();
+        assert_eq!(reset[0].sequence, 3);
+        assert!(matches!(
+            &reset[0].event,
+            NodeEvent::TerminalFrame { address, frame }
+                if address == &resumed && frame.sequence == 1
+        ));
+        shared.clear_terminal_frame_watermark(&resumed);
+        assert!(!shared
+            .terminal_frame_watermarks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&resumed.session.instance_id));
+    }
+
+    #[test]
+    fn terminal_frame_batches_replace_without_entering_node_event_history() {
+        let shared = terminal_test_shared();
+        let mut receiver = shared.terminal_event_tx.subscribe();
+        let address = terminal_address(1);
+        let count = NODE_EVENT_HISTORY_MAX as u64 + 17;
+
+        for sequence in 1..=count {
+            shared.publish_terminal_frame_candidates(vec![(
+                address.clone(),
+                terminal_frame(sequence),
+            )]);
+        }
+
+        let history = shared
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(history.events.is_empty());
+        assert_eq!(history.last_sequence, count);
+        drop(history);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) if skipped == count - 1
+        ));
+        let latest = receiver.try_recv().unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].sequence, count);
+    }
+
+    #[test]
+    fn legacy_terminal_frame_connection_has_no_live_subscription() {
+        let shared = terminal_test_shared();
+        let without_capability = terminal_event_subscription(&shared, false);
+        let with_capability = terminal_event_subscription(&shared, true);
+        assert!(without_capability.is_none());
+        assert!(with_capability.is_some());
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY
+        }));
+    }
+
+    #[test]
+    fn continuous_terminal_output_leaves_request_service_after_bounded_event_burst() {
+        let mut pending = Vec::new();
+        let mut event_sequence = 0_u64;
+        for frame_sequence in 1..=4 {
+            for instance in 1..=(NODE_CONNECTION_EVENT_BURST_MAX as u64 * 2) {
+                event_sequence += 1;
+                let mut address = terminal_address(1);
+                address.session.instance_id = AgentInstanceId(instance);
+                queue_connection_event(
+                    &mut pending,
+                    NodeEventEnvelope {
+                        sequence: event_sequence,
+                        event: NodeEvent::TerminalFrame {
+                            address,
+                            frame: terminal_frame(frame_sequence),
+                        },
+                    },
+                    0,
+                );
+            }
+        }
+        assert_eq!(pending.len(), NODE_CONNECTION_EVENT_BURST_MAX * 2);
+        pending.sort_unstable_by_key(|event| event.sequence);
+
+        let mut uninterrupted = pending.clone();
+        let first_burst = connection_event_burst_len(uninterrupted.len());
+        uninterrupted.drain(..first_burst);
+        let second_burst = connection_event_burst_len(uninterrupted.len());
+        uninterrupted.drain(..second_burst);
+        assert!(uninterrupted.is_empty());
+
+        let (frame_tx, mut frame_rx) =
+            mpsc::channel::<Result<ClientFrame, FrameError>>(1);
+        frame_tx
+            .try_send(Ok(ClientFrame::Request(RequestEnvelope {
+                request_id: 77,
+                request: NodeRequest::Snapshot,
+            })))
+            .unwrap();
+        let burst_len = connection_event_burst_len(pending.len());
+        assert_eq!(burst_len, NODE_CONNECTION_EVENT_BURST_MAX);
+        pending.drain(..burst_len);
+        assert_eq!(pending.len(), NODE_CONNECTION_EVENT_BURST_MAX);
+        assert!(matches!(
+            frame_rx.try_recv(),
+            Ok(Ok(ClientFrame::Request(RequestEnvelope {
+                request_id: 77,
+                request: NodeRequest::Snapshot,
+            })))
+        ));
+    }
+
+    #[test]
+    fn terminal_lag_watermark_discards_retained_and_replayed_batches() {
+        let mut pending = Vec::new();
+        for sequence in [7_u64, 8] {
+            let mut address = terminal_address(1);
+            address.session.instance_id = AgentInstanceId(sequence);
+            queue_connection_event(
+                &mut pending,
+                NodeEventEnvelope {
+                    sequence,
+                    event: NodeEvent::TerminalFrame {
+                        address,
+                        frame: terminal_frame(sequence),
+                    },
+                },
+                0,
+            );
+        }
+        let mut discard_through = 0;
+        apply_connection_resync_watermark(&mut pending, &mut discard_through, 8);
+        assert!(pending.is_empty());
+
+        let replayed = NodeEventEnvelope {
+            sequence: 8,
+            event: NodeEvent::TerminalFrame {
+                address: terminal_address(1),
+                frame: terminal_frame(8),
+            },
+        };
+        let advanced = NodeEventEnvelope {
+            sequence: 9,
+            event: NodeEvent::TerminalFrame {
+                address: terminal_address(2),
+                frame: terminal_frame(1),
+            },
+        };
+        queue_connection_event_batch(
+            &mut pending,
+            &[replayed, advanced.clone()],
+            discard_through,
+        );
+        assert_eq!(pending, vec![advanced]);
     }
 
     fn record(provider: &str, record_id: &str) -> ManagedSessionRecord {

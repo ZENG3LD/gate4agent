@@ -3,7 +3,7 @@
 pub use gate4agent_types::{AdapterFamily, AdapterId, AgentId};
 use gate4agent_types::{
     AgentInstanceId, ControlEvent, ProviderSessionIdentity, SessionGeneration, SessionSnapshot,
-    TerminalControl, TerminalSize,
+    TerminalControl, TerminalFrame, TerminalSize,
 };
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
@@ -29,6 +29,7 @@ pub const NODE_WORKSPACE_FILE_READ_CAPABILITY: &str = "workspace-file-read-v1";
 pub const NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str = "provider-contract-manifest-v1";
 pub const NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str = "provider-runtime-status-v1";
 pub const NODE_PROVIDER_ID_OPEN_CAPABILITY: &str = "provider-id.open-v1";
+pub const NODE_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = "terminal-frame-events-v1";
 pub const NODE_LEGACY_PROVIDER_IDS: [&str; 3] = ["claude", "codex", "kimi"];
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
@@ -1521,6 +1522,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_PROVIDER_ID_OPEN_CAPABILITY,
             NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
             NODE_REPOSITORY_PATH_CAPABILITY,
+            NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             NODE_WORKSPACE_FILE_READ_CAPABILITY,
         ]
         .into_iter()
@@ -2191,6 +2193,7 @@ pub struct NodeEventEnvelope {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum NodeEvent {
     Control { address: SessionAddress, event: ControlEvent },
+    TerminalFrame { address: SessionAddress, frame: TerminalFrame },
     ControllerChanged { controller: Option<ControllerState> },
     WorkspaceAdded { workspace: WorkspaceSnapshot },
     WorkspaceRemoved { workspace_id: WorkspaceId },
@@ -3290,6 +3293,88 @@ mod tests {
             r#"{"kind":"terminal-bytes","session":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"bytes":[27,91,49,59,53,68]}"#,
         );
         assert_eq!(serde_json::from_str::<NodeRequest>(&json).unwrap(), request);
+    }
+
+    #[test]
+    fn terminal_frame_event_wire_contract_is_exact() {
+        let event = NodeEvent::TerminalFrame {
+            address: SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(3),
+                },
+            },
+            frame: TerminalFrame {
+                sequence: 11,
+                size: TerminalSize { rows: 24, columns: 80 },
+                cursor_row: 2,
+                cursor_column: 4,
+                contents: "ready".to_owned(),
+                formatted: b"ready".to_vec(),
+                scrollback_formatted: vec![b"previous".to_vec()],
+                alternate_screen: false,
+                mouse_protocol_enabled: false,
+                mouse_protocol_encoding:
+                    gate4agent_types::TerminalMouseProtocolEncoding::Default,
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"terminal-frame","address":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"frame":{"sequence":11,"size":{"rows":24,"columns":80},"cursor_row":2,"cursor_column":4,"contents":"ready","formatted":[114,101,97,100,121],"scrollback_formatted":[[112,114,101,118,105,111,117,115]],"alternate_screen":false,"mouse_protocol_enabled":false,"mouse_protocol_encoding":"default"}}"#,
+        );
+        assert_eq!(serde_json::from_str::<NodeEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn terminal_frame_events_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(
+            NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+            "terminal-frame-events-v1",
+        );
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY));
+
+        let capability = CapabilityId::new(NODE_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap();
+        let mut support = portable_node_support();
+        support.capabilities = vec![capability.clone()];
+        let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
+        assert!(support
+            .negotiate(NODE_PROTOCOL_VERSION, &legacy)
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        assert_eq!(
+            String::from_utf8(
+                encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
+            )
+            .unwrap(),
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":8,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+        );
+    }
+
+    #[test]
+    fn legacy_node_event_bytes_remain_exact_after_terminal_frame_addition() {
+        assert_eq!(
+            serde_json::to_vec(&NodeEvent::ResyncRequired {
+                oldest_available_sequence: 7,
+            })
+            .unwrap(),
+            br#"{"kind":"resync-required","oldest_available_sequence":7}"#,
+        );
     }
 
     #[test]

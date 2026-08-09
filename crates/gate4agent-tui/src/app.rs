@@ -8,7 +8,8 @@ use gate4agent_node_protocol::{
     MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
 };
 use gate4agent_types::{
-    AgentId, TerminalControl, TerminalMouseProtocolEncoding, TERMINAL_INPUT_MAX_BYTES,
+    AgentId, TerminalControl, TerminalFrame, TerminalMouseProtocolEncoding,
+    TERMINAL_INPUT_MAX_BYTES,
 };
 use uzor_tui::Rect;
 
@@ -1264,6 +1265,49 @@ impl App {
         self.git_cursor = self.git_cursor.min(self.git_item_count().saturating_sub(1));
         self.reconcile_terminal_scroll_offsets(&previous_scrollback);
         self.reconcile_session_drag();
+    }
+
+    pub fn apply_terminal_frame(
+        &mut self,
+        address: &SessionAddress,
+        incarnation_id: NodeIncarnationId,
+        frame: TerminalFrame,
+    ) -> bool {
+        let Some(node) = self.nodes.iter_mut().find(|node| {
+            node.node_id == address.node_id
+                && node.incarnation_id == Some(incarnation_id)
+        }) else {
+            return false;
+        };
+        let Some(workspace) = node.workspaces.iter_mut().find(|workspace| {
+            workspace.workspace_id == address.workspace_id
+        }) else {
+            return false;
+        };
+        let Some(session) = workspace.sessions.iter_mut().find(|session| {
+            session.address == *address
+        }) else {
+            return false;
+        };
+        let previous_scrollback = session.terminal_scrollback.clone();
+        let current_scrollback = frame.scrollback_formatted.clone();
+        session.terminal_formatted = frame.formatted;
+        session.terminal_scrollback = frame.scrollback_formatted;
+        session.terminal_alternate_screen = frame.alternate_screen;
+        session.terminal_mouse_protocol_enabled = frame.mouse_protocol_enabled;
+        session.terminal_mouse_protocol_encoding = frame.mouse_protocol_encoding;
+        session.terminal_cursor = Some((frame.cursor_row, frame.cursor_column));
+        if let Some(offset) = self.terminal_scroll_offsets.get(address).copied() {
+            let offset = offset
+                .saturating_add(scrollback_advance(&previous_scrollback, &current_scrollback))
+                .min(current_scrollback.len());
+            if offset == 0 {
+                self.terminal_scroll_offsets.remove(address);
+            } else {
+                self.terminal_scroll_offsets.insert(address.clone(), offset);
+            }
+        }
+        true
     }
 
     fn rebound_address(&self, address: &SessionAddress) -> Option<SessionAddress> {

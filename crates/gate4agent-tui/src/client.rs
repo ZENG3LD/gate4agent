@@ -28,7 +28,8 @@ use gate4agent_node_protocol::{
 };
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
 use gate4agent_types::{
-    AgentId, ControlEvent, ControlEventKind, ProviderActivity, SessionSnapshot, SessionStatus, TerminalSize,
+    AgentId, ControlEvent, ControlEventKind, ProviderActivity, SessionSnapshot, SessionStatus,
+    TerminalFrame, TerminalSize,
     TerminalMouseProtocolEncoding, TransportKind,
 };
 use tokio::sync::{mpsc, watch};
@@ -136,6 +137,7 @@ enum WorkerUpdate {
 }
 
 enum C2EventUpdate {
+    TerminalFrame { address: SessionAddress, frame: TerminalFrame },
     SessionRecordUpserted(ManagedSessionView),
     SessionRecordRemoved { record_id: String },
     Notice(String),
@@ -146,6 +148,7 @@ enum C2EventUpdate {
 #[derive(Default)]
 struct C2ApplyState {
     watermarks: BTreeMap<String, gate4agent_c2_protocol::NodeCursor>,
+    terminal_watermarks: BTreeMap<SessionAddress, u64>,
 }
 
 impl C2ApplyState {
@@ -175,6 +178,37 @@ impl C2ApplyState {
         }
         self.watermarks.insert(node_id.to_owned(), cursor);
         true
+    }
+
+    fn rebuild_terminal_watermarks(&mut self, node_id: &str, snapshot: &C2NodeSnapshot) {
+        self.terminal_watermarks
+            .retain(|address, _| address.node_id != node_id);
+        for workspace in &snapshot.workspaces {
+            for session in &workspace.sessions {
+                let Some(frame) = session.terminal_frame.as_ref() else { continue; };
+                self.terminal_watermarks.insert(SessionAddress {
+                    node_id: node_id.to_owned(),
+                    workspace_id: workspace.workspace_id.to_string(),
+                    instance_id: session.instance_id.0,
+                    generation: session.generation.0,
+                }, frame.sequence);
+            }
+        }
+    }
+
+    fn terminal_frame_is_new(&self, address: &SessionAddress, sequence: u64) -> bool {
+        self.terminal_watermarks
+            .get(address)
+            .is_none_or(|current| sequence > *current)
+    }
+
+    fn record_terminal_frame(&mut self, address: SessionAddress, sequence: u64) {
+        self.terminal_watermarks.insert(address, sequence);
+    }
+
+    fn reset_terminal_watermarks(&mut self, node_id: &str) {
+        self.terminal_watermarks
+            .retain(|address, _| address.node_id != node_id);
     }
 }
 
@@ -1253,6 +1287,12 @@ async fn publish_c2_event(
                 None
             }
         }
+        C2NodeEvent::TerminalFrame { address, frame } => Some(
+            C2EventUpdate::TerminalFrame {
+                address: project_wire_address(node_id, address),
+                frame,
+            },
+        ),
         C2NodeEvent::SessionRecordUpserted { record } => Some(
             C2EventUpdate::SessionRecordUpserted(project_c2_managed_session(node_id, record)),
         ),
@@ -2088,6 +2128,7 @@ async fn publish_node_event(
                 send_update(updates, WorkerUpdate::Notice(notice)).await;
             }
         }
+        NodeEvent::TerminalFrame { .. } => {}
         NodeEvent::SessionRecordUpserted { record } => {
             send_update(
                 updates,
@@ -2154,6 +2195,7 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) {
                 sequence: event_sequence,
             };
             if c2.accept_snapshot(&expected_node_id, cursor) {
+                c2.rebuild_terminal_watermarks(&expected_node_id, &snapshot);
                 app.upsert_node(project_c2_node(
                     expected_node_id,
                     endpoint,
@@ -2168,6 +2210,14 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) {
                 return;
             }
             match event {
+                C2EventUpdate::TerminalFrame { address, frame } => {
+                    let frame_sequence = frame.sequence;
+                    if c2.terminal_frame_is_new(&address, frame_sequence)
+                        && app.apply_terminal_frame(&address, cursor.incarnation_id, frame)
+                    {
+                        c2.record_terminal_frame(address, frame_sequence);
+                    }
+                }
                 C2EventUpdate::SessionRecordUpserted(record) => {
                     app.upsert_managed_session(record)
                 }
@@ -2176,6 +2226,7 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) {
                 }
                 C2EventUpdate::Notice(notice) => app.notice = Some(notice),
                 C2EventUpdate::ResyncRequired => {
+                    c2.reset_terminal_watermarks(&node_id);
                     let endpoint = app.nodes.iter()
                         .find(|node| node.node_id == node_id)
                         .map(|node| node.endpoint.clone())
@@ -3484,6 +3535,137 @@ mod tests {
             workspaces: Vec::new(),
             session_records: vec![c2_test_record(display_name)],
         }
+    }
+
+    fn terminal_frame(sequence: u64, formatted: &[u8]) -> TerminalFrame {
+        TerminalFrame {
+            sequence,
+            size: TerminalSize { rows: 24, columns: 80 },
+            cursor_row: 2,
+            cursor_column: formatted.len() as u16,
+            contents: String::from_utf8_lossy(formatted).into_owned(),
+            formatted: formatted.to_vec(),
+            scrollback_formatted: vec![b"previous".to_vec()],
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
+        }
+    }
+
+    fn c2_terminal_snapshot(frame: TerminalFrame) -> C2NodeSnapshot {
+        C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: Default::default(),
+            workspaces: vec![gate4agent_c2_protocol::C2WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                canonical_root: host_path(r"C:\repo"),
+                sessions: vec![C2SessionSnapshot {
+                    instance_id: gate4agent_types::AgentInstanceId(7),
+                    agent_id: provider("codex"),
+                    transport: TransportKind::Pty,
+                    generation: gate4agent_types::SessionGeneration(2),
+                    status: C2SessionStatus::Running,
+                    pending_operation: None,
+                    pending_input: None,
+                    process_id: Some(7),
+                    terminal_size: Some(frame.size),
+                    terminal_frame: Some(frame),
+                    provider_activity: ProviderActivity::Idle,
+                    provider_interaction_pending: false,
+                    provider_identity_present: true,
+                }],
+            }],
+            session_records: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn c2_terminal_frames_require_exact_address_incarnation_and_monotonic_sequence() {
+        let incarnation_id = gate4agent_c2_protocol::NodeIncarnationId::from_bytes([5; 16]);
+        let mut app = App::default();
+        let mut c2 = C2ApplyState::default();
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: c2_terminal_snapshot(terminal_frame(10, b"snapshot")),
+            event_sequence: 4,
+        });
+        let address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 7,
+            generation: 2,
+        };
+        let push = |cursor_sequence, incarnation_id, address, frame| WorkerUpdate::C2Event {
+            node_id: "node-a".to_owned(),
+            cursor: gate4agent_c2_protocol::NodeCursor {
+                incarnation_id,
+                sequence: cursor_sequence,
+            },
+            event: C2EventUpdate::TerminalFrame { address, frame },
+        };
+
+        apply_update(&mut app, &mut c2, push(
+            5,
+            incarnation_id,
+            address.clone(),
+            terminal_frame(11, b"push-11"),
+        ));
+        apply_update(&mut app, &mut c2, push(
+            6,
+            incarnation_id,
+            address.clone(),
+            terminal_frame(11, b"duplicate"),
+        ));
+        assert_eq!(app.find_session(&address).unwrap().terminal_formatted, b"push-11");
+
+        let mut wrong_address = address.clone();
+        wrong_address.workspace_id = "other-workspace".to_owned();
+        apply_update(&mut app, &mut c2, push(
+            7,
+            incarnation_id,
+            wrong_address,
+            terminal_frame(12, b"wrong-address"),
+        ));
+        apply_update(&mut app, &mut c2, push(
+            8,
+            gate4agent_c2_protocol::NodeIncarnationId::from_bytes([6; 16]),
+            address.clone(),
+            terminal_frame(12, b"wrong-incarnation"),
+        ));
+        apply_update(&mut app, &mut c2, push(
+            9,
+            incarnation_id,
+            address.clone(),
+            terminal_frame(12, b"push-12"),
+        ));
+        assert_eq!(app.find_session(&address).unwrap().terminal_formatted, b"push-12");
+
+        apply_update(&mut app, &mut c2, push(
+            10,
+            incarnation_id,
+            address.clone(),
+            terminal_frame(20, b"push-20"),
+        ));
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: c2_terminal_snapshot(terminal_frame(2, b"resynced")),
+            event_sequence: 10,
+        });
+        apply_update(&mut app, &mut c2, push(
+            11,
+            incarnation_id,
+            address.clone(),
+            terminal_frame(3, b"post-resync"),
+        ));
+        assert_eq!(
+            app.find_session(&address).unwrap().terminal_formatted,
+            b"post-resync",
+        );
     }
 
     #[test]

@@ -1263,12 +1263,12 @@ fn render_spawn(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
                 .providers
                 .iter()
                 .filter(|inventory| inventory.enabled)
-                .map(|inventory| inventory.provider)
+                .map(|inventory| inventory.provider.clone())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
         .iter()
-        .map(|provider| if *provider == spawn.provider { format!("[{provider}]") } else { provider.to_string() })
+        .map(|provider| if provider == &spawn.provider { format!("[{provider}]") } else { provider.to_string() })
         .collect::<Vec<_>>()
         .join("  ");
     Paragraph::new(Text::from_lines(vec![
@@ -1612,7 +1612,7 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
                 .iter()
                 .map(|key| {
                     if let Some(record) = app.find_managed_session(key) {
-                        return cell_width(record.short_title())
+                        return cell_width(&record.short_title())
                             .max(cell_width(&record.workspace_id) + cell_width(&record.node_id) + 10)
                             + 3;
                     }
@@ -2068,7 +2068,7 @@ mod tests {
         GitCommitSummary, GitStatusEntry, GitWorktreeSnapshot, ManagedSessionState, SessionMode,
         WorkspaceEntry, WorkspaceId,
     };
-    use gate4agent_types::TerminalMouseProtocolEncoding;
+    use gate4agent_types::{AgentId, TerminalMouseProtocolEncoding};
     use crate::app::{
         DragSource, ManagedSessionView, NodeView, Provider, ProviderInventory, SessionAddress,
         SessionTab, SessionView, WorkspaceView,
@@ -2082,6 +2082,10 @@ mod tests {
         gate4agent_node_protocol::RepositoryPath::utf8(value.into()).unwrap()
     }
 
+    fn provider(value: &str) -> Provider {
+        AgentId::new(value).unwrap()
+    }
+
     fn fixture(mode: PtyColorMode) -> App {
         let address = SessionAddress {
             node_id: "node-a".to_owned(),
@@ -2093,6 +2097,7 @@ mod tests {
         app.color_mode = mode;
         app.nodes.push(NodeView {
             node_id: "node-a".to_owned(),
+            incarnation_id: None,
             endpoint: "pipe".to_owned(),
             connection: ConnectionState::Connected,
             controller_owned: true,
@@ -2102,10 +2107,10 @@ mod tests {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
                 canonical_root: host_path(r"C:\work\nemo"),
-                providers: vec![ProviderInventory { provider: Provider::Kimi, enabled: true }],
+                providers: vec![ProviderInventory { provider: provider("kimi"), enabled: true }],
                 sessions: vec![SessionView {
                     address: address.clone(),
-                    provider: Provider::Kimi,
+                    provider: provider("kimi"),
                     status: "running".to_owned(),
                     running: true,
                     stoppable: true,
@@ -2720,7 +2725,7 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 record_id: format!("record-{name}"),
                 display_name: format!("{name} session"),
-                provider: Provider::Codex,
+                provider: provider("codex"),
                 mode: SessionMode::Pty,
                 state,
                 workspace_id: "workspace-a".to_owned(),

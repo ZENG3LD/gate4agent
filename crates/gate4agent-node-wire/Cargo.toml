@@ -25,6 +25,7 @@ libc = "0.2"
 ring = "=0.17.14"
 
 [dev-dependencies]
+gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["macros", "net", "rt"] }
 
 [features]

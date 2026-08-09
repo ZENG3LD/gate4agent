@@ -290,7 +290,7 @@ mod tests {
         ArchitectureId, CapabilityId, HostDescriptor, LocalTransportKind,
         NodeCompatibilitySupport, OperatingSystemId, PathEncoding, PathSemantics,
         PathStyle, ProtocolRange, StateSchemaSupport,
-        NODE_COMPATIBILITY_METADATA_CAPABILITY,
+        NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROVIDER_ID_OPEN_CAPABILITY,
     };
 
     fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
@@ -447,6 +447,58 @@ mod tests {
         )
         .unwrap();
         assert!(!proofs_match(&proof, &selection_proof));
+    }
+
+    #[test]
+    fn open_provider_capability_is_bound_in_both_offer_and_selection() {
+        let (mut offer, mut selected) = negotiated_fixture();
+        let capability = CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap();
+        offer.capabilities.push(capability.clone());
+        selected.capabilities.push(capability);
+        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
+        let proof = negotiated_auth_proof(
+            b"local-secret",
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &selected,
+        )
+        .unwrap();
+
+        let mut legacy_offer = offer.clone();
+        legacy_offer.capabilities.retain(|candidate| {
+            candidate.as_str() != NODE_PROVIDER_ID_OPEN_CAPABILITY
+        });
+        let changed_offer = negotiated_auth_proof(
+            b"local-secret",
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &legacy_offer,
+            &selected,
+        )
+        .unwrap();
+        assert!(!proofs_match(&proof, &changed_offer));
+
+        let mut legacy_selection = selected.clone();
+        legacy_selection.capabilities.retain(|candidate| {
+            candidate.as_str() != NODE_PROVIDER_ID_OPEN_CAPABILITY
+        });
+        let changed_selection = negotiated_auth_proof(
+            b"local-secret",
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &legacy_selection,
+        )
+        .unwrap();
+        assert!(!proofs_match(&proof, &changed_selection));
     }
 
     #[test]

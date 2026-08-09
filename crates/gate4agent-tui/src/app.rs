@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use gate4agent_node_protocol::{
-    GitWorktreeSnapshot, ManagedSessionState, OpaqueHostPath, RepositoryPath, SessionMode,
+    GitWorktreeSnapshot, ManagedSessionState, NodeIncarnationId, OpaqueHostPath, RepositoryPath, SessionMode,
     WorkspaceEntryKind, WorkspaceId,
     WorkspaceInspection, MAX_SESSION_DISPLAY_NAME_BYTES,
     MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
 };
 use gate4agent_types::{
-    TerminalControl, TerminalMouseProtocolEncoding, TERMINAL_INPUT_MAX_BYTES,
+    AgentId, TerminalControl, TerminalMouseProtocolEncoding, TERMINAL_INPUT_MAX_BYTES,
 };
 use uzor_tui::Rect;
 
@@ -16,43 +16,7 @@ const WHEEL_SCROLL_LINES: usize = 3;
 const MIN_CONTROL_MODAL_WIDTH: u16 = 36;
 const MIN_CONTROL_MODAL_HEIGHT: u16 = 6;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Provider {
-    Claude,
-    Codex,
-    Kimi,
-}
-
-impl Provider {
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Kimi];
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Kimi => "kimi",
-        }
-    }
-}
-
-impl fmt::Display for Provider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.id())
-    }
-}
-
-impl std::str::FromStr for Provider {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "kimi" => Ok(Self::Kimi),
-            _ => Err(format!("unsupported agent: {value}")),
-        }
-    }
-}
+pub type Provider = AgentId;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PtyColorMode {
@@ -146,8 +110,22 @@ pub struct ManagedSessionView {
 }
 
 impl ManagedSessionView {
-    pub fn short_title(&self) -> &str {
-        &self.display_name
+    pub fn short_title(&self) -> String {
+        if let Some(address) = self.active_session.as_ref() {
+            format!(
+                "{} · {}/{} #{}:{}",
+                self.display_name,
+                address.node_id,
+                address.workspace_id,
+                address.instance_id,
+                address.generation,
+            )
+        } else {
+            format!(
+                "{} · {}/{} @{}",
+                self.display_name, self.node_id, self.workspace_id, self.record_id,
+            )
+        }
     }
 }
 
@@ -159,7 +137,14 @@ pub enum AgentRowKey {
 
 impl SessionView {
     pub fn short_title(&self) -> String {
-        format!("{} #{}", self.provider, self.address.instance_id)
+        format!(
+            "{} · {}/{} #{}:{}",
+            self.provider,
+            self.address.node_id,
+            self.address.workspace_id,
+            self.address.instance_id,
+            self.address.generation,
+        )
     }
 }
 
@@ -181,6 +166,7 @@ pub struct WorkspaceView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeView {
     pub node_id: String,
+    pub incarnation_id: Option<NodeIncarnationId>,
     pub endpoint: String,
     pub connection: ConnectionState,
     pub controller_owned: bool,
@@ -950,7 +936,7 @@ impl App {
             .flat_map(|node| node.session_records.iter())
             .find(|record| record.active_session.as_ref() == Some(address))
         {
-            return Some(record.display_name.clone());
+            return Some(record.short_title());
         }
         self.find_session(address).map(SessionView::short_title)
     }
@@ -996,7 +982,7 @@ impl App {
             (
                 !left.attention,
                 !left.running,
-                left.provider.id(),
+                left.provider.as_str(),
                 left.address.node_id.as_str(),
                 left.address.workspace_id.as_str(),
                 left.address.instance_id,
@@ -1004,7 +990,7 @@ impl App {
                 .cmp(&(
                     !right.attention,
                     !right.running,
-                    right.provider.id(),
+                    right.provider.as_str(),
                     right.address.node_id.as_str(),
                     right.address.workspace_id.as_str(),
                     right.address.instance_id,
@@ -1056,7 +1042,7 @@ impl App {
             return (
                 !attention,
                 state,
-                record.provider.id().to_owned(),
+                record.provider.as_str().to_owned(),
                 record.display_name.to_ascii_lowercase(),
                 record.record_id.clone(),
             );
@@ -1068,13 +1054,32 @@ impl App {
         (
             !session.is_some_and(|session| session.attention),
             if session.is_some_and(|session| session.running) { 0 } else { 3 },
-            session.map(|session| session.provider.id()).unwrap_or("unknown").to_owned(),
+            session.map(|session| session.provider.as_str()).unwrap_or("unknown").to_owned(),
             format!("{:020}", address.instance_id),
             format!("{}:{}", address.node_id, address.workspace_id),
         )
     }
 
     pub fn upsert_node(&mut self, node: NodeView) {
+        let incarnation_changed = self
+            .nodes
+            .iter()
+            .find(|existing| existing.node_id == node.node_id)
+            .is_some_and(|existing| match (existing.incarnation_id, node.incarnation_id) {
+                (Some(previous), Some(current)) => previous != current,
+                _ => false,
+            });
+        if incarnation_changed {
+            self.tabs.retain(|tab| tab.address.node_id != node.node_id);
+            self.grid.panes.retain(|pane| pane.address.node_id != node.node_id);
+            self.pending_open.retain(|address| address.node_id != node.node_id);
+            self.terminal_scroll_offsets
+                .retain(|address, _| address.node_id != node.node_id);
+            self.notice = Some(format!(
+                "{} restarted; stale PTY targets were detached",
+                node.node_id,
+            ));
+        }
         let previous_scrollback = self
             .terminal_scroll_offsets
             .keys()
@@ -1291,6 +1296,7 @@ impl App {
         } else {
             self.nodes.push(NodeView {
                 node_id: expected_node_id.to_owned(),
+                incarnation_id: None,
                 endpoint: endpoint.to_owned(),
                 connection: state,
                 controller_owned: false,
@@ -2473,7 +2479,7 @@ impl App {
             .providers
             .iter()
             .find(|inventory| inventory.enabled)
-            .map(|inventory| inventory.provider)
+            .map(|inventory| inventory.provider.clone())
         else {
             self.notice = Some("selected workspace has no enabled provider".to_owned());
             return AppAction::None;
@@ -2964,7 +2970,7 @@ impl App {
                         .providers
                         .iter()
                         .filter(|inventory| inventory.enabled)
-                        .map(|inventory| inventory.provider)
+                        .map(|inventory| inventory.provider.clone())
                         .collect::<Vec<_>>();
                     (!providers.is_empty()).then(|| {
                         (
@@ -3000,7 +3006,7 @@ impl App {
         spawn.node_id.clone_from(node_id);
         spawn.workspace_id.clone_from(workspace_id);
         if !providers.contains(&spawn.provider) {
-            spawn.provider = providers[0];
+            spawn.provider = providers[0].clone();
         }
     }
 
@@ -3382,7 +3388,7 @@ impl App {
                     .providers
                     .iter()
                     .filter(|inventory| inventory.enabled)
-                    .map(|inventory| inventory.provider)
+                    .map(|inventory| inventory.provider.clone())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -3393,9 +3399,9 @@ impl App {
             }
             UiKey::Up => self.cycle_spawn_workspace(&mut spawn, false),
             UiKey::Down => self.cycle_spawn_workspace(&mut spawn, true),
-            UiKey::Left => spawn.provider = cycle_provider(&enabled, spawn.provider, false),
+            UiKey::Left => spawn.provider = cycle_provider(&enabled, &spawn.provider, false),
             UiKey::Right | UiKey::Tab => {
-                spawn.provider = cycle_provider(&enabled, spawn.provider, true)
+                spawn.provider = cycle_provider(&enabled, &spawn.provider, true)
             }
             UiKey::Enter => {
                 self.focus = Focus::Agents;
@@ -4277,11 +4283,11 @@ fn function_control(number: u8) -> TerminalControl {
     }
 }
 
-fn cycle_provider(enabled: &[Provider], current: Provider, forward: bool) -> Provider {
+fn cycle_provider(enabled: &[Provider], current: &Provider, forward: bool) -> Provider {
     if enabled.is_empty() {
-        return current;
+        return current.clone();
     }
-    let current = enabled.iter().position(|provider| *provider == current).unwrap_or(0);
+    let current = enabled.iter().position(|provider| provider == current).unwrap_or(0);
     let index = if forward {
         (current + 1) % enabled.len()
     } else if current == 0 {
@@ -4289,7 +4295,7 @@ fn cycle_provider(enabled: &[Provider], current: Provider, forward: bool) -> Pro
     } else {
         current - 1
     };
-    enabled[index]
+    enabled[index].clone()
 }
 
 pub fn managed_state_label(state: ManagedSessionState) -> &'static str {
@@ -4337,6 +4343,17 @@ mod tests {
         RepositoryPath::utf8(value.into()).unwrap()
     }
 
+    fn provider(value: &str) -> Provider {
+        AgentId::new(value).unwrap()
+    }
+
+    fn fixture_providers() -> Vec<Provider> {
+        ["claude", "codex", "kimi", "qwen-code", "grok"]
+            .into_iter()
+            .map(provider)
+            .collect()
+    }
+
     fn fixture() -> App {
         let address = SessionAddress {
             node_id: "node-a".to_owned(),
@@ -4347,6 +4364,7 @@ mod tests {
         let mut app = App::default();
         app.nodes.push(NodeView {
             node_id: "node-a".to_owned(),
+            incarnation_id: None,
             endpoint: r"\\.\pipe\node-a".to_owned(),
             connection: ConnectionState::Connected,
             controller_owned: true,
@@ -4356,13 +4374,13 @@ mod tests {
                 workspace_id: "workspace-a".to_owned(),
                 label: "nemo".to_owned(),
                 canonical_root: host_path(r"C:\work\nemo"),
-                providers: Provider::ALL
+                providers: fixture_providers()
                     .into_iter()
                     .map(|provider| ProviderInventory { provider, enabled: true })
                     .collect(),
                 sessions: vec![SessionView {
                     address: address.clone(),
-                    provider: Provider::Codex,
+                    provider: provider("codex"),
                     status: "running".to_owned(),
                     running: true,
                     stoppable: true,
@@ -4405,7 +4423,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             record_id: record_id.to_owned(),
             display_name: display_name.to_owned(),
-            provider: Provider::Codex,
+            provider: provider("codex"),
             mode: SessionMode::Pty,
             state,
             workspace_id: "workspace-a".to_owned(),
@@ -4587,7 +4605,70 @@ mod tests {
         app.focus = Focus::Agents;
         assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
         assert_eq!(app.focus, Focus::Spawn);
-        assert!(matches!(app.reduce(UiKey::Enter), AppAction::Spawn { node_id, workspace_id, provider: Provider::Claude, .. } if node_id == "node-a" && workspace_id == "workspace-a"));
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::Spawn { node_id, workspace_id, provider: actual, .. }
+                if node_id == "node-a" && workspace_id == "workspace-a" && actual == provider("claude")
+        ));
+    }
+
+    #[test]
+    fn open_provider_ids_are_selectable_without_tui_enum_changes() {
+        let mut app = fixture();
+        app.nodes[0].workspaces[0].providers = vec![
+            ProviderInventory { provider: provider("qwen-code"), enabled: true },
+            ProviderInventory { provider: provider("grok"), enabled: true },
+        ];
+        app.focus = Focus::Agents;
+        assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().provider, provider("qwen-code"));
+        app.reduce(UiKey::Right);
+        assert_eq!(app.spawn.as_ref().unwrap().provider, provider("grok"));
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::Spawn { provider: actual, .. } if actual == provider("grok")
+        ));
+    }
+
+    #[test]
+    fn qualified_titles_disambiguate_reused_local_ids_and_reserved_names() {
+        let mut first = fixture();
+        let first_session = first.nodes[0].workspaces[0].sessions[0].clone();
+        let mut second_session = first_session.clone();
+        second_session.address.node_id = "node-b".to_owned();
+        second_session.provider = provider("grok");
+        assert_ne!(first_session.short_title(), second_session.short_title());
+        assert!(first_session.short_title().contains("node-a/workspace-a #7:2"));
+        assert!(second_session.short_title().contains("node-b/workspace-a #7:2"));
+
+        let key = add_managed_record(
+            &mut first,
+            "record-pending",
+            "pending",
+            ManagedSessionState::Dormant,
+            None,
+            false,
+        );
+        let title = first.find_managed_session(&key).unwrap().short_title();
+        assert_eq!(title, "pending · node-a/workspace-a @record-pending");
+    }
+
+    #[test]
+    fn changed_node_incarnation_detaches_reused_numeric_session_targets() {
+        let mut app = fixture();
+        app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([1; 16]));
+        let mut restarted = app.nodes[0].clone();
+        restarted.incarnation_id = Some(NodeIncarnationId::from_bytes([2; 16]));
+        assert_eq!(app.tabs.len(), 1);
+
+        app.upsert_node(restarted);
+
+        assert!(app.tabs.is_empty());
+        assert!(app.grid.panes.is_empty());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("node-a restarted; stale PTY targets were detached"),
+        );
     }
 
     #[test]
@@ -4599,7 +4680,7 @@ mod tests {
         second.canonical_root = host_path(r"C:\work\other");
         second.sessions.clear();
         second.providers = vec![ProviderInventory {
-            provider: Provider::Kimi,
+            provider: provider("kimi"),
             enabled: true,
         }];
         app.nodes[0].workspaces.push(second);
@@ -4611,15 +4692,15 @@ mod tests {
         assert_eq!(app.click(20, 3), AppAction::None);
         assert_eq!(app.focus, Focus::Spawn);
         assert_eq!(app.spawn.as_ref().unwrap().workspace_id, "workspace-b");
-        assert_eq!(app.spawn.as_ref().unwrap().provider, Provider::Kimi);
+        assert_eq!(app.spawn.as_ref().unwrap().provider, provider("kimi"));
 
         app.reduce(UiKey::Up);
         assert_eq!(app.spawn.as_ref().unwrap().workspace_id, "workspace-a");
         app.reduce(UiKey::Down);
         assert!(matches!(
             app.reduce(UiKey::Enter),
-            AppAction::Spawn { workspace_id, provider: Provider::Kimi, .. }
-                if workspace_id == "workspace-b"
+            AppAction::Spawn { workspace_id, provider: actual, .. }
+                if workspace_id == "workspace-b" && actual == provider("kimi")
         ));
     }
 
@@ -4655,7 +4736,7 @@ mod tests {
         app.nodes[0].workspaces.push(second_workspace);
         let mut second_agent = app.nodes[0].workspaces[0].sessions[0].clone();
         second_agent.address.instance_id = 8;
-        second_agent.provider = Provider::Claude;
+        second_agent.provider = provider("claude");
         app.nodes[0].workspaces[0].sessions.push(second_agent);
         app.layout.spaces = Rect::new(0, 0, 25, 4);
         app.layout.agents = Rect::new(0, 4, 25, 5);
@@ -5277,7 +5358,7 @@ mod tests {
         let mut app = fixture();
         let mut other = app.nodes[0].workspaces[0].sessions[0].clone();
         other.address.instance_id = 8;
-        other.provider = Provider::Claude;
+        other.provider = provider("claude");
         app.nodes[0].workspaces[0].sessions.push(other);
         let original = app.nodes[0].workspaces[0].sessions[0].address.clone();
         app.selected_agent = app
@@ -5351,6 +5432,7 @@ mod tests {
         let mut app = fixture();
         app.nodes.push(NodeView {
             node_id: "node-b".to_owned(),
+            incarnation_id: None,
             endpoint: r"\\.\pipe\node-b".to_owned(),
             connection: ConnectionState::Connected,
             controller_owned: true,
@@ -5438,7 +5520,7 @@ mod tests {
     fn agent_chip_activates_only_on_release_and_drag_preserves_the_active_surface() {
         let mut click_app = fixture();
         let first = click_app.tabs[0].address.clone();
-        let second = add_session(&mut click_app, 8, Provider::Claude);
+        let second = add_session(&mut click_app, 8, provider("claude"));
         let addresses = click_app.agent_addresses();
         let first_index = addresses.iter().position(|address| address == &first).unwrap();
         let second_index = addresses.iter().position(|address| address == &second).unwrap();
@@ -5457,7 +5539,7 @@ mod tests {
 
         let mut drag_app = fixture();
         let first = drag_app.tabs[0].address.clone();
-        let second = add_session(&mut drag_app, 8, Provider::Claude);
+        let second = add_session(&mut drag_app, 8, provider("claude"));
         let second_index = drag_app
             .agent_addresses()
             .iter()
@@ -5482,10 +5564,10 @@ mod tests {
     fn grid_reorders_duplicates_and_rejects_a_fifth_unique_pty() {
         let mut app = fixture();
         let first = app.tabs[0].address.clone();
-        let second = add_session(&mut app, 8, Provider::Claude);
-        let third = add_session(&mut app, 9, Provider::Kimi);
-        let fourth = add_session(&mut app, 10, Provider::Codex);
-        let fifth = add_session(&mut app, 11, Provider::Claude);
+        let second = add_session(&mut app, 8, provider("claude"));
+        let third = add_session(&mut app, 9, provider("kimi"));
+        let fourth = add_session(&mut app, 10, provider("codex"));
+        let fifth = add_session(&mut app, 11, provider("claude"));
 
         for address in [&first, &second, &third, &fourth] {
             assert!(app.move_address_to_grid(address.clone(), None));
@@ -5504,7 +5586,7 @@ mod tests {
     fn focused_grid_pane_routes_input_paste_and_terminal_geometry() {
         let mut app = fixture();
         let first = app.tabs[0].address.clone();
-        let second = add_session(&mut app, 8, Provider::Claude);
+        let second = add_session(&mut app, 8, provider("claude"));
         assert!(app.move_address_to_grid(first.clone(), None));
         assert!(app.move_address_to_grid(second.clone(), None));
         app.layout.grid_panes = vec![
@@ -5543,7 +5625,7 @@ mod tests {
     fn grid_rebinds_generation_and_keeps_nearest_pane_when_focused_one_disappears() {
         let mut app = fixture();
         let first = app.tabs[0].address.clone();
-        let second = add_session(&mut app, 8, Provider::Claude);
+        let second = add_session(&mut app, 8, provider("claude"));
         assert!(app.move_address_to_grid(first.clone(), None));
         assert!(app.move_address_to_grid(second.clone(), None));
         app.focus_grid_pane(0);
@@ -5613,9 +5695,9 @@ mod tests {
     fn grid_keyboard_navigation_respects_visual_preset_axes() {
         let mut app = fixture();
         let first = app.tabs[0].address.clone();
-        let second = add_session(&mut app, 8, Provider::Claude);
-        let third = add_session(&mut app, 9, Provider::Kimi);
-        let fourth = add_session(&mut app, 10, Provider::Codex);
+        let second = add_session(&mut app, 8, provider("claude"));
+        let third = add_session(&mut app, 9, provider("kimi"));
+        let fourth = add_session(&mut app, 10, provider("codex"));
         for address in [first, second, third, fourth] {
             app.move_address_to_grid(address, None);
         }
@@ -5712,7 +5794,7 @@ mod tests {
     fn wheel_scrolls_the_hovered_grid_pane_independently() {
         let mut app = fixture();
         let first = app.tabs[0].address.clone();
-        let second = add_session(&mut app, 8, Provider::Claude);
+        let second = add_session(&mut app, 8, provider("claude"));
         for session in &mut app.nodes[0].workspaces[0].sessions {
             session.terminal_scrollback =
                 (0..8).map(|line| format!("history-{line}").into_bytes()).collect();
@@ -5958,7 +6040,7 @@ mod tests {
         let mut app = fixture();
         app.apply_workspace_inspection("node-a".to_owned(), workspace_inspection());
         for instance in 8..13 {
-            add_session(&mut app, instance, Provider::Claude);
+            add_session(&mut app, instance, provider("claude"));
         }
         for index in 1..5 {
             let mut workspace = app.nodes[0].workspaces[0].clone();

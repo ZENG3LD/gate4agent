@@ -226,6 +226,22 @@ pub(crate) fn query_process_rows() -> Result<Vec<ProcessRow>, PtyProcessProbeErr
     query_process_rows_cim().or_else(|_| query_process_rows_native())
 }
 
+/// Return the process table used for ownership and termination decisions.
+///
+/// Windows CIM preserves command lines for foreground classification, but a
+/// newly spawned process can be absent from its first successful snapshot.
+/// Toolhelp is an immediate kernel snapshot and carries the PID, parent PID,
+/// executable name, and creation identity required by the tree reaper.
+#[cfg(windows)]
+pub(crate) fn query_process_tree_rows() -> Result<Vec<ProcessRow>, PtyProcessProbeError> {
+    query_process_rows_native()
+}
+
+#[cfg(unix)]
+pub(crate) fn query_process_tree_rows() -> Result<Vec<ProcessRow>, PtyProcessProbeError> {
+    query_process_rows()
+}
+
 #[cfg(windows)]
 fn query_process_rows_cim() -> Result<Vec<ProcessRow>, PtyProcessProbeError> {
     const SCRIPT: &str = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance -ClassName Win32_Process -Property CommandLine,CreationDate,Name,ParentProcessId,ProcessId | Select-Object CommandLine,Name,ParentProcessId,ProcessId,@{Name='StartedAt';Expression={$_.CreationDate.ToUniversalTime().Ticks}} | ConvertTo-Json -Compress";

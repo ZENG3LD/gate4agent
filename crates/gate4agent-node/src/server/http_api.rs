@@ -319,7 +319,10 @@ async fn write_response(stream: &mut TcpStream, response: Response) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{NodeId, WorkspaceId};
+    use crate::protocol::{
+        AgentId, NodeId, ProviderRuntimeContractId, ProviderRuntimeStatus,
+        ProviderRuntimeStatuses, ProviderRuntimeVersion, WorkspaceId,
+    };
     use crate::{NodeServer, NodeServerConfig, WorkspaceConfig};
     use std::path::PathBuf;
 
@@ -334,6 +337,45 @@ mod tests {
         )
         .unwrap();
         NodeServer::new(config).unwrap()
+    }
+
+    fn node_server_with_verified_runtime_status() -> NodeServer {
+        let mut server = node_server();
+        Arc::get_mut(&mut server.shared)
+            .expect("the test server has one shared-state owner")
+            .provider_runtime_statuses = ProviderRuntimeStatuses::new([
+                ProviderRuntimeStatus::verified_semantic(
+                    AgentId::new("codex").unwrap(),
+                    ProviderRuntimeVersion::new("9.8.7").unwrap(),
+                    ProviderRuntimeContractId::new("codex.test.9.8.7").unwrap(),
+                ),
+            ])
+            .unwrap();
+        server
+    }
+
+    #[test]
+    fn authorized_status_exposes_only_normalized_version_and_contract_id() {
+        let server = node_server_with_verified_runtime_status();
+        let encoded = serde_json::to_string(&status_body(&server.shared)).unwrap();
+        assert!(encoded.contains("\"version\":\"9.8.7\""));
+        assert!(encoded.contains("\"contract_id\":\"codex.test.9.8.7\""));
+        for forbidden in [
+            "launcher", "stdout", "stderr", "fallback", "reason", "arguments", "environment",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked field {forbidden}");
+        }
+    }
+
+    #[test]
+    fn public_health_does_not_expose_provider_runtime_details() {
+        let server = node_server_with_verified_runtime_status();
+        for body in [health_body(&server.shared), ready_body(&server.shared)] {
+            let encoded = serde_json::to_string(&body).unwrap();
+            assert!(!encoded.contains("provider_runtime"));
+            assert!(!encoded.contains("9.8.7"));
+            assert!(!encoded.contains("codex.test.9.8.7"));
+        }
     }
 
     #[test]

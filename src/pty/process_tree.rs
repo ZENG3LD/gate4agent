@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::os_process::{
-    collect_descendants, query_process_rows, run_bounded, ProcessRow, PtyProcessProbeError,
+    collect_descendants, query_process_tree_rows, run_bounded, ProcessRow, PtyProcessProbeError,
 };
 
 pub const PTY_DESCENDANT_GRACE: Duration = Duration::from_secs(2);
@@ -107,7 +107,7 @@ pub(crate) fn terminate_process_tree(
 fn capture_snapshot(root_pid: u32) -> Result<Option<DescendantSnapshot>, PtyProcessProbeError> {
     #[cfg(unix)]
     let captured_at = chrono::Local::now().naive_local();
-    let rows = query_process_rows()?;
+    let rows = query_process_tree_rows()?;
     let Some(root) = rows.iter().find(|row| row.pid == root_pid).cloned() else {
         return Ok(None);
     };
@@ -145,7 +145,7 @@ fn wait_for_root_ownership_end(
 }
 
 fn root_ownership_ended(root_pid: u32, snapshot: Option<&DescendantSnapshot>) -> bool {
-    let Ok(rows) = query_process_rows() else {
+    let Ok(rows) = query_process_tree_rows() else {
         return false;
     };
     let mut matches = rows.iter().filter(|row| row.pid == root_pid);
@@ -167,7 +167,7 @@ fn same_process_identity(expected: &ProcessRow, current: &ProcessRow) -> bool {
 
 #[cfg(windows)]
 fn force_identity_matched_root(snapshot: &DescendantSnapshot) -> bool {
-    let Ok(rows) = query_process_rows() else {
+    let Ok(rows) = query_process_tree_rows() else {
         return false;
     };
     let mut matches = rows.iter().filter(|row| row.pid == snapshot.root.pid);
@@ -186,7 +186,7 @@ fn force_identity_matched_root(snapshot: &DescendantSnapshot) -> bool {
 
 #[cfg(unix)]
 fn force_identity_matched_root(snapshot: &DescendantSnapshot) -> bool {
-    let Ok(rows) = query_process_rows() else {
+    let Ok(rows) = query_process_tree_rows() else {
         return false;
     };
     let matches: Vec<_> = rows
@@ -221,7 +221,7 @@ fn force_identity_matched_survivors(snapshot: &DescendantSnapshot) -> usize {
         return 0;
     }
     thread::sleep(PTY_DESCENDANT_GRACE);
-    let Ok(rows) = query_process_rows() else {
+    let Ok(rows) = query_process_tree_rows() else {
         return 0;
     };
     let targets = identity_matched_survivors(snapshot, &rows, true);
@@ -311,7 +311,7 @@ fn signal_posix(signal: &str, pids: &[u32]) -> usize {
 
 #[cfg(windows)]
 fn force_windows_identity_matched(snapshot: &DescendantSnapshot) -> usize {
-    let Ok(rows) = query_process_rows() else {
+    let Ok(rows) = query_process_tree_rows() else {
         return 0;
     };
     let targets = identity_matched_survivors(snapshot, &rows, false);

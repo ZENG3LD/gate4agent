@@ -1,6 +1,6 @@
 //! Bounded wire contract for the local Gate4Agent node.
 
-pub use gate4agent_types::{AdapterFamily, AdapterId};
+pub use gate4agent_types::{AdapterFamily, AdapterId, AgentId};
 use gate4agent_types::{
     AgentInstanceId, ControlEvent, ProviderSessionIdentity, SessionGeneration, SessionSnapshot,
     TerminalControl, TerminalSize,
@@ -21,16 +21,24 @@ use tokio::time::{timeout, Duration};
 pub const NODE_PROTOCOL_VERSION: u16 = 8;
 pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
+pub const NODE_STATE_SCHEMA_V3: u16 = 3;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
 pub const NODE_WORKSPACE_FILE_READ_CAPABILITY: &str = "workspace-file-read-v1";
 pub const NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str = "provider-contract-manifest-v1";
+pub const NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str = "provider-runtime-status-v1";
+pub const NODE_PROVIDER_ID_OPEN_CAPABILITY: &str = "provider-id.open-v1";
+pub const NODE_LEGACY_PROVIDER_IDS: [&str; 3] = ["claude", "codex", "kimi"];
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
+pub const MAX_PROVIDER_RUNTIME_VERSION_BYTES: usize = MAX_COMPATIBILITY_IDENTIFIER_BYTES;
+pub const MAX_PROVIDER_RUNTIME_CONTRACT_ID_BYTES: usize = MAX_COMPATIBILITY_IDENTIFIER_BYTES;
 pub const MAX_PROVIDER_CONTRACT_REVISION_BYTES: usize = 128;
 pub const MAX_ADAPTER_CONTRACT_REVISION_BYTES: usize = 128;
-pub const MAX_PROVIDER_CONTRACTS: usize = 3;
+pub const MAX_PROVIDER_IDENTITIES: usize = 16;
+pub const MAX_PROVIDER_CONTRACTS: usize = MAX_PROVIDER_IDENTITIES;
+pub const MAX_PROVIDER_RUNTIME_STATUSES: usize = MAX_PROVIDER_IDENTITIES;
 pub const MAX_PROVIDER_ADAPTER_CONTRACTS: usize = 32;
 pub const NODE_INCARNATION_ID_BYTES: usize = 16;
 pub const MAX_NODE_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -47,6 +55,11 @@ pub const NODE_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_CONTROLLER_LEASE_MS: u64 = 60_000;
 pub const MIN_CONTROLLER_LEASE_MS: u64 = 1_000;
 pub const DEFAULT_CONTROLLER_LEASE_MS: u64 = 15_000;
+
+pub fn provider_id_is_legacy(provider: &AgentId) -> bool {
+    NODE_LEGACY_PROVIDER_IDS.contains(&provider.as_str())
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClientRole {
@@ -56,20 +69,242 @@ pub enum ClientRole {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum AgentProvider {
-    Claude,
-    Codex,
-    Kimi,
+pub enum ProviderRuntimeMode {
+    Unavailable,
+    RawPassthrough,
+    VerifiedSemantic,
 }
 
-impl AgentProvider {
-    pub fn agent_id(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Kimi => "kimi",
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderRuntimeVersion(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderRuntimeContractId(String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderRuntimeStatus {
+    provider: AgentId,
+    mode: ProviderRuntimeMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<ProviderRuntimeVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contract_id: Option<ProviderRuntimeContractId>,
+}
+
+impl ProviderRuntimeStatus {
+    pub fn unavailable(provider: AgentId) -> Self {
+        Self {
+            provider,
+            mode: ProviderRuntimeMode::Unavailable,
+            version: None,
+            contract_id: None,
         }
     }
+
+    pub fn raw_passthrough(
+        provider: AgentId,
+        version: Option<ProviderRuntimeVersion>,
+    ) -> Self {
+        Self {
+            provider,
+            mode: ProviderRuntimeMode::RawPassthrough,
+            version,
+            contract_id: None,
+        }
+    }
+
+    pub fn verified_semantic(
+        provider: AgentId,
+        version: ProviderRuntimeVersion,
+        contract_id: ProviderRuntimeContractId,
+    ) -> Self {
+        Self {
+            provider,
+            mode: ProviderRuntimeMode::VerifiedSemantic,
+            version: Some(version),
+            contract_id: Some(contract_id),
+        }
+    }
+
+    pub fn provider(&self) -> &AgentId {
+        &self.provider
+    }
+
+    pub const fn mode(&self) -> ProviderRuntimeMode {
+        self.mode
+    }
+
+    pub fn version(&self) -> Option<&ProviderRuntimeVersion> {
+        self.version.as_ref()
+    }
+
+    pub fn contract_id(&self) -> Option<&ProviderRuntimeContractId> {
+        self.contract_id.as_ref()
+    }
+
+    fn from_wire(
+        provider: AgentId,
+        mode: ProviderRuntimeMode,
+        version: Option<ProviderRuntimeVersion>,
+        contract_id: Option<ProviderRuntimeContractId>,
+    ) -> Result<Self, ProviderRuntimeStatusError> {
+        match (mode, version, contract_id) {
+            (ProviderRuntimeMode::Unavailable, None, None) => Ok(Self::unavailable(provider)),
+            (ProviderRuntimeMode::RawPassthrough, version, None) => {
+                Ok(Self::raw_passthrough(provider, version))
+            }
+            (ProviderRuntimeMode::VerifiedSemantic, Some(version), Some(contract_id)) => {
+                Ok(Self::verified_semantic(provider, version, contract_id))
+            }
+            (ProviderRuntimeMode::Unavailable, _, _) => {
+                Err(ProviderRuntimeStatusError::UnavailableHasMetadata { provider })
+            }
+            (ProviderRuntimeMode::RawPassthrough, _, Some(_)) => {
+                Err(ProviderRuntimeStatusError::RawPassthroughHasContract { provider })
+            }
+            (ProviderRuntimeMode::VerifiedSemantic, _, _) => {
+                Err(ProviderRuntimeStatusError::VerifiedSemanticMissingMetadata { provider })
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderRuntimeStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireStatus {
+            provider: AgentId,
+            mode: ProviderRuntimeMode,
+            #[serde(default)]
+            version: Option<ProviderRuntimeVersion>,
+            #[serde(default)]
+            contract_id: Option<ProviderRuntimeContractId>,
+        }
+
+        let wire = WireStatus::deserialize(deserializer)?;
+        Self::from_wire(wire.provider, wire.mode, wire.version, wire.contract_id)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ProviderRuntimeStatuses(Vec<ProviderRuntimeStatus>);
+
+impl ProviderRuntimeStatuses {
+    pub fn new(
+        statuses: impl IntoIterator<Item = ProviderRuntimeStatus>,
+    ) -> Result<Self, ProviderRuntimeStatusError> {
+        let mut bounded = Vec::with_capacity(MAX_PROVIDER_RUNTIME_STATUSES);
+        for status in statuses {
+            if bounded.len() == MAX_PROVIDER_RUNTIME_STATUSES {
+                return Err(ProviderRuntimeStatusError::TooMany {
+                    max: MAX_PROVIDER_RUNTIME_STATUSES,
+                });
+            }
+            if bounded
+                .iter()
+                .any(|existing: &ProviderRuntimeStatus| existing.provider == status.provider)
+            {
+                return Err(ProviderRuntimeStatusError::DuplicateProvider {
+                    provider: status.provider.clone(),
+                });
+            }
+            bounded.push(status);
+        }
+        bounded.sort_by(|left, right| left.provider.cmp(&right.provider));
+        Ok(Self(bounded))
+    }
+
+    pub fn as_slice(&self) -> &[ProviderRuntimeStatus] {
+        &self.0
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &ProviderRuntimeStatus> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn retain(
+        &mut self,
+        mut predicate: impl FnMut(&ProviderRuntimeStatus) -> bool,
+    ) {
+        self.0.retain(|status| predicate(status));
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderRuntimeStatuses {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StatusesVisitor;
+
+        impl<'de> Visitor<'de> for StatusesVisitor {
+            type Value = ProviderRuntimeStatuses;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "at most {MAX_PROVIDER_RUNTIME_STATUSES} unique provider runtime statuses",
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut statuses = Vec::with_capacity(MAX_PROVIDER_RUNTIME_STATUSES);
+                while let Some(status) = sequence.next_element::<ProviderRuntimeStatus>()? {
+                    if statuses.len() == MAX_PROVIDER_RUNTIME_STATUSES {
+                        return Err(serde::de::Error::custom(
+                            ProviderRuntimeStatusError::TooMany {
+                                max: MAX_PROVIDER_RUNTIME_STATUSES,
+                            },
+                        ));
+                    }
+                    if statuses.iter().any(|existing: &ProviderRuntimeStatus| {
+                        existing.provider == status.provider
+                    }) {
+                        return Err(serde::de::Error::custom(
+                            ProviderRuntimeStatusError::DuplicateProvider {
+                                provider: status.provider.clone(),
+                            },
+                        ));
+                    }
+                    statuses.push(status);
+                }
+                statuses.sort_by(|left, right| left.provider.cmp(&right.provider));
+                Ok(ProviderRuntimeStatuses(statuses))
+            }
+        }
+
+        deserializer.deserialize_seq(StatusesVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ProviderRuntimeStatusError {
+    #[error("provider runtime status exceeds the {max}-provider limit")]
+    TooMany { max: usize },
+    #[error("provider runtime status contains duplicate provider {provider:?}")]
+    DuplicateProvider { provider: AgentId },
+    #[error("unavailable provider {provider:?} cannot include version or contract metadata")]
+    UnavailableHasMetadata { provider: AgentId },
+    #[error("raw passthrough provider {provider:?} cannot include a semantic contract")]
+    RawPassthroughHasContract { provider: AgentId },
+    #[error("verified semantic provider {provider:?} requires both version and contract metadata")]
+    VerifiedSemanticMissingMetadata { provider: AgentId },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -422,6 +657,83 @@ macro_rules! compatibility_identifier_impl {
 compatibility_identifier_impl!(CapabilityId, "capability");
 compatibility_identifier_impl!(OperatingSystemId, "operating system");
 compatibility_identifier_impl!(ArchitectureId, "architecture");
+compatibility_identifier_impl!(ProviderRuntimeContractId, "provider runtime contract");
+
+impl ProviderRuntimeVersion {
+    pub fn new(value: impl Into<String>) -> Result<Self, CompatibilityIdentifierError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(CompatibilityIdentifierError::Empty {
+                label: "provider runtime version",
+            });
+        }
+        if value.len() > MAX_PROVIDER_RUNTIME_VERSION_BYTES {
+            return Err(CompatibilityIdentifierError::TooLong {
+                label: "provider runtime version",
+                len: value.len(),
+                max: MAX_PROVIDER_RUNTIME_VERSION_BYTES,
+            });
+        }
+        let mut components = value.split('.');
+        let valid_component = |component: &str| {
+            !component.is_empty()
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && (component.len() == 1 || !component.starts_with('0'))
+                && component.parse::<u64>().is_ok()
+        };
+        if !components.by_ref().take(3).all(valid_component) || components.next().is_some() {
+            return Err(CompatibilityIdentifierError::InvalidCharacters {
+                label: "provider runtime version",
+                value,
+            });
+        }
+        let component_count = value.bytes().filter(|byte| *byte == b'.').count() + 1;
+        if component_count != 3 {
+            return Err(CompatibilityIdentifierError::InvalidCharacters {
+                label: "provider runtime version",
+                value,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderRuntimeVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderRuntimeVersion {
+    type Err = CompatibilityIdentifierError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for ProviderRuntimeVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderRuntimeVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl ProviderContractRevision {
     pub fn new(value: impl Into<String>) -> Result<Self, CompatibilityIdentifierError> {
@@ -1101,13 +1413,13 @@ pub struct StateSchemaSupport {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderContractSupport {
-    pub provider: AgentProvider,
+    pub provider: AgentId,
     pub revision: ProviderContractRevision,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderAdapterContractSupport {
-    pub provider: AgentProvider,
+    pub provider: AgentId,
     pub family: AdapterFamily,
     pub adapter_id: AdapterId,
     pub revision: AdapterContractRevision,
@@ -1120,12 +1432,12 @@ pub enum ProviderContractManifestError {
     #[error("provider adapter contract count {len} exceeds the {max}-entry limit")]
     TooManyAdapterContracts { len: usize, max: usize },
     #[error("provider contract manifest contains duplicate provider {provider:?}")]
-    DuplicateProvider { provider: AgentProvider },
+    DuplicateProvider { provider: AgentId },
     #[error("provider adapter contract for {provider:?} has no provider contract")]
-    UnlinkedAdapterProvider { provider: AgentProvider },
+    UnlinkedAdapterProvider { provider: AgentId },
     #[error("provider adapter contract manifest contains duplicate family {family:?} for {provider:?}")]
     DuplicateProviderFamily {
-        provider: AgentProvider,
+        provider: AgentId,
         family: AdapterFamily,
     },
 }
@@ -1152,7 +1464,7 @@ pub fn validate_provider_contract_manifest(
             .any(|existing| existing.provider == contract.provider)
         {
             return Err(ProviderContractManifestError::DuplicateProvider {
-                provider: contract.provider,
+                provider: contract.provider.clone(),
             });
         }
     }
@@ -1162,14 +1474,14 @@ pub fn validate_provider_contract_manifest(
             .any(|provider| provider.provider == contract.provider)
         {
             return Err(ProviderContractManifestError::UnlinkedAdapterProvider {
-                provider: contract.provider,
+                provider: contract.provider.clone(),
             });
         }
         if provider_adapter_contracts[..index].iter().any(|existing| {
             existing.provider == contract.provider && existing.family == contract.family
         }) {
             return Err(ProviderContractManifestError::DuplicateProviderFamily {
-                provider: contract.provider,
+                provider: contract.provider.clone(),
                 family: contract.family,
             });
         }
@@ -1206,6 +1518,8 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_COMPATIBILITY_METADATA_CAPABILITY,
             NODE_OPAQUE_UNIX_PATH_CAPABILITY,
             NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
+            NODE_PROVIDER_ID_OPEN_CAPABILITY,
+            NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
             NODE_REPOSITORY_PATH_CAPABILITY,
             NODE_WORKSPACE_FILE_READ_CAPABILITY,
         ]
@@ -1215,7 +1529,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V2,
+                maximum: NODE_STATE_SCHEMA_V3,
             },
         }),
     }
@@ -1428,7 +1742,7 @@ pub enum ManagedSessionState {
 pub struct ManagedSessionRecord {
     pub record_id: SessionRecordId,
     pub display_name: String,
-    pub provider: AgentProvider,
+    pub provider: AgentId,
     pub mode: SessionMode,
     pub state: ManagedSessionState,
     pub workspace_id: WorkspaceId,
@@ -1579,7 +1893,9 @@ impl<'de> Deserialize<'de> for WorkspaceFileContent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeSnapshot {
     pub node_id: NodeId,
-    pub enabled_providers: Vec<AgentProvider>,
+    pub enabled_providers: Vec<AgentId>,
+    #[serde(default, skip_serializing_if = "ProviderRuntimeStatuses::is_empty")]
+    pub provider_runtime_statuses: ProviderRuntimeStatuses,
     pub workspaces: Vec<WorkspaceSnapshot>,
     #[serde(default)]
     pub session_records: Vec<ManagedSessionRecord>,
@@ -1695,7 +2011,7 @@ pub enum NodeRequest {
     },
     Spawn {
         workspace_id: WorkspaceId,
-        provider: AgentProvider,
+        provider: AgentId,
         mode: SessionMode,
         terminal_size: TerminalSize,
         initial_prompt: Option<String>,
@@ -2001,6 +2317,10 @@ pub enum FrameError {
 mod tests {
     use super::*;
 
+    fn agent(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
     fn host_path(value: &str) -> OpaqueHostPath {
         OpaqueHostPath::utf8(value.to_owned()).unwrap()
     }
@@ -2029,11 +2349,11 @@ mod tests {
                 versions: ProtocolRange::new(3, 5).unwrap(),
             },
             provider_contracts: vec![ProviderContractSupport {
-                provider: AgentProvider::Codex,
+                provider: agent("codex"),
                 revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
             }],
             provider_adapter_contracts: vec![ProviderAdapterContractSupport {
-                provider: AgentProvider::Codex,
+                provider: agent("codex"),
                 family: AdapterFamily::PtySemantic,
                 adapter_id: AdapterId::new("codex-cli").unwrap(),
                 revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
@@ -2064,6 +2384,80 @@ mod tests {
     fn legacy_hello_omits_compatibility_instead_of_synthesizing_a_selection() {
         let hello = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
         assert_eq!(hello.compatibility, None);
+    }
+
+    #[test]
+    fn provider_ids_preserve_legacy_json_and_accept_open_values() {
+        for (provider, expected) in [
+            (agent("claude"), r#""claude""#),
+            (agent("codex"), r#""codex""#),
+            (agent("kimi"), r#""kimi""#),
+        ] {
+            assert!(provider_id_is_legacy(&provider));
+            assert_eq!(serde_json::to_string(&provider).unwrap(), expected);
+            assert_eq!(serde_json::from_str::<AgentId>(expected).unwrap(), provider);
+        }
+
+        let open = agent("qwen-3");
+        assert!(!provider_id_is_legacy(&open));
+        assert_eq!(serde_json::to_string(&open).unwrap(), r#""qwen-3""#);
+    }
+
+    #[test]
+    fn provider_runtime_wire_is_exact_bounded_and_consistent() {
+        let statuses = ProviderRuntimeStatuses::new([
+            ProviderRuntimeStatus::raw_passthrough(
+                agent("claude"),
+                Some(ProviderRuntimeVersion::new("2.1.220").unwrap()),
+            ),
+            ProviderRuntimeStatus::verified_semantic(
+                agent("codex"),
+                ProviderRuntimeVersion::new("0.147.0").unwrap(),
+                ProviderRuntimeContractId::new("codex.windows-x86_64.0.147.0").unwrap(),
+            ),
+            ProviderRuntimeStatus::unavailable(agent("kimi")),
+        ])
+        .unwrap();
+        let encoded = serde_json::to_string(&statuses).unwrap();
+        assert_eq!(
+            encoded,
+            r#"[{"provider":"claude","mode":"raw-passthrough","version":"2.1.220"},{"provider":"codex","mode":"verified-semantic","version":"0.147.0","contract_id":"codex.windows-x86_64.0.147.0"},{"provider":"kimi","mode":"unavailable"}]"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderRuntimeStatuses>(&encoded).unwrap(),
+            statuses,
+        );
+
+        let duplicate = r#"[{"provider":"codex","mode":"unavailable"},{"provider":"codex","mode":"unavailable"}]"#;
+        assert!(serde_json::from_str::<ProviderRuntimeStatuses>(duplicate).is_err());
+        let too_many = (0..=MAX_PROVIDER_RUNTIME_STATUSES)
+            .map(|index| ProviderRuntimeStatus::unavailable(agent(&format!("provider-{index}"))))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            ProviderRuntimeStatuses::new(too_many),
+            Err(ProviderRuntimeStatusError::TooMany {
+                max: MAX_PROVIDER_RUNTIME_STATUSES,
+            }),
+        ));
+        let inconsistent = r#"[{"provider":"codex","mode":"verified-semantic","version":"0.147.0"}]"#;
+        assert!(serde_json::from_str::<ProviderRuntimeStatuses>(inconsistent).is_err());
+        for arbitrary in ["secret-token", "raw.stdout", "1.2", "01.2.3", "1.2.3.4"] {
+            assert!(ProviderRuntimeVersion::new(arbitrary).is_err(), "accepted {arbitrary}");
+        }
+        let overflow = format!(
+            r#"[{{"provider":"codex","mode":"raw-passthrough","version":"{}"}}]"#,
+            "1".repeat(MAX_PROVIDER_RUNTIME_VERSION_BYTES + 1),
+        );
+        assert!(serde_json::from_str::<ProviderRuntimeStatuses>(&overflow).is_err());
+    }
+
+    #[test]
+    fn legacy_node_snapshot_defaults_runtime_status_to_unreported() {
+        let legacy = r#"{"node_id":"legacy-node","enabled_providers":["codex"],"workspaces":[]}"#;
+        let snapshot = serde_json::from_str::<NodeSnapshot>(legacy).unwrap();
+        assert!(snapshot.provider_runtime_statuses.is_empty());
+        let reencoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!reencoded.contains("provider_runtime"));
     }
 
     #[test]
@@ -2164,6 +2558,33 @@ mod tests {
     }
 
     #[test]
+    fn open_provider_capability_and_manifest_are_auth_bound_exactly() {
+        let manifest_capability =
+            CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
+        let open_capability = CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap();
+        let mut support = portable_node_support();
+        support.capabilities = vec![manifest_capability.clone(), open_capability.clone()];
+        support.provider_contracts = vec![ProviderContractSupport {
+            provider: agent("qwen"),
+            revision: ProviderContractRevision::new("qwen.2026-08").unwrap(),
+        }];
+        support.provider_adapter_contracts.clear();
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![manifest_capability, open_capability],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap();
+        let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":8,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"qwen","revision":"qwen.2026-08"}]}}"#,
+        );
+    }
+
+    #[test]
     fn n_minus_one_selected_json_round_trips_without_manifest_fields() {
         let json = r#"{"protocol_version":8,"capabilities":["compatibility.metadata"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":1,"provider_contracts":[]}"#;
         let selected: NegotiatedNodeCompatibility = serde_json::from_str(json).unwrap();
@@ -2175,18 +2596,21 @@ mod tests {
     #[test]
     fn provider_contract_manifest_rejects_bounds_duplicates_and_unlinked_entries() {
         let provider = ProviderContractSupport {
-            provider: AgentProvider::Codex,
+            provider: agent("codex"),
             revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
         };
         let adapter = ProviderAdapterContractSupport {
-            provider: AgentProvider::Codex,
+            provider: agent("codex"),
             family: AdapterFamily::PtySemantic,
             adapter_id: AdapterId::new("codex-cli").unwrap(),
             revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
         };
         assert!(matches!(
-            validate_provider_contract_manifest(&vec![provider.clone(); 4], &[]),
-            Err(ProviderContractManifestError::TooManyProviders { len: 4, .. }),
+            validate_provider_contract_manifest(
+                &vec![provider.clone(); MAX_PROVIDER_CONTRACTS + 1],
+                &[],
+            ),
+            Err(ProviderContractManifestError::TooManyProviders { .. }),
         ));
         assert!(matches!(
             validate_provider_contract_manifest(
@@ -2204,17 +2628,15 @@ mod tests {
         ));
         assert!(matches!(
             validate_provider_contract_manifest(&[provider.clone(), provider.clone()], &[]),
-            Err(ProviderContractManifestError::DuplicateProvider {
-                provider: AgentProvider::Codex,
-            }),
+            Err(ProviderContractManifestError::DuplicateProvider { provider })
+                if provider == agent("codex"),
         ));
         let mut unlinked = adapter.clone();
-        unlinked.provider = AgentProvider::Claude;
+        unlinked.provider = agent("claude");
         assert!(matches!(
             validate_provider_contract_manifest(&[provider.clone()], &[unlinked]),
-            Err(ProviderContractManifestError::UnlinkedAdapterProvider {
-                provider: AgentProvider::Claude,
-            }),
+            Err(ProviderContractManifestError::UnlinkedAdapterProvider { provider })
+                if provider == agent("claude"),
         ));
         let mut duplicate_family = adapter.clone();
         duplicate_family.adapter_id = AdapterId::new("codex-cli-next").unwrap();
@@ -2224,9 +2646,9 @@ mod tests {
                 &[adapter.clone(), duplicate_family],
             ),
             Err(ProviderContractManifestError::DuplicateProviderFamily {
-                provider: AgentProvider::Codex,
+                provider,
                 family: AdapterFamily::PtySemantic,
-            }),
+            }) if provider == agent("codex"),
         ));
         let mut shared_adapter_id = adapter.clone();
         shared_adapter_id.family = AdapterFamily::History;
@@ -2240,9 +2662,9 @@ mod tests {
     #[test]
     fn provider_contract_manifest_negotiates_all_current_provider_family_tuples() {
         let providers = [
-            (AgentProvider::Claude, "claude-code", "claude.2026-08"),
-            (AgentProvider::Codex, "codex-cli", "codex.2026-08"),
-            (AgentProvider::Kimi, "kimi-cli", "kimi.2026-08"),
+            (agent("claude"), "claude-code", "claude.2026-08"),
+            (agent("codex"), "codex-cli", "codex.2026-08"),
+            (agent("kimi"), "kimi-cli", "kimi.2026-08"),
         ];
         let families = [
             AdapterFamily::PtySemantic,
@@ -2259,7 +2681,7 @@ mod tests {
         let provider_contracts = providers
             .iter()
             .map(|(provider, _, revision)| ProviderContractSupport {
-                provider: *provider,
+                provider: provider.clone(),
                 revision: ProviderContractRevision::new(*revision).unwrap(),
             })
             .collect::<Vec<_>>();
@@ -2269,14 +2691,14 @@ mod tests {
                 families
                     .iter()
                     .map(move |family| ProviderAdapterContractSupport {
-                        provider: *provider,
+                        provider: provider.clone(),
                         family: *family,
                         adapter_id: AdapterId::new(*adapter_id).unwrap(),
                         revision: AdapterContractRevision::new("adapter-contract-v1").unwrap(),
                     })
             })
             .collect::<Vec<_>>();
-        assert_eq!(provider_contracts.len(), MAX_PROVIDER_CONTRACTS);
+        assert_eq!(provider_contracts.len(), 3);
         assert_eq!(provider_adapter_contracts.len(), 30);
         assert!(provider_adapter_contracts.len() <= MAX_PROVIDER_ADAPTER_CONTRACTS);
 
@@ -2296,8 +2718,43 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(selected.provider_contracts.len(), MAX_PROVIDER_CONTRACTS);
+        assert_eq!(selected.provider_contracts.len(), 3);
         assert_eq!(selected.provider_adapter_contracts.len(), 30);
+    }
+
+    #[test]
+    fn sixteen_provider_manifest_headroom_fits_the_authenticated_handshake() {
+        assert_eq!(MAX_PROVIDER_IDENTITIES, 16);
+        let providers = (0..MAX_PROVIDER_IDENTITIES)
+            .map(|index| agent(&format!("provider-{index}")))
+            .collect::<Vec<_>>();
+        let mut support = portable_node_support();
+        support.capabilities.extend([
+            CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
+            CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+        ]);
+        support.provider_contracts = providers
+            .iter()
+            .map(|provider| ProviderContractSupport {
+                provider: provider.clone(),
+                revision: ProviderContractRevision::new(format!(
+                    "{}.2026-08",
+                    provider.as_str(),
+                ))
+                .unwrap(),
+            })
+            .collect();
+        support.provider_adapter_contracts = providers
+            .iter()
+            .map(|provider| ProviderAdapterContractSupport {
+                provider: provider.clone(),
+                family: AdapterFamily::PtySemantic,
+                adapter_id: AdapterId::new(format!("{}-cli", provider.as_str())).unwrap(),
+                revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
+            })
+            .collect();
+
+        validate_node_negotiated_handshake_capacity(&support, NODE_PROTOCOL_VERSION).unwrap();
     }
 
     #[test]
@@ -2801,6 +3258,7 @@ mod tests {
             snapshot: NodeSnapshot {
                 node_id: NodeId::new("fixture-node").unwrap(),
                 enabled_providers: Vec::new(),
+                provider_runtime_statuses: ProviderRuntimeStatuses::default(),
                 workspaces: Vec::new(),
                 session_records: Vec::new(),
             },
@@ -3106,7 +3564,7 @@ mod tests {
         let record = ManagedSessionRecord {
             record_id: SessionRecordId::new("session-001").unwrap(),
             display_name: "release shepherd".to_owned(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: WorkspaceId::new("primary").unwrap(),

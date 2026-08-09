@@ -19,6 +19,84 @@ use crate::pty::os_process::{
 
 pub const PTY_OUTPUT_HIGH_WATER_BYTES: usize = 256 * 1024;
 pub const PTY_OUTPUT_LOW_WATER_BYTES: usize = 32 * 1024;
+const PTY_TERM: &str = "xterm-256color";
+
+#[cfg(windows)]
+const PTY_CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "SystemDrive",
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "PATHEXT",
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "PSModulePath",
+];
+
+#[cfg(not(windows))]
+const PTY_CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+fn is_allowed_pty_child_environment_key(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        PTY_CHILD_ENV_ALLOWLIST
+            .iter()
+            .any(|allowed| key.eq_ignore_ascii_case(allowed))
+    }
+    #[cfg(not(windows))]
+    {
+        PTY_CHILD_ENV_ALLOWLIST.contains(&key) || key.starts_with("LC_")
+    }
+}
+
+/// Start each PTY child from a small machine-local runtime environment.
+/// Provider credentials, control-plane tokens, SSH agents, proxy credentials,
+/// and unrelated daemon state are not inherited implicitly. A launch plan may
+/// still set or remove any variable explicitly after this baseline is built.
+fn isolate_pty_child_environment_from<I, K, V>(command: &mut CommandBuilder, inherited: I)
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    command.env_clear();
+    for (key, value) in inherited {
+        if is_allowed_pty_child_environment_key(key.as_ref()) {
+            command.env(key, value);
+        }
+    }
+    command.env("TERM", PTY_TERM);
+}
+
+fn isolate_pty_child_environment(command: &mut CommandBuilder) {
+    isolate_pty_child_environment_from(command, std::env::vars_os());
+}
 
 /// Module-internal PTY errors. Converted to `AgentError` at the `PtySession` boundary.
 #[derive(Error, Debug)]
@@ -320,9 +398,7 @@ impl PtyWrapper {
 
         cmd.cwd(validated_windows_child_working_directory(working_dir)?);
 
-        // Note: CommandBuilder::new() already inherits ALL current process
-        // environment variables via get_base_env(), so we don't need to
-        // manually pass through HOME, PATH, APPDATA, etc.
+        isolate_pty_child_environment(&mut cmd);
 
         // Add custom env vars (these override inherited values if keys match)
         for (key, value) in env_vars {
@@ -359,6 +435,7 @@ impl PtyWrapper {
         };
 
         command.cwd(validated_windows_child_working_directory(&plan.working_dir)?);
+        isolate_pty_child_environment(&mut command);
         for mutation in &plan.env {
             if let Some(value) = &mutation.value {
                 command.env(&mutation.key, value);
@@ -632,6 +709,365 @@ fn is_safe_windows_wrapper_argument(argument: &OsStr) -> bool {
 mod tests {
     use super::*;
 
+    const CHILD_ENV_BOOTSTRAP_KEY: &str = "GATE4AGENT_PTY_CHILD_ENV_BOOTSTRAP";
+    const CHILD_ENV_BOOTSTRAP_REPORT_KEY: &str = "GATE4AGENT_PTY_CHILD_ENV_BOOTSTRAP_REPORT";
+    const CHILD_ENV_REPORT_KEY: &str = "GATE4AGENT_PTY_CHILD_ENV_REPORT";
+    const CHILD_ENV_EXPECTED_HOME_KEY: &str = "GATE4AGENT_PTY_CHILD_ENV_EXPECTED_HOME";
+    const CHILD_ENV_EXPECTED_CONFIG_KEY: &str = "GATE4AGENT_PTY_CHILD_ENV_EXPECTED_CONFIG";
+    const CHILD_ENV_EXPLICIT_KEY: &str = "GATE4AGENT_PTY_CHILD_ENV_EXPLICIT";
+    const CHILD_ENV_SECRET_KEY: &str = "GATE4AGENT_PTY_CHILD_ENV_FAKE_JWT";
+
+    struct PtyChildEnvTestRoot(PathBuf);
+
+    impl Drop for PtyChildEnvTestRoot {
+        fn drop(&mut self) {
+            if self
+                .0
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("gate4agent-pty-child-env-"))
+            {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn child_home_key() -> &'static str {
+        "USERPROFILE"
+    }
+
+    #[cfg(not(windows))]
+    fn child_home_key() -> &'static str {
+        "HOME"
+    }
+
+    #[cfg(windows)]
+    fn child_config_key() -> &'static str {
+        "APPDATA"
+    }
+
+    #[cfg(not(windows))]
+    fn child_config_key() -> &'static str {
+        "XDG_CONFIG_HOME"
+    }
+
+    #[cfg(windows)]
+    fn child_removed_key() -> &'static str {
+        "LOCALAPPDATA"
+    }
+
+    #[cfg(not(windows))]
+    fn child_removed_key() -> &'static str {
+        "LOGNAME"
+    }
+
+    #[test]
+    fn isolated_environment_keeps_only_machine_runtime_and_terminal_keys() {
+        let mut command = CommandBuilder::new("fixture-program");
+        command.env(CHILD_ENV_SECRET_KEY, "ambient-secret-that-must-be-cleared");
+
+        #[cfg(windows)]
+        let inherited = vec![
+            (OsString::from("SystemDrive"), OsString::from(r"C:")),
+            (OsString::from("Path"), OsString::from(r"C:\runtime\bin")),
+            (OsString::from("HOME"), OsString::from(r"C:\Users\fixture")),
+            (OsString::from("USERPROFILE"), OsString::from(r"C:\Users\fixture")),
+            (OsString::from("APPDATA"), OsString::from(r"C:\Users\fixture\AppData\Roaming")),
+            (OsString::from("OPENAI_API_KEY"), OsString::from("fake-api-key")),
+            (OsString::from("HTTPS_PROXY"), OsString::from("http://fake-auth@proxy.invalid")),
+        ];
+        #[cfg(not(windows))]
+        let inherited = vec![
+            (OsString::from("PATH"), OsString::from("/usr/local/bin:/usr/bin:/bin")),
+            (OsString::from("HOME"), OsString::from("/home/fixture")),
+            (OsString::from("XDG_CONFIG_HOME"), OsString::from("/home/fixture/.config")),
+            (OsString::from("LC_MESSAGES"), OsString::from("C.UTF-8")),
+            (OsString::from("OPENAI_API_KEY"), OsString::from("fake-api-key")),
+            (OsString::from("HTTPS_PROXY"), OsString::from("http://fake-auth@proxy.invalid")),
+        ];
+
+        isolate_pty_child_environment_from(&mut command, inherited);
+
+        assert!(command.get_env(CHILD_ENV_SECRET_KEY).is_none());
+        assert!(command.get_env("OPENAI_API_KEY").is_none());
+        assert!(command.get_env("HTTPS_PROXY").is_none());
+        assert!(command.get_env("PATH").is_some());
+        assert!(command.get_env("HOME").is_some());
+        assert!(command.get_env(child_home_key()).is_some());
+        assert!(command.get_env(child_config_key()).is_some());
+        #[cfg(windows)]
+        {
+            assert_eq!(command.get_env("SystemDrive"), Some(OsStr::new(r"C:")));
+            assert!(command.iter_full_env_as_str().all(|(_, value)| {
+                !value
+                    .to_ascii_lowercase()
+                    .contains("%systemdrive%")
+            }));
+        }
+        #[cfg(not(windows))]
+        assert_eq!(command.get_env("LC_MESSAGES"), Some(OsStr::new("C.UTF-8")));
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new(PTY_TERM)));
+    }
+
+    #[test]
+    fn launch_plan_environment_mutations_are_authoritative_after_isolation() {
+        let current_exe = std::env::current_exe().unwrap();
+        let working_dir = std::env::current_dir().unwrap();
+        let removed_key = child_removed_key();
+        let plan = LaunchPlan {
+            agent_id: AgentId::new("codex").unwrap(),
+            program: current_exe.as_os_str().to_owned(),
+            args: vec![OsString::from("--list")],
+            working_dir: working_dir.clone(),
+            env: vec![
+                crate::agent::EnvMutation {
+                    key: OsString::from(CHILD_ENV_EXPLICIT_KEY),
+                    value: Some(OsString::from("explicit-value")),
+                },
+                crate::agent::EnvMutation {
+                    key: OsString::from(removed_key),
+                    value: Some(OsString::from("remove-this-value")),
+                },
+                crate::agent::EnvMutation {
+                    key: OsString::from(removed_key),
+                    value: None,
+                },
+            ],
+            followup_prompt: None,
+            followup_draft: None,
+            applied_session_options: None,
+        };
+
+        let command = PtyWrapper::build_launch_plan_command(&plan).unwrap();
+
+        assert_eq!(command.get_argv().first(), Some(&plan.program));
+        assert_eq!(command.get_cwd(), Some(&working_dir.into_os_string()));
+        assert_eq!(
+            command.get_env(CHILD_ENV_EXPLICIT_KEY),
+            Some(OsStr::new("explicit-value"))
+        );
+        assert!(command.get_env(removed_key).is_none());
+    }
+
+    #[test]
+    fn legacy_tool_command_keeps_runtime_lookup_and_explicit_environment() {
+        let working_dir = std::env::current_dir().unwrap();
+        let command = PtyWrapper::build_command(
+            CliTool::Codex,
+            &working_dir,
+            &[(
+                CHILD_ENV_EXPLICIT_KEY.to_owned(),
+                "legacy-explicit-value".to_owned(),
+            )],
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        assert_eq!(
+            command.get_argv(),
+            &vec![
+                OsString::from("cmd"),
+                OsString::from("/Q"),
+                OsString::from("/K"),
+                OsString::from("codex"),
+            ]
+        );
+        #[cfg(not(windows))]
+        assert_eq!(command.get_argv(), &vec![OsString::from("codex")]);
+        assert_eq!(command.get_cwd(), Some(&working_dir.into_os_string()));
+        assert_eq!(command.get_env("PATH"), std::env::var_os("PATH").as_deref());
+        assert_eq!(
+            command.get_env(CHILD_ENV_EXPLICIT_KEY),
+            Some(OsStr::new("legacy-explicit-value"))
+        );
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new(PTY_TERM)));
+    }
+
+    #[test]
+    fn pty_child_environment_fixture() {
+        let Some(report_path) = std::env::var_os(CHILD_ENV_REPORT_KEY) else {
+            return;
+        };
+        let expected_home = std::env::var_os(CHILD_ENV_EXPECTED_HOME_KEY).unwrap();
+        let expected_config = std::env::var_os(CHILD_ENV_EXPECTED_CONFIG_KEY).unwrap();
+        let checks = vec![
+            std::env::var_os(CHILD_ENV_SECRET_KEY).is_none(),
+            std::env::var_os("ANTHROPIC_API_KEY").is_none(),
+            std::env::var_os("OPENAI_API_KEY").is_none(),
+            std::env::var_os("SSH_AUTH_SOCK").is_none(),
+            std::env::var_os("HTTPS_PROXY").is_none(),
+            std::env::var_os(CHILD_ENV_BOOTSTRAP_KEY).is_none(),
+            std::env::var_os(child_home_key()).as_ref() == Some(&expected_home),
+            std::env::var_os("HOME").as_ref() == Some(&expected_home),
+            std::env::var_os(child_config_key()).as_ref() == Some(&expected_config),
+            std::env::var_os(CHILD_ENV_EXPLICIT_KEY).as_deref()
+                == Some(OsStr::new("explicit-value")),
+            std::env::var_os(child_removed_key()).is_none(),
+            std::env::var_os("TERM").as_deref() == Some(OsStr::new(PTY_TERM)),
+        ];
+        #[cfg(windows)]
+        let checks = {
+            let mut checks = checks;
+            let system_drive = std::env::var_os("SystemDrive");
+            let retained_paths_are_expanded = std::env::vars_os()
+                .filter(|(key, _)| is_allowed_pty_child_environment_key(key))
+                .all(|(_, value)| {
+                    !value
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("%systemdrive%")
+                });
+            if system_drive.is_none() {
+                std::fs::create_dir_all(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("%SystemDrive%")
+                        .join("ProgramData"),
+                )
+                .unwrap();
+            }
+            checks.extend([
+                system_drive.is_some(),
+                retained_paths_are_expanded,
+                !std::env::current_dir()
+                    .unwrap()
+                    .join("%SystemDrive%")
+                    .exists(),
+            ]);
+            checks
+        };
+        let report = checks
+            .iter()
+            .map(|passed| if *passed { "true" } else { "false" })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(report_path, report).unwrap();
+    }
+
+    #[test]
+    fn isolated_pty_child_receives_no_ambient_control_plane_credentials() {
+        if std::env::var_os(CHILD_ENV_BOOTSTRAP_KEY).is_some() {
+            run_isolated_pty_child_environment_bootstrap();
+            return;
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = PtyChildEnvTestRoot(std::env::temp_dir().join(format!(
+            "gate4agent-pty-child-env-{}-{nonce}",
+            std::process::id(),
+        )));
+        let home = root.0.join("home");
+        let config = root.0.join("config");
+        let report = root.0.join("report.txt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+
+        let mut bootstrap = std::process::Command::new(std::env::current_exe().unwrap());
+        bootstrap.env_clear();
+        for (key, value) in std::env::vars_os() {
+            if is_allowed_pty_child_environment_key(&key) {
+                bootstrap.env(key, value);
+            }
+        }
+        bootstrap
+            .args([
+                "--exact",
+                "pty::wrapper::tests::isolated_pty_child_receives_no_ambient_control_plane_credentials",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV_BOOTSTRAP_KEY, "1")
+            .env(CHILD_ENV_BOOTSTRAP_REPORT_KEY, &report)
+            .env("HOME", &home)
+            .env(child_home_key(), &home)
+            .env(child_config_key(), &config)
+            .env(child_removed_key(), "ambient-value-to-remove")
+            .env(CHILD_ENV_SECRET_KEY, "fake-jwt-that-must-not-cross-the-pty")
+            .env("ANTHROPIC_API_KEY", "fake-anthropic-key")
+            .env("OPENAI_API_KEY", "fake-openai-key")
+            .env("SSH_AUTH_SOCK", root.0.join("fake-ssh-agent.sock"))
+            .env("HTTPS_PROXY", "http://fake-auth@proxy.invalid");
+        let output = bootstrap.output().unwrap();
+        assert!(
+            output.status.success(),
+            "isolated PTY bootstrap failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let checks = std::fs::read_to_string(&report)
+            .expect("PTY child did not write its environment report");
+        #[cfg(windows)]
+        assert_eq!(checks.lines().count(), 15);
+        #[cfg(not(windows))]
+        assert_eq!(checks.lines().count(), 12);
+        assert!(checks.lines().all(|line| line == "true"));
+        #[cfg(windows)]
+        assert!(!home.join("%SystemDrive%").exists());
+    }
+
+    fn run_isolated_pty_child_environment_bootstrap() {
+        let report_path = std::env::var_os(CHILD_ENV_BOOTSTRAP_REPORT_KEY).unwrap();
+        let expected_home = std::env::var_os(child_home_key()).unwrap();
+        let expected_config = std::env::var_os(child_config_key()).unwrap();
+        let working_dir = PathBuf::from(&expected_home);
+        let plan = LaunchPlan {
+            agent_id: AgentId::new("codex").unwrap(),
+            program: std::env::current_exe().unwrap().into_os_string(),
+            args: vec![
+                OsString::from("--exact"),
+                OsString::from("pty::wrapper::tests::pty_child_environment_fixture"),
+                OsString::from("--nocapture"),
+                OsString::from("--test-threads=1"),
+            ],
+            working_dir,
+            env: vec![
+                crate::agent::EnvMutation {
+                    key: OsString::from(CHILD_ENV_REPORT_KEY),
+                    value: Some(report_path),
+                },
+                crate::agent::EnvMutation {
+                    key: OsString::from(CHILD_ENV_EXPECTED_HOME_KEY),
+                    value: Some(expected_home),
+                },
+                crate::agent::EnvMutation {
+                    key: OsString::from(CHILD_ENV_EXPECTED_CONFIG_KEY),
+                    value: Some(expected_config),
+                },
+                crate::agent::EnvMutation {
+                    key: OsString::from(CHILD_ENV_EXPLICIT_KEY),
+                    value: Some(OsString::from("explicit-value")),
+                },
+                crate::agent::EnvMutation {
+                    key: OsString::from(child_removed_key()),
+                    value: None,
+                },
+            ],
+            followup_prompt: None,
+            followup_draft: None,
+            applied_session_options: None,
+        };
+        let mut wrapper = PtyWrapper::from_launch_plan(plan, None, 24, 80).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let exit_code = loop {
+            if let Some(exit_code) = wrapper.try_exit_code() {
+                break exit_code;
+            }
+            if Instant::now() >= deadline {
+                let _ = wrapper.kill();
+                panic!("isolated PTY child did not exit");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exit_code, 0);
+        wrapper
+            .close_and_join_reader(Duration::from_secs(2))
+            .unwrap();
+    }
+
     #[cfg(windows)]
     struct WindowsWrapperTestRoot(PathBuf);
 
@@ -672,7 +1108,7 @@ mod tests {
         let fixture = root.0.join("fixture.cmd");
         std::fs::write(
             &fixture,
-            b"@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText($env:GATE4AGENT_WRAPPER_CHILD_PID_FILE, [string]$PID); Start-Sleep -Seconds 5\"\r\nexit /b %errorlevel%\r\n",
+            b"@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText($env:GATE4AGENT_WRAPPER_CHILD_PID_FILE, [string]$PID); [Console]::ReadLine() | Out-Null\"\r\nexit /b %errorlevel%\r\n",
         )
         .unwrap();
         let plan = LaunchPlan {
@@ -700,7 +1136,7 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        let running_rows = crate::pty::os_process::query_process_rows().unwrap();
+        let running_rows = crate::pty::os_process::query_process_tree_rows().unwrap();
         let root_row = running_rows
             .iter()
             .find(|row| row.pid == root_pid)
@@ -715,6 +1151,8 @@ mod tests {
             .iter()
             .any(|(row, _)| row.pid == child_pid));
 
+        wrapper.write_bytes(b"\r").unwrap();
+
         let exit_deadline = Instant::now() + Duration::from_secs(8);
         let exit_code = loop {
             if let Some(exit_code) = wrapper.try_exit_code() {
@@ -726,14 +1164,23 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(exit_code, 0);
+        let mut fixture_output = Vec::new();
+        while let Some(chunk) = wrapper.try_recv() {
+            fixture_output.extend(chunk);
+        }
+        assert_eq!(
+            exit_code,
+            0,
+            "wrapper fixture failed: {}",
+            String::from_utf8_lossy(&fixture_output)
+        );
         wrapper
             .close_and_join_reader(Duration::from_secs(2))
             .unwrap();
 
         let reaped_deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let rows = crate::pty::os_process::query_process_rows().unwrap();
+            let rows = crate::pty::os_process::query_process_tree_rows().unwrap();
             let root_alive = rows.iter().any(|row| {
                 row.pid == root_row.pid && row.started_at == root_row.started_at
             });
@@ -750,6 +1197,54 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cloned_conpty_killer_reports_success_and_reaps_wrapper() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = WindowsWrapperTestRoot(std::env::temp_dir().join(format!(
+            "gate4agent-wrapper-reap-{}-{nonce}",
+            std::process::id(),
+        )));
+        std::fs::create_dir_all(&root.0).unwrap();
+        let fixture = root.0.join("fixture.cmd");
+        std::fs::write(
+            &fixture,
+            b"@echo off\r\npause >nul\r\n",
+        )
+        .unwrap();
+        let plan = LaunchPlan {
+            agent_id: AgentId::new("codex").unwrap(),
+            program: fixture.into_os_string(),
+            args: Vec::new(),
+            working_dir: root.0.clone(),
+            env: Vec::new(),
+            followup_prompt: None,
+            followup_draft: None,
+            applied_session_options: None,
+        };
+        let mut wrapper = PtyWrapper::from_launch_plan(plan, None, 24, 80).unwrap();
+        let mut killer = wrapper.clone_killer();
+
+        killer
+            .kill()
+            .expect("successful TerminateProcess was reported as an error");
+
+        let exit_deadline = Instant::now() + Duration::from_secs(3);
+        while wrapper.try_exit_code().is_none() {
+            assert!(
+                Instant::now() < exit_deadline,
+                "ConPTY wrapper did not expose its forced exit"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        wrapper
+            .close_and_join_reader(Duration::from_secs(2))
+            .unwrap();
     }
 
     #[cfg(windows)]

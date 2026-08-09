@@ -1,8 +1,8 @@
 use crate::protocol::{
-    AgentProvider, ManagedSessionRecord, ManagedSessionState, NodeId, OpaqueHostPath,
+    AgentId, ManagedSessionRecord, ManagedSessionState, NodeId, OpaqueHostPath,
     SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,7 +10,10 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,20 +31,20 @@ static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
 pub(crate) type ProviderSessionSemanticKey = (String, u8, String);
 
 pub(crate) fn provider_session_semantic_key(
-    provider: crate::protocol::AgentProvider,
+    provider: &AgentId,
     identity: &gate4agent_types::ProviderSessionIdentity,
 ) -> ProviderSessionSemanticKey {
     let key = match identity.key {
         gate4agent_types::ProviderSessionKey::SessionId => 0,
         gate4agent_types::ProviderSessionKey::ConversationId => 1,
     };
-    (provider.agent_id().to_owned(), key, identity.id.clone())
+    (provider.as_str().to_owned(), key, identity.id.clone())
 }
 
 pub(crate) fn same_provider_session(
-    left_provider: crate::protocol::AgentProvider,
+    left_provider: &AgentId,
     left: &gate4agent_types::ProviderSessionIdentity,
-    right_provider: crate::protocol::AgentProvider,
+    right_provider: &AgentId,
     right: &gate4agent_types::ProviderSessionIdentity,
 ) -> bool {
     left_provider == right_provider && left.key == right.key && left.id == right.id
@@ -60,6 +63,7 @@ pub(crate) fn sanitized_persistence_summary(message: &str) -> String {
 
 pub(crate) struct StatePathLock {
     file: Option<File>,
+    #[cfg(windows)]
     path: PathBuf,
 }
 
@@ -72,7 +76,10 @@ impl StatePathLock {
             io::Error::new(io::ErrorKind::InvalidInput, "durable state path has no parent")
         })?;
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        secure_state_directory(parent)?;
         let lock_path = sibling_path(path, "lock");
+        #[cfg(windows)]
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -89,8 +96,11 @@ impl StatePathLock {
                     error
                 }
             })?;
+        #[cfg(unix)]
+        let file = acquire_unix_state_lock(&lock_path)?;
         Ok(Some(Self {
             file: Some(file),
+            #[cfg(windows)]
             path: lock_path,
         }))
     }
@@ -98,9 +108,72 @@ impl StatePathLock {
 
 impl Drop for StatePathLock {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(file) = self.file.as_ref() {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
         drop(self.file.take());
+        #[cfg(windows)]
         let _ = fs::remove_file(&self.path);
     }
+}
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+#[cfg(unix)]
+fn secure_state_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "durable state directory is not owned by the current user",
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "durable state directory must have mode 0700",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn acquire_unix_state_lock(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "durable state lock is not an owner-controlled regular file",
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "durable state path is already owned by another node process",
+            ));
+        }
+        return Err(error);
+    }
+    Ok(file)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +207,14 @@ struct PersistedNodeStateV2 {
     node_id: NodeId,
     workspaces: Vec<PersistedWorkspaceV2>,
     session_records: Vec<PersistedManagedSessionRecordV2>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedNodeStateV3 {
+    version: u16,
+    node_id: NodeId,
+    workspaces: Vec<PersistedWorkspaceV2>,
+    session_records: Vec<PersistedManagedSessionRecordV3>,
 }
 
 struct DecodedNodeState {
@@ -178,7 +259,7 @@ impl fmt::Display for StateLoadRefusalError {
                 write!(formatter, "unsupported durable state version {version}")
             }
             Self::PathSemanticsUnsupported => {
-                formatter.write_str("durable state path semantics are unsupported on Windows")
+                formatter.write_str("durable state path semantics are unsupported on this host")
             }
             Self::NodeIdentityMismatch => {
                 formatter.write_str("durable state belongs to a different node")
@@ -205,7 +286,7 @@ struct PersistedWorkspaceV2 {
 struct PersistedManagedSessionRecordV1 {
     record_id: SessionRecordId,
     display_name: String,
-    provider: AgentProvider,
+    provider: LegacyAgentProvider,
     mode: SessionMode,
     state: ManagedSessionState,
     workspace_id: WorkspaceId,
@@ -221,7 +302,52 @@ struct PersistedManagedSessionRecordV1 {
 struct PersistedManagedSessionRecordV2 {
     record_id: SessionRecordId,
     display_name: String,
-    provider: AgentProvider,
+    provider: LegacyAgentProvider,
+    mode: SessionMode,
+    state: ManagedSessionState,
+    workspace_id: WorkspaceId,
+    canonical_root: OpaqueHostPath,
+    provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
+    active_session: Option<SessionAddress>,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum LegacyAgentProvider {
+    Claude,
+    Codex,
+    Kimi,
+}
+
+impl LegacyAgentProvider {
+    fn into_agent_id(self) -> AgentId {
+        let value = match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Kimi => "kimi",
+        };
+        AgentId::new(value).expect("legacy provider IDs remain valid")
+    }
+
+    #[cfg(test)]
+    fn from_agent_id(provider: &AgentId) -> Self {
+        match provider.as_str() {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            "kimi" => Self::Kimi,
+            value => panic!("{value} is not a legacy provider ID"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedManagedSessionRecordV3 {
+    record_id: SessionRecordId,
+    display_name: String,
+    provider: AgentId,
     mode: SessionMode,
     state: ManagedSessionState,
     workspace_id: WorkspaceId,
@@ -328,7 +454,7 @@ fn load_one(path: &Path, expected_node_id: &NodeId) -> io::Result<LoadedNodeStat
         {
             return Err(invalid_data("durable state contains duplicate workspace IDs"));
         }
-        if !roots.insert(canonical_root.to_lowercase()) {
+        if !roots.insert(crate::platform::root_identity(&canonical_root)) {
             return Err(invalid_data("durable state contains duplicate workspace roots"));
         }
     }
@@ -349,7 +475,7 @@ fn load_one(path: &Path, expected_node_id: &NodeId) -> io::Result<LoadedNodeStat
             return Err(invalid_data("durable state contains duplicate session record IDs"));
         }
         if let Some(identity) = &mut record.provider_session {
-            let key = provider_session_semantic_key(record.provider, identity);
+            let key = provider_session_semantic_key(&record.provider, identity);
             if !provider_sessions.insert(key) {
                 return Err(invalid_data("durable state contains duplicate provider sessions"));
             }
@@ -383,6 +509,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v2_state(state)
         }
+        NODE_STATE_SCHEMA_V3 => {
+            let state: PersistedNodeStateV3 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v3_state(state)
+        }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             StateLoadRefusalError::UnsupportedSchema(version),
@@ -405,7 +536,7 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
                 Ok(ManagedSessionRecord {
                     record_id: record.record_id,
                     display_name: record.display_name,
-                    provider: record.provider,
+                    provider: record.provider.into_agent_id(),
                     mode: record.mode,
                     state: record.state,
                     workspace_id: record.workspace_id,
@@ -433,7 +564,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
             .map(|workspace| {
                 Ok((
                     workspace.workspace_id,
-                    require_windows_state_path(&workspace.canonical_root)?.to_owned(),
+                    require_utf8_state_path(&workspace.canonical_root)?.to_owned(),
                 ))
             })
             .collect::<io::Result<_>>()?,
@@ -441,7 +572,44 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
             .session_records
             .into_iter()
             .map(|record| {
-                require_windows_state_path(&record.canonical_root)?;
+                require_utf8_state_path(&record.canonical_root)?;
+                Ok(ManagedSessionRecord {
+                    record_id: record.record_id,
+                    display_name: record.display_name,
+                    provider: record.provider.into_agent_id(),
+                    mode: record.mode,
+                    state: record.state,
+                    workspace_id: record.workspace_id,
+                    canonical_root: record.canonical_root,
+                    provider_session: record.provider_session,
+                    active_session: record.active_session,
+                    created_at_unix_ms: record.created_at_unix_ms,
+                    updated_at_unix_ms: record.updated_at_unix_ms,
+                    last_error: record.last_error,
+                })
+            })
+            .collect::<io::Result<_>>()?,
+    })
+}
+
+fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> {
+    Ok(DecodedNodeState {
+        node_id: state.node_id,
+        workspaces: state
+            .workspaces
+            .into_iter()
+            .map(|workspace| {
+                Ok((
+                    workspace.workspace_id,
+                    require_utf8_state_path(&workspace.canonical_root)?.to_owned(),
+                ))
+            })
+            .collect::<io::Result<_>>()?,
+        session_records: state
+            .session_records
+            .into_iter()
+            .map(|record| {
+                require_utf8_state_path(&record.canonical_root)?;
                 Ok(ManagedSessionRecord {
                     record_id: record.record_id,
                     display_name: record.display_name,
@@ -461,7 +629,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
     })
 }
 
-fn require_windows_state_path(path: &OpaqueHostPath) -> io::Result<&str> {
+fn require_utf8_state_path(path: &OpaqueHostPath) -> io::Result<&str> {
     path.as_utf8().ok_or_else(|| io::Error::new(
         io::ErrorKind::Unsupported,
         StateLoadRefusalError::PathSemanticsUnsupported,
@@ -501,7 +669,7 @@ pub(crate) fn save(
         persisted.active_session = None;
         if let Some(identity) = &mut persisted.provider_session {
             if !provider_sessions.insert(provider_session_semantic_key(
-                persisted.provider,
+                &persisted.provider,
                 identity,
             )) {
                 return Err(invalid_data(
@@ -522,8 +690,8 @@ pub(crate) fn save(
         };
         persisted_records.push(persisted);
     }
-    let state = PersistedNodeStateV2 {
-        version: NODE_STATE_SCHEMA_V2,
+    let state = PersistedNodeStateV3 {
+        version: NODE_STATE_SCHEMA_V3,
         node_id: node_id.clone(),
         workspaces: workspaces
             .iter()
@@ -538,7 +706,7 @@ pub(crate) fn save(
             .collect::<io::Result<_>>()?,
         session_records: persisted_records
             .into_iter()
-            .map(persisted_v2_record)
+                .map(persisted_v3_record)
             .collect(),
     };
     let bytes = serde_json::to_vec_pretty(&state)
@@ -558,8 +726,8 @@ pub(crate) fn save(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
-fn persisted_v2_record(record: ManagedSessionRecord) -> PersistedManagedSessionRecordV2 {
-    PersistedManagedSessionRecordV2 {
+fn persisted_v3_record(record: ManagedSessionRecord) -> PersistedManagedSessionRecordV3 {
+    PersistedManagedSessionRecordV3 {
         record_id: record.record_id,
         display_name: record.display_name,
         provider: record.provider,
@@ -589,7 +757,7 @@ pub(crate) fn validate_display_name(display_name: &str) -> io::Result<()> {
 
 fn validate_record(record: &ManagedSessionRecord) -> io::Result<()> {
     validate_display_name(&record.display_name)?;
-    validate_root(require_windows_state_path(&record.canonical_root)?)?;
+    validate_root(require_utf8_state_path(&record.canonical_root)?)?;
     if record.created_at_unix_ms > record.updated_at_unix_ms {
         return Err(invalid_data("session record timestamps are inconsistent"));
     }
@@ -708,6 +876,8 @@ fn atomic_write_with_policy(
         io::Error::new(io::ErrorKind::InvalidInput, "durable state path has no parent")
     })?;
     fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    secure_state_directory(parent)?;
     let (temporary, mut file) = create_unique_sibling_file(path, "tmp")?;
     let backup = sibling_path(path, "bak");
     let prepared = (|| {
@@ -755,7 +925,8 @@ fn atomic_write_with_policy(
                 "injected failure before durable primary commit",
             ));
         }
-        fs::rename(&temporary, path)
+        fs::rename(&temporary, path)?;
+        sync_parent_directory(path)
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
@@ -808,6 +979,8 @@ fn rotate_backup_after_commit(
 }
 
 fn replace_file(replaced: &Path, replacement: &Path, preserved: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
 
@@ -856,16 +1029,49 @@ fn replace_file(replaced: &Path, replacement: &Path, preserved: &Path) -> io::Re
     } else {
         Ok(())
     }
+    }
+    #[cfg(unix)]
+    {
+        fs::rename(replaced, preserved)?;
+        match fs::rename(replacement, replaced) {
+            Ok(()) => sync_parent_directory(replaced),
+            Err(error) => {
+                let rollback = fs::rename(preserved, replaced);
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(io::Error::new(
+                        rollback_error.kind(),
+                        format!(
+                            "durable backup rotation failed ({error}); restoring the prior backup also failed: {rollback_error}"
+                        ),
+                    )),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "durable state path has no parent")
+    })?;
+    File::open(parent)?.sync_all()
 }
 
 fn create_unique_sibling_file(path: &Path, suffix: &str) -> io::Result<(PathBuf, File)> {
     for _ in 0..32 {
         let candidate = unique_sibling_candidate(path, suffix);
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&candidate)
-        {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -917,11 +1123,15 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{AgentProvider, SessionMode, SessionRecordId};
+    use crate::protocol::{SessionMode, SessionRecordId};
     use gate4agent_types::{ProviderSessionIdentity, ProviderSessionKey};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+    fn agent(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
 
     fn temp_path(test: &str) -> PathBuf {
         let unique = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -938,7 +1148,7 @@ mod tests {
         let record = ManagedSessionRecord {
             record_id: SessionRecordId::new("session-1").unwrap(),
             display_name: "Claude release check".to_owned(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             state: ManagedSessionState::Live,
             workspace_id,
@@ -960,7 +1170,7 @@ mod tests {
         PersistedManagedSessionRecordV1 {
             record_id: record.record_id,
             display_name: record.display_name,
-            provider: record.provider,
+            provider: LegacyAgentProvider::from_agent_id(&record.provider),
             mode: record.mode,
             state: record.state,
             workspace_id: record.workspace_id,
@@ -993,6 +1203,41 @@ mod tests {
         }
     }
 
+    fn persisted_v2_state(
+        node_id: NodeId,
+        workspaces: &BTreeMap<WorkspaceId, String>,
+        records: Vec<ManagedSessionRecord>,
+    ) -> PersistedNodeStateV2 {
+        PersistedNodeStateV2 {
+            version: NODE_STATE_SCHEMA_V2,
+            node_id,
+            workspaces: workspaces
+                .iter()
+                .map(|(workspace_id, canonical_root)| PersistedWorkspaceV2 {
+                    workspace_id: workspace_id.clone(),
+                    canonical_root: OpaqueHostPath::utf8(canonical_root.clone()).unwrap(),
+                })
+                .collect(),
+            session_records: records
+                .into_iter()
+                .map(|record| PersistedManagedSessionRecordV2 {
+                    record_id: record.record_id,
+                    display_name: record.display_name,
+                    provider: LegacyAgentProvider::from_agent_id(&record.provider),
+                    mode: record.mode,
+                    state: record.state,
+                    workspace_id: record.workspace_id,
+                    canonical_root: record.canonical_root,
+                    provider_session: record.provider_session,
+                    active_session: record.active_session,
+                    created_at_unix_ms: record.created_at_unix_ms,
+                    updated_at_unix_ms: record.updated_at_unix_ms,
+                    last_error: record.last_error,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn durable_state_round_trips_without_ephemeral_active_binding() {
         let path = temp_path("round-trip");
@@ -1005,7 +1250,7 @@ mod tests {
             serde_json::from_str::<PersistedNodeStateHeader>(&persisted)
                 .unwrap()
                 .version,
-            NODE_STATE_SCHEMA_V2,
+            NODE_STATE_SCHEMA_V3,
         );
         assert!(!persisted.contains("provider-transcript.jsonl"));
         assert!(!persisted.contains(r"C:\private"));
@@ -1027,6 +1272,26 @@ mod tests {
     }
 
     #[test]
+    fn v3_state_round_trips_open_provider_id_exactly() {
+        let path = temp_path("v3-open-provider-round-trip");
+        let (node_id, workspaces, mut record) = fixture(&path);
+        record.provider = agent("qwen-code");
+        save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
+
+        let persisted: PersistedNodeStateV3 =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.version, NODE_STATE_SCHEMA_V3);
+        assert_eq!(persisted.session_records.len(), 1);
+        assert_eq!(persisted.session_records[0].provider, agent("qwen-code"));
+
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.records[0].provider, agent("qwen-code"));
+        assert_eq!(loaded.records[0].record_id, record.record_id);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn semantic_provider_session_key_ignores_only_transcript_path() {
         let without_path = ProviderSessionIdentity {
             key: ProviderSessionKey::SessionId,
@@ -1038,20 +1303,20 @@ mod tests {
             ..without_path.clone()
         };
         assert_eq!(
-            provider_session_semantic_key(AgentProvider::Claude, &without_path),
-            provider_session_semantic_key(AgentProvider::Claude, &with_path),
+            provider_session_semantic_key(&agent("claude"), &without_path),
+            provider_session_semantic_key(&agent("claude"), &with_path),
         );
         assert_ne!(
-            provider_session_semantic_key(AgentProvider::Claude, &without_path),
-            provider_session_semantic_key(AgentProvider::Codex, &with_path),
+            provider_session_semantic_key(&agent("claude"), &without_path),
+            provider_session_semantic_key(&agent("codex"), &with_path),
         );
         let conversation = ProviderSessionIdentity {
             key: ProviderSessionKey::ConversationId,
             ..with_path
         };
         assert_ne!(
-            provider_session_semantic_key(AgentProvider::Claude, &without_path),
-            provider_session_semantic_key(AgentProvider::Claude, &conversation),
+            provider_session_semantic_key(&agent("claude"), &without_path),
+            provider_session_semantic_key(&agent("claude"), &conversation),
         );
     }
 
@@ -1087,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_state_loads_losslessly_and_next_save_migrates_to_v2() {
+    fn v1_state_loads_losslessly_and_next_save_migrates_to_v3() {
         let path = temp_path("v1-migration");
         let backup = sibling_path(&path, "bak");
         let (node_id, workspaces, record) = fixture(&path);
@@ -1112,11 +1377,39 @@ mod tests {
 
         let migrated = fs::read(&path).unwrap();
         let header: PersistedNodeStateHeader = serde_json::from_slice(&migrated).unwrap();
-        assert_eq!(header.version, NODE_STATE_SCHEMA_V2);
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V3);
         assert_eq!(fs::read(&backup).unwrap(), legacy_bytes);
         let reloaded = load(Some(&path), &node_id).unwrap();
         assert_eq!(reloaded.workspaces, workspaces);
         assert_eq!(reloaded.records, loaded.records);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v2_state_loads_losslessly_and_next_save_migrates_to_v3() {
+        let path = temp_path("v2-migration");
+        let backup = sibling_path(&path, "bak");
+        let (node_id, workspaces, record) = fixture(&path);
+        let legacy = persisted_v2_state(
+            node_id.clone(),
+            &workspaces,
+            vec![record.clone()],
+        );
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &legacy_bytes).unwrap();
+
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.workspaces, workspaces);
+        assert_eq!(loaded.records[0].provider, agent("claude"));
+        assert_eq!(loaded.records[0].record_id, record.record_id);
+        save(Some(&path), &node_id, &loaded.workspaces, &loaded.records).unwrap();
+
+        let migrated = fs::read(&path).unwrap();
+        let header: PersistedNodeStateHeader = serde_json::from_slice(&migrated).unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V3);
+        assert_eq!(fs::read(&backup).unwrap(), legacy_bytes);
+        assert_eq!(load(Some(&path), &node_id).unwrap().records, loaded.records);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -1220,7 +1513,7 @@ mod tests {
         load_one(&backup, &node_id).unwrap();
 
         let future = persisted_v1_state(
-            NODE_STATE_SCHEMA_V2 + 1,
+            NODE_STATE_SCHEMA_V3 + 1,
             node_id.clone(),
             &workspaces,
             vec![record.clone()],
@@ -1258,7 +1551,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         let future = persisted_v1_state(
-            NODE_STATE_SCHEMA_V2 + 1,
+            NODE_STATE_SCHEMA_V3 + 1,
             node_id.clone(),
             &workspaces,
             vec![record],
@@ -1426,7 +1719,7 @@ mod tests {
 
         let schema = io::Error::new(
             io::ErrorKind::Unsupported,
-            StateLoadRefusalError::UnsupportedSchema(NODE_STATE_SCHEMA_V2 + 1),
+            StateLoadRefusalError::UnsupportedSchema(NODE_STATE_SCHEMA_V3 + 1),
         );
         let node = io::Error::new(
             io::ErrorKind::PermissionDenied,

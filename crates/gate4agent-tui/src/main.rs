@@ -66,7 +66,10 @@ fn parse_args_from(
                 )
             }
             "--agent" => {
-                provider = Some(Provider::from_str(&value(args, &mut index, "--agent")?)?)
+                provider = Some(
+                    Provider::from_str(&value(args, &mut index, "--agent")?)
+                        .map_err(|error| error.to_string())?,
+                )
             }
             "--style" => {
                 color_mode_override = Some(PtyColorMode::from_str(&value(args, &mut index, "--style")?)?)
@@ -77,7 +80,7 @@ fn parse_args_from(
                      token env: GATE4AGENT_NODE_TOKEN_<NORMALIZED_NODE_ID>\n\
                      C2 token env: GATE4AGENT_C2_TOKEN\n\
                      optional startup: --startup-node NODE_ID --workspace WORKSPACE_ID \
-                     --agent claude|codex|kimi [--style inherit|gate]"
+                     --agent PROVIDER_ID [--style inherit|gate]"
                         .to_owned(),
                 )
             }

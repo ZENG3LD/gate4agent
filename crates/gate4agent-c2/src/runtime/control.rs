@@ -1,13 +1,15 @@
 use super::*;
 use crate::protocol::{
-    c2_auth_transcript, c2_bound_auth_transcript, ArchitectureId, C2AuthDirection, C2ClientAuthentication,
+    c2_auth_transcript, c2_bound_auth_transcript, provider_id_is_legacy, AgentId, ArchitectureId, C2AuthDirection, C2ClientAuthentication,
     C2ClientFrame, C2ControlCompatibilitySupport, C2Hello, C2ReplyEnvelope,
     C2ServerChallenge, C2ServerFrame, C2Topology, CapabilityId, ClientCompatibilityOffer,
     HostDescriptor, NegotiatedC2ControlCompatibility,
     OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
-    C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_PROVIDER_ID_OPEN_CAPABILITY,
+    C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    C2_WORKSPACE_FILE_READ_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -35,6 +37,8 @@ struct NegotiatedPathCapabilities {
     opaque_host_paths: bool,
     repository_paths: bool,
     workspace_file_read: bool,
+    provider_runtime_status: bool,
+    provider_ids_open: bool,
 }
 
 pub(super) async fn run(
@@ -105,6 +109,8 @@ async fn serve_connection(
     let compatibility = hello.compatibility.as_ref().map(|_| negotiated);
     let include_provider_contracts =
         provider_contract_manifest_selected(compatibility.as_ref());
+    let path_capabilities = negotiated_path_capabilities(compatibility.as_ref());
+    let include_provider_runtime_status = path_capabilities.provider_runtime_status;
     let server_nonce = random_nonce().map_err(authentication_frame_error)?;
     let auth_compatibility = hello.compatibility.as_ref().zip(compatibility.as_ref());
     let server_proof = c2_proof(
@@ -168,6 +174,12 @@ async fn serve_connection(
     if !include_provider_contracts {
         clear_provider_contract_manifests(&mut hello_status);
     }
+    if !include_provider_runtime_status {
+        clear_provider_runtime_statuses(&mut hello_status);
+    }
+    if !path_capabilities.provider_ids_open {
+        retain_legacy_provider_status(&mut hello_status);
+    }
     if !prune_pre_hello_events(
         &hub,
         connection_id,
@@ -179,11 +191,11 @@ async fn serve_connection(
         hub.detach(connection_id);
         return Ok(());
     }
-    let mut last_topology = C2Topology::from_status_with_provider_contracts(
+    let mut last_topology = C2Topology::from_status_with_capabilities(
         &hello_status,
         include_provider_contracts,
+        include_provider_runtime_status,
     );
-    let path_capabilities = negotiated_path_capabilities(compatibility.as_ref());
     if timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
         &C2ServerFrame::Hello(C2Hello {
@@ -206,6 +218,7 @@ async fn serve_connection(
         Arc::clone(&budget),
         disconnect_tx.clone(),
         path_capabilities,
+        status.clone(),
     ));
     let mut dispatches = JoinSet::new();
     let mut last_request_id = 0_u64;
@@ -235,6 +248,20 @@ async fn serve_connection(
                     }).await.is_err() { break; }
                     continue;
                 }
+                if !path_capabilities.provider_ids_open
+                    && request_targets_unavailable_provider(&request.request, status.borrow().as_ref())
+                {
+                    let failure = relay_failure(
+                        C2RelayFailureCode::RequestForbidden,
+                        "provider identity capability was not negotiated with C2",
+                        None,
+                    );
+                    if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope {
+                        request_id: request.request_id,
+                        result: Err(failure),
+                    }).await.is_err() { break; }
+                    continue;
+                }
                 match dispatch_start(connection_id, request.request, &relays, &status) {
                     DispatchStart::Immediate(result) => {
                         if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result }).await.is_err() { break; }
@@ -257,9 +284,14 @@ async fn serve_connection(
                 if changed.is_err() { break; }
                 let next_topology = {
                     let latest = status.borrow_and_update();
-                    C2Topology::from_status_with_provider_contracts(
-                        latest.as_ref(),
+                    let mut projected = latest.as_ref().clone();
+                    if !path_capabilities.provider_ids_open {
+                        retain_legacy_provider_status(&mut projected);
+                    }
+                    C2Topology::from_status_with_capabilities(
+                        &projected,
                         include_provider_contracts,
+                        include_provider_runtime_status,
                     )
                 };
                 if queue_topology_if_changed(
@@ -419,23 +451,44 @@ async fn control_writer<W>(
     budget: Arc<AtomicUsize>,
     disconnect: watch::Sender<bool>,
     path_capabilities: NegotiatedPathCapabilities,
+    status: watch::Receiver<Arc<StatusResponse>>,
 ) where
     W: tokio::io::AsyncWrite + Unpin,
 {
     while let Some(queued) = frames.recv().await {
+        let mut frame = queued.frame;
+        if !path_capabilities.provider_runtime_status {
+            clear_server_frame_provider_runtime_status(&mut frame);
+        }
+        if !path_capabilities.provider_ids_open {
+            match project_server_frame_for_legacy_provider_ids(
+                &mut frame,
+                status.borrow().as_ref(),
+            ) {
+                LegacyFrameProjection::Write => {}
+                LegacyFrameProjection::Drop => {
+                    budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+                    continue;
+                }
+                LegacyFrameProjection::Reject => {
+                    budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+                    break;
+                }
+            }
+        }
         if (!path_capabilities.opaque_host_paths
-            && server_frame_contains_opaque_unix_path(&queued.frame))
+            && server_frame_contains_opaque_unix_path(&frame))
             || (!path_capabilities.repository_paths
-                && server_frame_contains_unix_repository_path(&queued.frame))
+                && server_frame_contains_unix_repository_path(&frame))
             || (!path_capabilities.workspace_file_read
-                && server_frame_contains_workspace_file_read(&queued.frame))
+                && server_frame_contains_workspace_file_read(&frame))
         {
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
         let result = timeout(FRAME_BODY_DEADLINE, write_json_frame_limited(
             &mut writer,
-            &queued.frame,
+            &frame,
             MAX_C2_SERVER_FRAME_BYTES,
         )).await;
         budget.fetch_sub(queued.bytes, Ordering::AcqRel);
@@ -458,6 +511,8 @@ fn negotiated_path_capabilities(
         opaque_host_paths: selected_has(C2_OPAQUE_UNIX_PATH_CAPABILITY),
         repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
         workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
+        provider_runtime_status: selected_has(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY),
+        provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
     }
 }
 
@@ -474,6 +529,15 @@ fn unnegotiated_request_failure(
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
             "request capability was not negotiated with C2",
+            None,
+        ));
+    }
+    if !capabilities.provider_ids_open
+        && matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "open provider IDs require negotiated C2 capability",
             None,
         ));
     }
@@ -815,18 +879,29 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
-            operating_system: OperatingSystemId::new("windows")
+            operating_system: OperatingSystemId::new(std::env::consts::OS)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             architecture: ArchitectureId::new(std::env::consts::ARCH)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
         },
-        path_semantics: PathSemantics {
-            style: PathStyle::Windows,
-            encoding: PathEncoding::Utf8,
-        },
+        path_semantics: local_path_semantics(),
     })
+}
+
+#[cfg(windows)]
+fn local_path_semantics() -> PathSemantics {
+    PathSemantics { style: PathStyle::Windows, encoding: PathEncoding::Utf8 }
+}
+
+#[cfg(unix)]
+fn local_path_semantics() -> PathSemantics {
+    PathSemantics { style: PathStyle::Posix, encoding: PathEncoding::UnixBytes }
 }
 
 fn provider_contract_manifest_selected(
@@ -839,6 +914,296 @@ fn provider_contract_manifest_selected(
     })
 }
 
+fn provider_text_is_legacy(value: &str) -> bool {
+    AgentId::new(value).is_ok_and(|provider| provider_id_is_legacy(&provider))
+}
+
+fn retain_legacy_provider_status(status: &mut StatusResponse) {
+    for inventory in status.nodes.values_mut().filter_map(|node| node.inventory.as_mut()) {
+        inventory.enabled_providers.retain(provider_id_is_legacy);
+        inventory.provider_runtime_statuses
+            .retain(|runtime| provider_id_is_legacy(runtime.provider()));
+        inventory.provider_contracts
+            .retain(|contract| provider_id_is_legacy(&contract.provider));
+        inventory.provider_adapter_contracts
+            .retain(|contract| provider_id_is_legacy(&contract.provider));
+        for workspace in inventory.workspaces.values_mut() {
+            workspace.sessions.retain(|session| provider_text_is_legacy(&session.agent_id));
+            workspace.session_count = workspace.sessions.len();
+            workspace.sessions_truncated = false;
+        }
+        inventory.session_count = inventory.workspaces.values()
+            .map(|workspace| workspace.sessions.len())
+            .sum();
+        inventory.sessions_truncated = false;
+        inventory.managed_sessions
+            .retain(|record| provider_id_is_legacy(&record.provider));
+        inventory.managed_session_count = inventory.managed_sessions.len();
+        inventory.managed_sessions_truncated = false;
+    }
+}
+
+fn request_targets_unavailable_provider(
+    request: &crate::protocol::RoutedNodeRequest,
+    status: &StatusResponse,
+) -> bool {
+    let node_id = &request.route.node_id;
+    match &request.request {
+        NodeRequest::Resume { session, .. }
+        | NodeRequest::Prompt { session, .. }
+        | NodeRequest::Paste { session, .. }
+        | NodeRequest::Input { session, .. }
+        | NodeRequest::TerminalBytes { session, .. }
+        | NodeRequest::TerminalControl { session, .. }
+        | NodeRequest::Resize { session, .. }
+        | NodeRequest::Interrupt { session }
+        | NodeRequest::Stop { session, .. }
+        | NodeRequest::Remove { session } => {
+            !status_address_is_legacy(status, node_id, session)
+        }
+        NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::ResumeSessionRecord { record_id, .. }
+        | NodeRequest::ForgetSessionRecord { record_id } => {
+            !status_record_is_legacy(status, node_id, record_id)
+        }
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
+fn status_address_is_legacy(
+    status: &StatusResponse,
+    node_id: &NodeId,
+    address: &gate4agent_node_protocol::SessionAddress,
+) -> bool {
+    let Some(inventory) = status.nodes.get(node_id).and_then(|node| node.inventory.as_ref()) else {
+        return false;
+    };
+    let mut matched = false;
+    let mut all_legacy = true;
+    if let Some(workspace) = inventory.workspaces.get(&address.workspace_id) {
+        for session in workspace.sessions.iter().filter(|session| {
+            session.instance_id == address.session.instance_id
+                && session.generation == address.session.generation
+        }) {
+            matched = true;
+            all_legacy &= provider_text_is_legacy(&session.agent_id);
+        }
+    }
+    for record in inventory.managed_sessions.iter()
+        .filter(|record| record.active_session.as_ref() == Some(address))
+    {
+        matched = true;
+        all_legacy &= provider_id_is_legacy(&record.provider);
+    }
+    matched && all_legacy
+}
+
+fn status_record_is_legacy(
+    status: &StatusResponse,
+    node_id: &NodeId,
+    record_id: &gate4agent_node_protocol::SessionRecordId,
+) -> bool {
+    status.nodes.get(node_id)
+        .and_then(|node| node.inventory.as_ref())
+        .and_then(|inventory| {
+            inventory.managed_sessions.iter().find(|record| &record.record_id == record_id)
+        })
+        .is_some_and(|record| provider_id_is_legacy(&record.provider))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyFrameProjection {
+    Write,
+    Drop,
+    Reject,
+}
+
+fn project_server_frame_for_legacy_provider_ids(
+    frame: &mut C2ServerFrame,
+    status: &StatusResponse,
+) -> LegacyFrameProjection {
+    match frame {
+        C2ServerFrame::Hello(hello) => {
+            retain_legacy_provider_status(&mut hello.status);
+            LegacyFrameProjection::Write
+        }
+        C2ServerFrame::Topology(topology) => {
+            retain_legacy_topology(topology);
+            LegacyFrameProjection::Write
+        }
+        C2ServerFrame::Reply(reply) => {
+            let Ok(routed) = reply.result.as_mut() else {
+                return LegacyFrameProjection::Write;
+            };
+            let Ok(response) = routed.response.as_mut() else {
+                return LegacyFrameProjection::Write;
+            };
+            if project_legacy_response(response, &routed.node_id, status) {
+                LegacyFrameProjection::Write
+            } else {
+                LegacyFrameProjection::Reject
+            }
+        }
+        C2ServerFrame::Event(event) => {
+            let node_id = event.node_id.clone();
+            if project_legacy_event(&mut event.event, &node_id, status, None) {
+                LegacyFrameProjection::Write
+            } else {
+                LegacyFrameProjection::Drop
+            }
+        }
+        C2ServerFrame::Challenge(_) | C2ServerFrame::Rejected(_) => {
+            LegacyFrameProjection::Write
+        }
+    }
+}
+
+fn retain_legacy_topology(topology: &mut C2Topology) {
+    for node in &mut topology.nodes {
+        node.provider_contracts
+            .retain(|contract| provider_id_is_legacy(&contract.provider));
+        node.provider_adapter_contracts
+            .retain(|contract| provider_id_is_legacy(&contract.provider));
+        node.provider_runtime_statuses
+            .retain(|runtime| provider_id_is_legacy(runtime.provider()));
+    }
+}
+
+fn retain_legacy_workspace(workspace: &mut crate::protocol::C2WorkspaceSnapshot) {
+    workspace.sessions.retain(|session| provider_id_is_legacy(&session.agent_id));
+}
+
+fn retain_legacy_snapshot(snapshot: &mut crate::protocol::C2NodeSnapshot) {
+    snapshot.enabled_providers.retain(provider_id_is_legacy);
+    snapshot.provider_runtime_statuses
+        .retain(|runtime| provider_id_is_legacy(runtime.provider()));
+    for workspace in &mut snapshot.workspaces {
+        retain_legacy_workspace(workspace);
+    }
+    snapshot.session_records
+        .retain(|record| provider_id_is_legacy(&record.provider));
+}
+
+fn project_legacy_response(
+    response: &mut C2NodeResponse,
+    node_id: &NodeId,
+    status: &StatusResponse,
+) -> bool {
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. } => {
+            retain_legacy_snapshot(snapshot);
+            true
+        }
+        C2NodeResponse::Resync { snapshot, events, .. } => {
+            let source_snapshot = snapshot.clone();
+            events.retain_mut(|event| {
+                project_legacy_event(
+                    &mut event.event,
+                    node_id,
+                    status,
+                    Some(&source_snapshot),
+                )
+            });
+            retain_legacy_snapshot(snapshot);
+            true
+        }
+        C2NodeResponse::SessionRecordUpdated { record }
+        | C2NodeResponse::SessionRecordResumed { record, .. } => {
+            provider_id_is_legacy(&record.provider)
+        }
+        C2NodeResponse::WorkspaceRegistered { workspace }
+        | C2NodeResponse::WorktreeCreated { workspace, .. } => {
+            retain_legacy_workspace(workspace);
+            true
+        }
+        C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::WorktreeRemoved { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => true,
+    }
+}
+
+fn project_legacy_event(
+    event: &mut C2NodeEvent,
+    node_id: &NodeId,
+    status: &StatusResponse,
+    snapshot: Option<&crate::protocol::C2NodeSnapshot>,
+) -> bool {
+    match event {
+        C2NodeEvent::Control { address, .. } => {
+            address_is_legacy(status, node_id, snapshot, address)
+        }
+        C2NodeEvent::WorkspaceAdded { workspace } => {
+            retain_legacy_workspace(workspace);
+            true
+        }
+        C2NodeEvent::SessionRecordUpserted { record } => {
+            provider_id_is_legacy(&record.provider)
+        }
+        C2NodeEvent::SessionRecordRemoved { record_id } => {
+            record_is_legacy(status, node_id, snapshot, record_id)
+        }
+        C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::ResyncRequired { .. } => true,
+    }
+}
+
+fn address_is_legacy(
+    status: &StatusResponse,
+    node_id: &NodeId,
+    snapshot: Option<&crate::protocol::C2NodeSnapshot>,
+    address: &gate4agent_node_protocol::SessionAddress,
+) -> bool {
+    let status_match = status_address_is_legacy(status, node_id, address);
+    let snapshot_match = snapshot.is_some_and(|snapshot| {
+        snapshot.workspaces.iter()
+            .find(|workspace| workspace.workspace_id == address.workspace_id)
+            .is_some_and(|workspace| {
+                workspace.sessions.iter().any(|session| {
+                    session.instance_id == address.session.instance_id
+                        && session.generation == address.session.generation
+                        && provider_id_is_legacy(&session.agent_id)
+                })
+            })
+            || snapshot.session_records.iter().any(|record| {
+                record.active_session.as_ref() == Some(address)
+                    && provider_id_is_legacy(&record.provider)
+            })
+    });
+    status_match || snapshot_match
+}
+
+fn record_is_legacy(
+    status: &StatusResponse,
+    node_id: &NodeId,
+    snapshot: Option<&crate::protocol::C2NodeSnapshot>,
+    record_id: &gate4agent_node_protocol::SessionRecordId,
+) -> bool {
+    status_record_is_legacy(status, node_id, record_id)
+        || snapshot.is_some_and(|snapshot| {
+            snapshot.session_records.iter().any(|record| {
+                &record.record_id == record_id && provider_id_is_legacy(&record.provider)
+            })
+        })
+}
+
 fn clear_provider_contract_manifests(status: &mut StatusResponse) {
     for inventory in status.nodes.values_mut().filter_map(|node| node.inventory.as_mut()) {
         inventory.provider_contracts.clear();
@@ -846,18 +1211,57 @@ fn clear_provider_contract_manifests(status: &mut StatusResponse) {
     }
 }
 
-#[cfg(test)]
+fn clear_provider_runtime_statuses(status: &mut StatusResponse) {
+    for inventory in status.nodes.values_mut().filter_map(|node| node.inventory.as_mut()) {
+        inventory.provider_runtime_statuses.clear();
+    }
+}
+
+fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
+    let C2ServerFrame::Reply(reply) = frame else {
+        return;
+    };
+    let Ok(routed) = reply.result.as_mut() else {
+        return;
+    };
+    let Ok(response) = routed.response.as_mut() else {
+        return;
+    };
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. }
+        | C2NodeResponse::Resync { snapshot, .. } => {
+            snapshot.provider_runtime_statuses.clear();
+        }
+        C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SessionRecordUpdated { .. }
+        | C2NodeResponse::SessionRecordResumed { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::WorkspaceRegistered { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::WorktreeCreated { .. }
+        | C2NodeResponse::WorktreeRemoved { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => {}
+    }
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::protocol::{
         AdapterContractRevision, AdapterFamily, AdapterId, C2ClientHello, C2GitSnapshot,
         C2WorkspaceInspection, C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
-        RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
+        RepositoryPath, SlimManagedSessionRecord, WorkspaceFileContent, WorkspaceFileRead,
     };
     use gate4agent_node_protocol::{
-        AgentProvider, GitStatusEntry, WorkspaceEntry, WorkspaceEntryKind,
+        GitStatusEntry, ManagedSessionState, SessionAddress, SessionKey, SessionMode,
+        SessionRecordId, WorkspaceEntry, WorkspaceEntryKind, WorkspaceId,
     };
+    use gate4agent_types::{AgentInstanceId, SessionGeneration, TerminalSize};
     use tokio::io::AsyncReadExt;
 
     fn status(transport: NodeTransportState, incarnation_id: Option<NodeIncarnationId>) -> StatusResponse {
@@ -891,22 +1295,52 @@ mod tests {
         let observed = value.nodes.get_mut(&NodeId::new("node-a").unwrap()).unwrap();
         let mut inventory = SlimNodeInventory::from_snapshot(&NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: vec![AgentProvider::Codex],
+            enabled_providers: vec![AgentId::new("codex").unwrap()],
+            provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
         });
         inventory.provider_contracts = vec![ProviderContractSupport {
-            provider: AgentProvider::Codex,
+            provider: AgentId::new("codex").unwrap(),
             revision: ProviderContractRevision::new("old-contract").unwrap(),
         }];
         inventory.provider_adapter_contracts = vec![ProviderAdapterContractSupport {
-            provider: AgentProvider::Codex,
+            provider: AgentId::new("codex").unwrap(),
             family: AdapterFamily::PtySemantic,
             adapter_id: AdapterId::new("codex").unwrap(),
             revision: AdapterContractRevision::new("old-adapter-contract").unwrap(),
         }];
         observed.inventory = Some(inventory);
         value
+    }
+
+    fn address(instance_id: u64) -> SessionAddress {
+        SessionAddress {
+            workspace_id: WorkspaceId::new("repo").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(instance_id),
+                generation: SessionGeneration(1),
+            },
+        }
+    }
+
+    fn managed_record(
+        record_id: &str,
+        provider: &str,
+        active_session: Option<SessionAddress>,
+    ) -> SlimManagedSessionRecord {
+        SlimManagedSessionRecord {
+            record_id: SessionRecordId::new(record_id).unwrap(),
+            display_name: record_id.to_owned(),
+            display_name_truncated: false,
+            provider: AgentId::new(provider).unwrap(),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Live,
+            workspace_id: WorkspaceId::new("repo").unwrap(),
+            active_session,
+            provider_identity_present: false,
+            updated_at_unix_ms: 1,
+        }
     }
 
     #[test]
@@ -925,6 +1359,8 @@ mod tests {
                 CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -950,6 +1386,138 @@ mod tests {
     }
 
     #[test]
+    fn legacy_provider_projection_preserves_legacy_bytes_and_filters_open_ids() {
+        let mut status = status_with_provider_contract_manifest(
+            NodeIncarnationId::from_bytes([11; 16]),
+        );
+        let inventory = status.nodes.values_mut().next().unwrap().inventory.as_mut().unwrap();
+        inventory.enabled_providers = ["claude", "codex", "kimi", "qwen-code"]
+            .into_iter()
+            .map(|provider| AgentId::new(provider).unwrap())
+            .collect();
+        inventory.provider_runtime_statuses = crate::protocol::ProviderRuntimeStatuses::new(
+            ["claude", "codex", "kimi", "qwen-code"].into_iter().map(|provider| {
+                crate::protocol::ProviderRuntimeStatus::raw_passthrough(
+                    AgentId::new(provider).unwrap(),
+                    None,
+                )
+            }),
+        ).unwrap();
+        inventory.provider_contracts.push(ProviderContractSupport {
+            provider: AgentId::new("qwen-code").unwrap(),
+            revision: ProviderContractRevision::new("open-contract").unwrap(),
+        });
+        inventory.provider_adapter_contracts.push(ProviderAdapterContractSupport {
+            provider: AgentId::new("qwen-code").unwrap(),
+            family: AdapterFamily::PtySemantic,
+            adapter_id: AdapterId::new("qwen-code").unwrap(),
+            revision: AdapterContractRevision::new("open-adapter-contract").unwrap(),
+        });
+        inventory.managed_sessions = vec![
+            managed_record("claude-record", "claude", None),
+            managed_record("codex-record", "codex", None),
+            managed_record("kimi-record", "kimi", None),
+            managed_record("qwen-record", "qwen-code", None),
+        ];
+        inventory.managed_session_count = inventory.managed_sessions.len();
+
+        retain_legacy_provider_status(&mut status);
+
+        let inventory = status.nodes.values().next().unwrap().inventory.as_ref().unwrap();
+        assert_eq!(
+            inventory.enabled_providers.iter().map(AgentId::as_str).collect::<Vec<_>>(),
+            vec!["claude", "codex", "kimi"],
+        );
+        assert_eq!(
+            inventory.provider_runtime_statuses.iter()
+                .map(|runtime| runtime.provider().as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "kimi"],
+        );
+        assert_eq!(
+            inventory.managed_sessions.iter()
+                .map(|record| record.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "kimi"],
+        );
+        let json = serde_json::to_string(inventory).unwrap();
+        assert!(json.contains(r#""enabled_providers":["claude","codex","kimi"]"#));
+        assert!(!json.contains("qwen-code"));
+    }
+
+    #[test]
+    fn legacy_provider_gate_blocks_open_and_unknown_session_mutations_before_dispatch() {
+        let incarnation = NodeIncarnationId::from_bytes([12; 16]);
+        let mut status = status_with_provider_contract_manifest(incarnation);
+        let inventory = status.nodes.values_mut().next().unwrap().inventory.as_mut().unwrap();
+        inventory.managed_sessions = vec![
+            managed_record("legacy-record", "codex", Some(address(1))),
+            managed_record("open-record", "qwen-code", Some(address(2))),
+        ];
+        inventory.managed_session_count = inventory.managed_sessions.len();
+        let routed = |request| crate::protocol::RoutedNodeRequest {
+            route: crate::protocol::NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: incarnation,
+            },
+            request,
+        };
+
+        assert!(!request_targets_unavailable_provider(
+            &routed(NodeRequest::Interrupt { session: address(1) }),
+            &status,
+        ));
+        assert!(request_targets_unavailable_provider(
+            &routed(NodeRequest::Interrupt { session: address(2) }),
+            &status,
+        ));
+        assert!(request_targets_unavailable_provider(
+            &routed(NodeRequest::Interrupt { session: address(3) }),
+            &status,
+        ));
+        assert!(!request_targets_unavailable_provider(
+            &routed(NodeRequest::ForgetSessionRecord {
+                record_id: SessionRecordId::new("legacy-record").unwrap(),
+            }),
+            &status,
+        ));
+        assert!(request_targets_unavailable_provider(
+            &routed(NodeRequest::ForgetSessionRecord {
+                record_id: SessionRecordId::new("open-record").unwrap(),
+            }),
+            &status,
+        ));
+        assert!(request_targets_unavailable_provider(
+            &routed(NodeRequest::ForgetSessionRecord {
+                record_id: SessionRecordId::new("unknown-record").unwrap(),
+            }),
+            &status,
+        ));
+    }
+
+    #[test]
+    fn legacy_provider_gate_blocks_open_spawn_before_dispatch() {
+        let request = NodeRequest::Spawn {
+            workspace_id: WorkspaceId::new("repo").unwrap(),
+            provider: AgentId::new("qwen-code").unwrap(),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize { rows: 40, columns: 120 },
+            initial_prompt: None,
+        };
+        let capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: false,
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure { code: C2RelayFailureCode::RequestForbidden, .. })
+        ));
+    }
+
+    #[test]
     fn cross_incarnation_snapshot_never_inherits_stale_provider_contract_manifest() {
         let old_incarnation = NodeIncarnationId::from_bytes([3; 16]);
         let new_incarnation = NodeIncarnationId::from_bytes([4; 16]);
@@ -964,6 +1532,44 @@ mod tests {
         let restarted = provider_contract_manifest_for_snapshot(&observed, new_incarnation);
         assert!(restarted.provider_contracts.is_empty());
         assert!(restarted.provider_adapter_contracts.is_empty());
+    }
+
+    #[test]
+    fn legacy_c2_client_receives_no_runtime_status() {
+        let incarnation = NodeIncarnationId::from_bytes([6; 16]);
+        let mut status = status_with_provider_contract_manifest(incarnation);
+        status
+            .nodes
+            .values_mut()
+            .next()
+            .unwrap()
+            .inventory
+            .as_mut()
+            .unwrap()
+            .provider_runtime_statuses = crate::protocol::ProviderRuntimeStatuses::new([
+                crate::protocol::ProviderRuntimeStatus::raw_passthrough(
+                    AgentId::new("codex").unwrap(),
+                    Some(crate::protocol::ProviderRuntimeVersion::new("0.147.0").unwrap()),
+                ),
+            ])
+            .unwrap();
+
+        clear_provider_runtime_statuses(&mut status);
+        assert!(status
+            .nodes
+            .values()
+            .next()
+            .unwrap()
+            .inventory
+            .as_ref()
+            .unwrap()
+            .provider_runtime_statuses
+            .is_empty());
+        let topology = C2Topology::from_status_with_capabilities(&status, false, false);
+        assert!(topology.nodes[0].provider_runtime_statuses.is_empty());
+        assert!(!serde_json::to_string(&topology)
+            .unwrap()
+            .contains("provider_runtime_statuses"));
     }
 
     #[test]
@@ -1086,7 +1692,10 @@ mod tests {
                 opaque_host_paths: false,
                 repository_paths: false,
                 workspace_file_read: false,
+                provider_runtime_status: false,
+                provider_ids_open: false,
             },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
@@ -1128,6 +1737,8 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: false,
+            provider_runtime_status: true,
+            provider_ids_open: true,
         };
         assert!(matches!(
             unnegotiated_request_failure(&utf8_request, no_file_read),
@@ -1137,6 +1748,8 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: false,
             workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
         };
         assert!(matches!(
             unnegotiated_request_failure(&tagged_request, no_repository_path),
@@ -1146,6 +1759,8 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
         assert!(server_frame_contains_workspace_file_read(
@@ -1174,7 +1789,10 @@ mod tests {
                 opaque_host_paths: true,
                 repository_paths: true,
                 workspace_file_read: false,
+                provider_runtime_status: true,
+                provider_ids_open: true,
             },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();

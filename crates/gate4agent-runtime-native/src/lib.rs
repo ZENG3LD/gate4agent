@@ -1,6 +1,7 @@
 //! Tick-driven native runtime for embedding gate4agent in an owning app core.
 
 mod launch_profiles;
+mod vendor_contract;
 
 pub use launch_profiles::{
     NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
@@ -8,6 +9,15 @@ pub use launch_profiles::{
     ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
     ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
     ZAI_GLM_CLAUDE_PROFILE_REVISION, ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
+};
+pub use vendor_contract::{
+    probe_installed_vendor_version, resolve_vendor_contract, VendorCapabilitySet,
+    VendorCapabilityUnavailableReason, VendorCapabilityVerdict, VendorCliFamily,
+    VendorContractResolution, VendorFallbackReason, VendorLauncherIdentity, VendorPlatform,
+    VendorRuntimeMode, VendorVersionProbeCache, VendorVersionProbeResult,
+    VendorVersionProbeStatus, VendorVersionStatus,
+    CLAUDE_WINDOWS_X86_64_2_1_223_CONTRACT_ID,
+    CLAUDE_WINDOWS_X86_64_2_1_224_CONTRACT_ID,
 };
 
 use gate4agent_catalog::{AgentRegistry, EnvMutation};

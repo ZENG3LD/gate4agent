@@ -3,9 +3,11 @@ use crate::protocol::{
     NodeIncarnationId, NodeRequest, RoutedNodeEvent, RoutedNodeResponse,
     NodeTransportState, ObservedNode, ProviderAdapterContractSupport, ProviderContractSupport,
     ReadyResponse, SanitizedError, SlimNodeInventory, StatusResponse,
-    C2_API_VERSION, C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, MAX_C2_ENDPOINT_BYTES,
+    C2_API_VERSION, C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
     MAX_C2_GAPS_PER_NODE, MAX_C2_NODES,
 };
+#[cfg(windows)]
+use crate::protocol::MAX_C2_ENDPOINT_BYTES;
 use gate4agent_node_protocol::{
     ClientRole, FrameError, NegotiatedNodeCompatibility, NodeEventEnvelope, NodeFailureCode,
     NodeResponse, NodeSnapshot,
@@ -17,6 +19,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,26 +39,71 @@ const RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 mod control;
 
+#[cfg(windows)]
 pub const DEFAULT_C2_CONTROL_ENDPOINT: &str = r"\\.\pipe\gate4agent-c2";
+#[cfg(unix)]
+pub const DEFAULT_C2_CONTROL_ENDPOINT: &str = "gate4agent-c2.sock";
+
+#[cfg(windows)]
+pub fn default_c2_control_endpoint() -> Result<String, C2ConfigError> {
+    Ok(DEFAULT_C2_CONTROL_ENDPOINT.to_owned())
+}
+
+#[cfg(unix)]
+pub fn default_c2_control_endpoint() -> Result<String, C2ConfigError> {
+    let root = unix_runtime_root()?;
+    let directory = root.join("gate4agent");
+    let endpoint = directory.join(DEFAULT_C2_CONTROL_ENDPOINT);
+    validate_unix_endpoint(&endpoint).map_err(|_| C2ConfigError::InvalidControlEndpoint)?;
+    Ok(endpoint.to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
+fn unix_runtime_root() -> Result<PathBuf, C2ConfigError> {
+    if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(root);
+        if root.is_absolute() { return Ok(root); }
+    }
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())
+        .ok_or_else(|| C2ConfigError::RuntimeEndpoint(
+            "neither absolute XDG_RUNTIME_DIR nor HOME is available".to_owned(),
+        ))?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(C2ConfigError::RuntimeEndpoint("HOME is not absolute".to_owned()));
+    }
+    Ok(home.join(".gate4agent").join("run"))
+}
 
 #[derive(Clone)]
 pub struct C2NodeConfig {
     pub node_id: NodeId,
     pub endpoint: String,
+    route: C2NodeRoute,
     token: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum C2NodeRoute {
+    Local,
+    SshForwardedLoopback(SocketAddr),
 }
 
 impl C2NodeConfig {
     pub fn new(node_id: NodeId, endpoint: impl Into<String>, token: impl Into<String>) -> Result<Self, C2ConfigError> {
         let endpoint = endpoint.into();
         let token = token.into();
-        if !endpoint.starts_with(r"\\.\pipe\") || endpoint.len() <= r"\\.\pipe\".len()
-            || endpoint.len() > MAX_C2_ENDPOINT_BYTES
-        {
-            return Err(C2ConfigError::InvalidEndpoint(node_id));
-        }
+        let (endpoint, route) = parse_node_endpoint(&endpoint)
+            .ok_or_else(|| C2ConfigError::InvalidEndpoint(node_id.clone()))?;
         validate_token(&token)?;
-        Ok(Self { node_id, endpoint, token })
+        Ok(Self { node_id, endpoint, route, token })
+    }
+
+    fn transport_label(&self) -> &'static str {
+        match self.route {
+            C2NodeRoute::Local => local_transport_label(),
+            C2NodeRoute::SshForwardedLoopback(_) => "ssh-forwarded-loopback",
+        }
     }
 }
 
@@ -100,11 +151,12 @@ impl C2Config {
         let mut ids = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         if nodes.iter().any(|node| !ids.insert(node.node_id.clone())) { return Err(C2ConfigError::DuplicateNode); }
-        if nodes.iter().any(|node| !endpoints.insert(node.endpoint.to_ascii_lowercase())) { return Err(C2ConfigError::DuplicateEndpoint); }
-        if nodes.iter().any(|node| node.endpoint.eq_ignore_ascii_case(DEFAULT_C2_CONTROL_ENDPOINT)) {
+        if nodes.iter().any(|node| !endpoints.insert(endpoint_key(&node.endpoint))) { return Err(C2ConfigError::DuplicateEndpoint); }
+        let control_endpoint = default_c2_control_endpoint()?;
+        if nodes.iter().any(|node| endpoints_equal(&node.endpoint, &control_endpoint)) {
             return Err(C2ConfigError::ControlEndpointConflict);
         }
-        Ok(Self { api_listen, control_endpoint: DEFAULT_C2_CONTROL_ENDPOINT.to_owned(), api_token, nodes, timings: C2Timings::default() })
+        Ok(Self { api_listen, control_endpoint, api_token, nodes, timings: C2Timings::default() })
     }
 
     pub fn with_timings(mut self, timings: C2Timings) -> Self {
@@ -115,7 +167,7 @@ impl C2Config {
     pub fn with_control_endpoint(mut self, endpoint: impl Into<String>) -> Result<Self, C2ConfigError> {
         let endpoint = endpoint.into();
         validate_control_endpoint(&endpoint)?;
-        if self.nodes.iter().any(|node| node.endpoint.eq_ignore_ascii_case(&endpoint)) {
+        if self.nodes.iter().any(|node| endpoints_equal(&node.endpoint, &endpoint)) {
             return Err(C2ConfigError::ControlEndpointConflict);
         }
         self.control_endpoint = endpoint;
@@ -124,13 +176,63 @@ impl C2Config {
 }
 
 fn validate_control_endpoint(endpoint: &str) -> Result<(), C2ConfigError> {
-    if !endpoint.starts_with(r"\\.\pipe\") || endpoint.len() <= r"\\.\pipe\".len()
-        || endpoint.len() > MAX_C2_ENDPOINT_BYTES
-    {
+    if !valid_local_endpoint(endpoint) {
         return Err(C2ConfigError::InvalidControlEndpoint);
     }
     Ok(())
 }
+
+fn parse_node_endpoint(endpoint: &str) -> Option<(String, C2NodeRoute)> {
+    if let Some(authority) = endpoint.strip_prefix("tcp://") {
+        let address = authority.parse::<SocketAddr>().ok()?;
+        let is_exact_loopback = match address.ip() {
+            std::net::IpAddr::V4(ip) => ip == std::net::Ipv4Addr::LOCALHOST,
+            std::net::IpAddr::V6(ip) => ip == std::net::Ipv6Addr::LOCALHOST,
+        };
+        if !is_exact_loopback || address.port() == 0 {
+            return None;
+        }
+        return Some((format!("tcp://{address}"), C2NodeRoute::SshForwardedLoopback(address)));
+    }
+    if endpoint.contains("://") || !valid_local_endpoint(endpoint) {
+        return None;
+    }
+    Some((endpoint.to_owned(), C2NodeRoute::Local))
+}
+
+#[cfg(windows)]
+fn valid_local_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with(r"\\.\pipe\") && endpoint.len() > r"\\.\pipe\".len()
+        && endpoint.len() <= MAX_C2_ENDPOINT_BYTES
+}
+
+#[cfg(unix)]
+fn valid_local_endpoint(endpoint: &str) -> bool {
+    validate_unix_endpoint(Path::new(endpoint)).is_ok()
+}
+
+#[cfg(unix)]
+fn validate_unix_endpoint(endpoint: &Path) -> Result<(), ()> {
+    const MAX_UNIX_ENDPOINT_BYTES: usize = 103;
+    use std::os::unix::ffi::OsStrExt;
+
+    if !endpoint.is_absolute() || endpoint.file_name().is_none()
+        || endpoint.as_os_str().as_bytes().len() > MAX_UNIX_ENDPOINT_BYTES
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn endpoint_key(endpoint: &str) -> String {
+    if endpoint.starts_with("tcp://") { endpoint.to_owned() } else { endpoint.to_ascii_lowercase() }
+}
+
+#[cfg(unix)]
+fn endpoint_key(endpoint: &str) -> String { endpoint.to_owned() }
+
+fn endpoints_equal(left: &str, right: &str) -> bool { endpoint_key(left) == endpoint_key(right) }
 
 fn validate_token(token: &str) -> Result<(), C2ConfigError> {
     if token.is_empty() || token.len() > 4096 || !token.bytes().all(|byte| matches!(byte, 0x21..=0x7e)) {
@@ -143,7 +245,8 @@ fn validate_token(token: &str) -> Result<(), C2ConfigError> {
 pub enum C2ConfigError {
     #[error("C2 tokens must contain 1..=4096 visible ASCII bytes without whitespace")]
     InvalidToken,
-    #[error("node '{0}' has an invalid Windows named-pipe endpoint")]
+    #[cfg_attr(windows, error("node '{0}' requires a bounded Windows named pipe or exact loopback TCP endpoint"))]
+    #[cfg_attr(unix, error("node '{0}' requires a bounded local socket or exact loopback TCP endpoint"))]
     InvalidEndpoint(NodeId),
     #[error("C2 API listen address must be loopback: {0}")]
     NonLoopback(SocketAddr),
@@ -151,12 +254,16 @@ pub enum C2ConfigError {
     NodeCount(usize),
     #[error("C2 node IDs must be unique")]
     DuplicateNode,
-    #[error("C2 named-pipe endpoints must be unique")]
+    #[error("C2 node endpoints must be unique")]
     DuplicateEndpoint,
-    #[error("C2 control endpoint must be a bounded local Windows named pipe")]
+    #[cfg_attr(windows, error("C2 control endpoint must be a bounded local Windows named pipe"))]
+    #[cfg_attr(unix, error("C2 control endpoint must be a bounded local endpoint"))]
     InvalidControlEndpoint,
     #[error("C2 control endpoint must not equal a configured node endpoint")]
     ControlEndpointConflict,
+    #[cfg(unix)]
+    #[error("C2 default runtime endpoint is unavailable: {0}")]
+    RuntimeEndpoint(String),
 }
 
 type RelayResult = Result<RoutedNodeResponse, C2RelayFailure>;
@@ -254,6 +361,7 @@ pub struct C2Running {
 
 impl C2Running {
     pub async fn start(config: C2Config) -> Result<Self, C2Error> {
+        prepare_default_control_parent(&config.control_endpoint)?;
         let listener = TcpListener::bind(config.api_listen).await?;
         let api_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -269,6 +377,21 @@ impl C2Running {
     }
 }
 
+#[cfg(windows)]
+fn prepare_default_control_parent(_endpoint: &str) -> io::Result<()> { Ok(()) }
+
+#[cfg(unix)]
+fn prepare_default_control_parent(endpoint: &str) -> io::Result<()> {
+    let default = default_c2_control_endpoint()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    if endpoint != default { return Ok(()); }
+    let parent = Path::new(endpoint).parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "default C2 endpoint has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+}
+
 impl Drop for C2Running {
     fn drop(&mut self) {
         self.shutdown.shutdown();
@@ -279,7 +402,7 @@ impl Drop for C2Running {
 async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<(), C2Error> {
     let now = unix_ms();
     let nodes = config.nodes.iter().map(|node| (node.node_id.clone(), ObservedNode {
-        endpoint: node.endpoint.clone(), transport_label: "windows-named-pipe".to_owned(),
+        endpoint: node.endpoint.clone(), transport_label: node.transport_label().to_owned(),
         transport: NodeTransportState::Offline, freshness: NodeFreshness::Unavailable,
         cursor: None, inventory: None, last_attempt_unix_ms: None, last_success_unix_ms: None,
         consecutive_failures: 0, last_error: None, gaps: Vec::new(), gaps_truncated: 0,
@@ -336,6 +459,12 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
     tasks.shutdown().await;
     Ok(())
 }
+
+#[cfg(windows)]
+fn local_transport_label() -> &'static str { "windows-named-pipe" }
+
+#[cfg(unix)]
+fn local_transport_label() -> &'static str { "unix-domain-socket" }
 
 #[derive(Clone, Default)]
 struct ProviderContractManifest {
@@ -545,7 +674,14 @@ async fn node_relay_worker(
 }
 
 async fn connect_operator(node: &C2NodeConfig) -> Result<LocalNodeClient, NodeClientError> {
-    LocalNodeClient::connect(&node.endpoint, &node.node_id, ClientRole::Operator, &node.token).await
+    match node.route {
+        C2NodeRoute::Local => {
+            LocalNodeClient::connect(&node.endpoint, &node.node_id, ClientRole::Operator, &node.token).await
+        }
+        C2NodeRoute::SshForwardedLoopback(endpoint) => {
+            LocalNodeClient::connect_loopback(endpoint, &node.node_id, ClientRole::Operator, &node.token).await
+        }
+    }
 }
 
 async fn bounded_node_request(
@@ -1016,6 +1152,13 @@ async fn inventory_owner(
                     }
                     AttemptResult::Cursor { cursor, gaps } => {
                         let previous = node.cursor;
+                        if previous.is_some_and(|previous| {
+                            previous.incarnation_id != cursor.incarnation_id
+                        }) {
+                            if let Some(inventory) = node.inventory.as_mut() {
+                                inventory.provider_runtime_statuses.clear();
+                            }
+                        }
                         node.transport = NodeTransportState::Online;
                         node.freshness = NodeFreshness::Fresh;
                         node.cursor = Some(cursor);
@@ -1182,11 +1325,67 @@ fn unix_ms() -> u64 {
 }
 
 #[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    fn node(endpoint: &str) -> Result<C2NodeConfig, C2ConfigError> {
+        C2NodeConfig::new(NodeId::new("remote-node").unwrap(), endpoint, "safe-token")
+    }
+
+    #[test]
+    fn ssh_forwarded_loopback_route_is_strict_canonical_and_control_stays_local() {
+        let ipv4 = node("tcp://127.0.0.1:48100").unwrap();
+        assert_eq!(ipv4.endpoint, "tcp://127.0.0.1:48100");
+        assert_eq!(ipv4.route, C2NodeRoute::SshForwardedLoopback("127.0.0.1:48100".parse().unwrap()));
+        assert_eq!(ipv4.transport_label(), "ssh-forwarded-loopback");
+
+        let ipv6 = node("tcp://[0:0:0:0:0:0:0:1]:48100").unwrap();
+        assert_eq!(ipv6.endpoint, "tcp://[::1]:48100");
+        assert_eq!(ipv6.transport_label(), "ssh-forwarded-loopback");
+
+        for invalid in [
+            "tcp://localhost:48100",
+            "tcp://127.0.0.2:48100",
+            "tcp://0.0.0.0:48100",
+            "tcp://127.0.0.1:0",
+            "tcp://user@127.0.0.1:48100",
+            "tcp://127.0.0.1:48100/path",
+            "TCP://127.0.0.1:48100",
+        ] {
+            assert!(matches!(node(invalid), Err(C2ConfigError::InvalidEndpoint(_))), "accepted {invalid}");
+        }
+
+        assert!(matches!(
+            C2Config::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "safe-token",
+                vec![ipv4.clone(), C2NodeConfig::new(
+                    NodeId::new("duplicate-route").unwrap(),
+                    "tcp://127.0.0.1:48100",
+                    "safe-token",
+                ).unwrap()],
+            ),
+            Err(C2ConfigError::DuplicateEndpoint)
+        ));
+        assert!(matches!(
+            C2Config::new("127.0.0.1:0".parse().unwrap(), "safe-token", vec![ipv4])
+                .unwrap()
+                .with_control_endpoint("tcp://127.0.0.1:48101"),
+            Err(C2ConfigError::InvalidControlEndpoint)
+        ));
+    }
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use gate4agent_node_protocol::SessionRecordId;
     use gate4agent_types::TerminalSize;
     use std::collections::BTreeMap;
+
+    fn agent(value: &str) -> gate4agent_node_protocol::AgentId {
+        gate4agent_node_protocol::AgentId::new(value).unwrap()
+    }
 
     #[test]
     fn windows_runtime_default_control_endpoint_is_exact_valid_and_distinct_from_a_node() {
@@ -1388,17 +1587,18 @@ mod tests {
         let snapshot = NodeSnapshot {
             node_id: node_id.clone(),
             enabled_providers: Vec::new(),
+            provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
         };
         let cursor = NodeCursor { incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([1; 16]), sequence: 0 };
         let old_manifest = ProviderContractManifest {
             provider_contracts: vec![crate::protocol::ProviderContractSupport {
-                provider: gate4agent_node_protocol::AgentProvider::Codex,
+                provider: agent("codex"),
                 revision: crate::protocol::ProviderContractRevision::new("old-contract").unwrap(),
             }],
             provider_adapter_contracts: vec![crate::protocol::ProviderAdapterContractSupport {
-                provider: gate4agent_node_protocol::AgentProvider::Codex,
+                provider: agent("codex"),
                 family: crate::protocol::AdapterFamily::PtySemantic,
                 adapter_id: crate::protocol::AdapterId::new("codex").unwrap(),
                 revision: crate::protocol::AdapterContractRevision::new("old-adapter").unwrap(),
@@ -1435,7 +1635,7 @@ mod tests {
         assert_eq!(status_rx.borrow().nodes[&node_id].transport, NodeTransportState::Parked);
         let replacement_manifest = ProviderContractManifest {
             provider_contracts: vec![crate::protocol::ProviderContractSupport {
-                provider: gate4agent_node_protocol::AgentProvider::Claude,
+                provider: agent("claude"),
                 revision: crate::protocol::ProviderContractRevision::new("new-contract").unwrap(),
             }],
             provider_adapter_contracts: Vec::new(),
@@ -1455,7 +1655,7 @@ mod tests {
         assert_eq!(status_rx.borrow().nodes[&node_id].freshness, NodeFreshness::Fresh);
         let recovered_inventory = status_rx.borrow().nodes[&node_id].inventory.as_ref().unwrap().clone();
         assert_eq!(recovered_inventory.provider_contracts.len(), 1);
-        assert_eq!(recovered_inventory.provider_contracts[0].provider, gate4agent_node_protocol::AgentProvider::Claude);
+        assert_eq!(recovered_inventory.provider_contracts[0].provider, agent("claude"));
         assert_eq!(recovered_inventory.provider_contracts[0].revision.as_str(), "new-contract");
         assert!(recovered_inventory.provider_adapter_contracts.is_empty());
         ingress_tx.send(Attempt {
@@ -1469,6 +1669,7 @@ mod tests {
                 snapshot: NodeSnapshot {
                     node_id: node_id.clone(),
                     enabled_providers: Vec::new(),
+                    provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
                     workspaces: Vec::new(),
                     session_records: Vec::new(),
                 },
@@ -1481,6 +1682,171 @@ mod tests {
         assert!(unpublished.provider_contracts.is_empty());
         assert!(unpublished.provider_adapter_contracts.is_empty());
         shutdown_tx.send(true).unwrap();
+        owner.await.unwrap().unwrap();
+    }
+
+    fn runtime_statuses(
+        provider: gate4agent_node_protocol::AgentId,
+        version: &str,
+    ) -> crate::protocol::ProviderRuntimeStatuses {
+        crate::protocol::ProviderRuntimeStatuses::new([
+            crate::protocol::ProviderRuntimeStatus::raw_passthrough(
+                provider,
+                Some(crate::protocol::ProviderRuntimeVersion::new(version).unwrap()),
+            ),
+        ])
+        .unwrap()
+    }
+
+    async fn runtime_inventory_owner() -> (
+        NodeId,
+        mpsc::Sender<Attempt>,
+        watch::Receiver<Arc<StatusResponse>>,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let node_id = NodeId::new("runtime-node").unwrap();
+        let nodes = BTreeMap::from([(
+            node_id.clone(),
+            ObservedNode {
+                endpoint: r"\\.\pipe\runtime-node".to_owned(),
+                transport_label: "windows-named-pipe".to_owned(),
+                transport: NodeTransportState::Offline,
+                freshness: NodeFreshness::Unavailable,
+                cursor: None,
+                inventory: None,
+                last_attempt_unix_ms: None,
+                last_success_unix_ms: None,
+                consecutive_failures: 0,
+                last_error: None,
+                gaps: Vec::new(),
+                gaps_truncated: 0,
+            },
+        )]);
+        let initial = Arc::new(StatusResponse {
+            api_version: C2_API_VERSION,
+            ready: false,
+            observed_at_unix_ms: unix_ms(),
+            nodes,
+        });
+        let (status_tx, status_rx) = watch::channel(initial);
+        let (ingress_tx, ingress_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = tokio::spawn(inventory_owner(
+            1,
+            Duration::from_secs(1),
+            ingress_rx,
+            status_tx,
+            shutdown_rx,
+        ));
+        (node_id, ingress_tx, status_rx, shutdown_tx, owner)
+    }
+
+    #[tokio::test]
+    async fn incarnation_change_replaces_runtime_status() {
+        let (node_id, ingress, mut status, shutdown, owner) = runtime_inventory_owner().await;
+        for (incarnation, provider, version) in [
+            (1, agent("claude"), "1.0.0"),
+            (2, agent("codex"), "2.0.0"),
+        ] {
+            ingress
+                .send(Attempt {
+                    node_id: node_id.clone(),
+                    at_unix_ms: unix_ms(),
+                    result: AttemptResult::Connected {
+                        cursor: NodeCursor {
+                            incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([
+                                incarnation;
+                                16
+                            ]),
+                            sequence: 0,
+                        },
+                        snapshot: NodeSnapshot {
+                            node_id: node_id.clone(),
+                            enabled_providers: vec![provider.clone()],
+                            provider_runtime_statuses: runtime_statuses(provider, version),
+                            workspaces: Vec::new(),
+                            session_records: Vec::new(),
+                        },
+                        gaps: Vec::new(),
+                        provider_contract_manifest: ProviderContractManifest::default(),
+                    },
+                })
+                .await
+                .unwrap();
+            status.changed().await.unwrap();
+        }
+        let current_status = status.borrow();
+        let statuses = &current_status.nodes[&node_id]
+            .inventory
+            .as_ref()
+            .unwrap()
+            .provider_runtime_statuses;
+        assert_eq!(statuses.as_slice().len(), 1);
+        assert_eq!(
+            statuses.as_slice()[0].provider(),
+            &agent("codex"),
+        );
+        assert_eq!(statuses.as_slice()[0].version().unwrap().as_str(), "2.0.0");
+        shutdown.send(true).unwrap();
+        owner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn incarnation_change_without_snapshot_clears_dynamic_inventory() {
+        let (node_id, ingress, mut status, shutdown, owner) = runtime_inventory_owner().await;
+        ingress
+            .send(Attempt {
+                node_id: node_id.clone(),
+                at_unix_ms: unix_ms(),
+                result: AttemptResult::Connected {
+                    cursor: NodeCursor {
+                        incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([
+                            3; 16
+                        ]),
+                        sequence: 0,
+                    },
+                    snapshot: NodeSnapshot {
+                        node_id: node_id.clone(),
+                        enabled_providers: vec![agent("claude")],
+                        provider_runtime_statuses: runtime_statuses(
+                            agent("claude"),
+                            "3.0.0",
+                        ),
+                        workspaces: Vec::new(),
+                        session_records: Vec::new(),
+                    },
+                    gaps: Vec::new(),
+                    provider_contract_manifest: ProviderContractManifest::default(),
+                },
+            })
+            .await
+            .unwrap();
+        status.changed().await.unwrap();
+        ingress
+            .send(Attempt {
+                node_id: node_id.clone(),
+                at_unix_ms: unix_ms(),
+                result: AttemptResult::Cursor {
+                    cursor: NodeCursor {
+                        incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([
+                            4; 16
+                        ]),
+                        sequence: 0,
+                    },
+                    gaps: vec![GapKind::IncarnationChanged],
+                },
+            })
+            .await
+            .unwrap();
+        status.changed().await.unwrap();
+        assert!(status.borrow().nodes[&node_id]
+            .inventory
+            .as_ref()
+            .unwrap()
+            .provider_runtime_statuses
+            .is_empty());
+        shutdown.send(true).unwrap();
         owner.await.unwrap().unwrap();
     }
 }

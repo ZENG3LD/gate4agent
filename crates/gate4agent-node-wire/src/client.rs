@@ -1,46 +1,55 @@
 use gate4agent_node_protocol::{
+    provider_id_is_legacy,
     production_node_client_compatibility_offer,
     read_json_frame_limited_body_timeout, validate_provider_contract_manifest,
     write_json_frame_limited, CapabilityId,
     ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
     FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure, NodeHello,
-    NodeId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope,
+    NodeId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope, WorkspaceSnapshot,
     ServerChallenge, ServerFrame,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
+    NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
 use crate::{
     connect_local_stream, negotiated_auth_proof, proofs_match, random_nonce, AuthDirection,
-    LocalClientStream,
 };
 #[cfg(test)]
 use gate4agent_node_protocol::{
     NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3,
 };
 #[cfg(test)]
 use crate::auth_proof;
 use std::collections::VecDeque;
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 #[cfg(feature = "fixture")]
 use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 
+trait NodeClientStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> NodeClientStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
 pub struct LocalNodeClient {
-    pipe: LocalClientStream,
+    pipe: Box<dyn NodeClientStream>,
     hello: NodeHello,
     opaque_unix_paths_enabled: bool,
     repository_paths_enabled: bool,
+    open_provider_ids_enabled: bool,
     negotiated_capabilities: Vec<CapabilityId>,
     next_request_id: u64,
     pending_events: VecDeque<NodeEventEnvelope>,
@@ -53,7 +62,32 @@ impl LocalNodeClient {
         role: ClientRole,
         access_token: &str,
     ) -> Result<Self, NodeClientError> {
-        let mut pipe = connect_local_stream(endpoint).await?;
+        let pipe = connect_local_stream(endpoint).await?;
+        Self::connect_stream(Box::new(pipe), expected_node_id, role, access_token).await
+    }
+
+    pub async fn connect_loopback(
+        endpoint: SocketAddr,
+        expected_node_id: &NodeId,
+        role: ClientRole,
+        access_token: &str,
+    ) -> Result<Self, NodeClientError> {
+        if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+            return Err(NodeClientError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "node TCP endpoint must be loopback with a nonzero port",
+            )));
+        }
+        let stream = TcpStream::connect(endpoint).await?;
+        Self::connect_stream(Box::new(stream), expected_node_id, role, access_token).await
+    }
+
+    async fn connect_stream(
+        mut pipe: Box<dyn NodeClientStream>,
+        expected_node_id: &NodeId,
+        role: ClientRole,
+        access_token: &str,
+    ) -> Result<Self, NodeClientError> {
         let client_nonce = random_nonce().map_err(NodeClientError::Authentication)?;
         let compatibility_offer = client_compatibility_offer()?;
         write_json_frame_limited(
@@ -137,7 +171,11 @@ impl LocalNodeClient {
         let negotiated_capabilities = hello.compatibility.as_ref()
             .map(|compatibility| compatibility.capabilities.clone())
             .unwrap_or_default();
+        let open_provider_ids_enabled = selected_supports_open_provider_ids(
+            hello.compatibility.as_ref(),
+        );
         ensure_node_hello_path_capability(&hello, opaque_unix_paths_enabled)?;
+        ensure_node_hello_provider_capability(&hello, open_provider_ids_enabled)?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
                 "node identity mismatch: expected '{}', received '{}'",
@@ -150,6 +188,7 @@ impl LocalNodeClient {
             hello,
             opaque_unix_paths_enabled,
             repository_paths_enabled,
+            open_provider_ids_enabled,
             negotiated_capabilities,
             next_request_id: 1,
             pending_events: VecDeque::new(),
@@ -166,6 +205,7 @@ impl LocalNodeClient {
             &request,
             self.opaque_unix_paths_enabled,
             self.repository_paths_enabled,
+            self.open_provider_ids_enabled,
             &self.negotiated_capabilities,
         )?;
         write_json_frame_limited(
@@ -193,6 +233,7 @@ impl LocalNodeClient {
             self.opaque_unix_paths_enabled,
             self.repository_paths_enabled,
         )?;
+        ensure_server_frame_provider_capability(&frame, self.open_provider_ids_enabled)?;
         Ok(frame)
     }
 
@@ -257,11 +298,22 @@ fn selected_supports_repository_paths(
     })
 }
 
+fn selected_supports_open_provider_ids(
+    selected: Option<&NegotiatedNodeCompatibility>,
+) -> bool {
+    selected.is_some_and(|compatibility| {
+        compatibility.capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_PROVIDER_ID_OPEN_CAPABILITY
+        })
+    })
+}
+
 fn reserve_request_id(
     next_request_id: &mut u64,
     request: &NodeRequest,
     opaque_unix_paths_enabled: bool,
     repository_paths_enabled: bool,
+    open_provider_ids_enabled: bool,
     negotiated_capabilities: &[CapabilityId],
 ) -> Result<u64, NodeClientError> {
     ensure_node_request_required_capability(request, negotiated_capabilities)?;
@@ -270,6 +322,7 @@ fn reserve_request_id(
         opaque_unix_paths_enabled,
         repository_paths_enabled,
     )?;
+    ensure_node_request_provider_capability(request, open_provider_ids_enabled)?;
     let request_id = *next_request_id;
     *next_request_id = next_request_id
         .checked_add(1)
@@ -350,6 +403,60 @@ fn ensure_server_frame_path_capability(
     )
 }
 
+fn ensure_node_hello_provider_capability(
+    hello: &NodeHello,
+    open_provider_ids_enabled: bool,
+) -> Result<(), NodeClientError> {
+    ensure_inbound_open_provider_capability(
+        node_snapshot_contains_open_provider_id(&hello.snapshot),
+        open_provider_ids_enabled,
+    )
+}
+
+fn ensure_node_request_provider_capability(
+    request: &NodeRequest,
+    open_provider_ids_enabled: bool,
+) -> Result<(), NodeClientError> {
+    if let NodeRequest::Spawn { provider, .. } = request {
+        ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
+    }
+    Ok(())
+}
+
+fn ensure_outbound_provider_id_capability(
+    provider: &gate4agent_node_protocol::AgentId,
+    open_provider_ids_enabled: bool,
+) -> Result<(), NodeClientError> {
+    if !provider_id_is_legacy(provider) && !open_provider_ids_enabled {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_PROVIDER_ID_OPEN_CAPABILITY.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_server_frame_provider_capability(
+    frame: &ServerFrame,
+    open_provider_ids_enabled: bool,
+) -> Result<(), NodeClientError> {
+    ensure_inbound_open_provider_capability(
+        server_frame_contains_open_provider_id(frame),
+        open_provider_ids_enabled,
+    )
+}
+
+fn ensure_inbound_open_provider_capability(
+    contains_open_provider_id: bool,
+    open_provider_ids_enabled: bool,
+) -> Result<(), NodeClientError> {
+    if contains_open_provider_id && !open_provider_ids_enabled {
+        return Err(NodeClientError::Protocol(
+            "node sent an open provider ID without negotiating the capability".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_opaque_unix_path_capability(
     contains_opaque_unix_path: bool,
     opaque_unix_paths_enabled: bool,
@@ -406,6 +513,80 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::Stop { .. }
         | NodeRequest::Remove { .. }
         | NodeRequest::Shutdown => false,
+    }
+}
+
+fn server_frame_contains_open_provider_id(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Hello(hello) => node_snapshot_contains_open_provider_id(&hello.snapshot),
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(
+            node_response_contains_open_provider_id,
+        ),
+        ServerFrame::Event(event) => node_event_contains_open_provider_id(&event.event),
+        ServerFrame::Challenge(_) => false,
+    }
+}
+
+fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => {
+            node_snapshot_contains_open_provider_id(snapshot)
+        }
+        NodeResponse::Resync { snapshot, events, .. } => {
+            node_snapshot_contains_open_provider_id(snapshot)
+                || events.iter().any(|event| {
+                    node_event_contains_open_provider_id(&event.event)
+                })
+        }
+        NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::SessionRecordResumed { record, .. } => {
+            !provider_id_is_legacy(&record.provider)
+        }
+        NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::WorktreeCreated { workspace, .. } => {
+            workspace_contains_open_provider_id(workspace)
+        }
+        NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::Controller { .. }
+        | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::WorkspaceUnregistered { .. }
+        | NodeResponse::WorktreeRemoved { .. }
+        | NodeResponse::Accepted
+        | NodeResponse::ShuttingDown => false,
+    }
+}
+
+fn node_snapshot_contains_open_provider_id(snapshot: &NodeSnapshot) -> bool {
+    snapshot.enabled_providers.iter().any(|provider| {
+        !provider_id_is_legacy(provider)
+    }) || snapshot.provider_runtime_statuses.iter().any(|status| {
+        !provider_id_is_legacy(status.provider())
+    }) || snapshot.session_records.iter().any(|record| {
+        !provider_id_is_legacy(&record.provider)
+    }) || snapshot.workspaces.iter().any(workspace_contains_open_provider_id)
+}
+
+fn workspace_contains_open_provider_id(workspace: &WorkspaceSnapshot) -> bool {
+    workspace.sessions.iter().any(|session| {
+        !provider_id_is_legacy(&session.agent_id)
+    })
+}
+
+fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
+    match event {
+        NodeEvent::WorkspaceAdded { workspace } => {
+            workspace_contains_open_provider_id(workspace)
+        }
+        NodeEvent::SessionRecordUpserted { record } => {
+            !provider_id_is_legacy(&record.provider)
+        }
+        NodeEvent::Control { .. }
+        | NodeEvent::ControllerChanged { .. }
+        | NodeEvent::WorkspaceRemoved { .. }
+        | NodeEvent::SessionRecordRemoved { .. }
+        | NodeEvent::ResyncRequired { .. } => false,
     }
 }
 
@@ -646,6 +827,20 @@ fn validate_selected_compatibility(
             "node omitted the required compatibility metadata capability".to_owned(),
         ));
     }
+    let open_provider_ids_selected = selected.capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_PROVIDER_ID_OPEN_CAPABILITY
+    });
+    if !open_provider_ids_selected
+        && (selected.provider_contracts.iter().any(|contract| {
+            !provider_id_is_legacy(&contract.provider)
+        }) || selected.provider_adapter_contracts.iter().any(|contract| {
+            !provider_id_is_legacy(&contract.provider)
+        }))
+    {
+        return Err(NodeClientError::Protocol(
+            "node published an open provider ID without negotiating the capability".to_owned(),
+        ));
+    }
     let provider_manifest_selected = selected.capabilities.iter().any(|capability| {
         capability.as_str() == NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY
     });
@@ -704,15 +899,25 @@ pub enum NodeClientError {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        AdapterContractRevision, AdapterFamily, AdapterId, AgentProvider, ArchitectureId,
+        AdapterContractRevision, AdapterFamily, AdapterId, AgentId, ArchitectureId,
         GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, HostDescriptor, LocalTransportKind,
         ManagedSessionRecord, ManagedSessionState, NodeCompatibilitySupport, OpaqueHostPath,
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
-        RepositoryPath, ResponseEnvelope, SessionMode, SessionRecordId, WorkspaceEntry,
+        ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
+        SessionMode, SessionRecordId, WorkspaceEntry,
         WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
         WorkspaceInspection, WorkspaceSnapshot,
     };
+    use gate4agent_types::{
+        AgentInstanceId, CapabilitySnapshot, ForegroundSnapshot, HistorySnapshot,
+        ProviderSnapshot, ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
+        TransportKind,
+    };
+
+    fn agent(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
 
     fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
         let offer = ClientCompatibilityOffer {
@@ -768,11 +973,33 @@ mod tests {
         }
     }
 
+    fn session_snapshot(provider: &str) -> SessionSnapshot {
+        SessionSnapshot {
+            instance_id: AgentInstanceId(7),
+            agent_id: agent(provider),
+            transport: TransportKind::Pty,
+            generation: SessionGeneration(2),
+            status: SessionStatus::Running,
+            pending_operation: None,
+            pending_input: None,
+            process_id: None,
+            terminal_size: None,
+            terminal_frame: None,
+            terminal_stale: None,
+            session_options: None,
+            capabilities: CapabilitySnapshot::default(),
+            history: HistorySnapshot::default(),
+            resume: ResumeSnapshot::default(),
+            foreground: ForegroundSnapshot::default(),
+            provider: ProviderSnapshot::default(),
+        }
+    }
+
     fn session_record_with_path(canonical_root: OpaqueHostPath) -> ManagedSessionRecord {
         ManagedSessionRecord {
             record_id: SessionRecordId::new("session-a").unwrap(),
             display_name: "session a".to_owned(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
@@ -804,6 +1031,7 @@ mod tests {
         NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
             enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
         }
@@ -830,8 +1058,12 @@ mod tests {
     }
 
     #[test]
-    fn client_offer_accepts_durable_state_schema_v1_through_v2() {
+    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v3() {
         let offer = client_compatibility_offer().unwrap();
+        assert_eq!(
+            offer.protocol_versions,
+            ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+        );
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
         ));
@@ -844,9 +1076,12 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
-            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2).unwrap(),
+            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3).unwrap(),
         );
     }
 
@@ -927,7 +1162,7 @@ mod tests {
     fn selected_manifest_requires_capability_and_valid_provider_linkage() {
         let (offer, mut selected) = negotiated_fixture();
         selected.provider_contracts.push(ProviderContractSupport {
-            provider: AgentProvider::Codex,
+            provider: agent("codex"),
             revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
         });
         assert!(matches!(
@@ -942,7 +1177,7 @@ mod tests {
         offer.capabilities.push(manifest_capability.clone());
         selected.capabilities.push(manifest_capability);
         selected.provider_adapter_contracts.push(ProviderAdapterContractSupport {
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             family: AdapterFamily::PtySemantic,
             adapter_id: AdapterId::new("claude-code").unwrap(),
             revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
@@ -962,11 +1197,11 @@ mod tests {
         offer.capabilities.push(manifest_capability.clone());
         selected.capabilities.push(manifest_capability);
         selected.provider_contracts.push(ProviderContractSupport {
-            provider: AgentProvider::Codex,
+            provider: agent("codex"),
             revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
         });
         selected.provider_adapter_contracts.push(ProviderAdapterContractSupport {
-            provider: AgentProvider::Codex,
+            provider: agent("codex"),
             family: AdapterFamily::PtySemantic,
             adapter_id: AdapterId::new("codex-cli").unwrap(),
             revision: AdapterContractRevision::new("pty-semantic-v1").unwrap(),
@@ -1056,6 +1291,128 @@ mod tests {
     }
 
     #[test]
+    fn open_provider_gate_requires_explicit_authenticated_selection() {
+        let (_, mut selected) = negotiated_fixture();
+        assert!(!selected_supports_open_provider_ids(None));
+        assert!(!selected_supports_open_provider_ids(Some(&selected)));
+
+        selected.capabilities.push(
+            CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+        );
+        assert!(selected_supports_open_provider_ids(Some(&selected)));
+    }
+
+    #[test]
+    fn outbound_open_provider_gate_preserves_all_legacy_ids() {
+        for provider in [agent("claude"), agent("codex"), agent("kimi")] {
+            assert!(ensure_outbound_provider_id_capability(&provider, false).is_ok());
+        }
+        let error = ensure_outbound_provider_id_capability(&agent("qwen"), false)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeClientError::UnsupportedCapability(capability)
+                if capability == NODE_PROVIDER_ID_OPEN_CAPABILITY
+        ));
+        assert!(ensure_outbound_provider_id_capability(&agent("qwen"), true).is_ok());
+    }
+
+    #[test]
+    fn inbound_open_provider_payloads_require_the_authenticated_capability() {
+        let mut snapshot = empty_snapshot();
+        snapshot.enabled_providers.push(agent("qwen"));
+        assert!(ensure_node_hello_provider_capability(
+            &hello_with_snapshot(snapshot.clone()),
+            false,
+        )
+        .is_err());
+        assert!(ensure_node_hello_provider_capability(
+            &hello_with_snapshot(snapshot),
+            true,
+        )
+        .is_ok());
+
+        let mut runtime_snapshot = empty_snapshot();
+        runtime_snapshot.provider_runtime_statuses = ProviderRuntimeStatuses::new([
+            ProviderRuntimeStatus::unavailable(agent("grok")),
+        ])
+        .unwrap();
+        assert!(ensure_node_hello_provider_capability(
+            &hello_with_snapshot(runtime_snapshot),
+            false,
+        )
+        .is_err());
+
+        let mut record = session_record_with_path(utf8_path());
+        record.provider = agent("qwen");
+        let reply = response_frame(NodeResponse::SessionRecordUpdated {
+            record: record.clone(),
+        });
+        assert!(ensure_server_frame_provider_capability(&reply, false).is_err());
+        let event = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 1,
+            event: NodeEvent::SessionRecordUpserted { record },
+        });
+        assert!(ensure_server_frame_provider_capability(&event, false).is_err());
+        assert!(ensure_server_frame_provider_capability(&event, true).is_ok());
+
+        let mut open_workspace = workspace_with_path(utf8_path());
+        open_workspace.sessions.push(session_snapshot("qwen-code"));
+        let mut nested_snapshot = empty_snapshot();
+        nested_snapshot.workspaces.push(open_workspace.clone());
+        let nested_frames = [
+            ServerFrame::Hello(hello_with_snapshot(nested_snapshot)),
+            ServerFrame::Event(NodeEventEnvelope {
+                sequence: 2,
+                event: NodeEvent::WorkspaceAdded {
+                    workspace: open_workspace.clone(),
+                },
+            }),
+            response_frame(NodeResponse::WorkspaceRegistered {
+                workspace: open_workspace.clone(),
+            }),
+            response_frame(NodeResponse::WorktreeCreated {
+                worktree: worktree_with_path(utf8_path()),
+                workspace: open_workspace,
+            }),
+        ];
+        for frame in nested_frames {
+            assert!(ensure_server_frame_provider_capability(&frame, false).is_err());
+            assert!(ensure_server_frame_provider_capability(&frame, true).is_ok());
+        }
+
+        let mut legacy_workspace = workspace_with_path(utf8_path());
+        legacy_workspace.sessions.push(session_snapshot("claude"));
+        let legacy_frame = response_frame(NodeResponse::WorkspaceRegistered {
+            workspace: legacy_workspace,
+        });
+        assert!(ensure_server_frame_provider_capability(&legacy_frame, false).is_ok());
+    }
+
+    #[test]
+    fn selected_open_provider_manifest_requires_the_open_id_capability() {
+        let (mut offer, mut selected) = negotiated_fixture();
+        let manifest_capability =
+            CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
+        offer.capabilities.push(manifest_capability.clone());
+        selected.capabilities.push(manifest_capability);
+        selected.provider_contracts.push(ProviderContractSupport {
+            provider: agent("qwen"),
+            revision: ProviderContractRevision::new("qwen.2026-08").unwrap(),
+        });
+        assert!(matches!(
+            validate_selected_compatibility(&offer, &selected),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("open provider ID")
+        ));
+
+        let open_capability = CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap();
+        offer.capabilities.push(open_capability.clone());
+        selected.capabilities.push(open_capability);
+        assert!(validate_selected_compatibility(&offer, &selected).is_ok());
+    }
+
+    #[test]
     fn unnegotiated_workspace_file_read_is_rejected_before_consuming_a_request_id() {
         let request = NodeRequest::ReadWorkspaceFile {
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
@@ -1066,6 +1423,7 @@ mod tests {
         let error = reserve_request_id(
             &mut next_request_id,
             &request,
+            false,
             false,
             false,
             &no_capabilities,
@@ -1084,6 +1442,7 @@ mod tests {
         let request_id = reserve_request_id(
             &mut next_request_id,
             &request,
+            false,
             false,
             false,
             &file_read_capabilities,

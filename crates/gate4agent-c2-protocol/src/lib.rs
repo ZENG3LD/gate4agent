@@ -1,21 +1,24 @@
 //! Stable, serde-only inventory and control contract for Gate4Agent C2.
 
 pub use gate4agent_node_protocol::{
-    AdapterContractRevision, AdapterFamily, AdapterId, ArchitectureId, CapabilityId,
+    AdapterContractRevision, AdapterFamily, AdapterId, AgentId, ArchitectureId, CapabilityId,
     ClientCompatibilityOffer, HostDescriptor,
-    NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
+    provider_id_is_legacy, NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
     ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
+    ProviderRuntimeContractId, ProviderRuntimeMode, ProviderRuntimeStatus,
+    ProviderRuntimeStatuses, ProviderRuntimeVersion,
+    NODE_PROVIDER_ID_OPEN_CAPABILITY,
     RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     ProtocolNegotiationError, ProtocolRange,
 };
 use gate4agent_node_protocol::{
-    AgentProvider, ManagedSessionRecord, ManagedSessionState, NodeSnapshot, SessionAddress,
-    SessionMode, SessionRecordId, WorkspaceId,
+    ManagedSessionRecord, ManagedSessionState, NodeSnapshot, SessionAddress, SessionMode,
+    SessionRecordId, WorkspaceId,
 };
 use gate4agent_types::{
-    AgentId, AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity,
-    SessionGeneration, SessionStatus, TerminalFrame, TerminalSize, TransportKind,
+    AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity, SessionGeneration,
+    SessionStatus, TerminalFrame, TerminalSize, TransportKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -33,6 +36,9 @@ pub const C2_WORKSPACE_FILE_READ_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_WORKSPACE_FILE_READ_CAPABILITY;
 pub const C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY;
+pub const C2_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str =
+    gate4agent_node_protocol::NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY;
+pub const C2_PROVIDER_ID_OPEN_CAPABILITY: &str = NODE_PROVIDER_ID_OPEN_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -135,7 +141,7 @@ impl From<&NodeFailure> for C2NodeFailure {
 pub struct C2ManagedSessionRecord {
     pub record_id: SessionRecordId,
     pub display_name: String,
-    pub provider: AgentProvider,
+    pub provider: AgentId,
     pub mode: SessionMode,
     pub state: ManagedSessionState,
     pub workspace_id: WorkspaceId,
@@ -150,7 +156,7 @@ impl From<&ManagedSessionRecord> for C2ManagedSessionRecord {
         Self {
             record_id: record.record_id.clone(),
             display_name: record.display_name.clone(),
-            provider: record.provider,
+            provider: record.provider.clone(),
             mode: record.mode,
             state: record.state,
             workspace_id: record.workspace_id.clone(),
@@ -243,7 +249,9 @@ impl From<&gate4agent_node_protocol::WorkspaceSnapshot> for C2WorkspaceSnapshot 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2NodeSnapshot {
     pub node_id: NodeId,
-    pub enabled_providers: Vec<AgentProvider>,
+    pub enabled_providers: Vec<AgentId>,
+    #[serde(default, skip_serializing_if = "ProviderRuntimeStatuses::is_empty")]
+    pub provider_runtime_statuses: ProviderRuntimeStatuses,
     pub workspaces: Vec<C2WorkspaceSnapshot>,
     pub session_records: Vec<C2ManagedSessionRecord>,
 }
@@ -253,6 +261,7 @@ impl From<&NodeSnapshot> for C2NodeSnapshot {
         Self {
             node_id: snapshot.node_id.clone(),
             enabled_providers: snapshot.enabled_providers.clone(),
+            provider_runtime_statuses: snapshot.provider_runtime_statuses.clone(),
             workspaces: snapshot.workspaces.iter().map(C2WorkspaceSnapshot::from).collect(),
             session_records: snapshot.session_records.iter()
                 .map(C2ManagedSessionRecord::from)
@@ -779,6 +788,8 @@ pub struct C2TopologyNode {
     pub provider_contracts: Vec<ProviderContractSupport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
+    #[serde(default, skip_serializing_if = "ProviderRuntimeStatuses::is_empty")]
+    pub provider_runtime_statuses: ProviderRuntimeStatuses,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -788,28 +799,50 @@ pub struct C2Topology {
 
 impl C2Topology {
     pub fn from_status(status: &StatusResponse) -> Self {
-        Self::from_status_with_provider_contracts(status, true)
+        Self::from_status_with_capabilities(status, true, true)
     }
 
     pub fn from_status_with_provider_contracts(
         status: &StatusResponse,
         include_provider_contracts: bool,
     ) -> Self {
+        Self::from_status_with_capabilities(
+            status,
+            include_provider_contracts,
+            include_provider_contracts,
+        )
+    }
+
+    pub fn from_status_with_capabilities(
+        status: &StatusResponse,
+        include_provider_contracts: bool,
+        include_provider_runtime_status: bool,
+    ) -> Self {
         let nodes = status.nodes.iter().take(MAX_C2_NODES).map(|(node_id, observed)| {
-            let inventory = include_provider_contracts
+            let provider_contract_inventory = include_provider_contracts
                 .then_some(observed.inventory.as_ref())
                 .flatten();
+            let provider_runtime_statuses = if include_provider_runtime_status {
+                observed
+                    .inventory
+                    .as_ref()
+                    .map(|inventory| inventory.provider_runtime_statuses.clone())
+                    .unwrap_or_default()
+            } else {
+                ProviderRuntimeStatuses::default()
+            };
             C2TopologyNode {
                 node_id: node_id.clone(),
                 endpoint: observed.endpoint.clone(),
                 transport: observed.transport,
                 current_incarnation_id: observed.cursor.map(|cursor| cursor.incarnation_id),
-                provider_contracts: inventory
+                provider_contracts: provider_contract_inventory
                     .map(|inventory| inventory.provider_contracts.clone())
                     .unwrap_or_default(),
-                provider_adapter_contracts: inventory
+                provider_adapter_contracts: provider_contract_inventory
                     .map(|inventory| inventory.provider_adapter_contracts.clone())
                     .unwrap_or_default(),
+                provider_runtime_statuses,
             }
         }).collect();
         Self { nodes }
@@ -1095,7 +1128,7 @@ pub struct SlimManagedSessionRecord {
     pub record_id: SessionRecordId,
     pub display_name: String,
     pub display_name_truncated: bool,
-    pub provider: AgentProvider,
+    pub provider: AgentId,
     pub mode: SessionMode,
     pub state: ManagedSessionState,
     pub workspace_id: WorkspaceId,
@@ -1107,7 +1140,9 @@ pub struct SlimManagedSessionRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SlimNodeInventory {
     pub node_id: NodeId,
-    pub enabled_providers: Vec<AgentProvider>,
+    pub enabled_providers: Vec<AgentId>,
+    #[serde(default, skip_serializing_if = "ProviderRuntimeStatuses::is_empty")]
+    pub provider_runtime_statuses: ProviderRuntimeStatuses,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_contracts: Vec<ProviderContractSupport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1128,7 +1163,7 @@ pub struct SlimNodeInventory {
 impl SlimNodeInventory {
     pub fn from_snapshot(snapshot: &NodeSnapshot) -> Self {
         let mut providers = snapshot.enabled_providers.clone();
-        providers.sort_by_key(|provider| provider.agent_id());
+        providers.sort();
         providers.dedup();
         let workspace_count = snapshot.workspaces.len();
         let session_count = snapshot.workspaces.iter().map(|workspace| workspace.sessions.len()).sum();
@@ -1179,6 +1214,7 @@ impl SlimNodeInventory {
         Self {
             node_id: snapshot.node_id.clone(),
             enabled_providers: providers,
+            provider_runtime_statuses: snapshot.provider_runtime_statuses.clone(),
             provider_contracts: Vec::new(),
             provider_adapter_contracts: Vec::new(),
             workspaces,
@@ -1194,7 +1230,7 @@ impl SlimNodeInventory {
 
     pub fn from_c2_snapshot(snapshot: &C2NodeSnapshot) -> Self {
         let mut providers = snapshot.enabled_providers.clone();
-        providers.sort_by_key(|provider| provider.agent_id());
+        providers.sort();
         providers.dedup();
         let workspace_count = snapshot.workspaces.len();
         let session_count = snapshot.workspaces.iter().map(|workspace| workspace.sessions.len()).sum();
@@ -1243,6 +1279,7 @@ impl SlimNodeInventory {
         Self {
             node_id: snapshot.node_id.clone(),
             enabled_providers: providers,
+            provider_runtime_statuses: snapshot.provider_runtime_statuses.clone(),
             provider_contracts: Vec::new(),
             provider_adapter_contracts: Vec::new(),
             workspaces,
@@ -1265,7 +1302,7 @@ impl From<&ManagedSessionRecord> for SlimManagedSessionRecord {
             record_id: record.record_id.clone(),
             display_name,
             display_name_truncated,
-            provider: record.provider,
+            provider: record.provider.clone(),
             mode: record.mode,
             state: record.state,
             workspace_id: record.workspace_id.clone(),
@@ -1284,7 +1321,7 @@ impl From<&C2ManagedSessionRecord> for SlimManagedSessionRecord {
             record_id: record.record_id.clone(),
             display_name,
             display_name_truncated,
-            provider: record.provider,
+            provider: record.provider.clone(),
             mode: record.mode,
             state: record.state,
             workspace_id: record.workspace_id.clone(),
@@ -1385,6 +1422,10 @@ mod tests {
         RepositoryPath::utf8(value.into()).unwrap()
     }
 
+    fn provider(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
     fn fixture_session() -> SessionSnapshot {
         SessionSnapshot {
             instance_id: AgentInstanceId(7),
@@ -1411,7 +1452,7 @@ mod tests {
         ManagedSessionRecord {
             record_id: SessionRecordId::new("session-private").unwrap(),
             display_name: "release shepherd".to_owned(),
-            provider: AgentProvider::Codex,
+            provider: provider("codex"),
             mode: SessionMode::Pty,
             state: ManagedSessionState::Live,
             workspace_id: WorkspaceId::new("primary").unwrap(),
@@ -1497,11 +1538,11 @@ mod tests {
     ) {
         (
             vec![ProviderContractSupport {
-                provider: AgentProvider::Codex,
+                provider: provider("codex"),
                 revision: ProviderContractRevision::new("codex.2026-08").unwrap(),
             }],
             vec![ProviderAdapterContractSupport {
-                provider: AgentProvider::Codex,
+                provider: provider("codex"),
                 family: AdapterFamily::PtySemantic,
                 adapter_id: AdapterId::new("codex").unwrap(),
                 revision: AdapterContractRevision::new("pty-semantic.2026-08").unwrap(),
@@ -1727,6 +1768,7 @@ mod tests {
         let projected = C2NodeSnapshot::from(&NodeSnapshot {
             node_id: NodeId::new("remote-mac").unwrap(),
             enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: vec![WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("repo").unwrap(),
                 canonical_root: host_path("/srv/CaseSensitive/../literal-root"),
@@ -1816,7 +1858,8 @@ mod tests {
     fn slim_inventory_is_deterministic_and_excludes_terminal_history() {
         let snapshot = NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: vec![AgentProvider::Codex, AgentProvider::Claude, AgentProvider::Codex],
+            enabled_providers: vec![provider("codex"), provider("claude"), provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: vec![
                 WorkspaceSnapshot { workspace_id: WorkspaceId::new("z-work").unwrap(), canonical_root: host_path("z"), sessions: Vec::new() },
                 WorkspaceSnapshot {
@@ -1828,7 +1871,7 @@ mod tests {
             session_records: Vec::new(),
         };
         let slim = SlimNodeInventory::from_snapshot(&snapshot);
-        assert_eq!(slim.enabled_providers, vec![AgentProvider::Claude, AgentProvider::Codex]);
+        assert_eq!(slim.enabled_providers, vec![provider("claude"), provider("codex")]);
         assert_eq!(slim.workspaces.keys().map(WorkspaceId::as_str).collect::<Vec<_>>(), vec!["a-work", "z-work"]);
         let session = &slim.workspaces[&WorkspaceId::new("a-work").unwrap()].sessions[0];
         assert_eq!(session.transport, TransportKind::Pty);
@@ -1845,7 +1888,8 @@ mod tests {
     fn slim_inventory_provider_contract_projection_is_exact_and_private() {
         let mut slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: vec![AgentProvider::Codex],
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
         });
@@ -1885,6 +1929,40 @@ mod tests {
     }
 
     #[test]
+    fn c2_projection_omits_path_stdout_stderr_env_and_fallback_reason() {
+        let runtime_statuses = ProviderRuntimeStatuses::new([
+            ProviderRuntimeStatus::raw_passthrough(
+                provider("codex"),
+                Some(ProviderRuntimeVersion::new("0.999.0").unwrap()),
+            ),
+        ])
+        .unwrap();
+        let snapshot = NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: runtime_statuses.clone(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+        };
+        let projected = C2NodeSnapshot::from(&snapshot);
+        let inventory = SlimNodeInventory::from_snapshot(&snapshot);
+        assert_eq!(projected.provider_runtime_statuses, runtime_statuses);
+        assert_eq!(inventory.provider_runtime_statuses, runtime_statuses);
+        for encoded in [
+            serde_json::to_string(&projected).unwrap(),
+            serde_json::to_string(&inventory).unwrap(),
+        ] {
+            assert!(encoded.contains("\"version\":\"0.999.0\""));
+            for forbidden in [
+                "launcher", "executable", "stdout", "stderr", "environment", "fallback",
+                "reason", "arguments",
+            ] {
+                assert!(!encoded.contains(forbidden), "leaked field {forbidden}");
+            }
+        }
+    }
+
+    #[test]
     fn slim_inventory_reports_sessions_hidden_by_workspace_truncation() {
         let mut workspaces = (0..MAX_C2_WORKSPACES_PER_NODE)
             .map(|index| WorkspaceSnapshot {
@@ -1901,6 +1979,7 @@ mod tests {
         let slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
             enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces,
             session_records: Vec::new(),
         });
@@ -1971,7 +2050,8 @@ mod tests {
             provider_contract_manifest();
         let mut inventory = SlimNodeInventory::from_snapshot(&NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: vec![AgentProvider::Codex],
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
         });
@@ -2055,7 +2135,8 @@ mod tests {
                 controller: None,
                 snapshot: NodeSnapshot {
                     node_id: NodeId::new("node-a").unwrap(),
-                    enabled_providers: vec![AgentProvider::Codex],
+                    enabled_providers: vec![provider("codex")],
+                    provider_runtime_statuses: ProviderRuntimeStatuses::default(),
                     workspaces: Vec::new(),
                     session_records: vec![record.clone()],
                 },
@@ -2069,7 +2150,8 @@ mod tests {
                 event_sequence: 5,
                 snapshot: NodeSnapshot {
                     node_id: NodeId::new("node-a").unwrap(),
-                    enabled_providers: vec![AgentProvider::Codex],
+                    enabled_providers: vec![provider("codex")],
+                    provider_runtime_statuses: ProviderRuntimeStatuses::default(),
                     workspaces: Vec::new(),
                     session_records: vec![record.clone()],
                 },
@@ -2244,6 +2326,7 @@ mod tests {
         let projected = C2NodeSnapshot::from(&NodeSnapshot {
             node_id: NodeId::new("remote-linux").unwrap(),
             enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: vec![WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("repo").unwrap(),
                 canonical_root: opaque.clone(),
@@ -2380,7 +2463,8 @@ mod tests {
             controller: None,
             snapshot: NodeSnapshot {
                 node_id: NodeId::new("node-a").unwrap(),
-                enabled_providers: vec![AgentProvider::Codex],
+                enabled_providers: vec![provider("codex")],
+                provider_runtime_statuses: ProviderRuntimeStatuses::default(),
                 workspaces: vec![WorkspaceSnapshot {
                     workspace_id: WorkspaceId::new("primary").unwrap(),
                     canonical_root: host_path(r"C:\workspace"),
@@ -2420,7 +2504,7 @@ mod tests {
         let make_record = |record_id: &str, display_name: String| ManagedSessionRecord {
             record_id: SessionRecordId::new(record_id).unwrap(),
             display_name,
-            provider: AgentProvider::Codex,
+            provider: provider("codex"),
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: WorkspaceId::new("primary").unwrap(),
@@ -2437,7 +2521,8 @@ mod tests {
         };
         let snapshot = NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: vec![AgentProvider::Codex],
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: vec![
                 make_record("session-z", "z".to_owned()),
@@ -2485,7 +2570,7 @@ mod tests {
             .map(|index| ManagedSessionRecord {
                 record_id: SessionRecordId::new(format!("session-{index:03}")).unwrap(),
                 display_name: format!("session {index}"),
-                provider: AgentProvider::Claude,
+                provider: provider("claude"),
                 mode: SessionMode::Inline,
                 state: ManagedSessionState::Unavailable,
                 workspace_id: WorkspaceId::new("primary").unwrap(),
@@ -2500,6 +2585,7 @@ mod tests {
         let slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
             enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records,
         });

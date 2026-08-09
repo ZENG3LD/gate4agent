@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const GIT_STDERR_MAX_BYTES: usize = 4 * 1_024;
 const GIT_LIST_MAX_BYTES: usize = 256 * 1_024;
@@ -74,8 +75,6 @@ async fn run_git_mutation_bounded(
     output_limit: usize,
     timeout_ms: u64,
 ) -> io::Result<GitCommandOutput> {
-    use std::os::windows::process::CommandExt;
-
     let mut command = tokio::process::Command::new("git");
     command
         .arg("--no-pager")
@@ -89,7 +88,12 @@ async fn run_git_mutation_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
     collect_child_output(command, output_limit, timeout_ms).await
 }
 
@@ -100,8 +104,6 @@ async fn run_git_bounded(
     timeout_ms: u64,
     read_only: bool,
 ) -> io::Result<GitCommandOutput> {
-    use std::os::windows::process::CommandExt;
-
     let mut command = tokio::process::Command::new("git");
     command
         .arg("--no-pager")
@@ -118,7 +120,12 @@ async fn run_git_bounded(
     if read_only {
         command.env("GIT_OPTIONAL_LOCKS", "0");
     }
-    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
     collect_child_output(command, output_limit, timeout_ms).await
 }
 
@@ -519,8 +526,11 @@ fn normalized_absent_target(value: &str) -> Result<PathBuf, GitWorktreeError> {
     Ok(normalize_windows_verbatim_path(canonical_parent).join(file_name))
 }
 
+#[cfg(windows)]
 fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
-    let value = path.to_string_lossy();
+    let Some(value) = path.to_str() else {
+        return path;
+    };
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
     } else if let Some(rest) = value.strip_prefix(r"\\?\") {
@@ -528,6 +538,11 @@ fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
     } else {
         path
     }
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn path_to_string(path: &Path) -> Result<String, GitWorktreeError> {
@@ -538,35 +553,89 @@ fn path_to_string(path: &Path) -> Result<String, GitWorktreeError> {
 }
 
 fn dangerous_path(target: &str, repository_root: &str) -> bool {
-    if paths_equal(target, repository_root) {
-        return true;
-    }
     let target_path = Path::new(target);
-    if target_path.parent().is_none() || path_contains(target, repository_root) {
+    let repository_root = Path::new(repository_root);
+    let home = configured_home_directory();
+    dangerous_path_with_home(target_path, repository_root, home.as_deref())
+}
+
+fn dangerous_path_with_home(
+    target: &Path,
+    repository_root: &Path,
+    home: Option<&Path>,
+) -> bool {
+    if native_paths_equal(target, repository_root) {
         return true;
     }
-    std::env::var_os("USERPROFILE")
-        .and_then(|home| home.to_str().map(str::to_owned))
-        .is_some_and(|home| paths_equal(target, &home) || path_contains(target, &home))
+    if target.parent().is_none() || native_path_contains(target, repository_root) {
+        return true;
+    }
+    home.is_some_and(|home| {
+        native_paths_equal(target, home) || native_path_contains(target, home)
+    })
+}
+
+#[cfg(windows)]
+fn configured_home_directory() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn configured_home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 fn path_contains(parent: &str, child: &str) -> bool {
-    let parent = normalized_path_for_compare(parent);
-    let child = normalized_path_for_compare(child);
-    child.len() > parent.len()
-        && child.starts_with(&parent)
-        && child.as_bytes().get(parent.len()) == Some(&b'/')
+    native_path_contains(Path::new(parent), Path::new(child))
 }
 
 pub(crate) fn paths_equal(left: &str, right: &str) -> bool {
-    normalized_path_for_compare(left) == normalized_path_for_compare(right)
+    native_paths_equal(Path::new(left), Path::new(right))
 }
 
-fn normalized_path_for_compare(value: &str) -> String {
-    value
-        .trim_end_matches(['/', '\\'])
-        .replace('\\', "/")
-        .to_ascii_lowercase()
+#[cfg(windows)]
+fn native_path_contains(parent: &Path, child: &Path) -> bool {
+    let (Some(normalized_parent), Some(normalized_child)) = (
+        normalized_path_for_compare(parent),
+        normalized_path_for_compare(child),
+    ) else {
+        return parent != child && child.starts_with(parent);
+    };
+    normalized_child.len() > normalized_parent.len()
+        && normalized_child.starts_with(&normalized_parent)
+        && normalized_child.as_bytes().get(normalized_parent.len()) == Some(&b'/')
+}
+
+#[cfg(not(windows))]
+fn native_path_contains(parent: &Path, child: &Path) -> bool {
+    parent != child && child.starts_with(parent)
+}
+
+#[cfg(windows)]
+fn native_paths_equal(left: &Path, right: &Path) -> bool {
+    match (
+        normalized_path_for_compare(left),
+        normalized_path_for_compare(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+#[cfg(not(windows))]
+fn native_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn normalized_path_for_compare(value: &Path) -> Option<String> {
+    Some(
+        value
+            .to_str()?
+            .trim_end_matches(['/', '\\'])
+            .replace('\\', "/")
+            .to_ascii_lowercase(),
+    )
 }
 
 fn command_result(
@@ -809,6 +878,39 @@ mod tests {
         assert_eq!(parsed[0].path, "C:/repo/line\nfeed");
         assert!(parsed[0].is_main);
         assert!(!parsed[1].is_main);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_comparison_is_case_insensitive_and_separator_agnostic() {
+        assert!(paths_equal(r"C:\Repo\Tree", "c:/repo/tree/"));
+        assert!(path_contains(r"C:\Repo", "c:/repo/tree"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_path_comparison_is_case_sensitive_and_treats_backslash_as_a_name_byte() {
+        assert!(!paths_equal("/srv/Repo", "/srv/repo"));
+        assert!(path_contains("/srv/Repo", "/srv/Repo/tree"));
+        assert!(!path_contains("/srv/repo", "/srv/repo\\tree"));
+    }
+
+    #[test]
+    fn removal_safety_protects_home_and_ancestors_but_not_home_children() {
+        let repository_root = Path::new("D:/repository");
+        let home = Path::new("C:/Users/operator");
+
+        assert!(dangerous_path_with_home(home, repository_root, Some(home)));
+        assert!(dangerous_path_with_home(
+            Path::new("C:/Users"),
+            repository_root,
+            Some(home),
+        ));
+        assert!(!dangerous_path_with_home(
+            Path::new("C:/Users/operator/worktree"),
+            repository_root,
+            Some(home),
+        ));
     }
 
     #[test]

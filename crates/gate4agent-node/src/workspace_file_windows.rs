@@ -4,7 +4,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 
-use crate::protocol::MAX_WORKSPACE_FILE_BYTES;
+use crate::protocol::{RepositoryPath, MAX_WORKSPACE_FILE_BYTES};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
@@ -81,8 +81,11 @@ impl WorkspaceFileReadError {
 /// disabled. The final bytes are read from that same verified handle.
 pub(crate) fn read_workspace_file(
     canonical_root: &Path,
-    repository_path: &str,
+    repository_path: &RepositoryPath,
 ) -> Result<WorkspaceFileBytes, WorkspaceFileReadError> {
+    let repository_path = repository_path.as_utf8().ok_or_else(|| {
+        WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::InvalidPath)
+    })?;
     let components = validate_repository_path(repository_path)?;
     let root = open_verified_root(canonical_root)?;
     let mut parent = root;

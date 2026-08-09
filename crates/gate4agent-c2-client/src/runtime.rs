@@ -1,12 +1,14 @@
 use gate4agent_c2_protocol::{
-    c2_auth_transcript, c2_bound_auth_transcript, C2AuthDirection, C2ClientAuthentication, C2ClientFrame,
+    c2_auth_transcript, c2_bound_auth_transcript, provider_id_is_legacy, C2AuthDirection, C2ClientAuthentication, C2ClientFrame,
     C2ClientHello, C2Hello, C2NodeEvent, C2NodeResponse, C2RelayFailure,
     C2RequestEnvelope, C2RequestId, C2ServerFrame, C2Topology, CapabilityId,
     ClientCompatibilityOffer, NegotiatedC2ControlCompatibility, NodeRequest, NodeRoute,
     ProtocolRange, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
-    C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_PROVIDER_ID_OPEN_CAPABILITY,
+    C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -39,12 +41,15 @@ const REPOSITORY_PATH_NOT_NEGOTIATED: &str =
     "tagged repository paths require negotiated C2 capability";
 const WORKSPACE_FILE_READ_NOT_NEGOTIATED: &str =
     "workspace file reads require negotiated C2 capability";
+const OPEN_PROVIDER_ID_NOT_NEGOTIATED: &str =
+    "open provider IDs require negotiated C2 capability";
 
 #[derive(Clone, Copy)]
 struct NegotiatedPathCapabilities {
     opaque_host_paths: bool,
     repository_paths: bool,
     workspace_file_read: bool,
+    provider_ids_open: bool,
 }
 
 #[derive(Clone)]
@@ -199,6 +204,12 @@ pub async fn connect_local(
             "C2 compatibility selection changed after authentication".to_owned(),
         ));
     }
+    let path_capabilities = negotiated_path_capabilities(hello.compatibility.as_ref());
+    if !path_capabilities.provider_ids_open && status_has_open_provider_id(&hello.status) {
+        return Err(C2ControlError::Protocol(
+            OPEN_PROVIDER_ID_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
 
     let (reader, writer) = tokio::io::split(pipe);
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -207,7 +218,6 @@ pub async fn connect_local(
     let (topology_tx, topology_rx) = watch::channel(initial_topology);
     let (writer_tx, writer_rx) = mpsc::channel(WRITER_CAPACITY);
     let (owner_tx, owner_rx) = mpsc::channel(INBOUND_CAPACITY);
-    let path_capabilities = negotiated_path_capabilities(hello.compatibility.as_ref());
     let reader_task = tokio::spawn(control_reader(reader, owner_tx.clone()));
     let writer_task = tokio::spawn(control_writer(writer, writer_rx, owner_tx));
     tokio::spawn(async move {
@@ -243,6 +253,10 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
             CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
@@ -306,6 +320,7 @@ fn negotiated_path_capabilities(
         opaque_host_paths: selected_has(C2_OPAQUE_UNIX_PATH_CAPABILITY),
         repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
         workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
+        provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
     }
 }
 
@@ -316,6 +331,13 @@ fn reject_unnegotiated_outbound_path(
     if !capabilities.opaque_host_paths && node_request_has_unix_bytes(request) {
         return Err(C2ControlError::Protocol(
             OPAQUE_UNIX_PATH_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
+    if !capabilities.provider_ids_open
+        && matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
+    {
+        return Err(C2ControlError::Protocol(
+            OPEN_PROVIDER_ID_NOT_NEGOTIATED.to_owned(),
         ));
     }
     let required_capability_available = match request.required_capability() {
@@ -508,6 +530,107 @@ fn c2_node_event_has_unix_bytes(event: &C2NodeEvent) -> bool {
     }
 }
 
+fn provider_text_is_legacy(value: &str) -> bool {
+    gate4agent_c2_protocol::AgentId::new(value)
+        .is_ok_and(|provider| provider_id_is_legacy(&provider))
+}
+
+fn status_has_open_provider_id(status: &gate4agent_c2_protocol::StatusResponse) -> bool {
+    status.nodes.values().filter_map(|node| node.inventory.as_ref()).any(|inventory| {
+        inventory.enabled_providers.iter().any(|provider| !provider_id_is_legacy(provider))
+            || inventory.provider_runtime_statuses.iter()
+                .any(|runtime| !provider_id_is_legacy(runtime.provider()))
+            || inventory.provider_contracts.iter()
+                .any(|contract| !provider_id_is_legacy(&contract.provider))
+            || inventory.provider_adapter_contracts.iter()
+                .any(|contract| !provider_id_is_legacy(&contract.provider))
+            || inventory.workspaces.values().any(|workspace| {
+                workspace.sessions.iter()
+                    .any(|session| !provider_text_is_legacy(&session.agent_id))
+            })
+            || inventory.managed_sessions.iter()
+                .any(|record| !provider_id_is_legacy(&record.provider))
+    })
+}
+
+fn topology_has_open_provider_id(topology: &C2Topology) -> bool {
+    topology.nodes.iter().any(|node| {
+        node.provider_contracts.iter()
+            .any(|contract| !provider_id_is_legacy(&contract.provider))
+            || node.provider_adapter_contracts.iter()
+                .any(|contract| !provider_id_is_legacy(&contract.provider))
+            || node.provider_runtime_statuses.iter()
+                .any(|runtime| !provider_id_is_legacy(runtime.provider()))
+    })
+}
+
+fn workspace_has_open_provider_id(
+    workspace: &gate4agent_c2_protocol::C2WorkspaceSnapshot,
+) -> bool {
+    workspace.sessions.iter()
+        .any(|session| !provider_id_is_legacy(&session.agent_id))
+}
+
+fn snapshot_has_open_provider_id(
+    snapshot: &gate4agent_c2_protocol::C2NodeSnapshot,
+) -> bool {
+    snapshot.enabled_providers.iter().any(|provider| !provider_id_is_legacy(provider))
+        || snapshot.provider_runtime_statuses.iter()
+            .any(|runtime| !provider_id_is_legacy(runtime.provider()))
+        || snapshot.workspaces.iter().any(workspace_has_open_provider_id)
+        || snapshot.session_records.iter()
+            .any(|record| !provider_id_is_legacy(&record.provider))
+}
+
+fn c2_event_has_open_provider_id(event: &C2NodeEvent) -> bool {
+    match event {
+        C2NodeEvent::WorkspaceAdded { workspace } => workspace_has_open_provider_id(workspace),
+        C2NodeEvent::SessionRecordUpserted { record } => {
+            !provider_id_is_legacy(&record.provider)
+        }
+        C2NodeEvent::Control { .. }
+        | C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ResyncRequired { .. } => false,
+    }
+}
+
+fn routed_event_has_open_provider_id(event: &RoutedNodeEvent) -> bool {
+    c2_event_has_open_provider_id(&event.event)
+}
+
+fn c2_node_response_has_open_provider_id(response: &C2NodeResponse) -> bool {
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. } => snapshot_has_open_provider_id(snapshot),
+        C2NodeResponse::Resync { snapshot, events, .. } => {
+            snapshot_has_open_provider_id(snapshot)
+                || events.iter().any(|event| c2_event_has_open_provider_id(&event.event))
+        }
+        C2NodeResponse::SessionRecordUpdated { record }
+        | C2NodeResponse::SessionRecordResumed { record, .. } => {
+            !provider_id_is_legacy(&record.provider)
+        }
+        C2NodeResponse::WorkspaceRegistered { workspace }
+        | C2NodeResponse::WorktreeCreated { workspace, .. } => {
+            workspace_has_open_provider_id(workspace)
+        }
+        C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::WorktreeRemoved { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => false,
+    }
+}
+
+fn routed_response_has_open_provider_id(response: &RoutedNodeResponse) -> bool {
+    response.response.as_ref().is_ok_and(c2_node_response_has_open_provider_id)
+}
+
 async fn read_server_frame(
     pipe: &mut LocalClientStream,
     limit: usize,
@@ -588,6 +711,17 @@ async fn control_owner(
                 match input {
                     Some(OwnerInput::Frame(C2ServerFrame::Reply(reply))) => {
                         let Some(waiter) = pending.remove(&reply.request_id) else { break; };
+                        if !path_capabilities.provider_ids_open
+                            && reply
+                                .result
+                                .as_ref()
+                                .is_ok_and(routed_response_has_open_provider_id)
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                OPEN_PROVIDER_ID_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         if !path_capabilities.opaque_host_paths
                             && reply
                                 .result
@@ -624,6 +758,11 @@ async fn control_owner(
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
+                        if !path_capabilities.provider_ids_open
+                            && routed_event_has_open_provider_id(&event)
+                        {
+                            break;
+                        }
                         if !path_capabilities.opaque_host_paths
                             && routed_event_has_unix_bytes(&event)
                         {
@@ -632,6 +771,11 @@ async fn control_owner(
                         if events.try_send(event).is_err() { break; }
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Topology(next))) => {
+                        if !path_capabilities.provider_ids_open
+                            && topology_has_open_provider_id(&next)
+                        {
+                            break;
+                        }
                         if topology.borrow().as_ref() != &next {
                             topology.send_replace(Arc::new(next));
                         }
@@ -666,8 +810,23 @@ fn c2_proof(
         .map_err(C2ControlError::Authentication)
 }
 
+#[cfg(windows)]
 fn validate_endpoint(endpoint: &str) -> Result<(), C2ControlError> {
     if !endpoint.starts_with(r"\\.\pipe\") || endpoint.len() <= r"\\.\pipe\".len() || endpoint.len() > 1024 {
+        return Err(C2ControlError::InvalidEndpoint);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_endpoint(endpoint: &str) -> Result<(), C2ControlError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    let path = Path::new(endpoint);
+    if endpoint.is_empty() || path.as_os_str().as_bytes().len() > 103 || !path.is_absolute()
+        || path.file_name().is_none()
+    {
         return Err(C2ControlError::InvalidEndpoint);
     }
     Ok(())
@@ -682,7 +841,8 @@ fn validate_token(token: &str) -> Result<(), C2ControlError> {
 
 #[derive(Debug, Error)]
 pub enum C2ControlError {
-    #[error("C2 control endpoint is not a bounded local named pipe")]
+    #[cfg_attr(windows, error("C2 control endpoint is not a bounded local named pipe"))]
+    #[cfg_attr(unix, error("C2 control endpoint is not a bounded absolute local endpoint"))]
     InvalidEndpoint,
     #[error("C2 token must contain 1..=4096 visible ASCII bytes without whitespace")]
     InvalidToken,
@@ -704,7 +864,7 @@ pub enum C2ControlError {
     RequestIdExhausted,
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use gate4agent_c2_protocol::{
@@ -714,8 +874,10 @@ mod tests {
         WorkspaceFileContent, WorkspaceFileRead,
     };
     use gate4agent_node_protocol::{
-        GitStatusEntry, NodeIncarnationId, WorkspaceEntry, WorkspaceEntryKind, WorkspaceId,
+        GitStatusEntry, NodeIncarnationId, SessionMode, WorkspaceEntry, WorkspaceEntryKind,
+        WorkspaceId,
     };
+    use gate4agent_types::TerminalSize;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -758,6 +920,7 @@ mod tests {
             opaque_host_paths: false,
             repository_paths: false,
             workspace_file_read: false,
+            provider_ids_open: false,
         }
     }
 
@@ -766,6 +929,7 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            provider_ids_open: true,
         }
     }
 
@@ -885,6 +1049,8 @@ mod tests {
                 CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -1095,6 +1261,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_open_provider_spawn_before_write() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, no_path_capabilities(),
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Spawn {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                provider: gate4agent_c2_protocol::AgentId::new("qwen-code").unwrap(),
+                mode: SessionMode::Pty,
+                terminal_size: TerminalSize { rows: 40, columns: 120 },
+                initial_prompt: None,
+            },
+            reply: reply_tx,
+        }).await.unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == OPEN_PROVIDER_ID_NOT_NEGOTIATED
+        ));
+        assert!(writer_rx.try_recv().is_err());
+        drop(commands_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_open_provider_reply_and_closes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, no_path_capabilities(),
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(OwnerInput::Frame(C2ServerFrame::Reply(
+            gate4agent_c2_protocol::C2ReplyEnvelope {
+                request_id: C2RequestId(1),
+                result: Ok(RoutedNodeResponse {
+                    node_id: NodeId::new("node-a").unwrap(),
+                    incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                    response: Ok(C2NodeResponse::Snapshot {
+                        event_sequence: 1,
+                        controller: None,
+                        snapshot: gate4agent_c2_protocol::C2NodeSnapshot {
+                            node_id: NodeId::new("node-a").unwrap(),
+                            enabled_providers: vec![
+                                gate4agent_c2_protocol::AgentId::new("qwen-code").unwrap(),
+                            ],
+                            provider_runtime_statuses: Default::default(),
+                            workspaces: Vec::new(),
+                            session_records: Vec::new(),
+                        },
+                    }),
+                }),
+            },
+        ))).await.unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == OPEN_PROVIDER_ID_NOT_NEGOTIATED
+        ));
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+        assert!(commands_tx.is_closed());
+    }
+
+    #[tokio::test]
     async fn control_owner_rejects_unnegotiated_workspace_file_read_before_write_and_stays_healthy() {
         let (commands_tx, commands_rx) = mpsc::channel(2);
         let (events_tx, _events_rx) = mpsc::channel(1);
@@ -1149,6 +1399,7 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: false,
             workspace_file_read: true,
+            provider_ids_open: true,
         };
         assert!(matches!(
             reject_unnegotiated_outbound_path(&request, missing_repository),
@@ -1159,6 +1410,7 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: false,
+            provider_ids_open: true,
         };
         assert!(matches!(
             reject_unnegotiated_outbound_path(&request, missing_file_read),
@@ -1330,20 +1582,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topology_frame_updates_watch_without_entering_event_stream() {
+    async fn c2_client_topology_replaces_old_incarnation_status() {
         use gate4agent_c2_protocol::{C2TopologyNode, NodeTransportState};
 
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (events_tx, mut events_rx) = mpsc::channel(1);
         let (writer_tx, _writer_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let old_runtime_status = gate4agent_c2_protocol::ProviderRuntimeStatuses::new([
+            gate4agent_c2_protocol::ProviderRuntimeStatus::raw_passthrough(
+                gate4agent_c2_protocol::AgentId::new("claude").unwrap(),
+                Some(gate4agent_c2_protocol::ProviderRuntimeVersion::new("1.0.0").unwrap()),
+            ),
+        ])
+        .unwrap();
         let offline = Arc::new(C2Topology { nodes: vec![C2TopologyNode {
             node_id: NodeId::new("node-a").unwrap(),
             endpoint: r"\\.\pipe\node-a".to_owned(),
             transport: NodeTransportState::Offline,
-            current_incarnation_id: None,
+            current_incarnation_id: Some(NodeIncarnationId::from_bytes([8; 16])),
             provider_contracts: Vec::new(),
             provider_adapter_contracts: Vec::new(),
+            provider_runtime_statuses: old_runtime_status,
         }] });
         let (topology_tx, mut topology_rx) = watch::channel(offline);
         let owner = tokio::spawn(control_owner(
@@ -1358,11 +1618,26 @@ mod tests {
                 current_incarnation_id: Some(incarnation_id),
                 provider_contracts: Vec::new(),
                 provider_adapter_contracts: Vec::new(),
+                provider_runtime_statuses: gate4agent_c2_protocol::ProviderRuntimeStatuses::new([
+                    gate4agent_c2_protocol::ProviderRuntimeStatus::raw_passthrough(
+                        gate4agent_c2_protocol::AgentId::new("codex").unwrap(),
+                        Some(gate4agent_c2_protocol::ProviderRuntimeVersion::new("2.0.0").unwrap()),
+                    ),
+                ])
+                .unwrap(),
             }],
         }))).await.unwrap();
 
         timeout(Duration::from_secs(1), topology_rx.changed()).await.unwrap().unwrap();
         assert_eq!(topology_rx.borrow().nodes[0].current_incarnation_id, Some(incarnation_id));
+        let topology = topology_rx.borrow().clone();
+        let statuses = &topology.nodes[0].provider_runtime_statuses;
+        assert_eq!(statuses.as_slice().len(), 1);
+        assert_eq!(
+            statuses.as_slice()[0].provider(),
+            &gate4agent_c2_protocol::AgentId::new("codex").unwrap(),
+        );
+        assert_eq!(statuses.as_slice()[0].version().unwrap().as_str(), "2.0.0");
         assert!(events_rx.try_recv().is_err());
         drop(incoming_tx);
         timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();

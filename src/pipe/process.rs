@@ -223,7 +223,8 @@ impl PipeProcess {
         let builder = cli_builder(tool);
         let inner_cmd = builder.build_command(opts);
 
-        if cfg!(windows) {
+        #[cfg(windows)]
+        {
             // On Windows, npm-installed CLIs have `.cmd` batch wrappers that
             // cmd.exe can invoke. Non-npm tools (e.g. cursor-agent) may be
             // bash scripts or native binaries with no `.cmd` wrapper.
@@ -284,7 +285,9 @@ impl PipeProcess {
                     cmd
                 }
             }
-        } else {
+        }
+        #[cfg(not(windows))]
+        {
             inner_cmd
         }
     }

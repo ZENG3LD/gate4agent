@@ -57,7 +57,7 @@ pub fn interactive_agent_spec() -> AgentSpec {
     #[cfg(windows)]
     let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write([char]27 + '[?2004h' + [char]27 + '[?25hfixture-ready>'); $line=[Console]::ReadLine(); [Console]::Write('fixture-echo:' + $line); Start-Sleep -Seconds 60";
     #[cfg(not(windows))]
-    let script = "printf '\033[?2004h\033[?25hfixture-ready>'; IFS= read -r line; printf 'fixture-echo:%s' \"$line\"; sleep 60";
+    let script = r#"printf '\033[?2004h\033[?25hfixture-ready>'; IFS= read -r line; printf 'fixture-echo:%s' "$line"; sleep 60"#;
     fixture_spec(script)
 }
 
@@ -392,5 +392,23 @@ fn fixture_spec(script: &str) -> AgentSpec {
             ..AgentCapabilities::default()
         },
         verification: SpecVerification::Gate4AgentVerified,
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_interactive_fixture_argv_is_nul_free_and_retains_terminal_escapes() {
+        let spec = interactive_agent_spec();
+        assert!(spec
+            .launch
+            .fixed_args
+            .iter()
+            .all(|argument| !argument.as_bytes().contains(&0)));
+        let script = spec.launch.fixed_args.last().unwrap();
+        assert!(script.contains(r"\033[?2004h"));
+        assert!(script.contains(r"\033[?25h"));
     }
 }

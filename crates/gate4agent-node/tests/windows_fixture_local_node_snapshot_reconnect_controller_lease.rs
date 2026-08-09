@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use gate4agent_node::protocol::{
-    read_json_frame_limited_body_timeout, write_json_frame_limited, AgentProvider, CapabilityId,
+    read_json_frame_limited_body_timeout, write_json_frame_limited, AgentId, CapabilityId,
     ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
     FrameError, LocalTransportKind, NodeEvent, NodeFailureCode, NodeId, NodeRequest, NodeResponse,
     NodeSnapshot, OpaqueHostPath, PathEncoding, PathStyle, ProtocolRange, ServerFrame,
@@ -24,6 +24,10 @@ use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
 use tokio::time::{sleep, timeout, Duration};
+
+fn agent(value: &str) -> AgentId {
+    AgentId::new(value).unwrap()
+}
 
 fn endpoint() -> String {
     gate4agent_testkit::suppress_windows_fault_dialogs_for_test();
@@ -219,7 +223,7 @@ async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility
     assert_eq!(compatibility.local_transport, LocalTransportKind::WindowsNamedPipe);
     assert_eq!(compatibility.state_schema_version, Some(2));
     assert_eq!(compatibility.provider_contracts.len(), 1);
-    assert_eq!(compatibility.provider_contracts[0].provider, AgentProvider::Claude);
+    assert_eq!(compatibility.provider_contracts[0].provider, agent("claude"));
     assert_eq!(compatibility.provider_contracts[0].revision.as_str(), "fixture-r1");
     assert!(compatibility.provider_adapter_contracts.is_empty());
 
@@ -257,12 +261,14 @@ async fn windows_production_named_pipe_negotiates_exact_provider_contract_manife
         compatibility
             .provider_contracts
             .iter()
-            .map(|contract| (contract.provider, contract.revision.as_str()))
+            .map(|contract| (contract.provider.as_str(), contract.revision.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            (AgentProvider::Claude, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
-            (AgentProvider::Codex, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
-            (AgentProvider::Kimi, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            ("claude", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            ("codex", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            ("grok", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            ("kimi", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+            ("qwen-code", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
         ]
     );
     assert_eq!(
@@ -270,36 +276,40 @@ async fn windows_production_named_pipe_negotiates_exact_provider_contract_manife
             .provider_adapter_contracts
             .iter()
             .map(|contract| (
-                contract.provider,
+                contract.provider.as_str(),
                 contract.family,
                 contract.adapter_id.as_str(),
                 contract.revision.as_str(),
             ))
             .collect::<Vec<_>>(),
         vec![
-            (AgentProvider::Claude, AdapterFamily::PtySemantic, "claude-code", "gate4agent-adapter/v1"),
-            (AgentProvider::Claude, AdapterFamily::Pipe, "claude-code", "gate4agent-adapter/v1"),
-            (AgentProvider::Claude, AdapterFamily::Hook, "claude-code", "gate4agent-adapter/v1"),
-            (AgentProvider::Claude, AdapterFamily::ManagedHook, "claude", "gate4agent-managed-hooks/orca-d8629c4/v1"),
-            (AgentProvider::Claude, AdapterFamily::OneShot, "claude", "gate4agent-inline/claude-code-2.1/v1"),
-            (AgentProvider::Claude, AdapterFamily::History, "claude-code", "gate4agent-adapter/v1"),
-            (AgentProvider::Claude, AdapterFamily::Resume, "claude-code", "gate4agent-adapter/v1"),
-            (AgentProvider::Claude, AdapterFamily::SessionOptions, "claude-code", "gate4agent-session-options/orca-d8629c4/v1"),
-            (AgentProvider::Codex, AdapterFamily::PtySemantic, "codex", "gate4agent-adapter/v1"),
-            (AgentProvider::Codex, AdapterFamily::Pipe, "codex", "gate4agent-adapter/v1"),
-            (AgentProvider::Codex, AdapterFamily::Hook, "codex", "gate4agent-adapter/v1"),
-            (AgentProvider::Codex, AdapterFamily::ManagedHook, "codex", "gate4agent-managed-hooks/orca-d8629c4/v1"),
-            (AgentProvider::Codex, AdapterFamily::OneShot, "codex", "gate4agent-inline/codex-cli-0.144/v1"),
-            (AgentProvider::Codex, AdapterFamily::History, "codex", "gate4agent-adapter/v1"),
-            (AgentProvider::Codex, AdapterFamily::Resume, "codex", "gate4agent-adapter/v1"),
-            (AgentProvider::Codex, AdapterFamily::SessionOptions, "codex", "gate4agent-session-options/orca-d8629c4/v1"),
-            (AgentProvider::Kimi, AdapterFamily::PtySemantic, "kimi", "gate4agent-adapter/v1"),
-            (AgentProvider::Kimi, AdapterFamily::Pipe, "kimi", "gate4agent-adapter/v1"),
-            (AgentProvider::Kimi, AdapterFamily::Hook, "kimi", "gate4agent-adapter/v1"),
-            (AgentProvider::Kimi, AdapterFamily::ManagedHook, "kimi", "gate4agent-managed-hooks/orca-d8629c4/v1"),
-            (AgentProvider::Kimi, AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
-            (AgentProvider::Kimi, AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
-            (AgentProvider::Kimi, AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
+            ("claude", AdapterFamily::PtySemantic, "claude-code", "gate4agent-adapter/v1"),
+            ("claude", AdapterFamily::Pipe, "claude-code", "gate4agent-adapter/v1"),
+            ("claude", AdapterFamily::Hook, "claude-code", "gate4agent-adapter/v1"),
+            ("claude", AdapterFamily::ManagedHook, "claude", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+            ("claude", AdapterFamily::OneShot, "claude", "gate4agent-inline/claude-code-2.1/v1"),
+            ("claude", AdapterFamily::History, "claude-code", "gate4agent-adapter/v1"),
+            ("claude", AdapterFamily::Resume, "claude-code", "gate4agent-adapter/v1"),
+            ("claude", AdapterFamily::SessionOptions, "claude-code", "gate4agent-session-options/orca-d8629c4/v1"),
+            ("codex", AdapterFamily::PtySemantic, "codex", "gate4agent-adapter/v1"),
+            ("codex", AdapterFamily::Pipe, "codex", "gate4agent-adapter/v1"),
+            ("codex", AdapterFamily::Hook, "codex", "gate4agent-adapter/v1"),
+            ("codex", AdapterFamily::ManagedHook, "codex", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+            ("codex", AdapterFamily::OneShot, "codex", "gate4agent-inline/codex-cli-0.144/v1"),
+            ("codex", AdapterFamily::History, "codex", "gate4agent-adapter/v1"),
+            ("codex", AdapterFamily::Resume, "codex", "gate4agent-adapter/v1"),
+            ("codex", AdapterFamily::SessionOptions, "codex", "gate4agent-session-options/orca-d8629c4/v1"),
+            ("grok", AdapterFamily::Hook, "grok", "gate4agent-adapter/v1"),
+            ("grok", AdapterFamily::ManagedHook, "grok", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+            ("grok", AdapterFamily::History, "grok", "gate4agent-adapter/v1"),
+            ("grok", AdapterFamily::Resume, "grok", "gate4agent-adapter/v1"),
+            ("kimi", AdapterFamily::PtySemantic, "kimi", "gate4agent-adapter/v1"),
+            ("kimi", AdapterFamily::Pipe, "kimi", "gate4agent-adapter/v1"),
+            ("kimi", AdapterFamily::Hook, "kimi", "gate4agent-adapter/v1"),
+            ("kimi", AdapterFamily::ManagedHook, "kimi", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+            ("kimi", AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
+            ("kimi", AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
+            ("kimi", AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
         ]
     );
 
@@ -607,7 +617,7 @@ async fn windows_fixture_extracted_named_pipe_client_preserves_auth_snapshot_eve
     let oversized_text = first
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             initial_prompt: Some("x".repeat(MAX_NODE_TEXT_BYTES + 1)),
@@ -621,7 +631,7 @@ async fn windows_fixture_extracted_named_pipe_client_preserves_auth_snapshot_eve
     let unknown_workspace = first
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("unknown").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             initial_prompt: None,
@@ -705,7 +715,7 @@ async fn windows_fixture_extracted_named_pipe_client_preserves_auth_snapshot_eve
     let NodeResponse::SpawnAccepted { session } = reconnected
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             initial_prompt: None,
@@ -919,7 +929,7 @@ async fn windows_fixture_extracted_named_pipe_client_preserves_auth_snapshot_eve
     let post_shutdown = reconnected
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             initial_prompt: None,
@@ -1003,7 +1013,7 @@ async fn windows_fixture_cmd_provider_uses_the_exact_registry_workspace_cwd() {
     let NodeResponse::SpawnAccepted { session } = client
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 8, columns: 120 },
             initial_prompt: None,
@@ -1524,7 +1534,7 @@ async fn windows_fixture_git_worktree_lifecycle_is_clean_registered_and_evented(
     let NodeResponse::SpawnAccepted { session } = operator
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("topic-one").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             initial_prompt: None,
@@ -1788,7 +1798,7 @@ async fn windows_fixture_promptless_resume_advances_generation_through_node() {
     let NodeResponse::SpawnAccepted { session } = operator
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             initial_prompt: None,

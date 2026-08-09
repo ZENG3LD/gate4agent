@@ -84,8 +84,10 @@ members = [
     "crates/gate4agent-c2-protocol",
     "crates/gate4agent-c2-client",
     "crates/gate4agent-c2",
-    "crates/gate4agent-tui",
     "crates/gate4agent-testkit",
 ]
-exclude = ["vendor/portable-pty-0.8.1-gate4agent"]
+exclude = [
+    "vendor/portable-pty-0.8.1-gate4agent",
+    "crates/gate4agent-tui",
+]
 resolver = "2"

@@ -9,7 +9,7 @@ use gate4agent_c2::protocol::{
 };
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
-    AgentProvider, ClientRole, ManagedSessionState, NodeFailureCode, NodeRequest,
+    AgentId, ClientRole, ManagedSessionState, NodeFailureCode, NodeRequest,
     NodeResponse, OpaqueHostPath, SessionMode, WorkspaceId,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
@@ -384,7 +384,7 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
 
     let spawned = control.request(route_a.clone(), NodeRequest::Spawn {
         workspace_id: WorkspaceId::new("primary").unwrap(),
-        provider: AgentProvider::Claude,
+        provider: AgentId::new("claude").unwrap(),
         mode: SessionMode::Pty,
         terminal_size: TerminalSize { rows: 24, columns: 80 },
         initial_prompt: None,
@@ -554,7 +554,7 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
 
     let survivor = control.request(route_a.clone(), NodeRequest::Spawn {
         workspace_id: WorkspaceId::new("primary").unwrap(),
-        provider: AgentProvider::Claude,
+        provider: AgentId::new("claude").unwrap(),
         mode: SessionMode::Pty,
         terminal_size: TerminalSize { rows: 24, columns: 80 },
         initial_prompt: None,

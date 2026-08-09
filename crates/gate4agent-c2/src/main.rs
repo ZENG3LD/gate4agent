@@ -1,21 +1,21 @@
-#[cfg(windows)]
-use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, DEFAULT_C2_CONTROL_ENDPOINT};
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
+use gate4agent_c2::{default_c2_control_endpoint, C2Config, C2NodeConfig, C2Running};
+#[cfg(any(windows, unix))]
 use gate4agent_c2::protocol::{NodeId, DEFAULT_C2_API_LISTEN, MAX_C2_NODES};
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 use std::collections::BTreeSet;
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut api_listen = DEFAULT_C2_API_LISTEN.parse().expect("built-in C2 listen address is valid");
-    let mut control_endpoint = DEFAULT_C2_CONTROL_ENDPOINT.to_owned();
+    let mut control_endpoint = default_c2_control_endpoint()
+        .unwrap_or_else(|error| fail(&error.to_string()));
     let mut node_args = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut seen_endpoints = BTreeSet::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -27,14 +27,13 @@ async fn main() {
             "--node" => {
                 if node_args.len() == MAX_C2_NODES { fail("at most 64 --node values are allowed"); }
                 let value = required_value("--node", args.next());
-                let (id, endpoint) = value.split_once('=').unwrap_or_else(|| fail("--node requires NODE_ID=NAMED_PIPE"));
+                let (id, endpoint) = value.split_once('=').unwrap_or_else(|| fail(node_assignment_error()));
                 let node_id = NodeId::new(id).unwrap_or_else(|error| fail(&error.to_string()));
                 if !seen.insert(node_id.clone()) { fail(&format!("duplicate node ID: {node_id}")); }
-                if !seen_endpoints.insert(endpoint.to_ascii_lowercase()) { fail(&format!("duplicate named-pipe endpoint: {endpoint}")); }
                 node_args.push((node_id, endpoint.to_owned()));
             }
             "--help" | "-h" => {
-                println!("gate4agent-c2 --node NODE_ID=\\\\.\\pipe\\ENDPOINT [--node ...] [--api-listen 127.0.0.1:PORT] [--control-endpoint \\\\.\\pipe\\ENDPOINT]");
+                print_help();
                 println!("API token: {C2_TOKEN_ENV}; node tokens: GATE4AGENT_NODE_TOKEN_<NORMALIZED_NODE_ID>");
                 return;
             }
@@ -61,17 +60,10 @@ async fn main() {
     let shutdown = running.shutdown_handle();
     let wait = running.wait();
     tokio::pin!(wait);
-    let mut ctrl_c = tokio::signal::windows::ctrl_c().unwrap_or_else(|error| fail(&error.to_string()));
-    let mut ctrl_break = tokio::signal::windows::ctrl_break().unwrap_or_else(|error| fail(&error.to_string()));
     tokio::select! {
         result = &mut wait => if let Err(error) = result { fail(&error.to_string()); },
-        signal = ctrl_c.recv() => {
-            if signal.is_none() { fail("Ctrl-C signal stream closed"); }
-            shutdown.shutdown();
-            if let Err(error) = wait.await { fail(&error.to_string()); }
-        }
-        signal = ctrl_break.recv() => {
-            if signal.is_none() { fail("Ctrl-Break signal stream closed"); }
+        result = shutdown_signal() => {
+            if let Err(error) = result { fail(&error.to_string()); }
             shutdown.shutdown();
             if let Err(error) = wait.await { fail(&error.to_string()); }
         }
@@ -79,6 +71,31 @@ async fn main() {
 }
 
 #[cfg(windows)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+    tokio::select! {
+        signal = ctrl_c.recv() => signal.map(|_| ()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Ctrl-C signal stream closed")
+        }),
+        signal = ctrl_break.recv() => signal.map(|_| ()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Ctrl-Break signal stream closed")
+        }),
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        signal = terminate.recv() => signal.map(|_| ()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "SIGTERM signal stream closed")
+        }),
+    }
+}
+
+#[cfg(any(windows, unix))]
 fn node_token_env(node_id: &NodeId) -> String {
     let normalized = node_id.as_str().bytes().map(|byte| match byte {
         b'a'..=b'z' => (byte - b'a' + b'A') as char,
@@ -88,19 +105,35 @@ fn node_token_env(node_id: &NodeId) -> String {
     format!("GATE4AGENT_NODE_TOKEN_{normalized}")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn required_value(flag: &str, value: Option<String>) -> String {
     value.unwrap_or_else(|| fail(&format!("{flag} requires a value")))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn fail(message: &str) -> ! {
     eprintln!("gate4agent-c2: {message}");
     std::process::exit(2)
 }
 
-#[cfg(not(windows))]
+#[cfg(windows)]
+fn node_assignment_error() -> &'static str { "--node requires NODE_ID=NAMED_PIPE_OR_TCP_LOOPBACK" }
+
+#[cfg(unix)]
+fn node_assignment_error() -> &'static str { "--node requires NODE_ID=LOCAL_ENDPOINT_OR_TCP_LOOPBACK" }
+
+#[cfg(windows)]
+fn print_help() {
+    println!("gate4agent-c2 --node NODE_ID=\\\\.\\pipe\\ENDPOINT|tcp://127.0.0.1:PORT|tcp://[::1]:PORT [--node ...] [--api-listen 127.0.0.1:PORT] [--control-endpoint \\\\.\\pipe\\ENDPOINT]");
+}
+
+#[cfg(unix)]
+fn print_help() {
+    println!("gate4agent-c2 --node NODE_ID=LOCAL_ENDPOINT|tcp://127.0.0.1:PORT|tcp://[::1]:PORT [--node ...] [--api-listen 127.0.0.1:PORT] [--control-endpoint LOCAL_ENDPOINT]");
+}
+
+#[cfg(not(any(windows, unix)))]
 fn main() {
-    eprintln!("gate4agent-c2: Windows named pipes are currently required");
+    eprintln!("gate4agent-c2: this operating system has no supported local transport");
     std::process::exit(2);
 }

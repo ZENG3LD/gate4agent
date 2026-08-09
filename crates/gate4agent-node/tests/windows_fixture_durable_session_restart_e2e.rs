@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use gate4agent_node::protocol::{
-    AgentProvider, ClientRole, ManagedSessionRecord, ManagedSessionState, NodeFailureCode, NodeId,
+    AgentId, ClientRole, ManagedSessionRecord, ManagedSessionState, NodeFailureCode, NodeId,
     NodeEvent, NodeRequest, NodeResponse, OpaqueHostPath, SessionMode, SessionRecordId, WorkspaceId,
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
 };
@@ -23,6 +23,10 @@ const CHILD_TOKEN_ENV: &str = "GATE4AGENT_DURABLE_FIXTURE_TOKEN";
 const CHILD_WORKSPACE_ENV: &str = "GATE4AGENT_DURABLE_FIXTURE_WORKSPACE";
 const CHILD_STATE_ENV: &str = "GATE4AGENT_DURABLE_FIXTURE_STATE";
 const LIVE_CANARY_ENV: &str = "GATE4AGENT_VENDOR_CANARY";
+
+fn agent(value: &str) -> AgentId {
+    AgentId::new(value).unwrap()
+}
 
 struct ChildGuard(Option<Child>);
 
@@ -266,7 +270,7 @@ async fn windows_fixture_durable_record_survives_process_restart_and_cold_resume
     let NodeResponse::SpawnAccepted { session: fresh_address } = first
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize {
                 rows: 24,
@@ -625,8 +629,8 @@ fn bounded_child_diagnostics(mut child: Child) -> String {
         .collect()
 }
 
-fn live_challenge(provider: AgentProvider, phase: &str) -> (String, String) {
-    let provider = provider.agent_id().to_ascii_uppercase();
+fn live_challenge(provider: &AgentId, phase: &str) -> (String, String) {
+    let provider = provider.as_str().to_ascii_uppercase();
     let phase = phase.to_ascii_uppercase();
     let marker = format!("G4A{provider}NODE{phase}OK");
     let prompt = format!(
@@ -826,7 +830,7 @@ async fn wait_live_record(client: &mut NamedPipeNodeClient) -> ManagedSessionRec
     }
 }
 
-async fn live_vendor_durable_restart_canary(provider: AgentProvider) {
+async fn live_vendor_durable_restart_canary(provider: AgentId) {
     if std::env::var(LIVE_CANARY_ENV).ok().as_deref() != Some("1") {
         eprintln!("skipped: set {LIVE_CANARY_ENV}=1 to run authenticated vendor node canaries");
         return;
@@ -838,8 +842,8 @@ async fn live_vendor_durable_restart_canary(provider: AgentProvider) {
     let workspace = std::env::current_dir().unwrap();
     let state = root.0.join("state").join("state-v1.json");
     let endpoint = endpoint();
-    let token = format!("live-{}-durable-token", provider.agent_id());
-    let node_id = NodeId::new(format!("live-{}-node", provider.agent_id())).unwrap();
+    let token = format!("live-{}-durable-token", provider.as_str());
+    let node_id = NodeId::new(format!("live-{}-node", provider.as_str())).unwrap();
     let config = || {
         NodeServerConfig::new(
             endpoint.clone(),
@@ -860,11 +864,11 @@ async fn live_vendor_durable_restart_canary(provider: AgentProvider) {
         .request(NodeRequest::AcquireController { lease_ms: 60_000 })
         .await
         .unwrap();
-    let (fresh_marker, fresh_prompt) = live_challenge(provider, "fresh");
+    let (fresh_marker, fresh_prompt) = live_challenge(&provider, "fresh");
     let NodeResponse::SpawnAccepted { session: fresh_address } = first
         .request(NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("primary").unwrap(),
-            provider,
+            provider: provider.clone(),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize {
                 rows: 32,
@@ -901,7 +905,7 @@ async fn live_vendor_durable_restart_canary(provider: AgentProvider) {
         .request(NodeRequest::AcquireController { lease_ms: 60_000 })
         .await
         .unwrap();
-    let (resume_marker, resume_prompt) = live_challenge(provider, "resume");
+    let (resume_marker, resume_prompt) = live_challenge(&provider, "resume");
     let NodeResponse::SessionRecordResumed {
         record: resumed,
         session: resumed_address,
@@ -950,24 +954,24 @@ async fn live_vendor_durable_restart_canary(provider: AgentProvider) {
         .unwrap();
     println!(
         "vendor_node_durable_canary provider={} fresh_identity=true node_runtime_restart=true cold_resume_identity=true resumed_prompt=true cleanup=true",
-        provider.agent_id(),
+        provider.as_str(),
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires authenticated Claude CLI and GATE4AGENT_VENDOR_CANARY=1"]
 async fn windows_live_claude_durable_session_restart_canary() {
-    live_vendor_durable_restart_canary(AgentProvider::Claude).await;
+    live_vendor_durable_restart_canary(agent("claude")).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires authenticated Codex CLI and GATE4AGENT_VENDOR_CANARY=1"]
 async fn windows_live_codex_durable_session_restart_canary() {
-    live_vendor_durable_restart_canary(AgentProvider::Codex).await;
+    live_vendor_durable_restart_canary(agent("codex")).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires authenticated Kimi CLI and GATE4AGENT_VENDOR_CANARY=1"]
 async fn windows_live_kimi_durable_session_restart_canary() {
-    live_vendor_durable_restart_canary(AgentProvider::Kimi).await;
+    live_vendor_durable_restart_canary(agent("kimi")).await;
 }

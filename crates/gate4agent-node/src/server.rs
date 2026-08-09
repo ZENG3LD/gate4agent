@@ -7,31 +7,42 @@ use crate::git_worktree::{
 use crate::session_registry::{
     self, validate_display_name, LoadedNodeState, MAX_MANAGED_SESSION_RECORDS,
 };
+#[cfg(unix)]
+use crate::workspace_file_unix::{
+    read_workspace_file as read_workspace_file_from_disk, WorkspaceFileBytes,
+    WorkspaceFileReadError, WorkspaceFileReadErrorKind,
+};
+#[cfg(windows)]
 use crate::workspace_file_windows::{
     read_workspace_file as read_workspace_file_from_disk, WorkspaceFileBytes,
-    WorkspaceFileReadErrorKind,
+    WorkspaceFileReadError, WorkspaceFileReadErrorKind,
 };
+use crate::platform;
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
-    AdapterContractRevision, AgentProvider, ArchitectureId, CapabilityId, ClientFrame, ClientRole,
+    provider_id_is_legacy, AdapterContractRevision, CapabilityId, ClientFrame, ClientRole,
     ControllerState,
     FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
-    GitWorktreeSnapshot, HostDescriptor, LocalTransportKind, NodeCompatibilitySupport, NodeEvent,
+    GitWorktreeSnapshot, NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
-    NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath, OperatingSystemId, PathEncoding,
-    PathSemantics, PathStyle, ProtocolRange, ProviderAdapterContractSupport,
+    NegotiatedNodeCompatibility, NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath,
+    ProtocolRange,
+    ProviderAdapterContractSupport,
     ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
-    ResponseEnvelope,
+    ProviderRuntimeStatuses, ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
     ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceFileContent, WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     DEFAULT_CONTROLLER_LEASE_MS,
     MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
-    NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
+    NODE_PROVIDER_ID_OPEN_CAPABILITY,
+    NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
-    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2,
+    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3,
 };
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
@@ -59,7 +70,8 @@ use tokio::time::{sleep, timeout};
 
 mod http_api;
 
-pub const DEFAULT_NODE_ENDPOINT: &str = r"\\.\pipe\gate4agent-node";
+#[cfg(windows)]
+pub use crate::platform::DEFAULT_NODE_ENDPOINT;
 
 const NODE_EVENT_HISTORY_MAX: usize = 4_096;
 const NODE_BROADCAST_CAPACITY: usize = 1_024;
@@ -111,7 +123,7 @@ fn require_windows_path(path: OpaqueHostPath) -> Result<String, NodeFailure> {
         .map(str::to_owned)
         .ok_or_else(|| failure(
             NodeFailureCode::InvalidRequest,
-            "Windows node rejects non-UTF-8 host paths",
+            "this node requires UTF-8 host paths",
         ))
 }
 
@@ -170,7 +182,7 @@ impl WorkspaceConfig {
                 message: "canonical path is not valid Unicode".to_owned(),
             }
         })?;
-        let canonical_root = normalize_windows_verbatim_path(canonical_root);
+        let canonical_root = platform::normalize_canonical_root(canonical_root);
         validate_workspace_root(&workspace_id, &canonical_root)?;
         Ok(Self {
             workspace_id,
@@ -207,7 +219,7 @@ impl NodeServerConfig {
     ) -> Result<Self, NodeServerError> {
         let endpoint = endpoint.into();
         let access_token = access_token.into();
-        if !endpoint.starts_with(r"\\.\pipe\") || endpoint.len() <= r"\\.\pipe\".len() {
+        if !platform::validate_endpoint(&endpoint) {
             return Err(NodeServerError::InvalidEndpoint);
         }
         if access_token.is_empty() || access_token.len() > 4_096 {
@@ -228,7 +240,7 @@ impl NodeServerConfig {
                     workspace.workspace_id.clone(),
                 ));
             }
-            let root_key = workspace.canonical_root.to_lowercase();
+            let root_key = platform::root_identity(&workspace.canonical_root);
             if let Some(existing) = workspace_roots.insert(
                 root_key,
                 workspace.workspace_id.clone(),
@@ -278,15 +290,12 @@ impl NodeServerConfig {
 }
 
 pub fn default_state_path(node_id: &NodeId) -> Result<PathBuf, NodeServerError> {
-    let root = std::env::var_os("LOCALAPPDATA")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or(NodeServerError::LocalAppDataUnavailable)?;
-    Ok(root
-        .join("Gate4Agent")
-        .join("nodes")
-        .join(node_id.as_str())
-        .join("state-v1.json"))
+    platform::default_state_path(node_id.as_str())
+        .ok_or(NodeServerError::LocalStateDirectoryUnavailable)
+}
+
+pub fn default_node_endpoint() -> Result<PathBuf, NodeServerError> {
+    platform::default_node_endpoint().ok_or(NodeServerError::LocalRuntimeDirectoryUnavailable)
 }
 
 pub struct NodeServer {
@@ -308,6 +317,48 @@ impl NodeServer {
         let mut spec = gate4agent_testkit::interactive_agent_spec();
         spec.id = AgentId::new("claude").map_err(|error| NodeServerError::Registry(error.to_string()))?;
         spec.display_name = "Controlled Claude PTY fixture".to_owned();
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    #[cfg(feature = "fixture")]
+    pub fn new_exact_launcher_fixture(
+        config: NodeServerConfig,
+        agent_id: AgentId,
+        launcher: String,
+    ) -> Result<Self, NodeServerError> {
+        if !matches!(agent_id.as_str(), "claude" | "codex" | "grok" | "kimi" | "qwen-code") {
+            return Err(NodeServerError::Registry(
+                "exact launcher fixture requires a supported provider".to_owned(),
+            ));
+        }
+        if launcher.contains('\0') {
+            return Err(NodeServerError::Registry(
+                "exact launcher fixture path contains NUL".to_owned(),
+            ));
+        }
+        let launcher_path = Path::new(&launcher);
+        if !launcher_path.is_absolute() {
+            return Err(NodeServerError::Registry(
+                "exact launcher fixture path must be absolute".to_owned(),
+            ));
+        }
+        let metadata = std::fs::metadata(launcher_path).map_err(|_| {
+            NodeServerError::Registry("exact launcher fixture path is unavailable".to_owned())
+        })?;
+        if !metadata.is_file() {
+            return Err(NodeServerError::Registry(
+                "exact launcher fixture path must be a regular file".to_owned(),
+            ));
+        }
+        let mut spec = builtin_registry()
+            .get(&agent_id)
+            .ok_or_else(|| {
+                NodeServerError::Registry(
+                    "exact launcher fixture provider is unavailable".to_owned(),
+                )
+            })?
+            .clone();
+        spec.launch.program = launcher;
         Self::new_fixture_with_spec(config, spec)
     }
 
@@ -394,8 +445,9 @@ impl NodeServer {
         .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
         let enabled_providers = provider_contracts
             .iter()
-            .map(|contract| contract.provider)
+            .map(|contract| contract.provider.clone())
             .collect();
+        let provider_runtime_statuses = crate::provider_runtime::collect(&catalog);
         let state_path_lock =
             session_registry::StatePathLock::acquire(config.state_path.as_deref())
                 .map_err(|error| {
@@ -416,6 +468,7 @@ impl NodeServer {
             incarnation_id,
             workspaces,
             enabled_providers,
+            provider_runtime_statuses,
             provider_contracts,
             provider_adapter_contracts,
             config.state_path.clone(),
@@ -588,18 +641,35 @@ impl NodeShutdownHandle {
 }
 
 async fn wait_for_ctrl_signal() -> Result<(), NodeServerError> {
+    #[cfg(windows)]
+    {
     let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
     let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
-    tokio::select! {
+    return tokio::select! {
         signal = ctrl_c.recv() => signal.ok_or(NodeServerError::SignalStreamClosed),
         signal = ctrl_break.recv() => signal.ok_or(NodeServerError::SignalStreamClosed),
+    };
+    }
+    #[cfg(unix)]
+    {
+        let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            signal = interrupt.recv() => signal.ok_or(NodeServerError::SignalStreamClosed),
+            signal = terminate.recv() => signal.ok_or(NodeServerError::SignalStreamClosed),
+        }
     }
 }
 
 fn active_registry() -> Result<AgentRegistry, NodeServerError> {
     let specs = builtin_registry()
         .iter()
-        .filter(|spec| matches!(spec.id.as_str(), "claude" | "codex" | "kimi"))
+        .filter(|spec| {
+            matches!(
+                spec.id.as_str(),
+                "claude" | "codex" | "grok" | "kimi" | "qwen-code"
+            )
+        })
         .cloned()
         .collect::<Vec<_>>();
     AgentRegistry::new(specs).map_err(|error| NodeServerError::Registry(error.to_string()))
@@ -617,17 +687,18 @@ fn provider_contract_manifest(
     let mut provider_contracts = Vec::new();
     let mut provider_adapter_contracts = Vec::new();
     for spec in catalog.iter() {
-        let Some(provider) = agent_provider(&spec.id) else {
-            continue;
-        };
+        let provider = spec.id.clone();
         let revision = ProviderContractRevision::new(spec.revision.clone())
             .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
-        provider_contracts.push(ProviderContractSupport { provider, revision });
+        provider_contracts.push(ProviderContractSupport {
+            provider: provider.clone(),
+            revision,
+        });
         for (family, binding) in declared_adapter_bindings(spec)? {
             let revision = AdapterContractRevision::new(binding.revision.clone())
                 .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
             provider_adapter_contracts.push(ProviderAdapterContractSupport {
-                provider,
+                provider: provider.clone(),
                 family,
                 adapter_id: binding.id.clone(),
                 revision,
@@ -637,15 +708,6 @@ fn provider_contract_manifest(
     validate_provider_contract_manifest(&provider_contracts, &provider_adapter_contracts)
         .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
     Ok((provider_contracts, provider_adapter_contracts))
-}
-
-fn agent_provider(agent_id: &AgentId) -> Option<AgentProvider> {
-    match agent_id.as_str() {
-        "claude" => Some(AgentProvider::Claude),
-        "codex" => Some(AgentProvider::Codex),
-        "kimi" => Some(AgentProvider::Kimi),
-        _ => None,
-    }
 }
 
 fn declared_adapter_bindings(
@@ -760,7 +822,7 @@ fn merge_durable_state(
         .values()
         .map(|workspace| {
             (
-                workspace.canonical_root.to_lowercase(),
+                platform::root_identity(&workspace.canonical_root),
                 workspace.workspace_id.clone(),
             )
         })
@@ -772,7 +834,7 @@ fn merge_durable_state(
 
     for (workspace_id, canonical_root) in loaded.workspaces {
         if let Some(existing) = workspaces.get(&workspace_id) {
-            if !existing.canonical_root.eq_ignore_ascii_case(&canonical_root) {
+            if !platform::roots_equal(&existing.canonical_root, &canonical_root) {
                 return Err(NodeServerError::DurableState(io::Error::new(
                     io::ErrorKind::InvalidData,
                     DURABLE_STATE_CONFLICT_ERROR,
@@ -780,7 +842,7 @@ fn merge_durable_state(
             }
             continue;
         }
-        if roots.get(&canonical_root.to_lowercase()).is_some() {
+        if roots.get(&platform::root_identity(&canonical_root)).is_some() {
             return Err(NodeServerError::DurableState(io::Error::new(
                 io::ErrorKind::InvalidData,
                 DURABLE_STATE_CONFLICT_ERROR,
@@ -799,7 +861,7 @@ fn merge_durable_state(
             ))
         })?;
         roots.insert(
-            workspace.canonical_root.to_lowercase(),
+            platform::root_identity(&workspace.canonical_root),
             workspace.workspace_id.clone(),
         );
         workspaces.insert(workspace_id, workspace);
@@ -808,9 +870,10 @@ fn merge_durable_state(
     for record in &mut loaded.records {
         match workspaces.get(&record.workspace_id) {
             Some(workspace)
-                if workspace
-                    .canonical_root
-                    .eq_ignore_ascii_case(windows_path_text(&record.canonical_root)) => {}
+                if platform::roots_equal(
+                    &workspace.canonical_root,
+                    windows_path_text(&record.canonical_root),
+                ) => {}
             Some(_) => {
                 return Err(NodeServerError::DurableState(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -834,7 +897,8 @@ struct NodeShared {
     incarnation_id: NodeIncarnationId,
     started_at_unix_ms: u64,
     workspaces: RwLock<BTreeMap<WorkspaceId, String>>,
-    enabled_providers: Vec<AgentProvider>,
+    enabled_providers: Vec<AgentId>,
+    provider_runtime_statuses: ProviderRuntimeStatuses,
     provider_contracts: Vec<ProviderContractSupport>,
     provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
     controller: Mutex<Option<ControllerLease>>,
@@ -878,13 +942,17 @@ struct ControllerLease {
 struct NodeEventHistory {
     last_sequence: u64,
     events: VecDeque<NodeEventEnvelope>,
+    record_providers: BTreeMap<SessionRecordId, AgentId>,
+    removed_record_providers: BTreeMap<u64, AgentId>,
 }
 
 impl NodeEventHistory {
-    fn new() -> Self {
+    fn new(record_providers: BTreeMap<SessionRecordId, AgentId>) -> Self {
         Self {
             last_sequence: 0,
             events: VecDeque::with_capacity(NODE_EVENT_HISTORY_MAX),
+            record_providers,
+            removed_record_providers: BTreeMap::new(),
         }
     }
 }
@@ -896,7 +964,8 @@ impl NodeShared {
         node_id: NodeId,
         incarnation_id: NodeIncarnationId,
         workspaces: Vec<WorkspaceConfig>,
-        enabled_providers: Vec<AgentProvider>,
+        enabled_providers: Vec<AgentId>,
+        provider_runtime_statuses: ProviderRuntimeStatuses,
         provider_contracts: Vec<ProviderContractSupport>,
         provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
         state_path: Option<PathBuf>,
@@ -905,6 +974,10 @@ impl NodeShared {
         input_settle_timeout_ms: u64,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(NODE_BROADCAST_CAPACITY);
+        let record_providers = records
+            .iter()
+            .map(|record| (record.record_id.clone(), record.provider.clone()))
+            .collect();
         Self {
             handle,
             access_token,
@@ -922,10 +995,11 @@ impl NodeShared {
                     .collect(),
             ),
             enabled_providers,
+            provider_runtime_statuses,
             provider_contracts,
             provider_adapter_contracts,
             controller: Mutex::new(None),
-            history: Mutex::new(NodeEventHistory::new()),
+            history: Mutex::new(NodeEventHistory::new(record_providers)),
             event_tx,
             next_connection_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
@@ -959,7 +1033,7 @@ impl NodeShared {
         access_token: String,
         node_id: NodeId,
         workspaces: Vec<WorkspaceConfig>,
-        enabled_providers: Vec<AgentProvider>,
+        enabled_providers: Vec<AgentId>,
     ) -> Self {
         Self::new_with_incarnation(
             handle,
@@ -968,6 +1042,7 @@ impl NodeShared {
             NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
             workspaces,
             enabled_providers,
+            ProviderRuntimeStatuses::default(),
             Vec::new(),
             Vec::new(),
             None,
@@ -1155,7 +1230,7 @@ impl NodeShared {
         ))
     }
 
-    fn default_record_name(&self, provider: AgentProvider) -> String {
+    fn default_record_name(&self, provider: &AgentId) -> String {
         let records = self
             .session_records
             .lock()
@@ -1163,21 +1238,16 @@ impl NodeShared {
         let ordinal = records
             .records
             .values()
-            .filter(|record| record.provider == provider)
+            .filter(|record| &record.provider == provider)
             .count()
             .saturating_add(1);
-        let provider_name = match provider {
-            AgentProvider::Claude => "claude",
-            AgentProvider::Codex => "codex",
-            AgentProvider::Kimi => "kimi",
-        };
-        format!("{provider_name} #{ordinal}")
+        format!("{} #{ordinal}", provider.as_str())
     }
 
     fn new_record(
         &self,
         address: &SessionAddress,
-        provider: AgentProvider,
+        provider: AgentId,
         mode: SessionMode,
         state: ManagedSessionState,
         provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
@@ -1186,7 +1256,7 @@ impl NodeShared {
         let now = unix_time_ms();
         Ok(ManagedSessionRecord {
             record_id: self.allocate_record_id()?,
-            display_name: self.default_record_name(provider),
+            display_name: self.default_record_name(&provider),
             provider,
             mode,
             state,
@@ -1215,9 +1285,9 @@ impl NodeShared {
             if records.records.values().any(|candidate| {
                 candidate.provider_session.as_ref().is_some_and(|candidate_identity| {
                     session_registry::same_provider_session(
-                        candidate.provider,
+                        &candidate.provider,
                         candidate_identity,
-                        record.provider,
+                        &record.provider,
                         identity,
                     )
                 })
@@ -1446,7 +1516,10 @@ impl NodeShared {
             )
         })?;
         let working_directory = self.workspace_root(&record.workspace_id)?;
-        if !working_directory.eq_ignore_ascii_case(windows_path_text(&record.canonical_root)) {
+        if !platform::roots_equal(
+            &working_directory,
+            windows_path_text(&record.canonical_root),
+        ) {
             return Err(failure(
                 NodeFailureCode::SessionRecordConflict,
                 "managed session workspace root changed; refusing to resume in another directory",
@@ -1461,9 +1534,9 @@ impl NodeShared {
                 candidate.record_id != *record_id
                     && candidate.provider_session.as_ref().is_some_and(|candidate_identity| {
                         session_registry::same_provider_session(
-                            candidate.provider,
+                            &candidate.provider,
                             candidate_identity,
-                            record.provider,
+                            &record.provider,
                             &identity,
                         )
                     })
@@ -1523,8 +1596,7 @@ impl NodeShared {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
         };
-        let agent_id = AgentId::new(record.provider.agent_id())
-            .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        let agent_id = record.provider.clone();
         let dispatch_timeout = Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
         if let Err(error) = self
             .dispatch_bounded(
@@ -1695,12 +1767,6 @@ impl NodeShared {
         workspace_id: WorkspaceId,
         path: RepositoryPath,
     ) -> Result<WorkspaceFileRead, NodeFailure> {
-        let repository_path = path.as_utf8().map(str::to_owned).ok_or_else(|| {
-            failure(
-                NodeFailureCode::InvalidRepositoryPath,
-                "repository path is not supported by this node",
-            )
-        })?;
         let canonical_root = self.workspace_root(&workspace_id)?;
         let permit = self
             .inspection_slots
@@ -1712,9 +1778,10 @@ impl NodeShared {
                     "workspace file read capacity is busy",
                 )
             })?;
+        let path_to_read = path.clone();
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            read_workspace_file_from_disk(Path::new(&canonical_root), &repository_path)
+            read_workspace_file_from_disk(Path::new(&canonical_root), &path_to_read)
         });
         let content = timeout(
             Duration::from_millis(WORKSPACE_FILE_READ_TIMEOUT_MS),
@@ -1790,7 +1857,7 @@ impl NodeShared {
             ));
         }
         if let Some((existing_id, _)) = workspaces.iter().find(|(_, existing_root)| {
-            existing_root.eq_ignore_ascii_case(workspace.canonical_root())
+            platform::roots_equal(existing_root, workspace.canonical_root())
         }) {
             return Err(failure(
                 NodeFailureCode::DuplicateWorkspaceRoot,
@@ -1807,7 +1874,7 @@ impl NodeShared {
                     && !record
                         .canonical_root
                         .as_utf8()
-                        .is_some_and(|root| root.eq_ignore_ascii_case(workspace.canonical_root()))
+                        .is_some_and(|root| platform::roots_equal(root, workspace.canonical_root()))
             }) {
                 return Err(failure(
                     NodeFailureCode::SessionRecordConflict,
@@ -1836,7 +1903,7 @@ impl NodeShared {
                     && record
                         .canonical_root
                         .as_utf8()
-                        .is_some_and(|root| root.eq_ignore_ascii_case(workspace.canonical_root()))
+                        .is_some_and(|root| platform::roots_equal(root, workspace.canonical_root()))
             }) {
                 if record.active_session.is_none() {
                     record.state = detached_record_state(record);
@@ -2250,9 +2317,9 @@ impl NodeShared {
                         record.record_id != *record_id
                             && record.provider_session.as_ref().is_some_and(|record_identity| {
                                 session_registry::same_provider_session(
-                                    record.provider,
+                                    &record.provider,
                                     record_identity,
-                                    current_snapshot.provider,
+                                    &current_snapshot.provider,
                                     &identity,
                                 )
                             })
@@ -2266,7 +2333,7 @@ impl NodeShared {
                                 .canonical_root
                                 .as_utf8()
                                 .zip(current_snapshot.canonical_root.as_utf8())
-                                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+                                .is_some_and(|(left, right)| platform::roots_equal(left, right))
                     });
                     if !scope_matches {
                         if let Some(current) = records.records.get_mut(record_id) {
@@ -2317,9 +2384,9 @@ impl NodeShared {
                     .as_ref()
                     .is_some_and(|current| {
                         !session_registry::same_provider_session(
-                            current_snapshot.provider,
+                            &current_snapshot.provider,
                             current,
-                            current_snapshot.provider,
+                            &current_snapshot.provider,
                             &identity,
                         )
                     })
@@ -2344,7 +2411,7 @@ impl NodeShared {
                             record_id: new_record_id.clone(),
                             display_name: format!(
                                 "{} #{}",
-                                current_snapshot.provider.agent_id(),
+                                current_snapshot.provider.as_str(),
                                 records
                                     .records
                                     .values()
@@ -2354,7 +2421,7 @@ impl NodeShared {
                                     .count()
                                     .saturating_add(1),
                             ),
-                            provider: current_snapshot.provider,
+                            provider: current_snapshot.provider.clone(),
                             mode: current_snapshot.mode,
                             state: ManagedSessionState::Live,
                             workspace_id: current_snapshot.workspace_id,
@@ -2524,6 +2591,7 @@ impl NodeShared {
         NodeSnapshot {
             node_id: self.node_id.clone(),
             enabled_providers: self.enabled_providers.clone(),
+            provider_runtime_statuses: self.provider_runtime_statuses.clone(),
             workspaces: workspaces.into_values().collect(),
             session_records: self
                 .session_records
@@ -2542,10 +2610,29 @@ impl NodeShared {
             .last_sequence
             .checked_add(1)
             .expect("node event sequence exhausted");
-        let envelope = NodeEventEnvelope { sequence, event };
         if history.events.len() == NODE_EVENT_HISTORY_MAX {
-            history.events.pop_front();
+            if let Some(evicted) = history.events.pop_front() {
+                history.removed_record_providers.remove(&evicted.sequence);
+            }
         }
+        match &event {
+            NodeEvent::SessionRecordUpserted { record } => {
+                history
+                    .record_providers
+                    .insert(record.record_id.clone(), record.provider.clone());
+            }
+            NodeEvent::SessionRecordRemoved { record_id } => {
+                if let Some(provider) = history.record_providers.remove(record_id) {
+                    history.removed_record_providers.insert(sequence, provider);
+                }
+            }
+            NodeEvent::Control { .. }
+            | NodeEvent::ControllerChanged { .. }
+            | NodeEvent::WorkspaceAdded { .. }
+            | NodeEvent::WorkspaceRemoved { .. }
+            | NodeEvent::ResyncRequired { .. } => {}
+        }
+        let envelope = NodeEventEnvelope { sequence, event };
         history.events.push_back(envelope.clone());
         history.last_sequence = sequence;
         drop(history);
@@ -2894,7 +2981,7 @@ impl NodeShared {
     async fn spawn_session(
         &self,
         workspace_id: WorkspaceId,
-        provider: AgentProvider,
+        provider: AgentId,
         mode: SessionMode,
         terminal_size: gate4agent_types::TerminalSize,
         initial_prompt: Option<String>,
@@ -2912,7 +2999,7 @@ impl NodeShared {
         };
         let record = self.new_record(
             &address,
-            provider,
+            provider.clone(),
             mode,
             ManagedSessionState::IdentityPending,
             None,
@@ -2935,8 +3022,7 @@ impl NodeShared {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
         };
-        let agent_id = AgentId::new(provider.agent_id())
-            .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        let agent_id = provider;
         let dispatch_timeout = Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
         if let Err(error) = self.dispatch_bounded(
             ControlCommand::Register {
@@ -3164,11 +3250,13 @@ async fn serve_connection(
         return Err(NodeServerError::Handshake("node protocol version mismatch".to_owned()));
     }
     let compatibility = match hello.compatibility.as_ref() {
-        Some(offer) => Some(
-            node_compatibility_support(&shared)?
+        Some(offer) => {
+            let mut selected = node_compatibility_support(&shared)?
                 .negotiate(NODE_PROTOCOL_VERSION, offer)
-                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
-        ),
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?;
+            project_negotiated_provider_ids(&mut selected);
+            Some(selected)
+        }
         None => None,
     };
     let server_nonce = random_nonce().map_err(NodeServerError::Authentication)?;
@@ -3243,6 +3331,12 @@ async fn serve_connection(
         .as_ref()
         .map(|selected| selected.capabilities.clone())
         .unwrap_or_default();
+    let include_provider_runtime_status = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY
+    });
+    let include_open_provider_ids = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_PROVIDER_ID_OPEN_CAPABILITY
+    });
     let authenticated_permit = Arc::clone(&shared.authenticated_slots)
         .try_acquire_owned()
         .map_err(|_| NodeServerError::AuthenticatedConnectionLimit)?;
@@ -3263,7 +3357,11 @@ async fn serve_connection(
             role: hello.role,
             event_sequence: shared.current_sequence(),
             controller: shared.controller_state(),
-            snapshot: shared.snapshot(),
+            snapshot: snapshot_for_wire(
+                &shared,
+                include_provider_runtime_status,
+                include_open_provider_ids,
+            ),
             compatibility,
         }),
     )
@@ -3300,7 +3398,17 @@ async fn serve_connection(
                 let ClientFrame::Request(request) = frame else {
                     return Err(NodeServerError::Handshake("hello may only be sent once".to_owned()));
                 };
-                let reply = if request
+                let requires_open_provider_ids =
+                    request_requires_open_provider_ids(&shared, &request.request);
+                let mut reply = if requires_open_provider_ids && !include_open_provider_ids {
+                    ResponseEnvelope {
+                        request_id: request.request_id,
+                        result: Err(failure(
+                            NodeFailureCode::UnsupportedCapability,
+                            "open provider IDs were not negotiated",
+                        )),
+                    }
+                } else if request
                     .request
                     .required_capability()
                     .is_some_and(|required| {
@@ -3319,11 +3427,26 @@ async fn serve_connection(
                 } else {
                     process_request(&shared, connection_id, hello.role, request).await
                 };
+                if !include_provider_runtime_status {
+                    clear_response_provider_runtime_status(&mut reply);
+                }
+                if !include_open_provider_ids {
+                    project_response_legacy_provider_ids(&shared, &mut reply);
+                }
                 write_json_frame(&mut writer, &ServerFrame::Reply(reply)).await?;
             }
             event = event_rx.recv() => {
                 match event {
-                    Ok(event) => write_json_frame(&mut writer, &ServerFrame::Event(event)).await?,
+                    Ok(event) => {
+                        let event = if include_open_provider_ids {
+                            Some(event)
+                        } else {
+                            project_event_legacy_provider_ids(&shared, event)
+                        };
+                        if let Some(event) = event {
+                            write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let (sequence, oldest) = {
                             let history = shared.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3363,19 +3486,11 @@ fn node_compatibility_support_for_manifest(
         protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION)
             .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         capabilities: baseline_capabilities()?,
-        host: HostDescriptor {
-            operating_system: OperatingSystemId::new("windows")
-                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
-            architecture: ArchitectureId::new(std::env::consts::ARCH)
-                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
-        },
-        path_semantics: PathSemantics {
-            style: PathStyle::Windows,
-            encoding: PathEncoding::Utf8,
-        },
-        local_transport: LocalTransportKind::WindowsNamedPipe,
+        host: platform::host_descriptor().map_err(NodeServerError::Handshake)?,
+        path_semantics: platform::path_semantics(),
+        local_transport: platform::local_transport(),
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: provider_contracts.to_vec(),
@@ -3386,8 +3501,11 @@ fn node_compatibility_support_for_manifest(
 fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
     [
         NODE_COMPATIBILITY_METADATA_CAPABILITY,
+        NODE_REPOSITORY_PATH_CAPABILITY,
         NODE_WORKSPACE_FILE_READ_CAPABILITY,
         NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
+        NODE_PROVIDER_ID_OPEN_CAPABILITY,
+        NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -3395,6 +3513,205 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))
         })
         .collect()
+}
+
+fn snapshot_for_wire(
+    shared: &NodeShared,
+    include_provider_runtime_status: bool,
+    include_open_provider_ids: bool,
+) -> NodeSnapshot {
+    let mut snapshot = shared.snapshot();
+    if !include_provider_runtime_status {
+        snapshot.provider_runtime_statuses.clear();
+    }
+    if !include_open_provider_ids {
+        project_snapshot_legacy_provider_ids(&mut snapshot);
+    }
+    snapshot
+}
+
+fn project_negotiated_provider_ids(compatibility: &mut NegotiatedNodeCompatibility) {
+    let includes_open_provider_ids = compatibility.capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_PROVIDER_ID_OPEN_CAPABILITY
+    });
+    if includes_open_provider_ids {
+        return;
+    }
+    compatibility
+        .provider_contracts
+        .retain(|contract| provider_id_is_legacy(&contract.provider));
+    compatibility
+        .provider_adapter_contracts
+        .retain(|contract| provider_id_is_legacy(&contract.provider));
+}
+
+fn request_requires_open_provider_ids(shared: &NodeShared, request: &NodeRequest) -> bool {
+    request_requires_open_provider_ids_with(
+        request,
+        |session| shared.validate_address(session).ok(),
+        |record_id| shared.record(record_id).ok().map(|record| record.provider),
+    )
+}
+
+fn request_requires_open_provider_ids_with(
+    request: &NodeRequest,
+    provider_for_session: impl Fn(&SessionAddress) -> Option<AgentId>,
+    provider_for_record: impl Fn(&SessionRecordId) -> Option<AgentId>,
+) -> bool {
+    match request {
+        NodeRequest::Spawn { provider, .. } => !provider_id_is_legacy(provider),
+        NodeRequest::Resume { session, .. }
+        | NodeRequest::Prompt { session, .. }
+        | NodeRequest::Paste { session, .. }
+        | NodeRequest::Input { session, .. }
+        | NodeRequest::TerminalBytes { session, .. }
+        | NodeRequest::TerminalControl { session, .. }
+        | NodeRequest::Resize { session, .. }
+        | NodeRequest::Interrupt { session }
+        | NodeRequest::Stop { session, .. }
+        | NodeRequest::Remove { session } => provider_for_session(session)
+            .map_or(true, |provider| !provider_id_is_legacy(&provider)),
+        NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::ResumeSessionRecord { record_id, .. }
+        | NodeRequest::ForgetSessionRecord { record_id } => provider_for_record(record_id)
+            .map_or(true, |provider| !provider_id_is_legacy(&provider)),
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
+fn project_snapshot_legacy_provider_ids(snapshot: &mut NodeSnapshot) {
+    snapshot.enabled_providers.retain(provider_id_is_legacy);
+    snapshot.provider_runtime_statuses = ProviderRuntimeStatuses::new(
+        snapshot
+            .provider_runtime_statuses
+            .as_slice()
+            .iter()
+            .filter(|status| provider_id_is_legacy(status.provider()))
+            .cloned(),
+    )
+    .expect("a filtered provider runtime projection remains valid");
+    snapshot
+        .session_records
+        .retain(|record| provider_id_is_legacy(&record.provider));
+    for workspace in &mut snapshot.workspaces {
+        workspace
+            .sessions
+            .retain(|session| provider_id_is_legacy(&session.agent_id));
+    }
+}
+
+fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut ResponseEnvelope) {
+    let contains_open_record = match reply.result.as_ref() {
+        Ok(NodeResponse::SessionRecordUpdated { record })
+        | Ok(NodeResponse::SessionRecordResumed { record, .. }) => {
+            !provider_id_is_legacy(&record.provider)
+        }
+        _ => false,
+    };
+    if contains_open_record {
+        reply.result = Err(failure(
+            NodeFailureCode::UnsupportedCapability,
+            "open provider IDs were not negotiated",
+        ));
+        return;
+    }
+    let Ok(response) = reply.result.as_mut() else {
+        return;
+    };
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => {
+            project_snapshot_legacy_provider_ids(snapshot);
+        }
+        NodeResponse::Resync { snapshot, events, .. } => {
+            project_snapshot_legacy_provider_ids(snapshot);
+            *events = std::mem::take(events)
+                .into_iter()
+                .filter_map(|event| project_event_legacy_provider_ids(shared, event))
+                .collect();
+        }
+        NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::WorktreeCreated { workspace, .. } => {
+            workspace
+                .sessions
+                .retain(|session| provider_id_is_legacy(&session.agent_id));
+        }
+        NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::Controller { .. }
+        | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SessionRecordUpdated { .. }
+        | NodeResponse::SessionRecordResumed { .. }
+        | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::WorkspaceUnregistered { .. }
+        | NodeResponse::WorktreeRemoved { .. }
+        | NodeResponse::Accepted
+        | NodeResponse::ShuttingDown => {}
+    }
+}
+
+fn project_event_legacy_provider_ids(
+    shared: &NodeShared,
+    mut envelope: NodeEventEnvelope,
+) -> Option<NodeEventEnvelope> {
+    let include = match &mut envelope.event {
+        NodeEvent::Control { address, .. } => shared
+            .validate_address(address)
+            .is_ok_and(|provider| provider_id_is_legacy(&provider)),
+        NodeEvent::WorkspaceAdded { workspace } => {
+            workspace
+                .sessions
+                .retain(|session| provider_id_is_legacy(&session.agent_id));
+            true
+        }
+        NodeEvent::SessionRecordUpserted { record } => {
+            provider_id_is_legacy(&record.provider)
+        }
+        NodeEvent::SessionRecordRemoved { .. } => shared
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .removed_record_providers
+            .get(&envelope.sequence)
+            .is_some_and(provider_id_is_legacy),
+        NodeEvent::ControllerChanged { .. }
+        | NodeEvent::WorkspaceRemoved { .. }
+        | NodeEvent::ResyncRequired { .. } => true,
+    };
+    include.then_some(envelope)
+}
+
+fn clear_response_provider_runtime_status(reply: &mut ResponseEnvelope) {
+    let Ok(response) = reply.result.as_mut() else {
+        return;
+    };
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } | NodeResponse::Resync { snapshot, .. } => {
+            snapshot.provider_runtime_statuses.clear();
+        }
+        NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::Controller { .. }
+        | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SessionRecordUpdated { .. }
+        | NodeResponse::SessionRecordResumed { .. }
+        | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::WorkspaceUnregistered { .. }
+        | NodeResponse::WorktreeCreated { .. }
+        | NodeResponse::WorktreeRemoved { .. }
+        | NodeResponse::Accepted
+        | NodeResponse::ShuttingDown => {}
+    }
 }
 
 struct ControllerReleaseGuard {
@@ -4123,7 +4440,7 @@ fn git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
     failure(code, &error.message)
 }
 
-fn workspace_file_failure(error: crate::workspace_file_windows::WorkspaceFileReadError) -> NodeFailure {
+fn workspace_file_failure(error: WorkspaceFileReadError) -> NodeFailure {
     let code = match error.kind() {
         WorkspaceFileReadErrorKind::InvalidPath => NodeFailureCode::InvalidRepositoryPath,
         WorkspaceFileReadErrorKind::UnsafePath | WorkspaceFileReadErrorKind::ReparsePoint => {
@@ -4140,20 +4457,11 @@ fn workspace_file_failure(error: crate::workspace_file_windows::WorkspaceFileRea
     failure(code, "repository file read failed")
 }
 
-fn normalize_windows_verbatim_path(path: String) -> String {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        rest.to_owned()
-    } else {
-        path
-    }
-}
-
 fn validate_workspace_root(
     workspace_id: &WorkspaceId,
     canonical_root: &str,
 ) -> Result<(), NodeServerError> {
+    #[cfg(windows)]
     if canonical_root.starts_with(r"\\") {
         return Err(NodeServerError::InvalidWorkspaceRoot {
             workspace_id: workspace_id.clone(),
@@ -4161,10 +4469,8 @@ fn validate_workspace_root(
             message: "UNC workspace roots are unsupported by Windows PTY providers".to_owned(),
         });
     }
-    if canonical_root.is_empty()
+    if !platform::workspace_root_supported(canonical_root)
         || canonical_root.len() > WORKING_DIRECTORY_MAX_BYTES
-        || canonical_root.chars().any(char::is_control)
-        || !Path::new(canonical_root).is_absolute()
     {
         return Err(NodeServerError::InvalidWorkspaceRoot {
             workspace_id: workspace_id.clone(),
@@ -4267,7 +4573,7 @@ fn detached_record_state(record: &ManagedSessionRecord) -> ManagedSessionState {
 
 #[derive(Debug, Error)]
 pub enum NodeServerError {
-    #[error("node endpoint must be a non-empty Windows named-pipe path")]
+    #[error("node endpoint must be a bounded absolute local transport path")]
     InvalidEndpoint,
     #[error("node access token must contain 1..=4096 bytes")]
     InvalidAccessToken,
@@ -4275,8 +4581,10 @@ pub enum NodeServerError {
     InvalidApiListen(std::net::SocketAddr),
     #[error("node durable state path must be an absolute file path: {0}")]
     InvalidStatePath(String),
-    #[error("LOCALAPPDATA is unavailable; cannot derive the product node state path")]
-    LocalAppDataUnavailable,
+    #[error("the local state directory is unavailable; supply an explicit state path")]
+    LocalStateDirectoryUnavailable,
+    #[error("the local runtime directory is unavailable; supply an explicit endpoint")]
+    LocalRuntimeDirectoryUnavailable,
     #[error("node durable state failed: {0}")]
     DurableState(io::Error),
     #[error("node requires at least one configured workspace")]
@@ -4327,9 +4635,32 @@ pub enum NodeServerError {
     ShutdownTimedOut { active_native_sessions: usize },
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    fn agent(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
+    fn record(provider: &str, record_id: &str) -> ManagedSessionRecord {
+        ManagedSessionRecord {
+            record_id: SessionRecordId::new(record_id).unwrap(),
+            display_name: format!("{provider} record"),
+            provider: agent(provider),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Unavailable,
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            canonical_root: opaque_windows_path(
+                std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+            ),
+            provider_session: None,
+            active_session: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            last_error: None,
+        }
+    }
 
     #[test]
     fn windows_runtime_default_node_endpoint_is_exact_and_valid() {
@@ -4356,48 +4687,54 @@ mod tests {
         assert_eq!(
             providers
                 .iter()
-                .map(|contract| (contract.provider, contract.revision.as_str()))
+                .map(|contract| (contract.provider.as_str(), contract.revision.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (AgentProvider::Claude, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
-                (AgentProvider::Codex, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
-                (AgentProvider::Kimi, "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+                ("claude", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+                ("codex", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+                ("grok", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+                ("kimi", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
+                ("qwen-code", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
             ]
         );
         assert_eq!(
             adapters
                 .iter()
                 .map(|contract| (
-                    contract.provider,
+                    contract.provider.as_str(),
                     contract.family,
                     contract.adapter_id.as_str(),
                     contract.revision.as_str(),
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                (AgentProvider::Claude, AdapterFamily::PtySemantic, "claude-code", "gate4agent-adapter/v1"),
-                (AgentProvider::Claude, AdapterFamily::Pipe, "claude-code", "gate4agent-adapter/v1"),
-                (AgentProvider::Claude, AdapterFamily::Hook, "claude-code", "gate4agent-adapter/v1"),
-                (AgentProvider::Claude, AdapterFamily::ManagedHook, "claude", "gate4agent-managed-hooks/orca-d8629c4/v1"),
-                (AgentProvider::Claude, AdapterFamily::OneShot, "claude", "gate4agent-inline/claude-code-2.1/v1"),
-                (AgentProvider::Claude, AdapterFamily::History, "claude-code", "gate4agent-adapter/v1"),
-                (AgentProvider::Claude, AdapterFamily::Resume, "claude-code", "gate4agent-adapter/v1"),
-                (AgentProvider::Claude, AdapterFamily::SessionOptions, "claude-code", "gate4agent-session-options/orca-d8629c4/v1"),
-                (AgentProvider::Codex, AdapterFamily::PtySemantic, "codex", "gate4agent-adapter/v1"),
-                (AgentProvider::Codex, AdapterFamily::Pipe, "codex", "gate4agent-adapter/v1"),
-                (AgentProvider::Codex, AdapterFamily::Hook, "codex", "gate4agent-adapter/v1"),
-                (AgentProvider::Codex, AdapterFamily::ManagedHook, "codex", "gate4agent-managed-hooks/orca-d8629c4/v1"),
-                (AgentProvider::Codex, AdapterFamily::OneShot, "codex", "gate4agent-inline/codex-cli-0.144/v1"),
-                (AgentProvider::Codex, AdapterFamily::History, "codex", "gate4agent-adapter/v1"),
-                (AgentProvider::Codex, AdapterFamily::Resume, "codex", "gate4agent-adapter/v1"),
-                (AgentProvider::Codex, AdapterFamily::SessionOptions, "codex", "gate4agent-session-options/orca-d8629c4/v1"),
-                (AgentProvider::Kimi, AdapterFamily::PtySemantic, "kimi", "gate4agent-adapter/v1"),
-                (AgentProvider::Kimi, AdapterFamily::Pipe, "kimi", "gate4agent-adapter/v1"),
-                (AgentProvider::Kimi, AdapterFamily::Hook, "kimi", "gate4agent-adapter/v1"),
-                (AgentProvider::Kimi, AdapterFamily::ManagedHook, "kimi", "gate4agent-managed-hooks/orca-d8629c4/v1"),
-                (AgentProvider::Kimi, AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
-                (AgentProvider::Kimi, AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
-                (AgentProvider::Kimi, AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
+                ("claude", AdapterFamily::PtySemantic, "claude-code", "gate4agent-adapter/v1"),
+                ("claude", AdapterFamily::Pipe, "claude-code", "gate4agent-adapter/v1"),
+                ("claude", AdapterFamily::Hook, "claude-code", "gate4agent-adapter/v1"),
+                ("claude", AdapterFamily::ManagedHook, "claude", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+                ("claude", AdapterFamily::OneShot, "claude", "gate4agent-inline/claude-code-2.1/v1"),
+                ("claude", AdapterFamily::History, "claude-code", "gate4agent-adapter/v1"),
+                ("claude", AdapterFamily::Resume, "claude-code", "gate4agent-adapter/v1"),
+                ("claude", AdapterFamily::SessionOptions, "claude-code", "gate4agent-session-options/orca-d8629c4/v1"),
+                ("codex", AdapterFamily::PtySemantic, "codex", "gate4agent-adapter/v1"),
+                ("codex", AdapterFamily::Pipe, "codex", "gate4agent-adapter/v1"),
+                ("codex", AdapterFamily::Hook, "codex", "gate4agent-adapter/v1"),
+                ("codex", AdapterFamily::ManagedHook, "codex", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+                ("codex", AdapterFamily::OneShot, "codex", "gate4agent-inline/codex-cli-0.144/v1"),
+                ("codex", AdapterFamily::History, "codex", "gate4agent-adapter/v1"),
+                ("codex", AdapterFamily::Resume, "codex", "gate4agent-adapter/v1"),
+                ("codex", AdapterFamily::SessionOptions, "codex", "gate4agent-session-options/orca-d8629c4/v1"),
+                ("grok", AdapterFamily::Hook, "grok", "gate4agent-adapter/v1"),
+                ("grok", AdapterFamily::ManagedHook, "grok", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+                ("grok", AdapterFamily::History, "grok", "gate4agent-adapter/v1"),
+                ("grok", AdapterFamily::Resume, "grok", "gate4agent-adapter/v1"),
+                ("kimi", AdapterFamily::PtySemantic, "kimi", "gate4agent-adapter/v1"),
+                ("kimi", AdapterFamily::Pipe, "kimi", "gate4agent-adapter/v1"),
+                ("kimi", AdapterFamily::Hook, "kimi", "gate4agent-adapter/v1"),
+                ("kimi", AdapterFamily::ManagedHook, "kimi", "gate4agent-managed-hooks/orca-d8629c4/v1"),
+                ("kimi", AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
+                ("kimi", AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
+                ("kimi", AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
             ]
         );
     }
@@ -4481,10 +4818,10 @@ mod tests {
     }
 
     #[test]
-    fn node_server_construction_accepts_production_manifest_at_provider_count_limit() {
+    fn node_server_construction_accepts_five_provider_production_manifest() {
         let registry = active_registry().unwrap();
         let (providers, _) = provider_contract_manifest(&registry).unwrap();
-        assert_eq!(providers.len(), crate::protocol::MAX_PROVIDER_CONTRACTS);
+        assert_eq!(providers.len(), 5);
         let server = NodeServer::new_with_registry(
             construction_test_config("manifest-production-bound"),
             registry,
@@ -4497,7 +4834,7 @@ mod tests {
     fn node_server_construction_rejects_count_valid_manifest_over_handshake_capacity() {
         let registry = maximum_size_provider_manifest_registry();
         let (providers, adapters) = provider_contract_manifest(&registry).unwrap();
-        assert_eq!(providers.len(), crate::protocol::MAX_PROVIDER_CONTRACTS);
+        assert_eq!(providers.len(), 3);
         assert_eq!(adapters.len(), 30);
         assert!(adapters.len() <= crate::protocol::MAX_PROVIDER_ADAPTER_CONTRACTS);
         let error = match NodeServer::new_with_registry(
@@ -4671,7 +5008,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![workspace.clone()],
-            vec![AgentProvider::Claude, AgentProvider::Codex, AgentProvider::Kimi],
+            vec![agent("claude"), agent("codex"), agent("kimi")],
         );
         let instance_id = AgentInstanceId(17);
         let generation = SessionGeneration(3);
@@ -4691,6 +5028,173 @@ mod tests {
     }
 
     #[test]
+    fn open_provider_request_gate_is_state_aware_and_fail_closed() {
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(2),
+            },
+        };
+        let record_id = SessionRecordId::new("record-a").unwrap();
+        let size = gate4agent_types::TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let address_requests = [
+            NodeRequest::Resume {
+                session: address.clone(),
+                terminal_size: size,
+                initial_prompt: None,
+            },
+            NodeRequest::Prompt { session: address.clone(), text: "p".to_owned() },
+            NodeRequest::Paste { session: address.clone(), text: "p".to_owned() },
+            NodeRequest::Input { session: address.clone(), text: "p".to_owned() },
+            NodeRequest::TerminalBytes { session: address.clone(), bytes: vec![1] },
+            NodeRequest::TerminalControl {
+                session: address.clone(),
+                control: TerminalControl::Enter,
+            },
+            NodeRequest::Resize { session: address.clone(), size },
+            NodeRequest::Interrupt { session: address.clone() },
+            NodeRequest::Stop { session: address.clone(), force: false },
+            NodeRequest::Remove { session: address },
+        ];
+        for request in &address_requests {
+            assert!(request_requires_open_provider_ids_with(
+                request,
+                |_| Some(agent("qwen-code")),
+                |_| Some(agent("claude")),
+            ));
+            assert!(!request_requires_open_provider_ids_with(
+                request,
+                |_| Some(agent("claude")),
+                |_| Some(agent("claude")),
+            ));
+            assert!(request_requires_open_provider_ids_with(
+                request,
+                |_| None,
+                |_| Some(agent("claude")),
+            ));
+        }
+
+        let record_requests = [
+            NodeRequest::RenameSessionRecord {
+                record_id: record_id.clone(),
+                display_name: "renamed".to_owned(),
+            },
+            NodeRequest::ResumeSessionRecord {
+                record_id: record_id.clone(),
+                terminal_size: size,
+                initial_prompt: None,
+            },
+            NodeRequest::ForgetSessionRecord { record_id },
+        ];
+        for request in &record_requests {
+            assert!(request_requires_open_provider_ids_with(
+                request,
+                |_| Some(agent("claude")),
+                |_| Some(agent("grok")),
+            ));
+            assert!(!request_requires_open_provider_ids_with(
+                request,
+                |_| Some(agent("claude")),
+                |_| Some(agent("kimi")),
+            ));
+            assert!(request_requires_open_provider_ids_with(
+                request,
+                |_| Some(agent("claude")),
+                |_| None,
+            ));
+        }
+
+        assert!(request_requires_open_provider_ids_with(
+            &NodeRequest::Spawn {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                provider: agent("qwen-code"),
+                mode: SessionMode::Pty,
+                terminal_size: size,
+                initial_prompt: None,
+            },
+            |_| None,
+            |_| None,
+        ));
+        assert!(!request_requires_open_provider_ids_with(
+            &NodeRequest::Snapshot,
+            |_| None,
+            |_| None,
+        ));
+    }
+
+    #[test]
+    fn legacy_projection_filters_open_record_replies_and_event_history() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace],
+            vec![agent("claude"), agent("grok")],
+        );
+        let legacy = record("claude", "legacy-record");
+        let open = record("grok", "open-record");
+        let legacy_upsert = shared.publish(NodeEvent::SessionRecordUpserted {
+            record: legacy.clone(),
+        });
+        let open_upsert = shared.publish(NodeEvent::SessionRecordUpserted {
+            record: open.clone(),
+        });
+        let legacy_removed = shared.publish(NodeEvent::SessionRecordRemoved {
+            record_id: legacy.record_id.clone(),
+        });
+        let open_removed = shared.publish(NodeEvent::SessionRecordRemoved {
+            record_id: open.record_id.clone(),
+        });
+        assert!(project_event_legacy_provider_ids(&shared, legacy_upsert.clone()).is_some());
+        assert!(project_event_legacy_provider_ids(&shared, open_upsert.clone()).is_none());
+        assert!(project_event_legacy_provider_ids(&shared, legacy_removed.clone()).is_some());
+        assert!(project_event_legacy_provider_ids(&shared, open_removed.clone()).is_none());
+
+        let mut record_reply = ResponseEnvelope {
+            request_id: 1,
+            result: Ok(NodeResponse::SessionRecordUpdated { record: open }),
+        };
+        project_response_legacy_provider_ids(&shared, &mut record_reply);
+        assert!(matches!(
+            record_reply.result,
+            Err(NodeFailure { code: NodeFailureCode::UnsupportedCapability, .. })
+        ));
+
+        let mut resync = ResponseEnvelope {
+            request_id: 2,
+            result: Ok(NodeResponse::Resync {
+                event_sequence: open_removed.sequence,
+                snapshot: shared.snapshot(),
+                events: vec![legacy_upsert, open_upsert, legacy_removed, open_removed],
+            }),
+        };
+        project_response_legacy_provider_ids(&shared, &mut resync);
+        let Ok(NodeResponse::Resync { snapshot, events, .. }) = resync.result else {
+            panic!("legacy projection changed the resync response kind");
+        };
+        assert!(snapshot.session_records.iter().all(|item| {
+            provider_id_is_legacy(&item.provider)
+        }));
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| matches!(
+            &event.event,
+            NodeEvent::SessionRecordUpserted { record }
+                if provider_id_is_legacy(&record.provider)
+        ) || matches!(&event.event, NodeEvent::SessionRecordRemoved { .. })));
+    }
+
+    #[test]
     fn session_binding_capacity_is_bounded_by_the_control_session_limit() {
         let catalog = active_registry().unwrap();
         let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
@@ -4705,7 +5209,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![workspace],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         for index in 0..CONTROL_SESSIONS_MAX {
             shared.bind_session(
@@ -4732,7 +5236,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![primary],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         shared
             .acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS)
@@ -4769,7 +5273,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![primary.clone()],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         let secondary_id = WorkspaceId::new("secondary").unwrap();
         let secondary = shared
@@ -4854,13 +5358,13 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![workspace.clone()],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         let record_id = SessionRecordId::new("sr-collision").unwrap();
         let original = ManagedSessionRecord {
             record_id: record_id.clone(),
             display_name: "original".to_owned(),
-            provider: AgentProvider::Claude,
+            provider: agent("claude"),
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: workspace.workspace_id,
@@ -4893,14 +5397,14 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![workspace.clone()],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         let record_id = SessionRecordId::new("sr-runtime-error").unwrap();
         shared
             .insert_record(ManagedSessionRecord {
                 record_id: record_id.clone(),
                 display_name: "runtime error".to_owned(),
-                provider: AgentProvider::Claude,
+                provider: agent("claude"),
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::IdentityPending,
                 workspace_id: workspace.workspace_id,
@@ -4950,7 +5454,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![primary.clone(), secondary.clone()],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         let identity = gate4agent_types::ProviderSessionIdentity {
             key: gate4agent_types::ProviderSessionKey::SessionId,
@@ -4962,7 +5466,7 @@ mod tests {
             .insert_record(ManagedSessionRecord {
                 record_id: dormant_id.clone(),
                 display_name: "dormant".to_owned(),
-                provider: AgentProvider::Claude,
+                provider: agent("claude"),
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::Dormant,
                 workspace_id: primary.workspace_id,
@@ -4986,7 +5490,7 @@ mod tests {
             .insert_record(ManagedSessionRecord {
                 record_id: current_id.clone(),
                 display_name: "current".to_owned(),
-                provider: AgentProvider::Claude,
+                provider: agent("claude"),
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::IdentityPending,
                 workspace_id: secondary.workspace_id,
@@ -5062,7 +5566,8 @@ mod tests {
             node_id.clone(),
             NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
             vec![workspace.clone()],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
             Vec::new(),
             Vec::new(),
             Some(state_path.clone()),
@@ -5080,7 +5585,7 @@ mod tests {
             .insert_record(ManagedSessionRecord {
                 record_id: durable_id.clone(),
                 display_name: "durable".to_owned(),
-                provider: AgentProvider::Claude,
+                provider: agent("claude"),
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::Dormant,
                 workspace_id: workspace.workspace_id.clone(),
@@ -5104,7 +5609,7 @@ mod tests {
             .insert_record(ManagedSessionRecord {
                 record_id: pending_id.clone(),
                 display_name: "pending".to_owned(),
-                provider: AgentProvider::Claude,
+                provider: agent("claude"),
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::IdentityPending,
                 workspace_id: workspace.workspace_id.clone(),
@@ -5206,7 +5711,8 @@ mod tests {
             node_id,
             NodeIncarnationId::from_bytes([1; crate::protocol::NODE_INCARNATION_ID_BYTES]),
             vec![workspace],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
             Vec::new(),
             Vec::new(),
             None,
@@ -5242,14 +5748,14 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![primary, secondary.clone()],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         let record_id = SessionRecordId::new("sr-workspace").unwrap();
         shared
             .insert_record(ManagedSessionRecord {
                 record_id: record_id.clone(),
                 display_name: "workspace record".to_owned(),
-                provider: AgentProvider::Claude,
+                provider: agent("claude"),
                 mode: SessionMode::Pty,
                 state: ManagedSessionState::Dormant,
                 workspace_id: secondary.workspace_id.clone(),
@@ -5317,7 +5823,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![workspace],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         let publishers = 4_u64;
         let events_per_publisher = 256_u64;
@@ -5362,11 +5868,11 @@ mod tests {
     #[test]
     fn canonical_workspace_roots_are_safe_for_cmd_exe() {
         assert_eq!(
-            normalize_windows_verbatim_path(r"\\?\C:\repo\worktree".to_owned()),
+            platform::normalize_canonical_root(r"\\?\C:\repo\worktree".to_owned()),
             r"C:\repo\worktree",
         );
         assert_eq!(
-            normalize_windows_verbatim_path(r"\\?\UNC\server\share\repo".to_owned()),
+            platform::normalize_canonical_root(r"\\?\UNC\server\share\repo".to_owned()),
             r"\\server\share\repo",
         );
         assert!(validate_workspace_root(
@@ -5397,7 +5903,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![workspace],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
         let instance_id = AgentInstanceId(17);
         let original = SessionAddress {
@@ -5640,7 +6146,7 @@ mod tests {
             "fixture-token".to_owned(),
             NodeId::new("node-1").unwrap(),
             vec![workspace],
-            vec![AgentProvider::Claude],
+            vec![agent("claude")],
         );
 
         let response = process_request_inner(

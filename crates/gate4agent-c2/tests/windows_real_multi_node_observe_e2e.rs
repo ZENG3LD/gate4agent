@@ -1,6 +1,8 @@
 #![cfg(windows)]
 
-use gate4agent_c2::protocol::{GapKind, NodeFreshness, NodeId, NodeTransportState};
+use gate4agent_c2::protocol::{
+    GapKind, NodeFreshness, NodeId, NodeTransportState, ProviderRuntimeMode,
+};
 use gate4agent_c2_client::{C2Client, C2ClientError};
 use gate4agent_node::protocol::{ClientRole, NodeRequest, OpaqueHostPath, WorkspaceId};
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
@@ -122,6 +124,22 @@ async fn windows_real_multi_node_observe_only_c2_survives_partial_loss_restart_a
     assert_eq!(client.ready().await.unwrap().online_nodes, 2);
     assert_eq!(initial.nodes[&id_a].inventory.as_ref().unwrap().workspace_count, 1);
     assert_eq!(initial.nodes[&id_b].inventory.as_ref().unwrap().workspace_count, 1);
+    for node_id in [&id_a, &id_b] {
+        let inventory = initial.nodes[node_id].inventory.as_ref().unwrap();
+        assert_eq!(
+            inventory.enabled_providers,
+            [gate4agent_node::protocol::AgentId::new("claude").unwrap()],
+        );
+        assert_eq!(inventory.provider_runtime_statuses.as_slice().len(), 1);
+        assert_eq!(
+            inventory.provider_runtime_statuses.as_slice()[0].provider(),
+            &gate4agent_node::protocol::AgentId::new("claude").unwrap(),
+        );
+        assert_eq!(
+            inventory.provider_runtime_statuses.as_slice()[0].mode(),
+            ProviderRuntimeMode::RawPassthrough,
+        );
+    }
     let initial_b_cursor = initial.nodes[&id_b].cursor;
 
     let mut operator_a = NamedPipeNodeClient::connect(&endpoint_a, &id_a, ClientRole::Operator, token_a).await.unwrap();
@@ -156,6 +174,16 @@ async fn windows_real_multi_node_observe_only_c2_survives_partial_loss_restart_a
             && node.gaps.iter().any(|gap| gap.kind == GapKind::IncarnationChanged)
     }).await;
     assert!(recovered.nodes[&id_b].gaps.iter().any(|gap| gap.kind == GapKind::IncarnationChanged));
+    assert_eq!(
+        recovered.nodes[&id_b]
+            .inventory
+            .as_ref()
+            .unwrap()
+            .provider_runtime_statuses
+            .as_slice()[0]
+            .mode(),
+        ProviderRuntimeMode::RawPassthrough,
+    );
 
     c2_child.terminate().await;
     let post_exit_connect = timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(c2_addr)).await;

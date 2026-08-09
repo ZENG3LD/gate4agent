@@ -22,3 +22,5 @@ path = "src/lib.rs"
 [[bin]]
 name = "gate4agent-tui"
 path = "src/main.rs"
+
+[workspace]

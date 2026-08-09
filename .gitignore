@@ -1,5 +1,6 @@
-/target
+target/
 Cargo.lock
+!crates/gate4agent-tui/Cargo.lock
 
 # Local planning and research — not part of the crate release
 /docs/plans/

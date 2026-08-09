@@ -1,17 +1,19 @@
-#[cfg(windows)]
 use gate4agent_node::{
-    default_state_path, NodeServer, NodeServerConfig, WorkspaceConfig, DEFAULT_NODE_ENDPOINT,
+    default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, WorkspaceConfig,
 };
-#[cfg(windows)]
 use gate4agent_node::protocol::{NodeId, WorkspaceId};
 
-#[cfg(windows)]
 const NODE_TOKEN_ENV: &str = "GATE4AGENT_NODE_TOKEN";
 
-#[cfg(windows)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut endpoint = DEFAULT_NODE_ENDPOINT.to_owned();
+    let mut endpoint = default_node_endpoint()
+        .and_then(|path| {
+            path.into_os_string().into_string().map_err(|_| {
+                gate4agent_node::NodeServerError::InvalidEndpoint
+            })
+        })
+        .unwrap_or_else(|error| fail(&error.to_string()));
     let mut api_listen = "127.0.0.1:18310"
         .parse()
         .expect("the built-in node API listen address must be valid");
@@ -48,7 +50,7 @@ async fn main() {
                 );
             }
             "--help" | "-h" => {
-                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--workspace ID=ABSOLUTE_PATH ...] [--endpoint <named-pipe>] [--api-listen 127.0.0.1:PORT]");
+                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--workspace ID=ABSOLUTE_PATH ...] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT]");
                 println!("control token: {NODE_TOKEN_ENV} environment variable");
                 return;
             }
@@ -70,19 +72,11 @@ async fn main() {
     }
 }
 
-#[cfg(windows)]
 fn required_value(flag: &str, value: Option<String>) -> String {
     value.unwrap_or_else(|| fail(&format!("{flag} requires a value")))
 }
 
-#[cfg(windows)]
 fn fail(message: &str) -> ! {
     eprintln!("gate4agent-node: {message}");
     std::process::exit(2)
-}
-
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("gate4agent-node: Windows named pipes are currently required");
-    std::process::exit(2);
 }

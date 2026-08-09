@@ -21,14 +21,14 @@ use gate4agent_c2_protocol::{
     NodeTransportState, C2WorkspaceInspection,
 };
 use gate4agent_node_protocol::{
-    AgentProvider, ClientRole, ControllerState, ManagedSessionRecord, NodeEvent, NodeFailureCode,
+    ClientRole, ControllerState, ManagedSessionRecord, NodeEvent, NodeFailureCode,
     NodeId, NodeRequest, NodeResponse, NodeSnapshot, SessionAddress as WireSessionAddress,
     SessionKey, SessionMode, SessionRecordId, WorkspaceId, MAX_CONTROLLER_LEASE_MS,
     MAX_NODE_TEXT_BYTES,
 };
 use gate4agent_node_wire::{NamedPipeNodeClient, NodeClientError};
 use gate4agent_types::{
-    ControlEvent, ControlEventKind, ProviderActivity, SessionSnapshot, SessionStatus, TerminalSize,
+    AgentId, ControlEvent, ControlEventKind, ProviderActivity, SessionSnapshot, SessionStatus, TerminalSize,
     TerminalMouseProtocolEncoding, TransportKind,
 };
 use tokio::sync::{mpsc, watch};
@@ -102,6 +102,7 @@ enum WorkerUpdate {
     Snapshot {
         expected_node_id: String,
         endpoint: String,
+        incarnation_id: gate4agent_node_protocol::NodeIncarnationId,
         snapshot: NodeSnapshot,
         controller_owned: bool,
         event_sequence: u64,
@@ -1345,6 +1346,7 @@ async fn node_worker(
         send_snapshot(
             &updates,
             &endpoint,
+            hello.incarnation_id,
             hello.snapshot,
             controller_owned,
             hello.event_sequence,
@@ -1733,7 +1735,15 @@ async fn request_and_publish(
     match response {
         NodeResponse::Snapshot { event_sequence, controller, snapshot } => {
             *controller_owned = owns_controller(&controller, connection_id);
-            send_snapshot(updates, endpoint, snapshot, *controller_owned, event_sequence).await;
+            send_snapshot(
+                updates,
+                endpoint,
+                node.hello().incarnation_id,
+                snapshot,
+                *controller_owned,
+                event_sequence,
+            )
+            .await;
         }
         NodeResponse::Resync { event_sequence, snapshot, events } => {
             for envelope in events {
@@ -1746,7 +1756,15 @@ async fn request_and_publish(
                 )
                 .await;
             }
-            send_snapshot(updates, endpoint, snapshot, *controller_owned, event_sequence).await;
+            send_snapshot(
+                updates,
+                endpoint,
+                node.hello().incarnation_id,
+                snapshot,
+                *controller_owned,
+                event_sequence,
+            )
+            .await;
         }
         NodeResponse::WorkspaceInspected { inspection } => {
             send_update(
@@ -2002,7 +2020,15 @@ async fn await_input_completion(
                     && session.generation.0 == address.generation
             }))
             .is_some_and(|session| session.pending_input.is_none() && session.pending_operation.is_none());
-        send_snapshot(updates, endpoint, snapshot, *controller_owned, event_sequence).await;
+        send_snapshot(
+            updates,
+            endpoint,
+            node.hello().incarnation_id,
+            snapshot,
+            *controller_owned,
+            event_sequence,
+        )
+        .await;
         if complete {
             return Ok(());
         }
@@ -2104,12 +2130,14 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) {
         WorkerUpdate::Snapshot {
             expected_node_id,
             endpoint,
+            incarnation_id,
             snapshot,
             controller_owned,
             event_sequence,
         } => app.upsert_node(project_node(
             expected_node_id,
             endpoint,
+            incarnation_id,
             snapshot,
             controller_owned,
             event_sequence,
@@ -2129,6 +2157,7 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) {
                 app.upsert_node(project_c2_node(
                     expected_node_id,
                     endpoint,
+                    incarnation_id,
                     snapshot,
                     event_sequence,
                 ));
@@ -2182,6 +2211,7 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) {
 fn project_c2_node(
     expected_node_id: String,
     endpoint: String,
+    incarnation_id: gate4agent_c2_protocol::NodeIncarnationId,
     snapshot: C2NodeSnapshot,
     event_sequence: u64,
 ) -> NodeView {
@@ -2189,7 +2219,7 @@ fn project_c2_node(
         .enabled_providers
         .iter()
         .map(|provider| ProviderInventory {
-            provider: project_provider(*provider),
+            provider: project_provider(provider.clone()),
             enabled: true,
         })
         .collect::<Vec<_>>();
@@ -2222,6 +2252,7 @@ fn project_c2_node(
         .collect();
     NodeView {
         node_id,
+        incarnation_id: Some(incarnation_id),
         endpoint,
         connection: ConnectionState::Connected,
         controller_owned: true,
@@ -2234,6 +2265,7 @@ fn project_c2_node(
 fn project_node(
     expected_node_id: String,
     endpoint: String,
+    incarnation_id: gate4agent_node_protocol::NodeIncarnationId,
     snapshot: NodeSnapshot,
     controller_owned: bool,
     event_sequence: u64,
@@ -2242,7 +2274,7 @@ fn project_node(
         .enabled_providers
         .iter()
         .map(|provider| ProviderInventory {
-            provider: project_provider(*provider),
+            provider: project_provider(provider.clone()),
             enabled: true,
         })
         .collect::<Vec<_>>();
@@ -2275,6 +2307,7 @@ fn project_node(
         .collect();
     NodeView {
         node_id,
+        incarnation_id: Some(incarnation_id),
         endpoint,
         connection: ConnectionState::Connected,
         controller_owned,
@@ -2702,6 +2735,7 @@ fn reject_disconnected_commands(
 async fn send_snapshot(
     updates: &mpsc::Sender<WorkerUpdate>,
     endpoint: &NodeEndpoint,
+    incarnation_id: gate4agent_node_protocol::NodeIncarnationId,
     snapshot: NodeSnapshot,
     controller_owned: bool,
     event_sequence: u64,
@@ -2711,6 +2745,7 @@ async fn send_snapshot(
         WorkerUpdate::Snapshot {
             expected_node_id: endpoint.expected_node_id.to_string(),
             endpoint: endpoint.endpoint.clone(),
+            incarnation_id,
             snapshot,
             controller_owned,
             event_sequence,
@@ -2739,20 +2774,12 @@ fn wire_address(address: &SessionAddress) -> Result<WireSessionAddress, String> 
     })
 }
 
-fn map_provider(provider: Provider) -> AgentProvider {
-    match provider {
-        Provider::Claude => AgentProvider::Claude,
-        Provider::Codex => AgentProvider::Codex,
-        Provider::Kimi => AgentProvider::Kimi,
-    }
+fn map_provider(provider: Provider) -> AgentId {
+    provider
 }
 
-fn project_provider(provider: AgentProvider) -> Provider {
-    match provider {
-        AgentProvider::Claude => Provider::Claude,
-        AgentProvider::Codex => Provider::Codex,
-        AgentProvider::Kimi => Provider::Kimi,
-    }
+fn project_provider(provider: AgentId) -> Provider {
+    provider
 }
 
 fn status_label(status: &SessionStatus) -> String {
@@ -2796,6 +2823,14 @@ mod tests {
         OpaqueHostPath::utf8(value.into()).unwrap()
     }
 
+    fn provider(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
+    fn incarnation(byte: u8) -> gate4agent_node_protocol::NodeIncarnationId {
+        gate4agent_node_protocol::NodeIncarnationId::from_bytes([byte; 16])
+    }
+
     fn cursor_app() -> App {
         let address = SessionAddress {
             node_id: "node-a".to_owned(),
@@ -2806,6 +2841,7 @@ mod tests {
         let mut app = App::default();
         app.nodes.push(NodeView {
             node_id: "node-a".to_owned(),
+            incarnation_id: None,
             endpoint: r"\\.\pipe\node-a".to_owned(),
             connection: ConnectionState::Connected,
             controller_owned: true,
@@ -2818,7 +2854,7 @@ mod tests {
                 providers: Vec::new(),
                 sessions: vec![SessionView {
                     address: address.clone(),
-                    provider: Provider::Codex,
+                    provider: provider("codex"),
                     status: "running".to_owned(),
                     running: true,
                     stoppable: true,
@@ -2853,9 +2889,11 @@ mod tests {
         let view = project_c2_node(
             "node-a".to_owned(),
             "remote".to_owned(),
+            incarnation(1),
             C2NodeSnapshot {
                 node_id: NodeId::new("node-a").unwrap(),
                 enabled_providers: Vec::new(),
+                provider_runtime_statuses: Default::default(),
                 workspaces: vec![gate4agent_c2_protocol::C2WorkspaceSnapshot {
                     workspace_id: WorkspaceId::new("workspace-a").unwrap(),
                     canonical_root: opaque.clone(),
@@ -2908,6 +2946,7 @@ mod tests {
                 current_incarnation_id: None,
                 provider_contracts: Vec::new(),
                 provider_adapter_contracts: Vec::new(),
+                provider_runtime_statuses: Default::default(),
             }],
         };
         let mut routes = BTreeMap::new();
@@ -2939,6 +2978,7 @@ mod tests {
                 current_incarnation_id: None,
                 provider_contracts: Vec::new(),
                 provider_adapter_contracts: Vec::new(),
+                provider_runtime_statuses: Default::default(),
             }],
         };
         let snapshots = reconcile_c2_topology(
@@ -2962,6 +3002,7 @@ mod tests {
                 current_incarnation_id: Some(incarnation),
                 provider_contracts: Vec::new(),
                 provider_adapter_contracts: Vec::new(),
+                provider_runtime_statuses: Default::default(),
             }],
         };
         let snapshots = reconcile_c2_topology(
@@ -3132,7 +3173,7 @@ mod tests {
         let spawn = action_to_request(AppAction::Spawn {
             node_id: "node-a".to_owned(),
             workspace_id: "workspace-a".to_owned(),
-            provider: Provider::Kimi,
+            provider: provider("kimi"),
             rows: 24,
             cols: 80,
         })
@@ -3424,7 +3465,7 @@ mod tests {
         C2ManagedSessionRecord {
             record_id: SessionRecordId::new("record-1").unwrap(),
             display_name: display_name.to_owned(),
-            provider: AgentProvider::Codex,
+            provider: provider("codex"),
             mode: SessionMode::Pty,
             state: gate4agent_node_protocol::ManagedSessionState::Dormant,
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
@@ -3438,7 +3479,8 @@ mod tests {
     fn c2_test_snapshot(display_name: &str) -> C2NodeSnapshot {
         C2NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: vec![AgentProvider::Codex],
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: Default::default(),
             workspaces: Vec::new(),
             session_records: vec![c2_test_record(display_name)],
         }
@@ -3562,7 +3604,7 @@ mod tests {
         let record = C2ManagedSessionRecord {
             record_id: SessionRecordId::new("record-1").unwrap(),
             display_name: "review".to_owned(),
-            provider: AgentProvider::Codex,
+            provider: provider("codex"),
             mode: SessionMode::Pty,
             state: gate4agent_node_protocol::ManagedSessionState::IdentityPending,
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
@@ -3573,7 +3615,8 @@ mod tests {
         };
         let snapshot = C2NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: vec![AgentProvider::Codex],
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: Default::default(),
             workspaces: Vec::new(),
             session_records: vec![record.clone()],
         };

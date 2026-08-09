@@ -32,6 +32,7 @@ pub mod acp;
 pub mod agent;
 pub mod context;
 pub mod core;
+pub mod child_environment;
 pub mod transport;
 pub mod pty;
 pub mod pipe;

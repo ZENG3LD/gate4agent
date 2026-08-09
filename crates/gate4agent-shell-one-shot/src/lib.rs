@@ -1,5 +1,7 @@
 //! Bounded native process authority for provider-owned one-shot plans.
 
+use gate4agent::agent::EnvMutation;
+use gate4agent::child_environment::platform_minimal_child_environment;
 use gate4agent::AgentEvent;
 use gate4agent_adapters::{
     resolve_one_shot_plan, OneShotAdapterError, OneShotPlan, ONE_SHOT_OUTPUT_MAX_BYTES,
@@ -59,12 +61,34 @@ impl NativeOneShotSession {
         selection: Option<&SessionOptionSelection>,
         working_directory: &Path,
     ) -> Result<Self, NativeOneShotError> {
-        Self::spawn_with_config(
+        Self::spawn_with_environment(
             spec,
             binding,
             prompt,
             selection,
             working_directory,
+            &[],
+        )
+        .await
+    }
+
+    /// Spawn a one-shot child with shell-owned mutations applied after the
+    /// platform-minimal inherited environment.
+    pub async fn spawn_with_environment(
+        spec: &AgentSpec,
+        binding: &AdapterBinding,
+        prompt: &str,
+        selection: Option<&SessionOptionSelection>,
+        working_directory: &Path,
+        environment: &[EnvMutation],
+    ) -> Result<Self, NativeOneShotError> {
+        Self::spawn_with_environment_and_config(
+            spec,
+            binding,
+            prompt,
+            selection,
+            working_directory,
+            environment,
             NativeOneShotConfig::default(),
         )
         .await
@@ -76,6 +100,27 @@ impl NativeOneShotSession {
         prompt: &str,
         selection: Option<&SessionOptionSelection>,
         working_directory: &Path,
+        config: NativeOneShotConfig,
+    ) -> Result<Self, NativeOneShotError> {
+        Self::spawn_with_environment_and_config(
+            spec,
+            binding,
+            prompt,
+            selection,
+            working_directory,
+            &[],
+            config,
+        )
+        .await
+    }
+
+    async fn spawn_with_environment_and_config(
+        spec: &AgentSpec,
+        binding: &AdapterBinding,
+        prompt: &str,
+        selection: Option<&SessionOptionSelection>,
+        working_directory: &Path,
+        environment: &[EnvMutation],
         mut config: NativeOneShotConfig,
     ) -> Result<Self, NativeOneShotError> {
         config.output_max_bytes = config.output_max_bytes.clamp(1, ONE_SHOT_OUTPUT_MAX_BYTES);
@@ -98,6 +143,15 @@ impl NativeOneShotSession {
             }
         }
         let mut command = native_command(&plan.program, &plan.args)?;
+        command.env_clear();
+        command.envs(platform_minimal_child_environment());
+        for mutation in environment {
+            if let Some(value) = &mutation.value {
+                command.env(&mutation.key, value);
+            } else {
+                command.env_remove(&mutation.key);
+            }
+        }
         command
             .current_dir(working_directory)
             .stdin(if plan.stdin_payload.is_some() {
@@ -656,8 +710,17 @@ mod tests {
     use super::*;
     use gate4agent_catalog::builtin_registry;
     use gate4agent_types::{PipeProtocol, SpecVerification};
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const CHILD_ENV_BOOTSTRAP_KEY: &str = "GATE4AGENT_ONE_SHOT_ENV_BOOTSTRAP";
+    const CHILD_ENV_FIXTURE_KEY: &str = "GATE4AGENT_ONE_SHOT_ENV_FIXTURE";
+    const CHILD_ENV_EXPECTED_HOME_KEY: &str = "GATE4AGENT_ONE_SHOT_EXPECTED_HOME";
+    const CHILD_ENV_EXPECTED_CONFIG_KEY: &str = "GATE4AGENT_ONE_SHOT_EXPECTED_CONFIG";
+    const CHILD_ENV_EXPLICIT_KEY: &str = "GATE4AGENT_ONE_SHOT_EXPLICIT";
+    const CHILD_ENV_SENTINEL_KEY: &str = "GATE4AGENT_ONE_SHOT_FAKE_JWT";
+    const CHILD_ENV_SENTINEL_VALUE: &str = "fake-jwt-that-must-not-cross-one-shot";
 
     fn fixture_dir(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -698,6 +761,36 @@ mod tests {
         spec
     }
 
+    #[cfg(windows)]
+    fn child_home_key() -> &'static str {
+        "USERPROFILE"
+    }
+
+    #[cfg(not(windows))]
+    fn child_home_key() -> &'static str {
+        "HOME"
+    }
+
+    #[cfg(windows)]
+    fn child_config_key() -> &'static str {
+        "APPDATA"
+    }
+
+    #[cfg(not(windows))]
+    fn child_config_key() -> &'static str {
+        "XDG_CONFIG_HOME"
+    }
+
+    #[cfg(windows)]
+    fn child_removed_key() -> &'static str {
+        "LOCALAPPDATA"
+    }
+
+    #[cfg(not(windows))]
+    fn child_removed_key() -> &'static str {
+        "LOGNAME"
+    }
+
     async fn collect(session: &NativeOneShotSession) -> Vec<AgentEvent> {
         let mut receiver = session.subscribe();
         let mut events = Vec::new();
@@ -714,6 +807,179 @@ mod tests {
         .await
         .unwrap();
         events
+    }
+
+    #[test]
+    fn one_shot_child_environment_fixture() {
+        if std::env::var_os(CHILD_ENV_FIXTURE_KEY).is_none() {
+            return;
+        }
+        let expected_home = std::env::var_os(CHILD_ENV_EXPECTED_HOME_KEY).unwrap();
+        let expected_config = std::env::var_os(CHILD_ENV_EXPECTED_CONFIG_KEY).unwrap();
+        let mut checks = vec![
+            ("ambient_custom_absent", std::env::var_os(CHILD_ENV_SENTINEL_KEY).is_none()),
+            ("ambient_api_absent", std::env::var_os("OPENAI_API_KEY").is_none()),
+            ("ambient_jwt_absent", std::env::var_os("GATE4AGENT_FAKE_JWT").is_none()),
+            ("ambient_proxy_absent", std::env::var_os("HTTPS_PROXY").is_none()),
+            ("ambient_ssh_absent", std::env::var_os("SSH_AUTH_SOCK").is_none()),
+            ("bootstrap_absent", std::env::var_os(CHILD_ENV_BOOTSTRAP_KEY).is_none()),
+            ("path_present", std::env::var_os("PATH").is_some()),
+            (
+                "home_present",
+                std::env::var_os(child_home_key()).as_ref() == Some(&expected_home),
+            ),
+            (
+                "config_present",
+                std::env::var_os(child_config_key()).as_ref() == Some(&expected_config),
+            ),
+            (
+                "explicit_present",
+                std::env::var_os(CHILD_ENV_EXPLICIT_KEY).as_deref()
+                    == Some(OsStr::new("explicit-value")),
+            ),
+            ("explicit_remove", std::env::var_os(child_removed_key()).is_none()),
+        ];
+        #[cfg(windows)]
+        checks.extend([
+            ("system_drive_present", std::env::var_os("SystemDrive").is_some()),
+            ("system_root_present", std::env::var_os("SystemRoot").is_some()),
+            ("windir_present", std::env::var_os("WINDIR").is_some()),
+            ("comspec_present", std::env::var_os("ComSpec").is_some()),
+        ]);
+        for (name, passed) in checks {
+            println!("{name}={passed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_one_shot_child_receives_baseline_and_explicit_environment_only() {
+        if std::env::var_os(CHILD_ENV_BOOTSTRAP_KEY).is_some() {
+            run_isolated_one_shot_environment_bootstrap().await;
+            return;
+        }
+
+        let directory = fixture_dir("environment-bootstrap");
+        let home = directory.join("home");
+        let config = directory.join("config");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config).unwrap();
+        let mut bootstrap = std::process::Command::new(std::env::current_exe().unwrap());
+        bootstrap.env_clear();
+        bootstrap.envs(platform_minimal_child_environment());
+        bootstrap
+            .args([
+                "--exact",
+                "tests::isolated_one_shot_child_receives_baseline_and_explicit_environment_only",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV_BOOTSTRAP_KEY, "true")
+            .env("HOME", &home)
+            .env(child_home_key(), &home)
+            .env(child_config_key(), &config)
+            .env(child_removed_key(), "ambient-remove-me")
+            .env(CHILD_ENV_SENTINEL_KEY, CHILD_ENV_SENTINEL_VALUE)
+            .env("OPENAI_API_KEY", "fake-api-key")
+            .env("GATE4AGENT_FAKE_JWT", "fake-control-jwt")
+            .env("HTTPS_PROXY", "http://fake-auth@proxy.invalid")
+            .env("SSH_AUTH_SOCK", directory.join("fake-ssh-agent.sock"));
+        let output = bootstrap.output().unwrap();
+        assert!(
+            output.status.success(),
+            "isolated OneShot bootstrap failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn run_isolated_one_shot_environment_bootstrap() {
+        let expected_home = std::env::var_os(child_home_key()).unwrap();
+        let expected_config = std::env::var_os(child_config_key()).unwrap();
+        let working_directory = std::path::PathBuf::from(&expected_home);
+        let mut spec = builtin_registry().get_by_id("claude").unwrap().clone();
+        spec.launch.program = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        spec.launch.fixed_args = vec![
+            "--exact".to_owned(),
+            "tests::one_shot_child_environment_fixture".to_owned(),
+            "--nocapture".to_owned(),
+            "--test-threads=1".to_owned(),
+        ];
+        let binding = spec.capabilities.adapters.one_shot.clone().unwrap();
+        let pipe = spec.capabilities.transports.pipe.as_mut().unwrap();
+        pipe.adapter = binding.clone();
+        pipe.protocol = PipeProtocol::OneShotText;
+        pipe.launch_override = Some(spec.launch.clone());
+        spec.verification = SpecVerification::Gate4AgentVerified;
+        let environment = vec![
+            EnvMutation {
+                key: OsString::from(CHILD_ENV_FIXTURE_KEY),
+                value: Some(OsString::from("true")),
+            },
+            EnvMutation {
+                key: OsString::from(CHILD_ENV_EXPECTED_HOME_KEY),
+                value: Some(expected_home),
+            },
+            EnvMutation {
+                key: OsString::from(CHILD_ENV_EXPECTED_CONFIG_KEY),
+                value: Some(expected_config),
+            },
+            EnvMutation {
+                key: OsString::from(CHILD_ENV_EXPLICIT_KEY),
+                value: Some(OsString::from("explicit-value")),
+            },
+            EnvMutation {
+                key: OsString::from(child_removed_key()),
+                value: None,
+            },
+        ];
+        let mut session = NativeOneShotSession::spawn_with_environment(
+            &spec,
+            &binding,
+            "fixture prompt",
+            None,
+            &working_directory,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let events = collect(&session).await;
+        let output = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for name in [
+            "ambient_custom_absent",
+            "ambient_api_absent",
+            "ambient_jwt_absent",
+            "ambient_proxy_absent",
+            "ambient_ssh_absent",
+            "bootstrap_absent",
+            "path_present",
+            "home_present",
+            "config_present",
+            "explicit_present",
+            "explicit_remove",
+        ] {
+            assert!(output.contains(&format!("{name}=true")), "output: {output}");
+        }
+        #[cfg(windows)]
+        for name in [
+            "system_drive_present",
+            "system_root_present",
+            "windir_present",
+            "comspec_present",
+        ] {
+            assert!(output.contains(&format!("{name}=true")), "output: {output}");
+        }
+        assert!(!output.contains(CHILD_ENV_SENTINEL_VALUE));
+        session.kill().await.unwrap();
     }
 
     #[tokio::test]

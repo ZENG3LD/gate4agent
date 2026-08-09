@@ -199,16 +199,26 @@ impl NativeEffectShell {
     }
 
     pub async fn execute(&mut self, envelope: EffectEnvelope) -> ObservationEnvelope {
-        self.execute_with_pty_env(envelope, Vec::new()).await
+        self.execute_with_environment(envelope, Vec::new()).await
     }
 
-    /// Execute an effect with shell-owned environment injected only into a
-    /// newly spawned PTY process. The canonical start request cannot set these
-    /// authority variables itself.
+    /// Backward-compatible name for PTY-only callers. OneShot launches now
+    /// receive the same shell-owned mutations.
     pub async fn execute_with_pty_env(
         &mut self,
         envelope: EffectEnvelope,
         pty_env: Vec<EnvMutation>,
+    ) -> ObservationEnvelope {
+        self.execute_with_environment(envelope, pty_env).await
+    }
+
+    /// Execute an effect with shell-owned environment injected only into a
+    /// newly spawned provider process. The canonical start request cannot set
+    /// these authority variables itself.
+    pub async fn execute_with_environment(
+        &mut self,
+        envelope: EffectEnvelope,
+        environment: Vec<EnvMutation>,
     ) -> ObservationEnvelope {
         let EffectEnvelope {
             protocol_version,
@@ -248,7 +258,7 @@ impl NativeEffectShell {
                             launch_extra_args: Vec::new(),
                             resumed_provider_session: None,
                         },
-                        pty_env,
+                        environment,
                     )
                     .await
                 }
@@ -267,7 +277,7 @@ impl NativeEffectShell {
                         provider_session,
                         runtime_policy,
                         request,
-                        pty_env,
+                        environment,
                     )
                     .await
                 }
@@ -704,12 +714,13 @@ impl NativeEffectShell {
                             ),
                         };
                     }
-                    return match NativeOneShotSession::spawn(
+                    return match NativeOneShotSession::spawn_with_environment(
                         &spec,
                         binding,
                         &prompt,
                         request.session_options.as_ref(),
                         &working_dir,
+                        &pty_env,
                     )
                     .await
                     {

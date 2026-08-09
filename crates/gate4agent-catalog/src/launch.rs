@@ -3,17 +3,28 @@ use crate::{
     RuntimePlatform, SessionOptionCatalogError, SessionOptionSelection,
 };
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::PathBuf;
 use thiserror::Error;
 
 pub const MAX_LAUNCH_PROMPT_BYTES: usize = 16 * 1024 * 1024;
 pub const WINDOWS_INLINE_LAUNCH_MAX_CHARS: usize = 24_000;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct EnvMutation {
     pub key: OsString,
     /// `None` removes the variable from the child environment.
     pub value: Option<OsString>,
+}
+
+impl fmt::Debug for EnvMutation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnvMutation")
+            .field("key", &self.key)
+            .field("action", &if self.value.is_some() { "set" } else { "remove" })
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +51,7 @@ impl Default for LaunchRequest {
 }
 
 /// Shell-free executable plan for an interactive agent CLI.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LaunchPlan {
     pub agent_id: AgentId,
     pub program: OsString,
@@ -54,6 +65,25 @@ pub struct LaunchPlan {
     /// Options actually applied by generated launch arguments after accounting
     /// for later caller-provided overrides.
     pub applied_session_options: Option<SessionOptionSelection>,
+}
+
+impl fmt::Debug for LaunchPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchPlan")
+            .field("agent_id", &self.agent_id)
+            .field("program", &self.program)
+            .field("args_len", &self.args.len())
+            .field("working_dir", &self.working_dir)
+            .field("env", &self.env)
+            .field("has_followup_prompt", &self.followup_prompt.is_some())
+            .field("has_followup_draft", &self.followup_draft.is_some())
+            .field(
+                "has_applied_session_options",
+                &self.applied_session_options.is_some(),
+            )
+            .finish()
+    }
 }
 
 pub fn plan_launch(
@@ -282,6 +312,31 @@ mod tests {
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn environment_and_launch_debug_preserve_names_and_actions_without_values() {
+        let spec = builtin_registry().get_by_id("codex").unwrap();
+        let mut request = request("prompt-value-must-be-redacted");
+        request.env = vec![
+            EnvMutation {
+                key: OsString::from("EXPLICIT_SECRET"),
+                value: Some(OsString::from("environment-value-must-be-redacted")),
+            },
+            EnvMutation {
+                key: OsString::from("AMBIENT_SECRET"),
+                value: None,
+            },
+        ];
+        let plan = plan_launch(spec, request).unwrap();
+
+        let debug = format!("{plan:?}");
+        assert!(debug.contains("EXPLICIT_SECRET"));
+        assert!(debug.contains("AMBIENT_SECRET"));
+        assert!(debug.contains("action: \"set\""));
+        assert!(debug.contains("action: \"remove\""));
+        assert!(!debug.contains("environment-value-must-be-redacted"));
+        assert!(!debug.contains("prompt-value-must-be-redacted"));
     }
 
     #[test]

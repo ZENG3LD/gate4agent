@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::agent::{AgentId, AgentSpec, LaunchPlan};
+use crate::child_environment::platform_minimal_child_environment;
+#[cfg(test)]
+use crate::child_environment::{
+    is_platform_child_environment_key, platform_minimal_child_environment_from,
+};
 use crate::core::types::CliTool;
 use crate::pty::os_process::{
     observe_pty_foreground, PtyForegroundObservation, PtyProcessProbeError,
@@ -21,64 +26,11 @@ pub const PTY_OUTPUT_HIGH_WATER_BYTES: usize = 256 * 1024;
 pub const PTY_OUTPUT_LOW_WATER_BYTES: usize = 32 * 1024;
 const PTY_TERM: &str = "xterm-256color";
 
-#[cfg(windows)]
-const PTY_CHILD_ENV_ALLOWLIST: &[&str] = &[
-    "SystemDrive",
-    "SystemRoot",
-    "WINDIR",
-    "ComSpec",
-    "PATHEXT",
-    "PATH",
-    "HOME",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "TEMP",
-    "TMP",
-    "ProgramFiles",
-    "ProgramFiles(x86)",
-    "ProgramW6432",
-    "CommonProgramFiles",
-    "CommonProgramFiles(x86)",
-    "CommonProgramW6432",
-    "PSModulePath",
-];
-
-#[cfg(not(windows))]
-const PTY_CHILD_ENV_ALLOWLIST: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "TMPDIR",
-    "LANG",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",
-];
-
-fn is_allowed_pty_child_environment_key(key: &OsStr) -> bool {
-    let Some(key) = key.to_str() else {
-        return false;
-    };
-    #[cfg(windows)]
-    {
-        PTY_CHILD_ENV_ALLOWLIST
-            .iter()
-            .any(|allowed| key.eq_ignore_ascii_case(allowed))
-    }
-    #[cfg(not(windows))]
-    {
-        PTY_CHILD_ENV_ALLOWLIST.contains(&key) || key.starts_with("LC_")
-    }
-}
-
 /// Start each PTY child from a small machine-local runtime environment.
 /// Provider credentials, control-plane tokens, SSH agents, proxy credentials,
 /// and unrelated daemon state are not inherited implicitly. A launch plan may
 /// still set or remove any variable explicitly after this baseline is built.
+#[cfg(test)]
 fn isolate_pty_child_environment_from<I, K, V>(command: &mut CommandBuilder, inherited: I)
 where
     I: IntoIterator<Item = (K, V)>,
@@ -86,16 +38,18 @@ where
     V: AsRef<OsStr>,
 {
     command.env_clear();
-    for (key, value) in inherited {
-        if is_allowed_pty_child_environment_key(key.as_ref()) {
-            command.env(key, value);
-        }
+    for (key, value) in platform_minimal_child_environment_from(inherited) {
+        command.env(key, value);
     }
     command.env("TERM", PTY_TERM);
 }
 
 fn isolate_pty_child_environment(command: &mut CommandBuilder) {
-    isolate_pty_child_environment_from(command, std::env::vars_os());
+    command.env_clear();
+    for (key, value) in platform_minimal_child_environment() {
+        command.env(key, value);
+    }
+    command.env("TERM", PTY_TERM);
 }
 
 /// Module-internal PTY errors. Converted to `AgentError` at the `PtySession` boundary.
@@ -911,7 +865,7 @@ mod tests {
             let mut checks = checks;
             let system_drive = std::env::var_os("SystemDrive");
             let retained_paths_are_expanded = std::env::vars_os()
-                .filter(|(key, _)| is_allowed_pty_child_environment_key(key))
+                .filter(|(key, _)| is_platform_child_environment_key(key))
                 .all(|(_, value)| {
                     !value
                         .to_string_lossy()
@@ -969,7 +923,7 @@ mod tests {
         let mut bootstrap = std::process::Command::new(std::env::current_exe().unwrap());
         bootstrap.env_clear();
         for (key, value) in std::env::vars_os() {
-            if is_allowed_pty_child_environment_key(&key) {
+            if is_platform_child_environment_key(&key) {
                 bootstrap.env(key, value);
             }
         }

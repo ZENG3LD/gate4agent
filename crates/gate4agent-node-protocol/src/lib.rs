@@ -25,6 +25,7 @@ pub const NODE_STATE_SCHEMA_V3: u16 = 3;
 pub const NODE_STATE_SCHEMA_V4: u16 = 4;
 pub const NODE_STATE_SCHEMA_V5: u16 = 5;
 pub const NODE_STATE_SCHEMA_V6: u16 = 6;
+pub const NODE_STATE_SCHEMA_V7: u16 = 7;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
@@ -40,6 +41,8 @@ pub const NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     "managed-worktree-lifecycle-v1";
 pub const NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
     "child-environment-profile-v1";
+pub const NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
+    "session-bundle-materialization-v1";
 pub const SPAWN_RUNTIME_RAW_PTY_LIFECYCLE: &str = "raw-pty-lifecycle";
 pub const SPAWN_RUNTIME_SEMANTIC_READINESS: &str = "semantic-readiness";
 pub const SPAWN_RUNTIME_STRUCTURED_PROMPT: &str = "structured-prompt";
@@ -65,6 +68,7 @@ pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
 pub const MAX_SPAWN_PROFILE_ID_BYTES: usize = 64;
 pub const MAX_SPAWN_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_ENVIRONMENT_PROFILE_REVISION_BYTES: usize = 128;
+pub const MAX_SPAWN_BUNDLE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_RESOURCE_ID_BYTES: usize = 128;
 pub const MAX_SPAWN_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub const MAX_SPAWN_REQUIRED_CAPABILITIES: usize = 16;
@@ -355,6 +359,14 @@ pub struct SpawnBundleId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+pub struct SpawnBundleRevision(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnBundleDigest(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct SpawnContextId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -416,12 +428,66 @@ spawn_identifier_impl!(
     MAX_SPAWN_PROFILE_REVISION_BYTES
 );
 spawn_identifier_impl!(SpawnBundleId, "spawn bundle", MAX_SPAWN_RESOURCE_ID_BYTES);
+spawn_identifier_impl!(
+    SpawnBundleRevision,
+    "spawn bundle revision",
+    MAX_SPAWN_BUNDLE_REVISION_BYTES
+);
 spawn_identifier_impl!(SpawnContextId, "spawn context", MAX_SPAWN_RESOURCE_ID_BYTES);
 spawn_identifier_impl!(
     SpawnEnvironmentProfileId,
     "spawn environment profile",
     MAX_SPAWN_RESOURCE_ID_BYTES
 );
+
+impl SpawnBundleDigest {
+    pub fn new(value: impl Into<String>) -> Result<Self, SpawnBundleDigestError> {
+        let value = value.into();
+        let digest = value
+            .strip_prefix("sha256:")
+            .ok_or(SpawnBundleDigestError)?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(SpawnBundleDigestError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SpawnBundleDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SpawnBundleDigest {
+    type Err = SpawnBundleDigestError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for SpawnBundleDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("spawn bundle digest must be sha256: followed by exactly 64 lowercase hexadecimal characters")]
+pub struct SpawnBundleDigestError;
 spawn_identifier_impl!(
     SpawnEnvironmentProfileRevision,
     "spawn environment profile revision",
@@ -1057,6 +1123,14 @@ pub struct ResolvedEnvironmentProfileReceipt {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResolvedBundleReceipt {
+    pub id: SpawnBundleId,
+    pub revision: SpawnBundleRevision,
+    pub digest: SpawnBundleDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedSpawnReceipt {
     pub incarnation_id: NodeIncarnationId,
     pub session: SessionAddress,
@@ -1068,6 +1142,8 @@ pub struct ResolvedSpawnReceipt {
     pub terminal_size: TerminalSize,
     pub prompt: SpawnPromptMetadata,
     pub bundle_id: Option<SpawnBundleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ResolvedBundleReceipt>,
     pub context_id: Option<SpawnContextId>,
     #[serde(rename = "environment_profile_id")]
     pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
@@ -1156,7 +1232,7 @@ impl ResolvedSpawnSpec {
         incarnation_id: NodeIncarnationId,
         session: SessionAddress,
     ) -> ResolvedSpawnReceipt {
-        self.receipt_with_environment(incarnation_id, session, None)
+        self.receipt_with_materialization(incarnation_id, session, None, None)
     }
 
     pub fn receipt_with_environment(
@@ -1164,6 +1240,21 @@ impl ResolvedSpawnSpec {
         incarnation_id: NodeIncarnationId,
         session: SessionAddress,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    ) -> ResolvedSpawnReceipt {
+        self.receipt_with_materialization(
+            incarnation_id,
+            session,
+            environment_profile,
+            None,
+        )
+    }
+
+    pub fn receipt_with_materialization(
+        &self,
+        incarnation_id: NodeIncarnationId,
+        session: SessionAddress,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
     ) -> ResolvedSpawnReceipt {
         ResolvedSpawnReceipt {
             incarnation_id,
@@ -1176,6 +1267,7 @@ impl ResolvedSpawnSpec {
             terminal_size: self.terminal_size,
             prompt: SpawnPromptMetadata::from_prompt(self.prompt.as_ref()),
             bundle_id: self.bundle_id.clone(),
+            bundle,
             context_id: self.context_id.clone(),
             environment_profile,
             deadline_ms: self.deadline_ms,
@@ -2432,6 +2524,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
             NODE_REPOSITORY_PATH_CAPABILITY,
             NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+            NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -2444,7 +2537,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V6,
+                maximum: NODE_STATE_SCHEMA_V7,
             },
         }),
     }
@@ -2666,6 +2759,8 @@ pub struct ManagedSessionRecord {
     pub active_session: Option<SessionAddress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ResolvedBundleReceipt>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub last_error: Option<String>,
@@ -2829,6 +2924,12 @@ impl NodeSnapshot {
         self.session_records
             .iter()
             .any(|record| record.environment_profile.is_some())
+    }
+
+    pub fn requires_session_bundle_materialization_capability(&self) -> bool {
+        self.session_records
+            .iter()
+            .any(|record| record.bundle.is_some())
     }
 }
 
@@ -3102,6 +3203,16 @@ impl NodeRequest {
             SpawnOverride::Set { .. }
         )
     }
+
+
+    pub fn requires_session_bundle_materialization_capability(&self) -> bool {
+        let spec = match self {
+            Self::SpawnSpec { spec } => spec,
+            Self::SpawnManagedWorktree { request } => &request.spawn_spec,
+            _ => return false,
+        };
+        !matches!(spec.overrides.bundle_id, SpawnOverride::Clear)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3225,6 +3336,38 @@ impl NodeResponse {
             | Self::ShuttingDown => false,
         }
     }
+
+    pub fn requires_session_bundle_materialization_capability(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.requires_session_bundle_materialization_capability()
+            }
+            Self::Resync {
+                snapshot, events, ..
+            } => {
+                snapshot.requires_session_bundle_materialization_capability()
+                    || events.iter().any(|event| {
+                        event.event.requires_session_bundle_materialization_capability()
+                    })
+            }
+            Self::SpawnSpecAccepted { receipt } => receipt.bundle.is_some(),
+            Self::ManagedWorktreeSpawnAccepted { receipt } => receipt.spawn.bundle.is_some(),
+            Self::SessionRecordUpdated { record }
+            | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
+            Self::WorkspaceInspected { .. }
+            | Self::WorkspaceFileRead { .. }
+            | Self::Controller { .. }
+            | Self::SpawnAccepted { .. }
+            | Self::ManagedWorktreeCleanup { .. }
+            | Self::SessionRecordForgotten { .. }
+            | Self::WorkspaceRegistered { .. }
+            | Self::WorkspaceUnregistered { .. }
+            | Self::WorktreeCreated { .. }
+            | Self::WorktreeRemoved { .. }
+            | Self::Accepted
+            | Self::ShuttingDown => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3264,8 +3407,11 @@ pub enum NodeFailureCode {
     ManagedWorktreeOwnershipConflict,
     ManagedWorktreeRecoveryRequired,
     UnknownSpawnProfile,
+    UnknownBundle,
     UnknownEnvironmentProfile,
+    BundleBindingMismatch,
     EnvironmentProfileBindingMismatch,
+    BundleMaterializationFailed,
     SpawnTargetMismatch,
     SpawnIdempotencyConflict,
     SpawnIdempotencyCapacity,
@@ -3309,6 +3455,12 @@ impl NodeEvent {
     pub fn requires_child_environment_profile_capability(&self) -> bool {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.environment_profile.is_some())
+    }
+
+
+    pub fn requires_session_bundle_materialization_capability(&self) -> bool {
+        matches!(self, Self::SessionRecordUpserted { record }
+            if record.bundle.is_some())
     }
 }
 
@@ -3706,6 +3858,86 @@ mod tests {
             r#"{"kind":"set","value":"claude","typo":true}"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn session_bundle_materialization_contract_is_bounded_exact_and_dual_gated() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 8);
+        assert_eq!(NODE_STATE_SCHEMA_V7, 7);
+        assert_eq!(
+            NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+            "session-bundle-materialization-v1",
+        );
+        let capability =
+            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .contains(&capability));
+        let mut support = portable_node_support();
+        support.capabilities = vec![capability.clone()];
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let bound = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
+        assert!(bound
+            .windows(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY.len())
+            .any(|window| {
+                window == NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY.as_bytes()
+            }));
+        assert!(SpawnBundleRevision::new(
+            "r".repeat(MAX_SPAWN_BUNDLE_REVISION_BYTES),
+        )
+        .is_ok());
+        assert!(SpawnBundleRevision::new(
+            "r".repeat(MAX_SPAWN_BUNDLE_REVISION_BYTES + 1),
+        )
+        .is_err());
+
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let receipt = ResolvedBundleReceipt {
+            id: SpawnBundleId::new("review-bundle").unwrap(),
+            revision: SpawnBundleRevision::new("review-bundle.r1").unwrap(),
+            digest: SpawnBundleDigest::new(&digest).unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&receipt).unwrap(),
+            format!(
+                r#"{{"id":"review-bundle","revision":"review-bundle.r1","digest":"{digest}"}}"#,
+            ),
+        );
+        for invalid in [
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "A".repeat(64)),
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+        ] {
+            assert!(SpawnBundleDigest::new(invalid).is_err());
+        }
+
+        let minimal_json = r#"{"target":{"node_id":"node-a","workspace_id":"primary"},"profile_id":"review-default","deadline_ms":1,"idempotency_key":"request-bundle"}"#;
+        let inherited = serde_json::from_str::<SpawnSpec>(minimal_json).unwrap();
+        assert!(NodeRequest::SpawnSpec {
+            spec: inherited.clone(),
+        }
+        .requires_session_bundle_materialization_capability());
+
+        let mut explicit = inherited.clone();
+        explicit.overrides.bundle_id = SpawnOverride::Set {
+            value: SpawnBundleId::new("review-bundle").unwrap(),
+        };
+        assert!(NodeRequest::SpawnSpec { spec: explicit }
+            .requires_session_bundle_materialization_capability());
+
+        let mut cleared = inherited;
+        cleared.overrides.bundle_id = SpawnOverride::Clear;
+        assert!(!NodeRequest::SpawnSpec { spec: cleared }
+            .requires_session_bundle_materialization_capability());
     }
 
     #[test]
@@ -5227,6 +5459,7 @@ mod tests {
             }),
             active_session: None,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 1_723_000_000_000,
             updated_at_unix_ms: 1_723_000_000_123,
             last_error: None,

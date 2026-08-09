@@ -11,7 +11,8 @@ pub use gate4agent_node_protocol::{
     ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
     ProviderRuntimeContractId, ProviderRuntimeMode, ProviderRuntimeStatus,
     ProviderRuntimeStatuses, ProviderRuntimeVersion,
-    ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt, ResolvedSpawnSpec, SpawnBundleId,
+    ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt,
+    ResolvedSpawnSpec, SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision,
     SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId,
     SpawnEnvironmentProfileRevision, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
     SpawnOverrides, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision, SpawnPrompt,
@@ -20,6 +21,7 @@ pub use gate4agent_node_protocol::{
     WorktreeProfileId, WorktreeProfileRevision,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+    NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
@@ -62,6 +64,8 @@ pub const C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY;
 pub const C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY;
+pub const C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
+    NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -156,11 +160,18 @@ impl From<&NodeFailure> for C2NodeFailure {
             }
             NodeFailureCode::SpawnTargetMismatch => "spawn target mismatch",
             NodeFailureCode::UnknownSpawnProfile => "spawn profile unavailable",
+            NodeFailureCode::UnknownBundle => "session bundle unavailable",
             NodeFailureCode::UnknownEnvironmentProfile => {
                 "environment profile unavailable"
             }
+            NodeFailureCode::BundleBindingMismatch => {
+                "session bundle binding mismatch"
+            }
             NodeFailureCode::EnvironmentProfileBindingMismatch => {
                 "environment profile binding mismatch"
+            }
+            NodeFailureCode::BundleMaterializationFailed => {
+                "session bundle materialization failed"
             }
             NodeFailureCode::SpawnIdempotencyConflict => "spawn idempotency conflict",
             NodeFailureCode::SpawnIdempotencyCapacity => "spawn idempotency capacity exhausted",
@@ -193,6 +204,8 @@ pub struct C2ManagedSessionRecord {
     pub active_session: Option<SessionAddress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ResolvedBundleReceipt>,
     pub provider_identity_present: bool,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -209,6 +222,7 @@ impl From<&ManagedSessionRecord> for C2ManagedSessionRecord {
             workspace_id: record.workspace_id.clone(),
             active_session: record.active_session.clone(),
             environment_profile: record.environment_profile.clone(),
+            bundle: record.bundle.clone(),
             provider_identity_present: record.provider_session.is_some(),
             created_at_unix_ms: record.created_at_unix_ms,
             updated_at_unix_ms: record.updated_at_unix_ms,
@@ -315,6 +329,12 @@ impl C2NodeSnapshot {
         self.session_records
             .iter()
             .any(|record| record.environment_profile.is_some())
+    }
+
+    pub fn requires_session_bundle_materialization_capability(&self) -> bool {
+        self.session_records
+            .iter()
+            .any(|record| record.bundle.is_some())
     }
 }
 
@@ -617,6 +637,11 @@ impl C2NodeEvent {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.environment_profile.is_some())
     }
+
+    pub fn requires_session_bundle_materialization_capability(&self) -> bool {
+        matches!(self, Self::SessionRecordUpserted { record }
+            if record.bundle.is_some())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -824,6 +849,38 @@ impl C2NodeResponse {
             | Self::SessionRecordResumed { record, .. } => {
                 record.environment_profile.is_some()
             }
+            Self::WorkspaceInspected { .. }
+            | Self::WorkspaceFileRead { .. }
+            | Self::Controller { .. }
+            | Self::SpawnAccepted { .. }
+            | Self::ManagedWorktreeCleanup { .. }
+            | Self::SessionRecordForgotten { .. }
+            | Self::WorkspaceRegistered { .. }
+            | Self::WorkspaceUnregistered { .. }
+            | Self::WorktreeCreated { .. }
+            | Self::WorktreeRemoved { .. }
+            | Self::Accepted
+            | Self::ShuttingDown => false,
+        }
+    }
+
+    pub fn requires_session_bundle_materialization_capability(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.requires_session_bundle_materialization_capability()
+            }
+            Self::Resync {
+                snapshot, events, ..
+            } => {
+                snapshot.requires_session_bundle_materialization_capability()
+                    || events.iter().any(|event| {
+                        event.event.requires_session_bundle_materialization_capability()
+                    })
+            }
+            Self::SpawnSpecAccepted { receipt } => receipt.bundle.is_some(),
+            Self::ManagedWorktreeSpawnAccepted { receipt } => receipt.spawn.bundle.is_some(),
+            Self::SessionRecordUpdated { record }
+            | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
             Self::WorkspaceInspected { .. }
             | Self::WorkspaceFileRead { .. }
             | Self::Controller { .. }
@@ -1321,6 +1378,8 @@ pub struct SlimManagedSessionRecord {
     pub active_session: Option<SessionAddress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ResolvedBundleReceipt>,
     pub provider_identity_present: bool,
     pub updated_at_unix_ms: u64,
 }
@@ -1522,6 +1581,7 @@ impl From<&ManagedSessionRecord> for SlimManagedSessionRecord {
             workspace_id: record.workspace_id.clone(),
             active_session: record.active_session.clone(),
             environment_profile: record.environment_profile.clone(),
+            bundle: record.bundle.clone(),
             provider_identity_present: record.provider_session.is_some(),
             updated_at_unix_ms: record.updated_at_unix_ms,
         }
@@ -1542,6 +1602,7 @@ impl From<&C2ManagedSessionRecord> for SlimManagedSessionRecord {
             workspace_id: record.workspace_id.clone(),
             active_session: record.active_session.clone(),
             environment_profile: record.environment_profile.clone(),
+            bundle: record.bundle.clone(),
             provider_identity_present: record.provider_identity_present,
             updated_at_unix_ms: record.updated_at_unix_ms,
         }
@@ -1692,6 +1753,7 @@ mod tests {
                 )
                 .unwrap(),
             }),
+            bundle: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
             last_error: Some("private-error-with-secret-token".to_owned()),
@@ -2165,6 +2227,65 @@ mod tests {
             .unwrap()
             .capabilities
             .is_empty());
+    }
+
+    #[test]
+    fn c2_session_bundle_materialization_is_auth_bound_and_projected_as_opaque_metadata() {
+        assert_eq!(
+            C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+            "session-bundle-materialization-v1",
+        );
+        assert_eq!(
+            C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+            NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+        );
+        let capability =
+            CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let bound = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        assert!(bound
+            .windows(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY.len())
+            .any(|window| {
+                window == C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY.as_bytes()
+            }));
+
+        let mut record = private_session_record();
+        record.bundle = Some(ResolvedBundleReceipt {
+            id: SpawnBundleId::new("review-bundle").unwrap(),
+            revision: SpawnBundleRevision::new("review-bundle.r1").unwrap(),
+            digest: SpawnBundleDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap(),
+        });
+        let projected = C2ManagedSessionRecord::from(&record);
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(json.contains(
+            r#""bundle":{"id":"review-bundle","revision":"review-bundle.r1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        ));
+        assert_private_record_fields_absent(&json);
+        assert!(C2NodeEvent::SessionRecordUpserted { record: projected }
+            .requires_session_bundle_materialization_capability());
     }
 
     #[test]
@@ -3069,6 +3190,7 @@ mod tests {
             }),
             active_session: None,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
             last_error: Some("private backend diagnostic".to_owned()),
@@ -3133,6 +3255,7 @@ mod tests {
                 provider_session: None,
                 active_session: None,
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: index as u64,
                 updated_at_unix_ms: index as u64,
                 last_error: None,

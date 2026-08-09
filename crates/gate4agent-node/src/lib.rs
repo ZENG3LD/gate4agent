@@ -1,5 +1,7 @@
 //! Native Gate4Agent node server and runtime.
 
+mod bundle_catalog;
+
 mod git_worktree;
 
 mod environment_profiles;
@@ -25,6 +27,13 @@ pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
     NodeShutdownHandle, WorkspaceConfig, WorktreeServiceMode,
 };
+pub use bundle_catalog::{
+    BundleCatalog, BundleCatalogError, NodeBundle, NodeBundleError, NodeBundleFile,
+    MAX_BUNDLE_CATALOG_ENTRIES, MAX_BUNDLE_FILES, MAX_BUNDLE_FILE_BYTES,
+    MAX_BUNDLE_PATH_BYTES, MAX_BUNDLE_TOTAL_BYTES,
+};
+#[cfg(feature = "fixture")]
+pub use bundle_catalog::protect_bundle_source_tree_fixture;
 pub use environment_profiles::{
     NodeEnvironmentProfile, NodeEnvironmentProfileError, MAX_NODE_ENVIRONMENT_PROFILES,
 };

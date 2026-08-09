@@ -10,6 +10,7 @@ use gate4agent_node_protocol::{
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES,
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+    NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
@@ -26,7 +27,7 @@ use crate::{
 #[cfg(test)]
 use gate4agent_node_protocol::{
     NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V7,
 };
 #[cfg(test)]
 use crate::auth_proof;
@@ -288,6 +289,10 @@ impl LocalNodeClient {
         ensure_node_hello_path_capability(&hello, opaque_unix_paths_enabled)?;
         ensure_node_hello_provider_capability(&hello, open_provider_ids_enabled)?;
         ensure_node_hello_environment_profile_capability(
+            &hello,
+            &negotiated_capabilities,
+        )?;
+        ensure_node_hello_bundle_materialization_capability(
             &hello,
             &negotiated_capabilities,
         )?;
@@ -573,6 +578,16 @@ fn ensure_node_request_required_capability(
             NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY.to_owned(),
         ));
     }
+    if request.requires_session_bundle_materialization_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY.to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -646,6 +661,29 @@ fn ensure_server_frame_required_capability(
     {
         return Err(NodeClientError::Protocol(
             "node sent child environment profile metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    let contains_bundle = match frame {
+        ServerFrame::Hello(hello) => hello
+            .snapshot
+            .requires_session_bundle_materialization_capability(),
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(
+            NodeResponse::requires_session_bundle_materialization_capability,
+        ),
+        ServerFrame::Event(event) => event
+            .event
+            .requires_session_bundle_materialization_capability(),
+        ServerFrame::Challenge(_) => false,
+    };
+    if contains_bundle
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent session bundle materialization metadata without negotiating the capability"
                 .to_owned(),
         ));
     }
@@ -783,6 +821,26 @@ fn ensure_node_hello_environment_profile_capability(
     {
         return Err(NodeClientError::Protocol(
             "node sent child environment profile metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_node_hello_bundle_materialization_capability(
+    hello: &NodeHello,
+    negotiated_capabilities: &[CapabilityId],
+) -> Result<(), NodeClientError> {
+    if hello
+        .snapshot
+        .requires_session_bundle_materialization_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent session bundle materialization metadata without negotiating the capability"
                 .to_owned(),
         ));
     }
@@ -1325,9 +1383,11 @@ mod tests {
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
-        ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt, SessionAddress, SessionKey,
+        ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt,
+        SessionAddress, SessionKey,
         SessionMode, SessionRecordId,
-        SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
+        SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision, SpawnDeadlineMs,
+        SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
         SpawnEnvironmentProfileId, SpawnEnvironmentProfileRevision, SpawnProfileId,
         SpawnProfileRevision, SpawnPromptMetadata, SpawnRequiredCapabilities,
         SpawnResolutionProvenance, SpawnSpec, SpawnTarget, WorkspaceEntry,
@@ -1433,6 +1493,7 @@ mod tests {
             provider_session: None,
             active_session: None,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
             last_error: None,
@@ -1530,6 +1591,7 @@ mod tests {
                 byte_len: 0,
             },
             bundle_id: None,
+            bundle: None,
             context_id: None,
             environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
@@ -1581,9 +1643,12 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
-            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6).unwrap(),
+            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V7).unwrap(),
         );
     }
 
@@ -2261,6 +2326,7 @@ mod tests {
 
         let capabilities = vec![
             CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
+            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
         ];
         assert_eq!(
             reserve_request_id(
@@ -2355,6 +2421,8 @@ mod tests {
             };
         let spawn_capability =
             CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        let bundle_capability =
+            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
         let mut next_request_id = 91;
         assert!(matches!(
             reserve_request_id(
@@ -2363,7 +2431,7 @@ mod tests {
                 false,
                 false,
                 false,
-                &[spawn_capability.clone()],
+                &[spawn_capability.clone(), bundle_capability.clone()],
             ),
             Err(NodeClientError::UnsupportedCapability(capability))
                 if capability == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
@@ -2384,7 +2452,7 @@ mod tests {
                 false,
                 false,
                 false,
-                &[spawn_capability.clone()],
+                &[spawn_capability.clone(), bundle_capability.clone()],
             )
             .unwrap(),
             101,
@@ -2399,7 +2467,11 @@ mod tests {
                 false,
                 false,
                 false,
-                &[spawn_capability.clone(), environment_capability.clone()],
+                &[
+                    spawn_capability.clone(),
+                    environment_capability.clone(),
+                    bundle_capability,
+                ],
             )
             .unwrap(),
             91,
@@ -2425,6 +2497,81 @@ mod tests {
     }
 
     #[test]
+    fn session_bundle_materialization_is_gated_before_write_and_on_recursive_read() {
+        let spawn_capability =
+            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        let bundle_capability =
+            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        let request = spawn_spec_request();
+        let mut next_request_id = 111;
+        assert!(matches!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &[spawn_capability.clone()],
+            ),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY
+        ));
+        assert_eq!(next_request_id, 111);
+        assert_eq!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &[spawn_capability.clone(), bundle_capability.clone()],
+            )
+            .unwrap(),
+            111,
+        );
+
+        let mut cleared = spawn_spec_request();
+        let NodeRequest::SpawnSpec { spec } = &mut cleared else {
+            unreachable!("spawn spec helper changed variant");
+        };
+        spec.overrides.bundle_id = gate4agent_node_protocol::SpawnOverride::Clear;
+        let mut clear_request_id = 121;
+        assert_eq!(
+            reserve_request_id(
+                &mut clear_request_id,
+                &cleared,
+                false,
+                false,
+                false,
+                &[spawn_capability.clone()],
+            )
+            .unwrap(),
+            121,
+        );
+
+        let mut receipt = spawn_spec_receipt();
+        let bundle_id = SpawnBundleId::new("review-bundle").unwrap();
+        receipt.bundle_id = Some(bundle_id.clone());
+        receipt.bundle = Some(ResolvedBundleReceipt {
+            id: bundle_id,
+            revision: SpawnBundleRevision::new("review-bundle.r1").unwrap(),
+            digest: SpawnBundleDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap(),
+        });
+        let frame = response_frame(NodeResponse::SpawnSpecAccepted { receipt });
+        assert!(matches!(
+            ensure_server_frame_required_capability(&frame, &[spawn_capability.clone()]),
+            Err(NodeClientError::Protocol(ref message))
+                if message.contains("session bundle materialization metadata")
+        ));
+        assert!(ensure_server_frame_required_capability(
+            &frame,
+            &[spawn_capability, bundle_capability],
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn managed_worktree_partial_capability_intersections_fail_closed() {
         let NodeRequest::SpawnSpec { spec } = spawn_spec_request() else {
             unreachable!("spawn spec helper changed variant");
@@ -2438,6 +2585,8 @@ mod tests {
         let managed = CapabilityId::new(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap();
         let spawn = CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
         let worktree = CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
+        let bundle =
+            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
         let mut next_request_id = 91;
         assert!(matches!(
             reserve_request_id(&mut next_request_id, &request, false, false, false, &[]),
@@ -2468,13 +2617,22 @@ mod tests {
             Err(NodeClientError::UnsupportedCapability(capability))
                 if capability == NODE_WORKTREE_SELECTION_CAPABILITY
         ));
-        assert!(reserve_request_id(
+        assert!(matches!(reserve_request_id(
             &mut next_request_id,
             &request,
             false,
             false,
             false,
             &[managed.clone(), spawn.clone(), worktree.clone()],
+        ), Err(NodeClientError::UnsupportedCapability(capability))
+            if capability == NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY));
+        assert!(reserve_request_id(
+            &mut next_request_id,
+            &request,
+            false,
+            false,
+            false,
+            &[managed.clone(), spawn.clone(), worktree.clone(), bundle],
         )
         .is_ok());
 

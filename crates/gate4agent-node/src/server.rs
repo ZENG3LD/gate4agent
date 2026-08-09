@@ -11,6 +11,7 @@ use crate::git_worktree::{
 use crate::environment_profiles::{
     EnvironmentProfileBinding, NodeEnvironmentProfile, MAX_NODE_ENVIRONMENT_PROFILES,
 };
+use crate::bundle_catalog::{BundleCatalog, NodeBundle};
 use crate::session_environment::{
     MaterializationId, MaterializationOwner, MaterializationOwnershipRecord,
     MaterializationState, NodeSecretResolver, NodeSessionMaterializationProfile,
@@ -51,7 +52,8 @@ use crate::protocol::{
     ProtocolRange,
     ProviderAdapterContractSupport,
     ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
-    ProviderRuntimeStatuses, ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt,
+    ProviderRuntimeStatuses, ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt,
+    ResolvedSpawnReceipt,
     ResolvedSpawnSpec, ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
     ManagedSessionState, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
@@ -66,12 +68,13 @@ use crate::protocol::{
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY, NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+    NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY, NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
-    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6,
+    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V7,
     SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
     SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
     SPAWN_RUNTIME_STRUCTURED_PROMPT,
@@ -714,6 +717,23 @@ impl NodeServer {
         Ok(())
     }
 
+    /// Installs one immutable host-local bundle before the server runs.
+    pub fn install_bundle(&mut self, bundle: NodeBundle) -> Result<(), NodeServerError> {
+        if self.shared.session_environment_materializer.is_none() {
+            return Err(NodeServerError::SessionEnvironmentMaterializerRequired);
+        }
+        let mut catalog = self
+            .shared
+            .bundle_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bundles = catalog.iter().cloned().collect::<Vec<_>>();
+        bundles.push(bundle);
+        *catalog = BundleCatalog::new(bundles)
+            .map_err(|error| NodeServerError::BundleCatalog(error.to_string()))?;
+        Ok(())
+    }
+
     pub async fn run_until_ctrl_signal(self) -> Result<(), NodeServerError> {
         let shutdown = self.shutdown_handle();
         let run = self.run();
@@ -1134,6 +1154,7 @@ struct NodeShared {
         RwLock<BTreeMap<SpawnEnvironmentProfileId, EnvironmentProfileBinding>>,
     environment_materialization_profiles:
         RwLock<BTreeMap<SpawnEnvironmentProfileId, NodeSessionMaterializationProfile>>,
+    bundle_catalog: RwLock<BundleCatalog>,
     native_launch_profile_control: Option<NativeLaunchProfileControl>,
     session_environment_materializer: Option<SessionEnvironmentMaterializer>,
     materializations: Mutex<BTreeMap<MaterializationId, MaterializationOwnershipRecord>>,
@@ -1170,6 +1191,7 @@ struct SessionBinding {
     record_id: Option<SessionRecordId>,
     managed_worktree_lease_id: Option<ManagedWorktreeLeaseId>,
     environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    bundle: Option<ResolvedBundleReceipt>,
     materialization_id: Option<MaterializationId>,
 }
 
@@ -1345,6 +1367,7 @@ impl NodeShared {
             spawn_profiles,
             environment_profiles: RwLock::new(BTreeMap::new()),
             environment_materialization_profiles: RwLock::new(BTreeMap::new()),
+            bundle_catalog: RwLock::new(BundleCatalog::default()),
             native_launch_profile_control,
             session_environment_materializer,
             materializations: Mutex::new(
@@ -1511,6 +1534,27 @@ impl NodeShared {
         }))
     }
 
+    fn resolve_bundle(
+        &self,
+        resolved: &ResolvedSpawnSpec,
+    ) -> Result<Option<ResolvedBundleReceipt>, NodeFailure> {
+        let Some(bundle_id) = resolved.bundle_id.as_ref() else {
+            return Ok(None);
+        };
+        self.bundle_catalog
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(bundle_id)
+            .map(NodeBundle::receipt)
+            .ok_or_else(|| {
+                failure(
+                    NodeFailureCode::UnknownBundle,
+                    "spawn bundle is unavailable on this node",
+                )
+            })
+            .map(Some)
+    }
+
     fn select_environment_profile(
         &self,
         instance_id: AgentInstanceId,
@@ -1580,18 +1624,57 @@ impl NodeShared {
             .cloned()
     }
 
+    fn materialization_profile(
+        &self,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<&ResolvedBundleReceipt>,
+    ) -> Result<Option<(NodeSessionMaterializationProfile, bool)>, NodeFailure> {
+        let environment = environment_profile
+            .and_then(|receipt| self.environment_materialization_profile(receipt));
+        let bundle = match bundle {
+            Some(receipt) => {
+                let catalog = self.bundle_catalog.read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let installed = catalog.get(&receipt.id).ok_or_else(|| failure(
+                    NodeFailureCode::UnknownBundle,
+                    "session bundle is unavailable on this node",
+                ))?;
+                if installed.receipt() != *receipt {
+                    return Err(failure(
+                        NodeFailureCode::BundleBindingMismatch,
+                        "session bundle revision or digest changed",
+                    ));
+                }
+                Some(installed.clone())
+            }
+            None => None,
+        };
+        let has_environment_materialization = environment.is_some();
+        let profile = match (environment, bundle.as_ref()) {
+            (None, None) => return Ok(None),
+            (Some(profile), None) => Ok(profile),
+            (None, Some(bundle)) => NodeSessionMaterializationProfile::from_bundle(bundle),
+            (Some(profile), Some(bundle)) => profile.with_bundle(bundle),
+        }
+        .map_err(|_| failure(
+            NodeFailureCode::BundleMaterializationFailed,
+            "session bundle materialization profile is invalid",
+        ))?;
+        Ok(Some((profile, has_environment_materialization)))
+    }
+
     fn prepare_session_materialization<'a>(
         &'a self,
         address: &SessionAddress,
         provider: &AgentId,
         mode: SessionMode,
         environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<&ResolvedBundleReceipt>,
         managed_lease_id: Option<ManagedWorktreeLeaseId>,
-    ) -> Result<Option<(NativeLaunchEnvironmentOverlay, SessionMaterializationGuard<'a>)>, NodeFailure> {
-        let Some(environment_profile) = environment_profile else {
-            return Ok(None);
-        };
-        let Some(profile) = self.environment_materialization_profile(environment_profile) else {
+    ) -> Result<Option<(Option<NativeLaunchEnvironmentOverlay>, SessionMaterializationGuard<'a>)>, NodeFailure> {
+        let Some((profile, has_environment_materialization)) =
+            self.materialization_profile(environment_profile, bundle)?
+        else {
             return Ok(None);
         };
         let materializer = self.session_environment_materializer.as_ref().ok_or_else(|| {
@@ -1600,6 +1683,11 @@ impl NodeShared {
                 "session environment materializer is unavailable",
             )
         })?;
+        let materialization_failure_code = if bundle.is_some() {
+            NodeFailureCode::BundleMaterializationFailed
+        } else {
+            NodeFailureCode::BackendOperationFailed
+        };
         let id = MaterializationId::new(format!(
             "mat-{}-{}-{}",
             self.incarnation_id,
@@ -1620,7 +1708,8 @@ impl NodeShared {
         let mut ownership = materializer
             .begin(
                 id.clone(),
-                environment_profile.clone(),
+                environment_profile.cloned(),
+                bundle.cloned(),
                 owner,
                 managed_lease_id,
                 &profile,
@@ -1628,8 +1717,8 @@ impl NodeShared {
             )
             .map_err(|_| {
                 failure(
-                    NodeFailureCode::BackendOperationFailed,
-                    "session environment preparation failed",
+                    materialization_failure_code,
+                    "session materialization preparation failed",
                 )
             })?;
         {
@@ -1675,8 +1764,8 @@ impl NodeShared {
                     let _ = self.cleanup_materialization(&id);
                 }
                 return Err(failure(
-                    NodeFailureCode::BackendOperationFailed,
-                    "session environment materialization failed",
+                    materialization_failure_code,
+                    "session materialization failed",
                 ));
             }
         };
@@ -1703,17 +1792,21 @@ impl NodeShared {
             shared: self,
             id: Some(id),
         };
-        let overlay = NativeLaunchEnvironmentOverlay::new(
-            provider.clone(),
-            transport,
-            environment,
-        )
-        .map_err(|_| {
-            failure(
-                NodeFailureCode::BackendOperationFailed,
-                "session environment overlay is invalid",
+        let overlay = if has_environment_materialization {
+            Some(NativeLaunchEnvironmentOverlay::new(
+                provider.clone(),
+                transport,
+                environment,
             )
-        })?;
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "session environment overlay is invalid",
+                )
+            })?)
+        } else {
+            None
+        };
         Ok(Some((overlay, guard)))
     }
 
@@ -1799,7 +1892,8 @@ impl NodeShared {
         provider: &AgentId,
         mode: SessionMode,
         environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
-    ) -> Result<Option<(MaterializationId, NativeLaunchEnvironmentOverlay)>, NodeFailure> {
+        bundle: Option<&ResolvedBundleReceipt>,
+    ) -> Result<Option<(MaterializationId, Option<NativeLaunchEnvironmentOverlay>)>, NodeFailure> {
         let ownership = {
             let materializations = self
                 .materializations
@@ -1820,16 +1914,16 @@ impl NodeShared {
             }
             ownership
         };
-        let profile = environment_profile
-            .and_then(|receipt| self.environment_materialization_profile(receipt));
-        match (ownership, profile, environment_profile) {
-            (None, None, _) => Ok(None),
-            (None, Some(_), _) | (Some(_), None, _) | (Some(_), Some(_), None) => Err(failure(
+        let materialization = self.materialization_profile(environment_profile, bundle)?;
+        match (ownership, materialization) {
+            (None, None) => Ok(None),
+            (None, Some(_)) | (Some(_), None) => Err(failure(
                 NodeFailureCode::BackendOperationFailed,
-                "managed session environment materialization is unavailable",
+                "managed session materialization is unavailable",
             )),
-            (Some(ownership), Some(profile), Some(environment_profile)) => {
+            (Some(ownership), Some((profile, has_environment_materialization))) => {
                 if ownership.environment_profile() != environment_profile
+                    || ownership.bundle() != bundle
                     || ownership.state() != MaterializationState::Ready
                 {
                     self.mark_materialization_recovery_required(ownership.id());
@@ -1850,6 +1944,27 @@ impl NodeShared {
                         NodeFailureCode::BackendOperationFailed,
                         "managed session environment revalidation failed",
                     ));
+                }
+                if let Some(bundle_receipt) = bundle {
+                    let catalog = self.bundle_catalog.read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Some(installed) = catalog.get(&bundle_receipt.id) else {
+                        return Err(failure(
+                            NodeFailureCode::UnknownBundle,
+                            "managed session bundle is unavailable",
+                        ));
+                    };
+                    if materializer.revalidate_bundle(&ownership, installed).is_err() {
+                        drop(catalog);
+                        self.mark_materialization_recovery_required(ownership.id());
+                        return Err(failure(
+                            NodeFailureCode::BundleMaterializationFailed,
+                            "managed session bundle revalidation failed",
+                        ));
+                    }
+                }
+                if !has_environment_materialization {
+                    return Ok(Some((ownership.id().clone(), None)));
                 }
                 let environment = match materializer.resolve_environment(&ownership, &profile) {
                     Ok(environment) => environment,
@@ -1891,7 +2006,7 @@ impl NodeShared {
                         "managed session environment overlay is invalid",
                     )
                 })?;
-                Ok(Some((ownership.id().clone(), overlay)))
+                Ok(Some((ownership.id().clone(), Some(overlay))))
             }
         }
     }
@@ -2075,12 +2190,29 @@ impl NodeShared {
                         )
                     })
                     .and_then(|materializer| {
-                        materializer.revalidate(&ownership).map_err(|_| {
-                            failure(
-                                NodeFailureCode::BackendOperationFailed,
-                                "session environment revalidation failed",
-                            )
-                        })
+                        materializer.revalidate(&ownership).map_err(|_| failure(
+                            NodeFailureCode::BackendOperationFailed,
+                            "session materialization revalidation failed",
+                        ))?;
+                        if let Some(receipt) = ownership.bundle() {
+                            let catalog = self.bundle_catalog.read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let bundle = catalog.get(&receipt.id).ok_or_else(|| failure(
+                                NodeFailureCode::UnknownBundle,
+                                "session bundle is unavailable after restart",
+                            ))?;
+                            if bundle.receipt() != *receipt {
+                                return Err(failure(
+                                    NodeFailureCode::BundleBindingMismatch,
+                                    "session bundle changed after restart",
+                                ));
+                            }
+                            materializer.revalidate_bundle(&ownership, bundle).map_err(|_| failure(
+                                NodeFailureCode::BundleMaterializationFailed,
+                                "session bundle revalidation failed",
+                            ))?;
+                        }
+                        Ok(())
                     }),
                 (MaterializationState::RecoveryRequired, _) => Ok(()),
             };
@@ -2102,9 +2234,6 @@ impl NodeShared {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        if materialized_profiles.is_empty() {
-            return;
-        }
         let ownership = self
             .materializations
             .lock()
@@ -2119,14 +2248,20 @@ impl NodeShared {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut changed = false;
             for record in session_records.records.values_mut() {
-                let Some(environment_profile) = record.environment_profile.as_ref() else {
+                let environment_profile = record.environment_profile.as_ref();
+                if environment_profile.is_none() && record.bundle.is_none() {
                     continue;
-                };
-                if !materialized_profiles.contains(&environment_profile.profile_id) {
+                }
+                if record.bundle.is_none()
+                    && environment_profile.is_some_and(|profile| {
+                        !materialized_profiles.contains(&profile.profile_id)
+                    })
+                {
                     continue;
                 }
                 let has_exact_ownership = ownership.iter().any(|candidate| {
                     candidate.environment_profile() == environment_profile
+                        && candidate.bundle() == record.bundle.as_ref()
                         && candidate.owner()
                             == &MaterializationOwner::Record {
                                 record_id: record.record_id.clone(),
@@ -2136,7 +2271,11 @@ impl NodeShared {
                     record.provider_session = None;
                     record.active_session = None;
                     record.state = ManagedSessionState::Unavailable;
-                    record.last_error = Some("environment-profile-unavailable".to_owned());
+                    record.last_error = Some(if record.bundle.is_some() {
+                        "bundle-unavailable".to_owned()
+                    } else {
+                        "environment-profile-unavailable".to_owned()
+                    });
                     record.updated_at_unix_ms = unix_time_ms();
                     changed = true;
                 }
@@ -2274,13 +2413,14 @@ impl NodeShared {
         if resolved.target.worktree_id.is_some() {
             self.require_worktree_service(&resolved.target.workspace_id)?;
         }
-        if resolved.bundle_id.is_some() || resolved.context_id.is_some() {
+        if resolved.context_id.is_some() {
             return Err(failure(
                 NodeFailureCode::UnsupportedSpawnCapability,
-                "spawn materialization capability is not available",
+                "spawn context materialization capability is not available",
             ));
         }
         self.resolve_environment_profile(&resolved)?;
+        self.resolve_bundle(&resolved)?;
         Ok(resolved)
     }
 
@@ -2329,6 +2469,7 @@ impl NodeShared {
         }
         let resolved = self.resolve_spawn_spec(&spec)?;
         let environment_profile = self.resolve_environment_profile(&resolved)?;
+        let bundle = self.resolve_bundle(&resolved)?;
         let required_capabilities = spawn_runtime_capabilities(&resolved.required_capabilities)?;
         let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
         let spawn_workspace_id = self.resolve_spawn_workspace(&resolved, deadline).await;
@@ -2360,6 +2501,7 @@ impl NodeShared {
                 resolved.terminal_size,
                 resolved.prompt.as_ref().map(|prompt| prompt.as_str().to_owned()),
                 environment_profile.clone(),
+                bundle.clone(),
                 None,
                 None,
                 Some(deadline),
@@ -2367,10 +2509,11 @@ impl NodeShared {
             )
             .await
             .map(|session| {
-                resolved.receipt_with_environment(
+                resolved.receipt_with_materialization(
                     self.incarnation_id,
                     session,
                     environment_profile,
+                    bundle,
                 )
             });
         self.remember_spawn_spec(spec, result.clone(), accepted_at);
@@ -2395,6 +2538,7 @@ impl NodeShared {
         }
         let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
         let environment_profile = self.resolve_environment_profile(&resolved)?;
+        let bundle = self.resolve_bundle(&resolved)?;
         let source_workspace_id = resolved.target.workspace_id.clone();
         let profile = self.managed_profile(&source_workspace_id, &request.worktree_profile_id)?;
         let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
@@ -2547,6 +2691,7 @@ impl NodeShared {
             resolved.terminal_size,
             resolved.prompt.as_ref().map(|prompt| prompt.as_str().to_owned()),
             environment_profile.clone(),
+            bundle.clone(),
             Some(lease.lease_id.clone()),
             Some(runtime_policy),
             Some(deadline),
@@ -2609,6 +2754,7 @@ impl NodeShared {
             session,
             snapshot,
             environment_profile,
+            bundle,
         );
         let result = Ok(receipt);
         self.remember_managed_spawn(request, result.clone(), accepted_at);
@@ -2865,7 +3011,7 @@ impl NodeShared {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let result = session_registry::save_v6(
+        let result = session_registry::save_v7(
             self.state_path.as_deref(),
             &self.node_id,
             &workspaces,
@@ -2964,6 +3110,7 @@ impl NodeShared {
             runtime_policy,
             environment_profile,
             None,
+            None,
         );
     }
 
@@ -2972,6 +3119,7 @@ impl NodeShared {
         address: &SessionAddress,
         runtime_policy: ProviderRuntimePolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
         materialization_id: Option<MaterializationId>,
     ) {
         let mut bindings = self
@@ -2988,6 +3136,7 @@ impl NodeShared {
             record_id: None,
             managed_worktree_lease_id: None,
             environment_profile,
+            bundle,
             materialization_id,
         });
     }
@@ -3006,6 +3155,7 @@ impl NodeShared {
             runtime_policy,
             environment_profile,
             None,
+            None,
         );
     }
 
@@ -3015,6 +3165,7 @@ impl NodeShared {
         record_id: SessionRecordId,
         runtime_policy: ProviderRuntimePolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
         materialization_id: Option<MaterializationId>,
     ) {
         let mut bindings = self
@@ -3033,6 +3184,7 @@ impl NodeShared {
                 record_id: Some(record_id),
                 managed_worktree_lease_id: None,
                 environment_profile,
+                bundle,
                 materialization_id,
             },
         );
@@ -3054,6 +3206,7 @@ impl NodeShared {
             runtime_policy,
             environment_profile,
             None,
+            None,
         )
     }
 
@@ -3064,6 +3217,7 @@ impl NodeShared {
         mode: SessionMode,
         runtime_policy: ProviderRuntimePolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
         materialization_id: Option<MaterializationId>,
     ) -> Result<Option<SessionRecordId>, NodeFailure> {
         if !runtime_policy.provider_session_identity {
@@ -3071,6 +3225,7 @@ impl NodeShared {
                 address,
                 runtime_policy,
                 environment_profile,
+                bundle,
                 materialization_id,
             );
             return Ok(None);
@@ -3082,6 +3237,7 @@ impl NodeShared {
             ManagedSessionState::IdentityPending,
             None,
             environment_profile.clone(),
+            bundle.clone(),
         )?;
         let record_id = record.record_id.clone();
         let transaction = self
@@ -3123,6 +3279,7 @@ impl NodeShared {
             record_id.clone(),
             runtime_policy,
             environment_profile,
+            bundle,
             materialization_id.clone(),
         );
         if let Err(error) = self.persist_state_locked() {
@@ -3196,6 +3353,7 @@ impl NodeShared {
         state: ManagedSessionState,
         provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
     ) -> Result<ManagedSessionRecord, NodeFailure> {
         let canonical_root = self.workspace_root(&address.workspace_id)?;
         let now = unix_time_ms();
@@ -3210,6 +3368,7 @@ impl NodeShared {
             provider_session,
             active_session: Some(address.clone()),
             environment_profile,
+            bundle,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             last_error: None,
@@ -3544,15 +3703,22 @@ impl NodeShared {
             &record.provider,
             record.mode,
             record.environment_profile.as_ref(),
+            record.bundle.as_ref(),
         ) {
             Ok(materialization) => materialization,
             Err(error) => {
-                self.mark_record_error(record_id, "environment-profile-unavailable")?;
+                let label = match error.code {
+                    NodeFailureCode::UnknownBundle => "bundle-unavailable",
+                    NodeFailureCode::BundleBindingMismatch => "bundle-binding-mismatch",
+                    NodeFailureCode::BundleMaterializationFailed => "bundle-materialization-failed",
+                    _ => "environment-profile-unavailable",
+                };
+                self.mark_record_error(record_id, label)?;
                 return Err(error);
             }
         };
         let (materialization_id, environment_overlay) = match resolved_materialization {
-            Some((id, overlay)) => (Some(id), Some(overlay)),
+            Some((id, overlay)) => (Some(id), overlay),
             None => (None, None),
         };
         let mut environment_selection = match self.select_environment_profile(
@@ -3615,6 +3781,7 @@ impl NodeShared {
             record_id.clone(),
             runtime_policy,
             record.environment_profile.clone(),
+            record.bundle.clone(),
             materialization_id,
         );
         if let Some(selection) = environment_selection.take() {
@@ -4760,6 +4927,8 @@ impl NodeShared {
                     let scope_matches = records.records.get(&existing_id).is_some_and(|record| {
                         record.mode == current_snapshot.mode
                             && record.workspace_id == current_snapshot.workspace_id
+                            && record.environment_profile == current_snapshot.environment_profile
+                            && record.bundle == current_snapshot.bundle
                             && record
                                 .canonical_root
                                 .as_utf8()
@@ -4824,7 +4993,14 @@ impl NodeShared {
                 {
                     if let Some(current) = records.records.get_mut(record_id) {
                         current.active_session = None;
-                        current.state = ManagedSessionState::Dormant;
+                        if current.bundle.is_some() {
+                            current.provider_session = None;
+                            current.bundle = None;
+                            current.state = ManagedSessionState::Unavailable;
+                            current.last_error = Some("bundle-unavailable".to_owned());
+                        } else {
+                            current.state = ManagedSessionState::Dormant;
+                        }
                         current.updated_at_unix_ms = unix_time_ms();
                         upserts.push(current.clone());
                     }
@@ -4860,6 +5036,7 @@ impl NodeShared {
                             provider_session: Some(identity),
                             active_session: Some(address.clone()),
                             environment_profile: current_snapshot.environment_profile,
+                            bundle: current_snapshot.bundle,
                             created_at_unix_ms: now,
                             updated_at_unix_ms: now,
                             last_error: None,
@@ -5622,6 +5799,7 @@ impl NodeShared {
                 None,
                 None,
                 None,
+                None,
                 &[],
             )
             .await
@@ -5635,6 +5813,7 @@ impl NodeShared {
         terminal_size: gate4agent_types::TerminalSize,
         initial_prompt: Option<String>,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
         managed_authority: Option<ManagedWorktreeLeaseId>,
         admitted_runtime_policy: Option<ProviderRuntimePolicy>,
         deadline: Option<Instant>,
@@ -5708,6 +5887,7 @@ impl NodeShared {
             &provider,
             mode,
             environment_profile.as_ref(),
+            bundle.as_ref(),
             managed_authority.clone(),
         )?;
         let (environment_overlay, mut materialization_guard) = match prepared_materialization {
@@ -5724,7 +5904,7 @@ impl NodeShared {
             mode,
             environment_profile.as_ref(),
         )?;
-        if let Some(overlay) = environment_overlay {
+        if let Some(overlay) = environment_overlay.flatten() {
             self.native_launch_profile_control
                 .as_ref()
                 .ok_or_else(|| {
@@ -5748,6 +5928,7 @@ impl NodeShared {
             mode,
             runtime_policy,
             environment_profile,
+            bundle,
             materialization_id,
         )?;
         if let Some(selection) = environment_selection.take() {
@@ -6186,6 +6367,9 @@ async fn serve_connection(
     let include_child_environment_profiles = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
     });
+    let include_session_bundles = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY
+    });
     let authenticated_permit = Arc::clone(&shared.authenticated_slots)
         .try_acquire_owned()
         .map_err(|_| NodeServerError::AuthenticatedConnectionLimit)?;
@@ -6216,6 +6400,7 @@ async fn serve_connection(
                 include_open_provider_ids,
                 include_managed_worktrees,
                 include_child_environment_profiles,
+                include_session_bundles,
             ),
             compatibility,
         }),
@@ -6303,6 +6488,11 @@ async fn serve_connection(
                 } else {
                     project_event_without_child_environment_profile(event)
                 });
+                let event = event.map(|event| if include_session_bundles {
+                    event
+                } else {
+                    project_event_without_session_bundle(event)
+                });
                 if let Some(event) = event {
                     write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
                 }
@@ -6327,6 +6517,8 @@ async fn serve_connection(
                     request_requires_open_provider_ids(&shared, &request.request);
                 let requires_child_environment_profile =
                     request_requires_child_environment_profile(&shared, &request.request);
+                let requires_session_bundle =
+                    request_requires_session_bundle(&shared, &request.request);
                 let mut reply = if requires_open_provider_ids && !include_open_provider_ids {
                     ResponseEnvelope {
                         request_id: request.request_id,
@@ -6343,6 +6535,14 @@ async fn serve_connection(
                         result: Err(failure(
                             NodeFailureCode::UnsupportedCapability,
                             "child environment profiles were not negotiated",
+                        )),
+                    }
+                } else if requires_session_bundle && !include_session_bundles {
+                    ResponseEnvelope {
+                        request_id: request.request_id,
+                        result: Err(failure(
+                            NodeFailureCode::UnsupportedCapability,
+                            "session bundles were not negotiated",
                         )),
                     }
                 } else if request_uses_unnegotiated_capability(
@@ -6371,6 +6571,9 @@ async fn serve_connection(
                 }
                 if !include_child_environment_profiles {
                     project_response_without_child_environment_profile(&mut reply);
+                }
+                if !include_session_bundles {
+                    project_response_without_session_bundle(&mut reply);
                 }
                 write_json_frame(&mut writer, &ServerFrame::Reply(reply)).await?;
             }
@@ -6505,7 +6708,7 @@ fn node_compatibility_support_for_manifest(
         path_semantics: platform::path_semantics(),
         local_transport: platform::local_transport(),
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V7)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: provider_contracts.to_vec(),
@@ -6526,6 +6729,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_WORKTREE_SELECTION_CAPABILITY,
         NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
         NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+        NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -6553,6 +6757,8 @@ fn request_uses_unnegotiated_capability(
             && !selected(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY))
         || (request.requires_child_environment_profile_capability()
             && !selected(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY))
+        || (request.requires_session_bundle_materialization_capability()
+            && !selected(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY))
 }
 
 fn snapshot_for_wire(
@@ -6561,6 +6767,7 @@ fn snapshot_for_wire(
     include_open_provider_ids: bool,
     include_managed_worktrees: bool,
     include_child_environment_profiles: bool,
+    include_session_bundles: bool,
 ) -> NodeSnapshot {
     let mut snapshot = shared.snapshot();
     if !include_provider_runtime_status {
@@ -6574,6 +6781,9 @@ fn snapshot_for_wire(
     }
     if !include_child_environment_profiles {
         clear_snapshot_child_environment_profiles(&mut snapshot);
+    }
+    if !include_session_bundles {
+        clear_snapshot_session_bundles(&mut snapshot);
     }
     snapshot
 }
@@ -6703,6 +6913,59 @@ fn request_requires_child_environment_profile(
     }
 }
 
+fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -> bool {
+    if let Some(spec) = match request {
+        NodeRequest::SpawnSpec { spec } => Some(spec),
+        NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
+        _ => None,
+    } {
+        return shared
+            .resolve_spawn_spec(spec)
+            .is_ok_and(|resolved| resolved.bundle_id.is_some());
+    }
+    match request {
+        NodeRequest::Resume { session, .. }
+        | NodeRequest::Prompt { session, .. }
+        | NodeRequest::Paste { session, .. }
+        | NodeRequest::Input { session, .. }
+        | NodeRequest::TerminalBytes { session, .. }
+        | NodeRequest::TerminalControl { session, .. }
+        | NodeRequest::Resize { session, .. }
+        | NodeRequest::Interrupt { session }
+        | NodeRequest::Stop { session, .. }
+        | NodeRequest::Remove { session } => shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&session.session.instance_id)
+            .filter(|binding| {
+                binding.workspace_id == session.workspace_id
+                    && binding.generation == session.session.generation
+            })
+            .map_or(true, |binding| binding.bundle.is_some()),
+        NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::ResumeSessionRecord { record_id, .. }
+        | NodeRequest::ForgetSessionRecord { record_id } => shared
+            .record(record_id)
+            .map_or(true, |record| record.bundle.is_some()),
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
+        | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
 fn request_requires_open_provider_ids_with(
     request: &NodeRequest,
     provider_for_session: impl Fn(&SessionAddress) -> Option<AgentId>,
@@ -6814,6 +7077,68 @@ fn project_response_without_child_environment_profile(reply: &mut ResponseEnvelo
         | NodeResponse::SessionRecordResumed { record, .. } => {
             record.environment_profile = None;
         }
+        NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::Controller { .. }
+        | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SpawnSpecAccepted { .. }
+        | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. }
+        | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::WorkspaceUnregistered { .. }
+        | NodeResponse::WorktreeCreated { .. }
+        | NodeResponse::WorktreeRemoved { .. }
+        | NodeResponse::Accepted
+        | NodeResponse::ShuttingDown => {}
+    }
+}
+
+fn clear_snapshot_session_bundles(snapshot: &mut NodeSnapshot) {
+    for record in &mut snapshot.session_records {
+        record.bundle = None;
+    }
+}
+
+fn project_event_without_session_bundle(
+    mut envelope: NodeEventEnvelope,
+) -> NodeEventEnvelope {
+    if let NodeEvent::SessionRecordUpserted { record } = &mut envelope.event {
+        record.bundle = None;
+    }
+    envelope
+}
+
+fn project_response_without_session_bundle(reply: &mut ResponseEnvelope) {
+    let contains_bundle = match reply.result.as_ref() {
+        Ok(NodeResponse::SpawnSpecAccepted { receipt }) => receipt.bundle.is_some(),
+        Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt }) => {
+            receipt.spawn.bundle.is_some()
+        }
+        _ => false,
+    };
+    if contains_bundle {
+        reply.result = Err(failure(
+            NodeFailureCode::UnsupportedCapability,
+            "session bundles were not negotiated",
+        ));
+        return;
+    }
+    let Ok(response) = reply.result.as_mut() else {
+        return;
+    };
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => clear_snapshot_session_bundles(snapshot),
+        NodeResponse::Resync { snapshot, events, .. } => {
+            clear_snapshot_session_bundles(snapshot);
+            for event in events {
+                if let NodeEvent::SessionRecordUpserted { record } = &mut event.event {
+                    record.bundle = None;
+                }
+            }
+        }
+        NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::SessionRecordResumed { record, .. } => record.bundle = None,
         NodeResponse::WorkspaceInspected { .. }
         | NodeResponse::WorkspaceFileRead { .. }
         | NodeResponse::Controller { .. }
@@ -7753,14 +8078,16 @@ fn managed_spawn_receipt(
     session: SessionAddress,
     lease: ManagedWorktreeLeaseSnapshot,
     environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    bundle: Option<ResolvedBundleReceipt>,
 ) -> ManagedWorktreeSpawnReceipt {
     let mut managed = resolved.clone();
     managed.target.worktree_id = Some(lease.workspace_id.clone());
     ManagedWorktreeSpawnReceipt {
-        spawn: managed.receipt_with_environment(
+        spawn: managed.receipt_with_materialization(
             incarnation_id,
             session,
             environment_profile,
+            bundle,
         ),
         lease,
     }
@@ -7926,6 +8253,9 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::EnvironmentProfileBindingMismatch => {
             "environment-profile-binding-mismatch"
         }
+        NodeFailureCode::UnknownBundle => "unknown-bundle",
+        NodeFailureCode::BundleBindingMismatch => "bundle-binding-mismatch",
+        NodeFailureCode::BundleMaterializationFailed => "bundle-materialization-failed",
         NodeFailureCode::InvalidWorkspaceRoot => "invalid-workspace-root",
         NodeFailureCode::DuplicateWorkspaceId => "duplicate-workspace-id",
         NodeFailureCode::DuplicateWorkspaceRoot => "duplicate-workspace-root",
@@ -8053,6 +8383,8 @@ pub enum NodeServerError {
     SessionEnvironmentMaterializerRequired,
     #[error("node session-environment materializer failed to initialize")]
     SessionEnvironmentMaterializer,
+    #[error("node bundle catalog is invalid: {0}")]
+    BundleCatalog(String),
     #[error("active agent registry failed: {0}")]
     Registry(String),
     #[error("node provider contract manifest is invalid: {0}")]
@@ -8408,6 +8740,7 @@ mod tests {
                 SessionMode::Pty,
                 Some(receipt),
                 None,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -8433,7 +8766,7 @@ mod tests {
             .native_launch_profile_control
             .as_ref()
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap();
         let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
         let record_id = shared
@@ -8443,6 +8776,7 @@ mod tests {
                 SessionMode::Pty,
                 policy,
                 Some(receipt.clone()),
+                None,
                 Some(materialization_id.clone()),
             )
             .unwrap()
@@ -8459,7 +8793,7 @@ mod tests {
             capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
         }));
         let support = node_compatibility_support_for_manifest(&[], &[]).unwrap();
-        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V6);
+        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V7);
         let spec = spawn_spec_fixture();
         assert!(matches!(
             &spec.overrides.environment_profile_id,
@@ -8503,7 +8837,7 @@ mod tests {
             },
         ));
 
-        let snapshot = snapshot_for_wire(&shared, false, true, true, false);
+        let snapshot = snapshot_for_wire(&shared, false, true, true, false, false);
         assert_eq!(snapshot.session_records.len(), 1);
         assert!(snapshot.session_records[0].environment_profile.is_none());
         let event = project_event_without_child_environment_profile(NodeEventEnvelope {
@@ -8527,6 +8861,62 @@ mod tests {
             }),
         };
         project_response_without_child_environment_profile(&mut reply);
+        assert_eq!(
+            reply.result.unwrap_err().code,
+            NodeFailureCode::UnsupportedCapability,
+        );
+    }
+
+    #[test]
+    fn session_bundle_capability_is_state_aware_and_legacy_safe() {
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY
+        }));
+        let shared = terminal_test_shared();
+        let bundle = ResolvedBundleReceipt {
+            id: crate::protocol::SpawnBundleId::new("review-bundle").unwrap(),
+            revision: crate::protocol::SpawnBundleRevision::new("r1").unwrap(),
+            digest: crate::protocol::SpawnBundleDigest::new(format!(
+                "sha256:{}",
+                "0".repeat(64),
+            ))
+            .unwrap(),
+        };
+        let mut bundled = record("claude", "bundle-record");
+        bundled.bundle = Some(bundle.clone());
+        let record_id = bundled.record_id.clone();
+        shared.insert_record(bundled.clone()).unwrap();
+        assert!(request_requires_session_bundle(
+            &shared,
+            &NodeRequest::ForgetSessionRecord {
+                record_id: record_id.clone(),
+            },
+        ));
+
+        let snapshot = snapshot_for_wire(&shared, false, true, true, true, false);
+        assert!(snapshot.session_records[0].bundle.is_none());
+        let event = project_event_without_session_bundle(NodeEventEnvelope {
+            sequence: 1,
+            event: NodeEvent::SessionRecordUpserted { record: bundled },
+        });
+        let NodeEvent::SessionRecordUpserted { record } = event.event else {
+            panic!("record projection changed the event kind");
+        };
+        assert!(record.bundle.is_none());
+
+        let resolved = shared.resolve_spawn_spec(&spawn_spec_fixture()).unwrap();
+        let mut reply = ResponseEnvelope {
+            request_id: 1,
+            result: Ok(NodeResponse::SpawnSpecAccepted {
+                receipt: resolved.receipt_with_materialization(
+                    shared.incarnation_id,
+                    terminal_address(17),
+                    None,
+                    Some(bundle),
+                ),
+            }),
+        };
+        project_response_without_session_bundle(&mut reply);
         assert_eq!(
             reply.result.unwrap_err().code,
             NodeFailureCode::UnsupportedCapability,
@@ -8603,6 +8993,7 @@ mod tests {
             SessionMode::Pty,
             Some(&receipt),
             None,
+            None,
         ) {
             Ok(_) => panic!("denied local reference unexpectedly materialized"),
             Err(error) => error,
@@ -8641,6 +9032,7 @@ mod tests {
                 SessionMode::Pty,
                 Some(&receipt),
                 None,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -8666,12 +9058,13 @@ mod tests {
             .native_launch_profile_control
             .as_ref()
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap();
         shared.bind_session_with_materialization(
             &address,
             ProviderRuntimePolicy::raw_pty(),
             Some(receipt),
+            None,
             Some(materialization_id),
         );
         selection.retain();
@@ -8716,6 +9109,7 @@ mod tests {
                 SessionMode::Pty,
                 Some(&receipt),
                 None,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -8741,7 +9135,7 @@ mod tests {
             .native_launch_profile_control
             .as_ref()
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap();
         let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
         let record_id = shared
@@ -8751,6 +9145,7 @@ mod tests {
                 SessionMode::Pty,
                 policy,
                 Some(receipt.clone()),
+                None,
                 Some(materialization_id.clone()),
             )
             .unwrap()
@@ -8781,6 +9176,7 @@ mod tests {
                 &agent("claude"),
                 SessionMode::Pty,
                 Some(&receipt),
+                None,
             )
             .unwrap()
             .is_some());
@@ -8823,6 +9219,7 @@ mod tests {
             &agent("claude"),
             SessionMode::Pty,
             Some(&receipt),
+            None,
         ) {
             Ok(_) => panic!("tampered owner marker unexpectedly revalidated"),
             Err(error) => error,
@@ -8861,6 +9258,7 @@ mod tests {
             &agent("claude"),
             SessionMode::Pty,
             Some(&receipt),
+            None,
         ) {
             Ok(_) => panic!("denied transient resolver unexpectedly succeeded"),
             Err(error) => error,
@@ -8903,6 +9301,7 @@ mod tests {
                 }),
                 active_session: None,
                 environment_profile: Some(receipt),
+                bundle: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -8939,6 +9338,7 @@ mod tests {
                 &agent("claude"),
                 SessionMode::Pty,
                 Some(&receipt),
+                None,
                 Some(lease.lease_id.clone()),
             )
             .unwrap()
@@ -8965,12 +9365,13 @@ mod tests {
             .native_launch_profile_control
             .as_ref()
             .unwrap()
-            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap();
         shared.bind_session_with_materialization(
             &address,
             ProviderRuntimePolicy::raw_pty(),
             Some(receipt),
+            None,
             Some(materialization_id),
         );
         selection.retain();
@@ -9050,6 +9451,7 @@ mod tests {
             session.clone(),
             lease.snapshot(),
             None,
+            None,
         );
         assert!(resolved.target.worktree_id.is_none());
         assert_eq!(receipt.spawn.target.workspace_id, lease.source_workspace_id);
@@ -9089,7 +9491,7 @@ mod tests {
     fn legacy_projection_omits_managed_snapshot_events_and_path_bearing_diagnostics() {
         let shared = terminal_test_shared();
         let lease = install_managed_lease(&shared);
-        let snapshot = snapshot_for_wire(&shared, true, true, false, true);
+        let snapshot = snapshot_for_wire(&shared, true, true, false, true, true);
         assert!(snapshot.managed_worktrees.is_empty());
         let mut reply = ResponseEnvelope {
             request_id: 1,
@@ -9250,7 +9652,7 @@ mod tests {
             .spawn_from_spec(unsupported_materializer)
             .await
             .unwrap_err();
-        assert_eq!(failure.code, NodeFailureCode::UnsupportedSpawnCapability);
+        assert_eq!(failure.code, NodeFailureCode::UnknownBundle);
 
         let failure = shared
             .spawn_session_with_deadline(
@@ -9261,6 +9663,7 @@ mod tests {
                     rows: 24,
                     columns: 80,
                 },
+                None,
                 None,
                 None,
                 None,
@@ -9600,6 +10003,7 @@ mod tests {
             provider_session: None,
             active_session: None,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             last_error: None,
@@ -10541,6 +10945,7 @@ mod tests {
             provider_session: None,
             active_session: None,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             last_error: None,
@@ -10582,6 +10987,7 @@ mod tests {
                 provider_session: None,
                 active_session: None,
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -10640,6 +11046,7 @@ mod tests {
                 provider_session: None,
                 active_session: Some(address.clone()),
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -10722,6 +11129,7 @@ mod tests {
                 provider_session: Some(identity.clone()),
                 active_session: None,
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -10747,6 +11155,7 @@ mod tests {
                 provider_session: None,
                 active_session: Some(address.clone()),
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
                 last_error: None,
@@ -10855,6 +11264,7 @@ mod tests {
                 provider_session: Some(persisted_identity.clone()),
                 active_session: None,
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -10880,6 +11290,7 @@ mod tests {
                 provider_session: None,
                 active_session: Some(address.clone()),
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
                 last_error: None,
@@ -11043,6 +11454,7 @@ mod tests {
                 }),
                 active_session: None,
                 environment_profile: None,
+                bundle: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,

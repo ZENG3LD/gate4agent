@@ -8,6 +8,7 @@ use crate::protocol::{
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+    C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
@@ -48,6 +49,7 @@ struct NegotiatedPathCapabilities {
     worktree_selection: bool,
     managed_worktree_lifecycle: bool,
     child_environment_profile: bool,
+    session_bundle_materialization: bool,
     terminal_frame_events: bool,
 }
 
@@ -510,6 +512,12 @@ async fn control_writer<W>(
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
+        if !path_capabilities.session_bundle_materialization
+            && server_frame_contains_session_bundle_materialization(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
         }
@@ -573,6 +581,8 @@ fn negotiated_path_capabilities(
             selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
         child_environment_profile:
             selected_has(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY),
+        session_bundle_materialization:
+            selected_has(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -685,6 +695,15 @@ fn unnegotiated_request_failure(
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
             "child environment profile capability was not negotiated with C2",
+            None,
+        ));
+    }
+    if request.requires_session_bundle_materialization_capability()
+        && !capabilities.session_bundle_materialization
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "session bundle materialization capability was not negotiated with C2",
             None,
         ));
     }
@@ -929,6 +948,33 @@ fn status_contains_child_environment_profile(status: &StatusResponse) -> bool {
             inventory.managed_sessions.iter().any(|record| {
                 record.environment_profile.is_some()
             })
+        })
+    })
+}
+
+fn server_frame_contains_session_bundle_materialization(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Hello(hello) => {
+            status_contains_session_bundle_materialization(&hello.status)
+        }
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(
+                C2NodeResponse::requires_session_bundle_materialization_capability,
+            )
+        }),
+        C2ServerFrame::Event(event) => event
+            .event
+            .requires_session_bundle_materialization_capability(),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn status_contains_session_bundle_materialization(status: &StatusResponse) -> bool {
+    status.nodes.values().any(|node| {
+        node.inventory.as_ref().is_some_and(|inventory| {
+            inventory.managed_sessions.iter().any(|record| record.bundle.is_some())
         })
     })
 }
@@ -1211,6 +1257,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
@@ -1705,6 +1753,7 @@ mod tests {
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
             bundle_id: None,
+            bundle: None,
             context_id: None,
             environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
@@ -1812,6 +1861,7 @@ mod tests {
             workspace_id: WorkspaceId::new("repo").unwrap(),
             active_session,
             environment_profile: None,
+            bundle: None,
             provider_identity_present: false,
             updated_at_unix_ms: 1,
         }
@@ -1840,6 +1890,7 @@ mod tests {
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -1877,6 +1928,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_none());
@@ -1988,6 +2040,52 @@ mod tests {
     }
 
     #[test]
+    fn c2_session_bundle_gate_requires_inherit_or_set_but_not_clear() {
+        let mut capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            child_environment_profile: true,
+            session_bundle_materialization: false,
+            terminal_frame_events: true,
+        };
+        let inherited = spawn_spec("node-a");
+        assert!(matches!(
+            unnegotiated_request_failure(
+                &NodeRequest::SpawnSpec {
+                    spec: inherited.clone(),
+                },
+                capabilities,
+            ),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "session bundle materialization capability was not negotiated with C2"
+        ));
+
+        let mut cleared = inherited;
+        cleared.overrides.bundle_id = gate4agent_node_protocol::SpawnOverride::Clear;
+        assert!(unnegotiated_request_failure(
+            &NodeRequest::SpawnSpec { spec: cleared },
+            capabilities,
+        )
+        .is_none());
+
+        capabilities.session_bundle_materialization = true;
+        assert!(unnegotiated_request_failure(
+            &NodeRequest::SpawnSpec { spec: spawn_spec("node-a") },
+            capabilities,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn managed_worktree_partial_capability_intersections_fail_closed() {
         let request = NodeRequest::SpawnManagedWorktree {
             request: crate::protocol::ManagedWorktreeSpawnRequest {
@@ -2006,6 +2104,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: false,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_some());
@@ -2097,6 +2196,7 @@ mod tests {
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
+                session_bundle_materialization: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2148,6 +2248,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: false,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         control_writer(
@@ -2199,6 +2300,7 @@ mod tests {
                 worktree_selection: false,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
+                session_bundle_materialization: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2378,6 +2480,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2567,6 +2670,7 @@ mod tests {
                 worktree_selection: false,
                 managed_worktree_lifecycle: false,
                 child_environment_profile: false,
+                session_bundle_materialization: false,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2603,6 +2707,7 @@ mod tests {
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
+                session_bundle_materialization: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2639,6 +2744,7 @@ mod tests {
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
+                session_bundle_materialization: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2693,6 +2799,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2709,6 +2816,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2725,6 +2833,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
@@ -2760,6 +2869,7 @@ mod tests {
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
+                session_bundle_materialization: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,

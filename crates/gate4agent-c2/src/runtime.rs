@@ -969,6 +969,9 @@ fn validate_spawn_receipt(
         || receipt.idempotency_key != spec.idempotency_key
         || receipt.deadline_ms != spec.deadline_ms
         || receipt.required_capabilities != spec.required_capabilities
+        || receipt.bundle.as_ref().is_some_and(|bundle| {
+            receipt.bundle_id.as_ref() != Some(&bundle.id)
+        })
         || &receipt.session.workspace_id
             != spec
                 .target
@@ -1811,6 +1814,7 @@ mod tests {
             terminal_size,
             prompt: SpawnPromptMetadata::from_prompt(Some(&prompt)),
             bundle_id: None,
+            bundle: None,
             context_id: None,
             environment_profile: None,
             deadline_ms: spec.deadline_ms,
@@ -1877,6 +1881,21 @@ mod tests {
                     .unwrap(),
             },
         );
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.bundle = Some(gate4agent_node_protocol::ResolvedBundleReceipt {
+            id: gate4agent_node_protocol::SpawnBundleId::new("unexpected-bundle")
+                .unwrap(),
+            revision: gate4agent_node_protocol::SpawnBundleRevision::new(
+                "unexpected-bundle.r1",
+            )
+            .unwrap(),
+            digest: gate4agent_node_protocol::SpawnBundleDigest::new(format!(
+                "sha256:{}",
+                "a".repeat(64),
+            ))
+            .unwrap(),
+        });
         mismatches.push(changed);
 
         for mismatch in mismatches {
@@ -1968,6 +1987,7 @@ mod tests {
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
             bundle_id: None,
+            bundle: None,
             context_id: None,
             environment_profile: None,
             deadline_ms: spec.deadline_ms,

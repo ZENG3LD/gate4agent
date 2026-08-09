@@ -1,7 +1,8 @@
 use crate::protocol::{
     ManagedWorktreeLeaseId, NodeIncarnationId, OpaqueHostPath,
-    ResolvedEnvironmentProfileReceipt, SessionRecordId,
+    ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, SessionRecordId,
 };
+use crate::bundle_catalog::NodeBundle;
 use gate4agent_catalog::EnvMutation;
 use gate4agent_types::{AgentInstanceId, SessionGeneration};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -26,7 +27,7 @@ const MATERIALIZATION_OWNER_MARKER: &str = ".gate4agent-materialization-owner";
 const MATERIALIZATION_ROOT_MARKER_NAME: &str = ".gate4agent-materialization-root";
 const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
 
-#[derive(Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeSecretReference(String);
 
 impl NodeSecretReference {
@@ -102,6 +103,7 @@ pub enum NodeSecretResolveError {
     Denied,
 }
 
+#[derive(Clone)]
 pub enum NodeSessionEnvironmentMutation {
     SetNonSecret { key: String, value: String },
     SetSecret { key: String, reference: NodeSecretReference },
@@ -117,6 +119,10 @@ pub enum NodeSessionPathClass {
     Data,
     State,
     Tmp,
+    #[doc(hidden)]
+    BundleRoot,
+    #[doc(hidden)]
+    PluginData,
 }
 
 impl NodeSessionPathClass {
@@ -128,6 +134,8 @@ impl NodeSessionPathClass {
             Self::Data => "data",
             Self::State => "state",
             Self::Tmp => "tmp",
+            Self::BundleRoot => "bundle",
+            Self::PluginData => "plugin-data",
         }
     }
 }
@@ -149,6 +157,7 @@ impl NodeSessionPathBinding {
     }
 }
 
+#[derive(Clone)]
 pub enum NodeSessionFile {
     Generated {
         class: NodeSessionPathClass,
@@ -267,6 +276,47 @@ impl NodeSessionMaterializationProfile {
     pub fn is_empty(&self) -> bool {
         self.0.environment.is_empty() && self.0.path_bindings.is_empty() && self.0.files.is_empty()
     }
+
+    pub(crate) fn from_bundle(
+        bundle: &NodeBundle,
+    ) -> Result<Self, NodeSessionMaterializationProfileError> {
+        Self::new(
+            Vec::new(),
+            Vec::new(),
+            bundle
+                .files()
+                .iter()
+                .map(|file| {
+                    NodeSessionFile::generated(
+                        NodeSessionPathClass::BundleRoot,
+                        PathBuf::from(file.path()),
+                        file.bytes().to_vec(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    }
+
+    pub(crate) fn with_bundle(
+        &self,
+        bundle: &NodeBundle,
+    ) -> Result<Self, NodeSessionMaterializationProfileError> {
+        let mut files = self.0.files.clone();
+        files.extend(
+            bundle
+                .files()
+                .iter()
+                .map(|file| {
+                    NodeSessionFile::generated(
+                        NodeSessionPathClass::BundleRoot,
+                        PathBuf::from(file.path()),
+                        file.bytes().to_vec(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Self::new(self.0.environment.clone(), self.0.path_bindings.clone(), files)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -367,12 +417,15 @@ pub(crate) struct MaterializedPathDeclaration {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct MaterializationOwnershipRecord {
     id: MaterializationId,
-    environment_profile: ResolvedEnvironmentProfileReceipt,
+    environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    bundle: Option<ResolvedBundleReceipt>,
     owner: MaterializationOwner,
     managed_lease_id: Option<ManagedWorktreeLeaseId>,
     state: MaterializationState,
     root: PathBuf,
     provider_home: PathBuf,
+    bundle_root: PathBuf,
+    plugin_data: PathBuf,
     declared_paths: Vec<MaterializedPathDeclaration>,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
@@ -382,12 +435,15 @@ impl MaterializationOwnershipRecord {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_persisted(
         id: MaterializationId,
-        environment_profile: ResolvedEnvironmentProfileReceipt,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
         owner: MaterializationOwner,
         managed_lease_id: Option<ManagedWorktreeLeaseId>,
         state: MaterializationState,
         root: PathBuf,
         provider_home: PathBuf,
+        bundle_root: PathBuf,
+        plugin_data: PathBuf,
         declared_paths: Vec<MaterializedPathDeclaration>,
         created_at_unix_ms: u64,
         updated_at_unix_ms: u64,
@@ -395,11 +451,14 @@ impl MaterializationOwnershipRecord {
         let record = Self {
             id,
             environment_profile,
+            bundle,
             owner,
             managed_lease_id,
             state,
             root,
             provider_home,
+            bundle_root,
+            plugin_data,
             declared_paths,
             created_at_unix_ms,
             updated_at_unix_ms,
@@ -409,12 +468,15 @@ impl MaterializationOwnershipRecord {
     }
 
     pub(crate) fn id(&self) -> &MaterializationId { &self.id }
-    pub(crate) fn environment_profile(&self) -> &ResolvedEnvironmentProfileReceipt { &self.environment_profile }
+    pub(crate) fn environment_profile(&self) -> Option<&ResolvedEnvironmentProfileReceipt> { self.environment_profile.as_ref() }
+    pub(crate) fn bundle(&self) -> Option<&ResolvedBundleReceipt> { self.bundle.as_ref() }
     pub(crate) fn owner(&self) -> &MaterializationOwner { &self.owner }
     pub(crate) fn managed_lease_id(&self) -> Option<&ManagedWorktreeLeaseId> { self.managed_lease_id.as_ref() }
     pub(crate) fn state(&self) -> MaterializationState { self.state }
     pub(crate) fn root(&self) -> &Path { &self.root }
     pub(crate) fn provider_home(&self) -> &Path { &self.provider_home }
+    pub(crate) fn bundle_root(&self) -> &Path { &self.bundle_root }
+    pub(crate) fn plugin_data(&self) -> &Path { &self.plugin_data }
     pub(crate) fn declared_paths(&self) -> &[MaterializedPathDeclaration] { &self.declared_paths }
     pub(crate) fn created_at_unix_ms(&self) -> u64 { self.created_at_unix_ms }
     pub(crate) fn updated_at_unix_ms(&self) -> u64 { self.updated_at_unix_ms }
@@ -484,9 +546,14 @@ impl MaterializationOwnershipRecord {
     }
 
     pub(crate) fn validate(&self) -> Result<(), MaterializationRecordError> {
-        if !self.root.is_absolute()
+        if (self.environment_profile.is_none() && self.bundle.is_none())
+            || !self.root.is_absolute()
             || !self.provider_home.is_absolute()
+            || !self.bundle_root.is_absolute()
+            || !self.plugin_data.is_absolute()
             || self.provider_home != self.root.join(NodeSessionPathClass::ProviderHome.directory_name())
+            || self.bundle_root != self.root.join(NodeSessionPathClass::BundleRoot.directory_name())
+            || self.plugin_data != self.root.join(NodeSessionPathClass::PluginData.directory_name())
             || self.created_at_unix_ms > self.updated_at_unix_ms
             || self.declared_paths.len() > MAX_SESSION_MATERIALIZATION_FILES
         {
@@ -559,7 +626,8 @@ impl SessionEnvironmentMaterializer {
     pub(crate) fn begin(
         &self,
         id: MaterializationId,
-        environment_profile: ResolvedEnvironmentProfileReceipt,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        bundle: Option<ResolvedBundleReceipt>,
         owner: MaterializationOwner,
         managed_lease_id: Option<ManagedWorktreeLeaseId>,
         profile: &NodeSessionMaterializationProfile,
@@ -569,11 +637,14 @@ impl SessionEnvironmentMaterializer {
         MaterializationOwnershipRecord::from_persisted(
             id,
             environment_profile,
+            bundle,
             owner,
             managed_lease_id,
             MaterializationState::Preparing,
             materialization_root.clone(),
             materialization_root.join(NodeSessionPathClass::ProviderHome.directory_name()),
+            materialization_root.join(NodeSessionPathClass::BundleRoot.directory_name()),
+            materialization_root.join(NodeSessionPathClass::PluginData.directory_name()),
             profile.0.files.iter().map(NodeSessionFile::declaration).collect(),
             now,
             now,
@@ -601,7 +672,11 @@ impl SessionEnvironmentMaterializer {
             mark_materialization_failure(ownership, now, !materialization_root.exists());
             return Err(error.into());
         }
-        let marker = materialization_owner_marker(&ownership.id, &ownership.environment_profile);
+        let marker = materialization_owner_marker(
+            &ownership.id,
+            ownership.environment_profile.as_ref(),
+            ownership.bundle.as_ref(),
+        );
         if let Err(error) = secure_create_file(&materialization_root.join(MATERIALIZATION_OWNER_MARKER), marker.as_bytes()) {
             let absence_proven = fs::remove_dir(&materialization_root).is_ok()
                 && !materialization_root.exists();
@@ -632,7 +707,8 @@ impl SessionEnvironmentMaterializer {
     ) -> Result<PreparedSessionEnvironment, SessionEnvironmentMaterializeError> {
         let mut ownership = self.begin(
             id,
-            environment_profile,
+            Some(environment_profile),
+            None,
             owner,
             managed_lease_id,
             profile,
@@ -655,6 +731,8 @@ impl SessionEnvironmentMaterializer {
             NodeSessionPathClass::Data,
             NodeSessionPathClass::State,
             NodeSessionPathClass::Tmp,
+            NodeSessionPathClass::BundleRoot,
+            NodeSessionPathClass::PluginData,
         ] {
             let path = materialization_root.join(class.directory_name());
             secure_create_directory(&path)?;
@@ -733,7 +811,11 @@ impl SessionEnvironmentMaterializer {
             return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
         }
         validate_secure_directory(&ownership.root)?;
-        let expected = materialization_owner_marker(&ownership.id, &ownership.environment_profile);
+        let expected = materialization_owner_marker(
+            &ownership.id,
+            ownership.environment_profile.as_ref(),
+            ownership.bundle.as_ref(),
+        );
         let marker = ownership.root.join(MATERIALIZATION_OWNER_MARKER);
         validate_secure_file(&marker)?;
         let mut bytes = Vec::new();
@@ -748,6 +830,8 @@ impl SessionEnvironmentMaterializer {
             NodeSessionPathClass::Data,
             NodeSessionPathClass::State,
             NodeSessionPathClass::Tmp,
+            NodeSessionPathClass::BundleRoot,
+            NodeSessionPathClass::PluginData,
         ] {
             validate_secure_directory(&ownership.root.join(class.directory_name()))?;
         }
@@ -757,6 +841,38 @@ impl SessionEnvironmentMaterializer {
                     .join(declaration.class.directory_name())
                     .join(&declaration.relative_path),
             )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn revalidate_bundle(
+        &self,
+        ownership: &MaterializationOwnershipRecord,
+        bundle: &NodeBundle,
+    ) -> Result<(), SessionEnvironmentMaterializeError> {
+        if ownership.bundle() != Some(&bundle.receipt()) {
+            return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
+        }
+        self.revalidate(ownership)?;
+        let expected = bundle.files().iter()
+            .map(|file| PathBuf::from(file.path()))
+            .collect::<BTreeSet<_>>();
+        let declared = ownership.declared_paths.iter().filter_map(|path| {
+            (path.class == NodeSessionPathClass::BundleRoot)
+                .then(|| path.relative_path.clone())
+        }).collect::<BTreeSet<_>>();
+        let actual = collect_secure_files(&ownership.bundle_root)?;
+        if expected != declared || expected != actual {
+            return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
+        }
+        for file in bundle.files() {
+            let path = ownership.bundle_root.join(file.path());
+            let mut bytes = Vec::new();
+            File::open(path)?.take((MAX_SESSION_MATERIALIZATION_FILE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes != file.bytes() {
+                return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
+            }
         }
         Ok(())
     }
@@ -771,10 +887,56 @@ impl SessionEnvironmentMaterializer {
         if !ownership.root.exists() && ownership.state == MaterializationState::CleanupRequired {
             return Ok(());
         }
-        let expected = materialization_owner_marker(&ownership.id, &ownership.environment_profile);
+        let expected = materialization_owner_marker(
+            &ownership.id,
+            ownership.environment_profile.as_ref(),
+            ownership.bundle.as_ref(),
+        );
         remove_owned_tree(&ownership.root, expected.as_bytes())?;
         Ok(())
     }
+}
+
+fn collect_secure_files(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
+    fn visit(base: &Path, relative: &Path, files: &mut BTreeSet<PathBuf>) -> io::Result<()> {
+        let directory = base.join(relative);
+        validate_secure_directory(&directory)?;
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let child = relative.join(entry.file_name());
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "materialization bundle contains a link-like entry",
+                ));
+            }
+            if metadata.is_dir() {
+                visit(base, &child, files)?;
+            } else if metadata.is_file() {
+                validate_secure_file(&path)?;
+                if files.len() == MAX_SESSION_MATERIALIZATION_FILES
+                    || !files.insert(child)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "materialization bundle file set is invalid",
+                    ));
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "materialization bundle contains an unsupported entry",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = BTreeSet::new();
+    visit(root, Path::new(""), &mut files)?;
+    Ok(files)
 }
 
 #[derive(Debug, Error)]
@@ -877,8 +1039,36 @@ fn mark_materialization_failure(
     }
 }
 
-fn materialization_owner_marker(id: &MaterializationId, profile: &ResolvedEnvironmentProfileReceipt) -> String {
-    format!("{}\n{}\n{}\n", id.as_str(), profile.profile_id.as_str(), profile.profile_revision.as_str())
+fn materialization_owner_marker(
+    id: &MaterializationId,
+    environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+    bundle: Option<&ResolvedBundleReceipt>,
+) -> String {
+    if let (Some(profile), None) = (environment_profile, bundle) {
+        return format!(
+            "{}\n{}\n{}\n",
+            id.as_str(),
+            profile.profile_id.as_str(),
+            profile.profile_revision.as_str(),
+        );
+    }
+    let mut marker = format!("{}\nmaterialization-v2\n", id.as_str());
+    if let Some(profile) = environment_profile {
+        marker.push_str(&format!(
+            "environment\n{}\n{}\n",
+            profile.profile_id.as_str(),
+            profile.profile_revision.as_str(),
+        ));
+    }
+    if let Some(bundle) = bundle {
+        marker.push_str(&format!(
+            "bundle\n{}\n{}\n{}\n",
+            bundle.id.as_str(),
+            bundle.revision.as_str(),
+            bundle.digest.as_str(),
+        ));
+    }
+    marker
 }
 
 fn ensure_materialization_root(root: &Path) -> io::Result<()> {
@@ -1324,6 +1514,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_environment_owner_marker_bytes_remain_v6_compatible() {
+        let id = MaterializationId::new("legacy-environment").unwrap();
+        let receipt = receipt();
+        assert_eq!(
+            materialization_owner_marker(&id, Some(&receipt), None),
+            "legacy-environment\nfixture\nr1\n",
+        );
+    }
+
+    #[test]
     fn secret_reference_and_content_containers_have_no_debug_surface() {
         fn assert_no_debug<T>() {
             let name = std::any::type_name::<T>();
@@ -1374,7 +1574,8 @@ mod tests {
         ).unwrap();
         let mut ownership = materializer.begin(
             MaterializationId::new("fixture-failure").unwrap(),
-            receipt(),
+            Some(receipt()),
+            None,
             owner(),
             None,
             &profile,
@@ -1385,6 +1586,66 @@ mod tests {
         assert!(!ownership.root().exists());
         assert!(!error.to_string().contains("opaque-reference-never-in-errors"));
         materializer.cleanup(&ownership).unwrap();
+        drop(materializer);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundle_materialization_uses_private_roots_revalidates_and_cleans() {
+        let root = temp_root();
+        let materializer = SessionEnvironmentMaterializer::new(
+            root.clone(),
+            Arc::new(FakeResolver),
+        )
+        .unwrap();
+        let profile = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            Vec::new(),
+            vec![NodeSessionFile::generated(
+                NodeSessionPathClass::BundleRoot,
+                "skills/review/SKILL.md",
+                b"---\nname: review\ndescription: review\n---\n".to_vec(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let bundle = ResolvedBundleReceipt {
+            id: crate::protocol::SpawnBundleId::new("review-bundle").unwrap(),
+            revision: crate::protocol::SpawnBundleRevision::new("r1").unwrap(),
+            digest: crate::protocol::SpawnBundleDigest::new(format!(
+                "sha256:{}",
+                "0".repeat(64),
+            ))
+            .unwrap(),
+        };
+        let mut ownership = materializer
+            .begin(
+                MaterializationId::new("bundle-fixture").unwrap(),
+                None,
+                Some(bundle),
+                owner(),
+                None,
+                &profile,
+                30,
+            )
+            .unwrap();
+        let environment = materializer
+            .materialize(&mut ownership, &profile, 31)
+            .unwrap();
+        assert!(environment.is_empty());
+        assert!(ownership.bundle_root().join("skills/review/SKILL.md").is_file());
+        assert!(ownership.plugin_data().is_dir());
+        materializer.revalidate(&ownership).unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(ownership.bundle_root()).unwrap().permissions().mode() & 0o777,
+                0o700,
+            );
+        }
+        ownership.mark_cleanup_required(32).unwrap();
+        materializer.cleanup(&ownership).unwrap();
+        assert!(!ownership.root().exists());
         drop(materializer);
         let _ = fs::remove_dir_all(root);
     }

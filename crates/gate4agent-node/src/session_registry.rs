@@ -1,10 +1,11 @@
 use crate::protocol::{
     AgentId, ManagedSessionRecord, ManagedSessionState, NodeId, OpaqueHostPath,
-    ResolvedEnvironmentProfileReceipt, SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
+    ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, SessionAddress, SessionMode,
+    SessionRecordId, WorkspaceId,
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3, NODE_STATE_SCHEMA_V4,
     NODE_STATE_SCHEMA_V5,
-    NODE_STATE_SCHEMA_V6,
+    NODE_STATE_SCHEMA_V6, NODE_STATE_SCHEMA_V7,
 };
 use crate::worktree_service::ManagedWorktreeLeaseRecord;
 use crate::session_environment::{
@@ -277,6 +278,17 @@ struct PersistedNodeStateV6 {
     materializations: Vec<PersistedMaterializationRecordV6>,
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedNodeStateV7 {
+    version: u16,
+    node_id: NodeId,
+    workspaces: Vec<PersistedWorkspaceV2>,
+    session_records: Vec<ManagedSessionRecord>,
+    managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+    materializations: Vec<PersistedMaterializationRecordV7>,
+}
+
 struct DecodedNodeState {
     node_id: NodeId,
     workspaces: Vec<(WorkspaceId, String)>,
@@ -449,6 +461,24 @@ struct PersistedMaterializationRecordV6 {
     state: MaterializationState,
     root: OpaqueHostPath,
     provider_home: OpaqueHostPath,
+    declared_paths: Vec<MaterializedPathDeclaration>,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedMaterializationRecordV7 {
+    materialization_id: MaterializationId,
+    environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    bundle: Option<ResolvedBundleReceipt>,
+    owner: MaterializationOwner,
+    managed_lease_id: Option<crate::protocol::ManagedWorktreeLeaseId>,
+    state: MaterializationState,
+    root: OpaqueHostPath,
+    provider_home: OpaqueHostPath,
+    bundle_root: OpaqueHostPath,
+    plugin_data: OpaqueHostPath,
     declared_paths: Vec<MaterializedPathDeclaration>,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
@@ -627,6 +657,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v6_state(state)
         }
+        NODE_STATE_SCHEMA_V7 => {
+            let state: PersistedNodeStateV7 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v7_state(state)
+        }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             StateLoadRefusalError::UnsupportedSchema(version),
@@ -660,6 +695,7 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
                     provider_session: record.provider_session,
                     active_session: record.active_session,
                     environment_profile: None,
+                    bundle: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -701,6 +737,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
                     provider_session: record.provider_session,
                     active_session: record.active_session,
                     environment_profile: None,
+                    bundle: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -742,6 +779,7 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
                     provider_session: record.provider_session,
                     active_session: record.active_session,
                     environment_profile: None,
+                    bundle: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -830,12 +868,15 @@ fn decode_v6_state(state: PersistedNodeStateV6) -> io::Result<DecodedNodeState> 
     let materializations = state.materializations.into_iter().map(|record| {
         MaterializationOwnershipRecord::from_persisted(
             record.materialization_id,
-            record.environment_profile,
+            Some(record.environment_profile),
+            None,
             record.owner,
             record.managed_lease_id,
             record.state,
             opaque_to_path(&record.root)?,
             opaque_to_path(&record.provider_home)?,
+            opaque_to_path(&record.root)?.join("bundle"),
+            opaque_to_path(&record.root)?.join("plugin-data"),
             record.declared_paths,
             record.created_at_unix_ms,
             record.updated_at_unix_ms,
@@ -851,6 +892,48 @@ fn decode_v6_state(state: PersistedNodeStateV6) -> io::Result<DecodedNodeState> 
     Ok(decoded)
 }
 
+fn decode_v7_state(state: PersistedNodeStateV7) -> io::Result<DecodedNodeState> {
+    let materializations = state.materializations.into_iter().map(|record| {
+        MaterializationOwnershipRecord::from_persisted(
+            record.materialization_id,
+            record.environment_profile,
+            record.bundle,
+            record.owner,
+            record.managed_lease_id,
+            record.state,
+            opaque_to_path(&record.root)?,
+            opaque_to_path(&record.provider_home)?,
+            opaque_to_path(&record.bundle_root)?,
+            opaque_to_path(&record.plugin_data)?,
+            record.declared_paths,
+            record.created_at_unix_ms,
+            record.updated_at_unix_ms,
+        ).map_err(|error| invalid_data(format!("durable state materialization record is invalid: {error}")))
+    }).collect::<io::Result<Vec<_>>>()?;
+    validate_managed_worktree_records(&state.managed_worktrees, false)?;
+    validate_managed_worktree_records(&state.managed_worktree_tombstones, true)?;
+    validate_managed_worktree_identity_sets(
+        &state.managed_worktrees,
+        &state.managed_worktree_tombstones,
+    )?;
+    validate_materialization_records(
+        &materializations,
+        &state.session_records,
+        &state.managed_worktrees,
+        &state.managed_worktree_tombstones,
+    )?;
+    Ok(DecodedNodeState {
+        node_id: state.node_id,
+        workspaces: state.workspaces.into_iter().map(|workspace| {
+            Ok((workspace.workspace_id, require_utf8_state_path(&workspace.canonical_root)?.to_owned()))
+        }).collect::<io::Result<_>>()?,
+        session_records: state.session_records,
+        managed_worktrees: state.managed_worktrees,
+        managed_worktree_tombstones: state.managed_worktree_tombstones,
+        materializations,
+    })
+}
+
 fn validate_materialization_records(
     records: &[MaterializationOwnershipRecord],
     session_records: &[ManagedSessionRecord],
@@ -862,7 +945,7 @@ fn validate_materialization_records(
     }
     let known_records = session_records
         .iter()
-        .map(|record| (&record.record_id, &record.workspace_id))
+        .map(|record| (&record.record_id, record))
         .collect::<BTreeMap<_, _>>();
     let active_leases = managed_worktrees
         .iter()
@@ -885,12 +968,22 @@ fn validate_materialization_records(
                 )
             }
             MaterializationOwner::Record { record_id } => {
-                let workspace_id = known_records.get(record_id).ok_or_else(|| {
+                let managed_record = known_records.get(record_id).ok_or_else(|| {
                     invalid_data(
                         "durable state materialization references an unknown session record",
                     )
                 })?;
-                (format!("record:{}", record_id.as_str()), Some(*workspace_id))
+                if record.environment_profile() != managed_record.environment_profile.as_ref()
+                    || record.bundle() != managed_record.bundle.as_ref()
+                {
+                    return Err(invalid_data(
+                        "durable state materialization receipt disagrees with its session record",
+                    ));
+                }
+                (
+                    format!("record:{}", record_id.as_str()),
+                    Some(&managed_record.workspace_id),
+                )
             }
         };
         if let Some(lease_id) = record.managed_lease_id() {
@@ -917,6 +1010,20 @@ fn validate_materialization_records(
             || !owners.insert(owner_key)
         {
             return Err(invalid_data("durable state contains duplicate materialization ownership"));
+        }
+    }
+    for record in session_records.iter().filter(|record| record.bundle.is_some()) {
+        if !records.iter().any(|materialization| {
+            materialization.owner()
+                == &MaterializationOwner::Record {
+                    record_id: record.record_id.clone(),
+                }
+                && materialization.bundle() == record.bundle.as_ref()
+                && materialization.environment_profile() == record.environment_profile.as_ref()
+        }) {
+            return Err(invalid_data(
+                "durable bundle-bound session record lacks exact materialization ownership",
+            ));
         }
     }
     Ok(())
@@ -1253,7 +1360,7 @@ pub(crate) fn save_v5(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
-pub(crate) fn save_v6(
+pub(crate) fn save_v7(
     path: Option<&Path>,
     node_id: &NodeId,
     workspaces: &BTreeMap<WorkspaceId, String>,
@@ -1301,10 +1408,10 @@ pub(crate) fn save_v6(
         } else {
             ManagedSessionState::Unavailable
         };
-        persisted_records.push(persisted_v5_record(persisted));
+        persisted_records.push(persisted);
     }
-    let state = PersistedNodeStateV6 {
-        version: NODE_STATE_SCHEMA_V6,
+    let state = PersistedNodeStateV7 {
+        version: NODE_STATE_SCHEMA_V7,
         node_id: node_id.clone(),
         workspaces: workspaces.iter().map(|(workspace_id, canonical_root)| {
             Ok(PersistedWorkspaceV2 {
@@ -1318,14 +1425,17 @@ pub(crate) fn save_v6(
         managed_worktrees: managed_worktrees.to_vec(),
         managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
         materializations: materializations.iter().map(|record| {
-            Ok(PersistedMaterializationRecordV6 {
+            Ok(PersistedMaterializationRecordV7 {
                 materialization_id: record.id().clone(),
-                environment_profile: record.environment_profile().clone(),
+                environment_profile: record.environment_profile().cloned(),
+                bundle: record.bundle().cloned(),
                 owner: record.owner().clone(),
                 managed_lease_id: record.managed_lease_id().cloned(),
                 state: record.state(),
                 root: path_to_opaque(record.root())?,
                 provider_home: path_to_opaque(record.provider_home())?,
+                bundle_root: path_to_opaque(record.bundle_root())?,
+                plugin_data: path_to_opaque(record.plugin_data())?,
                 declared_paths: record.declared_paths().to_vec(),
                 created_at_unix_ms: record.created_at_unix_ms(),
                 updated_at_unix_ms: record.updated_at_unix_ms(),
@@ -1367,6 +1477,7 @@ fn persisted_v3_record(record: ManagedSessionRecord) -> PersistedManagedSessionR
     }
 }
 
+#[cfg(test)]
 fn persisted_v5_record(record: ManagedSessionRecord) -> PersistedManagedSessionRecordV5 {
     PersistedManagedSessionRecordV5 {
         record_id: record.record_id,
@@ -1437,6 +1548,9 @@ pub(crate) fn sanitized_record_error_summary(message: &str) -> String {
             | "durable-state-commit-failed"
             | "provider-runtime-failed"
             | "environment-profile-unavailable"
+            | "bundle-unavailable"
+            | "bundle-binding-mismatch"
+            | "bundle-materialization-failed"
     ) {
         return normalized;
     }
@@ -1803,6 +1917,7 @@ mod tests {
             }),
             active_session: None,
             environment_profile: None,
+            bundle: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 11,
             last_error: None,
@@ -1844,17 +1959,20 @@ mod tests {
             .join(id);
         MaterializationOwnershipRecord::from_persisted(
             MaterializationId::new(id).unwrap(),
-            ResolvedEnvironmentProfileReceipt {
+            Some(ResolvedEnvironmentProfileReceipt {
                 profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude")
                     .unwrap(),
                 profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1")
                     .unwrap(),
-            },
+            }),
+            None,
             owner,
             managed_lease_id,
             MaterializationState::Ready,
             root.clone(),
             root.join("home"),
+            root.join("bundle"),
+            root.join("plugin-data"),
             Vec::new(),
             10,
             11,
@@ -1867,7 +1985,7 @@ mod tests {
     ) -> PersistedMaterializationRecordV6 {
         PersistedMaterializationRecordV6 {
             materialization_id: record.id().clone(),
-            environment_profile: record.environment_profile().clone(),
+            environment_profile: record.environment_profile().cloned().unwrap(),
             owner: record.owner().clone(),
             managed_lease_id: record.managed_lease_id().cloned(),
             state: record.state(),
@@ -1983,7 +2101,7 @@ mod tests {
         save_v5(Some(&path), &node_id, &workspaces, &[record], &[], &[]).unwrap();
         let loaded = load(Some(&path), &node_id).unwrap();
         assert!(loaded.materializations.is_empty());
-        save_v6(
+        save_v7(
             Some(&path),
             &node_id,
             &workspaces,
@@ -1993,7 +2111,7 @@ mod tests {
             &loaded.materializations,
         ).unwrap();
         let header: PersistedNodeStateHeader = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(header.version, NODE_STATE_SCHEMA_V6);
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V7);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -2005,10 +2123,11 @@ mod tests {
         let materialization_root = path.parent().unwrap().join("session-environments").join("m-1");
         let ownership = MaterializationOwnershipRecord::from_persisted(
             MaterializationId::new("m-1").unwrap(),
-            ResolvedEnvironmentProfileReceipt {
+            Some(ResolvedEnvironmentProfileReceipt {
                 profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
                 profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
-            },
+            }),
+            None,
             MaterializationOwner::Session {
                 incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
                 instance_id: gate4agent_types::AgentInstanceId(9),
@@ -2018,6 +2137,8 @@ mod tests {
             MaterializationState::Ready,
             materialization_root.clone(),
             materialization_root.join("home"),
+            materialization_root.join("bundle"),
+            materialization_root.join("plugin-data"),
             vec![MaterializedPathDeclaration {
                 class: crate::session_environment::NodeSessionPathClass::Config,
                 relative_path: PathBuf::from("provider/settings.json"),
@@ -2026,7 +2147,7 @@ mod tests {
             10,
             11,
         ).unwrap();
-        save_v6(Some(&path), &node_id, &workspaces, &[], &[], &[], &[ownership.clone()]).unwrap();
+        save_v7(Some(&path), &node_id, &workspaces, &[], &[], &[], &[ownership.clone()]).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let serialized = String::from_utf8(bytes).unwrap();
         assert!(!serialized.contains("fixture-secret-reference"));
@@ -2055,7 +2176,7 @@ mod tests {
             Some(crate::protocol::ManagedWorktreeLeaseId::new("mw-missing").unwrap()),
         );
 
-        let error = save_v6(
+        let error = save_v7(
             Some(&path),
             &node_id,
             &BTreeMap::new(),
@@ -2133,7 +2254,7 @@ mod tests {
             Some(lease.lease_id.clone()),
         );
 
-        let error = save_v6(
+        let error = save_v7(
             Some(&path),
             &node_id,
             &workspaces,
@@ -2173,7 +2294,7 @@ mod tests {
             Some(lease.lease_id.clone()),
         );
 
-        save_v6(
+        save_v7(
             Some(&path),
             &node_id,
             &BTreeMap::new(),
@@ -3012,6 +3133,111 @@ mod tests {
         let error = load(Some(&path), &NodeId::new("node-a").unwrap()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&path).unwrap(), b"not-json");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v6_to_v7_migration_preserves_environment_receipt_and_adds_no_bundle() {
+        let path = temp_path("v6-to-v7-bundle-migration");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, mut record) = fixture(&path);
+        let environment_profile = ResolvedEnvironmentProfileReceipt {
+            profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
+            profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+        };
+        record.environment_profile = Some(environment_profile.clone());
+        let ownership = materialization_ownership(
+            &path,
+            "legacy-environment",
+            MaterializationOwner::Record {
+                record_id: record.record_id.clone(),
+            },
+            None,
+        );
+        let state = PersistedNodeStateV6 {
+            version: NODE_STATE_SCHEMA_V6,
+            node_id: node_id.clone(),
+            workspaces: workspaces.iter().map(|(workspace_id, root)| PersistedWorkspaceV2 {
+                workspace_id: workspace_id.clone(),
+                canonical_root: OpaqueHostPath::utf8(root.clone()).unwrap(),
+            }).collect(),
+            session_records: vec![persisted_v5_record(record)],
+            managed_worktrees: Vec::new(),
+            managed_worktree_tombstones: Vec::new(),
+            materializations: vec![persisted_materialization(&ownership)],
+        };
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.records[0].environment_profile.as_ref(), Some(&environment_profile));
+        assert!(loaded.records[0].bundle.is_none());
+        assert!(loaded.materializations[0].bundle().is_none());
+        save_v7(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &loaded.records,
+            &[],
+            &[],
+            &loaded.materializations,
+        )
+        .unwrap();
+        let header: PersistedNodeStateHeader =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V7);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v7_roundtrip_preserves_opaque_bundle_and_rejects_receipt_mismatch() {
+        let path = temp_path("v7-bundle-roundtrip");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, mut record) = fixture(&path);
+        let environment_profile = ResolvedEnvironmentProfileReceipt {
+            profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
+            profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+        };
+        let bundle = ResolvedBundleReceipt {
+            id: crate::protocol::SpawnBundleId::new("review-bundle").unwrap(),
+            revision: crate::protocol::SpawnBundleRevision::new("r1").unwrap(),
+            digest: crate::protocol::SpawnBundleDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap(),
+        };
+        record.environment_profile = Some(environment_profile.clone());
+        record.bundle = Some(bundle.clone());
+        let root = path.parent().unwrap().join("session-environments").join("bundle-record");
+        let ownership = MaterializationOwnershipRecord::from_persisted(
+            MaterializationId::new("bundle-record").unwrap(),
+            Some(environment_profile),
+            Some(bundle.clone()),
+            MaterializationOwner::Record { record_id: record.record_id.clone() },
+            None,
+            MaterializationState::Ready,
+            root.clone(),
+            root.join("home"),
+            root.join("bundle"),
+            root.join("plugin-data"),
+            Vec::new(),
+            10,
+            11,
+        )
+        .unwrap();
+        save_v7(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+            &[ownership],
+        )
+        .unwrap();
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.records[0].bundle.as_ref(), Some(&bundle));
+
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["session_records"][0]["bundle"]["digest"] =
+            serde_json::Value::String(format!("sha256:{}", "1".repeat(64)));
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(load(Some(&path), &node_id).unwrap_err().kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

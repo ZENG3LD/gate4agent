@@ -7,6 +7,7 @@ use gate4agent_c2_protocol::{
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+    C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
@@ -40,6 +41,7 @@ const COMMAND_CAPACITY: usize = 64;
 const INBOUND_CAPACITY: usize = 2;
 const WRITER_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 2;
+const REGULAR_EVENT_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
 const OPAQUE_UNIX_PATH_NOT_NEGOTIATED: &str =
     "opaque Unix paths require negotiated C2 capability";
 const REPOSITORY_PATH_NOT_NEGOTIATED: &str =
@@ -58,6 +60,8 @@ const MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED: &str =
     "managed worktree lifecycle requires negotiated C2 capability";
 const CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED: &str =
     "child environment profiles require negotiated C2 capability";
+const SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED: &str =
+    "session bundle materialization requires negotiated C2 capability";
 
 #[derive(Clone, Copy)]
 struct NegotiatedPathCapabilities {
@@ -69,6 +73,7 @@ struct NegotiatedPathCapabilities {
     worktree_selection: bool,
     managed_worktree_lifecycle: bool,
     child_environment_profile: bool,
+    session_bundle_materialization: bool,
     terminal_frame_events: bool,
 }
 
@@ -260,6 +265,13 @@ pub async fn connect_local(
             CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED.to_owned(),
         ));
     }
+    if !path_capabilities.session_bundle_materialization
+        && status_has_session_bundle_materialization(&hello.status)
+    {
+        return Err(C2ControlError::Protocol(
+            SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
 
     let (reader, writer) = tokio::io::split(pipe);
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -318,6 +330,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
@@ -389,6 +403,8 @@ fn negotiated_path_capabilities(
             selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
         child_environment_profile:
             selected_has(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY),
+        session_bundle_materialization:
+            selected_has(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -453,6 +469,13 @@ fn reject_unnegotiated_outbound_path(
     {
         return Err(C2ControlError::Protocol(
             CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
+    if request.requires_session_bundle_materialization_capability()
+        && !capabilities.session_bundle_materialization
+    {
+        return Err(C2ControlError::Protocol(
+            SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED.to_owned(),
         ));
     }
     if !capabilities.repository_paths && node_request_has_unix_repository_path(request) {
@@ -814,6 +837,16 @@ fn status_has_child_environment_profile(
     })
 }
 
+fn status_has_session_bundle_materialization(
+    status: &gate4agent_c2_protocol::StatusResponse,
+) -> bool {
+    status.nodes.values().any(|node| {
+        node.inventory.as_ref().is_some_and(|inventory| {
+            inventory.managed_sessions.iter().any(|record| record.bundle.is_some())
+        })
+    })
+}
+
 fn topology_has_open_provider_id(topology: &C2Topology) -> bool {
     topology.nodes.iter().any(|node| {
         node.provider_contracts.iter()
@@ -1096,6 +1129,18 @@ async fn control_owner(
                             )));
                             break;
                         }
+                        if !path_capabilities.session_bundle_materialization
+                            && reply.result.as_ref().is_ok_and(|routed| {
+                                routed.response.as_ref().is_ok_and(
+                                    C2NodeResponse::requires_session_bundle_materialization_capability,
+                                )
+                            })
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
@@ -1131,12 +1176,23 @@ async fn control_owner(
                         {
                             break;
                         }
-                        let terminal_frame = c2_node_event_is_terminal_frame(&event.event);
-                        match events.try_send(event) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) if terminal_frame => {}
-                            Err(mpsc::error::TrySendError::Full(_)
-                                | mpsc::error::TrySendError::Closed(_)) => break,
+                        if !path_capabilities.session_bundle_materialization
+                            && event
+                                .event
+                                .requires_session_bundle_materialization_capability()
+                        {
+                            break;
+                        }
+                        if c2_node_event_is_terminal_frame(&event.event) {
+                            match events.try_send(event) {
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            }
+                        } else if !matches!(
+                            timeout(REGULAR_EVENT_DELIVERY_DEADLINE, events.send(event)).await,
+                            Ok(Ok(())),
+                        ) {
+                            break;
                         }
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Topology(next))) => {
@@ -1269,8 +1325,8 @@ mod tests {
         )
     }
 
-    fn event(sequence: u64) -> OwnerInput {
-        OwnerInput::Frame(C2ServerFrame::Event(RoutedNodeEvent {
+    fn routed_event(sequence: u64) -> RoutedNodeEvent {
+        RoutedNodeEvent {
             node_id: NodeId::new("node-a").unwrap(),
             cursor: NodeCursor {
                 incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
@@ -1279,7 +1335,11 @@ mod tests {
             event: gate4agent_c2_protocol::C2NodeEvent::ResyncRequired {
                 oldest_available_sequence: sequence,
             },
-        }))
+        }
+    }
+
+    fn event(sequence: u64) -> OwnerInput {
+        OwnerInput::Frame(C2ServerFrame::Event(routed_event(sequence)))
     }
 
     fn terminal_event(sequence: u64) -> OwnerInput {
@@ -1357,6 +1417,7 @@ mod tests {
             terminal_size: TerminalSize { rows: 24, columns: 80 },
             prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
             bundle_id: None,
+            bundle: None,
             context_id: None,
             environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
@@ -1384,6 +1445,7 @@ mod tests {
             worktree_selection: false,
             managed_worktree_lifecycle: false,
             child_environment_profile: false,
+            session_bundle_materialization: false,
             terminal_frame_events: false,
         }
     }
@@ -1398,6 +1460,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         }
     }
@@ -1550,6 +1613,7 @@ mod tests {
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -2227,6 +2291,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2243,6 +2308,7 @@ mod tests {
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
+            session_bundle_materialization: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2415,6 +2481,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_regular_event_consumer_fails_closed_without_hanging_following_reply() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
+        events_tx.try_send(routed_event(1)).unwrap();
+        events_tx.try_send(routed_event(2)).unwrap();
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(2);
+        let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, no_path_capabilities(),
+        ));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(event(3)).await.unwrap();
+        incoming_tx.send(reply(1)).await.unwrap();
+
+        assert!(matches!(
+            timeout(
+                REGULAR_EVENT_DELIVERY_DEADLINE + Duration::from_secs(1),
+                reply_rx,
+            ).await.unwrap().unwrap(),
+            Err(C2ControlError::Closed),
+        ));
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+        assert!(commands_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn active_event_consumer_drains_regular_burst_and_owner_serves_following_reply() {
+        let burst_len = EVENT_CAPACITY + 2;
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, mut events_rx) =
+            mpsc::channel::<RoutedNodeEvent>(EVENT_CAPACITY);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(burst_len + 1);
+        let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+
+        for sequence in 1..=burst_len as u64 {
+            incoming_tx.send(event(sequence)).await.unwrap();
+        }
+        let collector = tokio::spawn(async move {
+            let mut sequences = Vec::with_capacity(burst_len);
+            while sequences.len() < burst_len {
+                let event = events_rx.recv().await.expect("event stream must stay open");
+                sequences.push(event.cursor.sequence);
+            }
+            sequences
+        });
+        tokio::task::yield_now().await;
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, no_path_capabilities(),
+        ));
+
+        let sequences = timeout(Duration::from_secs(1), collector)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequences, vec![1, 2, 3, 4]);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(reply(1)).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Ok(RoutedNodeResponse {
+                response: Ok(C2NodeResponse::Accepted),
+                ..
+            })
+        ));
+
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn c2_client_topology_replaces_old_incarnation_status() {
         use gate4agent_c2_protocol::{C2TopologyNode, NodeTransportState};
 
@@ -2525,6 +2677,45 @@ mod tests {
         let mut cleared = spawn_spec("node-a");
         cleared.overrides.environment_profile_id =
             gate4agent_node_protocol::SpawnOverride::Clear;
+        assert!(reject_unnegotiated_outbound_path(
+            &NodeRequest::SpawnSpec { spec: cleared },
+            capabilities,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn session_bundle_inherit_and_set_require_capability_but_clear_does_not() {
+        let mut capabilities = all_path_capabilities();
+        capabilities.session_bundle_materialization = false;
+
+        let inherited = spawn_spec("node-a");
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(
+                &NodeRequest::SpawnSpec {
+                    spec: inherited.clone(),
+                },
+                capabilities,
+            ),
+            Err(C2ControlError::Protocol(ref message))
+                if message == SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED
+        ));
+
+        let mut explicit = inherited.clone();
+        explicit.overrides.bundle_id = gate4agent_node_protocol::SpawnOverride::Set {
+            value: gate4agent_c2_protocol::SpawnBundleId::new("review-bundle").unwrap(),
+        };
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(
+                &NodeRequest::SpawnSpec { spec: explicit },
+                capabilities,
+            ),
+            Err(C2ControlError::Protocol(ref message))
+                if message == SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED
+        ));
+
+        let mut cleared = inherited;
+        cleared.overrides.bundle_id = gate4agent_node_protocol::SpawnOverride::Clear;
         assert!(reject_unnegotiated_outbound_path(
             &NodeRequest::SpawnSpec { spec: cleared },
             capabilities,

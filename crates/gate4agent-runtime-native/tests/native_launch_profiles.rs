@@ -1555,6 +1555,7 @@ fn native_launch_environment_overlay_debug_surfaces_never_expose_values() {
 #[tokio::test]
 async fn bundle_only_native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
     let mut spec = interactive_agent_spec();
+    #[cfg(windows)]
     let original_script = spec
         .launch
         .fixed_args

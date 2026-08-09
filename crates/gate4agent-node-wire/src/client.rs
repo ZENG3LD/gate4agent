@@ -15,6 +15,7 @@ use gate4agent_node_protocol::{
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
 use crate::{
@@ -537,6 +538,15 @@ fn ensure_node_request_required_capability(
             return Err(NodeClientError::UnsupportedCapability(required.to_owned()));
         }
     }
+    if request.requires_worktree_selection_capability()
+        && !negotiated_capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY
+        })
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_WORKTREE_SELECTION_CAPABILITY.to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -563,6 +573,21 @@ fn ensure_server_frame_required_capability(
         {
             return Err(NodeClientError::UnsupportedCapability(required.to_owned()));
         }
+    }
+    let requires_worktree_selection = match frame {
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(
+            NodeResponse::requires_worktree_selection_capability,
+        ),
+        _ => false,
+    };
+    if requires_worktree_selection
+        && !negotiated_capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY
+        })
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_WORKTREE_SELECTION_CAPABILITY.to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2102,6 +2127,62 @@ mod tests {
                 if capability == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
         ));
         assert!(ensure_server_frame_required_capability(&frame, &capabilities).is_ok());
+
+        let mut worktree_request = spawn_spec_request();
+        let NodeRequest::SpawnSpec { spec } = &mut worktree_request else {
+            unreachable!("spawn spec helper changed variant");
+        };
+        spec.target.worktree_id = Some(WorkspaceId::new("review-tree").unwrap());
+        let mut worktree_request_id = 81;
+        assert!(matches!(
+            reserve_request_id(
+                &mut worktree_request_id,
+                &worktree_request,
+                false,
+                false,
+                false,
+                &capabilities,
+            ),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_WORKTREE_SELECTION_CAPABILITY
+        ));
+        assert_eq!(worktree_request_id, 81);
+        let mut worktree_capabilities = capabilities.clone();
+        worktree_capabilities.push(
+            CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap(),
+        );
+        assert_eq!(
+            reserve_request_id(
+                &mut worktree_request_id,
+                &worktree_request,
+                false,
+                false,
+                false,
+                &worktree_capabilities,
+            )
+            .unwrap(),
+            81,
+        );
+
+        let mut worktree_receipt = spawn_spec_receipt();
+        worktree_receipt.target.worktree_id =
+            Some(WorkspaceId::new("review-tree").unwrap());
+        let worktree_frame = response_frame(NodeResponse::SpawnSpecAccepted {
+            receipt: worktree_receipt,
+        });
+        assert!(matches!(
+            ensure_server_frame_required_capability(
+                &worktree_frame,
+                &capabilities,
+            ),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_WORKTREE_SELECTION_CAPABILITY
+        ));
+        assert!(ensure_server_frame_required_capability(
+            &worktree_frame,
+            &worktree_capabilities,
+        )
+        .is_ok());
     }
 
     #[test]

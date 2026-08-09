@@ -12,6 +12,7 @@ use crate::protocol::{
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_WORKTREE_SELECTION_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -42,6 +43,7 @@ struct NegotiatedPathCapabilities {
     provider_runtime_status: bool,
     provider_ids_open: bool,
     spawn_spec_defaults_overrides: bool,
+    worktree_selection: bool,
     terminal_frame_events: bool,
 }
 
@@ -480,6 +482,12 @@ async fn control_writer<W>(
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
+        if !path_capabilities.worktree_selection
+            && server_frame_contains_worktree_selection_response(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
         }
@@ -538,6 +546,7 @@ fn negotiated_path_capabilities(
         provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
         spawn_spec_defaults_overrides:
             selected_has(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
+        worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -616,6 +625,15 @@ fn unnegotiated_request_failure(
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
             "request capability was not negotiated with C2",
+            None,
+        ));
+    }
+    if request.requires_worktree_selection_capability()
+        && !capabilities.worktree_selection
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "worktree selection capability was not negotiated with C2",
             None,
         ));
     }
@@ -762,6 +780,22 @@ fn server_frame_contains_spawn_spec_response(frame: &C2ServerFrame) -> bool {
         C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
             routed.response.as_ref().ok().is_some_and(|response| {
                 matches!(response, C2NodeResponse::SpawnSpecAccepted { .. })
+            })
+        }),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Event(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn server_frame_contains_worktree_selection_response(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(|response| {
+                matches!(response, C2NodeResponse::SpawnSpecAccepted { receipt }
+                    if receipt.target.worktree_id.is_some())
             })
         }),
         C2ServerFrame::Challenge(_)
@@ -1015,6 +1049,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
             CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
@@ -1628,6 +1664,7 @@ mod tests {
                 CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -1662,6 +1699,7 @@ mod tests {
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_none());
@@ -1690,6 +1728,24 @@ mod tests {
                 ref message,
                 ..
             }) if message == "request capability was not negotiated with C2"
+        ));
+
+        capabilities.spawn_spec_defaults_overrides = true;
+        capabilities.worktree_selection = false;
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+        let mut worktree_spec = spawn_spec("node-a");
+        worktree_spec.target.worktree_id =
+            Some(gate4agent_node_protocol::WorkspaceId::new("review-tree").unwrap());
+        assert!(matches!(
+            unnegotiated_request_failure(
+                &NodeRequest::SpawnSpec { spec: worktree_spec },
+                capabilities,
+            ),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "worktree selection capability was not negotiated with C2"
         ));
     }
 
@@ -1749,6 +1805,50 @@ mod tests {
                 provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: false,
+                worktree_selection: true,
+                terminal_frame_events: true,
+            },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        ).await;
+        assert!(*disconnected.borrow());
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn control_writer_rejects_unnegotiated_worktree_receipt_recursively() {
+        let mut receipt = spawn_receipt();
+        receipt.target.worktree_id =
+            Some(gate4agent_node_protocol::WorkspaceId::new("review-tree").unwrap());
+        let frame = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(4),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Ok(C2NodeResponse::SpawnSpecAccepted { receipt }),
+            }),
+        });
+        assert!(server_frame_contains_worktree_selection_response(&frame));
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender.send(queued(frame, &budget).unwrap()).await.unwrap();
+        let (disconnect, disconnected) = watch::channel(false);
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: true,
+                repository_paths: true,
+                workspace_file_read: true,
+                provider_runtime_status: true,
+                provider_ids_open: true,
+                spawn_spec_defaults_overrides: true,
+                worktree_selection: false,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -1924,6 +2024,7 @@ mod tests {
             provider_runtime_status: true,
             provider_ids_open: false,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2110,6 +2211,7 @@ mod tests {
                 provider_runtime_status: false,
                 provider_ids_open: false,
                 spawn_spec_defaults_overrides: false,
+                worktree_selection: false,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2143,6 +2245,7 @@ mod tests {
                 provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
+                worktree_selection: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2176,6 +2279,7 @@ mod tests {
                 provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
+                worktree_selection: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2227,6 +2331,7 @@ mod tests {
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2240,6 +2345,7 @@ mod tests {
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2253,6 +2359,7 @@ mod tests {
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
@@ -2285,6 +2392,7 @@ mod tests {
                 provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
+                worktree_selection: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,

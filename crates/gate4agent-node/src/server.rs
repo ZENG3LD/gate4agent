@@ -46,7 +46,7 @@ use crate::protocol::{
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
-    NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    NODE_WORKSPACE_FILE_READ_CAPABILITY, NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3,
@@ -163,6 +163,7 @@ fn protocol_worktree(mut worktree: NativeGitWorktreeSnapshot) -> GitWorktreeSnap
 pub struct WorkspaceConfig {
     workspace_id: WorkspaceId,
     canonical_root: String,
+    worktree_service_mode: WorktreeServiceMode,
 }
 
 impl WorkspaceConfig {
@@ -204,6 +205,7 @@ impl WorkspaceConfig {
         Ok(Self {
             workspace_id,
             canonical_root,
+            worktree_service_mode: WorktreeServiceMode::Manual,
         })
     }
 
@@ -213,6 +215,11 @@ impl WorkspaceConfig {
 
     pub fn canonical_root(&self) -> &str {
         &self.canonical_root
+    }
+
+    pub fn with_worktree_service_mode(mut self, mode: WorktreeServiceMode) -> Self {
+        self.worktree_service_mode = mode;
+        self
     }
 }
 
@@ -226,6 +233,13 @@ pub struct NodeServerConfig {
     pub runtime: NativeRuntimeConfig,
     state_path: Option<PathBuf>,
     spawn_profiles: SpawnProfileRegistry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorktreeServiceMode {
+    Manual,
+    Managed,
+    Off,
 }
 
 impl NodeServerConfig {
@@ -932,6 +946,7 @@ struct NodeShared {
     incarnation_id: NodeIncarnationId,
     started_at_unix_ms: u64,
     workspaces: RwLock<BTreeMap<WorkspaceId, String>>,
+    worktree_service_modes: BTreeMap<WorkspaceId, WorktreeServiceMode>,
     enabled_providers: Vec<AgentId>,
     provider_runtime_statuses: ProviderRuntimeStatuses,
     provider_runtime_status_updates:
@@ -1035,6 +1050,12 @@ impl NodeShared {
             .iter()
             .map(|record| (record.record_id.clone(), record.provider.clone()))
             .collect();
+        let worktree_service_modes = workspaces
+            .iter()
+            .map(|workspace| {
+                (workspace.workspace_id.clone(), workspace.worktree_service_mode)
+            })
+            .collect();
         Self {
             handle,
             access_token,
@@ -1051,6 +1072,7 @@ impl NodeShared {
                     .map(|workspace| (workspace.workspace_id, workspace.canonical_root))
                     .collect(),
             ),
+            worktree_service_modes,
             enabled_providers,
             provider_runtime_statuses,
             provider_runtime_status_updates: RwLock::new(BTreeMap::new()),
@@ -1248,8 +1270,10 @@ impl NodeShared {
                 "spawn specification could not be resolved",
             )
         })?;
-        if resolved.target.worktree_id.is_some()
-            || resolved.bundle_id.is_some()
+        if resolved.target.worktree_id.is_some() {
+            self.require_worktree_service(&resolved.target.workspace_id)?;
+        }
+        if resolved.bundle_id.is_some()
             || resolved.context_id.is_some()
             || resolved.environment_profile_id.is_some()
         {
@@ -1259,6 +1283,31 @@ impl NodeShared {
             ));
         }
         Ok(resolved)
+    }
+
+    async fn resolve_spawn_workspace(
+        &self,
+        resolved: &ResolvedSpawnSpec,
+        deadline: Instant,
+    ) -> Result<WorkspaceId, NodeFailure> {
+        let Some(worktree_id) = resolved.target.worktree_id.as_ref() else {
+            return Ok(resolved.target.workspace_id.clone());
+        };
+        self.require_worktree_service(&resolved.target.workspace_id)?;
+        let source_root = self.workspace_root(&resolved.target.workspace_id)?;
+        let selected_root = self.workspace_root(worktree_id)?;
+        let remaining = spawn_deadline_remaining(deadline)?;
+        let worktrees = timeout(remaining, list_git_worktrees(&source_root))
+            .await
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::SpawnDeadlineExceeded,
+                    "Git worktree selection exceeded the spawn deadline",
+                )
+            })?
+            .map_err(git_worktree_failure)?;
+        validate_selected_worktree(&source_root, &selected_root, &worktrees)?;
+        Ok(worktree_id.clone())
     }
 
     async fn spawn_from_spec(
@@ -1272,9 +1321,18 @@ impl NodeShared {
         let resolved = self.resolve_spawn_spec(&spec)?;
         let required_capabilities = spawn_runtime_capabilities(&resolved.required_capabilities)?;
         let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
+        let spawn_workspace_id = self.resolve_spawn_workspace(&resolved, deadline).await;
+        let spawn_workspace_id = match spawn_workspace_id {
+            Ok(workspace_id) => workspace_id,
+            Err(error) => {
+                let result = Err(error);
+                self.remember_spawn_spec(spec, result.clone(), accepted_at);
+                return result;
+            }
+        };
         let result = self
             .spawn_session_with_deadline(
-                resolved.target.workspace_id.clone(),
+                spawn_workspace_id,
                 resolved.provider.clone(),
                 resolved.mode,
                 resolved.terminal_size,
@@ -2325,6 +2383,7 @@ impl NodeShared {
         branch: String,
         base: Option<String>,
     ) -> Result<(GitWorktreeSnapshot, WorkspaceSnapshot), NodeFailure> {
+        self.require_worktree_service(&source_workspace_id)?;
         validate_workspace_request_root(&target_root)?;
         validate_git_revision("worktree base", base.as_deref())?;
         let source_root = self.workspace_root(&source_workspace_id)?;
@@ -2370,6 +2429,7 @@ impl NodeShared {
         source_workspace_id: WorkspaceId,
         target_root: String,
     ) -> Result<Option<WorkspaceId>, NodeFailure> {
+        self.require_worktree_service(&source_workspace_id)?;
         validate_workspace_request_root(&target_root)?;
         let source_root = self.workspace_root(&source_workspace_id)?;
         let target_root = normalize_worktree_removal_target(&target_root)
@@ -2425,6 +2485,24 @@ impl NodeShared {
                 .map_err(|error| failure(error.code, &error.message))?;
         }
         Ok(registered_workspace_id)
+    }
+
+    fn require_worktree_service(
+        &self,
+        source_workspace_id: &WorkspaceId,
+    ) -> Result<(), NodeFailure> {
+        match self
+            .worktree_service_modes
+            .get(source_workspace_id)
+            .copied()
+            .unwrap_or(WorktreeServiceMode::Manual)
+        {
+            WorktreeServiceMode::Manual => Ok(()),
+            WorktreeServiceMode::Managed | WorktreeServiceMode::Off => Err(failure(
+                NodeFailureCode::UnsupportedSpawnCapability,
+                "Git worktree service mode is unavailable in this node build",
+            )),
+        }
     }
 
     fn bound_workspace_root(&self, address: &SessionAddress) -> Result<String, NodeFailure> {
@@ -4014,14 +4092,10 @@ async fn serve_connection(
                             "open provider IDs were not negotiated",
                         )),
                     }
-                } else if request
-                    .request
-                    .required_capability()
-                    .is_some_and(|required| {
-                        !selected_capabilities
-                            .iter()
-                            .any(|selected| selected.as_str() == required)
-                    })
+                } else if request_uses_unnegotiated_capability(
+                    &request.request,
+                    &selected_capabilities,
+                )
                 {
                     ResponseEnvelope {
                         request_id: request.request_id,
@@ -4190,6 +4264,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
         NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
         NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+        NODE_WORKTREE_SELECTION_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -4197,6 +4272,22 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))
         })
         .collect()
+}
+
+fn request_uses_unnegotiated_capability(
+    request: &NodeRequest,
+    selected_capabilities: &[CapabilityId],
+) -> bool {
+    let selected = |required: &str| {
+        selected_capabilities
+            .iter()
+            .any(|capability| capability.as_str() == required)
+    };
+    request
+        .required_capability()
+        .is_some_and(|required| !selected(required))
+        || (request.requires_worktree_selection_capability()
+            && !selected(NODE_WORKTREE_SELECTION_CAPABILITY))
 }
 
 fn snapshot_for_wire(
@@ -5159,6 +5250,33 @@ fn git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
     failure(code, &error.message)
 }
 
+fn validate_selected_worktree(
+    source_root: &str,
+    selected_root: &str,
+    worktrees: &[NativeGitWorktreeSnapshot],
+) -> Result<(), NodeFailure> {
+    if !worktrees
+        .iter()
+        .any(|worktree| worktree_paths_equal(&worktree.path, source_root) && !worktree.is_bare)
+    {
+        return Err(failure(
+            NodeFailureCode::WorktreeProtected,
+            "source workspace is not an authoritative non-bare Git worktree root",
+        ));
+    }
+    if !worktrees.iter().any(|worktree| {
+        worktree_paths_equal(&worktree.path, selected_root)
+            && !worktree.is_main
+            && !worktree.is_bare
+    }) {
+        return Err(failure(
+            NodeFailureCode::WorktreeProtected,
+            "selected workspace is not an eligible Git worktree in the source repository",
+        ));
+    }
+    Ok(())
+}
+
 fn workspace_file_failure(error: WorkspaceFileReadError) -> NodeFailure {
     let code = match error.kind() {
         WorkspaceFileReadErrorKind::InvalidPath => NodeFailureCode::InvalidRepositoryPath,
@@ -5420,14 +5538,15 @@ mod tests {
         AgentId::new(value).unwrap()
     }
 
-    fn terminal_test_shared() -> NodeShared {
+    fn terminal_test_shared_with_mode(mode: WorktreeServiceMode) -> NodeShared {
         let catalog = active_registry().unwrap();
         let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
         let workspace = WorkspaceConfig::new(
             WorkspaceId::new("primary").unwrap(),
             std::env::current_dir().unwrap(),
         )
-        .unwrap();
+        .unwrap()
+        .with_worktree_service_mode(mode);
         NodeShared::new(
             handle,
             "fixture-token".to_owned(),
@@ -5435,6 +5554,10 @@ mod tests {
             vec![workspace],
             vec![agent("claude")],
         )
+    }
+
+    fn terminal_test_shared() -> NodeShared {
+        terminal_test_shared_with_mode(WorktreeServiceMode::Manual)
     }
 
     fn terminal_address(generation: u64) -> SessionAddress {
@@ -5467,6 +5590,9 @@ mod tests {
         let shared = terminal_test_shared();
         assert!(baseline_capabilities().unwrap().iter().any(|capability| {
             capability.as_str() == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+        }));
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY
         }));
 
         let mut target_mismatch = spawn_spec_fixture();
@@ -5512,6 +5638,25 @@ mod tests {
         assert!(shared.handle.snapshot().sessions.is_empty());
     }
 
+    #[test]
+    fn worktree_selection_requires_its_separate_negotiated_capability() {
+        let mut spec = spawn_spec_fixture();
+        spec.target.worktree_id = Some(WorkspaceId::new("selected-worktree").unwrap());
+        let request = NodeRequest::SpawnSpec { spec };
+        let spawn_spec_capability =
+            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        assert!(request_uses_unnegotiated_capability(
+            &request,
+            &[spawn_spec_capability.clone()],
+        ));
+        let worktree_capability =
+            CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
+        assert!(!request_uses_unnegotiated_capability(
+            &request,
+            &[spawn_spec_capability, worktree_capability],
+        ));
+    }
+
     #[tokio::test]
     async fn spawn_spec_idempotency_replays_receipt_and_conflicts_before_session_mutation() {
         let shared = terminal_test_shared();
@@ -5530,6 +5675,78 @@ mod tests {
         assert_eq!(failure.code, NodeFailureCode::SpawnIdempotencyConflict);
         assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
         assert!(shared.handle.snapshot().sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn off_worktree_service_rejects_selection_and_mutation_before_git() {
+        let shared = terminal_test_shared_with_mode(WorktreeServiceMode::Off);
+        let mut spec = spawn_spec_fixture();
+        spec.target.worktree_id = Some(WorkspaceId::new("unregistered-worktree").unwrap());
+        let failure = shared.spawn_from_spec(spec).await.unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::UnsupportedSpawnCapability);
+
+        let failure = shared
+            .create_worktree(
+                WorkspaceId::new("primary").unwrap(),
+                WorkspaceId::new("new-worktree").unwrap(),
+                "not-an-absolute-path".to_owned(),
+                "invalid branch".to_owned(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::UnsupportedSpawnCapability);
+
+        let failure = shared
+            .remove_worktree(
+                WorkspaceId::new("primary").unwrap(),
+                "not-an-absolute-path".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::UnsupportedSpawnCapability);
+        assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
+        assert!(shared.handle.snapshot().sessions.is_empty());
+    }
+
+    #[test]
+    fn selected_worktree_requires_authoritative_non_main_non_bare_entry() {
+        fn worktree(path: &str, is_main: bool, is_bare: bool) -> NativeGitWorktreeSnapshot {
+            NativeGitWorktreeSnapshot {
+                path: path.to_owned(),
+                head: "0123456789abcdef".to_owned(),
+                branch: Some("refs/heads/test".to_owned()),
+                is_bare,
+                is_main,
+                locked: false,
+                lock_reason: None,
+                prunable: false,
+                prunable_reason: None,
+                workspace_id: None,
+            }
+        }
+
+        let source = r"C:\repo";
+        let selected = r"C:\repo-worktree";
+        let listed = vec![
+            worktree(source, true, false),
+            worktree(selected, false, false),
+        ];
+        assert!(validate_selected_worktree(source, selected, &listed).is_ok());
+
+        let main_failure = validate_selected_worktree(source, source, &listed).unwrap_err();
+        assert_eq!(main_failure.code, NodeFailureCode::WorktreeProtected);
+
+        let bare = vec![
+            worktree(source, true, false),
+            worktree(selected, false, true),
+        ];
+        let bare_failure = validate_selected_worktree(source, selected, &bare).unwrap_err();
+        assert_eq!(bare_failure.code, NodeFailureCode::WorktreeProtected);
+
+        let foreign_failure =
+            validate_selected_worktree(source, r"C:\foreign", &listed).unwrap_err();
+        assert_eq!(foreign_failure.code, NodeFailureCode::WorktreeProtected);
     }
 
     fn terminal_frame(sequence: u64) -> TerminalFrame {

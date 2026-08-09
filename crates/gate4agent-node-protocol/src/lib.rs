@@ -32,6 +32,7 @@ pub const NODE_PROVIDER_ID_OPEN_CAPABILITY: &str = "provider-id.open-v1";
 pub const NODE_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = "terminal-frame-events-v1";
 pub const NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
     "spawn-spec.defaults-overrides-v1";
+pub const NODE_WORKTREE_SELECTION_CAPABILITY: &str = "worktree-selection-v1";
 pub const SPAWN_RUNTIME_RAW_PTY_LIFECYCLE: &str = "raw-pty-lifecycle";
 pub const SPAWN_RUNTIME_SEMANTIC_READINESS: &str = "semantic-readiness";
 pub const SPAWN_RUNTIME_STRUCTURED_PROMPT: &str = "structured-prompt";
@@ -2152,6 +2153,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             NODE_WORKSPACE_FILE_READ_CAPABILITY,
+            NODE_WORKTREE_SELECTION_CAPABILITY,
         ]
         .into_iter()
         .map(|capability| CapabilityId(capability.to_owned()))
@@ -2709,6 +2711,10 @@ impl NodeRequest {
             | Self::Shutdown => None,
         }
     }
+
+    pub fn requires_worktree_selection_capability(&self) -> bool {
+        matches!(self, Self::SpawnSpec { spec } if spec.target.worktree_id.is_some())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2771,6 +2777,13 @@ pub enum NodeResponse {
     },
     Accepted,
     ShuttingDown,
+}
+
+impl NodeResponse {
+    pub fn requires_worktree_selection_capability(&self) -> bool {
+        matches!(self, Self::SpawnSpecAccepted { receipt }
+            if receipt.target.worktree_id.is_some())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4161,6 +4174,40 @@ mod tests {
             )
             .unwrap(),
             r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":8,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+        );
+    }
+
+    #[test]
+    fn worktree_selection_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(NODE_WORKTREE_SELECTION_CAPABILITY, "worktree-selection-v1");
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY));
+
+        let capability = CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
+        let mut support = portable_node_support();
+        support.capabilities = vec![capability.clone()];
+        let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
+        assert!(support
+            .negotiate(NODE_PROTOCOL_VERSION, &legacy)
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        assert_eq!(
+            String::from_utf8(
+                encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
+            )
+            .unwrap(),
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["worktree-selection-v1"]},"selected":{"protocol_version":8,"capabilities":["worktree-selection-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
         );
     }
 

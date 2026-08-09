@@ -17,7 +17,7 @@ mod server;
 
 pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
-    NodeShutdownHandle, WorkspaceConfig,
+    NodeShutdownHandle, WorkspaceConfig, WorktreeServiceMode,
 };
 pub use spawn_spec::{
     SpawnProfileRegistry, SpawnProfileRegistryError, DEFAULT_SPAWN_PROFILE_ID,

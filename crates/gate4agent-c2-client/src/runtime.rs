@@ -11,6 +11,7 @@ use gate4agent_c2_protocol::{
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_WORKTREE_SELECTION_CAPABILITY,
     C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
 };
@@ -49,6 +50,8 @@ const SPAWN_SPEC_NOT_NEGOTIATED: &str =
     "spawn spec defaults/overrides require negotiated C2 capability";
 const TERMINAL_FRAME_EVENTS_NOT_NEGOTIATED: &str =
     "terminal frame events require negotiated C2 capability";
+const WORKTREE_SELECTION_NOT_NEGOTIATED: &str =
+    "worktree selection requires negotiated C2 capability";
 
 #[derive(Clone, Copy)]
 struct NegotiatedPathCapabilities {
@@ -57,6 +60,7 @@ struct NegotiatedPathCapabilities {
     workspace_file_read: bool,
     provider_ids_open: bool,
     spawn_spec_defaults_overrides: bool,
+    worktree_selection: bool,
     terminal_frame_events: bool,
 }
 
@@ -276,6 +280,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
     })
@@ -341,6 +347,7 @@ fn negotiated_path_capabilities(
         provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
         spawn_spec_defaults_overrides:
             selected_has(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
+        worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -378,6 +385,13 @@ fn reject_unnegotiated_outbound_path(
                 }
                 _ => WORKSPACE_FILE_READ_NOT_NEGOTIATED.to_owned(),
             },
+        ));
+    }
+    if request.requires_worktree_selection_capability()
+        && !capabilities.worktree_selection
+    {
+        return Err(C2ControlError::Protocol(
+            WORKTREE_SELECTION_NOT_NEGOTIATED.to_owned(),
         ));
     }
     if !capabilities.repository_paths && node_request_has_unix_repository_path(request) {
@@ -598,6 +612,13 @@ fn routed_response_requires_workspace_file_read(response: &RoutedNodeResponse) -
 fn routed_response_requires_spawn_spec(response: &RoutedNodeResponse) -> bool {
     response.response.as_ref().is_ok_and(|response| {
         matches!(response, C2NodeResponse::SpawnSpecAccepted { .. })
+    })
+}
+
+fn routed_response_requires_worktree_selection(response: &RoutedNodeResponse) -> bool {
+    response.response.as_ref().is_ok_and(|response| {
+        matches!(response, C2NodeResponse::SpawnSpecAccepted { receipt }
+            if receipt.target.worktree_id.is_some())
     })
 }
 
@@ -878,6 +899,17 @@ async fn control_owner(
                             )));
                             break;
                         }
+                        if !path_capabilities.worktree_selection
+                            && reply
+                                .result
+                                .as_ref()
+                                .is_ok_and(routed_response_requires_worktree_selection)
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                WORKTREE_SELECTION_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
@@ -1146,6 +1178,7 @@ mod tests {
             workspace_file_read: false,
             provider_ids_open: false,
             spawn_spec_defaults_overrides: false,
+            worktree_selection: false,
             terminal_frame_events: false,
         }
     }
@@ -1157,6 +1190,7 @@ mod tests {
             workspace_file_read: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         }
     }
@@ -1305,6 +1339,7 @@ mod tests {
                 CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -1737,6 +1772,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_owner_conditionally_gates_worktree_spawn_before_write() {
+        let (commands_tx, commands_rx) = mpsc::channel(2);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(2);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let mut capabilities = all_path_capabilities();
+        capabilities.worktree_selection = false;
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, capabilities,
+        ));
+
+        let (legacy_reply_tx, _legacy_reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::SpawnSpec { spec: spawn_spec("node-a") },
+            reply: legacy_reply_tx,
+        }).await.unwrap();
+        assert!(matches!(
+            writer_rx.recv().await,
+            Some(C2ClientFrame::Request(_)),
+        ));
+
+        let mut spec = spawn_spec("node-a");
+        spec.target.worktree_id = Some(WorkspaceId::new("review-tree").unwrap());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::SpawnSpec { spec },
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == WORKTREE_SELECTION_NOT_NEGOTIATED
+        ));
+        assert!(writer_rx.try_recv().is_err());
+        drop(commands_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_worktree_receipt_and_closes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let mut capabilities = all_path_capabilities();
+        capabilities.worktree_selection = false;
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, capabilities,
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        let mut receipt = spawn_receipt();
+        receipt.target.worktree_id = Some(WorkspaceId::new("review-tree").unwrap());
+        incoming_tx.send(OwnerInput::Frame(C2ServerFrame::Reply(
+            gate4agent_c2_protocol::C2ReplyEnvelope {
+                request_id: C2RequestId(1),
+                result: Ok(RoutedNodeResponse {
+                    node_id: NodeId::new("node-a").unwrap(),
+                    incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                    response: Ok(C2NodeResponse::SpawnSpecAccepted { receipt }),
+                }),
+            },
+        ))).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == WORKTREE_SELECTION_NOT_NEGOTIATED
+        ));
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn control_owner_rejects_unnegotiated_open_provider_reply_and_closes() {
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (events_tx, _events_rx) = mpsc::channel(1);
@@ -1843,6 +1961,7 @@ mod tests {
             workspace_file_read: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -1856,6 +1975,7 @@ mod tests {
             workspace_file_read: false,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
             terminal_frame_events: true,
         };
         assert!(matches!(

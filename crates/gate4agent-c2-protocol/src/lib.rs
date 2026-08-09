@@ -15,6 +15,7 @@ pub use gate4agent_node_protocol::{
     SpawnTarget,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    NODE_WORKTREE_SELECTION_CAPABILITY,
     RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     ProtocolNegotiationError, ProtocolRange,
 };
@@ -48,6 +49,7 @@ pub const C2_PROVIDER_ID_OPEN_CAPABILITY: &str = NODE_PROVIDER_ID_OPEN_CAPABILIT
 pub const C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY;
 pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS_CAPABILITY;
+pub const C2_WORKTREE_SELECTION_CAPABILITY: &str = NODE_WORKTREE_SELECTION_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -1821,6 +1823,67 @@ mod tests {
         assert_ne!(bound, without_spawn_spec);
         assert!(bound.windows(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.len()).any(
             |window| window == C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn c2_worktree_selection_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(C2_WORKTREE_SELECTION_CAPABILITY, "worktree-selection-v1");
+        assert_eq!(
+            C2_WORKTREE_SELECTION_CAPABILITY,
+            NODE_WORKTREE_SELECTION_CAPABILITY,
+        );
+        let capability = CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let bound = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        let without_worktree_selection = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &ClientCompatibilityOffer {
+                protocol_versions: offer.protocol_versions,
+                capabilities: Vec::new(),
+                state_schema: None,
+            },
+            &NegotiatedC2ControlCompatibility {
+                protocol_version: selected.protocol_version,
+                capabilities: Vec::new(),
+                host: selected.host.clone(),
+                path_semantics: selected.path_semantics.clone(),
+            },
+        )
+        .unwrap();
+        assert_ne!(bound, without_worktree_selection);
+        assert!(bound.windows(C2_WORKTREE_SELECTION_CAPABILITY.len()).any(
+            |window| window == C2_WORKTREE_SELECTION_CAPABILITY.as_bytes()
         ));
     }
 

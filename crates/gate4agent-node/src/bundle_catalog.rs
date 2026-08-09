@@ -1310,7 +1310,11 @@ mod tests {
 
     impl TestRoot {
         fn new() -> Self {
-            let base = std::env::temp_dir().join("gate4agent-bundle-catalog-tests");
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"));
+            let base = target.join("bundle-catalog-tests");
             fs::create_dir_all(&base).unwrap();
             let path = base.join(format!(
                 "gate4agent-bundle-catalog-{}-{}",
@@ -1416,12 +1420,16 @@ mod tests {
         assert!(matches!(error, NodeBundleError::McpUnsupported));
 
         let linked = TestRoot::valid();
-        let target = linked.path().join("skills/review-code/target.txt");
+        let linked_target = TestRoot::new();
+        let target = linked_target.path().join("target.txt");
         fs::write(&target, b"target").unwrap();
         let link = linked.path().join("skills/review-code/link.txt");
         if create_file_symlink(&target, &link).is_ok() {
             let error = bundle(&linked, zero_digest()).unwrap_err();
-            assert!(matches!(error, NodeBundleError::UnsafeFileType { .. }));
+            assert!(
+                matches!(&error, NodeBundleError::UnsafeFileType { .. }),
+                "symlink must fail closed as UnsafeFileType, got {error:?}",
+            );
         }
 
         #[cfg(unix)]
@@ -1441,13 +1449,17 @@ mod tests {
 
             let swapped = TestRoot::valid();
             let expected = swapped.expected_digest();
-            let target = swapped.path().join("replacement.md");
+            let swapped_target = TestRoot::new();
+            let target = swapped_target.path().join("replacement.md");
             fs::write(&target, b"replacement").unwrap();
             let skill = swapped.path().join("skills/review-code/SKILL.md");
             fs::remove_file(&skill).unwrap();
             std::os::unix::fs::symlink(&target, &skill).unwrap();
             let error = bundle(&swapped, expected).unwrap_err();
-            assert!(matches!(error, NodeBundleError::UnsafeFileType { .. }));
+            assert!(
+                matches!(&error, NodeBundleError::UnsafeFileType { .. }),
+                "swapped skill must fail closed as UnsafeFileType, got {error:?}",
+            );
         }
 
         #[cfg(windows)]

@@ -4,6 +4,8 @@ mod git_worktree;
 
 mod environment_profiles;
 
+mod session_environment;
+
 mod worktree_service;
 
 mod session_registry;
@@ -25,6 +27,15 @@ pub use server::{
 };
 pub use environment_profiles::{
     NodeEnvironmentProfile, NodeEnvironmentProfileError, MAX_NODE_ENVIRONMENT_PROFILES,
+};
+pub use session_environment::{
+    NodeSecretReference, NodeSecretResolveError, NodeSecretResolver, NodeSecretValue,
+    NodeSecretValueError, NodeSessionEnvironmentMutation, NodeSessionFile,
+    NodeSessionMaterializationProfile, NodeSessionMaterializationProfileError,
+    NodeSessionPathBinding, NodeSessionPathClass, MAX_NODE_SECRET_REFERENCE_BYTES,
+    MAX_NODE_SECRET_VALUE_BYTES, MAX_SESSION_ENVIRONMENT_ENTRIES,
+    MAX_SESSION_MATERIALIZATION_FILES, MAX_SESSION_MATERIALIZATION_FILE_BYTES,
+    MAX_SESSION_MATERIALIZATION_RELATIVE_PATH_BYTES,
 };
 pub use worktree_service::ManagedWorktreeProfile;
 pub use spawn_spec::{

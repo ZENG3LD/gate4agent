@@ -6,6 +6,7 @@ use gate4agent_runtime_native::{
 };
 use gate4agent_types::TransportKind;
 use thiserror::Error;
+use crate::session_environment::NodeSessionMaterializationProfile;
 
 pub const MAX_NODE_ENVIRONMENT_PROFILES: usize = 128;
 
@@ -18,6 +19,7 @@ pub struct NodeEnvironmentProfile {
     provider: AgentId,
     pty: Option<NativeLaunchProfile>,
     inline: Option<NativeLaunchProfile>,
+    materialization: Option<NodeSessionMaterializationProfile>,
 }
 
 impl NodeEnvironmentProfile {
@@ -26,6 +28,16 @@ impl NodeEnvironmentProfile {
         revision: SpawnEnvironmentProfileRevision,
         provider: AgentId,
         profiles: impl IntoIterator<Item = NativeLaunchProfile>,
+    ) -> Result<Self, NodeEnvironmentProfileError> {
+        Self::new_with_materialization(id, revision, provider, profiles, None)
+    }
+
+    pub fn new_with_materialization(
+        id: SpawnEnvironmentProfileId,
+        revision: SpawnEnvironmentProfileRevision,
+        provider: AgentId,
+        profiles: impl IntoIterator<Item = NativeLaunchProfile>,
+        materialization: Option<NodeSessionMaterializationProfile>,
     ) -> Result<Self, NodeEnvironmentProfileError> {
         let mut pty = None;
         let mut inline = None;
@@ -58,6 +70,7 @@ impl NodeEnvironmentProfile {
             provider,
             pty,
             inline,
+            materialization,
         })
     }
 
@@ -73,7 +86,13 @@ impl NodeEnvironmentProfile {
         &self.provider
     }
 
-    pub(crate) fn into_parts(self) -> (EnvironmentProfileBinding, Vec<NativeLaunchProfile>) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        EnvironmentProfileBinding,
+        Vec<NativeLaunchProfile>,
+        Option<NodeSessionMaterializationProfile>,
+    ) {
         let pty_id = self.pty.as_ref().map(|profile| profile.id().clone());
         let inline_id = self.inline.as_ref().map(|profile| profile.id().clone());
         let mut profiles = Vec::with_capacity(usize::from(self.pty.is_some()) + usize::from(self.inline.is_some()));
@@ -88,6 +107,7 @@ impl NodeEnvironmentProfile {
                 inline_id,
             },
             profiles,
+            self.materialization,
         )
     }
 }
@@ -180,7 +200,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let (binding, native_profiles) = profile.into_parts();
+        let (binding, native_profiles, materialization) = profile.into_parts();
+        assert!(materialization.is_none());
         assert_eq!(binding.id, id);
         assert_eq!(binding.revision, revision);
         assert_eq!(binding.provider, provider);

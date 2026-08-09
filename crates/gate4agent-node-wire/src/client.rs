@@ -26,7 +26,7 @@ use crate::{
 #[cfg(test)]
 use gate4agent_node_protocol::{
     NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6,
 };
 #[cfg(test)]
 use crate::auth_proof;
@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v5() {
+    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v6() {
         let offer = client_compatibility_offer().unwrap();
         assert_eq!(
             offer.protocol_versions,
@@ -1583,7 +1583,7 @@ mod tests {
         ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
-            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5).unwrap(),
+            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6).unwrap(),
         );
     }
 

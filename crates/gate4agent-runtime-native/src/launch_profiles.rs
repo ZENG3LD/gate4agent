@@ -186,6 +186,35 @@ pub struct NativeLaunchProfile {
     contract: NativeLaunchProfileContract,
 }
 
+/// Host-only, instance-bound environment applied after one exact native profile.
+///
+/// The overlay does not implement `Debug` because its values may contain secret
+/// material. It is validated and retained without crossing the wire or durable
+/// state boundaries.
+pub struct NativeLaunchEnvironmentOverlay {
+    agent_id: AgentId,
+    transport: TransportKind,
+    environment: Vec<EnvMutation>,
+}
+
+impl NativeLaunchEnvironmentOverlay {
+    pub fn new(
+        agent_id: AgentId,
+        transport: TransportKind,
+        environment: Vec<EnvMutation>,
+    ) -> Result<Self, NativeLaunchProfileError> {
+        if !matches!(transport, TransportKind::Pty | TransportKind::Pipe) {
+            return Err(NativeLaunchProfileError::UnsupportedTransport);
+        }
+        validate_environment_mutations(&environment)?;
+        Ok(Self {
+            agent_id,
+            transport,
+            environment,
+        })
+    }
+}
+
 impl NativeLaunchProfile {
     pub fn new(
         id: NativeLaunchProfileId,
@@ -315,6 +344,14 @@ pub enum NativeLaunchProfileError {
     BindingMismatch,
     #[error("native launch profile selection capacity is {max}")]
     SelectionCapacityExceeded { max: usize },
+    #[error("native launch environment overlay requires an existing profile selection")]
+    EnvironmentOverlaySelectionMissing,
+    #[error("native launch environment overlay does not match the selected profile binding")]
+    EnvironmentOverlayBindingMismatch,
+    #[error("native launch environment overlay conflicts with a selected profile-owned key")]
+    EnvironmentOverlayKeyConflict,
+    #[error("native launch environment overlay capacity is {max}")]
+    EnvironmentOverlayCapacityExceeded { max: usize },
     #[error("native launch profile is selected by an instance; clear the selection first")]
     ProfileInUse,
     #[error(transparent)]
@@ -324,6 +361,7 @@ pub enum NativeLaunchProfileError {
 pub(crate) struct NativeLaunchProfiles {
     profiles: BTreeMap<NativeLaunchProfileId, NativeLaunchProfile>,
     selections: BTreeMap<AgentInstanceId, NativeLaunchProfileId>,
+    environment_overlays: BTreeMap<AgentInstanceId, Arc<NativeLaunchEnvironmentOverlay>>,
 }
 
 impl NativeLaunchProfiles {
@@ -331,6 +369,7 @@ impl NativeLaunchProfiles {
         Self {
             profiles: BTreeMap::new(),
             selections: BTreeMap::new(),
+            environment_overlays: BTreeMap::new(),
         }
     }
 
@@ -344,6 +383,13 @@ impl NativeLaunchProfiles {
             return Err(NativeLaunchProfileError::ProfileCapacityExceeded {
                 max: NATIVE_LAUNCH_PROFILES_MAX,
             });
+        }
+        for (instance_id, selected_profile_id) in &self.selections {
+            if selected_profile_id == profile.id() {
+                if let Some(overlay) = self.environment_overlays.get(instance_id) {
+                    validate_environment_overlay_binding(&profile, overlay)?;
+                }
+            }
         }
         self.profiles.insert(profile.id.clone(), profile);
         Ok(())
@@ -368,11 +414,14 @@ impl NativeLaunchProfiles {
         instance_id: AgentInstanceId,
         profile_id: NativeLaunchProfileId,
     ) -> Result<(), NativeLaunchProfileError> {
-        self.profiles.get(&profile_id).ok_or_else(|| {
+        let profile = self.profiles.get(&profile_id).ok_or_else(|| {
             NativeLaunchProfileError::UnknownProfile {
                 profile_id: profile_id.clone(),
             }
         })?;
+        if let Some(overlay) = self.environment_overlays.get(&instance_id) {
+            validate_environment_overlay_binding(profile, overlay)?;
+        }
         if !self.selections.contains_key(&instance_id)
             && self.selections.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
         {
@@ -385,7 +434,39 @@ impl NativeLaunchProfiles {
     }
 
     pub(crate) fn clear_selection(&mut self, instance_id: AgentInstanceId) -> bool {
-        self.selections.remove(&instance_id).is_some()
+        let removed = self.selections.remove(&instance_id).is_some();
+        self.environment_overlays.remove(&instance_id);
+        removed
+    }
+
+    pub(crate) fn install_environment_overlay(
+        &mut self,
+        instance_id: AgentInstanceId,
+        overlay: NativeLaunchEnvironmentOverlay,
+    ) -> Result<(), NativeLaunchProfileError> {
+        let profile_id = self
+            .selections
+            .get(&instance_id)
+            .ok_or(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing)?;
+        let profile = self
+            .profiles
+            .get(profile_id)
+            .ok_or_else(|| NativeLaunchProfileError::UnknownProfile {
+                profile_id: profile_id.clone(),
+            })?;
+        validate_environment_overlay_binding(profile, &overlay)?;
+        if !self.environment_overlays.contains_key(&instance_id)
+            && self.environment_overlays.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
+        {
+            return Err(
+                NativeLaunchProfileError::EnvironmentOverlayCapacityExceeded {
+                    max: NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX,
+                },
+            );
+        }
+        self.environment_overlays
+            .insert(instance_id, Arc::new(overlay));
+        Ok(())
     }
 
     fn profile_for_spawn(
@@ -394,7 +475,7 @@ impl NativeLaunchProfiles {
         agent_id: &AgentId,
         transport: TransportKind,
         pipe_binding_is_exact_one_shot: bool,
-    ) -> Result<Option<NativeLaunchProfile>, NativeLaunchProfileError> {
+    ) -> Result<Option<NativeLaunchSpawnEnvironment>, NativeLaunchProfileError> {
         let Some(profile_id) = self.selections.get(&instance_id) else {
             return Ok(None);
         };
@@ -410,8 +491,20 @@ impl NativeLaunchProfiles {
         if transport == TransportKind::Pipe && !pipe_binding_is_exact_one_shot {
             return Err(NativeLaunchProfileError::UnsupportedTransport);
         }
-        Ok(Some(profile.clone()))
+        let overlay = self.environment_overlays.get(&instance_id).cloned();
+        if let Some(overlay) = &overlay {
+            validate_environment_overlay_binding(profile, overlay)?;
+        }
+        Ok(Some(NativeLaunchSpawnEnvironment {
+            profile: profile.clone(),
+            overlay,
+        }))
     }
+}
+
+struct NativeLaunchSpawnEnvironment {
+    profile: NativeLaunchProfile,
+    overlay: Option<Arc<NativeLaunchEnvironmentOverlay>>,
 }
 
 /// Clonable host-local control for selecting profiles without mutable runtime access.
@@ -461,6 +554,15 @@ impl NativeLaunchProfileControl {
         self.lock().clear_selection(instance_id)
     }
 
+    /// Installs or replaces one host-only environment overlay for an exact selection.
+    pub fn install_native_launch_environment_overlay(
+        &self,
+        instance_id: AgentInstanceId,
+        overlay: NativeLaunchEnvironmentOverlay,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.lock().install_environment_overlay(instance_id, overlay)
+    }
+
     pub(crate) fn resolve_environment(
         &self,
         instance_id: AgentInstanceId,
@@ -468,14 +570,23 @@ impl NativeLaunchProfileControl {
         transport: TransportKind,
         pipe_binding_is_exact_one_shot: bool,
     ) -> Result<Vec<EnvMutation>, NativeLaunchProfileError> {
-        let profile = self.lock().profile_for_spawn(
-            instance_id,
-            agent_id,
-            transport,
-            pipe_binding_is_exact_one_shot,
-        )?;
-        profile.map_or_else(|| Ok(Vec::new()), |profile| {
-            profile.resolve_environment(agent_id, transport)
+        let spawn_environment = {
+            self.lock().profile_for_spawn(
+                instance_id,
+                agent_id,
+                transport,
+                pipe_binding_is_exact_one_shot,
+            )?
+        };
+        spawn_environment.map_or_else(|| Ok(Vec::new()), |spawn_environment| {
+            let mut environment = spawn_environment
+                .profile
+                .resolve_environment(agent_id, transport)?;
+            if let Some(overlay) = spawn_environment.overlay {
+                environment.extend(overlay.environment.iter().cloned());
+            }
+            validate_environment_mutations(&environment)?;
+            Ok(environment)
         })
     }
 
@@ -539,8 +650,37 @@ fn validate_resolved_environment(
     if owned_keys != resolved_keys {
         return Err(NativeLaunchProfileError::EnvironmentOwnershipMismatch);
     }
+    validate_environment_mutations(environment)
+}
+
+fn validate_environment_mutations(
+    environment: &[EnvMutation],
+) -> Result<(), NativeLaunchProfileError> {
+    if environment.len() > NATIVE_LAUNCH_PROFILE_ENV_MUTATIONS_MAX {
+        return Err(NativeLaunchProfileError::TooManyEnvironmentMutations {
+            count: environment.len(),
+            max: NATIVE_LAUNCH_PROFILE_ENV_MUTATIONS_MAX,
+        });
+    }
+    let mut normalized_keys = BTreeSet::new();
     let mut total_bytes = 0usize;
     for (index, mutation) in environment.iter().enumerate() {
+        let Some(key) = mutation.key.to_str() else {
+            return Err(NativeLaunchProfileError::InvalidEnvironmentKey { index });
+        };
+        if key.is_empty()
+            || key.len() > NATIVE_LAUNCH_PROFILE_ENV_KEY_MAX_BYTES
+            || key.contains(['\0', '='])
+        {
+            return Err(NativeLaunchProfileError::InvalidEnvironmentKey { index });
+        }
+        let normalized_key = key.to_ascii_uppercase();
+        if normalized_key.starts_with(RESERVED_HOOK_ENV_PREFIX) {
+            return Err(NativeLaunchProfileError::ReservedHookEnvironmentKey { index });
+        }
+        if !normalized_keys.insert(normalized_key) {
+            return Err(NativeLaunchProfileError::DuplicateEnvironmentKey { index });
+        }
         total_bytes = total_bytes.saturating_add(os_string_bytes(&mutation.key));
         if let Some(value) = &mutation.value {
             let value_bytes = os_string_bytes(value);
@@ -560,6 +700,30 @@ fn validate_resolved_environment(
                 max: NATIVE_LAUNCH_PROFILE_ENV_TOTAL_MAX_BYTES,
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_environment_overlay_binding(
+    profile: &NativeLaunchProfile,
+    overlay: &NativeLaunchEnvironmentOverlay,
+) -> Result<(), NativeLaunchProfileError> {
+    if profile.agent_id() != &overlay.agent_id || profile.transport() != overlay.transport {
+        return Err(NativeLaunchProfileError::EnvironmentOverlayBindingMismatch);
+    }
+    let profile_keys = profile
+        .owned_env_keys
+        .iter()
+        .filter_map(|key| key.to_str())
+        .map(str::to_ascii_uppercase)
+        .collect::<BTreeSet<_>>();
+    if overlay.environment.iter().any(|mutation| {
+        mutation
+            .key
+            .to_str()
+            .is_some_and(|key| profile_keys.contains(&key.to_ascii_uppercase()))
+    }) {
+        return Err(NativeLaunchProfileError::EnvironmentOverlayKeyConflict);
     }
     Ok(())
 }

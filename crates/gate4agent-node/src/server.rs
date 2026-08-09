@@ -11,6 +11,11 @@ use crate::git_worktree::{
 use crate::environment_profiles::{
     EnvironmentProfileBinding, NodeEnvironmentProfile, MAX_NODE_ENVIRONMENT_PROFILES,
 };
+use crate::session_environment::{
+    MaterializationId, MaterializationOwner, MaterializationOwnershipRecord,
+    MaterializationState, NodeSecretResolver, NodeSessionMaterializationProfile,
+    SessionEnvironmentMaterializeError, SessionEnvironmentMaterializer,
+};
 use crate::worktree_service::{
     exact_created_worktree, exact_owned_worktree, ManagedWorktreeLeaseRecord,
     ManagedWorktreeProfile, ManagedWorktreeRegistry, ManagedWorktreeSessionHolder,
@@ -66,7 +71,7 @@ use crate::protocol::{
     NODE_WORKSPACE_FILE_READ_CAPABILITY, NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
-    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5,
+    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6,
     SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
     SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
     SPAWN_RUNTIME_STRUCTURED_PROMPT,
@@ -74,7 +79,8 @@ use crate::protocol::{
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
 use gate4agent_runtime_native::{
-    HookIngressConfig, NativeLaunchProfileControl, NativeRuntime, NativeRuntimeConfig,
+    HookIngressConfig, NativeLaunchEnvironmentOverlay, NativeLaunchProfileControl,
+    NativeRuntime, NativeRuntimeConfig,
 };
 use gate4agent_node_wire::{
     auth_proof, negotiated_auth_proof, proofs_match, random_incarnation_id, random_nonce,
@@ -267,7 +273,7 @@ impl WorkspaceConfig {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct NodeServerConfig {
     pub endpoint: String,
     api_listen: Option<std::net::SocketAddr>,
@@ -277,6 +283,13 @@ pub struct NodeServerConfig {
     pub runtime: NativeRuntimeConfig,
     state_path: Option<PathBuf>,
     spawn_profiles: SpawnProfileRegistry,
+    session_environment: Option<NodeSessionEnvironmentConfig>,
+}
+
+#[derive(Clone)]
+struct NodeSessionEnvironmentConfig {
+    root: PathBuf,
+    resolver: Arc<dyn NodeSecretResolver>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +364,7 @@ impl NodeServerConfig {
             runtime: NativeRuntimeConfig::default(),
             state_path: None,
             spawn_profiles: SpawnProfileRegistry::default(),
+            session_environment: None,
         })
     }
 
@@ -382,6 +396,19 @@ impl NodeServerConfig {
     pub fn with_spawn_profiles(mut self, spawn_profiles: SpawnProfileRegistry) -> Self {
         self.spawn_profiles = spawn_profiles;
         self
+    }
+
+    pub fn with_session_environment_materialization(
+        mut self,
+        root: impl Into<PathBuf>,
+        resolver: Arc<dyn NodeSecretResolver>,
+    ) -> Result<Self, NodeServerError> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(NodeServerError::InvalidSessionEnvironmentRoot);
+        }
+        self.session_environment = Some(NodeSessionEnvironmentConfig { root, resolver });
+        Ok(self)
     }
 }
 
@@ -557,6 +584,17 @@ impl NodeServer {
                 .map_err(|error| {
                     durable_state_server_error(error, DURABLE_STATE_LOCK_FAILED_ERROR)
                 })?;
+        let session_environment_materializer = config
+            .session_environment
+            .as_ref()
+            .map(|environment| {
+                SessionEnvironmentMaterializer::new(
+                    environment.root.clone(),
+                    Arc::clone(&environment.resolver),
+                )
+                .map_err(|_| NodeServerError::SessionEnvironmentMaterializer)
+            })
+            .transpose()?;
         let (handle, runtime) = NativeRuntime::new(catalog, config.runtime);
         let native_launch_profile_control = runtime.native_launch_profile_control();
         let events = handle.subscribe(CONTROL_EVENT_SUBSCRIPTION_CAPACITY);
@@ -567,6 +605,7 @@ impl NodeServer {
         let managed_worktrees = std::mem::take(&mut loaded.managed_worktrees);
         let managed_worktree_tombstones =
             std::mem::take(&mut loaded.managed_worktree_tombstones);
+        let materializations = std::mem::take(&mut loaded.materializations);
         let (workspaces, records, persistence_warning) =
             merge_durable_state(&config.workspaces, loaded)?;
         let shared = Arc::new(NodeShared::new_with_incarnation(
@@ -582,10 +621,12 @@ impl NodeServer {
             provider_adapter_contracts,
             config.spawn_profiles.clone(),
             Some(native_launch_profile_control),
+            session_environment_materializer,
             config.state_path.clone(),
             records,
             managed_worktrees,
             managed_worktree_tombstones,
+            materializations,
             persistence_warning,
             input_settle_timeout_ms,
         ));
@@ -622,7 +663,10 @@ impl NodeServer {
                 profile.provider().clone(),
             ));
         }
-        let (binding, native_profiles) = profile.into_parts();
+        let (binding, native_profiles, materialization) = profile.into_parts();
+        if materialization.is_some() && self.shared.session_environment_materializer.is_none() {
+            return Err(NodeServerError::SessionEnvironmentMaterializerRequired);
+        }
         let mut profiles = self
             .shared
             .environment_profiles
@@ -659,6 +703,13 @@ impl NodeServer {
             }
             installed.push(native_id);
         }
+        if let Some(materialization) = materialization {
+            self.shared
+                .environment_materialization_profiles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(binding.id.clone(), materialization);
+        }
         profiles.insert(binding.id.clone(), binding);
         Ok(())
     }
@@ -686,6 +737,7 @@ impl NodeServer {
             events,
             state_path_lock: _state_path_lock,
         } = self;
+        shared.reconcile_materializations();
         shared.reconcile_managed_worktrees().await;
         runtime
             .start_hook_ingress(HookIngressConfig::default())
@@ -1080,7 +1132,11 @@ struct NodeShared {
     spawn_profiles: SpawnProfileRegistry,
     environment_profiles:
         RwLock<BTreeMap<SpawnEnvironmentProfileId, EnvironmentProfileBinding>>,
+    environment_materialization_profiles:
+        RwLock<BTreeMap<SpawnEnvironmentProfileId, NodeSessionMaterializationProfile>>,
     native_launch_profile_control: Option<NativeLaunchProfileControl>,
+    session_environment_materializer: Option<SessionEnvironmentMaterializer>,
+    materializations: Mutex<BTreeMap<MaterializationId, MaterializationOwnershipRecord>>,
     spawn_idempotency: Mutex<SpawnIdempotencyCache>,
     controller: Mutex<Option<ControllerLease>>,
     history: Mutex<NodeEventHistory>,
@@ -1114,6 +1170,7 @@ struct SessionBinding {
     record_id: Option<SessionRecordId>,
     managed_worktree_lease_id: Option<ManagedWorktreeLeaseId>,
     environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    materialization_id: Option<MaterializationId>,
 }
 
 struct NativeEnvironmentSelectionGuard {
@@ -1131,6 +1188,29 @@ impl Drop for NativeEnvironmentSelectionGuard {
     fn drop(&mut self) {
         if let Some(control) = self.control.as_ref() {
             control.clear_native_launch_profile_selection(self.instance_id);
+        }
+    }
+}
+
+struct SessionMaterializationGuard<'a> {
+    shared: &'a NodeShared,
+    id: Option<MaterializationId>,
+}
+
+impl SessionMaterializationGuard<'_> {
+    fn id(&self) -> Option<&MaterializationId> {
+        self.id.as_ref()
+    }
+
+    fn retain(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for SessionMaterializationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = self.shared.cleanup_materialization(&id);
         }
     }
 }
@@ -1197,10 +1277,12 @@ impl NodeShared {
         provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
         spawn_profiles: SpawnProfileRegistry,
         native_launch_profile_control: Option<NativeLaunchProfileControl>,
+        session_environment_materializer: Option<SessionEnvironmentMaterializer>,
         state_path: Option<PathBuf>,
         records: Vec<ManagedSessionRecord>,
         managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
         managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+        materializations: Vec<MaterializationOwnershipRecord>,
         persistence_warning: Option<String>,
         input_settle_timeout_ms: u64,
     ) -> Self {
@@ -1262,7 +1344,15 @@ impl NodeShared {
             provider_adapter_contracts,
             spawn_profiles,
             environment_profiles: RwLock::new(BTreeMap::new()),
+            environment_materialization_profiles: RwLock::new(BTreeMap::new()),
             native_launch_profile_control,
+            session_environment_materializer,
+            materializations: Mutex::new(
+                materializations
+                    .into_iter()
+                    .map(|record| (record.id().clone(), record))
+                    .collect(),
+            ),
             spawn_idempotency: Mutex::new(SpawnIdempotencyCache {
                 entries: BTreeMap::new(),
             }),
@@ -1319,6 +1409,8 @@ impl NodeShared {
             SpawnProfileRegistry::default(),
             None,
             None,
+            None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1475,6 +1567,585 @@ impl NodeShared {
             control: Some(control),
             instance_id,
         }))
+    }
+
+    fn environment_materialization_profile(
+        &self,
+        environment_profile: &ResolvedEnvironmentProfileReceipt,
+    ) -> Option<NodeSessionMaterializationProfile> {
+        self.environment_materialization_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&environment_profile.profile_id)
+            .cloned()
+    }
+
+    fn prepare_session_materialization<'a>(
+        &'a self,
+        address: &SessionAddress,
+        provider: &AgentId,
+        mode: SessionMode,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+        managed_lease_id: Option<ManagedWorktreeLeaseId>,
+    ) -> Result<Option<(NativeLaunchEnvironmentOverlay, SessionMaterializationGuard<'a>)>, NodeFailure> {
+        let Some(environment_profile) = environment_profile else {
+            return Ok(None);
+        };
+        let Some(profile) = self.environment_materialization_profile(environment_profile) else {
+            return Ok(None);
+        };
+        let materializer = self.session_environment_materializer.as_ref().ok_or_else(|| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                "session environment materializer is unavailable",
+            )
+        })?;
+        let id = MaterializationId::new(format!(
+            "mat-{}-{}-{}",
+            self.incarnation_id,
+            address.session.instance_id.0,
+            address.session.generation.0,
+        ))
+        .map_err(|_| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                "session environment materialization identity failed",
+            )
+        })?;
+        let owner = MaterializationOwner::Session {
+            incarnation_id: self.incarnation_id,
+            instance_id: address.session.instance_id,
+            generation: address.session.generation,
+        };
+        let mut ownership = materializer
+            .begin(
+                id.clone(),
+                environment_profile.clone(),
+                owner,
+                managed_lease_id,
+                &profile,
+                unix_time_ms(),
+            )
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "session environment preparation failed",
+                )
+            })?;
+        {
+            let _transaction = self
+                .state_transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let duplicate = self
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone(), ownership.clone());
+            if duplicate.is_some() {
+                return Err(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "session environment materialization identity conflict",
+                ));
+            }
+            if let Err(error) = self.persist_state_locked() {
+                self.materializations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&id);
+                return Err(persistence_failure(error));
+            }
+        }
+        let environment = match materializer.materialize(&mut ownership, &profile, unix_time_ms()) {
+            Ok(environment) => environment,
+            Err(_) => {
+                let transaction = self
+                    .state_transaction
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.materializations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(id.clone(), ownership.clone());
+                if self.persist_state_locked().is_err() {
+                    self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+                }
+                drop(transaction);
+                if ownership.state() == MaterializationState::CleanupRequired {
+                    let _ = self.cleanup_materialization(&id);
+                }
+                return Err(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "session environment materialization failed",
+                ));
+            }
+        };
+        {
+            let _transaction = self
+                .state_transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone(), ownership);
+            if let Err(error) = self.persist_state_locked() {
+                drop(_transaction);
+                let _ = self.cleanup_materialization(&id);
+                return Err(persistence_failure(error));
+            }
+        }
+        let transport = match mode {
+            SessionMode::Pty => TransportKind::Pty,
+            SessionMode::Inline => TransportKind::Pipe,
+        };
+        let guard = SessionMaterializationGuard {
+            shared: self,
+            id: Some(id),
+        };
+        let overlay = NativeLaunchEnvironmentOverlay::new(
+            provider.clone(),
+            transport,
+            environment,
+        )
+        .map_err(|_| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                "session environment overlay is invalid",
+            )
+        })?;
+        Ok(Some((overlay, guard)))
+    }
+
+    fn cleanup_materialization(&self, id: &MaterializationId) -> Result<(), NodeFailure> {
+        let Some(mut ownership) = self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if ownership.state() != MaterializationState::CleanupRequired {
+            ownership.mark_cleanup_required(unix_time_ms()).map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "session environment cleanup state is invalid",
+                )
+            })?;
+        }
+        {
+            let _transaction = self
+                .state_transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = self
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone(), ownership.clone());
+            if let Err(error) = self.persist_state_locked() {
+                let mut materializations = self
+                    .materializations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(previous) = previous {
+                    materializations.insert(id.clone(), previous);
+                }
+                return Err(persistence_failure(error));
+            }
+        }
+        let cleanup = self
+            .session_environment_materializer
+            .as_ref()
+            .ok_or(())
+            .and_then(|materializer| materializer.cleanup(&ownership).map_err(|_| ()));
+        if cleanup.is_err() {
+            let _ = ownership.mark_recovery_required(unix_time_ms());
+            self.materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone(), ownership);
+            if self.persist_state().is_err() {
+                self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+            }
+            return Err(failure(
+                NodeFailureCode::BackendOperationFailed,
+                "session environment cleanup requires recovery",
+            ));
+        }
+        let _transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+        if let Err(error) = self.persist_state_locked() {
+            self.materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone(), ownership);
+            return Err(persistence_failure(error));
+        }
+        Ok(())
+    }
+
+    fn resolve_record_materialization(
+        &self,
+        record_id: &SessionRecordId,
+        provider: &AgentId,
+        mode: SessionMode,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+    ) -> Result<Option<(MaterializationId, NativeLaunchEnvironmentOverlay)>, NodeFailure> {
+        let ownership = {
+            let materializations = self
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut matches = materializations.values().filter(|record| {
+                record.owner()
+                    == &MaterializationOwner::Record {
+                        record_id: record_id.clone(),
+                    }
+            });
+            let ownership = matches.next().cloned();
+            if matches.next().is_some() {
+                return Err(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "managed session has conflicting environment ownership",
+                ));
+            }
+            ownership
+        };
+        let profile = environment_profile
+            .and_then(|receipt| self.environment_materialization_profile(receipt));
+        match (ownership, profile, environment_profile) {
+            (None, None, _) => Ok(None),
+            (None, Some(_), _) | (Some(_), None, _) | (Some(_), Some(_), None) => Err(failure(
+                NodeFailureCode::BackendOperationFailed,
+                "managed session environment materialization is unavailable",
+            )),
+            (Some(ownership), Some(profile), Some(environment_profile)) => {
+                if ownership.environment_profile() != environment_profile
+                    || ownership.state() != MaterializationState::Ready
+                {
+                    self.mark_materialization_recovery_required(ownership.id());
+                    return Err(failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed session environment ownership requires recovery",
+                    ));
+                }
+                let materializer = self.session_environment_materializer.as_ref().ok_or_else(|| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "session environment materializer is unavailable",
+                    )
+                })?;
+                if materializer.revalidate(&ownership).is_err() {
+                    self.mark_materialization_recovery_required(ownership.id());
+                    return Err(failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed session environment revalidation failed",
+                    ));
+                }
+                let environment = match materializer.resolve_environment(&ownership, &profile) {
+                    Ok(environment) => environment,
+                    Err(
+                        SessionEnvironmentMaterializeError::SecretUnavailable
+                        | SessionEnvironmentMaterializeError::SecretDenied
+                        | SessionEnvironmentMaterializeError::InvalidSecretValue,
+                    ) => {
+                        return Err(failure(
+                            NodeFailureCode::BackendOperationFailed,
+                            "managed session environment resolution failed",
+                        ));
+                    }
+                    Err(
+                        SessionEnvironmentMaterializeError::InvalidRoot
+                        | SessionEnvironmentMaterializeError::OwnershipMismatch
+                        | SessionEnvironmentMaterializeError::Filesystem(_)
+                        | SessionEnvironmentMaterializeError::Record(_),
+                    ) => {
+                        self.mark_materialization_recovery_required(ownership.id());
+                        return Err(failure(
+                            NodeFailureCode::BackendOperationFailed,
+                            "managed session environment resolution failed",
+                        ));
+                    }
+                };
+                let transport = match mode {
+                    SessionMode::Pty => TransportKind::Pty,
+                    SessionMode::Inline => TransportKind::Pipe,
+                };
+                let overlay = NativeLaunchEnvironmentOverlay::new(
+                    provider.clone(),
+                    transport,
+                    environment,
+                )
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed session environment overlay is invalid",
+                    )
+                })?;
+                Ok(Some((ownership.id().clone(), overlay)))
+            }
+        }
+    }
+
+    fn destroy_record_materialization(
+        &self,
+        record_id: &SessionRecordId,
+    ) -> Result<bool, NodeFailure> {
+        let ids = self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter_map(|record| {
+                (record.owner()
+                    == &MaterializationOwner::Record {
+                        record_id: record_id.clone(),
+                    })
+                .then(|| record.id().clone())
+            })
+            .collect::<Vec<_>>();
+        if ids.len() > 1 {
+            return Err(failure(
+                NodeFailureCode::BackendOperationFailed,
+                "managed session has conflicting environment ownership",
+            ));
+        }
+        let Some(id) = ids.first().cloned() else {
+            return Ok(false);
+        };
+        let (terminal_record, mut cleanup_ownership) = {
+            let _transaction = self
+                .state_transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original_record = self.record(record_id)?;
+            let mut terminal_record = original_record.clone();
+            terminal_record.provider_session = None;
+            terminal_record.active_session = None;
+            terminal_record.state = ManagedSessionState::Unavailable;
+            terminal_record.last_error = Some("environment-profile-unavailable".to_owned());
+            terminal_record.updated_at_unix_ms = unix_time_ms();
+            let original_ownership = self
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed session environment ownership disappeared during cleanup",
+                    )
+                })?;
+            let mut cleanup_ownership = original_ownership.clone();
+            if cleanup_ownership.state() != MaterializationState::CleanupRequired {
+                cleanup_ownership.mark_cleanup_required(unix_time_ms()).map_err(|_| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed session environment cleanup state is invalid",
+                    )
+                })?;
+            }
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .insert(record_id.clone(), terminal_record.clone());
+            self.materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone(), cleanup_ownership.clone());
+            if let Err(error) = self.persist_state_locked() {
+                self.session_records
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .records
+                    .insert(record_id.clone(), original_record);
+                self.materializations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(id.clone(), original_ownership);
+                return Err(persistence_failure(error));
+            }
+            (terminal_record, cleanup_ownership)
+        };
+        let cleanup = self
+            .session_environment_materializer
+            .as_ref()
+            .ok_or(())
+            .and_then(|materializer| materializer.cleanup(&cleanup_ownership).map_err(|_| ()));
+        if cleanup.is_err() {
+            let _ = cleanup_ownership.mark_recovery_required(unix_time_ms());
+            self.materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone(), cleanup_ownership);
+            if self.persist_state().is_err() {
+                self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+            }
+            return Err(failure(
+                NodeFailureCode::BackendOperationFailed,
+                "managed session environment cleanup requires recovery",
+            ));
+        }
+        let _transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.remove_record_memory(record_id);
+        self.materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+        if let Err(error) = self.persist_state_locked() {
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .insert(record_id.clone(), terminal_record);
+            self.materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, cleanup_ownership);
+            return Err(persistence_failure(error));
+        }
+        Ok(true)
+    }
+
+    fn mark_materialization_recovery_required(&self, id: &MaterializationId) {
+        let changed = {
+            let mut materializations = self
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(ownership) = materializations.get_mut(id) else {
+                return;
+            };
+            ownership.mark_recovery_required(unix_time_ms()).is_ok()
+        };
+        if changed && self.persist_state().is_err() {
+            self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+        }
+    }
+
+    fn reconcile_materializations(&self) {
+        let records = self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut ownership in records {
+            let result = match (ownership.state(), ownership.owner()) {
+                (MaterializationState::Preparing, _)
+                | (MaterializationState::CleanupRequired, _) => {
+                    self.cleanup_materialization(ownership.id())
+                }
+                (MaterializationState::Ready, MaterializationOwner::Session { .. }) => {
+                    if ownership.mark_recovery_required(unix_time_ms()).is_ok() {
+                        self.materializations
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(ownership.id().clone(), ownership.clone());
+                        self.persist_state().map_err(persistence_failure)
+                    } else {
+                        Err(failure(
+                            NodeFailureCode::BackendOperationFailed,
+                            "session environment reconciliation failed",
+                        ))
+                    }
+                }
+                (MaterializationState::Ready, MaterializationOwner::Record { .. }) => self
+                    .session_environment_materializer
+                    .as_ref()
+                    .ok_or_else(|| {
+                        failure(
+                            NodeFailureCode::BackendOperationFailed,
+                            "session environment materializer is unavailable",
+                        )
+                    })
+                    .and_then(|materializer| {
+                        materializer.revalidate(&ownership).map_err(|_| {
+                            failure(
+                                NodeFailureCode::BackendOperationFailed,
+                                "session environment revalidation failed",
+                            )
+                        })
+                    }),
+                (MaterializationState::RecoveryRequired, _) => Ok(()),
+            };
+            if result.is_err() && ownership.state() != MaterializationState::RecoveryRequired {
+                let _ = ownership.mark_recovery_required(unix_time_ms());
+                self.materializations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(ownership.id().clone(), ownership);
+                if self.persist_state().is_err() {
+                    self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+                }
+            }
+        }
+        let materialized_profiles = self
+            .environment_materialization_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if materialized_profiles.is_empty() {
+            return;
+        }
+        let ownership = self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = {
+            let mut session_records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut changed = false;
+            for record in session_records.records.values_mut() {
+                let Some(environment_profile) = record.environment_profile.as_ref() else {
+                    continue;
+                };
+                if !materialized_profiles.contains(&environment_profile.profile_id) {
+                    continue;
+                }
+                let has_exact_ownership = ownership.iter().any(|candidate| {
+                    candidate.environment_profile() == environment_profile
+                        && candidate.owner()
+                            == &MaterializationOwner::Record {
+                                record_id: record.record_id.clone(),
+                            }
+                });
+                if !has_exact_ownership {
+                    record.provider_session = None;
+                    record.active_session = None;
+                    record.state = ManagedSessionState::Unavailable;
+                    record.last_error = Some("environment-profile-unavailable".to_owned());
+                    record.updated_at_unix_ms = unix_time_ms();
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed && self.persist_state().is_err() {
+            self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
+        }
     }
 
     fn replay_spawn_spec(
@@ -2187,13 +2858,21 @@ impl NodeShared {
                 .collect::<Vec<_>>(),
             unix_time_ms(),
         );
-        let result = session_registry::save_v5(
+        let materializations = self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = session_registry::save_v6(
             self.state_path.as_deref(),
             &self.node_id,
             &workspaces,
             &records,
             &managed.records(),
             &managed.tombstones(),
+            &materializations,
         );
         match &result {
             Ok(warning) => self.set_persistence_error(warning.clone()),
@@ -2273,11 +2952,27 @@ impl NodeShared {
         );
     }
 
+    #[cfg(test)]
     fn bind_session_with_policy(
         &self,
         address: &SessionAddress,
         runtime_policy: ProviderRuntimePolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    ) {
+        self.bind_session_with_materialization(
+            address,
+            runtime_policy,
+            environment_profile,
+            None,
+        );
+    }
+
+    fn bind_session_with_materialization(
+        &self,
+        address: &SessionAddress,
+        runtime_policy: ProviderRuntimePolicy,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        materialization_id: Option<MaterializationId>,
     ) {
         let mut bindings = self
             .session_bindings
@@ -2293,15 +2988,34 @@ impl NodeShared {
             record_id: None,
             managed_worktree_lease_id: None,
             environment_profile,
+            materialization_id,
         });
     }
 
+    #[cfg(test)]
     fn bind_managed_session(
         &self,
         address: &SessionAddress,
         record_id: SessionRecordId,
         runtime_policy: ProviderRuntimePolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    ) {
+        self.bind_managed_session_with_materialization(
+            address,
+            record_id,
+            runtime_policy,
+            environment_profile,
+            None,
+        );
+    }
+
+    fn bind_managed_session_with_materialization(
+        &self,
+        address: &SessionAddress,
+        record_id: SessionRecordId,
+        runtime_policy: ProviderRuntimePolicy,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        materialization_id: Option<MaterializationId>,
     ) {
         let mut bindings = self
             .session_bindings
@@ -2319,10 +3033,12 @@ impl NodeShared {
                 record_id: Some(record_id),
                 managed_worktree_lease_id: None,
                 environment_profile,
+                materialization_id,
             },
         );
     }
 
+    #[cfg(test)]
     fn bind_spawn_session(
         &self,
         address: &SessionAddress,
@@ -2331,8 +3047,32 @@ impl NodeShared {
         runtime_policy: ProviderRuntimePolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     ) -> Result<Option<SessionRecordId>, NodeFailure> {
+        self.bind_spawn_session_with_materialization(
+            address,
+            provider,
+            mode,
+            runtime_policy,
+            environment_profile,
+            None,
+        )
+    }
+
+    fn bind_spawn_session_with_materialization(
+        &self,
+        address: &SessionAddress,
+        provider: AgentId,
+        mode: SessionMode,
+        runtime_policy: ProviderRuntimePolicy,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+        materialization_id: Option<MaterializationId>,
+    ) -> Result<Option<SessionRecordId>, NodeFailure> {
         if !runtime_policy.provider_session_identity {
-            self.bind_session_with_policy(address, runtime_policy, environment_profile);
+            self.bind_session_with_materialization(
+                address,
+                runtime_policy,
+                environment_profile,
+                materialization_id,
+            );
             return Ok(None);
         }
         let record = self.new_record(
@@ -2349,15 +3089,53 @@ impl NodeShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.insert_record(record.clone())?;
-        self.bind_managed_session(
+        let previous_materialization = if let Some(materialization_id) = materialization_id.as_ref() {
+            let mut materializations = self
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(ownership) = materializations.get_mut(materialization_id) else {
+                drop(materializations);
+                self.remove_record_memory(&record_id);
+                return Err(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "session environment ownership disappeared before binding",
+                ));
+            };
+            let previous = ownership.clone();
+            if ownership
+                .transfer_to_record(record_id.clone(), unix_time_ms())
+                .is_err()
+            {
+                drop(materializations);
+                self.remove_record_memory(&record_id);
+                return Err(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "session environment ownership transfer failed",
+                ));
+            }
+            Some(previous)
+        } else {
+            None
+        };
+        self.bind_managed_session_with_materialization(
             address,
             record_id.clone(),
             runtime_policy,
             environment_profile,
+            materialization_id.clone(),
         );
         if let Err(error) = self.persist_state_locked() {
             self.remove_binding(address);
             self.remove_record_memory(&record_id);
+            if let (Some(materialization_id), Some(previous)) =
+                (materialization_id.as_ref(), previous_materialization)
+            {
+                self.materializations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(materialization_id.clone(), previous);
+            }
             return Err(persistence_failure(error));
         }
         drop(transaction);
@@ -2504,6 +3282,12 @@ impl NodeShared {
     }
 
     fn discard_record(&self, record_id: &SessionRecordId) -> Result<(), NodeFailure> {
+        if self.destroy_record_materialization(record_id)? {
+            self.publish(NodeEvent::SessionRecordRemoved {
+                record_id: record_id.clone(),
+            });
+            return Ok(());
+        }
         let transaction = self
             .state_transaction
             .lock()
@@ -2641,21 +3425,23 @@ impl NodeShared {
         if let Some(address) = self.bound_address_for_record(record_id) {
             self.remove_session(&address).await?;
         }
-        let transaction = self
-            .state_transaction
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let removed = self.remove_record_memory(record_id).ok_or_else(|| {
-            failure(
-                NodeFailureCode::UnknownSessionRecord,
-                "managed session record does not exist",
-            )
-        })?;
-        if let Err(error) = self.persist_state_locked() {
-            let _ = self.insert_record(removed);
-            return Err(persistence_failure(error));
+        if !self.destroy_record_materialization(record_id)? {
+            let transaction = self
+                .state_transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let removed = self.remove_record_memory(record_id).ok_or_else(|| {
+                failure(
+                    NodeFailureCode::UnknownSessionRecord,
+                    "managed session record does not exist",
+                )
+            })?;
+            if let Err(error) = self.persist_state_locked() {
+                let _ = self.insert_record(removed);
+                return Err(persistence_failure(error));
+            }
+            drop(transaction);
         }
-        drop(transaction);
         self.publish(NodeEvent::SessionRecordRemoved {
             record_id: record_id.clone(),
         });
@@ -2753,6 +3539,22 @@ impl NodeShared {
             .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
         self.ensure_binding_capacity()?;
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
+        let resolved_materialization = match self.resolve_record_materialization(
+            record_id,
+            &record.provider,
+            record.mode,
+            record.environment_profile.as_ref(),
+        ) {
+            Ok(materialization) => materialization,
+            Err(error) => {
+                self.mark_record_error(record_id, "environment-profile-unavailable")?;
+                return Err(error);
+            }
+        };
+        let (materialization_id, environment_overlay) = match resolved_materialization {
+            Some((id, overlay)) => (Some(id), Some(overlay)),
+            None => (None, None),
+        };
         let mut environment_selection = match self.select_environment_profile(
             instance_id,
             &record.provider,
@@ -2765,6 +3567,23 @@ impl NodeShared {
                 return Err(error);
             }
         };
+        if let Some(overlay) = environment_overlay {
+            self.native_launch_profile_control
+                .as_ref()
+                .ok_or_else(|| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "native environment profile controller is unavailable",
+                    )
+                })?
+                .install_native_launch_environment_overlay(instance_id, overlay)
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed session environment overlay installation failed",
+                    )
+                })?;
+        }
         if let Some(stale_address) = self.bound_address_for_record(record_id) {
             self.remove_session(&stale_address).await?;
         }
@@ -2791,11 +3610,12 @@ impl NodeShared {
                 "managed session became active while resume was being prepared",
             ));
         }
-        self.bind_managed_session(
+        self.bind_managed_session_with_materialization(
             &address,
             record_id.clone(),
             runtime_policy,
             record.environment_profile.clone(),
+            materialization_id,
         );
         if let Some(selection) = environment_selection.take() {
             selection.retain();
@@ -2819,7 +3639,9 @@ impl NodeShared {
             )
             .await
         {
-            self.remove_binding(&address);
+            if let Some(binding) = self.remove_binding(&address) {
+                self.cleanup_session_owned_materialization(&address, &binding)?;
+            }
             return Err(error);
         }
         let command = self.prepare_command(ControlCommand::Resume {
@@ -3416,6 +4238,18 @@ impl NodeShared {
                 "managed worktree lease still has a session or durable-record holder",
             ));
         }
+        if self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|record| record.managed_lease_id() == Some(lease_id))
+        {
+            return Err(failure(
+                NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                "managed worktree cleanup is blocked by session environment ownership",
+            ));
+        }
         if !explicit && lease.retention == ManagedWorktreeRetention::Retain {
             let snapshot = {
                 let mut registry = self.managed_worktrees.lock()
@@ -3679,6 +4513,39 @@ impl NodeShared {
         None
     }
 
+    fn cleanup_session_owned_materialization(
+        &self,
+        address: &SessionAddress,
+        binding: &SessionBinding,
+    ) -> Result<(), NodeFailure> {
+        let Some(id) = binding.materialization_id.as_ref() else {
+            return Ok(());
+        };
+        let owner = self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .map(|record| record.owner().clone());
+        match owner {
+            None | Some(MaterializationOwner::Record { .. }) => Ok(()),
+            Some(MaterializationOwner::Session {
+                incarnation_id,
+                instance_id,
+                generation,
+            }) if incarnation_id == self.incarnation_id
+                && instance_id == address.session.instance_id
+                && generation == address.session.generation =>
+            {
+                self.cleanup_materialization(id)
+            }
+            Some(MaterializationOwner::Session { .. }) => Err(failure(
+                NodeFailureCode::BackendOperationFailed,
+                "session environment ownership requires recovery",
+            )),
+        }
+    }
+
     fn clear_terminal_frame_watermark(&self, address: &SessionAddress) {
         let mut watermarks = self
             .terminal_frame_watermarks
@@ -3851,6 +4718,7 @@ impl NodeShared {
             } if identity_admitted => Some(identity.clone()),
             _ => None,
         };
+        let identity_was_observed = observed_identity.is_some();
         let replacement_id = observed_identity
             .as_ref()
             .and_then(|_| self.allocate_record_id().ok());
@@ -3858,6 +4726,11 @@ impl NodeShared {
         let mut removals = Vec::new();
         let mut rebind = None;
         let original_records;
+        let original_materializations = self
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         {
             let mut records = self
                 .session_records
@@ -4063,7 +4936,86 @@ impl NodeShared {
                 }
             }
         }
-        if let Some(new_record_id) = rebind {
+        let materialization_owner_record = identity_was_observed.then(|| {
+            rebind.clone().unwrap_or_else(|| record_id.clone())
+        }).and_then(|candidate| {
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .get(&candidate)
+                .filter(|record| {
+                    record.provider_session.is_some()
+                        && record.active_session.as_ref() == Some(address)
+                })
+                .map(|_| candidate)
+        });
+        if let Some(owner_record_id) = materialization_owner_record {
+            let materialization_id = self
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&address.session.instance_id)
+                .and_then(|binding| binding.materialization_id.clone());
+            if let Some(materialization_id) = materialization_id {
+                let mut transfer_failed = false;
+                {
+                    let mut materializations = self
+                        .materializations
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(ownership) = materializations.get_mut(&materialization_id) {
+                        match ownership.owner() {
+                            MaterializationOwner::Session {
+                                incarnation_id,
+                                instance_id,
+                                generation,
+                            } if *incarnation_id == self.incarnation_id
+                                && *instance_id == address.session.instance_id
+                                && *generation == address.session.generation =>
+                            {
+                                transfer_failed = ownership
+                                    .transfer_to_record(owner_record_id.clone(), unix_time_ms())
+                                    .is_err();
+                            }
+                            MaterializationOwner::Record { record_id }
+                                if record_id == &owner_record_id => {}
+                            MaterializationOwner::Record { record_id } => {
+                                let expected = record_id.clone();
+                                transfer_failed = ownership
+                                    .transfer_record_owner(
+                                        &expected,
+                                        owner_record_id.clone(),
+                                        unix_time_ms(),
+                                    )
+                                    .is_err();
+                            }
+                            _ => transfer_failed = true,
+                        }
+                        if transfer_failed {
+                            let _ = ownership.mark_recovery_required(unix_time_ms());
+                        }
+                    } else {
+                        transfer_failed = true;
+                    }
+                }
+                if transfer_failed {
+                    if let Some(record) = self
+                        .session_records
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .records
+                        .get_mut(&owner_record_id)
+                    {
+                        record.state = ManagedSessionState::Unavailable;
+                        record.last_error = Some("environment-profile-unavailable".to_owned());
+                        record.updated_at_unix_ms = unix_time_ms();
+                        upserts.push(record.clone());
+                    }
+                }
+            }
+        }
+        if let Some(new_record_id) = rebind.clone() {
             if let Some(binding) = self
                 .session_bindings
                 .lock()
@@ -4083,6 +5035,10 @@ impl NodeShared {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             records.records = original_records;
+            *self
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = original_materializations;
             if let Some(current) = records.records.get_mut(record_id) {
                 current.state = ManagedSessionState::Unavailable;
                 current.last_error = Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned());
@@ -4739,12 +5695,6 @@ impl NodeShared {
         self.ensure_binding_capacity()?;
         let working_directory = self.workspace_root(&workspace_id)?;
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
-        let mut environment_selection = self.select_environment_profile(
-            instance_id,
-            &provider,
-            mode,
-            environment_profile.as_ref(),
-        )?;
         let session = SessionKey {
             instance_id,
             generation: SessionGeneration(1),
@@ -4753,22 +5703,64 @@ impl NodeShared {
             workspace_id: workspace_id.clone(),
             session,
         };
-        let record_id = self.bind_spawn_session(
+        let prepared_materialization = self.prepare_session_materialization(
+            &address,
+            &provider,
+            mode,
+            environment_profile.as_ref(),
+            managed_authority.clone(),
+        )?;
+        let (environment_overlay, mut materialization_guard) = match prepared_materialization {
+            Some((overlay, guard)) => (Some(overlay), Some(guard)),
+            None => (None, None),
+        };
+        let materialization_id = materialization_guard
+            .as_ref()
+            .and_then(SessionMaterializationGuard::id)
+            .cloned();
+        let mut environment_selection = self.select_environment_profile(
+            instance_id,
+            &provider,
+            mode,
+            environment_profile.as_ref(),
+        )?;
+        if let Some(overlay) = environment_overlay {
+            self.native_launch_profile_control
+                .as_ref()
+                .ok_or_else(|| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "native environment profile controller is unavailable",
+                    )
+                })?
+                .install_native_launch_environment_overlay(instance_id, overlay)
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "session environment overlay installation failed",
+                    )
+                })?;
+        }
+        let dispatch_timeout = spawn_dispatch_timeout(deadline)?;
+        let record_id = self.bind_spawn_session_with_materialization(
             &address,
             provider.clone(),
             mode,
             runtime_policy,
             environment_profile,
+            materialization_id,
         )?;
         if let Some(selection) = environment_selection.take() {
             selection.retain();
+        }
+        if let Some(guard) = materialization_guard.take() {
+            guard.retain();
         }
         let transport = match mode {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
         };
         let agent_id = provider;
-        let dispatch_timeout = spawn_dispatch_timeout(deadline)?;
         if let Err(error) = self.dispatch_bounded(
             ControlCommand::Register {
                 instance_id,
@@ -4778,7 +5770,9 @@ impl NodeShared {
             dispatch_timeout,
         )
         .await {
-            self.remove_binding(&address);
+            if let Some(binding) = self.remove_binding(&address) {
+                self.cleanup_session_owned_materialization(&address, &binding)?;
+            }
             if let Some(record_id) = record_id.as_ref() {
                 self.discard_record(record_id)?;
             }
@@ -4939,7 +5933,9 @@ impl NodeShared {
         )
         .await?;
         self.wait_until_removed(address, commit_timeout).await?;
-        self.remove_binding(address);
+        if let Some(binding) = self.remove_binding(address) {
+            self.cleanup_session_owned_materialization(address, &binding)?;
+        }
         Ok(())
     }
 
@@ -4954,6 +5950,9 @@ impl NodeShared {
             .await?;
         self.wait_until_removed(address, commit_timeout).await?;
         let removed = self.remove_binding(address);
+        if let Some(binding) = removed.as_ref() {
+            self.cleanup_session_owned_materialization(address, binding)?;
+        }
         if let Some(lease_id) = removed.and_then(|binding| binding.managed_worktree_lease_id) {
             let snapshot = self.managed_worktrees.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5506,7 +6505,7 @@ fn node_compatibility_support_for_manifest(
         path_semantics: platform::path_semantics(),
         local_transport: platform::local_transport(),
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V6)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: provider_contracts.to_vec(),
@@ -7048,6 +8047,12 @@ pub enum NodeServerError {
     DuplicateNativeEnvironmentProfile(String),
     #[error("node native environment profile is invalid: {0}")]
     NativeEnvironmentProfile(String),
+    #[error("node session-environment materialization root must be absolute")]
+    InvalidSessionEnvironmentRoot,
+    #[error("node session-environment materializer is unavailable")]
+    SessionEnvironmentMaterializerRequired,
+    #[error("node session-environment materializer failed to initialize")]
+    SessionEnvironmentMaterializer,
     #[error("active agent registry failed: {0}")]
     Registry(String),
     #[error("node provider contract manifest is invalid: {0}")]
@@ -7083,6 +8088,11 @@ pub enum NodeServerError {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use crate::session_environment::{
+        NodeSecretReference, NodeSecretResolveError, NodeSecretValue,
+        NodeSessionEnvironmentMutation, NodeSessionFile, NodeSessionPathBinding,
+        NodeSessionPathClass,
+    };
     use gate4agent_catalog::EnvMutation;
     use gate4agent_runtime_native::{
         NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
@@ -7092,6 +8102,24 @@ mod tests {
     use std::sync::Arc;
 
     struct EmptyEnvironmentResolver;
+
+    struct FixtureSecretResolver {
+        deny: Arc<AtomicBool>,
+    }
+
+    impl NodeSecretResolver for FixtureSecretResolver {
+        fn resolve(
+            &self,
+            _reference: &NodeSecretReference,
+        ) -> Result<NodeSecretValue, NodeSecretResolveError> {
+            if self.deny.load(Ordering::Acquire) {
+                Err(NodeSecretResolveError::Denied)
+            } else {
+                NodeSecretValue::text("fixture-secret")
+                    .map_err(|_| NodeSecretResolveError::Unavailable)
+            }
+        }
+    }
 
     impl NativeChildEnvironmentResolver for EmptyEnvironmentResolver {
         fn resolve_child_environment(
@@ -7196,7 +8224,7 @@ mod tests {
             .unwrap()],
         )
         .unwrap();
-        let (binding, native_profiles) = node_profile.into_parts();
+        let (binding, native_profiles, _materialization) = node_profile.into_parts();
         for native_profile in native_profiles {
             runtime.upsert_native_launch_profile(native_profile).unwrap();
         }
@@ -7219,6 +8247,8 @@ mod tests {
             spawn_profiles,
             Some(control),
             None,
+            None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -7240,6 +8270,188 @@ mod tests {
         )
     }
 
+    fn materialization_test_shared(
+        deny_secret: bool,
+    ) -> (
+        NodeShared,
+        NativeRuntime,
+        ResolvedEnvironmentProfileReceipt,
+        PathBuf,
+        Arc<AtomicBool>,
+    ) {
+        let root = temporary_workspace_root(if deny_secret {
+            "materialization-denied"
+        } else {
+            "materialization-ready"
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let materialization_root = root.join("session-environments");
+        let deny = Arc::new(AtomicBool::new(deny_secret));
+        let resolver = Arc::new(FixtureSecretResolver {
+            deny: Arc::clone(&deny),
+        });
+        let materializer = SessionEnvironmentMaterializer::new(
+            materialization_root,
+            resolver,
+        )
+        .unwrap();
+        let profile_id = SpawnEnvironmentProfileId::new("materialized-claude").unwrap();
+        let profile_revision = crate::protocol::SpawnEnvironmentProfileRevision::new(
+            "materialized-claude-r1",
+        )
+        .unwrap();
+        let materialization = NodeSessionMaterializationProfile::new(
+            vec![NodeSessionEnvironmentMutation::SetSecret {
+                key: "GATE4AGENT_SESSION_TOKEN".to_owned(),
+                reference: NodeSecretReference::new("fixture-token").unwrap(),
+            }],
+            vec![NodeSessionPathBinding::new(
+                "GATE4AGENT_PROVIDER_HOME",
+                NodeSessionPathClass::ProviderHome,
+            )
+            .unwrap()],
+            vec![NodeSessionFile::secret(
+                NodeSessionPathClass::Config,
+                "auth/token",
+                NodeSecretReference::new("fixture-token").unwrap(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let control = runtime.native_launch_profile_control();
+        let node_profile = NodeEnvironmentProfile::new_with_materialization(
+            profile_id.clone(),
+            profile_revision.clone(),
+            agent("claude"),
+            [NativeLaunchProfile::new(
+                NativeLaunchProfileId::new("materialized-claude-pty").unwrap(),
+                agent("claude"),
+                TransportKind::Pty,
+                vec![OsString::from("GATE4AGENT_TEST_PROFILE")],
+                Arc::new(EmptyEnvironmentResolver),
+            )
+            .unwrap()],
+            Some(materialization),
+        )
+        .unwrap();
+        let (binding, native_profiles, materialization) = node_profile.into_parts();
+        for native_profile in native_profiles {
+            runtime.upsert_native_launch_profile(native_profile).unwrap();
+        }
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new_with_incarnation(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-materialization-test").unwrap(),
+            NodeIncarnationId::from_bytes([9; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            SpawnProfileRegistry::default(),
+            Some(control),
+            Some(materializer),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+        shared
+            .environment_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(binding.id.clone(), binding);
+        shared
+            .environment_materialization_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(profile_id.clone(), materialization.unwrap());
+        (
+            shared,
+            runtime,
+            ResolvedEnvironmentProfileReceipt {
+                profile_id,
+                profile_revision,
+            },
+            root,
+            deny,
+        )
+    }
+
+    fn bind_record_owned_materialization_fixture(
+        shared: &NodeShared,
+        receipt: &ResolvedEnvironmentProfileReceipt,
+        instance_id: u64,
+    ) -> (SessionAddress, SessionRecordId, MaterializationId, PathBuf) {
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(instance_id),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (overlay, materialization_guard) = shared
+            .prepare_session_materialization(
+                &address,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(receipt),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let materialization_id = materialization_guard.id().unwrap().clone();
+        let materialization_root = shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&materialization_id)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let selection = shared
+            .select_environment_profile(
+                address.session.instance_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(receipt),
+            )
+            .unwrap()
+            .unwrap();
+        shared
+            .native_launch_profile_control
+            .as_ref()
+            .unwrap()
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .unwrap();
+        let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
+        let record_id = shared
+            .bind_spawn_session_with_materialization(
+                &address,
+                agent("claude"),
+                SessionMode::Pty,
+                policy,
+                Some(receipt.clone()),
+                Some(materialization_id.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        selection.retain();
+        materialization_guard.retain();
+        (address, record_id, materialization_id, materialization_root)
+    }
+
     #[test]
     fn child_environment_profile_capability_is_state_aware_and_legacy_safe() {
         let (shared, _runtime, environment_profile) = environment_profile_test_shared();
@@ -7247,7 +8459,7 @@ mod tests {
             capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
         }));
         let support = node_compatibility_support_for_manifest(&[], &[]).unwrap();
-        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V5);
+        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V6);
         let spec = spawn_spec_fixture();
         assert!(matches!(
             &spec.overrides.environment_profile_id,
@@ -7373,6 +8585,411 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(&AgentInstanceId(42)));
+    }
+
+    #[test]
+    fn session_environment_materialization_failure_is_pre_child_and_durable() {
+        let (shared, runtime, receipt, root, _deny) = materialization_test_shared(true);
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(201),
+                generation: SessionGeneration(1),
+            },
+        };
+        let error = match shared.prepare_session_materialization(
+            &address,
+            &agent("claude"),
+            SessionMode::Pty,
+            Some(&receipt),
+            None,
+        ) {
+            Ok(_) => panic!("denied local reference unexpectedly materialized"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, NodeFailureCode::BackendOperationFailed);
+        assert!(shared.handle.snapshot().sessions.is_empty());
+        assert!(shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_environment_binding_retains_on_stop_and_cleans_after_remove_reap() {
+        let (shared, runtime, receipt, root, _deny) = materialization_test_shared(false);
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(202),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (overlay, materialization_guard) = shared
+            .prepare_session_materialization(
+                &address,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let materialization_id = materialization_guard.id().unwrap().clone();
+        let materialization_root = shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&materialization_id)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let selection = shared
+            .select_environment_profile(
+                address.session.instance_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+            )
+            .unwrap()
+            .unwrap();
+        shared
+            .native_launch_profile_control
+            .as_ref()
+            .unwrap()
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .unwrap();
+        shared.bind_session_with_materialization(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            Some(receipt),
+            Some(materialization_id),
+        );
+        selection.retain();
+        materialization_guard.retain();
+
+        assert!(materialization_root.is_dir());
+        assert!(shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&address.session.instance_id));
+
+        let removed = shared.remove_binding(&address).unwrap();
+        shared
+            .cleanup_session_owned_materialization(&address, &removed)
+            .unwrap();
+        assert!(!materialization_root.exists());
+        assert!(shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_owned_session_environment_reuses_on_resume_and_forget_cleans() {
+        let (shared, runtime, receipt, root, _deny) = materialization_test_shared(false);
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(203),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (overlay, materialization_guard) = shared
+            .prepare_session_materialization(
+                &address,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let materialization_id = materialization_guard.id().unwrap().clone();
+        let materialization_root = shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&materialization_id)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let selection = shared
+            .select_environment_profile(
+                address.session.instance_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+            )
+            .unwrap()
+            .unwrap();
+        shared
+            .native_launch_profile_control
+            .as_ref()
+            .unwrap()
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .unwrap();
+        let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
+        let record_id = shared
+            .bind_spawn_session_with_materialization(
+                &address,
+                agent("claude"),
+                SessionMode::Pty,
+                policy,
+                Some(receipt.clone()),
+                Some(materialization_id.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        selection.retain();
+        materialization_guard.retain();
+        assert_eq!(
+            shared
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&materialization_id)
+                .unwrap()
+                .owner(),
+            &MaterializationOwner::Record {
+                record_id: record_id.clone(),
+            },
+        );
+
+        let removed = shared.remove_binding(&address).unwrap();
+        shared
+            .cleanup_session_owned_materialization(&address, &removed)
+            .unwrap();
+        assert!(materialization_root.is_dir());
+        assert!(shared
+            .resolve_record_materialization(
+                &record_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+            )
+            .unwrap()
+            .is_some());
+        {
+            let mut records = shared
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let record = records.records.get_mut(&record_id).unwrap();
+            record.active_session = None;
+            record.state = ManagedSessionState::Unavailable;
+        }
+        shared.forget_session_record(&record_id).await.unwrap();
+        assert!(!materialization_root.exists());
+        assert!(shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_materialization_revalidation_failure_persists_recovery_required() {
+        let (mut shared, runtime, receipt, root, _deny) = materialization_test_shared(false);
+        let state_path = root.join("node-state-v6.json");
+        shared.state_path = Some(state_path.clone());
+        let (_address, _record_id, materialization_id, materialization_root) =
+            bind_record_owned_materialization_fixture(&shared, &receipt, 205);
+        std::fs::write(
+            materialization_root.join(".gate4agent-materialization-owner"),
+            b"tampered",
+        )
+        .unwrap();
+
+        let error = match shared.resolve_record_materialization(
+            &_record_id,
+            &agent("claude"),
+            SessionMode::Pty,
+            Some(&receipt),
+        ) {
+            Ok(_) => panic!("tampered owner marker unexpectedly revalidated"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, NodeFailureCode::BackendOperationFailed);
+        assert_eq!(
+            shared
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&materialization_id)
+                .unwrap()
+                .state(),
+            MaterializationState::RecoveryRequired,
+        );
+        let loaded = session_registry::load(Some(&state_path), &shared.node_id).unwrap();
+        assert_eq!(loaded.materializations.len(), 1);
+        assert_eq!(
+            loaded.materializations[0].state(),
+            MaterializationState::RecoveryRequired,
+        );
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transient_record_materialization_resolution_failure_remains_ready() {
+        let (shared, runtime, receipt, root, deny) = materialization_test_shared(false);
+        let (_address, record_id, materialization_id, _materialization_root) =
+            bind_record_owned_materialization_fixture(&shared, &receipt, 206);
+        deny.store(true, Ordering::Release);
+
+        let error = match shared.resolve_record_materialization(
+            &record_id,
+            &agent("claude"),
+            SessionMode::Pty,
+            Some(&receipt),
+        ) {
+            Ok(_) => panic!("denied transient resolver unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, NodeFailureCode::BackendOperationFailed);
+        assert_eq!(
+            shared
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&materialization_id)
+                .unwrap()
+                .state(),
+            MaterializationState::Ready,
+        );
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_missing_record_materialization_is_not_resumable() {
+        let (shared, runtime, receipt, root, _deny) = materialization_test_shared(false);
+        let record_id = SessionRecordId::new("sr-missing-materialization").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: record_id.clone(),
+                display_name: "missing materialization".to_owned(),
+                provider: agent("claude"),
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::Dormant,
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                canonical_root: opaque_windows_path(
+                    std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+                ),
+                provider_session: Some(gate4agent_types::ProviderSessionIdentity {
+                    key: gate4agent_types::ProviderSessionKey::SessionId,
+                    id: "provider-session-missing-materialization".to_owned(),
+                    transcript_path: None,
+                }),
+                active_session: None,
+                environment_profile: Some(receipt),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_error: None,
+            })
+            .unwrap();
+
+        shared.reconcile_materializations();
+        let record = shared.record(&record_id).unwrap();
+        assert_eq!(record.state, ManagedSessionState::Unavailable);
+        assert!(record.provider_session.is_none());
+        assert_eq!(
+            record.last_error.as_deref(),
+            Some("environment-profile-unavailable"),
+        );
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_cleanup_waits_for_session_environment_cleanup() {
+        let (shared, runtime, receipt, root, _deny) = materialization_test_shared(false);
+        let lease = install_managed_lease(&shared);
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(204),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (overlay, materialization_guard) = shared
+            .prepare_session_materialization(
+                &address,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+                Some(lease.lease_id.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        let materialization_id = materialization_guard.id().unwrap().clone();
+        let materialization_root = shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&materialization_id)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let selection = shared
+            .select_environment_profile(
+                address.session.instance_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+            )
+            .unwrap()
+            .unwrap();
+        shared
+            .native_launch_profile_control
+            .as_ref()
+            .unwrap()
+            .install_native_launch_environment_overlay(address.session.instance_id, overlay)
+            .unwrap();
+        shared.bind_session_with_materialization(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            Some(receipt),
+            Some(materialization_id),
+        );
+        selection.retain();
+        materialization_guard.retain();
+
+        let blocked = shared
+            .cleanup_managed_worktree(&lease.lease_id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code, NodeFailureCode::ManagedWorktreeRecoveryRequired);
+        assert!(materialization_root.is_dir());
+        let removed = shared.remove_binding(&address).unwrap();
+        shared
+            .cleanup_session_owned_materialization(&address, &removed)
+            .unwrap();
+        assert!(!materialization_root.exists());
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn install_managed_lease(shared: &NodeShared) -> ManagedWorktreeLeaseRecord {
@@ -7569,8 +9186,10 @@ mod tests {
             SpawnProfileRegistry::default(),
             None,
             None,
+            None,
             Vec::new(),
             vec![lease.clone()],
+            Vec::new(),
             Vec::new(),
             None,
             MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
@@ -9209,7 +10828,9 @@ mod tests {
             Vec::new(),
             SpawnProfileRegistry::default(),
             None,
+            None,
             Some(state_path.clone()),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -9367,9 +10988,11 @@ mod tests {
             SpawnProfileRegistry::default(),
             None,
             None,
+            None,
             loaded.records,
             loaded.managed_worktrees,
             loaded.managed_worktree_tombstones,
+            loaded.materializations,
             loaded.warning,
             MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
         );

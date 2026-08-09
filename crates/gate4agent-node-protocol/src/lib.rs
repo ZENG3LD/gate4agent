@@ -24,6 +24,7 @@ pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_STATE_SCHEMA_V3: u16 = 3;
 pub const NODE_STATE_SCHEMA_V4: u16 = 4;
 pub const NODE_STATE_SCHEMA_V5: u16 = 5;
+pub const NODE_STATE_SCHEMA_V6: u16 = 6;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
@@ -2443,7 +2444,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V5,
+                maximum: NODE_STATE_SCHEMA_V6,
             },
         }),
     }
@@ -4603,6 +4604,7 @@ mod tests {
         assert_eq!(NODE_PROTOCOL_VERSION, 8);
         assert_eq!(NODE_STATE_SCHEMA_V4, 4);
         assert_eq!(NODE_STATE_SCHEMA_V5, 5);
+        assert_eq!(NODE_STATE_SCHEMA_V6, 6);
         assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES)).is_ok());
         assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES + 1)).is_err());
         assert!(WorktreeProfileRevision::new(

@@ -4,8 +4,14 @@ use crate::protocol::{
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3, NODE_STATE_SCHEMA_V4,
     NODE_STATE_SCHEMA_V5,
+    NODE_STATE_SCHEMA_V6,
 };
 use crate::worktree_service::ManagedWorktreeLeaseRecord;
+use crate::session_environment::{
+    opaque_to_path, path_to_opaque, MaterializationId, MaterializationOwner,
+    MaterializationOwnershipRecord, MaterializationState, MaterializedPathDeclaration,
+    MAX_SESSION_MATERIALIZATIONS,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
@@ -179,12 +185,13 @@ fn acquire_unix_state_lock(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct LoadedNodeState {
     pub workspaces: BTreeMap<WorkspaceId, String>,
     pub records: Vec<ManagedSessionRecord>,
     pub managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
     pub managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+    pub materializations: Vec<MaterializationOwnershipRecord>,
     pub warning: Option<String>,
 }
 
@@ -195,8 +202,23 @@ impl LoadedNodeState {
             records: Vec::new(),
             managed_worktrees: Vec::new(),
             managed_worktree_tombstones: Vec::new(),
+            materializations: Vec::new(),
             warning: None,
         }
+    }
+}
+
+impl fmt::Debug for LoadedNodeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedNodeState")
+            .field("workspace_count", &self.workspaces.len())
+            .field("record_count", &self.records.len())
+            .field("managed_worktree_count", &self.managed_worktrees.len())
+            .field("managed_worktree_tombstone_count", &self.managed_worktree_tombstones.len())
+            .field("materialization_count", &self.materializations.len())
+            .field("warning", &self.warning)
+            .finish()
     }
 }
 
@@ -244,12 +266,24 @@ struct PersistedNodeStateV5 {
     managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedNodeStateV6 {
+    version: u16,
+    node_id: NodeId,
+    workspaces: Vec<PersistedWorkspaceV2>,
+    session_records: Vec<PersistedManagedSessionRecordV5>,
+    managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+    materializations: Vec<PersistedMaterializationRecordV6>,
+}
+
 struct DecodedNodeState {
     node_id: NodeId,
     workspaces: Vec<(WorkspaceId, String)>,
     session_records: Vec<ManagedSessionRecord>,
     managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
     managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+    materializations: Vec<MaterializationOwnershipRecord>,
 }
 
 #[derive(Deserialize)]
@@ -405,6 +439,21 @@ struct PersistedManagedSessionRecordV5 {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedMaterializationRecordV6 {
+    materialization_id: MaterializationId,
+    environment_profile: ResolvedEnvironmentProfileReceipt,
+    owner: MaterializationOwner,
+    managed_lease_id: Option<crate::protocol::ManagedWorktreeLeaseId>,
+    state: MaterializationState,
+    root: OpaqueHostPath,
+    provider_home: OpaqueHostPath,
+    declared_paths: Vec<MaterializedPathDeclaration>,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+}
+
 pub(crate) fn load(path: Option<&Path>, expected_node_id: &NodeId) -> io::Result<LoadedNodeState> {
     let Some(path) = path else {
         return Ok(LoadedNodeState::empty());
@@ -539,6 +588,7 @@ fn load_one(path: &Path, expected_node_id: &NodeId) -> io::Result<LoadedNodeStat
         records,
         managed_worktrees: state.managed_worktrees,
         managed_worktree_tombstones: state.managed_worktree_tombstones,
+        materializations: state.materializations,
         warning: None,
     })
 }
@@ -571,6 +621,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
             let state: PersistedNodeStateV5 = serde_json::from_slice(bytes)
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v5_state(state)
+        }
+        NODE_STATE_SCHEMA_V6 => {
+            let state: PersistedNodeStateV6 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v6_state(state)
         }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -613,6 +668,7 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
             .collect::<io::Result<_>>()?,
         managed_worktrees: Vec::new(),
         managed_worktree_tombstones: Vec::new(),
+        materializations: Vec::new(),
     })
 }
 
@@ -653,6 +709,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
             .collect::<io::Result<_>>()?,
         managed_worktrees: Vec::new(),
         managed_worktree_tombstones: Vec::new(),
+        materializations: Vec::new(),
     })
 }
 
@@ -693,6 +750,7 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
             .collect::<io::Result<_>>()?,
         managed_worktrees: Vec::new(),
         managed_worktree_tombstones: Vec::new(),
+        materializations: Vec::new(),
     })
 }
 
@@ -705,18 +763,17 @@ fn decode_v4_state(state: PersistedNodeStateV4) -> io::Result<DecodedNodeState> 
     })?;
     validate_managed_worktree_records(&state.managed_worktrees, false)?;
     validate_managed_worktree_records(&state.managed_worktree_tombstones, true)?;
-    let active_ids = state.managed_worktrees.iter()
-        .map(|lease| lease.lease_id.clone())
-        .collect::<BTreeSet<_>>();
-    if state.managed_worktree_tombstones.iter().any(|lease| active_ids.contains(&lease.lease_id)) {
-        return Err(invalid_data("durable state contains duplicate managed worktree leases"));
-    }
+    validate_managed_worktree_identity_sets(
+        &state.managed_worktrees,
+        &state.managed_worktree_tombstones,
+    )?;
     Ok(DecodedNodeState {
         node_id: legacy.node_id,
         workspaces: legacy.workspaces,
         session_records: legacy.session_records,
         managed_worktrees: state.managed_worktrees,
         managed_worktree_tombstones: state.managed_worktree_tombstones,
+        materializations: Vec::new(),
     })
 }
 
@@ -759,6 +816,129 @@ fn decode_v5_state(state: PersistedNodeStateV5) -> io::Result<DecodedNodeState> 
         record.environment_profile = environment_profile;
     }
     Ok(decoded)
+}
+
+fn decode_v6_state(state: PersistedNodeStateV6) -> io::Result<DecodedNodeState> {
+    let mut decoded = decode_v5_state(PersistedNodeStateV5 {
+        version: NODE_STATE_SCHEMA_V5,
+        node_id: state.node_id,
+        workspaces: state.workspaces,
+        session_records: state.session_records,
+        managed_worktrees: state.managed_worktrees,
+        managed_worktree_tombstones: state.managed_worktree_tombstones,
+    })?;
+    let materializations = state.materializations.into_iter().map(|record| {
+        MaterializationOwnershipRecord::from_persisted(
+            record.materialization_id,
+            record.environment_profile,
+            record.owner,
+            record.managed_lease_id,
+            record.state,
+            opaque_to_path(&record.root)?,
+            opaque_to_path(&record.provider_home)?,
+            record.declared_paths,
+            record.created_at_unix_ms,
+            record.updated_at_unix_ms,
+        ).map_err(|error| invalid_data(format!("durable state materialization record is invalid: {error}")))
+    }).collect::<io::Result<Vec<_>>>()?;
+    validate_materialization_records(
+        &materializations,
+        &decoded.session_records,
+        &decoded.managed_worktrees,
+        &decoded.managed_worktree_tombstones,
+    )?;
+    decoded.materializations = materializations;
+    Ok(decoded)
+}
+
+fn validate_materialization_records(
+    records: &[MaterializationOwnershipRecord],
+    session_records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+) -> io::Result<()> {
+    if records.len() > MAX_SESSION_MATERIALIZATIONS {
+        return Err(invalid_data("durable state contains too many materializations"));
+    }
+    let known_records = session_records
+        .iter()
+        .map(|record| (&record.record_id, &record.workspace_id))
+        .collect::<BTreeMap<_, _>>();
+    let active_leases = managed_worktrees
+        .iter()
+        .map(|lease| (&lease.lease_id, lease))
+        .collect::<BTreeMap<_, _>>();
+    let tombstone_ids = managed_worktree_tombstones
+        .iter()
+        .map(|lease| &lease.lease_id)
+        .collect::<BTreeSet<_>>();
+    let mut ids = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    let mut owners = BTreeSet::new();
+    for record in records {
+        record.validate().map_err(|error| invalid_data(format!("durable state materialization record is invalid: {error}")))?;
+        let (owner_key, record_workspace) = match record.owner() {
+            MaterializationOwner::Session { incarnation_id, instance_id, generation } => {
+                (
+                    format!("session:{incarnation_id}:{}:{}", instance_id.0, generation.0),
+                    None,
+                )
+            }
+            MaterializationOwner::Record { record_id } => {
+                let workspace_id = known_records.get(record_id).ok_or_else(|| {
+                    invalid_data(
+                        "durable state materialization references an unknown session record",
+                    )
+                })?;
+                (format!("record:{}", record_id.as_str()), Some(*workspace_id))
+            }
+        };
+        if let Some(lease_id) = record.managed_lease_id() {
+            if tombstone_ids.contains(lease_id) {
+                return Err(invalid_data(
+                    "durable state materialization references a removed managed worktree lease",
+                ));
+            }
+            let lease = active_leases.get(lease_id).ok_or_else(|| {
+                invalid_data(
+                    "durable state materialization references an unknown managed worktree lease",
+                )
+            })?;
+            if let Some(record_workspace) = record_workspace {
+                if record_workspace != &lease.workspace_id {
+                    return Err(invalid_data(
+                        "durable state materialization record and managed worktree lease disagree on workspace",
+                    ));
+                }
+            }
+        }
+        if !ids.insert(record.id().clone())
+            || !roots.insert(record.root().to_path_buf())
+            || !owners.insert(owner_key)
+        {
+            return Err(invalid_data("durable state contains duplicate materialization ownership"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_worktree_identity_sets(
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+) -> io::Result<()> {
+    let active_ids = managed_worktrees
+        .iter()
+        .map(|lease| &lease.lease_id)
+        .collect::<BTreeSet<_>>();
+    if managed_worktree_tombstones
+        .iter()
+        .any(|lease| active_ids.contains(&lease.lease_id))
+    {
+        return Err(invalid_data(
+            "durable state contains duplicate managed worktree leases",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_managed_worktree_records(
@@ -998,6 +1178,7 @@ pub(crate) fn save_v4(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
+#[cfg(test)]
 pub(crate) fn save_v5(
     path: Option<&Path>,
     node_id: &NodeId,
@@ -1054,6 +1235,102 @@ pub(crate) fn save_v5(
         session_records: persisted_records,
         managed_worktrees: managed_worktrees.to_vec(),
         managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| invalid_data(format!("durable state encoding failed: {error}")))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(invalid_data("refusing to persist oversized durable state"));
+    }
+    let previous_primary_valid = if !path.exists() {
+        true
+    } else {
+        match load_one(path, node_id) {
+            Ok(_) => true,
+            Err(error) if is_authoritative_state_error(&error) => return Err(error),
+            Err(_) => false,
+        }
+    };
+    atomic_write(path, &bytes, previous_primary_valid)
+}
+
+pub(crate) fn save_v6(
+    path: Option<&Path>,
+    node_id: &NodeId,
+    workspaces: &BTreeMap<WorkspaceId, String>,
+    records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+    materializations: &[MaterializationOwnershipRecord],
+) -> io::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if workspaces.len() > MAX_PERSISTED_WORKSPACES {
+        return Err(invalid_data("refusing to persist too many workspaces"));
+    }
+    if records.len() > MAX_MANAGED_SESSION_RECORDS {
+        return Err(invalid_data("refusing to persist too many session records"));
+    }
+    validate_managed_worktree_records(managed_worktrees, false)?;
+    validate_managed_worktree_records(managed_worktree_tombstones, true)?;
+    validate_managed_worktree_identity_sets(
+        managed_worktrees,
+        managed_worktree_tombstones,
+    )?;
+    validate_materialization_records(
+        materializations,
+        records,
+        managed_worktrees,
+        managed_worktree_tombstones,
+    )?;
+    let mut persisted_records = Vec::with_capacity(records.len());
+    let mut provider_sessions = BTreeSet::new();
+    for record in records {
+        let mut persisted = record.clone();
+        persisted.active_session = None;
+        if let Some(identity) = &mut persisted.provider_session {
+            if !provider_sessions.insert(provider_session_semantic_key(&persisted.provider, identity)) {
+                return Err(invalid_data("refusing to persist duplicate provider sessions"));
+            }
+            identity.transcript_path = None;
+        }
+        persisted.last_error = persisted.last_error.as_deref().map(sanitized_record_error_summary);
+        validate_record(&persisted)?;
+        persisted.state = if persisted.provider_session.is_some() {
+            ManagedSessionState::Dormant
+        } else {
+            ManagedSessionState::Unavailable
+        };
+        persisted_records.push(persisted_v5_record(persisted));
+    }
+    let state = PersistedNodeStateV6 {
+        version: NODE_STATE_SCHEMA_V6,
+        node_id: node_id.clone(),
+        workspaces: workspaces.iter().map(|(workspace_id, canonical_root)| {
+            Ok(PersistedWorkspaceV2 {
+                workspace_id: workspace_id.clone(),
+                canonical_root: OpaqueHostPath::utf8(canonical_root.clone()).map_err(|error| {
+                    invalid_data(format!("refusing to persist an invalid workspace path: {error}"))
+                })?,
+            })
+        }).collect::<io::Result<_>>()?,
+        session_records: persisted_records,
+        managed_worktrees: managed_worktrees.to_vec(),
+        managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
+        materializations: materializations.iter().map(|record| {
+            Ok(PersistedMaterializationRecordV6 {
+                materialization_id: record.id().clone(),
+                environment_profile: record.environment_profile().clone(),
+                owner: record.owner().clone(),
+                managed_lease_id: record.managed_lease_id().cloned(),
+                state: record.state(),
+                root: path_to_opaque(record.root())?,
+                provider_home: path_to_opaque(record.provider_home())?,
+                declared_paths: record.declared_paths().to_vec(),
+                created_at_unix_ms: record.created_at_unix_ms(),
+                updated_at_unix_ms: record.updated_at_unix_ms(),
+            })
+        }).collect::<io::Result<Vec<_>>>()?,
     };
     let bytes = serde_json::to_vec_pretty(&state)
         .map_err(|error| invalid_data(format!("durable state encoding failed: {error}")))?;
@@ -1554,6 +1831,54 @@ mod tests {
         }
     }
 
+    fn materialization_ownership(
+        path: &Path,
+        id: &str,
+        owner: MaterializationOwner,
+        managed_lease_id: Option<crate::protocol::ManagedWorktreeLeaseId>,
+    ) -> MaterializationOwnershipRecord {
+        let root = path
+            .parent()
+            .unwrap()
+            .join("session-environments")
+            .join(id);
+        MaterializationOwnershipRecord::from_persisted(
+            MaterializationId::new(id).unwrap(),
+            ResolvedEnvironmentProfileReceipt {
+                profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude")
+                    .unwrap(),
+                profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1")
+                    .unwrap(),
+            },
+            owner,
+            managed_lease_id,
+            MaterializationState::Ready,
+            root.clone(),
+            root.join("home"),
+            Vec::new(),
+            10,
+            11,
+        )
+        .unwrap()
+    }
+
+    fn persisted_materialization(
+        record: &MaterializationOwnershipRecord,
+    ) -> PersistedMaterializationRecordV6 {
+        PersistedMaterializationRecordV6 {
+            materialization_id: record.id().clone(),
+            environment_profile: record.environment_profile().clone(),
+            owner: record.owner().clone(),
+            managed_lease_id: record.managed_lease_id().cloned(),
+            state: record.state(),
+            root: path_to_opaque(record.root()).unwrap(),
+            provider_home: path_to_opaque(record.provider_home()).unwrap(),
+            declared_paths: record.declared_paths().to_vec(),
+            created_at_unix_ms: record.created_at_unix_ms(),
+            updated_at_unix_ms: record.updated_at_unix_ms(),
+        }
+    }
+
     #[test]
     fn v4_roundtrip_preserves_host_only_managed_lease_identity() {
         let path = temp_path("v4-managed-roundtrip");
@@ -1647,6 +1972,320 @@ mod tests {
         )
         .unwrap();
         assert_eq!(header.version, NODE_STATE_SCHEMA_V5);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v5_to_v6_migration_starts_with_empty_materialization_registry() {
+        let path = temp_path("v5-to-v6-materializations");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, record) = fixture(&path);
+        save_v5(Some(&path), &node_id, &workspaces, &[record], &[], &[]).unwrap();
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert!(loaded.materializations.is_empty());
+        save_v6(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &loaded.records,
+            &[],
+            &[],
+            &loaded.materializations,
+        ).unwrap();
+        let header: PersistedNodeStateHeader = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V6);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v6_roundtrip_persists_ownership_without_secret_reference_or_value() {
+        let path = temp_path("v6-materialization-roundtrip");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, _) = fixture(&path);
+        let materialization_root = path.parent().unwrap().join("session-environments").join("m-1");
+        let ownership = MaterializationOwnershipRecord::from_persisted(
+            MaterializationId::new("m-1").unwrap(),
+            ResolvedEnvironmentProfileReceipt {
+                profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
+                profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+            },
+            MaterializationOwner::Session {
+                incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+                instance_id: gate4agent_types::AgentInstanceId(9),
+                generation: gate4agent_types::SessionGeneration(2),
+            },
+            None,
+            MaterializationState::Ready,
+            materialization_root.clone(),
+            materialization_root.join("home"),
+            vec![MaterializedPathDeclaration {
+                class: crate::session_environment::NodeSessionPathClass::Config,
+                relative_path: PathBuf::from("provider/settings.json"),
+                kind: crate::session_environment::MaterializedPathKind::Generated,
+            }],
+            10,
+            11,
+        ).unwrap();
+        save_v6(Some(&path), &node_id, &workspaces, &[], &[], &[], &[ownership.clone()]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let serialized = String::from_utf8(bytes).unwrap();
+        assert!(!serialized.contains("fixture-secret-reference"));
+        assert!(!serialized.contains("fixture-secret-value"));
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert!(loaded.materializations == vec![ownership]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v6_save_rejects_unknown_materialization_managed_lease() {
+        let path = temp_path("v6-unknown-materialization-lease");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let node_id = NodeId::new("node-a").unwrap();
+        let ownership = materialization_ownership(
+            &path,
+            "m-unknown",
+            MaterializationOwner::Session {
+                incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([
+                    3;
+                    crate::protocol::NODE_INCARNATION_ID_BYTES
+                ]),
+                instance_id: gate4agent_types::AgentInstanceId(9),
+                generation: gate4agent_types::SessionGeneration(2),
+            },
+            Some(crate::protocol::ManagedWorktreeLeaseId::new("mw-missing").unwrap()),
+        );
+
+        let error = save_v6(
+            Some(&path),
+            &node_id,
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &[ownership],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v6_decode_rejects_tombstoned_materialization_managed_lease() {
+        let path = temp_path("v6-tombstoned-materialization-lease");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let node_id = NodeId::new("node-a").unwrap();
+        let mut tombstone = managed_lease(
+            &path.parent().unwrap().join("managed-a"),
+            "mw-a",
+            "managed-a",
+            "gate4agent/mw-a",
+        );
+        tombstone.state = crate::protocol::ManagedWorktreeLeaseState::Removed;
+        let ownership = materialization_ownership(
+            &path,
+            "m-tombstone",
+            MaterializationOwner::Session {
+                incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([
+                    3;
+                    crate::protocol::NODE_INCARNATION_ID_BYTES
+                ]),
+                instance_id: gate4agent_types::AgentInstanceId(9),
+                generation: gate4agent_types::SessionGeneration(2),
+            },
+            Some(tombstone.lease_id.clone()),
+        );
+        let state = PersistedNodeStateV6 {
+            version: NODE_STATE_SCHEMA_V6,
+            node_id: node_id.clone(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            managed_worktree_tombstones: vec![tombstone],
+            materializations: vec![persisted_materialization(&ownership)],
+        };
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert_eq!(
+            load(Some(&path), &node_id).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v6_save_rejects_record_materialization_for_foreign_lease_workspace() {
+        let path = temp_path("v6-record-foreign-lease-workspace");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, record) = fixture(&path);
+        let lease = managed_lease(
+            &path.parent().unwrap().join("managed-a"),
+            "mw-a",
+            "managed-a",
+            "gate4agent/mw-a",
+        );
+        let ownership = materialization_ownership(
+            &path,
+            "m-foreign",
+            MaterializationOwner::Record {
+                record_id: record.record_id.clone(),
+            },
+            Some(lease.lease_id.clone()),
+        );
+
+        let error = save_v6(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[lease],
+            &[],
+            &[ownership],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v6_roundtrip_accepts_session_materialization_for_active_lease() {
+        let path = temp_path("v6-session-active-materialization-lease");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let node_id = NodeId::new("node-a").unwrap();
+        let lease = managed_lease(
+            &path.parent().unwrap().join("managed-a"),
+            "mw-a",
+            "managed-a",
+            "gate4agent/mw-a",
+        );
+        let ownership = materialization_ownership(
+            &path,
+            "m-active",
+            MaterializationOwner::Session {
+                incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([
+                    3;
+                    crate::protocol::NODE_INCARNATION_ID_BYTES
+                ]),
+                instance_id: gate4agent_types::AgentInstanceId(9),
+                generation: gate4agent_types::SessionGeneration(2),
+            },
+            Some(lease.lease_id.clone()),
+        );
+
+        save_v6(
+            Some(&path),
+            &node_id,
+            &BTreeMap::new(),
+            &[],
+            &[lease.clone()],
+            &[],
+            &[ownership.clone()],
+        )
+        .unwrap();
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.managed_worktrees, vec![lease]);
+        assert!(loaded.materializations == vec![ownership]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v6_rejects_declared_path_prefix_collisions() {
+        let path = temp_path("v6-prefix-collision");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let node_id = NodeId::new("node-a").unwrap();
+        let materialization_root = path.parent().unwrap().join("session-environments").join("m-1");
+        let state = PersistedNodeStateV6 {
+            version: NODE_STATE_SCHEMA_V6,
+            node_id: node_id.clone(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            managed_worktree_tombstones: Vec::new(),
+            materializations: vec![PersistedMaterializationRecordV6 {
+                materialization_id: MaterializationId::new("m-1").unwrap(),
+                environment_profile: ResolvedEnvironmentProfileReceipt {
+                    profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
+                    profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+                },
+                owner: MaterializationOwner::Session {
+                    incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+                    instance_id: gate4agent_types::AgentInstanceId(9),
+                    generation: gate4agent_types::SessionGeneration(2),
+                },
+                managed_lease_id: None,
+                state: MaterializationState::Ready,
+                root: path_to_opaque(&materialization_root).unwrap(),
+                provider_home: path_to_opaque(&materialization_root.join("home")).unwrap(),
+                declared_paths: vec![
+                    MaterializedPathDeclaration {
+                        class: crate::session_environment::NodeSessionPathClass::Config,
+                        relative_path: PathBuf::from("provider"),
+                        kind: crate::session_environment::MaterializedPathKind::Generated,
+                    },
+                    MaterializedPathDeclaration {
+                        class: crate::session_environment::NodeSessionPathClass::Config,
+                        relative_path: PathBuf::from("provider/settings.json"),
+                        kind: crate::session_environment::MaterializedPathKind::Generated,
+                    },
+                ],
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 11,
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(load(Some(&path), &node_id).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v6_rejects_case_ambiguous_materialization_ids() {
+        let path = temp_path("v6-case-ambiguous-materialization-id");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let node_id = NodeId::new("node-a").unwrap();
+        let first_root = path.parent().unwrap().join("session-environments").join("a");
+        let second_root = path.parent().unwrap().join("session-environments").join("b");
+        let first = PersistedMaterializationRecordV6 {
+            materialization_id: MaterializationId::new("a").unwrap(),
+            environment_profile: ResolvedEnvironmentProfileReceipt {
+                profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
+                profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
+            },
+            owner: MaterializationOwner::Session {
+                incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+                instance_id: gate4agent_types::AgentInstanceId(9),
+                generation: gate4agent_types::SessionGeneration(2),
+            },
+            managed_lease_id: None,
+            state: MaterializationState::Ready,
+            root: path_to_opaque(&first_root).unwrap(),
+            provider_home: path_to_opaque(&first_root.join("home")).unwrap(),
+            declared_paths: Vec::new(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 11,
+        };
+        let mut second = first.clone();
+        second.materialization_id = MaterializationId::new("b").unwrap();
+        second.owner = MaterializationOwner::Session {
+            incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            instance_id: gate4agent_types::AgentInstanceId(10),
+            generation: gate4agent_types::SessionGeneration(2),
+        };
+        second.root = path_to_opaque(&second_root).unwrap();
+        second.provider_home = path_to_opaque(&second_root.join("home")).unwrap();
+        let state = PersistedNodeStateV6 {
+            version: NODE_STATE_SCHEMA_V6,
+            node_id: node_id.clone(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            managed_worktree_tombstones: Vec::new(),
+            materializations: vec![first, second],
+        };
+        let mut value = serde_json::to_value(state).unwrap();
+        value["materializations"][1]["materialization_id"] = serde_json::Value::String("A".to_owned());
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(load(Some(&path), &node_id).unwrap_err().kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

@@ -2,29 +2,37 @@
 
 use gate4agent_c2::protocol::{
     C2NodeEvent, C2NodeResponse, C2NodeSnapshot, C2SessionStatus, NodeId, NodeRoute,
-    NodeTransportState, RoutedNodeEvent, C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
-    C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY, C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    NodeTransportState, RoutedNodeEvent, C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+    C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY, C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+    C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
 };
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlHandle};
+use gate4agent_catalog::EnvMutation;
 use gate4agent_node::protocol::{
     CapabilityId, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
     ManagedWorktreeLeaseState, ManagedWorktreeRetention, ManagedWorktreeSpawnRequest,
     NodeFailureCode, NodeRequest, SessionAddress, SessionMode, SpawnBundleDigest, SpawnBundleId,
-    SpawnBundleRevision, SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey,
-    SpawnOverride, SpawnOverrides, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision,
-    SpawnRequiredCapabilities, SpawnSpec, SpawnTarget, WorktreeProfileId,
-    WorktreeProfileRevision, WorkspaceId, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
+    SpawnBundleRevision, SpawnDeadlineMs, SpawnEnvironmentProfileId,
+    SpawnEnvironmentProfileRevision, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
+    SpawnOverrides, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision,
+    SpawnRequiredCapabilities, SpawnSpec, SpawnTarget, WorktreeProfileId, WorktreeProfileRevision,
+    WorkspaceId, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
 };
 use gate4agent_node::{
-    ManagedWorktreeProfile, NodeBundle, NodeBundleError, NodeSecretReference,
-    NodeSecretResolveError, NodeSecretResolver, NodeSecretValue, NodeServer, NodeServerConfig,
-    SpawnProfileRegistry, WorkspaceConfig, WorktreeServiceMode,
+    ManagedWorktreeProfile, NodeBundle, NodeBundleError, NodeEnvironmentProfile,
+    NodeSecretReference, NodeSecretResolveError, NodeSecretResolver, NodeSecretValue,
+    NodeSessionMaterializationProfile, NodeSessionPathBinding, NodeSessionPathClass, NodeServer,
+    NodeServerConfig, SpawnProfileRegistry, WorkspaceConfig, WorktreeServiceMode,
 };
-use gate4agent_types::{AgentId, TerminalFrame, TerminalSize};
+use gate4agent_runtime_native::{
+    NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
+    NativeLaunchProfileId,
+};
+use gate4agent_types::{AgentId, TerminalFrame, TerminalSize, TransportKind};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,12 +44,15 @@ use tokio::time::{sleep, timeout};
 const BUNDLE_ID: &str = "review-tools";
 const BUNDLE_REVISION: &str = "review-tools-r1";
 const BUNDLE_DIGEST: &str =
-    "sha256:941f20868a6ef49b4329bf1bb1368515763f5b64d8279b05cd9700966083d707";
+    "sha256:7667f0d83d5a8cfa0f9ad232f22669a1b122c6253cf1ae8fe5171ae1f8df752d";
 const ROOT_MANIFEST: &[u8] = br#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"review-tools"}"#;
-const CLAUDE_MANIFEST: &[u8] =
-    br#"{"name":"review-tools","version":"1.0.0","description":"Review helpers"}"#;
 const SKILL: &[u8] = b"---\nname: review-code\ndescription: Review code for correctness and safety.\n---\n\nReview the selected change.\n";
 const CHANGED_SKILL: &[u8] = b"---\nname: review-code\ndescription: Changed after the digest was pinned.\n---\n";
+const SKILL_SHA256: &str = "d78fe03be106b673fcf5415c8359e99f0298b5071cd11822c58ebcb27e52a68d";
+const CODEX_HOME_KEY: &str = "CODEX_HOME";
+const USERPROFILE_KEY: &str = "USERPROFILE";
+const GLOBAL_AUTH: &[u8] = b"fixture-global-auth-must-not-change\n";
+const GLOBAL_CONFIG: &[u8] = b"fixture-global-config-must-not-change\n";
 
 struct UnusedSecretResolver;
 
@@ -51,6 +62,21 @@ impl NodeSecretResolver for UnusedSecretResolver {
         _: &NodeSecretReference,
     ) -> Result<NodeSecretValue, NodeSecretResolveError> {
         Err(NodeSecretResolveError::Unavailable)
+    }
+}
+
+struct FixtureChildEnvironmentResolver {
+    user_profile: OsString,
+}
+
+impl NativeChildEnvironmentResolver for FixtureChildEnvironmentResolver {
+    fn resolve_child_environment(
+        &self,
+    ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+        Ok(vec![EnvMutation {
+            key: OsString::from(USERPROFILE_KEY),
+            value: Some(self.user_profile.clone()),
+        }])
     }
 }
 
@@ -86,7 +112,7 @@ fn endpoint(label: &str) -> String {
         .unwrap()
         .as_nanos();
     format!(
-        r"\\.\pipe\gate4agent-f62-bundle-{label}-{}-{nonce}-{}",
+        r"\\.\pipe\gate4agent-f63-codex-bundle-{label}-{}-{nonce}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed),
     )
@@ -123,7 +149,7 @@ impl Drop for RemoveFixtureDirectory {
             .0
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("gate4agent-f62-bundle-e2e-"));
+            .is_some_and(|name| name.starts_with("gate4agent-f63-codex-bundle-e2e-"));
         if safe {
             let _ = std::fs::remove_dir_all(&self.0);
         }
@@ -136,17 +162,28 @@ fn fixture_root() -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "gate4agent-f62-bundle-e2e-{}-{nonce}",
+        "gate4agent-f63-codex-bundle-e2e-{}-{nonce}",
         std::process::id(),
     ))
 }
 
 fn write_bundle_fixture(root: &Path) {
-    std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
     std::fs::create_dir_all(root.join("skills/review-code")).unwrap();
     std::fs::write(root.join("plugin.json"), ROOT_MANIFEST).unwrap();
-    std::fs::write(root.join(".claude-plugin/plugin.json"), CLAUDE_MANIFEST).unwrap();
     std::fs::write(root.join("skills/review-code/SKILL.md"), SKILL).unwrap();
+}
+
+fn codex_materialization_profile() -> NodeSessionMaterializationProfile {
+    NodeSessionMaterializationProfile::new(
+        Vec::new(),
+        vec![NodeSessionPathBinding::new(
+            CODEX_HOME_KEY,
+            NodeSessionPathClass::ProviderHome,
+        )
+        .unwrap()],
+        Vec::new(),
+    )
+    .unwrap()
 }
 
 fn protect_bundle_tree(root: &Path) {
@@ -202,12 +239,13 @@ fn node_config(
     state_path: &Path,
     materialization_root: &Path,
     spawn_profile_id: &SpawnProfileId,
+    environment_profile_id: &SpawnEnvironmentProfileId,
 ) -> NodeServerConfig {
     let managed_profile = ManagedWorktreeProfile::new(
         WorktreeProfileId::new("review").unwrap(),
         WorktreeProfileRevision::new("fixture-v1").unwrap(),
         allocation_root,
-        "codex/bundle",
+        "codex/f63-bundle",
         "HEAD",
         ManagedWorktreeRetention::RemoveWhenReleased,
     )
@@ -219,8 +257,8 @@ fn node_config(
         .unwrap();
     let profiles = SpawnProfileRegistry::new([SpawnProfileDefaults {
         profile_id: spawn_profile_id.clone(),
-        revision: SpawnProfileRevision::new("bundle-r1").unwrap(),
-        provider: agent("claude"),
+        revision: SpawnProfileRevision::new("codex-bundle-r1").unwrap(),
+        provider: agent("codex"),
         mode: SessionMode::Pty,
         terminal_size: TerminalSize {
             rows: 40,
@@ -229,7 +267,7 @@ fn node_config(
         prompt: None,
         bundle_id: None,
         context_id: None,
-        environment_profile_id: None,
+        environment_profile_id: Some(environment_profile_id.clone()),
     }])
     .unwrap();
     NodeServerConfig::new(endpoint, token, node_id.clone(), [workspace])
@@ -310,12 +348,15 @@ fn count_exact_json_string(value: &Value, expected: &str) -> usize {
 
 fn assert_state_v7_bundle_correlation(
     state_path: &Path,
+    environment_profile_id: &SpawnEnvironmentProfileId,
+    environment_profile_revision: &SpawnEnvironmentProfileRevision,
     expected_materializations: usize,
-    expected_bundle_root: Option<&Path>,
+    expected_root: Option<&Path>,
 ) {
     let encoded = std::fs::read_to_string(state_path).expect("durable state is unavailable");
     assert!(!encoded.contains(std::str::from_utf8(SKILL).unwrap()));
     assert!(!encoded.contains(std::str::from_utf8(ROOT_MANIFEST).unwrap()));
+    assert!(!encoded.contains(SKILL_SHA256));
     assert!(!encoded.contains("--plugin-dir"));
     assert!(!encoded.contains("--skills-dir"));
     assert!(!encoded.contains("argv"));
@@ -326,7 +367,13 @@ fn assert_state_v7_bundle_correlation(
         .expect("V7 state omitted its materialization registry");
     assert_eq!(materializations.len(), expected_materializations);
     for materialization in materializations {
-        assert_eq!(materialization["environment_profile"], Value::Null);
+        assert_eq!(
+            materialization["environment_profile"],
+            json!({
+                "profile_id": environment_profile_id,
+                "profile_revision": environment_profile_revision,
+            }),
+        );
         assert_eq!(
             materialization["bundle"],
             json!({
@@ -337,19 +384,67 @@ fn assert_state_v7_bundle_correlation(
         );
         assert_eq!(materialization["owner"]["kind"], "session");
     }
-    match expected_bundle_root {
-        Some(expected) => {
+    match expected_root {
+        Some(root) => {
             assert_eq!(materializations.len(), 1);
-            let expected = expected.to_string_lossy();
-            assert_eq!(materializations[0]["bundle_root"], expected.as_ref());
-            assert_eq!(
-                count_exact_json_string(&state, expected.as_ref()),
-                1,
-                "durable state retained a second provider argv/path copy",
-            );
+            for (field, expected) in [
+                ("root", root.to_path_buf()),
+                ("provider_home", root.join("home")),
+                ("bundle_root", root.join("bundle")),
+                ("plugin_data", root.join("plugin-data")),
+            ] {
+                let expected = expected.to_string_lossy();
+                assert_eq!(materializations[0][field], expected.as_ref());
+                assert_eq!(
+                    count_exact_json_string(&state, expected.as_ref()),
+                    1,
+                    "durable state retained an unexpected second {field} path copy",
+                );
+            }
         }
         None => assert_eq!(expected_materializations, 0),
     }
+}
+
+fn relative_file_inventory(root: &Path) -> Vec<String> {
+    fn collect(root: &Path, current: &Path, files: &mut Vec<String>) {
+        for entry in std::fs::read_dir(current).expect("Codex home inventory is unavailable") {
+            let entry = entry.expect("Codex home inventory entry is unavailable");
+            let path = entry.path();
+            let kind = entry.file_type().expect("Codex home entry type is unavailable");
+            assert!(!kind.is_symlink(), "Codex home contains a link: {path:?}");
+            if kind.is_dir() {
+                collect(root, &path, files);
+            } else {
+                assert!(kind.is_file(), "Codex home contains a non-file entry: {path:?}");
+                files.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(root, root, &mut files);
+    files.sort();
+    files
+}
+
+fn assert_git_clean(worktree: &Path) {
+    let output = git_command(worktree, &["status", "--porcelain=v1", "--untracked-files=all"]);
+    assert!(
+        output.status.success(),
+        "managed worktree status failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "Codex fixture dirtied its real worktree: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
 }
 
 fn materialization_directories(root: &Path) -> Vec<PathBuf> {
@@ -569,7 +664,7 @@ fn find_lease<'a>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_to_end() {
+async fn spawn_managed_codex_bundle_isolated_home_is_private_and_cleaned_end_to_end() {
     require_headless_windows_fixture();
     let test_root = fixture_root();
     std::fs::create_dir_all(&test_root).unwrap();
@@ -579,8 +674,15 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     let materialization_root = test_root.join("private-session-bundles");
     let bundle_source = test_root.join("bundle-source");
     let state_path = test_root.join("node-state.json");
-    let argv_proof_path = test_root.join("provider-argv.proof");
+    let child_proof_path = test_root.join("codex-child.proof");
+    let fixture_user_profile = test_root.join("fixture-user-profile");
+    let global_codex_home = fixture_user_profile.join(".codex");
+    let global_auth_path = global_codex_home.join("auth.json");
+    let global_config_path = global_codex_home.join("config.toml");
     std::fs::create_dir_all(&allocation_root).unwrap();
+    std::fs::create_dir_all(&global_codex_home).unwrap();
+    std::fs::write(&global_auth_path, GLOBAL_AUTH).unwrap();
+    std::fs::write(&global_config_path, GLOBAL_CONFIG).unwrap();
     write_bundle_fixture(&bundle_source);
     protect_bundle_tree(&bundle_source);
     let bundle = pinned_bundle(&bundle_source).expect("pinned bundle did not validate");
@@ -627,6 +729,10 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     let node_token = "materialized-bundle-node-token";
     let c2_token = "materialized-bundle-c2-token";
     let spawn_profile_id = SpawnProfileId::new("materialized-bundle").unwrap();
+    let environment_profile_id =
+        SpawnEnvironmentProfileId::new("isolated-codex-home").unwrap();
+    let environment_profile_revision =
+        SpawnEnvironmentProfileRevision::new("isolated-codex-home-r1").unwrap();
     let config = node_config(
         &node_endpoint,
         node_token,
@@ -637,13 +743,36 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         &state_path,
         &materialization_root,
         &spawn_profile_id,
+        &environment_profile_id,
     );
     let mut server = NodeServer::new_provider_bundle_argv_fixture(
         config,
-        agent("claude"),
-        argv_proof_path.clone(),
+        agent("codex"),
+        child_proof_path.clone(),
     )
     .unwrap();
+    let native_profile = NativeLaunchProfile::new(
+        NativeLaunchProfileId::new("isolated-codex-home-pty").unwrap(),
+        agent("codex"),
+        TransportKind::Pty,
+        vec![OsString::from(USERPROFILE_KEY)],
+        Arc::new(FixtureChildEnvironmentResolver {
+            user_profile: fixture_user_profile.clone().into_os_string(),
+        }),
+    )
+    .unwrap();
+    server
+        .install_environment_profile(
+            NodeEnvironmentProfile::new_with_materialization(
+                environment_profile_id.clone(),
+                environment_profile_revision.clone(),
+                agent("codex"),
+                [native_profile],
+                Some(codex_materialization_profile()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     server.install_bundle(bundle).unwrap();
     let node_shutdown = server.shutdown_handle();
     let node_task = tokio::spawn(server.run());
@@ -678,6 +807,7 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     let (control, mut events) = connect_local(&control_endpoint, c2_token).await.unwrap();
     let capabilities = &control.hello().compatibility.as_ref().unwrap().capabilities;
     for required in [
+        C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
         C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
         C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
         C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -722,38 +852,55 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     let after_unknown = snapshot(&control, &route).await;
     assert_eq!(session_count(&after_unknown), 0);
     assert!(after_unknown.managed_worktrees.is_empty());
+    assert!(after_unknown.session_records.is_empty());
+    assert!(materialization_directories(&allocation_root).is_empty());
     assert!(materialization_directories(&materialization_root).is_empty());
+    assert!(!child_proof_path.exists());
     assert_eq!(git_worktree_count(&repository), 1);
 
-    let mut unsupported_request = spawn_request(
+    let mut unisolated_request = spawn_request(
         &node_id,
         &workspace_id,
         &spawn_profile_id,
         BUNDLE_ID,
-        "unsupported-provider-once",
+        "unisolated-codex-bundle-once",
     );
-    unsupported_request.spawn_spec.overrides.provider = SpawnOverride::Set {
-        value: agent("codex"),
-    };
-    let unsupported = control
+    unisolated_request
+        .spawn_spec
+        .overrides
+        .environment_profile_id = SpawnOverride::Clear;
+    let unisolated = control
         .request(
             route.clone(),
             NodeRequest::SpawnManagedWorktree {
-                request: unsupported_request,
+                request: unisolated_request,
             },
         )
         .await
-        .expect("typed unsupported-provider failure closed the C2 connection");
-    match unsupported.response {
+        .expect("typed unisolated-Codex failure closed the C2 connection");
+    match unisolated.response {
         Err(failure) => assert_eq!(failure.code, NodeFailureCode::BundleBindingMismatch),
-        response => panic!("unsupported provider unexpectedly received a bundle: {response:?}"),
+        response => panic!("Codex bundle spawned without isolated CODEX_HOME: {response:?}"),
     }
-    let after_unsupported = snapshot(&control, &route).await;
-    assert_eq!(session_count(&after_unsupported), 0);
-    assert!(after_unsupported.managed_worktrees.is_empty());
+    let after_unisolated = snapshot(&control, &route).await;
+    assert_eq!(session_count(&after_unisolated), 0);
+    assert!(after_unisolated.managed_worktrees.is_empty());
+    assert!(after_unisolated.session_records.is_empty());
+    assert!(materialization_directories(&allocation_root).is_empty());
     assert!(materialization_directories(&materialization_root).is_empty());
-    assert!(!argv_proof_path.exists());
+    assert!(!child_proof_path.exists());
     assert_eq!(git_worktree_count(&repository), 1);
+    if state_path.exists() {
+        assert_state_v7_bundle_correlation(
+            &state_path,
+            &environment_profile_id,
+            &environment_profile_revision,
+            0,
+            None,
+        );
+    }
+    assert_eq!(std::fs::read(&global_auth_path).unwrap(), GLOBAL_AUTH);
+    assert_eq!(std::fs::read(&global_config_path).unwrap(), GLOBAL_CONFIG);
 
     let request = spawn_request(
         &node_id,
@@ -788,6 +935,21 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         receipt.spawn.provenance.bundle_id,
         SpawnFieldProvenance::Override,
     );
+    assert_eq!(
+        receipt
+            .spawn
+            .environment_profile
+            .as_ref()
+            .expect("Codex bundle receipt omitted its isolated environment profile"),
+        &gate4agent_node::protocol::ResolvedEnvironmentProfileReceipt {
+            profile_id: environment_profile_id.clone(),
+            profile_revision: environment_profile_revision.clone(),
+        },
+    );
+    assert_eq!(
+        receipt.spawn.provenance.environment_profile_id,
+        SpawnFieldProvenance::Profile,
+    );
     assert_eq!(receipt.lease.retention, ManagedWorktreeRetention::RemoveWhenReleased);
     wait_running(&control, &route, &receipt.spawn.session).await;
 
@@ -798,46 +960,86 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     let materializations = materialization_directories(&materialization_root);
     assert_eq!(materializations.len(), 1);
     let materialized = materializations[0].clone();
+    let provider_home = materialized.join("home");
     let private_bundle = materialized.join("bundle");
-    assert_eq!(std::fs::read(private_bundle.join("plugin.json")).unwrap(), ROOT_MANIFEST);
-    assert_eq!(
-        std::fs::read(private_bundle.join(".claude-plugin/plugin.json")).unwrap(),
-        CLAUDE_MANIFEST,
+    assert!(private_bundle.is_dir(), "Codex bundle root was not materialized");
+    assert!(
+        relative_file_inventory(&private_bundle).is_empty(),
+        "Codex duplicated its skills into the argv-oriented bundle root",
     );
     assert_eq!(
-        std::fs::read(private_bundle.join("skills/review-code/SKILL.md")).unwrap(),
+        relative_file_inventory(&provider_home),
+        vec!["skills/review-code/SKILL.md"],
+    );
+    assert_eq!(
+        std::fs::read(provider_home.join("skills/review-code/SKILL.md")).unwrap(),
         SKILL,
     );
+    assert!(!provider_home.starts_with(&managed_worktree));
+    assert!(!provider_home.starts_with(&global_codex_home));
+    assert_git_clean(&managed_worktree);
+    assert_eq!(std::fs::read(&global_auth_path).unwrap(), GLOBAL_AUTH);
+    assert_eq!(std::fs::read(&global_config_path).unwrap(), GLOBAL_CONFIG);
     wait_terminal_marker(
         &mut collected_events,
         &route,
         &receipt.spawn.session,
-        "F62_BUNDLE_ARGV_VALIDATED",
+        "F63_CODEX_BUNDLE_HOME_VALIDATED",
     )
     .await;
-    let argv_proof = std::fs::read_to_string(&argv_proof_path)
-        .expect("validated provider child omitted its private argv proof");
-    let argv: Vec<_> = argv_proof.lines().collect();
-    assert_eq!(argv.len(), 2, "provider child received a non-exact argv pair");
-    assert_eq!(argv[0], "--plugin-dir");
-    assert_eq!(Path::new(argv[1]), private_bundle);
-    assert_state_v7_bundle_correlation(&state_path, 1, Some(&private_bundle));
+    let child_proof = std::fs::read_to_string(&child_proof_path)
+        .expect("validated Codex fixture omitted its child-only home proof");
+    let proof: Vec<_> = child_proof.lines().collect();
+    assert_eq!(proof.len(), 4, "Codex fixture emitted a non-exact proof");
+    assert_eq!(proof[0], "bundled");
+    assert_eq!(
+        std::fs::canonicalize(Path::new(proof[1])).unwrap(),
+        std::fs::canonicalize(&provider_home).unwrap(),
+    );
+    assert_eq!(
+        std::fs::canonicalize(Path::new(proof[2])).unwrap(),
+        managed_worktree,
+    );
+    assert_eq!(proof[3], SKILL_SHA256);
+    assert_state_v7_bundle_correlation(
+        &state_path,
+        &environment_profile_id,
+        &environment_profile_revision,
+        1,
+        Some(&materialized),
+    );
 
     let source_text = bundle_source.to_string_lossy().into_owned();
     let private_text = materialized.to_string_lossy().into_owned();
-    let proof_text = argv_proof_path.to_string_lossy().into_owned();
+    let worktree_text = managed_worktree.to_string_lossy().into_owned();
+    let proof_text = child_proof_path.to_string_lossy().into_owned();
+    let global_home_text = global_codex_home.to_string_lossy().into_owned();
     let root_manifest_text = std::str::from_utf8(ROOT_MANIFEST).unwrap();
-    let claude_manifest_text = std::str::from_utf8(CLAUDE_MANIFEST).unwrap();
     let skill_text = std::str::from_utf8(SKILL).unwrap();
     let forbidden = [
         source_text.as_str(),
         private_text.as_str(),
+        worktree_text.as_str(),
         proof_text.as_str(),
+        global_home_text.as_str(),
         "--plugin-dir",
+        "--skills-dir",
+        CODEX_HOME_KEY,
+        std::str::from_utf8(GLOBAL_AUTH).unwrap().trim(),
+        std::str::from_utf8(GLOBAL_CONFIG).unwrap().trim(),
         root_manifest_text,
-        claude_manifest_text,
         skill_text,
     ];
+    let durable_state = std::fs::read_to_string(&state_path).unwrap();
+    let decoded_state_paths = durable_state.replace("\\\\", "\\");
+    for unexpected in [
+        source_text.as_str(),
+        proof_text.as_str(),
+        global_home_text.as_str(),
+    ] {
+        assert!(!durable_state.contains(unexpected));
+        assert!(!decoded_state_paths.contains(unexpected));
+    }
     assert_redacted(&request, &forbidden, "managed spawn request");
     assert_redacted(&receipt, &forbidden, "managed spawn receipt");
     let active_snapshot = snapshot(&control, &route).await;
@@ -860,6 +1062,9 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     }
     assert_eq!(session_count(&snapshot(&control, &route).await), 1);
     assert_eq!(materialization_directories(&materialization_root), vec![materialized.clone()]);
+    assert_git_clean(&managed_worktree);
+    assert_eq!(std::fs::read(&global_auth_path).unwrap(), GLOBAL_AUTH);
+    assert_eq!(std::fs::read(&global_config_path).unwrap(), GLOBAL_CONFIG);
 
     assert!(matches!(
         control
@@ -876,13 +1081,24 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         Ok(C2NodeResponse::Accepted)
     ));
     wait_stopped(&control, &route, &receipt.spawn.session).await;
-    assert!(private_bundle.is_dir(), "Stop removed the session-owned bundle");
+    assert!(provider_home.is_dir(), "Stop removed the isolated Codex home");
+    assert_eq!(
+        std::fs::read(provider_home.join("skills/review-code/SKILL.md")).unwrap(),
+        SKILL,
+    );
     assert!(managed_worktree.is_dir(), "Stop removed the managed worktree");
+    assert_git_clean(&managed_worktree);
     let stopped_snapshot = snapshot(&control, &route).await;
     let stopped_lease = find_lease(&stopped_snapshot, &receipt.lease)
         .expect("Stop removed the managed worktree lease");
     assert_eq!(stopped_lease.active_session_count, 1);
-    assert_state_v7_bundle_correlation(&state_path, 1, Some(&private_bundle));
+    assert_state_v7_bundle_correlation(
+        &state_path,
+        &environment_profile_id,
+        &environment_profile_revision,
+        1,
+        Some(&materialized),
+    );
 
     assert!(matches!(
         control
@@ -906,14 +1122,22 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
     assert!(!materialized.exists(), "Remove retained session-owned bundle bytes");
     assert!(!managed_worktree.exists(), "Remove retained the managed worktree");
     assert_eq!(git_worktree_count(&repository), 1);
-    assert_state_v7_bundle_correlation(&state_path, 0, None);
+    assert_state_v7_bundle_correlation(
+        &state_path,
+        &environment_profile_id,
+        &environment_profile_revision,
+        0,
+        None,
+    );
+    assert_eq!(std::fs::read(&global_auth_path).unwrap(), GLOBAL_AUTH);
+    assert_eq!(std::fs::read(&global_config_path).unwrap(), GLOBAL_CONFIG);
 
     let unbundled = control
         .request(
             route.clone(),
             NodeRequest::Spawn {
                 workspace_id: workspace_id.clone(),
-                provider: agent("claude"),
+                provider: agent("codex"),
                 mode: SessionMode::Pty,
                 terminal_size: TerminalSize {
                     rows: 40,
@@ -933,16 +1157,23 @@ async fn spawn_managed_materialized_bundle_is_immutable_private_and_cleaned_end_
         &mut collected_events,
         &route,
         &unbundled_session,
-        "F62_NO_BUNDLE_ARGV",
+        "F63_CODEX_UNBUNDLED_VALIDATED",
     )
     .await;
+    let unbundled_proof = std::fs::read_to_string(&child_proof_path)
+        .expect("unbundled Codex fixture omitted its isolation proof");
+    let unbundled: Vec<_> = unbundled_proof.lines().collect();
+    assert_eq!(unbundled.len(), 2, "unbundled Codex emitted a non-exact proof");
+    assert_eq!(unbundled[0], "unbundled");
     assert_eq!(
-        std::fs::read(&argv_proof_path).unwrap(),
-        b"",
-        "unbundled provider child inherited bundle argv",
+        std::fs::canonicalize(Path::new(unbundled[1])).unwrap(),
+        std::fs::canonicalize(&repository).unwrap(),
     );
     assert!(materialization_directories(&materialization_root).is_empty());
     assert_eq!(git_worktree_count(&repository), 1);
+    assert_git_clean(&repository);
+    assert_eq!(std::fs::read(&global_auth_path).unwrap(), GLOBAL_AUTH);
+    assert_eq!(std::fs::read(&global_config_path).unwrap(), GLOBAL_CONFIG);
     assert!(matches!(
         control
             .request(

@@ -3,10 +3,11 @@ use crate::protocol::{
     ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, SessionRecordId,
 };
 use crate::bundle_catalog::NodeBundle;
+use crate::bundle_provider::BundleProviderLayout;
 use gate4agent_catalog::EnvMutation;
 use gate4agent_types::{AgentInstanceId, SessionGeneration};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -26,6 +27,7 @@ const MATERIALIZATION_ROOT_MARKER: &[u8] = b"gate4agent-node-session-environment
 const MATERIALIZATION_OWNER_MARKER: &str = ".gate4agent-materialization-owner";
 const MATERIALIZATION_ROOT_MARKER_NAME: &str = ".gate4agent-materialization-root";
 const MATERIALIZATION_LOCK_NAME: &str = ".gate4agent-materialization-lock";
+const CODEX_HOME_ENVIRONMENT_KEY: &str = "CODEX_HOME";
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeSecretReference(String);
@@ -277,46 +279,89 @@ impl NodeSessionMaterializationProfile {
         self.0.environment.is_empty() && self.0.path_bindings.is_empty() && self.0.files.is_empty()
     }
 
+    pub(crate) fn supports_bundle_layout(&self, layout: BundleProviderLayout) -> bool {
+        layout != BundleProviderLayout::Codex
+            || (self.0.path_bindings.iter().any(|binding| {
+                    normalized_environment_key(&binding.key)
+                        == normalized_environment_key(CODEX_HOME_ENVIRONMENT_KEY)
+                        && binding.class == NodeSessionPathClass::ProviderHome
+                })
+                && self.0.path_bindings.iter().all(|binding| {
+                    binding.class != NodeSessionPathClass::BundleRoot
+                })
+                && self.0.files.iter().all(|file| {
+                    let declaration = file.declaration();
+                    declaration.class != NodeSessionPathClass::BundleRoot
+                        && !(declaration.class == NodeSessionPathClass::ProviderHome
+                            && declaration.relative_path.starts_with("skills"))
+                }))
+    }
+
     pub(crate) fn from_bundle(
         bundle: &NodeBundle,
-    ) -> Result<Self, NodeSessionMaterializationProfileError> {
-        Self::new(
+        layout: BundleProviderLayout,
+    ) -> Result<Self, BundleProfileCompositionError> {
+        if layout == BundleProviderLayout::Codex {
+            return Err(BundleProfileCompositionError::InvalidCodexProfile);
+        }
+        Ok(Self::new(
             Vec::new(),
             Vec::new(),
-            bundle
-                .files()
-                .iter()
-                .map(|file| {
-                    NodeSessionFile::generated(
-                        NodeSessionPathClass::BundleRoot,
-                        PathBuf::from(file.path()),
-                        file.bytes().to_vec(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
+            bundle_profile_files(bundle, layout)?,
+        )?)
     }
 
     pub(crate) fn with_bundle(
         &self,
         bundle: &NodeBundle,
-    ) -> Result<Self, NodeSessionMaterializationProfileError> {
+        layout: BundleProviderLayout,
+    ) -> Result<Self, BundleProfileCompositionError> {
+        if !self.supports_bundle_layout(layout) {
+            return Err(BundleProfileCompositionError::InvalidCodexProfile);
+        }
         let mut files = self.0.files.clone();
-        files.extend(
-            bundle
-                .files()
-                .iter()
-                .map(|file| {
-                    NodeSessionFile::generated(
-                        NodeSessionPathClass::BundleRoot,
-                        PathBuf::from(file.path()),
-                        file.bytes().to_vec(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        Self::new(self.0.environment.clone(), self.0.path_bindings.clone(), files)
+        files.extend(bundle_profile_files(bundle, layout)?);
+        Ok(Self::new(
+            self.0.environment.clone(),
+            self.0.path_bindings.clone(),
+            files,
+        )?)
     }
+}
+
+fn bundle_profile_files(
+    bundle: &NodeBundle,
+    layout: BundleProviderLayout,
+) -> Result<Vec<NodeSessionFile>, NodeSessionMaterializationProfileError> {
+    bundle
+        .files()
+        .iter()
+        .filter_map(|file| match layout {
+            BundleProviderLayout::Claude | BundleProviderLayout::Kimi => Some((
+                file,
+                NodeSessionPathClass::BundleRoot,
+                PathBuf::from(file.path()),
+            )),
+            BundleProviderLayout::Codex => file.path().strip_prefix("skills/").map(|_| {
+                (
+                    file,
+                    NodeSessionPathClass::ProviderHome,
+                    PathBuf::from(file.path()),
+                )
+            }),
+        })
+        .map(|(file, class, path)| {
+            NodeSessionFile::generated(class, path, file.bytes().to_vec())
+        })
+        .collect()
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum BundleProfileCompositionError {
+    #[error("the Codex bundle layout requires an exclusive CODEX_HOME ProviderHome profile")]
+    InvalidCodexProfile,
+    #[error("the bundle materialization profile is invalid")]
+    Profile(#[from] NodeSessionMaterializationProfileError),
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -849,32 +894,43 @@ impl SessionEnvironmentMaterializer {
         &self,
         ownership: &MaterializationOwnershipRecord,
         bundle: &NodeBundle,
+        layout: BundleProviderLayout,
     ) -> Result<(), SessionEnvironmentMaterializeError> {
         if ownership.bundle() != Some(&bundle.receipt()) {
             return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
         }
         self.revalidate(ownership)?;
-        let expected = bundle.files().iter()
-            .map(|file| PathBuf::from(file.path()))
-            .collect::<BTreeSet<_>>();
-        let declared = ownership.declared_paths.iter().filter_map(|path| {
-            (path.class == NodeSessionPathClass::BundleRoot)
-                .then(|| path.relative_path.clone())
-        }).collect::<BTreeSet<_>>();
-        let actual = collect_secure_files(&ownership.bundle_root)?;
-        if expected != declared || expected != actual {
-            return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
-        }
-        for file in bundle.files() {
-            let path = ownership.bundle_root.join(file.path());
-            let mut bytes = Vec::new();
-            File::open(path)?.take((MAX_SESSION_MATERIALIZATION_FILE_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            if bytes != file.bytes() {
-                return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
+        let (root, expected, declared) = match layout {
+            BundleProviderLayout::Claude | BundleProviderLayout::Kimi => (
+                ownership.bundle_root.clone(),
+                bundle.files().iter()
+                    .map(|file| (PathBuf::from(file.path()), file.bytes()))
+                    .collect::<BTreeMap<_, _>>(),
+                ownership.declared_paths.iter().filter_map(|path| {
+                    (path.class == NodeSessionPathClass::BundleRoot)
+                        .then(|| path.relative_path.clone())
+                }).collect::<BTreeSet<_>>(),
+            ),
+            BundleProviderLayout::Codex => {
+                if !collect_secure_files(&ownership.bundle_root)?.is_empty() {
+                    return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
+                }
+                (
+                    ownership.provider_home.join("skills"),
+                    bundle.files().iter().filter_map(|file| {
+                        file.path().strip_prefix("skills/")
+                            .map(|path| (PathBuf::from(path), file.bytes()))
+                    }).collect::<BTreeMap<_, _>>(),
+                    ownership.declared_paths.iter().filter_map(|path| {
+                        (path.class == NodeSessionPathClass::ProviderHome)
+                            .then(|| path.relative_path.strip_prefix("skills").ok())
+                            .flatten()
+                            .map(Path::to_path_buf)
+                    }).collect::<BTreeSet<_>>(),
+                )
             }
-        }
-        Ok(())
+        };
+        revalidate_exact_files(&root, &expected, &declared)
     }
 
     pub(crate) fn cleanup(&self, ownership: &MaterializationOwnershipRecord) -> Result<(), SessionEnvironmentMaterializeError> {
@@ -937,6 +993,28 @@ fn collect_secure_files(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
     visit(root, Path::new(""), &mut files)?;
     Ok(files)
+}
+
+fn revalidate_exact_files(
+    root: &Path,
+    expected: &BTreeMap<PathBuf, &[u8]>,
+    declared: &BTreeSet<PathBuf>,
+) -> Result<(), SessionEnvironmentMaterializeError> {
+    let expected_paths = expected.keys().cloned().collect::<BTreeSet<_>>();
+    let actual = collect_secure_files(root)?;
+    if expected_paths != *declared || expected_paths != actual {
+        return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
+    }
+    for (relative_path, expected_bytes) in expected {
+        let mut bytes = Vec::new();
+        File::open(root.join(relative_path))?
+            .take((MAX_SESSION_MATERIALIZATION_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes != *expected_bytes {
+            return Err(SessionEnvironmentMaterializeError::OwnershipMismatch);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -1514,6 +1592,90 @@ mod tests {
     }
 
     #[test]
+    fn codex_bundle_layout_requires_exact_home_binding_and_reserved_skill_tree() {
+        let exact = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            vec![NodeSessionPathBinding::new(
+                CODEX_HOME_ENVIRONMENT_KEY,
+                NodeSessionPathClass::ProviderHome,
+            )
+            .unwrap()],
+            vec![NodeSessionFile::generated(
+                NodeSessionPathClass::ProviderHome,
+                "auth.json",
+                b"explicit-auth-is-optional".to_vec(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        assert!(exact.supports_bundle_layout(BundleProviderLayout::Codex));
+
+        let no_auth = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            vec![NodeSessionPathBinding::new(
+                CODEX_HOME_ENVIRONMENT_KEY,
+                NodeSessionPathClass::ProviderHome,
+            )
+            .unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(no_auth.supports_bundle_layout(BundleProviderLayout::Codex));
+
+        let missing = NodeSessionMaterializationProfile::new(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert!(!missing.supports_bundle_layout(BundleProviderLayout::Codex));
+
+        let wrong_class = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            vec![NodeSessionPathBinding::new(
+                CODEX_HOME_ENVIRONMENT_KEY,
+                NodeSessionPathClass::Config,
+            )
+            .unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!wrong_class.supports_bundle_layout(BundleProviderLayout::Codex));
+
+        let reserved_skill = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            vec![NodeSessionPathBinding::new(
+                CODEX_HOME_ENVIRONMENT_KEY,
+                NodeSessionPathClass::ProviderHome,
+            )
+            .unwrap()],
+            vec![NodeSessionFile::generated(
+                NodeSessionPathClass::ProviderHome,
+                "skills/unmanaged/SKILL.md",
+                Vec::new(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        assert!(!reserved_skill.supports_bundle_layout(BundleProviderLayout::Codex));
+
+        let exposed_bundle_root = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            vec![
+                NodeSessionPathBinding::new(
+                    CODEX_HOME_ENVIRONMENT_KEY,
+                    NodeSessionPathClass::ProviderHome,
+                )
+                .unwrap(),
+                NodeSessionPathBinding::new(
+                    "UNMANAGED_BUNDLE_ROOT",
+                    NodeSessionPathClass::BundleRoot,
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!exposed_bundle_root.supports_bundle_layout(BundleProviderLayout::Codex));
+    }
+
+    #[test]
     fn legacy_environment_owner_marker_bytes_remain_v6_compatible() {
         let id = MaterializationId::new("legacy-environment").unwrap();
         let receipt = receipt();
@@ -1646,6 +1808,89 @@ mod tests {
         ownership.mark_cleanup_required(32).unwrap();
         materializer.cleanup(&ownership).unwrap();
         assert!(!ownership.root().exists());
+        drop(materializer);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_skill_tree_revalidation_is_exact_but_allows_other_home_state() {
+        let root = temp_root();
+        let materializer = SessionEnvironmentMaterializer::new(
+            root.clone(),
+            Arc::new(FakeResolver),
+        )
+        .unwrap();
+        let profile = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            vec![NodeSessionPathBinding::new(
+                CODEX_HOME_ENVIRONMENT_KEY,
+                NodeSessionPathClass::ProviderHome,
+            )
+            .unwrap()],
+            vec![NodeSessionFile::generated(
+                NodeSessionPathClass::ProviderHome,
+                "skills/review/SKILL.md",
+                b"review-skill".to_vec(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let bundle = ResolvedBundleReceipt {
+            id: crate::protocol::SpawnBundleId::new("review-bundle").unwrap(),
+            revision: crate::protocol::SpawnBundleRevision::new("r1").unwrap(),
+            digest: crate::protocol::SpawnBundleDigest::new(format!(
+                "sha256:{}",
+                "1".repeat(64),
+            ))
+            .unwrap(),
+        };
+        let mut ownership = materializer
+            .begin(
+                MaterializationId::new("codex-bundle-fixture").unwrap(),
+                None,
+                Some(bundle),
+                owner(),
+                None,
+                &profile,
+                40,
+            )
+            .unwrap();
+        materializer.materialize(&mut ownership, &profile, 41).unwrap();
+        assert!(collect_secure_files(ownership.bundle_root()).unwrap().is_empty());
+
+        let skills_root = ownership.provider_home().join("skills");
+        let skill_path = skills_root.join("review/SKILL.md");
+        let mut expected = BTreeMap::<PathBuf, &[u8]>::new();
+        expected.insert(PathBuf::from("review/SKILL.md"), b"review-skill");
+        let declared = BTreeSet::from([PathBuf::from("review/SKILL.md")]);
+        secure_create_file(
+            &ownership.provider_home().join("session-state.json"),
+            b"writable state",
+        )
+        .unwrap();
+        revalidate_exact_files(&skills_root, &expected, &declared).unwrap();
+
+        secure_replace_file(&skill_path, b"changed").unwrap();
+        assert!(revalidate_exact_files(&skills_root, &expected, &declared).is_err());
+        secure_replace_file(&skill_path, b"review-skill").unwrap();
+
+        let extra = skills_root.join("review/extra.txt");
+        secure_create_file(&extra, b"extra").unwrap();
+        assert!(revalidate_exact_files(&skills_root, &expected, &declared).is_err());
+        fs::remove_file(&extra).unwrap();
+
+        fs::remove_file(&skill_path).unwrap();
+        assert!(revalidate_exact_files(&skills_root, &expected, &declared).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing-target", &skill_path).unwrap();
+            assert!(revalidate_exact_files(&skills_root, &expected, &declared).is_err());
+            fs::remove_file(&skill_path).unwrap();
+        }
+        secure_create_file(&skill_path, b"review-skill").unwrap();
+
+        ownership.mark_cleanup_required(42).unwrap();
+        materializer.cleanup(&ownership).unwrap();
         drop(materializer);
         let _ = fs::remove_dir_all(root);
     }

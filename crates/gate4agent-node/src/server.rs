@@ -12,7 +12,9 @@ use crate::environment_profiles::{
     EnvironmentProfileBinding, NodeEnvironmentProfile, MAX_NODE_ENVIRONMENT_PROFILES,
 };
 use crate::bundle_catalog::{BundleCatalog, NodeBundle};
-use crate::bundle_provider::{bundle_launch_arguments, validate_bundle_binding};
+use crate::bundle_provider::{
+    bundle_launch_arguments, validate_bundle_binding, BundleProviderLayout,
+};
 use crate::session_environment::{
     MaterializationId, MaterializationOwner, MaterializationOwnershipRecord,
     MaterializationState, NodeSecretResolver, NodeSessionMaterializationProfile,
@@ -453,15 +455,11 @@ impl NodeServer {
         agent_id: AgentId,
         proof_path: PathBuf,
     ) -> Result<Self, NodeServerError> {
-        let expected_flag = match agent_id.as_str() {
-            "claude" => "--plugin-dir",
-            "kimi" => "--skills-dir",
-            _ => {
-                return Err(NodeServerError::Registry(
-                    "provider bundle argv fixture requires Claude or Kimi".to_owned(),
-                ));
-            }
-        };
+        if !matches!(agent_id.as_str(), "claude" | "codex" | "kimi") {
+            return Err(NodeServerError::Registry(
+                "provider bundle argv fixture requires Claude, Codex, or Kimi".to_owned(),
+            ));
+        }
         let mut spec = gate4agent_testkit::interactive_agent_spec();
         spec.id = agent_id.clone();
         spec.display_name = format!("Controlled {agent_id} bundle argv fixture");
@@ -485,13 +483,15 @@ impl NodeServer {
             .fixed_args
             .pop()
             .ok_or_else(|| NodeServerError::Registry("PTY fixture script is unavailable".to_owned()))?;
-        let provider_validation = if agent_id.as_str() == "claude" {
-            "if (-not (Test-Path -LiteralPath (Join-Path $bundleArgs[1] '.claude-plugin/plugin.json') -PathType Leaf)) { exit 92 }"
+        let bundle_validation = if agent_id.as_str() == "codex" {
+            "if ($bundleArgs.Count -ne 0) { exit 91 }; $codexHome = [Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process'); $cwd = (Get-Location).ProviderPath; if ([string]::IsNullOrEmpty($codexHome)) { [IO.File]::WriteAllLines($proofPath, [string[]]@('unbundled', $cwd)); [Console]::Out.WriteLine('F63_CODEX_UNBUNDLED_VALIDATED') } elseif (-not [IO.Path]::IsPathRooted($codexHome) -or -not (Test-Path -LiteralPath $codexHome -PathType Container)) { exit 92 } else { $skillPath = Join-Path $codexHome 'skills/review-code/SKILL.md'; if (-not (Test-Path -LiteralPath $skillPath -PathType Leaf)) { exit 93 }; $files = @(Get-ChildItem -LiteralPath $codexHome -Recurse -Force -File); if ($files.Count -ne 1 -or [IO.Path]::GetFullPath($files[0].FullName) -ine [IO.Path]::GetFullPath($skillPath)) { exit 94 }; $sha = [Security.Cryptography.SHA256]::Create(); try { $skillHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($skillPath)))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }; if ($skillHash -cne 'd78fe03be106b673fcf5415c8359e99f0298b5071cd11822c58ebcb27e52a68d') { exit 95 }; [IO.File]::WriteAllLines($proofPath, [string[]]@('bundled', $codexHome, $cwd, $skillHash)); [Console]::Out.WriteLine('F63_CODEX_BUNDLE_HOME_VALIDATED') }"
+        } else if agent_id.as_str() == "claude" {
+            "if ($bundleArgs.Count -eq 0) { [IO.File]::WriteAllLines($proofPath, [string[]]@()); [Console]::Out.WriteLine('F62_NO_BUNDLE_ARGV') } elseif ($bundleArgs.Count -eq 2 -and $bundleArgs[0] -ceq '--plugin-dir' -and [IO.Path]::IsPathRooted($bundleArgs[1]) -and (Test-Path -LiteralPath $bundleArgs[1] -PathType Container)) { if (-not (Test-Path -LiteralPath (Join-Path $bundleArgs[1] '.claude-plugin/plugin.json') -PathType Leaf)) { exit 92 }; [IO.File]::WriteAllLines($proofPath, [string[]]@($bundleArgs[0], $bundleArgs[1])); [Console]::Out.WriteLine('F62_BUNDLE_ARGV_VALIDATED') } else { exit 91 }"
         } else {
-            "if ((Split-Path -Leaf $bundleArgs[1]) -ne 'skills') { exit 93 }"
+            "if ($bundleArgs.Count -eq 0) { [IO.File]::WriteAllLines($proofPath, [string[]]@()); [Console]::Out.WriteLine('F62_NO_BUNDLE_ARGV') } elseif ($bundleArgs.Count -eq 2 -and $bundleArgs[0] -ceq '--skills-dir' -and [IO.Path]::IsPathRooted($bundleArgs[1]) -and (Test-Path -LiteralPath $bundleArgs[1] -PathType Container)) { if ((Split-Path -Leaf $bundleArgs[1]) -ne 'skills') { exit 93 }; [IO.File]::WriteAllLines($proofPath, [string[]]@($bundleArgs[0], $bundleArgs[1])); [Console]::Out.WriteLine('F62_BUNDLE_ARGV_VALIDATED') } else { exit 91 }"
         };
         spec.launch.fixed_args.push(format!(
-            "& {{ param([string]$proofPath, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) if ($bundleArgs.Count -eq 0) {{ [IO.File]::WriteAllLines($proofPath, [string[]]@()); [Console]::Out.WriteLine('F62_NO_BUNDLE_ARGV') }} elseif ($bundleArgs.Count -eq 2 -and $bundleArgs[0] -ceq '{expected_flag}' -and [IO.Path]::IsPathRooted($bundleArgs[1]) -and (Test-Path -LiteralPath $bundleArgs[1] -PathType Container)) {{ {provider_validation}; [IO.File]::WriteAllLines($proofPath, [string[]]@($bundleArgs[0], $bundleArgs[1])); [Console]::Out.WriteLine('F62_BUNDLE_ARGV_VALIDATED') }} else {{ exit 91 }}; {script} }}",
+            "& {{ param([string]$proofPath, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) {bundle_validation}; {script} }}",
         ));
         spec.launch.fixed_args.push(proof_path);
         Self::new_fixture_with_spec(config, spec)
@@ -1612,6 +1612,7 @@ impl NodeShared {
     fn resolve_bundle(
         &self,
         resolved: &ResolvedSpawnSpec,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
     ) -> Result<Option<ResolvedBundleReceipt>, NodeFailure> {
         let Some(bundle_id) = resolved.bundle_id.as_ref() else {
             return Ok(None);
@@ -1625,13 +1626,56 @@ impl NodeShared {
                     "spawn bundle is unavailable on this node",
                 )
             })?;
-        validate_bundle_binding(&resolved.provider, resolved.mode, bundle).map_err(|_| {
+        self.bundle_layout(
+            &resolved.provider,
+            resolved.mode,
+            environment_profile,
+            bundle,
+        )?;
+        Ok(Some(bundle.receipt()))
+    }
+
+    fn bundle_layout(
+        &self,
+        provider: &AgentId,
+        mode: SessionMode,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+        bundle: &NodeBundle,
+    ) -> Result<BundleProviderLayout, NodeFailure> {
+        let layout = validate_bundle_binding(provider, mode, bundle).map_err(|_| {
             failure(
                 NodeFailureCode::BundleBindingMismatch,
                 "spawn bundle does not match the provider and mode",
             )
         })?;
-        Ok(Some(bundle.receipt()))
+        if layout != BundleProviderLayout::Codex {
+            return Ok(layout);
+        }
+        let profile = environment_profile.and_then(|receipt| {
+            let profiles = self
+                .environment_profiles
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let binding = profiles.get(&receipt.profile_id)?;
+            if binding.revision != receipt.profile_revision
+                || &binding.provider != provider
+                || binding.native_profile_id(mode).is_none()
+            {
+                return None;
+            }
+            self.environment_materialization_profiles
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&receipt.profile_id)
+                .cloned()
+        });
+        if !profile.is_some_and(|profile| profile.supports_bundle_layout(layout)) {
+            return Err(failure(
+                NodeFailureCode::BundleBindingMismatch,
+                "Codex bundle requires an exact isolated CODEX_HOME profile",
+            ));
+        }
+        Ok(layout)
     }
 
     fn select_environment_profile(
@@ -1745,10 +1789,14 @@ impl NodeShared {
         mode: SessionMode,
         environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
         bundle: Option<&ResolvedBundleReceipt>,
-    ) -> Result<Option<(NodeSessionMaterializationProfile, bool)>, NodeFailure> {
+    ) -> Result<Option<(
+        NodeSessionMaterializationProfile,
+        bool,
+        Option<BundleProviderLayout>,
+    )>, NodeFailure> {
         let environment = environment_profile
             .and_then(|receipt| self.environment_materialization_profile(receipt));
-        let bundle = match bundle {
+        let (bundle, bundle_layout) = match bundle {
             Some(receipt) => {
                 let catalog = self.bundle_catalog.read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1762,28 +1810,38 @@ impl NodeShared {
                         "session bundle revision or digest changed",
                     ));
                 }
-                validate_bundle_binding(provider, mode, installed).map_err(|_| {
-                    failure(
-                        NodeFailureCode::BundleBindingMismatch,
-                        "session bundle does not match the provider and mode",
-                    )
-                })?;
-                Some(installed.clone())
+                let layout = self.bundle_layout(
+                    provider,
+                    mode,
+                    environment_profile,
+                    installed,
+                )?;
+                (Some(installed.clone()), Some(layout))
             }
-            None => None,
+            None => (None, None),
         };
         let has_environment_materialization = environment.is_some();
-        let profile = match (environment, bundle.as_ref()) {
-            (None, None) => return Ok(None),
-            (Some(profile), None) => Ok(profile),
-            (None, Some(bundle)) => NodeSessionMaterializationProfile::from_bundle(bundle),
-            (Some(profile), Some(bundle)) => profile.with_bundle(bundle),
+        let profile = match (environment, bundle.as_ref(), bundle_layout) {
+            (None, None, None) => return Ok(None),
+            (Some(profile), None, None) => Ok(profile),
+            (None, Some(bundle), Some(layout)) => {
+                NodeSessionMaterializationProfile::from_bundle(bundle, layout)
+            }
+            (Some(profile), Some(bundle), Some(layout)) => {
+                profile.with_bundle(bundle, layout)
+            }
+            _ => {
+                return Err(failure(
+                    NodeFailureCode::BundleBindingMismatch,
+                    "session bundle provider layout is unavailable",
+                ));
+            }
         }
         .map_err(|_| failure(
             NodeFailureCode::BundleMaterializationFailed,
             "session bundle materialization profile is invalid",
         ))?;
-        Ok(Some((profile, has_environment_materialization)))
+        Ok(Some((profile, has_environment_materialization, bundle_layout)))
     }
 
     fn prepare_session_materialization<'a>(
@@ -1795,7 +1853,7 @@ impl NodeShared {
         bundle: Option<&ResolvedBundleReceipt>,
         managed_lease_id: Option<ManagedWorktreeLeaseId>,
     ) -> Result<Option<(Option<PreparedNativeLaunchOverlay>, SessionMaterializationGuard<'a>)>, NodeFailure> {
-        let Some((profile, has_environment_materialization)) =
+        let Some((profile, has_environment_materialization, bundle_layout)) =
             self.materialization_profile(provider, mode, environment_profile, bundle)?
         else {
             return Ok(None);
@@ -1925,17 +1983,20 @@ impl NodeShared {
                         "session bundle revision or digest changed",
                     ));
                 }
-                materializer.revalidate_bundle(&ownership, installed).map_err(|_| {
+                let layout = bundle_layout.ok_or_else(|| failure(
+                    NodeFailureCode::BundleBindingMismatch,
+                    "materialized bundle provider layout is unavailable",
+                ))?;
+                materializer.revalidate_bundle(&ownership, installed, layout).map_err(|_| {
                     failure(
                         NodeFailureCode::BundleMaterializationFailed,
                         "session bundle byte revalidation failed",
                     )
                 })?;
                 Some(bundle_launch_arguments(
-                    provider,
-                    mode,
-                    installed,
+                    layout,
                     ownership.bundle_root(),
+                    ownership.provider_home(),
                 ).map_err(|_| failure(
                     NodeFailureCode::BundleBindingMismatch,
                     "session bundle launch binding is invalid",
@@ -2100,7 +2161,7 @@ impl NodeShared {
                 NodeFailureCode::BackendOperationFailed,
                 "managed session materialization is unavailable",
             )),
-            (Some(ownership), Some((profile, has_environment_materialization))) => {
+            (Some(ownership), Some((profile, has_environment_materialization, bundle_layout))) => {
                 if ownership.environment_profile() != environment_profile
                     || ownership.bundle() != bundle
                     || ownership.state() != MaterializationState::Ready
@@ -2133,7 +2194,11 @@ impl NodeShared {
                             "managed session bundle is unavailable",
                         ));
                     };
-                    if materializer.revalidate_bundle(&ownership, installed).is_err() {
+                    let layout = bundle_layout.ok_or_else(|| failure(
+                        NodeFailureCode::BundleBindingMismatch,
+                        "record bundle provider layout is unavailable",
+                    ))?;
+                    if materializer.revalidate_bundle(&ownership, installed, layout).is_err() {
                         drop(catalog);
                         self.mark_materialization_recovery_required(ownership.id());
                         return Err(failure(
@@ -2142,10 +2207,9 @@ impl NodeShared {
                         ));
                     }
                     Some(bundle_launch_arguments(
-                        provider,
-                        mode,
-                        installed,
+                        layout,
                         ownership.bundle_root(),
+                        ownership.provider_home(),
                     ).map_err(|_| failure(
                         NodeFailureCode::BundleBindingMismatch,
                         "managed session bundle launch binding is invalid",
@@ -2399,7 +2463,7 @@ impl NodeShared {
                         ))
                     }
                 }
-                (MaterializationState::Ready, MaterializationOwner::Record { .. }) => self
+                (MaterializationState::Ready, MaterializationOwner::Record { record_id }) => self
                     .session_environment_materializer
                     .as_ref()
                     .ok_or_else(|| {
@@ -2414,6 +2478,15 @@ impl NodeShared {
                             "session materialization revalidation failed",
                         ))?;
                         if let Some(receipt) = ownership.bundle() {
+                            let record = self.record(record_id)?;
+                            if record.environment_profile.as_ref() != ownership.environment_profile()
+                                || record.bundle.as_ref() != Some(receipt)
+                            {
+                                return Err(failure(
+                                    NodeFailureCode::BundleBindingMismatch,
+                                    "session bundle ownership changed after restart",
+                                ));
+                            }
                             let catalog = self.bundle_catalog.read()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             let bundle = catalog.get(&receipt.id).ok_or_else(|| failure(
@@ -2426,10 +2499,18 @@ impl NodeShared {
                                     "session bundle changed after restart",
                                 ));
                             }
-                            materializer.revalidate_bundle(&ownership, bundle).map_err(|_| failure(
-                                NodeFailureCode::BundleMaterializationFailed,
-                                "session bundle revalidation failed",
-                            ))?;
+                            let layout = self.bundle_layout(
+                                &record.provider,
+                                record.mode,
+                                record.environment_profile.as_ref(),
+                                bundle,
+                            )?;
+                            materializer
+                                .revalidate_bundle(&ownership, bundle, layout)
+                                .map_err(|_| failure(
+                                    NodeFailureCode::BundleMaterializationFailed,
+                                    "session bundle revalidation failed",
+                                ))?;
                         }
                         Ok(())
                     }),
@@ -2479,7 +2560,8 @@ impl NodeShared {
                     continue;
                 }
                 let has_exact_ownership = ownership.iter().any(|candidate| {
-                    candidate.environment_profile() == environment_profile
+                    candidate.state() == MaterializationState::Ready
+                        && candidate.environment_profile() == environment_profile
                         && candidate.bundle() == record.bundle.as_ref()
                         && candidate.owner()
                             == &MaterializationOwner::Record {
@@ -2638,8 +2720,8 @@ impl NodeShared {
                 "spawn context materialization capability is not available",
             ));
         }
-        self.resolve_environment_profile(&resolved)?;
-        self.resolve_bundle(&resolved)?;
+        let environment_profile = self.resolve_environment_profile(&resolved)?;
+        self.resolve_bundle(&resolved, environment_profile.as_ref())?;
         Ok(resolved)
     }
 
@@ -2688,7 +2770,7 @@ impl NodeShared {
         }
         let resolved = self.resolve_spawn_spec(&spec)?;
         let environment_profile = self.resolve_environment_profile(&resolved)?;
-        let bundle = self.resolve_bundle(&resolved)?;
+        let bundle = self.resolve_bundle(&resolved, environment_profile.as_ref())?;
         let required_capabilities = spawn_runtime_capabilities(&resolved.required_capabilities)?;
         let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
         let spawn_workspace_id = self.resolve_spawn_workspace(&resolved, deadline).await;
@@ -2757,7 +2839,7 @@ impl NodeShared {
         }
         let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
         let environment_profile = self.resolve_environment_profile(&resolved)?;
-        let bundle = self.resolve_bundle(&resolved)?;
+        let bundle = self.resolve_bundle(&resolved, environment_profile.as_ref())?;
         let source_workspace_id = resolved.target.workspace_id.clone();
         let profile = self.managed_profile(&source_workspace_id, &request.worktree_profile_id)?;
         let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
@@ -8924,6 +9006,299 @@ mod tests {
             root,
             deny,
         )
+    }
+
+    #[cfg(feature = "fixture")]
+    #[derive(Clone, Copy)]
+    enum CodexHomeProfile {
+        Missing,
+        WrongClass,
+        Exact,
+    }
+
+    #[cfg(feature = "fixture")]
+    fn codex_bundle_test_shared(
+        home_profile: CodexHomeProfile,
+    ) -> (
+        NodeShared,
+        NativeRuntime,
+        ResolvedEnvironmentProfileReceipt,
+        NodeBundle,
+        PathBuf,
+    ) {
+        const ROOT_MANIFEST: &[u8] = br#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"review-tools"}"#;
+        const CLAUDE_MANIFEST: &[u8] =
+            br#"{"name":"review-tools","version":"1.0.0","description":"Review helpers"}"#;
+        const SKILL: &[u8] = b"---\nname: review-code\ndescription: Review code for correctness and safety.\n---\n\nReview the selected change.\n";
+        const DIGEST: &str =
+            "sha256:941f20868a6ef49b4329bf1bb1368515763f5b64d8279b05cd9700966083d707";
+
+        let (shared, mut runtime, _claude_receipt, root, _deny) =
+            materialization_test_shared(false);
+        let profile_id = SpawnEnvironmentProfileId::new(match home_profile {
+            CodexHomeProfile::Missing => "codex-home-missing",
+            CodexHomeProfile::WrongClass => "codex-home-wrong",
+            CodexHomeProfile::Exact => "codex-home-exact",
+        })
+        .unwrap();
+        let profile_revision = crate::protocol::SpawnEnvironmentProfileRevision::new(
+            "codex-home-r1",
+        )
+        .unwrap();
+        let materialization = match home_profile {
+            CodexHomeProfile::Missing => None,
+            CodexHomeProfile::WrongClass | CodexHomeProfile::Exact => {
+                Some(NodeSessionMaterializationProfile::new(
+                    Vec::new(),
+                    vec![NodeSessionPathBinding::new(
+                        "CODEX_HOME",
+                        if matches!(home_profile, CodexHomeProfile::Exact) {
+                            NodeSessionPathClass::ProviderHome
+                        } else {
+                            NodeSessionPathClass::Config
+                        },
+                    )
+                    .unwrap()],
+                    Vec::new(),
+                )
+                .unwrap())
+            }
+        };
+        let node_profile = NodeEnvironmentProfile::new_with_materialization(
+            profile_id.clone(),
+            profile_revision.clone(),
+            agent("codex"),
+            [NativeLaunchProfile::new(
+                NativeLaunchProfileId::new(format!("{profile_id}-pty")).unwrap(),
+                agent("codex"),
+                TransportKind::Pty,
+                vec![OsString::from("GATE4AGENT_TEST_PROFILE")],
+                Arc::new(EmptyEnvironmentResolver),
+            )
+            .unwrap()],
+            materialization,
+        )
+        .unwrap();
+        let (binding, native_profiles, materialization) = node_profile.into_parts();
+        for native_profile in native_profiles {
+            runtime.upsert_native_launch_profile(native_profile).unwrap();
+        }
+        shared
+            .environment_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(binding.id.clone(), binding);
+        if let Some(materialization) = materialization {
+            shared
+                .environment_materialization_profiles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(profile_id.clone(), materialization);
+        }
+
+        let bundle_source = root.join(format!("bundle-source-{profile_id}"));
+        std::fs::create_dir_all(bundle_source.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(bundle_source.join("skills/review-code")).unwrap();
+        std::fs::write(bundle_source.join("plugin.json"), ROOT_MANIFEST).unwrap();
+        std::fs::write(
+            bundle_source.join(".claude-plugin/plugin.json"),
+            CLAUDE_MANIFEST,
+        )
+        .unwrap();
+        std::fs::write(bundle_source.join("skills/review-code/SKILL.md"), SKILL).unwrap();
+        crate::bundle_catalog::protect_bundle_source_tree_fixture(&bundle_source).unwrap();
+        let bundle = NodeBundle::new(
+            crate::protocol::SpawnBundleId::new("review-tools").unwrap(),
+            crate::protocol::SpawnBundleRevision::new("review-tools-r1").unwrap(),
+            crate::protocol::SpawnBundleDigest::new(DIGEST).unwrap(),
+            &bundle_source,
+        )
+        .unwrap();
+        *shared
+            .bundle_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            BundleCatalog::new([bundle.clone()]).unwrap();
+        (
+            shared,
+            runtime,
+            ResolvedEnvironmentProfileReceipt {
+                profile_id,
+                profile_revision,
+            },
+            bundle,
+            root,
+        )
+    }
+
+    #[cfg(feature = "fixture")]
+    #[test]
+    fn codex_bundle_preflight_rejects_missing_or_wrong_home_before_materialization() {
+        for home_profile in [CodexHomeProfile::Missing, CodexHomeProfile::WrongClass] {
+            let (shared, runtime, receipt, bundle, root) =
+                codex_bundle_test_shared(home_profile);
+            let error = shared
+                .bundle_layout(
+                    &agent("codex"),
+                    SessionMode::Pty,
+                    Some(&receipt),
+                    &bundle,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, NodeFailureCode::BundleBindingMismatch);
+            assert!(shared
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty());
+            let materialization_root = root.join("session-environments");
+            assert!(!std::fs::read_dir(&materialization_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())));
+            drop(shared);
+            drop(runtime);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(feature = "fixture")]
+    #[test]
+    fn codex_bundle_exact_home_profile_materializes_only_the_skill_tree() {
+        let (shared, runtime, receipt, bundle, root) =
+            codex_bundle_test_shared(CodexHomeProfile::Exact);
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(310),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (overlay, guard) = shared
+            .prepare_session_materialization(
+                &address,
+                &agent("codex"),
+                SessionMode::Pty,
+                Some(&receipt),
+                Some(&bundle.receipt()),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(overlay, Some(PreparedNativeLaunchOverlay::Instance(_))));
+        let ownership = shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(guard.id().unwrap())
+            .unwrap()
+            .clone();
+        let (profile, _, _) = shared
+            .materialization_profile(
+                &agent("codex"),
+                SessionMode::Pty,
+                Some(&receipt),
+                Some(&bundle.receipt()),
+            )
+            .unwrap()
+            .unwrap();
+        let environment = shared
+            .session_environment_materializer
+            .as_ref()
+            .unwrap()
+            .resolve_environment(&ownership, &profile)
+            .unwrap();
+        assert!(environment.iter().any(|mutation| {
+            mutation.key == OsString::from("CODEX_HOME")
+                && mutation.value.as_deref() == Some(ownership.provider_home().as_os_str())
+        }));
+        assert_eq!(
+            std::fs::read(ownership.provider_home().join("skills/review-code/SKILL.md"))
+                .unwrap(),
+            b"---\nname: review-code\ndescription: Review code for correctness and safety.\n---\n\nReview the selected change.\n",
+        );
+        assert!(std::fs::read_dir(ownership.bundle_root())
+            .unwrap()
+            .next()
+            .is_none());
+        drop(guard);
+        drop(shared);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fixture")]
+    #[test]
+    fn codex_cold_record_resume_revalidates_the_isolated_skill_tree() {
+        let (shared, runtime, receipt, bundle, root) =
+            codex_bundle_test_shared(CodexHomeProfile::Exact);
+        let bundle_receipt = bundle.receipt();
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(311),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (_overlay, guard) = shared
+            .prepare_session_materialization(
+                &address,
+                &agent("codex"),
+                SessionMode::Pty,
+                Some(&receipt),
+                Some(&bundle_receipt),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let materialization_id = guard.id().unwrap().clone();
+        let skill_path = shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&materialization_id)
+            .unwrap()
+            .provider_home()
+            .join("skills/review-code/SKILL.md");
+        let record_id = shared
+            .bind_spawn_session_with_materialization(
+                &address,
+                agent("codex"),
+                SessionMode::Pty,
+                ProviderRuntimePolicy::new(true, false, false, true, false).unwrap(),
+                Some(receipt.clone()),
+                Some(bundle_receipt.clone()),
+                Some(materialization_id.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        guard.retain();
+        std::fs::write(skill_path, b"changed-after-record-bind").unwrap();
+
+        let error = match shared.resolve_record_materialization(
+                &record_id,
+                &agent("codex"),
+                SessionMode::Pty,
+                Some(&receipt),
+                Some(&bundle_receipt),
+            ) {
+                Ok(_) => panic!("changed Codex skill tree unexpectedly revalidated"),
+                Err(error) => error,
+            };
+        assert_eq!(error.code, NodeFailureCode::BundleMaterializationFailed);
+        assert_eq!(
+            shared
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&materialization_id)
+                .unwrap()
+                .state(),
+            MaterializationState::RecoveryRequired,
+        );
+        drop(shared);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn bind_record_owned_materialization_fixture(

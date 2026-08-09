@@ -7,6 +7,7 @@ use crate::protocol::{
     OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
+    C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
@@ -46,6 +47,7 @@ struct NegotiatedPathCapabilities {
     spawn_spec_defaults_overrides: bool,
     worktree_selection: bool,
     managed_worktree_lifecycle: bool,
+    child_environment_profile: bool,
     terminal_frame_events: bool,
 }
 
@@ -187,6 +189,12 @@ async fn serve_connection(
     }
     if !path_capabilities.provider_ids_open {
         retain_legacy_provider_status(&mut hello_status);
+    }
+    if !path_capabilities.child_environment_profile
+        && status_contains_child_environment_profile(&hello_status)
+    {
+        hub.detach(connection_id);
+        return Ok(());
     }
     if !prune_pre_hello_events(
         &hub,
@@ -496,6 +504,12 @@ async fn control_writer<W>(
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
+        if !path_capabilities.child_environment_profile
+            && server_frame_contains_child_environment_profile(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
         }
@@ -557,6 +571,8 @@ fn negotiated_path_capabilities(
         worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
         managed_worktree_lifecycle:
             selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
+        child_environment_profile:
+            selected_has(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -663,6 +679,15 @@ fn unnegotiated_request_failure(
             None,
         ));
     }
+    if c2_request_requires_child_environment_profile_capability(request)
+        && !capabilities.child_environment_profile
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "child environment profile capability was not negotiated with C2",
+            None,
+        ));
+    }
     if !capabilities.provider_ids_open
         && (matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
             || spawn_spec_requires_open_provider_capability(request))
@@ -684,6 +709,18 @@ fn unnegotiated_request_failure(
         ));
     }
     None
+}
+
+fn c2_request_requires_child_environment_profile_capability(request: &NodeRequest) -> bool {
+    let spec = match request {
+        NodeRequest::SpawnSpec { spec } => spec,
+        NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
+        _ => return false,
+    };
+    !matches!(
+        &spec.overrides.environment_profile_id,
+        gate4agent_node_protocol::SpawnOverride::Clear
+    )
 }
 
 fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
@@ -865,6 +902,35 @@ fn server_frame_contains_managed_worktree(frame: &C2ServerFrame) -> bool {
         | C2ServerFrame::Topology(_)
         | C2ServerFrame::Rejected(_) => false,
     }
+}
+
+fn server_frame_contains_child_environment_profile(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Hello(hello) => {
+            status_contains_child_environment_profile(&hello.status)
+        }
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(
+                C2NodeResponse::requires_child_environment_profile_capability,
+            )
+        }),
+        C2ServerFrame::Event(event) => event
+            .event
+            .requires_child_environment_profile_capability(),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn status_contains_child_environment_profile(status: &StatusResponse) -> bool {
+    status.nodes.values().any(|node| {
+        node.inventory.as_ref().is_some_and(|inventory| {
+            inventory.managed_sessions.iter().any(|record| {
+                record.environment_profile.is_some()
+            })
+        })
+    })
 }
 
 fn c2_response_contains_managed_worktree(response: &C2NodeResponse) -> bool {
@@ -1143,6 +1209,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
             CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
@@ -1638,7 +1706,7 @@ mod tests {
             prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
             bundle_id: None,
             context_id: None,
-            environment_profile_id: None,
+            environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
             required_capabilities: SpawnRequiredCapabilities::default(),
@@ -1743,6 +1811,7 @@ mod tests {
             state: ManagedSessionState::Live,
             workspace_id: WorkspaceId::new("repo").unwrap(),
             active_session,
+            environment_profile: None,
             provider_identity_present: false,
             updated_at_unix_ms: 1,
         }
@@ -1770,6 +1839,7 @@ mod tests {
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -1806,6 +1876,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_none());
@@ -1853,6 +1924,67 @@ mod tests {
                 ..
             }) if message == "worktree selection capability was not negotiated with C2"
         ));
+
+        capabilities.worktree_selection = true;
+        capabilities.child_environment_profile = false;
+        let mut explicit_environment = spawn_spec("node-a");
+        explicit_environment.overrides.environment_profile_id =
+            gate4agent_node_protocol::SpawnOverride::Set {
+                value: crate::protocol::SpawnEnvironmentProfileId::new("local-default")
+                    .unwrap(),
+            };
+        assert!(matches!(
+            unnegotiated_request_failure(
+                &NodeRequest::SpawnSpec {
+                    spec: explicit_environment,
+                },
+                capabilities,
+            ),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "child environment profile capability was not negotiated with C2"
+        ));
+        let inherited_environment = spawn_spec("node-a");
+        assert!(matches!(
+            unnegotiated_request_failure(
+                &NodeRequest::SpawnSpec {
+                    spec: inherited_environment.clone(),
+                },
+                capabilities,
+            ),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "child environment profile capability was not negotiated with C2"
+        ));
+        let managed_environment = NodeRequest::SpawnManagedWorktree {
+            request: crate::protocol::ManagedWorktreeSpawnRequest {
+                spawn_spec: inherited_environment,
+                worktree_profile_id:
+                    crate::protocol::WorktreeProfileId::new("review").unwrap(),
+            },
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&managed_environment, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "child environment profile capability was not negotiated with C2"
+        ));
+        let mut cleared_environment = spawn_spec("node-a");
+        cleared_environment.overrides.environment_profile_id =
+            gate4agent_node_protocol::SpawnOverride::Clear;
+        assert!(unnegotiated_request_failure(
+            &NodeRequest::SpawnSpec {
+                spec: cleared_environment,
+            },
+            capabilities,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1873,6 +2005,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: false,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_some());
@@ -1963,8 +2096,66 @@ mod tests {
                 spawn_spec_defaults_overrides: false,
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
+                child_environment_profile: true,
                 terminal_frame_events: true,
             },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        ).await;
+        assert!(*disconnected.borrow());
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn control_writer_rejects_unnegotiated_environment_receipt_recursively() {
+        let mut receipt = spawn_receipt();
+        receipt.environment_profile = Some(
+            crate::protocol::ResolvedEnvironmentProfileReceipt {
+                profile_id: crate::protocol::SpawnEnvironmentProfileId::new(
+                    "local-default",
+                )
+                .unwrap(),
+                profile_revision:
+                    crate::protocol::SpawnEnvironmentProfileRevision::new(
+                        "local-default.r1",
+                    )
+                    .unwrap(),
+            },
+        );
+        let frame = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(4),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Ok(C2NodeResponse::SpawnSpecAccepted { receipt }),
+            }),
+        });
+        assert!(server_frame_contains_child_environment_profile(&frame));
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender.send(queued(frame, &budget).unwrap()).await.unwrap();
+        let (disconnect, disconnected) = watch::channel(false);
+        let capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            child_environment_profile: false,
+            terminal_frame_events: true,
+        };
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            capabilities,
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
         assert!(*disconnected.borrow());
@@ -2007,6 +2198,7 @@ mod tests {
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: false,
                 managed_worktree_lifecycle: true,
+                child_environment_profile: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2185,6 +2377,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2373,6 +2566,7 @@ mod tests {
                 spawn_spec_defaults_overrides: false,
                 worktree_selection: false,
                 managed_worktree_lifecycle: false,
+                child_environment_profile: false,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2408,6 +2602,7 @@ mod tests {
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
+                child_environment_profile: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2443,6 +2638,7 @@ mod tests {
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
+                child_environment_profile: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2496,6 +2692,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2511,6 +2708,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2526,6 +2724,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
@@ -2560,6 +2759,7 @@ mod tests {
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
+                child_environment_profile: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,

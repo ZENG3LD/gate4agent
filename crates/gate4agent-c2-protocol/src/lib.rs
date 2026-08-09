@@ -11,13 +11,15 @@ pub use gate4agent_node_protocol::{
     ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
     ProviderRuntimeContractId, ProviderRuntimeMode, ProviderRuntimeStatus,
     ProviderRuntimeStatuses, ProviderRuntimeVersion,
-    ResolvedSpawnReceipt, ResolvedSpawnSpec, SpawnBundleId, SpawnContextId, SpawnDeadlineMs,
-    SpawnEnvironmentProfileId, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
+    ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt, ResolvedSpawnSpec, SpawnBundleId,
+    SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId,
+    SpawnEnvironmentProfileRevision, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
     SpawnOverrides, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision, SpawnPrompt,
     SpawnPromptMetadata, SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnSpec,
     SpawnTarget,
     WorktreeProfileId, WorktreeProfileRevision,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+    NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
@@ -58,6 +60,8 @@ pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS
 pub const C2_WORKTREE_SELECTION_CAPABILITY: &str = NODE_WORKTREE_SELECTION_CAPABILITY;
 pub const C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY;
+pub const C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
+    NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -152,6 +156,12 @@ impl From<&NodeFailure> for C2NodeFailure {
             }
             NodeFailureCode::SpawnTargetMismatch => "spawn target mismatch",
             NodeFailureCode::UnknownSpawnProfile => "spawn profile unavailable",
+            NodeFailureCode::UnknownEnvironmentProfile => {
+                "environment profile unavailable"
+            }
+            NodeFailureCode::EnvironmentProfileBindingMismatch => {
+                "environment profile binding mismatch"
+            }
             NodeFailureCode::SpawnIdempotencyConflict => "spawn idempotency conflict",
             NodeFailureCode::SpawnIdempotencyCapacity => "spawn idempotency capacity exhausted",
             NodeFailureCode::SpawnDeadlineExceeded => "spawn deadline exceeded",
@@ -181,6 +191,8 @@ pub struct C2ManagedSessionRecord {
     pub state: ManagedSessionState,
     pub workspace_id: WorkspaceId,
     pub active_session: Option<SessionAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     pub provider_identity_present: bool,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -196,6 +208,7 @@ impl From<&ManagedSessionRecord> for C2ManagedSessionRecord {
             state: record.state,
             workspace_id: record.workspace_id.clone(),
             active_session: record.active_session.clone(),
+            environment_profile: record.environment_profile.clone(),
             provider_identity_present: record.provider_session.is_some(),
             created_at_unix_ms: record.created_at_unix_ms,
             updated_at_unix_ms: record.updated_at_unix_ms,
@@ -295,6 +308,14 @@ pub struct C2NodeSnapshot {
         deserialize_with = "deserialize_c2_managed_worktree_leases"
     )]
     pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
+}
+
+impl C2NodeSnapshot {
+    pub fn requires_child_environment_profile_capability(&self) -> bool {
+        self.session_records
+            .iter()
+            .any(|record| record.environment_profile.is_some())
+    }
 }
 
 fn deserialize_c2_managed_worktree_leases<'de, D>(
@@ -591,6 +612,13 @@ impl From<&NodeEvent> for C2NodeEvent {
     }
 }
 
+impl C2NodeEvent {
+    pub fn requires_child_environment_profile_capability(&self) -> bool {
+        matches!(self, Self::SessionRecordUpserted { record }
+            if record.environment_profile.is_some())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2GitWorktreeSnapshot {
     pub path: OpaqueHostPath,
@@ -774,6 +802,43 @@ impl From<&NodeResponse> for C2NodeResponse {
     }
 }
 
+impl C2NodeResponse {
+    pub fn requires_child_environment_profile_capability(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.requires_child_environment_profile_capability()
+            }
+            Self::Resync {
+                snapshot, events, ..
+            } => {
+                snapshot.requires_child_environment_profile_capability()
+                    || events.iter().any(|event| {
+                        event.event.requires_child_environment_profile_capability()
+                    })
+            }
+            Self::SpawnSpecAccepted { receipt } => receipt.environment_profile.is_some(),
+            Self::ManagedWorktreeSpawnAccepted { receipt } => {
+                receipt.spawn.environment_profile.is_some()
+            }
+            Self::SessionRecordUpdated { record }
+            | Self::SessionRecordResumed { record, .. } => {
+                record.environment_profile.is_some()
+            }
+            Self::WorkspaceInspected { .. }
+            | Self::WorkspaceFileRead { .. }
+            | Self::Controller { .. }
+            | Self::SpawnAccepted { .. }
+            | Self::ManagedWorktreeCleanup { .. }
+            | Self::SessionRecordForgotten { .. }
+            | Self::WorkspaceRegistered { .. }
+            | Self::WorkspaceUnregistered { .. }
+            | Self::WorktreeCreated { .. }
+            | Self::WorktreeRemoved { .. }
+            | Self::Accepted
+            | Self::ShuttingDown => false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1254,6 +1319,8 @@ pub struct SlimManagedSessionRecord {
     pub state: ManagedSessionState,
     pub workspace_id: WorkspaceId,
     pub active_session: Option<SessionAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     pub provider_identity_present: bool,
     pub updated_at_unix_ms: u64,
 }
@@ -1454,6 +1521,7 @@ impl From<&ManagedSessionRecord> for SlimManagedSessionRecord {
             state: record.state,
             workspace_id: record.workspace_id.clone(),
             active_session: record.active_session.clone(),
+            environment_profile: record.environment_profile.clone(),
             provider_identity_present: record.provider_session.is_some(),
             updated_at_unix_ms: record.updated_at_unix_ms,
         }
@@ -1473,6 +1541,7 @@ impl From<&C2ManagedSessionRecord> for SlimManagedSessionRecord {
             state: record.state,
             workspace_id: record.workspace_id.clone(),
             active_session: record.active_session.clone(),
+            environment_profile: record.environment_profile.clone(),
             provider_identity_present: record.provider_identity_present,
             updated_at_unix_ms: record.updated_at_unix_ms,
         }
@@ -1615,6 +1684,13 @@ mod tests {
                     instance_id: AgentInstanceId(41),
                     generation: SessionGeneration(3),
                 },
+            }),
+            environment_profile: Some(ResolvedEnvironmentProfileReceipt {
+                profile_id: SpawnEnvironmentProfileId::new("local-default").unwrap(),
+                profile_revision: SpawnEnvironmentProfileRevision::new(
+                    "local-default.2026-08",
+                )
+                .unwrap(),
             }),
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
@@ -2040,6 +2116,49 @@ mod tests {
             .windows(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY.len())
             .any(|window| {
                 window == C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY.as_bytes()
+            }));
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+    }
+
+    #[test]
+    fn c2_child_environment_profile_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(
+            C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+            "child-environment-profile-v1",
+        );
+        let capability =
+            CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        let bound = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        assert!(bound
+            .windows(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY.len())
+            .any(|window| {
+                window == C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY.as_bytes()
             }));
         assert!(support
             .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
@@ -2594,6 +2713,10 @@ mod tests {
             let json = serde_json::to_string(&routed_response(response)).unwrap();
             assert_private_record_fields_absent(&json);
             assert!(json.contains("provider_identity_present"));
+            assert!(json.contains(r#""profile_id":"local-default""#));
+            assert!(json.contains(
+                r#""profile_revision":"local-default.2026-08""#,
+            ));
             let decoded = serde_json::from_str::<RoutedNodeResponse>(&json).unwrap();
             let decoded_record = match decoded.response.unwrap() {
                 C2NodeResponse::Snapshot { snapshot, .. } => snapshot.session_records.into_iter().next().unwrap(),
@@ -2945,6 +3068,7 @@ mod tests {
                 transcript_path: Some(r"C:\private\transcript.jsonl".to_owned()),
             }),
             active_session: None,
+            environment_profile: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
             last_error: Some("private backend diagnostic".to_owned()),
@@ -3008,6 +3132,7 @@ mod tests {
                 canonical_root: host_path(r"C:\repo"),
                 provider_session: None,
                 active_session: None,
+                environment_profile: None,
                 created_at_unix_ms: index as u64,
                 updated_at_unix_ms: index as u64,
                 last_error: None,

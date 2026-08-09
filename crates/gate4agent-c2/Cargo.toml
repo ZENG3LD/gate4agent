@@ -22,7 +22,9 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "signal",
 
 [dev-dependencies]
 gate4agent-c2-client = { path = "../gate4agent-c2-client" }
+gate4agent-catalog = { path = "../gate4agent-catalog" }
 gate4agent-node = { path = "../gate4agent-node", features = ["fixture"] }
+gate4agent-runtime-native = { path = "../gate4agent-runtime-native" }
 gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 vt100 = "0.16"

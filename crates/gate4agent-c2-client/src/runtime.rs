@@ -6,6 +6,7 @@ use gate4agent_c2_protocol::{
     ProtocolRange, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
     C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
+    C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
@@ -55,6 +56,8 @@ const WORKTREE_SELECTION_NOT_NEGOTIATED: &str =
     "worktree selection requires negotiated C2 capability";
 const MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED: &str =
     "managed worktree lifecycle requires negotiated C2 capability";
+const CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED: &str =
+    "child environment profiles require negotiated C2 capability";
 
 #[derive(Clone, Copy)]
 struct NegotiatedPathCapabilities {
@@ -65,6 +68,7 @@ struct NegotiatedPathCapabilities {
     spawn_spec_defaults_overrides: bool,
     worktree_selection: bool,
     managed_worktree_lifecycle: bool,
+    child_environment_profile: bool,
     terminal_frame_events: bool,
 }
 
@@ -249,6 +253,13 @@ pub async fn connect_local(
             WORKTREE_SELECTION_NOT_NEGOTIATED.to_owned(),
         ));
     }
+    if !path_capabilities.child_environment_profile
+        && status_has_child_environment_profile(&hello.status)
+    {
+        return Err(C2ControlError::Protocol(
+            CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
 
     let (reader, writer) = tokio::io::split(pipe);
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -305,6 +316,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
             CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
@@ -374,6 +387,8 @@ fn negotiated_path_capabilities(
         worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
         managed_worktree_lifecycle:
             selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
+        child_environment_profile:
+            selected_has(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -433,12 +448,31 @@ fn reject_unnegotiated_outbound_path(
             WORKTREE_SELECTION_NOT_NEGOTIATED.to_owned(),
         ));
     }
+    if c2_request_requires_child_environment_profile_capability(request)
+        && !capabilities.child_environment_profile
+    {
+        return Err(C2ControlError::Protocol(
+            CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED.to_owned(),
+        ));
+    }
     if !capabilities.repository_paths && node_request_has_unix_repository_path(request) {
         return Err(C2ControlError::Protocol(
             REPOSITORY_PATH_NOT_NEGOTIATED.to_owned(),
         ));
     }
     Ok(())
+}
+
+fn c2_request_requires_child_environment_profile_capability(request: &NodeRequest) -> bool {
+    let spec = match request {
+        NodeRequest::SpawnSpec { spec } => spec,
+        NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
+        _ => return false,
+    };
+    !matches!(
+        &spec.overrides.environment_profile_id,
+        gate4agent_node_protocol::SpawnOverride::Clear
+    )
 }
 
 fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
@@ -768,6 +802,18 @@ fn status_has_managed_worktree(status: &gate4agent_c2_protocol::StatusResponse) 
     })
 }
 
+fn status_has_child_environment_profile(
+    status: &gate4agent_c2_protocol::StatusResponse,
+) -> bool {
+    status.nodes.values().any(|node| {
+        node.inventory.as_ref().is_some_and(|inventory| {
+            inventory.managed_sessions.iter().any(|record| {
+                record.environment_profile.is_some()
+            })
+        })
+    })
+}
+
 fn topology_has_open_provider_id(topology: &C2Topology) -> bool {
     topology.nodes.iter().any(|node| {
         node.provider_contracts.iter()
@@ -1038,6 +1084,18 @@ async fn control_owner(
                             )));
                             break;
                         }
+                        if !path_capabilities.child_environment_profile
+                            && reply.result.as_ref().is_ok_and(|routed| {
+                                routed.response.as_ref().is_ok_and(
+                                    C2NodeResponse::requires_child_environment_profile_capability,
+                                )
+                            })
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
@@ -1063,6 +1121,13 @@ async fn control_owner(
                         }
                         if !path_capabilities.worktree_selection
                             && c2_node_event_is_managed_worktree(&event.event)
+                        {
+                            break;
+                        }
+                        if !path_capabilities.child_environment_profile
+                            && event
+                                .event
+                                .requires_child_environment_profile_capability()
                         {
                             break;
                         }
@@ -1293,7 +1358,7 @@ mod tests {
             prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
             bundle_id: None,
             context_id: None,
-            environment_profile_id: None,
+            environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
             required_capabilities: SpawnRequiredCapabilities::default(),
@@ -1318,6 +1383,7 @@ mod tests {
             spawn_spec_defaults_overrides: false,
             worktree_selection: false,
             managed_worktree_lifecycle: false,
+            child_environment_profile: false,
             terminal_frame_events: false,
         }
     }
@@ -1331,6 +1397,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         }
     }
@@ -1481,6 +1548,8 @@ mod tests {
                 CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -1996,6 +2065,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_environment_receipt_and_closes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let mut capabilities = all_path_capabilities();
+        capabilities.child_environment_profile = false;
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, capabilities,
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        let mut receipt = spawn_receipt();
+        receipt.environment_profile = Some(
+            gate4agent_c2_protocol::ResolvedEnvironmentProfileReceipt {
+                profile_id: gate4agent_c2_protocol::SpawnEnvironmentProfileId::new(
+                    "local-default",
+                )
+                .unwrap(),
+                profile_revision:
+                    gate4agent_c2_protocol::SpawnEnvironmentProfileRevision::new(
+                        "local-default.r1",
+                    )
+                    .unwrap(),
+            },
+        );
+        incoming_tx.send(OwnerInput::Frame(C2ServerFrame::Reply(
+            gate4agent_c2_protocol::C2ReplyEnvelope {
+                request_id: C2RequestId(1),
+                result: Ok(RoutedNodeResponse {
+                    node_id: NodeId::new("node-a").unwrap(),
+                    incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                    response: Ok(C2NodeResponse::SpawnSpecAccepted { receipt }),
+                }),
+            },
+        ))).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED
+        ));
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn control_owner_rejects_unnegotiated_open_provider_reply_and_closes() {
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (events_tx, _events_rx) = mpsc::channel(1);
@@ -2105,6 +2226,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2120,6 +2242,7 @@ mod tests {
             spawn_spec_defaults_overrides: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            child_environment_profile: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2352,6 +2475,61 @@ mod tests {
         drop(incoming_tx);
         timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
         assert!(commands_tx.is_closed());
+    }
+
+    #[test]
+    fn child_environment_profile_set_and_inherit_require_capability_before_write() {
+        let mut explicit = spawn_spec("node-a");
+        explicit.overrides.environment_profile_id =
+            gate4agent_node_protocol::SpawnOverride::Set {
+                value: gate4agent_c2_protocol::SpawnEnvironmentProfileId::new(
+                    "local-default",
+                )
+                .unwrap(),
+            };
+        let mut capabilities = all_path_capabilities();
+        capabilities.child_environment_profile = false;
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(
+                &NodeRequest::SpawnSpec { spec: explicit },
+                capabilities,
+            ),
+            Err(C2ControlError::Protocol(ref message))
+                if message == CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED
+        ));
+
+        let inherited = spawn_spec("node-a");
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(
+                &NodeRequest::SpawnSpec {
+                    spec: inherited.clone(),
+                },
+                capabilities,
+            ),
+            Err(C2ControlError::Protocol(ref message))
+                if message == CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED
+        ));
+        let managed = NodeRequest::SpawnManagedWorktree {
+            request: gate4agent_c2_protocol::ManagedWorktreeSpawnRequest {
+                spawn_spec: inherited,
+                worktree_profile_id:
+                    gate4agent_c2_protocol::WorktreeProfileId::new("review").unwrap(),
+            },
+        };
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(&managed, capabilities),
+            Err(C2ControlError::Protocol(ref message))
+                if message == CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED
+        ));
+
+        let mut cleared = spawn_spec("node-a");
+        cleared.overrides.environment_profile_id =
+            gate4agent_node_protocol::SpawnOverride::Clear;
+        assert!(reject_unnegotiated_outbound_path(
+            &NodeRequest::SpawnSpec { spec: cleared },
+            capabilities,
+        )
+        .is_ok());
     }
 
     #[test]

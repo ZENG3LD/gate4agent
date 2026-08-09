@@ -23,6 +23,7 @@ pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_STATE_SCHEMA_V3: u16 = 3;
 pub const NODE_STATE_SCHEMA_V4: u16 = 4;
+pub const NODE_STATE_SCHEMA_V5: u16 = 5;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
@@ -36,6 +37,8 @@ pub const NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
 pub const NODE_WORKTREE_SELECTION_CAPABILITY: &str = "worktree-selection-v1";
 pub const NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     "managed-worktree-lifecycle-v1";
+pub const NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
+    "child-environment-profile-v1";
 pub const SPAWN_RUNTIME_RAW_PTY_LIFECYCLE: &str = "raw-pty-lifecycle";
 pub const SPAWN_RUNTIME_SEMANTIC_READINESS: &str = "semantic-readiness";
 pub const SPAWN_RUNTIME_STRUCTURED_PROMPT: &str = "structured-prompt";
@@ -60,6 +63,7 @@ pub const MAX_NODE_TERMINAL_BYTES: usize = 64;
 pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
 pub const MAX_SPAWN_PROFILE_ID_BYTES: usize = 64;
 pub const MAX_SPAWN_PROFILE_REVISION_BYTES: usize = 128;
+pub const MAX_SPAWN_ENVIRONMENT_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_RESOURCE_ID_BYTES: usize = 128;
 pub const MAX_SPAWN_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub const MAX_SPAWN_REQUIRED_CAPABILITIES: usize = 16;
@@ -358,6 +362,10 @@ pub struct SpawnEnvironmentProfileId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+pub struct SpawnEnvironmentProfileRevision(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct SpawnIdempotencyKey(String);
 
 macro_rules! spawn_identifier_impl {
@@ -412,6 +420,11 @@ spawn_identifier_impl!(
     SpawnEnvironmentProfileId,
     "spawn environment profile",
     MAX_SPAWN_RESOURCE_ID_BYTES
+);
+spawn_identifier_impl!(
+    SpawnEnvironmentProfileRevision,
+    "spawn environment profile revision",
+    MAX_SPAWN_ENVIRONMENT_PROFILE_REVISION_BYTES
 );
 spawn_identifier_impl!(
     SpawnIdempotencyKey,
@@ -1036,6 +1049,13 @@ impl SpawnPromptMetadata {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResolvedEnvironmentProfileReceipt {
+    pub profile_id: SpawnEnvironmentProfileId,
+    pub profile_revision: SpawnEnvironmentProfileRevision,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedSpawnReceipt {
     pub incarnation_id: NodeIncarnationId,
     pub session: SessionAddress,
@@ -1048,7 +1068,8 @@ pub struct ResolvedSpawnReceipt {
     pub prompt: SpawnPromptMetadata,
     pub bundle_id: Option<SpawnBundleId>,
     pub context_id: Option<SpawnContextId>,
-    pub environment_profile_id: Option<SpawnEnvironmentProfileId>,
+    #[serde(rename = "environment_profile_id")]
+    pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     pub deadline_ms: SpawnDeadlineMs,
     pub idempotency_key: SpawnIdempotencyKey,
     pub required_capabilities: SpawnRequiredCapabilities,
@@ -1134,6 +1155,15 @@ impl ResolvedSpawnSpec {
         incarnation_id: NodeIncarnationId,
         session: SessionAddress,
     ) -> ResolvedSpawnReceipt {
+        self.receipt_with_environment(incarnation_id, session, None)
+    }
+
+    pub fn receipt_with_environment(
+        &self,
+        incarnation_id: NodeIncarnationId,
+        session: SessionAddress,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    ) -> ResolvedSpawnReceipt {
         ResolvedSpawnReceipt {
             incarnation_id,
             session,
@@ -1146,7 +1176,7 @@ impl ResolvedSpawnSpec {
             prompt: SpawnPromptMetadata::from_prompt(self.prompt.as_ref()),
             bundle_id: self.bundle_id.clone(),
             context_id: self.context_id.clone(),
-            environment_profile_id: self.environment_profile_id.clone(),
+            environment_profile,
             deadline_ms: self.deadline_ms,
             idempotency_key: self.idempotency_key.clone(),
             required_capabilities: self.required_capabilities.clone(),
@@ -2400,6 +2430,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_PROVIDER_ID_OPEN_CAPABILITY,
             NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
             NODE_REPOSITORY_PATH_CAPABILITY,
+            NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -2412,7 +2443,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V4,
+                maximum: NODE_STATE_SCHEMA_V5,
             },
         }),
     }
@@ -2632,6 +2663,8 @@ pub struct ManagedSessionRecord {
     pub canonical_root: OpaqueHostPath,
     pub provider_session: Option<ProviderSessionIdentity>,
     pub active_session: Option<SessionAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub last_error: Option<String>,
@@ -2788,6 +2821,14 @@ pub struct NodeSnapshot {
         deserialize_with = "deserialize_managed_worktree_leases"
     )]
     pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
+}
+
+impl NodeSnapshot {
+    pub fn requires_child_environment_profile_capability(&self) -> bool {
+        self.session_records
+            .iter()
+            .any(|record| record.environment_profile.is_some())
+    }
 }
 
 fn deserialize_managed_worktree_leases<'de, D>(
@@ -3048,6 +3089,18 @@ impl NodeRequest {
             Self::SpawnSpec { .. } | Self::SpawnManagedWorktree { .. }
         )
     }
+
+    pub fn requires_child_environment_profile_capability(&self) -> bool {
+        let spec = match self {
+            Self::SpawnSpec { spec } => spec,
+            Self::SpawnManagedWorktree { request } => &request.spawn_spec,
+            _ => return false,
+        };
+        matches!(
+            spec.overrides.environment_profile_id,
+            SpawnOverride::Set { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3136,6 +3189,41 @@ impl NodeResponse {
             Self::SpawnSpecAccepted { .. } | Self::ManagedWorktreeSpawnAccepted { .. }
         )
     }
+    pub fn requires_child_environment_profile_capability(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.requires_child_environment_profile_capability()
+            }
+            Self::Resync {
+                snapshot, events, ..
+            } => {
+                snapshot.requires_child_environment_profile_capability()
+                    || events.iter().any(|event| {
+                        event.event.requires_child_environment_profile_capability()
+                    })
+            }
+            Self::SpawnSpecAccepted { receipt } => receipt.environment_profile.is_some(),
+            Self::ManagedWorktreeSpawnAccepted { receipt } => {
+                receipt.spawn.environment_profile.is_some()
+            }
+            Self::SessionRecordUpdated { record }
+            | Self::SessionRecordResumed { record, .. } => {
+                record.environment_profile.is_some()
+            }
+            Self::WorkspaceInspected { .. }
+            | Self::WorkspaceFileRead { .. }
+            | Self::Controller { .. }
+            | Self::SpawnAccepted { .. }
+            | Self::ManagedWorktreeCleanup { .. }
+            | Self::SessionRecordForgotten { .. }
+            | Self::WorkspaceRegistered { .. }
+            | Self::WorkspaceUnregistered { .. }
+            | Self::WorktreeCreated { .. }
+            | Self::WorktreeRemoved { .. }
+            | Self::Accepted
+            | Self::ShuttingDown => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3175,6 +3263,8 @@ pub enum NodeFailureCode {
     ManagedWorktreeOwnershipConflict,
     ManagedWorktreeRecoveryRequired,
     UnknownSpawnProfile,
+    UnknownEnvironmentProfile,
+    EnvironmentProfileBindingMismatch,
     SpawnTargetMismatch,
     SpawnIdempotencyConflict,
     SpawnIdempotencyCapacity,
@@ -3212,6 +3302,13 @@ pub enum NodeEvent {
     ManagedWorktreeUpserted { lease: ManagedWorktreeLeaseSnapshot },
     ManagedWorktreeRemoved { lease_id: ManagedWorktreeLeaseId },
     ResyncRequired { oldest_available_sequence: u64 },
+}
+
+impl NodeEvent {
+    pub fn requires_child_environment_profile_capability(&self) -> bool {
+        matches!(self, Self::SessionRecordUpserted { record }
+            if record.environment_profile.is_some())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3538,6 +3635,58 @@ mod tests {
         );
         assert!(!receipt_json.contains("private prompt text"));
         assert!(!receipt_json.contains("profile prompt"));
+
+        let environment_profile = ResolvedEnvironmentProfileReceipt {
+            profile_id: SpawnEnvironmentProfileId::new("local-default").unwrap(),
+            profile_revision: SpawnEnvironmentProfileRevision::new(
+                "local-default.2026-08",
+            )
+            .unwrap(),
+        };
+        let environment_receipt = first.receipt_with_environment(
+            NodeIncarnationId::from_bytes([9; NODE_INCARNATION_ID_BYTES]),
+            receipt.session.clone(),
+            Some(environment_profile.clone()),
+        );
+        let environment_json = serde_json::to_string(&environment_receipt).unwrap();
+        assert!(environment_json.contains(
+            r#""environment_profile_id":{"profile_id":"local-default","profile_revision":"local-default.2026-08"}"#,
+        ));
+        assert_eq!(
+            serde_json::from_str::<ResolvedSpawnReceipt>(&environment_json)
+                .unwrap()
+                .environment_profile,
+            Some(environment_profile),
+        );
+        assert!(serde_json::from_str::<ResolvedEnvironmentProfileReceipt>(
+            r#"{"profile_id":"local-default","profile_revision":"r1","value":"secret"}"#,
+        )
+        .is_err());
+        assert!(SpawnEnvironmentProfileRevision::new(
+            "r".repeat(MAX_SPAWN_ENVIRONMENT_PROFILE_REVISION_BYTES),
+        )
+        .is_ok());
+        assert!(SpawnEnvironmentProfileRevision::new(
+            "r".repeat(MAX_SPAWN_ENVIRONMENT_PROFILE_REVISION_BYTES + 1),
+        )
+        .is_err());
+
+        assert!(!NodeRequest::SpawnSpec { spec: spec.clone() }
+            .requires_child_environment_profile_capability());
+        let mut explicit_environment = spec.clone();
+        explicit_environment.overrides.environment_profile_id = SpawnOverride::Set {
+            value: SpawnEnvironmentProfileId::new("local-default").unwrap(),
+        };
+        assert!(NodeRequest::SpawnSpec {
+            spec: explicit_environment,
+        }
+        .requires_child_environment_profile_capability());
+        let mut inherited_environment = spec.clone();
+        inherited_environment.overrides.environment_profile_id = SpawnOverride::Inherit;
+        assert!(!NodeRequest::SpawnSpec {
+            spec: inherited_environment,
+        }
+        .requires_child_environment_profile_capability());
 
         let mut clear_required = spec.clone();
         clear_required.overrides.provider = SpawnOverride::Clear;
@@ -4453,6 +4602,7 @@ mod tests {
         );
         assert_eq!(NODE_PROTOCOL_VERSION, 8);
         assert_eq!(NODE_STATE_SCHEMA_V4, 4);
+        assert_eq!(NODE_STATE_SCHEMA_V5, 5);
         assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES)).is_ok());
         assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES + 1)).is_err());
         assert!(WorktreeProfileRevision::new(
@@ -4703,6 +4853,47 @@ mod tests {
             .unwrap(),
             r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":8,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
         );
+    }
+
+    #[test]
+    fn child_environment_profile_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(
+            NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+            "child-environment-profile-v1",
+        );
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .iter()
+            .any(|capability| {
+                capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
+            }));
+
+        let capability =
+            CapabilityId::new(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap();
+        let mut support = portable_node_support();
+        support.capabilities = vec![capability.clone()];
+        let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
+        assert!(support
+            .negotiate(NODE_PROTOCOL_VERSION, &legacy)
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let bound = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
+        assert!(bound
+            .windows(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY.len())
+            .any(|window| {
+                window == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY.as_bytes()
+            }));
     }
 
     #[test]
@@ -5033,10 +5224,14 @@ mod tests {
                 transcript_path: Some(r"C:\provider\sessions\b1ef3250.jsonl".to_owned()),
             }),
             active_session: None,
+            environment_profile: None,
             created_at_unix_ms: 1_723_000_000_000,
             updated_at_unix_ms: 1_723_000_000_123,
             last_error: None,
         };
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("environment_profile"));
 
         let requests = [
             NodeRequest::RenameSessionRecord {

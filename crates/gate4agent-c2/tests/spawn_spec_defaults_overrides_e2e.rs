@@ -365,7 +365,7 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
     assert_eq!(receipt.prompt.byte_len, 0);
     assert_eq!(receipt.bundle_id, None);
     assert_eq!(receipt.context_id, None);
-    assert_eq!(receipt.environment_profile_id, None);
+    assert_eq!(receipt.environment_profile, None);
     assert_eq!(receipt.deadline_ms, accepted_spec.deadline_ms);
     assert_eq!(receipt.idempotency_key, accepted_spec.idempotency_key);
     assert_eq!(receipt.required_capabilities, required_capabilities);

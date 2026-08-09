@@ -9,6 +9,7 @@ use gate4agent_node_protocol::{
     ServerChallenge, ServerFrame,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES,
+    NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
@@ -25,7 +26,7 @@ use crate::{
 #[cfg(test)]
 use gate4agent_node_protocol::{
     NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5,
 };
 #[cfg(test)]
 use crate::auth_proof;
@@ -286,6 +287,10 @@ impl LocalNodeClient {
         );
         ensure_node_hello_path_capability(&hello, opaque_unix_paths_enabled)?;
         ensure_node_hello_provider_capability(&hello, open_provider_ids_enabled)?;
+        ensure_node_hello_environment_profile_capability(
+            &hello,
+            &negotiated_capabilities,
+        )?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
                 "node identity mismatch: expected '{}', received '{}'",
@@ -558,6 +563,16 @@ fn ensure_node_request_required_capability(
             NODE_WORKTREE_SELECTION_CAPABILITY.to_owned(),
         ));
     }
+    if request.requires_child_environment_profile_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY.to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -609,6 +624,29 @@ fn ensure_server_frame_required_capability(
     {
         return Err(NodeClientError::UnsupportedCapability(
             NODE_WORKTREE_SELECTION_CAPABILITY.to_owned(),
+        ));
+    }
+    let contains_environment_profile = match frame {
+        ServerFrame::Hello(hello) => hello
+            .snapshot
+            .requires_child_environment_profile_capability(),
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(
+            NodeResponse::requires_child_environment_profile_capability,
+        ),
+        ServerFrame::Event(event) => event
+            .event
+            .requires_child_environment_profile_capability(),
+        ServerFrame::Challenge(_) => false,
+    };
+    if contains_environment_profile
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent child environment profile metadata without negotiating the capability"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -729,6 +767,26 @@ fn ensure_node_hello_provider_capability(
         node_snapshot_contains_open_provider_id(&hello.snapshot),
         open_provider_ids_enabled,
     )
+}
+
+fn ensure_node_hello_environment_profile_capability(
+    hello: &NodeHello,
+    negotiated_capabilities: &[CapabilityId],
+) -> Result<(), NodeClientError> {
+    if hello
+        .snapshot
+        .requires_child_environment_profile_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent child environment profile metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_node_request_provider_capability(
@@ -1267,9 +1325,11 @@ mod tests {
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
-        ResolvedSpawnReceipt, SessionAddress, SessionKey, SessionMode, SessionRecordId,
+        ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt, SessionAddress, SessionKey,
+        SessionMode, SessionRecordId,
         SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
-        SpawnProfileId, SpawnProfileRevision, SpawnPromptMetadata, SpawnRequiredCapabilities,
+        SpawnEnvironmentProfileId, SpawnEnvironmentProfileRevision, SpawnProfileId,
+        SpawnProfileRevision, SpawnPromptMetadata, SpawnRequiredCapabilities,
         SpawnResolutionProvenance, SpawnSpec, SpawnTarget, WorkspaceEntry,
         WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
         WorkspaceInspection, WorkspaceSnapshot,
@@ -1372,6 +1432,7 @@ mod tests {
             canonical_root,
             provider_session: None,
             active_session: None,
+            environment_profile: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
             last_error: None,
@@ -1470,7 +1531,7 @@ mod tests {
             },
             bundle_id: None,
             context_id: None,
-            environment_profile_id: None,
+            environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("request-a").unwrap(),
             required_capabilities: SpawnRequiredCapabilities::default(),
@@ -1487,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v3() {
+    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v5() {
         let offer = client_compatibility_offer().unwrap();
         assert_eq!(
             offer.protocol_versions,
@@ -1517,9 +1578,12 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
-            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4).unwrap(),
+            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5).unwrap(),
         );
     }
 
@@ -2275,6 +2339,87 @@ mod tests {
         assert!(ensure_server_frame_required_capability(
             &worktree_frame,
             &worktree_capabilities,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn child_environment_profile_is_gated_before_write_and_on_recursive_read() {
+        let mut request = spawn_spec_request();
+        let NodeRequest::SpawnSpec { spec } = &mut request else {
+            unreachable!("spawn spec helper changed variant");
+        };
+        spec.overrides.environment_profile_id =
+            gate4agent_node_protocol::SpawnOverride::Set {
+                value: SpawnEnvironmentProfileId::new("local-default").unwrap(),
+            };
+        let spawn_capability =
+            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        let mut next_request_id = 91;
+        assert!(matches!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &[spawn_capability.clone()],
+            ),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
+        ));
+        assert_eq!(next_request_id, 91);
+
+        let mut cleared = spawn_spec_request();
+        let NodeRequest::SpawnSpec { spec } = &mut cleared else {
+            unreachable!("spawn spec helper changed variant");
+        };
+        spec.overrides.environment_profile_id =
+            gate4agent_node_protocol::SpawnOverride::Clear;
+        let mut clear_request_id = 101;
+        assert_eq!(
+            reserve_request_id(
+                &mut clear_request_id,
+                &cleared,
+                false,
+                false,
+                false,
+                &[spawn_capability.clone()],
+            )
+            .unwrap(),
+            101,
+        );
+
+        let environment_capability =
+            CapabilityId::new(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap();
+        assert_eq!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &[spawn_capability.clone(), environment_capability.clone()],
+            )
+            .unwrap(),
+            91,
+        );
+
+        let mut receipt = spawn_spec_receipt();
+        receipt.environment_profile = Some(ResolvedEnvironmentProfileReceipt {
+            profile_id: SpawnEnvironmentProfileId::new("local-default").unwrap(),
+            profile_revision: SpawnEnvironmentProfileRevision::new("local-default.r1")
+                .unwrap(),
+        });
+        let frame = response_frame(NodeResponse::SpawnSpecAccepted { receipt });
+        assert!(matches!(
+            ensure_server_frame_required_capability(&frame, &[spawn_capability.clone()]),
+            Err(NodeClientError::Protocol(ref message))
+                if message.contains("child environment profile metadata")
+        ));
+        assert!(ensure_server_frame_required_capability(
+            &frame,
+            &[spawn_capability, environment_capability],
         )
         .is_ok());
     }

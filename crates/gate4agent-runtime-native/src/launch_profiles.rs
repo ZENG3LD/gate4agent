@@ -3,7 +3,7 @@ use gate4agent_types::{AgentId, AgentInstanceId, TransportKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
 const NATIVE_LAUNCH_PROFILE_ID_MAX_BYTES: usize = 64;
@@ -176,6 +176,7 @@ impl fmt::Display for NativeLaunchProfileId {
 /// The profile retains an opaque resolver rather than resolved values and does
 /// not implement `Debug`, preventing routine diagnostics from exposing child
 /// environment material.
+#[derive(Clone)]
 pub struct NativeLaunchProfile {
     id: NativeLaunchProfileId,
     agent_id: AgentId,
@@ -211,7 +212,7 @@ impl NativeLaunchProfile {
         resolver: Arc<dyn NativeChildEnvironmentResolver>,
         contract: NativeLaunchProfileContract,
     ) -> Result<Self, NativeLaunchProfileError> {
-        if transport != TransportKind::Pty {
+        if !matches!(transport, TransportKind::Pty | TransportKind::Pipe) {
             return Err(NativeLaunchProfileError::UnsupportedTransport);
         }
         validate_owned_environment_keys(&owned_env_keys)?;
@@ -282,7 +283,7 @@ pub enum NativeLaunchProfileError {
     IdTooLong { len: usize, max: usize },
     #[error("native launch profile ID must be a lowercase ASCII slug")]
     InvalidId,
-    #[error("native launch profiles currently support PTY transport only")]
+    #[error("native launch profiles support PTY and exact OneShotText Pipe transports only")]
     UnsupportedTransport,
     #[error("native launch profile must own at least one environment key")]
     EmptyEnvironmentOwnership,
@@ -387,14 +388,15 @@ impl NativeLaunchProfiles {
         self.selections.remove(&instance_id).is_some()
     }
 
-    pub(crate) fn resolve_environment(
+    fn profile_for_spawn(
         &self,
         instance_id: AgentInstanceId,
         agent_id: &AgentId,
         transport: TransportKind,
-    ) -> Result<Vec<EnvMutation>, NativeLaunchProfileError> {
+        pipe_binding_is_exact_one_shot: bool,
+    ) -> Result<Option<NativeLaunchProfile>, NativeLaunchProfileError> {
         let Some(profile_id) = self.selections.get(&instance_id) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let profile = self
             .profiles
@@ -402,7 +404,85 @@ impl NativeLaunchProfiles {
             .ok_or_else(|| NativeLaunchProfileError::UnknownProfile {
                 profile_id: profile_id.clone(),
             })?;
-        profile.resolve_environment(agent_id, transport)
+        if profile.agent_id() != agent_id || profile.transport() != transport {
+            return Err(NativeLaunchProfileError::BindingMismatch);
+        }
+        if transport == TransportKind::Pipe && !pipe_binding_is_exact_one_shot {
+            return Err(NativeLaunchProfileError::UnsupportedTransport);
+        }
+        Ok(Some(profile.clone()))
+    }
+}
+
+/// Clonable host-local control for selecting profiles without mutable runtime access.
+///
+/// The handle intentionally does not implement `Debug`: its shared registry retains
+/// opaque environment resolvers that may own secret material.
+#[derive(Clone)]
+pub struct NativeLaunchProfileControl {
+    launch_profiles: Arc<Mutex<NativeLaunchProfiles>>,
+}
+
+impl NativeLaunchProfileControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            launch_profiles: Arc::new(Mutex::new(NativeLaunchProfiles::new())),
+        }
+    }
+
+    pub(crate) fn upsert(
+        &self,
+        profile: NativeLaunchProfile,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.lock().upsert(profile)
+    }
+
+    pub(crate) fn remove(
+        &self,
+        profile_id: &NativeLaunchProfileId,
+    ) -> Result<bool, NativeLaunchProfileError> {
+        self.lock().remove(profile_id)
+    }
+
+    /// Selects a profile for future spawns of one exact instance.
+    ///
+    /// Spawn dispatch snapshots the selection under the same registry lock, so
+    /// a selection change does not alter a child that was already dispatched.
+    pub fn select_native_launch_profile(
+        &self,
+        instance_id: AgentInstanceId,
+        profile_id: NativeLaunchProfileId,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.lock().select(instance_id, profile_id)
+    }
+
+    /// Clears one instance selection for future spawns only.
+    pub fn clear_native_launch_profile_selection(&self, instance_id: AgentInstanceId) -> bool {
+        self.lock().clear_selection(instance_id)
+    }
+
+    pub(crate) fn resolve_environment(
+        &self,
+        instance_id: AgentInstanceId,
+        agent_id: &AgentId,
+        transport: TransportKind,
+        pipe_binding_is_exact_one_shot: bool,
+    ) -> Result<Vec<EnvMutation>, NativeLaunchProfileError> {
+        let profile = self.lock().profile_for_spawn(
+            instance_id,
+            agent_id,
+            transport,
+            pipe_binding_is_exact_one_shot,
+        )?;
+        profile.map_or_else(|| Ok(Vec::new()), |profile| {
+            profile.resolve_environment(agent_id, transport)
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, NativeLaunchProfiles> {
+        self.launch_profiles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

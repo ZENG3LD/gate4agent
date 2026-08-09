@@ -1,8 +1,9 @@
 use crate::protocol::{
     AgentId, ManagedSessionRecord, ManagedSessionState, NodeId, OpaqueHostPath,
-    SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
+    ResolvedEnvironmentProfileReceipt, SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3, NODE_STATE_SCHEMA_V4,
+    NODE_STATE_SCHEMA_V5,
 };
 use crate::worktree_service::ManagedWorktreeLeaseRecord;
 use serde::{Deserialize, Serialize};
@@ -233,6 +234,16 @@ struct PersistedNodeStateV4 {
     managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedNodeStateV5 {
+    version: u16,
+    node_id: NodeId,
+    workspaces: Vec<PersistedWorkspaceV2>,
+    session_records: Vec<PersistedManagedSessionRecordV5>,
+    managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+}
+
 struct DecodedNodeState {
     node_id: NodeId,
     workspaces: Vec<(WorkspaceId, String)>,
@@ -372,6 +383,23 @@ struct PersistedManagedSessionRecordV3 {
     canonical_root: OpaqueHostPath,
     provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
     active_session: Option<SessionAddress>,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedManagedSessionRecordV5 {
+    record_id: SessionRecordId,
+    display_name: String,
+    provider: AgentId,
+    mode: SessionMode,
+    state: ManagedSessionState,
+    workspace_id: WorkspaceId,
+    canonical_root: OpaqueHostPath,
+    provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
+    active_session: Option<SessionAddress>,
+    environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
     last_error: Option<String>,
@@ -539,6 +567,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v4_state(state)
         }
+        NODE_STATE_SCHEMA_V5 => {
+            let state: PersistedNodeStateV5 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v5_state(state)
+        }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             StateLoadRefusalError::UnsupportedSchema(version),
@@ -571,6 +604,7 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
                         )))?,
                     provider_session: record.provider_session,
                     active_session: record.active_session,
+                    environment_profile: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -610,6 +644,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
                     canonical_root: record.canonical_root,
                     provider_session: record.provider_session,
                     active_session: record.active_session,
+                    environment_profile: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -649,6 +684,7 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
                     canonical_root: record.canonical_root,
                     provider_session: record.provider_session,
                     active_session: record.active_session,
+                    environment_profile: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -682,6 +718,47 @@ fn decode_v4_state(state: PersistedNodeStateV4) -> io::Result<DecodedNodeState> 
         managed_worktrees: state.managed_worktrees,
         managed_worktree_tombstones: state.managed_worktree_tombstones,
     })
+}
+
+fn decode_v5_state(state: PersistedNodeStateV5) -> io::Result<DecodedNodeState> {
+    let mut environment_profiles = Vec::with_capacity(state.session_records.len());
+    let legacy_records = state
+        .session_records
+        .into_iter()
+        .map(|record| {
+            environment_profiles.push(record.environment_profile);
+            PersistedManagedSessionRecordV3 {
+                record_id: record.record_id,
+                display_name: record.display_name,
+                provider: record.provider,
+                mode: record.mode,
+                state: record.state,
+                workspace_id: record.workspace_id,
+                canonical_root: record.canonical_root,
+                provider_session: record.provider_session,
+                active_session: record.active_session,
+                created_at_unix_ms: record.created_at_unix_ms,
+                updated_at_unix_ms: record.updated_at_unix_ms,
+                last_error: record.last_error,
+            }
+        })
+        .collect();
+    let mut decoded = decode_v4_state(PersistedNodeStateV4 {
+        version: NODE_STATE_SCHEMA_V4,
+        node_id: state.node_id,
+        workspaces: state.workspaces,
+        session_records: legacy_records,
+        managed_worktrees: state.managed_worktrees,
+        managed_worktree_tombstones: state.managed_worktree_tombstones,
+    })?;
+    for (record, environment_profile) in decoded
+        .session_records
+        .iter_mut()
+        .zip(environment_profiles)
+    {
+        record.environment_profile = environment_profile;
+    }
+    Ok(decoded)
 }
 
 fn validate_managed_worktree_records(
@@ -846,6 +923,7 @@ pub(crate) fn save(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
+#[cfg(test)]
 pub(crate) fn save_v4(
     path: Option<&Path>,
     node_id: &NodeId,
@@ -920,6 +998,81 @@ pub(crate) fn save_v4(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
+pub(crate) fn save_v5(
+    path: Option<&Path>,
+    node_id: &NodeId,
+    workspaces: &BTreeMap<WorkspaceId, String>,
+    records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+) -> io::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if workspaces.len() > MAX_PERSISTED_WORKSPACES {
+        return Err(invalid_data("refusing to persist too many workspaces"));
+    }
+    if records.len() > MAX_MANAGED_SESSION_RECORDS {
+        return Err(invalid_data("refusing to persist too many session records"));
+    }
+    validate_managed_worktree_records(managed_worktrees, false)?;
+    validate_managed_worktree_records(managed_worktree_tombstones, true)?;
+    let mut persisted_records = Vec::with_capacity(records.len());
+    let mut provider_sessions = BTreeSet::new();
+    for record in records {
+        let mut persisted = record.clone();
+        persisted.active_session = None;
+        if let Some(identity) = &mut persisted.provider_session {
+            if !provider_sessions.insert(provider_session_semantic_key(
+                &persisted.provider,
+                identity,
+            )) {
+                return Err(invalid_data("refusing to persist duplicate provider sessions"));
+            }
+            identity.transcript_path = None;
+        }
+        persisted.last_error = persisted.last_error.as_deref().map(sanitized_record_error_summary);
+        validate_record(&persisted)?;
+        persisted.state = if persisted.provider_session.is_some() {
+            ManagedSessionState::Dormant
+        } else {
+            ManagedSessionState::Unavailable
+        };
+        persisted_records.push(persisted_v5_record(persisted));
+    }
+    let state = PersistedNodeStateV5 {
+        version: NODE_STATE_SCHEMA_V5,
+        node_id: node_id.clone(),
+        workspaces: workspaces.iter().map(|(workspace_id, canonical_root)| {
+            Ok(PersistedWorkspaceV2 {
+                workspace_id: workspace_id.clone(),
+                canonical_root: OpaqueHostPath::utf8(canonical_root.clone()).map_err(|error| {
+                    invalid_data(format!("refusing to persist an invalid workspace path: {error}"))
+                })?,
+            })
+        }).collect::<io::Result<_>>()?,
+        session_records: persisted_records,
+        managed_worktrees: managed_worktrees.to_vec(),
+        managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| invalid_data(format!("durable state encoding failed: {error}")))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(invalid_data("refusing to persist oversized durable state"));
+    }
+    let previous_primary_valid = if !path.exists() {
+        true
+    } else {
+        match load_one(path, node_id) {
+            Ok(_) => true,
+            Err(error) if is_authoritative_state_error(&error) => return Err(error),
+            Err(_) => false,
+        }
+    };
+    atomic_write(path, &bytes, previous_primary_valid)
+}
+
+#[cfg(test)]
 fn persisted_v3_record(record: ManagedSessionRecord) -> PersistedManagedSessionRecordV3 {
     PersistedManagedSessionRecordV3 {
         record_id: record.record_id,
@@ -931,6 +1084,24 @@ fn persisted_v3_record(record: ManagedSessionRecord) -> PersistedManagedSessionR
         canonical_root: record.canonical_root,
         provider_session: record.provider_session,
         active_session: record.active_session,
+        created_at_unix_ms: record.created_at_unix_ms,
+        updated_at_unix_ms: record.updated_at_unix_ms,
+        last_error: record.last_error,
+    }
+}
+
+fn persisted_v5_record(record: ManagedSessionRecord) -> PersistedManagedSessionRecordV5 {
+    PersistedManagedSessionRecordV5 {
+        record_id: record.record_id,
+        display_name: record.display_name,
+        provider: record.provider,
+        mode: record.mode,
+        state: record.state,
+        workspace_id: record.workspace_id,
+        canonical_root: record.canonical_root,
+        provider_session: record.provider_session,
+        active_session: record.active_session,
+        environment_profile: record.environment_profile,
         created_at_unix_ms: record.created_at_unix_ms,
         updated_at_unix_ms: record.updated_at_unix_ms,
         last_error: record.last_error,
@@ -988,6 +1159,7 @@ pub(crate) fn sanitized_record_error_summary(message: &str) -> String {
             | "provider-resume-failed"
             | "durable-state-commit-failed"
             | "provider-runtime-failed"
+            | "environment-profile-unavailable"
     ) {
         return normalized;
     }
@@ -1353,6 +1525,7 @@ mod tests {
                 transcript_path: Some(r"C:\private\provider-transcript.jsonl".to_owned()),
             }),
             active_session: None,
+            environment_profile: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 11,
             last_error: None,
@@ -1407,6 +1580,73 @@ mod tests {
         let loaded = load(Some(&path), &node_id).unwrap();
         assert_eq!(loaded.managed_worktrees, vec![lease]);
         assert!(loaded.managed_worktree_tombstones.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v5_roundtrip_preserves_only_opaque_environment_profile_identity() {
+        let path = temp_path("v5-environment-profile-roundtrip");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, mut record) = fixture(&path);
+        let environment_profile = ResolvedEnvironmentProfileReceipt {
+            profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
+            profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new(
+                "local-claude-r1",
+            )
+            .unwrap(),
+        };
+        record.environment_profile = Some(environment_profile.clone());
+
+        save_v5(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let header: PersistedNodeStateHeader = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V5);
+        let serialized = String::from_utf8(bytes).unwrap();
+        assert!(serialized.contains("local-claude"));
+        assert!(!serialized.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!serialized.contains("secret"));
+
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(
+            loaded.records[0].environment_profile.as_ref(),
+            Some(&environment_profile),
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v4_to_v5_migration_defaults_environment_profile_to_none() {
+        let path = temp_path("v4-to-v5-environment-profile");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, record) = fixture(&path);
+        save_v4(Some(&path), &node_id, &workspaces, &[record], &[], &[]).unwrap();
+
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.records.len(), 1);
+        assert!(loaded.records[0].environment_profile.is_none());
+        save_v5(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &loaded.records,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let header: PersistedNodeStateHeader = serde_json::from_slice(
+            &std::fs::read(&path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V5);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

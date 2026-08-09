@@ -5,7 +5,8 @@ mod vendor_contract;
 
 pub use launch_profiles::{
     NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
-    NativeLaunchProfileDescriptor, NativeLaunchProfileError, NativeLaunchProfileId,
+    NativeLaunchProfileControl, NativeLaunchProfileDescriptor, NativeLaunchProfileError,
+    NativeLaunchProfileId,
     ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
     ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
     ZAI_GLM_CLAUDE_PROFILE_REVISION, ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
@@ -54,10 +55,9 @@ use gate4agent_types::{
     AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect, ControlObservation,
     EffectEnvelope, HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole,
     HistorySessionRecord, ObservationEnvelope, ProviderRuntimeCapability, ProviderRuntimePolicy,
-    ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration, SessionStatus, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    PipeProtocol, ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration, SessionStatus,
+    TransportKind, CONTROL_PROTOCOL_VERSION,
 };
-use launch_profiles::NativeLaunchProfiles;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -495,7 +495,9 @@ impl NativeRuntime {
         instance_id: AgentInstanceId,
         profile_id: NativeLaunchProfileId,
     ) -> Result<(), NativeLaunchProfileError> {
-        self.effects.launch_profiles.select(instance_id, profile_id)
+        self.effects
+            .launch_profiles
+            .select_native_launch_profile(instance_id, profile_id)
     }
 
     /// Clears one instance selection for future spawns only.
@@ -503,7 +505,14 @@ impl NativeRuntime {
         &mut self,
         instance_id: AgentInstanceId,
     ) -> bool {
-        self.effects.launch_profiles.clear_selection(instance_id)
+        self.effects
+            .launch_profiles
+            .clear_native_launch_profile_selection(instance_id)
+    }
+
+    /// Returns a clonable selector for future native launch-profile spawns.
+    pub fn native_launch_profile_control(&self) -> NativeLaunchProfileControl {
+        self.effects.launch_profiles.clone()
     }
 
     /// Start the process-global loopback Hook listener. Call this before
@@ -612,7 +621,7 @@ struct EffectWorker {
 
 struct NativeEffectRequest {
     effect: EffectEnvelope,
-    pty_env: Vec<EnvMutation>,
+    spawn_env: Vec<EnvMutation>,
 }
 
 #[derive(Clone)]
@@ -628,7 +637,7 @@ struct NativeWorkerContext {
 struct NativeEffectDispatcher {
     catalog: AgentRegistry,
     config: NativeRuntimeConfig,
-    launch_profiles: NativeLaunchProfiles,
+    launch_profiles: NativeLaunchProfileControl,
     workers: HashMap<AgentInstanceId, EffectWorker>,
     authority_worker: Option<EffectWorker>,
     capability_worker: Option<EffectWorker>,
@@ -651,7 +660,7 @@ impl NativeEffectDispatcher {
         Self {
             catalog,
             config,
-            launch_profiles: NativeLaunchProfiles::new(),
+            launch_profiles: NativeLaunchProfileControl::new(),
             workers: HashMap::new(),
             authority_worker: None,
             capability_worker: None,
@@ -693,7 +702,7 @@ impl NativeEffectDispatcher {
             return;
         }
         let instance_id = effect.instance_id;
-        let pty_env = match self.compose_pty_spawn_environment(&effect) {
+        let spawn_env = match self.compose_spawn_environment(&effect) {
             Ok(environment) => environment,
             Err(message) => {
                 self.pending_failures
@@ -701,7 +710,7 @@ impl NativeEffectDispatcher {
                 return;
             }
         };
-        let mut pending = NativeEffectRequest { effect, pty_env };
+        let mut pending = NativeEffectRequest { effect, spawn_env };
         for _ in 0..2 {
             let sender = self.worker_sender(instance_id);
             match sender.try_send(pending) {
@@ -730,7 +739,7 @@ impl NativeEffectDispatcher {
     fn dispatch_capability(&mut self, effect: EffectEnvelope) {
         let mut pending = NativeEffectRequest {
             effect,
-            pty_env: Vec::new(),
+            spawn_env: Vec::new(),
         };
         for _ in 0..2 {
             let sender = self.capability_sender();
@@ -788,7 +797,7 @@ impl NativeEffectDispatcher {
         }
         let mut pending = NativeEffectRequest {
             effect,
-            pty_env: Vec::new(),
+            spawn_env: Vec::new(),
         };
         for _ in 0..2 {
             let sender = self.authority_sender();
@@ -876,16 +885,16 @@ impl NativeEffectDispatcher {
             .collect())
     }
 
-    fn compose_pty_spawn_environment(
+    fn compose_spawn_environment(
         &self,
         effect: &EffectEnvelope,
     ) -> Result<Vec<EnvMutation>, String> {
-        let mut environment = self.profile_pty_env(effect)?;
+        let mut environment = self.profile_spawn_env(effect)?;
         environment.extend(self.hook_pty_env(effect)?);
         Ok(environment)
     }
 
-    fn profile_pty_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
+    fn profile_spawn_env(&self, effect: &EffectEnvelope) -> Result<Vec<EnvMutation>, String> {
         let (agent_id, transport) = match &effect.effect {
             ControlEffect::Spawn {
                 agent_id,
@@ -899,8 +908,20 @@ impl NativeEffectDispatcher {
             } => (agent_id, *transport),
             _ => return Ok(Vec::new()),
         };
+        let pipe_binding_is_exact_one_shot = transport != TransportKind::Pipe
+            || self.catalog.get(agent_id).is_some_and(|spec| {
+                spec.capabilities.transports.pipe.as_ref().is_some_and(|pipe| {
+                    pipe.protocol == PipeProtocol::OneShotText
+                        && spec.capabilities.adapters.one_shot.as_ref() == Some(&pipe.adapter)
+                })
+            });
         self.launch_profiles
-            .resolve_environment(effect.instance_id, agent_id, transport)
+            .resolve_environment(
+                effect.instance_id,
+                agent_id,
+                transport,
+                pipe_binding_is_exact_one_shot,
+            )
             .map_err(|error| error.to_string())
     }
 
@@ -1379,7 +1400,7 @@ async fn run_effect_worker(
                 last_effect = Instant::now();
                 let before = shell.active_session_count();
                 let completion = shell
-                    .execute_with_pty_env(request.effect, request.pty_env)
+                    .execute_with_pty_env(request.effect, request.spawn_env)
                     .await;
                 update_active_count(&context.active_sessions, before, shell.active_session_count());
                 remove_hook_route_for_observation(&context.hook_ingress, &completion);

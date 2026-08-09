@@ -983,9 +983,9 @@ fn validate_spawn_receipt(
         || !required_override_matches(&spec.overrides.terminal_size, &receipt.terminal_size)
         || !optional_override_matches(&spec.overrides.bundle_id, &receipt.bundle_id)
         || !optional_override_matches(&spec.overrides.context_id, &receipt.context_id)
-        || !optional_override_matches(
+        || !environment_profile_override_matches(
             &spec.overrides.environment_profile_id,
-            &receipt.environment_profile_id,
+            receipt.environment_profile.as_ref(),
         )
     {
         return Err("spawn receipt contradicts explicit overrides");
@@ -1001,6 +1001,19 @@ fn validate_spawn_receipt(
         }
     }
     Ok(())
+}
+
+fn environment_profile_override_matches(
+    expected: &SpawnOverride<gate4agent_node_protocol::SpawnEnvironmentProfileId>,
+    actual: Option<&gate4agent_node_protocol::ResolvedEnvironmentProfileReceipt>,
+) -> bool {
+    match expected {
+        SpawnOverride::Inherit => true,
+        SpawnOverride::Set { value } => {
+            actual.is_some_and(|receipt| &receipt.profile_id == value)
+        }
+        SpawnOverride::Clear => actual.is_none(),
+    }
 }
 
 fn required_override_matches<T: Eq>(override_value: &SpawnOverride<T>, actual: &T) -> bool {
@@ -1799,7 +1812,7 @@ mod tests {
             prompt: SpawnPromptMetadata::from_prompt(Some(&prompt)),
             bundle_id: None,
             context_id: None,
-            environment_profile_id: None,
+            environment_profile: None,
             deadline_ms: spec.deadline_ms,
             idempotency_key: spec.idempotency_key.clone(),
             required_capabilities,
@@ -1849,6 +1862,22 @@ mod tests {
         let mut changed = receipt.clone();
         changed.prompt = SpawnPromptMetadata { present: false, byte_len: 0 };
         mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.environment_profile = Some(
+            gate4agent_node_protocol::ResolvedEnvironmentProfileReceipt {
+                profile_id:
+                    gate4agent_node_protocol::SpawnEnvironmentProfileId::new(
+                        "local-default",
+                    )
+                    .unwrap(),
+                profile_revision:
+                    gate4agent_node_protocol::SpawnEnvironmentProfileRevision::new(
+                        "local-default.r1",
+                    )
+                    .unwrap(),
+            },
+        );
+        mismatches.push(changed);
 
         for mismatch in mismatches {
             assert!(validate_spawn_spec_response(
@@ -1857,6 +1886,45 @@ mod tests {
                 incarnation_id,
             ).is_err());
         }
+
+        let mut environment_spec = spec;
+        environment_spec.overrides.environment_profile_id = SpawnOverride::Set {
+            value: gate4agent_node_protocol::SpawnEnvironmentProfileId::new(
+                "local-default",
+            )
+            .unwrap(),
+        };
+        let environment_expected = ExpectedSpawnRequest::Spec(environment_spec);
+        let mut environment_receipt = receipt;
+        environment_receipt.environment_profile = Some(
+            gate4agent_node_protocol::ResolvedEnvironmentProfileReceipt {
+                profile_id:
+                    gate4agent_node_protocol::SpawnEnvironmentProfileId::new(
+                        "local-default",
+                    )
+                    .unwrap(),
+                profile_revision:
+                    gate4agent_node_protocol::SpawnEnvironmentProfileRevision::new(
+                        "local-default.r1",
+                    )
+                    .unwrap(),
+            },
+        );
+        assert!(validate_spawn_spec_response(
+            Some(&environment_expected),
+            &response(environment_receipt.clone()),
+            incarnation_id,
+        )
+        .is_ok());
+        environment_receipt.environment_profile.as_mut().unwrap().profile_id =
+            gate4agent_node_protocol::SpawnEnvironmentProfileId::new("other")
+                .unwrap();
+        assert!(validate_spawn_spec_response(
+            Some(&environment_expected),
+            &response(environment_receipt),
+            incarnation_id,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1901,7 +1969,7 @@ mod tests {
             prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
             bundle_id: None,
             context_id: None,
-            environment_profile_id: None,
+            environment_profile: None,
             deadline_ms: spec.deadline_ms,
             idempotency_key: spec.idempotency_key.clone(),
             required_capabilities: SpawnRequiredCapabilities::default(),

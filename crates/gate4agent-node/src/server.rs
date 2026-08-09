@@ -8,6 +8,9 @@ use crate::git_worktree::{
     run_git_read_bounded, GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind,
     NativeGitWorktreeSnapshot,
 };
+use crate::environment_profiles::{
+    EnvironmentProfileBinding, NodeEnvironmentProfile, MAX_NODE_ENVIRONMENT_PROFILES,
+};
 use crate::worktree_service::{
     exact_created_worktree, exact_owned_worktree, ManagedWorktreeLeaseRecord,
     ManagedWorktreeProfile, ManagedWorktreeRegistry, ManagedWorktreeSessionHolder,
@@ -43,32 +46,36 @@ use crate::protocol::{
     ProtocolRange,
     ProviderAdapterContractSupport,
     ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
-    ProviderRuntimeStatuses, ResolvedSpawnReceipt, ResolvedSpawnSpec, ResponseEnvelope,
+    ProviderRuntimeStatuses, ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt,
+    ResolvedSpawnSpec, ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
     ManagedSessionState, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
     ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
     ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest, SessionRecordId,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
-    SpawnIdempotencyKey, SpawnRequiredCapabilities, SpawnSpec, WorkspaceFileContent,
+    SpawnEnvironmentProfileId, SpawnIdempotencyKey, SpawnRequiredCapabilities, SpawnSpec,
+    WorkspaceFileContent,
     WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     DEFAULT_CONTROLLER_LEASE_MS,
     MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
-    NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY, NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY, NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
-    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4,
+    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5,
     SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
     SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
     SPAWN_RUNTIME_STRUCTURED_PROMPT,
 };
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
-use gate4agent_runtime_native::{HookIngressConfig, NativeRuntime, NativeRuntimeConfig};
+use gate4agent_runtime_native::{
+    HookIngressConfig, NativeLaunchProfileControl, NativeRuntime, NativeRuntimeConfig,
+};
 use gate4agent_node_wire::{
     auth_proof, negotiated_auth_proof, proofs_match, random_incarnation_id, random_nonce,
     AuthDirection, LocalServerStream, OwnerOnlyLocalListener,
@@ -551,6 +558,7 @@ impl NodeServer {
                     durable_state_server_error(error, DURABLE_STATE_LOCK_FAILED_ERROR)
                 })?;
         let (handle, runtime) = NativeRuntime::new(catalog, config.runtime);
+        let native_launch_profile_control = runtime.native_launch_profile_control();
         let events = handle.subscribe(CONTROL_EVENT_SUBSCRIPTION_CAPACITY);
         let incarnation_id = random_incarnation_id()
             .map_err(NodeServerError::IncarnationIdentity)?;
@@ -573,6 +581,7 @@ impl NodeServer {
             provider_contracts,
             provider_adapter_contracts,
             config.spawn_profiles.clone(),
+            Some(native_launch_profile_control),
             config.state_path.clone(),
             records,
             managed_worktrees,
@@ -598,6 +607,60 @@ impl NodeServer {
         NodeShutdownHandle {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    /// Installs one immutable host-local environment profile before the server runs.
+    ///
+    /// Native resolvers remain inside the runtime; the shared node registry keeps
+    /// only public IDs, revisions, provider bindings, and opaque native profile IDs.
+    pub fn install_environment_profile(
+        &mut self,
+        profile: NodeEnvironmentProfile,
+    ) -> Result<(), NodeServerError> {
+        if !self.shared.enabled_providers.contains(profile.provider()) {
+            return Err(NodeServerError::EnvironmentProfileProviderUnavailable(
+                profile.provider().clone(),
+            ));
+        }
+        let (binding, native_profiles) = profile.into_parts();
+        let mut profiles = self
+            .shared
+            .environment_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if profiles.contains_key(&binding.id) {
+            return Err(NodeServerError::DuplicateEnvironmentProfile(
+                binding.id.clone(),
+            ));
+        }
+        if profiles.len() >= MAX_NODE_ENVIRONMENT_PROFILES {
+            return Err(NodeServerError::EnvironmentProfileCapacity {
+                max: MAX_NODE_ENVIRONMENT_PROFILES,
+            });
+        }
+        for native_id in binding.native_profile_ids() {
+            if profiles.values().any(|current| {
+                current.native_profile_ids().any(|current_id| current_id == native_id)
+            }) {
+                return Err(NodeServerError::DuplicateNativeEnvironmentProfile(
+                    native_id.to_string(),
+                ));
+            }
+        }
+
+        let mut installed = Vec::with_capacity(native_profiles.len());
+        for native_profile in native_profiles {
+            let native_id = native_profile.id().clone();
+            if let Err(error) = self.runtime.upsert_native_launch_profile(native_profile) {
+                for installed_id in installed.into_iter().rev() {
+                    let _ = self.runtime.remove_native_launch_profile(&installed_id);
+                }
+                return Err(NodeServerError::NativeEnvironmentProfile(error.to_string()));
+            }
+            installed.push(native_id);
+        }
+        profiles.insert(binding.id.clone(), binding);
+        Ok(())
     }
 
     pub async fn run_until_ctrl_signal(self) -> Result<(), NodeServerError> {
@@ -1015,6 +1078,9 @@ struct NodeShared {
     provider_contracts: Vec<ProviderContractSupport>,
     provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
     spawn_profiles: SpawnProfileRegistry,
+    environment_profiles:
+        RwLock<BTreeMap<SpawnEnvironmentProfileId, EnvironmentProfileBinding>>,
+    native_launch_profile_control: Option<NativeLaunchProfileControl>,
     spawn_idempotency: Mutex<SpawnIdempotencyCache>,
     controller: Mutex<Option<ControllerLease>>,
     history: Mutex<NodeEventHistory>,
@@ -1047,6 +1113,26 @@ struct SessionBinding {
     pending_resume: Option<(SessionGeneration, CommandId, ProviderRuntimePolicy)>,
     record_id: Option<SessionRecordId>,
     managed_worktree_lease_id: Option<ManagedWorktreeLeaseId>,
+    environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+}
+
+struct NativeEnvironmentSelectionGuard {
+    control: Option<NativeLaunchProfileControl>,
+    instance_id: AgentInstanceId,
+}
+
+impl NativeEnvironmentSelectionGuard {
+    fn retain(mut self) {
+        self.control = None;
+    }
+}
+
+impl Drop for NativeEnvironmentSelectionGuard {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.as_ref() {
+            control.clear_native_launch_profile_selection(self.instance_id);
+        }
+    }
 }
 
 struct SessionRecords {
@@ -1110,6 +1196,7 @@ impl NodeShared {
         provider_contracts: Vec<ProviderContractSupport>,
         provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
         spawn_profiles: SpawnProfileRegistry,
+        native_launch_profile_control: Option<NativeLaunchProfileControl>,
         state_path: Option<PathBuf>,
         records: Vec<ManagedSessionRecord>,
         managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
@@ -1174,6 +1261,8 @@ impl NodeShared {
             provider_contracts,
             provider_adapter_contracts,
             spawn_profiles,
+            environment_profiles: RwLock::new(BTreeMap::new()),
+            native_launch_profile_control,
             spawn_idempotency: Mutex::new(SpawnIdempotencyCache {
                 entries: BTreeMap::new(),
             }),
@@ -1228,6 +1317,7 @@ impl NodeShared {
             Vec::new(),
             Vec::new(),
             SpawnProfileRegistry::default(),
+            None,
             None,
             Vec::new(),
             Vec::new(),
@@ -1296,6 +1386,95 @@ impl NodeShared {
                 "provider runtime probe is already in progress",
             ),
         })
+    }
+
+    fn resolve_environment_profile(
+        &self,
+        resolved: &ResolvedSpawnSpec,
+    ) -> Result<Option<ResolvedEnvironmentProfileReceipt>, NodeFailure> {
+        let Some(profile_id) = resolved.environment_profile_id.as_ref() else {
+            return Ok(None);
+        };
+        let profiles = self
+            .environment_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let binding = profiles.get(profile_id).ok_or_else(|| {
+            failure(
+                NodeFailureCode::UnknownEnvironmentProfile,
+                "spawn environment profile is unavailable on this node",
+            )
+        })?;
+        if binding.provider != resolved.provider
+            || binding.native_profile_id(resolved.mode).is_none()
+        {
+            return Err(failure(
+                NodeFailureCode::EnvironmentProfileBindingMismatch,
+                "spawn environment profile does not match the provider and mode",
+            ));
+        }
+        Ok(Some(ResolvedEnvironmentProfileReceipt {
+            profile_id: binding.id.clone(),
+            profile_revision: binding.revision.clone(),
+        }))
+    }
+
+    fn select_environment_profile(
+        &self,
+        instance_id: AgentInstanceId,
+        provider: &AgentId,
+        mode: SessionMode,
+        environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
+    ) -> Result<Option<NativeEnvironmentSelectionGuard>, NodeFailure> {
+        let Some(environment_profile) = environment_profile else {
+            return Ok(None);
+        };
+        let native_profile_id = {
+            let profiles = self
+                .environment_profiles
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let binding = profiles
+                .get(&environment_profile.profile_id)
+                .ok_or_else(|| {
+                    failure(
+                        NodeFailureCode::UnknownEnvironmentProfile,
+                        "session environment profile is unavailable on this node",
+                    )
+                })?;
+            if &binding.revision != &environment_profile.profile_revision
+                || &binding.provider != provider
+            {
+                return Err(failure(
+                    NodeFailureCode::EnvironmentProfileBindingMismatch,
+                    "session environment profile revision or provider changed",
+                ));
+            }
+            binding.native_profile_id(mode).cloned().ok_or_else(|| {
+                failure(
+                    NodeFailureCode::EnvironmentProfileBindingMismatch,
+                    "session environment profile does not support this mode",
+                )
+            })?
+        };
+        let control = self.native_launch_profile_control.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                "native environment profile controller is unavailable",
+            )
+        })?;
+        control
+            .select_native_launch_profile(instance_id, native_profile_id)
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "native environment profile selection failed",
+                )
+            })?;
+        Ok(Some(NativeEnvironmentSelectionGuard {
+            control: Some(control),
+            instance_id,
+        }))
     }
 
     fn replay_spawn_spec(
@@ -1424,15 +1603,13 @@ impl NodeShared {
         if resolved.target.worktree_id.is_some() {
             self.require_worktree_service(&resolved.target.workspace_id)?;
         }
-        if resolved.bundle_id.is_some()
-            || resolved.context_id.is_some()
-            || resolved.environment_profile_id.is_some()
-        {
+        if resolved.bundle_id.is_some() || resolved.context_id.is_some() {
             return Err(failure(
                 NodeFailureCode::UnsupportedSpawnCapability,
                 "spawn materialization capability is not available",
             ));
         }
+        self.resolve_environment_profile(&resolved)?;
         Ok(resolved)
     }
 
@@ -1480,6 +1657,7 @@ impl NodeShared {
             return replayed;
         }
         let resolved = self.resolve_spawn_spec(&spec)?;
+        let environment_profile = self.resolve_environment_profile(&resolved)?;
         let required_capabilities = spawn_runtime_capabilities(&resolved.required_capabilities)?;
         let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
         let spawn_workspace_id = self.resolve_spawn_workspace(&resolved, deadline).await;
@@ -1510,13 +1688,20 @@ impl NodeShared {
                 resolved.mode,
                 resolved.terminal_size,
                 resolved.prompt.as_ref().map(|prompt| prompt.as_str().to_owned()),
+                environment_profile.clone(),
                 None,
                 None,
                 Some(deadline),
                 &required_capabilities,
             )
             .await
-            .map(|session| resolved.receipt(self.incarnation_id, session));
+            .map(|session| {
+                resolved.receipt_with_environment(
+                    self.incarnation_id,
+                    session,
+                    environment_profile,
+                )
+            });
         self.remember_spawn_spec(spec, result.clone(), accepted_at);
         result
     }
@@ -1538,6 +1723,7 @@ impl NodeShared {
             return result;
         }
         let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
+        let environment_profile = self.resolve_environment_profile(&resolved)?;
         let source_workspace_id = resolved.target.workspace_id.clone();
         let profile = self.managed_profile(&source_workspace_id, &request.worktree_profile_id)?;
         let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
@@ -1689,6 +1875,7 @@ impl NodeShared {
             resolved.mode,
             resolved.terminal_size,
             resolved.prompt.as_ref().map(|prompt| prompt.as_str().to_owned()),
+            environment_profile.clone(),
             Some(lease.lease_id.clone()),
             Some(runtime_policy),
             Some(deadline),
@@ -1745,7 +1932,13 @@ impl NodeShared {
             return result;
         }
         self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot.clone() });
-        let receipt = managed_spawn_receipt(&resolved, self.incarnation_id, session, snapshot);
+        let receipt = managed_spawn_receipt(
+            &resolved,
+            self.incarnation_id,
+            session,
+            snapshot,
+            environment_profile,
+        );
         let result = Ok(receipt);
         self.remember_managed_spawn(request, result.clone(), accepted_at);
         result
@@ -1994,7 +2187,7 @@ impl NodeShared {
                 .collect::<Vec<_>>(),
             unix_time_ms(),
         );
-        let result = session_registry::save_v4(
+        let result = session_registry::save_v5(
             self.state_path.as_deref(),
             &self.node_id,
             &workspaces,
@@ -2076,6 +2269,7 @@ impl NodeShared {
                 session: SessionKey { instance_id, generation },
             },
             ProviderRuntimePolicy::raw_pty(),
+            None,
         );
     }
 
@@ -2083,6 +2277,7 @@ impl NodeShared {
         &self,
         address: &SessionAddress,
         runtime_policy: ProviderRuntimePolicy,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     ) {
         let mut bindings = self
             .session_bindings
@@ -2097,6 +2292,7 @@ impl NodeShared {
             pending_resume: None,
             record_id: None,
             managed_worktree_lease_id: None,
+            environment_profile,
         });
     }
 
@@ -2105,6 +2301,7 @@ impl NodeShared {
         address: &SessionAddress,
         record_id: SessionRecordId,
         runtime_policy: ProviderRuntimePolicy,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     ) {
         let mut bindings = self
             .session_bindings
@@ -2121,6 +2318,7 @@ impl NodeShared {
                 pending_resume: None,
                 record_id: Some(record_id),
                 managed_worktree_lease_id: None,
+                environment_profile,
             },
         );
     }
@@ -2131,9 +2329,10 @@ impl NodeShared {
         provider: AgentId,
         mode: SessionMode,
         runtime_policy: ProviderRuntimePolicy,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     ) -> Result<Option<SessionRecordId>, NodeFailure> {
         if !runtime_policy.provider_session_identity {
-            self.bind_session_with_policy(address, runtime_policy);
+            self.bind_session_with_policy(address, runtime_policy, environment_profile);
             return Ok(None);
         }
         let record = self.new_record(
@@ -2142,6 +2341,7 @@ impl NodeShared {
             mode,
             ManagedSessionState::IdentityPending,
             None,
+            environment_profile.clone(),
         )?;
         let record_id = record.record_id.clone();
         let transaction = self
@@ -2149,7 +2349,12 @@ impl NodeShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.insert_record(record.clone())?;
-        self.bind_managed_session(address, record_id.clone(), runtime_policy);
+        self.bind_managed_session(
+            address,
+            record_id.clone(),
+            runtime_policy,
+            environment_profile,
+        );
         if let Err(error) = self.persist_state_locked() {
             self.remove_binding(address);
             self.remove_record_memory(&record_id);
@@ -2212,6 +2417,7 @@ impl NodeShared {
         mode: SessionMode,
         state: ManagedSessionState,
         provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     ) -> Result<ManagedSessionRecord, NodeFailure> {
         let canonical_root = self.workspace_root(&address.workspace_id)?;
         let now = unix_time_ms();
@@ -2225,6 +2431,7 @@ impl NodeShared {
             canonical_root: opaque_windows_path(canonical_root),
             provider_session,
             active_session: Some(address.clone()),
+            environment_profile,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             last_error: None,
@@ -2544,11 +2751,23 @@ impl NodeShared {
         request
             .validate()
             .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        self.ensure_binding_capacity()?;
+        let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
+        let mut environment_selection = match self.select_environment_profile(
+            instance_id,
+            &record.provider,
+            record.mode,
+            record.environment_profile.as_ref(),
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.mark_record_error(record_id, "environment-profile-unavailable")?;
+                return Err(error);
+            }
+        };
         if let Some(stale_address) = self.bound_address_for_record(record_id) {
             self.remove_session(&stale_address).await?;
         }
-        self.ensure_binding_capacity()?;
-        let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
         let address = SessionAddress {
             workspace_id: record.workspace_id.clone(),
             session: SessionKey {
@@ -2572,7 +2791,15 @@ impl NodeShared {
                 "managed session became active while resume was being prepared",
             ));
         }
-        self.bind_managed_session(&address, record_id.clone(), runtime_policy);
+        self.bind_managed_session(
+            &address,
+            record_id.clone(),
+            runtime_policy,
+            record.environment_profile.clone(),
+        );
+        if let Some(selection) = environment_selection.take() {
+            selection.retain();
+        }
         drop(transaction);
 
         let transport = match record.mode {
@@ -3437,6 +3664,16 @@ impl NodeShared {
         }) {
             let removed = bindings.remove(&address.session.instance_id);
             self.clear_terminal_frame_watermark(address);
+            if removed
+                .as_ref()
+                .is_some_and(|binding| binding.environment_profile.is_some())
+            {
+                if let Some(control) = self.native_launch_profile_control.as_ref() {
+                    control.clear_native_launch_profile_selection(
+                        address.session.instance_id,
+                    );
+                }
+            }
             return removed;
         }
         None
@@ -3749,6 +3986,7 @@ impl NodeShared {
                             canonical_root: current_snapshot.canonical_root,
                             provider_session: Some(identity),
                             active_session: Some(address.clone()),
+                            environment_profile: current_snapshot.environment_profile,
                             created_at_unix_ms: now,
                             updated_at_unix_ms: now,
                             last_error: None,
@@ -4427,6 +4665,7 @@ impl NodeShared {
                 None,
                 None,
                 None,
+                None,
                 &[],
             )
             .await
@@ -4439,6 +4678,7 @@ impl NodeShared {
         mode: SessionMode,
         terminal_size: gate4agent_types::TerminalSize,
         initial_prompt: Option<String>,
+        environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
         managed_authority: Option<ManagedWorktreeLeaseId>,
         admitted_runtime_policy: Option<ProviderRuntimePolicy>,
         deadline: Option<Instant>,
@@ -4499,6 +4739,12 @@ impl NodeShared {
         self.ensure_binding_capacity()?;
         let working_directory = self.workspace_root(&workspace_id)?;
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
+        let mut environment_selection = self.select_environment_profile(
+            instance_id,
+            &provider,
+            mode,
+            environment_profile.as_ref(),
+        )?;
         let session = SessionKey {
             instance_id,
             generation: SessionGeneration(1),
@@ -4512,7 +4758,11 @@ impl NodeShared {
             provider.clone(),
             mode,
             runtime_policy,
+            environment_profile,
         )?;
+        if let Some(selection) = environment_selection.take() {
+            selection.retain();
+        }
         let transport = match mode {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
@@ -4615,7 +4865,33 @@ impl NodeShared {
                 .find(|current| current.instance_id == instance_id)
             {
                 if current.generation != session.generation {
-                    return Err(failure(NodeFailureCode::StaleGeneration, "spawn generation diverged"));
+                    let divergence = failure(
+                        NodeFailureCode::StaleGeneration,
+                        "spawn generation diverged",
+                    );
+                    return match self
+                        .rollback_spawn(
+                            &address,
+                            Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            if let Some(record_id) = record_id.as_ref() {
+                                self.discard_record(record_id)?;
+                            }
+                            Err(divergence)
+                        }
+                        Err(recovery_error) => {
+                            if let Some(record_id) = record_id.as_ref() {
+                                self.mark_record_error(
+                                    record_id,
+                                    "spawn generation diverged and recovery failed",
+                                )?;
+                            }
+                            Err(recovery_error)
+                        }
+                    };
                 }
                 if !matches!(current.status, gate4agent_types::SessionStatus::Registered) {
                     return Ok(address);
@@ -4908,6 +5184,9 @@ async fn serve_connection(
     }) && selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY
     });
+    let include_child_environment_profiles = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
+    });
     let authenticated_permit = Arc::clone(&shared.authenticated_slots)
         .try_acquire_owned()
         .map_err(|_| NodeServerError::AuthenticatedConnectionLimit)?;
@@ -4937,6 +5216,7 @@ async fn serve_connection(
                 include_provider_runtime_status,
                 include_open_provider_ids,
                 include_managed_worktrees,
+                include_child_environment_profiles,
             ),
             compatibility,
         }),
@@ -5019,6 +5299,11 @@ async fn serve_connection(
                 } else {
                     project_event_legacy_provider_ids(&shared, event)
                 });
+                let event = event.map(|event| if include_child_environment_profiles {
+                    event
+                } else {
+                    project_event_without_child_environment_profile(event)
+                });
                 if let Some(event) = event {
                     write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
                 }
@@ -5041,12 +5326,24 @@ async fn serve_connection(
                 };
                 let requires_open_provider_ids =
                     request_requires_open_provider_ids(&shared, &request.request);
+                let requires_child_environment_profile =
+                    request_requires_child_environment_profile(&shared, &request.request);
                 let mut reply = if requires_open_provider_ids && !include_open_provider_ids {
                     ResponseEnvelope {
                         request_id: request.request_id,
                         result: Err(failure(
                             NodeFailureCode::UnsupportedCapability,
                             "open provider IDs were not negotiated",
+                        )),
+                    }
+                } else if requires_child_environment_profile
+                    && !include_child_environment_profiles
+                {
+                    ResponseEnvelope {
+                        request_id: request.request_id,
+                        result: Err(failure(
+                            NodeFailureCode::UnsupportedCapability,
+                            "child environment profiles were not negotiated",
                         )),
                     }
                 } else if request_uses_unnegotiated_capability(
@@ -5072,6 +5369,9 @@ async fn serve_connection(
                 }
                 if !include_open_provider_ids {
                     project_response_legacy_provider_ids(&shared, &mut reply);
+                }
+                if !include_child_environment_profiles {
+                    project_response_without_child_environment_profile(&mut reply);
                 }
                 write_json_frame(&mut writer, &ServerFrame::Reply(reply)).await?;
             }
@@ -5206,7 +5506,7 @@ fn node_compatibility_support_for_manifest(
         path_semantics: platform::path_semantics(),
         local_transport: platform::local_transport(),
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V4)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V5)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: provider_contracts.to_vec(),
@@ -5226,6 +5526,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
         NODE_WORKTREE_SELECTION_CAPABILITY,
         NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+        NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -5251,6 +5552,8 @@ fn request_uses_unnegotiated_capability(
             && !selected(NODE_WORKTREE_SELECTION_CAPABILITY))
         || (request.requires_spawn_spec_defaults_overrides_capability()
             && !selected(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY))
+        || (request.requires_child_environment_profile_capability()
+            && !selected(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY))
 }
 
 fn snapshot_for_wire(
@@ -5258,6 +5561,7 @@ fn snapshot_for_wire(
     include_provider_runtime_status: bool,
     include_open_provider_ids: bool,
     include_managed_worktrees: bool,
+    include_child_environment_profiles: bool,
 ) -> NodeSnapshot {
     let mut snapshot = shared.snapshot();
     if !include_provider_runtime_status {
@@ -5268,6 +5572,9 @@ fn snapshot_for_wire(
     }
     if !include_managed_worktrees {
         snapshot.managed_worktrees.clear();
+    }
+    if !include_child_environment_profiles {
+        clear_snapshot_child_environment_profiles(&mut snapshot);
     }
     snapshot
 }
@@ -5341,6 +5648,62 @@ fn request_requires_open_provider_ids(shared: &NodeShared, request: &NodeRequest
     )
 }
 
+fn request_requires_child_environment_profile(
+    shared: &NodeShared,
+    request: &NodeRequest,
+) -> bool {
+    if let Some(spec) = match request {
+        NodeRequest::SpawnSpec { spec } => Some(spec),
+        NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
+        _ => None,
+    } {
+        return shared
+            .resolve_spawn_spec(spec)
+            .is_ok_and(|resolved| resolved.environment_profile_id.is_some());
+    }
+    match request {
+        NodeRequest::Resume { session, .. }
+        | NodeRequest::Prompt { session, .. }
+        | NodeRequest::Paste { session, .. }
+        | NodeRequest::Input { session, .. }
+        | NodeRequest::TerminalBytes { session, .. }
+        | NodeRequest::TerminalControl { session, .. }
+        | NodeRequest::Resize { session, .. }
+        | NodeRequest::Interrupt { session }
+        | NodeRequest::Stop { session, .. }
+        | NodeRequest::Remove { session } => shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&session.session.instance_id)
+            .filter(|binding| {
+                binding.workspace_id == session.workspace_id
+                    && binding.generation == session.session.generation
+            })
+            .map_or(true, |binding| binding.environment_profile.is_some()),
+        NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::ResumeSessionRecord { record_id, .. }
+        | NodeRequest::ForgetSessionRecord { record_id } => shared
+            .record(record_id)
+            .map_or(true, |record| record.environment_profile.is_some()),
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
+        | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
+        | NodeRequest::Shutdown => false,
+    }
+}
+
 fn request_requires_open_provider_ids_with(
     request: &NodeRequest,
     provider_for_session: impl Fn(&SessionAddress) -> Option<AgentId>,
@@ -5398,6 +5761,74 @@ fn project_snapshot_legacy_provider_ids(snapshot: &mut NodeSnapshot) {
         workspace
             .sessions
             .retain(|session| provider_id_is_legacy(&session.agent_id));
+    }
+}
+
+fn clear_snapshot_child_environment_profiles(snapshot: &mut NodeSnapshot) {
+    for record in &mut snapshot.session_records {
+        record.environment_profile = None;
+    }
+}
+
+fn project_event_without_child_environment_profile(
+    mut envelope: NodeEventEnvelope,
+) -> NodeEventEnvelope {
+    if let NodeEvent::SessionRecordUpserted { record } = &mut envelope.event {
+        record.environment_profile = None;
+    }
+    envelope
+}
+
+fn project_response_without_child_environment_profile(reply: &mut ResponseEnvelope) {
+    let contains_environment_profile = match reply.result.as_ref() {
+        Ok(NodeResponse::SpawnSpecAccepted { receipt }) => {
+            receipt.environment_profile.is_some()
+        }
+        Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt }) => {
+            receipt.spawn.environment_profile.is_some()
+        }
+        _ => false,
+    };
+    if contains_environment_profile {
+        reply.result = Err(failure(
+            NodeFailureCode::UnsupportedCapability,
+            "child environment profiles were not negotiated",
+        ));
+        return;
+    }
+    let Ok(response) = reply.result.as_mut() else {
+        return;
+    };
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => {
+            clear_snapshot_child_environment_profiles(snapshot);
+        }
+        NodeResponse::Resync { snapshot, events, .. } => {
+            clear_snapshot_child_environment_profiles(snapshot);
+            for event in events {
+                if let NodeEvent::SessionRecordUpserted { record } = &mut event.event {
+                    record.environment_profile = None;
+                }
+            }
+        }
+        NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::SessionRecordResumed { record, .. } => {
+            record.environment_profile = None;
+        }
+        NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::Controller { .. }
+        | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SpawnSpecAccepted { .. }
+        | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | NodeResponse::ManagedWorktreeCleanup { .. }
+        | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::WorkspaceUnregistered { .. }
+        | NodeResponse::WorktreeCreated { .. }
+        | NodeResponse::WorktreeRemoved { .. }
+        | NodeResponse::Accepted
+        | NodeResponse::ShuttingDown => {}
     }
 }
 
@@ -6322,11 +6753,16 @@ fn managed_spawn_receipt(
     incarnation_id: NodeIncarnationId,
     session: SessionAddress,
     lease: ManagedWorktreeLeaseSnapshot,
+    environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
 ) -> ManagedWorktreeSpawnReceipt {
     let mut managed = resolved.clone();
     managed.target.worktree_id = Some(lease.workspace_id.clone());
     ManagedWorktreeSpawnReceipt {
-        spawn: managed.receipt(incarnation_id, session),
+        spawn: managed.receipt_with_environment(
+            incarnation_id,
+            session,
+            environment_profile,
+        ),
         lease,
     }
 }
@@ -6487,6 +6923,10 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::SpawnIdempotencyCapacity => "spawn-idempotency-capacity",
         NodeFailureCode::SpawnDeadlineExceeded => "spawn-deadline-exceeded",
         NodeFailureCode::UnsupportedSpawnCapability => "unsupported-spawn-capability",
+        NodeFailureCode::UnknownEnvironmentProfile => "unknown-environment-profile",
+        NodeFailureCode::EnvironmentProfileBindingMismatch => {
+            "environment-profile-binding-mismatch"
+        }
         NodeFailureCode::InvalidWorkspaceRoot => "invalid-workspace-root",
         NodeFailureCode::DuplicateWorkspaceId => "duplicate-workspace-id",
         NodeFailureCode::DuplicateWorkspaceRoot => "duplicate-workspace-root",
@@ -6598,6 +7038,16 @@ pub enum NodeServerError {
         profile_id: WorktreeProfileId,
         message: String,
     },
+    #[error("duplicate node environment profile: {0}")]
+    DuplicateEnvironmentProfile(SpawnEnvironmentProfileId),
+    #[error("node environment profile provider is unavailable: {0}")]
+    EnvironmentProfileProviderUnavailable(AgentId),
+    #[error("node environment profile capacity is {max}")]
+    EnvironmentProfileCapacity { max: usize },
+    #[error("node environment profiles reuse native profile ID '{0}'")]
+    DuplicateNativeEnvironmentProfile(String),
+    #[error("node native environment profile is invalid: {0}")]
+    NativeEnvironmentProfile(String),
     #[error("active agent registry failed: {0}")]
     Registry(String),
     #[error("node provider contract manifest is invalid: {0}")]
@@ -6633,6 +7083,26 @@ pub enum NodeServerError {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use gate4agent_catalog::EnvMutation;
+    use gate4agent_runtime_native::{
+        NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
+        NativeLaunchProfile, NativeLaunchProfileId,
+    };
+    use std::ffi::OsString;
+    use std::sync::Arc;
+
+    struct EmptyEnvironmentResolver;
+
+    impl NativeChildEnvironmentResolver for EmptyEnvironmentResolver {
+        fn resolve_child_environment(
+            &self,
+        ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+            Ok(vec![EnvMutation {
+                key: OsString::from("GATE4AGENT_TEST_PROFILE"),
+                value: None,
+            }])
+        }
+    }
 
     fn agent(value: &str) -> AgentId {
         AgentId::new(value).unwrap()
@@ -6683,6 +7153,226 @@ mod tests {
             idempotency_key: SpawnIdempotencyKey::new("spawn-spec-fixture").unwrap(),
             required_capabilities: SpawnRequiredCapabilities::default(),
         }
+    }
+
+    fn environment_profile_test_shared(
+    ) -> (NodeShared, NativeRuntime, ResolvedEnvironmentProfileReceipt) {
+        let profile_id = SpawnEnvironmentProfileId::new("local-claude").unwrap();
+        let profile_revision = crate::protocol::SpawnEnvironmentProfileRevision::new(
+            "local-claude-r1",
+        )
+        .unwrap();
+        let spawn_profiles = SpawnProfileRegistry::new([
+            crate::protocol::SpawnProfileDefaults {
+                profile_id: crate::protocol::SpawnProfileId::new("default").unwrap(),
+                revision: crate::protocol::SpawnProfileRevision::new("test-r1").unwrap(),
+                provider: agent("claude"),
+                mode: SessionMode::Pty,
+                terminal_size: gate4agent_types::TerminalSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                prompt: None,
+                bundle_id: None,
+                context_id: None,
+                environment_profile_id: Some(profile_id.clone()),
+            },
+        ])
+        .unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let control = runtime.native_launch_profile_control();
+        let node_profile = NodeEnvironmentProfile::new(
+            profile_id.clone(),
+            profile_revision.clone(),
+            agent("claude"),
+            [NativeLaunchProfile::new(
+                NativeLaunchProfileId::new("local-claude-pty").unwrap(),
+                agent("claude"),
+                TransportKind::Pty,
+                vec![OsString::from("GATE4AGENT_TEST_PROFILE")],
+                Arc::new(EmptyEnvironmentResolver),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let (binding, native_profiles) = node_profile.into_parts();
+        for native_profile in native_profiles {
+            runtime.upsert_native_launch_profile(native_profile).unwrap();
+        }
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new_with_incarnation(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-terminal-test").unwrap(),
+            NodeIncarnationId::from_bytes([0; crate::protocol::NODE_INCARNATION_ID_BYTES]),
+            vec![workspace],
+            vec![agent("claude")],
+            ProviderRuntimeStatuses::default(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            spawn_profiles,
+            Some(control),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            MUTATION_SETTLE_TIMEOUT_MS.saturating_add(READINESS_SETTLE_HEADROOM_MS),
+        );
+        shared
+            .environment_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(binding.id.clone(), binding);
+        (
+            shared,
+            runtime,
+            ResolvedEnvironmentProfileReceipt {
+                profile_id,
+                profile_revision,
+            },
+        )
+    }
+
+    #[test]
+    fn child_environment_profile_capability_is_state_aware_and_legacy_safe() {
+        let (shared, _runtime, environment_profile) = environment_profile_test_shared();
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
+        }));
+        let support = node_compatibility_support_for_manifest(&[], &[]).unwrap();
+        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V5);
+        let spec = spawn_spec_fixture();
+        assert!(matches!(
+            &spec.overrides.environment_profile_id,
+            crate::protocol::SpawnOverride::Inherit,
+        ));
+        assert!(!NodeRequest::SpawnSpec { spec: spec.clone() }
+            .requires_child_environment_profile_capability());
+        assert!(request_requires_child_environment_profile(
+            &shared,
+            &NodeRequest::SpawnSpec { spec: spec.clone() },
+        ));
+
+        let address = terminal_address(1);
+        shared.bind_session_with_policy(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            Some(environment_profile.clone()),
+        );
+        assert!(request_requires_child_environment_profile(
+            &shared,
+            &NodeRequest::Input {
+                session: address.clone(),
+                text: "x".to_owned(),
+            },
+        ));
+
+        let mut record = record("claude", "profile-record");
+        record.active_session = Some(address.clone());
+        record.environment_profile = Some(environment_profile.clone());
+        let record_id = record.record_id.clone();
+        shared.insert_record(record.clone()).unwrap();
+        assert!(request_requires_child_environment_profile(
+            &shared,
+            &NodeRequest::ResumeSessionRecord {
+                record_id,
+                terminal_size: gate4agent_types::TerminalSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                initial_prompt: None,
+            },
+        ));
+
+        let snapshot = snapshot_for_wire(&shared, false, true, true, false);
+        assert_eq!(snapshot.session_records.len(), 1);
+        assert!(snapshot.session_records[0].environment_profile.is_none());
+        let event = project_event_without_child_environment_profile(NodeEventEnvelope {
+            sequence: 1,
+            event: NodeEvent::SessionRecordUpserted { record },
+        });
+        let NodeEvent::SessionRecordUpserted { record } = event.event else {
+            panic!("record projection changed the event kind");
+        };
+        assert!(record.environment_profile.is_none());
+
+        let resolved = shared.resolve_spawn_spec(&spec).unwrap();
+        let mut reply = ResponseEnvelope {
+            request_id: 1,
+            result: Ok(NodeResponse::SpawnSpecAccepted {
+                receipt: resolved.receipt_with_environment(
+                    shared.incarnation_id,
+                    address,
+                    Some(environment_profile),
+                ),
+            }),
+        };
+        project_response_without_child_environment_profile(&mut reply);
+        assert_eq!(
+            reply.result.unwrap_err().code,
+            NodeFailureCode::UnsupportedCapability,
+        );
+    }
+
+    #[test]
+    fn environment_profile_selection_is_owned_by_the_exact_session_binding() {
+        let (shared, mut runtime, environment_profile) = environment_profile_test_shared();
+        let address = terminal_address(1);
+        let selection = shared
+            .select_environment_profile(
+                address.session.instance_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&environment_profile),
+            )
+            .unwrap()
+            .unwrap();
+        shared.bind_session_with_policy(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            Some(environment_profile.clone()),
+        );
+        selection.retain();
+        let native_id = NativeLaunchProfileId::new("local-claude-pty").unwrap();
+        assert!(matches!(
+            runtime.remove_native_launch_profile(&native_id),
+            Err(gate4agent_runtime_native::NativeLaunchProfileError::ProfileInUse),
+        ));
+        assert!(shared.remove_binding(&address).is_some());
+        assert_eq!(runtime.remove_native_launch_profile(&native_id), Ok(true));
+
+        let mismatched = ResolvedEnvironmentProfileReceipt {
+            profile_id: environment_profile.profile_id,
+            profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new(
+                "local-claude-r2",
+            )
+            .unwrap(),
+        };
+        let error = match shared.select_environment_profile(
+                AgentInstanceId(42),
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&mismatched),
+            ) {
+            Ok(_) => panic!("mismatched environment profile revision was selected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code,
+            NodeFailureCode::EnvironmentProfileBindingMismatch,
+        );
+        assert!(!shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&AgentInstanceId(42)));
     }
 
     fn install_managed_lease(shared: &NodeShared) -> ManagedWorktreeLeaseRecord {
@@ -6742,6 +7432,7 @@ mod tests {
             shared.incarnation_id,
             session.clone(),
             lease.snapshot(),
+            None,
         );
         assert!(resolved.target.worktree_id.is_none());
         assert_eq!(receipt.spawn.target.workspace_id, lease.source_workspace_id);
@@ -6781,7 +7472,7 @@ mod tests {
     fn legacy_projection_omits_managed_snapshot_events_and_path_bearing_diagnostics() {
         let shared = terminal_test_shared();
         let lease = install_managed_lease(&shared);
-        let snapshot = snapshot_for_wire(&shared, true, true, false);
+        let snapshot = snapshot_for_wire(&shared, true, true, false, true);
         assert!(snapshot.managed_worktrees.is_empty());
         let mut reply = ResponseEnvelope {
             request_id: 1,
@@ -6877,6 +7568,7 @@ mod tests {
             Vec::new(),
             SpawnProfileRegistry::default(),
             None,
+            None,
             Vec::new(),
             vec![lease.clone()],
             Vec::new(),
@@ -6950,6 +7642,7 @@ mod tests {
                     rows: 24,
                     columns: 80,
                 },
+                None,
                 None,
                 None,
                 None,
@@ -7287,6 +7980,7 @@ mod tests {
             ),
             provider_session: None,
             active_session: None,
+            environment_profile: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             last_error: None,
@@ -7958,6 +8652,7 @@ mod tests {
                     agent("claude"),
                     SessionMode::Pty,
                     ProviderRuntimePolicy::raw_pty(),
+                    None,
                 )
                 .unwrap(),
             None,
@@ -8016,7 +8711,11 @@ mod tests {
                 generation: SessionGeneration::default(),
             },
         };
-        shared.bind_session_with_policy(&address, ProviderRuntimePolicy::raw_pty());
+        shared.bind_session_with_policy(
+            &address,
+            ProviderRuntimePolicy::raw_pty(),
+            None,
+        );
         shared
             .handle
             .dispatch(shared.prepare_command(ControlCommand::Register {
@@ -8222,6 +8921,7 @@ mod tests {
             canonical_root: opaque_windows_path(workspace.canonical_root),
             provider_session: None,
             active_session: None,
+            environment_profile: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             last_error: None,
@@ -8262,6 +8962,7 @@ mod tests {
                 canonical_root: opaque_windows_path(workspace.canonical_root),
                 provider_session: None,
                 active_session: None,
+                environment_profile: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -8319,6 +9020,7 @@ mod tests {
                 canonical_root: opaque_windows_path(workspace.canonical_root),
                 provider_session: None,
                 active_session: Some(address.clone()),
+                environment_profile: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -8400,6 +9102,7 @@ mod tests {
                 canonical_root: opaque_windows_path(primary.canonical_root),
                 provider_session: Some(identity.clone()),
                 active_session: None,
+                environment_profile: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -8424,6 +9127,7 @@ mod tests {
                 canonical_root: opaque_windows_path(secondary.canonical_root),
                 provider_session: None,
                 active_session: Some(address.clone()),
+                environment_profile: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
                 last_error: None,
@@ -8433,6 +9137,7 @@ mod tests {
             &address,
             current_id.clone(),
             ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            None,
         );
         let event = ControlEvent {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -8503,6 +9208,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             SpawnProfileRegistry::default(),
+            None,
             Some(state_path.clone()),
             Vec::new(),
             Vec::new(),
@@ -8527,6 +9233,7 @@ mod tests {
                 canonical_root: opaque_windows_path(workspace.canonical_root.clone()),
                 provider_session: Some(persisted_identity.clone()),
                 active_session: None,
+                environment_profile: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -8551,6 +9258,7 @@ mod tests {
                 canonical_root: opaque_windows_path(workspace.canonical_root.clone()),
                 provider_session: None,
                 active_session: Some(address.clone()),
+                environment_profile: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
                 last_error: None,
@@ -8560,6 +9268,7 @@ mod tests {
             &address,
             pending_id.clone(),
             ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            None,
         );
         let observed_identity = gate4agent_types::ProviderSessionIdentity {
             transcript_path: Some(r"C:\private\provider-transcript.jsonl".to_owned()),
@@ -8657,6 +9366,7 @@ mod tests {
             Vec::new(),
             SpawnProfileRegistry::default(),
             None,
+            None,
             loaded.records,
             loaded.managed_worktrees,
             loaded.managed_worktree_tombstones,
@@ -8709,6 +9419,7 @@ mod tests {
                     transcript_path: None,
                 }),
                 active_session: None,
+                environment_profile: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,

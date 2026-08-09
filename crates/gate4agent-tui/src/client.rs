@@ -3522,6 +3522,7 @@ mod tests {
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             active_session: None,
             provider_identity_present: true,
+            environment_profile: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         }
@@ -3792,6 +3793,7 @@ mod tests {
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             active_session: None,
             provider_identity_present: true,
+            environment_profile: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         };

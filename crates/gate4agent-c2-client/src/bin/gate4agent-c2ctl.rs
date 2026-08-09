@@ -4,7 +4,7 @@ use std::time::Duration;
 use gate4agent_c2_client::{connect_local, C2ControlHandle};
 use gate4agent_c2_protocol::{
     C2NodeResponse, C2NodeSnapshot, C2SessionSnapshot, C2SessionStatus, NodeRoute,
-    NodeTransportState,
+    NodeTransportState, RoutedNodeResponse,
 };
 use gate4agent_node_protocol::{NodeId, NodeRequest, SessionMode, WorkspaceId};
 use gate4agent_types::{AgentId, TerminalFrame, TerminalSize};
@@ -37,6 +37,23 @@ enum ParseOutcome {
 struct SeededSession {
     provider: AgentId,
     address: gate4agent_node_protocol::SessionAddress,
+    evidence: SeedEvidence,
+}
+
+#[derive(Debug, Default)]
+struct SeedEvidence {
+    observed_running_pid: bool,
+    pty_output: bool,
+    final_status: Option<C2SessionStatus>,
+}
+
+#[derive(serde::Serialize)]
+struct SeedResult<'a> {
+    provider: &'a str,
+    ready: bool,
+    observed_running_pid: bool,
+    pty_output: bool,
+    final_status: &'static str,
 }
 
 #[derive(Debug, Error)]
@@ -210,39 +227,76 @@ async fn snapshot(
         .request(route.clone(), NodeRequest::Snapshot)
         .await
         .map_err(|_| SeedError::Snapshot)?;
+    if !response_matches_route(&response, route) {
+        return Err(SeedError::Snapshot);
+    }
     match response.response {
         Ok(C2NodeResponse::Snapshot { snapshot, .. }) => Ok(snapshot),
         _ => Err(SeedError::Snapshot),
     }
 }
 
-fn frame_has_output(frame: &TerminalFrame) -> bool {
-    !frame.formatted.is_empty()
-        && frame
-            .contents
-            .chars()
-            .any(|character| !character.is_whitespace() && !character.is_control())
+fn response_matches_route(response: &RoutedNodeResponse, route: &NodeRoute) -> bool {
+    response.node_id == route.node_id
+        && response.incarnation_id == route.expected_incarnation_id
 }
 
-fn session_is_visible(session: &C2SessionSnapshot) -> bool {
-    let has_process_or_finished = match session.status {
-        C2SessionStatus::Running => session.process_id.is_some(),
-        C2SessionStatus::Stopping | C2SessionStatus::Exited { .. } | C2SessionStatus::Failed => true,
-        C2SessionStatus::Registered | C2SessionStatus::Starting => false,
-    };
-    has_process_or_finished && session.terminal_frame.as_ref().is_some_and(frame_has_output)
+fn frame_has_pty_output(frame: &TerminalFrame) -> bool {
+    frame.sequence > 0
+        && (!frame.formatted.is_empty()
+            || frame
+                .scrollback_formatted
+                .iter()
+                .any(|row| !row.is_empty()))
+}
+
+fn observe_session(
+    seeded: &mut SeededSession,
+    session: &C2SessionSnapshot,
+) -> Result<(), SeedError> {
+    if session.agent_id != seeded.provider
+        || session.transport != gate4agent_types::TransportKind::Pty
+    {
+        return Err(SeedError::SessionMismatch { provider: seeded.provider.clone() });
+    }
+    seeded.evidence.observed_running_pid |=
+        session.status == C2SessionStatus::Running && session.process_id.is_some();
+    seeded.evidence.pty_output |= session
+        .terminal_frame
+        .as_ref()
+        .is_some_and(frame_has_pty_output);
+    seeded.evidence.final_status = Some(session.status.clone());
+    Ok(())
+}
+
+fn evidence_is_ready(evidence: &SeedEvidence) -> bool {
+    evidence.observed_running_pid && evidence.pty_output
+}
+
+fn status_name(status: &C2SessionStatus) -> &'static str {
+    match status {
+        C2SessionStatus::Registered => "registered",
+        C2SessionStatus::Starting => "starting",
+        C2SessionStatus::Running => "running",
+        C2SessionStatus::Stopping => "stopping",
+        C2SessionStatus::Exited { .. } => "exited",
+        C2SessionStatus::Failed => "failed",
+    }
 }
 
 fn evaluate_readiness(
     snapshot: &C2NodeSnapshot,
     workspace_id: &WorkspaceId,
-    sessions: &[SeededSession],
+    sessions: &mut [SeededSession],
 ) -> Result<bool, SeedError> {
     let Some(workspace) = snapshot.workspaces.iter().find(|workspace| &workspace.workspace_id == workspace_id) else {
         return Err(SeedError::WorkspaceUnavailable);
     };
     let mut all_ready = true;
     for seeded in sessions {
+        if &seeded.address.workspace_id != workspace_id {
+            return Err(SeedError::SessionMismatch { provider: seeded.provider.clone() });
+        }
         let Some(session) = workspace.sessions.iter().find(|session| {
             session.instance_id == seeded.address.session.instance_id
                 && session.generation == seeded.address.session.generation
@@ -250,12 +304,27 @@ fn evaluate_readiness(
             all_ready = false;
             continue;
         };
-        if session.agent_id != seeded.provider {
-            return Err(SeedError::SessionMismatch { provider: seeded.provider.clone() });
-        }
-        all_ready &= session_is_visible(session);
+        observe_session(seeded, session)?;
+        all_ready &= evidence_is_ready(&seeded.evidence);
     }
     Ok(all_ready)
+}
+
+fn success_result_line(session: &SeededSession) -> String {
+    serde_json::to_string(&SeedResult {
+        provider: provider_name(&session.provider),
+        ready: true,
+        observed_running_pid: session.evidence.observed_running_pid,
+        pty_output: session.evidence.pty_output,
+        final_status: status_name(
+            session
+                .evidence
+                .final_status
+                .as_ref()
+                .expect("ready seed must have a final observed status"),
+        ),
+    })
+    .expect("seed result serialization must succeed")
 }
 
 async fn seed_connected(
@@ -274,17 +343,27 @@ async fn seed_connected(
             .request(route.clone(), spawn_request(&options.workspace_id, provider.clone()))
             .await
             .map_err(|_| SeedError::Spawn { provider: provider.clone() })?;
+        if !response_matches_route(&response, &route) {
+            return Err(SeedError::Spawn { provider });
+        }
         let address = match response.response {
             Ok(C2NodeResponse::SpawnAccepted { session }) => session,
             _ => return Err(SeedError::Spawn { provider: provider.clone() }),
         };
-        sessions.push(SeededSession { provider, address });
+        if address.workspace_id != options.workspace_id {
+            return Err(SeedError::SessionMismatch { provider });
+        }
+        sessions.push(SeededSession {
+            provider,
+            address,
+            evidence: SeedEvidence::default(),
+        });
     }
 
     timeout(READINESS_DEADLINE, async {
         loop {
             let current = snapshot(control, &route).await?;
-            if evaluate_readiness(&current, &options.workspace_id, &sessions)? {
+            if evaluate_readiness(&current, &options.workspace_id, &mut sessions)? {
                 return Ok(());
             }
             sleep(POLL_INTERVAL).await;
@@ -342,11 +421,7 @@ fn main() {
     match runtime.block_on(run_seed(options)) {
         Ok(sessions) => {
             for session in sessions {
-                println!(
-                    "visible provider={} session={}",
-                    provider_name(&session.provider),
-                    session.address.session.instance_id.0,
-                );
+                println!("{}", success_result_line(&session));
             }
         }
         Err(error) => {
@@ -360,7 +435,7 @@ fn main() {
 mod tests {
     use super::*;
     use gate4agent_c2_protocol::C2WorkspaceSnapshot;
-    use gate4agent_node_protocol::SessionKey;
+    use gate4agent_node_protocol::{NodeIncarnationId, SessionAddress, SessionKey};
     use gate4agent_types::{
         AgentId, AgentInstanceId, ProviderActivity, SessionGeneration,
         TerminalMouseProtocolEncoding, TransportKind,
@@ -400,6 +475,37 @@ mod tests {
             provider_activity: ProviderActivity::Idle,
             provider_interaction_pending: false,
             provider_identity_present: false,
+        }
+    }
+
+    fn seeded_session(provider: AgentId, workspace_id: &WorkspaceId, instance: u64) -> SeededSession {
+        SeededSession {
+            provider,
+            address: SessionAddress {
+                workspace_id: workspace_id.clone(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(instance),
+                    generation: SessionGeneration(1),
+                },
+            },
+            evidence: SeedEvidence::default(),
+        }
+    }
+
+    fn fixture_snapshot(workspace_id: &WorkspaceId, session: C2SessionSnapshot) -> C2NodeSnapshot {
+        C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            provider_runtime_statuses: Default::default(),
+            workspaces: vec![C2WorkspaceSnapshot {
+                workspace_id: workspace_id.clone(),
+                canonical_root: gate4agent_node_protocol::OpaqueHostPath::utf8(
+                    "fixture-root".to_owned(),
+                ).unwrap(),
+                sessions: vec![session],
+            }],
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
         }
     }
 
@@ -458,51 +564,160 @@ mod tests {
     }
 
     #[test]
-    fn fixture_c2_readiness_accepts_live_or_finished_real_terminal_output() {
+    fn seed_vendor_pty_readiness_accumulates_live_pid_then_terminal_exit_output() {
         let workspace_id = WorkspaceId::new("primary").unwrap();
-        let address = gate4agent_node_protocol::SessionAddress {
-            workspace_id: workspace_id.clone(),
-            session: SessionKey {
-                instance_id: AgentInstanceId(9),
-                generation: SessionGeneration(1),
-            },
-        };
-        let seeded = [SeededSession { provider: agent("codex"), address }];
+        let mut seeded = [seeded_session(agent("codex"), &workspace_id, 9)];
         let mut session = fixture_session(agent("codex"), 9);
-        let mut snapshot = C2NodeSnapshot {
-            node_id: NodeId::new("node-a").unwrap(),
-            enabled_providers: Vec::new(),
-            provider_runtime_statuses: Default::default(),
-            workspaces: vec![C2WorkspaceSnapshot {
-                workspace_id: workspace_id.clone(),
-                canonical_root: gate4agent_node_protocol::OpaqueHostPath::utf8(
-                    "fixture-root".to_owned(),
-                ).unwrap(),
-                sessions: vec![session.clone()],
-            }],
-            session_records: Vec::new(),
-        };
-        assert_eq!(evaluate_readiness(&snapshot, &workspace_id, &seeded).unwrap(), true);
+        session.terminal_frame.as_mut().unwrap().formatted.clear();
+        let mut snapshot = fixture_snapshot(&workspace_id, session.clone());
+        assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+        assert!(seeded[0].evidence.observed_running_pid);
+        assert!(!seeded[0].evidence.pty_output);
 
         session.status = C2SessionStatus::Exited { exit_code: Some(1) };
         session.process_id = None;
-        snapshot.workspaces[0].sessions[0] = session.clone();
-        assert_eq!(evaluate_readiness(&snapshot, &workspace_id, &seeded).unwrap(), true);
+        session.terminal_frame.as_mut().unwrap().formatted = b"authentication failed".to_vec();
+        snapshot.workspaces[0].sessions[0] = session;
+        assert!(evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+        assert_eq!(seeded[0].evidence.final_status, Some(C2SessionStatus::Exited { exit_code: Some(1) }));
+        assert_eq!(
+            success_result_line(&seeded[0]),
+            r#"{"provider":"codex","ready":true,"observed_running_pid":true,"pty_output":true,"final_status":"exited"}"#,
+        );
+    }
+
+    #[test]
+    fn seed_vendor_pty_readiness_allows_output_before_live_pid_but_not_without_it() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let mut seeded = [seeded_session(agent("kimi"), &workspace_id, 10)];
+        let mut session = fixture_session(agent("kimi"), 10);
+        session.status = C2SessionStatus::Failed;
+        session.process_id = None;
+        let mut snapshot = fixture_snapshot(&workspace_id, session.clone());
+        assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+        assert!(!seeded[0].evidence.observed_running_pid);
+        assert!(seeded[0].evidence.pty_output);
 
         session.status = C2SessionStatus::Running;
-        session.process_id = None;
-        snapshot.workspaces[0].sessions[0] = session.clone();
-        assert_eq!(evaluate_readiness(&snapshot, &workspace_id, &seeded).unwrap(), false);
-
-        session.process_id = Some(7009);
+        session.process_id = Some(7010);
         session.terminal_frame.as_mut().unwrap().formatted.clear();
+        session.terminal_frame.as_mut().unwrap().scrollback_formatted.clear();
         snapshot.workspaces[0].sessions[0] = session;
-        assert_eq!(evaluate_readiness(&snapshot, &workspace_id, &seeded).unwrap(), false);
+        assert!(evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+        assert!(seeded[0].evidence.observed_running_pid);
+        assert!(seeded[0].evidence.pty_output);
+    }
 
-        let frame = snapshot.workspaces[0].sessions[0].terminal_frame.as_mut().unwrap();
-        frame.formatted = b"\x1b[2J".to_vec();
+    #[test]
+    fn seed_vendor_pty_readiness_rejects_status_pid_output_and_identity_gaps() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        for status in [
+            C2SessionStatus::Registered,
+            C2SessionStatus::Starting,
+            C2SessionStatus::Stopping,
+            C2SessionStatus::Exited { exit_code: Some(2) },
+            C2SessionStatus::Failed,
+        ] {
+            let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+            let mut session = fixture_session(agent("qwen-code"), 11);
+            session.status = status;
+            let snapshot = fixture_snapshot(&workspace_id, session);
+            assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+        }
+
+        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+        let mut session = fixture_session(agent("qwen-code"), 11);
+        session.process_id = None;
+        let snapshot = fixture_snapshot(&workspace_id, session.clone());
+        assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+
+        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+        session.process_id = Some(7011);
+        let frame = session.terminal_frame.as_mut().unwrap();
+        frame.formatted.clear();
+        frame.scrollback_formatted.clear();
+        let snapshot = fixture_snapshot(&workspace_id, session.clone());
+        assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+
+        seeded[0].address.session.generation = SessionGeneration(2);
+        assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+
+        let mut seeded = [seeded_session(agent("claude"), &workspace_id, 11)];
+        assert!(matches!(
+            evaluate_readiness(&snapshot, &workspace_id, &mut seeded),
+            Err(SeedError::SessionMismatch { provider }) if provider == agent("claude")
+        ));
+
+        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+        seeded[0].address.workspace_id = WorkspaceId::new("other").unwrap();
+        assert!(matches!(
+            evaluate_readiness(&snapshot, &workspace_id, &mut seeded),
+            Err(SeedError::SessionMismatch { .. })
+        ));
+
+        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+        session.transport = TransportKind::Pipe;
+        let snapshot = fixture_snapshot(&workspace_id, session);
+        assert!(matches!(
+            evaluate_readiness(&snapshot, &workspace_id, &mut seeded),
+            Err(SeedError::SessionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn seed_vendor_pty_readiness_accepts_scrollback_bytes_and_exact_incarnation_only() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let mut seeded = [seeded_session(agent("grok"), &workspace_id, 12)];
+        let mut session = fixture_session(agent("grok"), 12);
+        let frame = session.terminal_frame.as_mut().unwrap();
+        frame.formatted.clear();
         frame.contents.clear();
-        frame.scrollback_formatted = vec![b"\x1b[2J".to_vec()];
-        assert_eq!(evaluate_readiness(&snapshot, &workspace_id, &seeded).unwrap(), false);
+        frame.scrollback_formatted = vec![Vec::new(), b"region unavailable".to_vec()];
+        let snapshot = fixture_snapshot(&workspace_id, session);
+        assert!(evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+
+        let incarnation = NodeIncarnationId::from_bytes([7; 16]);
+        let route = NodeRoute {
+            node_id: NodeId::new("node-a").unwrap(),
+            expected_incarnation_id: incarnation,
+        };
+        let response = RoutedNodeResponse {
+            node_id: route.node_id.clone(),
+            incarnation_id: incarnation,
+            response: Ok(C2NodeResponse::Snapshot {
+                event_sequence: 1,
+                controller: None,
+                snapshot,
+            }),
+        };
+        assert!(response_matches_route(&response, &route));
+
+        let wrong_incarnation_route = NodeRoute {
+            expected_incarnation_id: NodeIncarnationId::from_bytes([8; 16]),
+            ..route.clone()
+        };
+        assert!(!response_matches_route(&response, &wrong_incarnation_route));
+
+        let wrong_node_route = NodeRoute {
+            node_id: NodeId::new("node-b").unwrap(),
+            ..route
+        };
+        assert!(!response_matches_route(&response, &wrong_node_route));
+    }
+
+    #[test]
+    fn seed_vendor_pty_readiness_rejects_sequence_zero_with_terminal_bytes() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let mut seeded = [seeded_session(agent("claude"), &workspace_id, 13)];
+        let mut session = fixture_session(agent("claude"), 13);
+        let frame = session.terminal_frame.as_mut().unwrap();
+        frame.sequence = 0;
+        frame.formatted = b"startup bytes".to_vec();
+        frame.scrollback_formatted = vec![b"older startup bytes".to_vec()];
+        let snapshot = fixture_snapshot(&workspace_id, session);
+
+        assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+        assert!(seeded[0].evidence.observed_running_pid);
+        assert!(!seeded[0].evidence.pty_output);
     }
 }

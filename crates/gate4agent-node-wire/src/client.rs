@@ -12,6 +12,7 @@ use gate4agent_node_protocol::{
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
+    NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION,
@@ -543,19 +544,25 @@ fn ensure_server_frame_required_capability(
     frame: &ServerFrame,
     negotiated_capabilities: &[CapabilityId],
 ) -> Result<(), NodeClientError> {
-    let requires_workspace_file_read = matches!(
-        frame,
-        ServerFrame::Reply(reply)
-            if matches!(reply.result.as_ref(), Ok(NodeResponse::WorkspaceFileRead { .. }))
-    );
-    if requires_workspace_file_read
-        && !negotiated_capabilities.iter().any(|capability| {
-            capability.as_str() == NODE_WORKSPACE_FILE_READ_CAPABILITY
-        })
-    {
-        return Err(NodeClientError::UnsupportedCapability(
-            NODE_WORKSPACE_FILE_READ_CAPABILITY.to_owned(),
-        ));
+    let required = match frame {
+        ServerFrame::Reply(reply) => match reply.result.as_ref() {
+            Ok(NodeResponse::WorkspaceFileRead { .. }) => {
+                Some(NODE_WORKSPACE_FILE_READ_CAPABILITY)
+            }
+            Ok(NodeResponse::SpawnSpecAccepted { .. }) => {
+                Some(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(required) = required {
+        if !negotiated_capabilities
+            .iter()
+            .any(|capability| capability.as_str() == required)
+        {
+            return Err(NodeClientError::UnsupportedCapability(required.to_owned()));
+        }
     }
     Ok(())
 }
@@ -639,8 +646,18 @@ fn ensure_node_request_provider_capability(
     request: &NodeRequest,
     open_provider_ids_enabled: bool,
 ) -> Result<(), NodeClientError> {
-    if let NodeRequest::Spawn { provider, .. } = request {
-        ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
+    match request {
+        NodeRequest::Spawn { provider, .. } => {
+            ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
+        }
+        NodeRequest::SpawnSpec { spec } => {
+            if let gate4agent_node_protocol::SpawnOverride::Set { value: provider } =
+                &spec.overrides.provider
+            {
+                ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -721,6 +738,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -767,6 +785,9 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
         NodeResponse::WorkspaceRegistered { workspace }
         | NodeResponse::WorktreeCreated { workspace, .. } => {
             workspace_contains_open_provider_id(workspace)
+        }
+        NodeResponse::SpawnSpecAccepted { receipt } => {
+            !provider_id_is_legacy(&receipt.provider)
         }
         NodeResponse::WorkspaceInspected { .. }
         | NodeResponse::WorkspaceFileRead { .. }
@@ -826,6 +847,7 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -880,6 +902,7 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
         | NodeResponse::Resync { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -923,6 +946,7 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         }
         NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::Accepted
@@ -1129,7 +1153,10 @@ mod tests {
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
-        SessionAddress, SessionKey, SessionMode, SessionRecordId, WorkspaceEntry,
+        ResolvedSpawnReceipt, SessionAddress, SessionKey, SessionMode, SessionRecordId,
+        SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
+        SpawnProfileId, SpawnProfileRevision, SpawnPromptMetadata, SpawnRequiredCapabilities,
+        SpawnResolutionProvenance, SpawnSpec, SpawnTarget, WorkspaceEntry,
         WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
         WorkspaceInspection, WorkspaceSnapshot,
     };
@@ -1281,6 +1308,68 @@ mod tests {
         })
     }
 
+    fn spawn_spec_request() -> NodeRequest {
+        NodeRequest::SpawnSpec {
+            spec: SpawnSpec {
+                target: SpawnTarget {
+                    node_id: NodeId::new("node-a").unwrap(),
+                    workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                    worktree_id: None,
+                },
+                profile_id: SpawnProfileId::new("default").unwrap(),
+                overrides: SpawnOverrides::default(),
+                deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+                idempotency_key: SpawnIdempotencyKey::new("request-a").unwrap(),
+                required_capabilities: SpawnRequiredCapabilities::default(),
+            },
+        }
+    }
+
+    fn spawn_spec_receipt() -> ResolvedSpawnReceipt {
+        ResolvedSpawnReceipt {
+            incarnation_id: NodeIncarnationId::from_bytes([3; NODE_INCARNATION_ID_BYTES]),
+            session: SessionAddress {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(9),
+                    generation: SessionGeneration(1),
+                },
+            },
+            target: SpawnTarget {
+                node_id: NodeId::new("node-a").unwrap(),
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            profile_revision: SpawnProfileRevision::new("default.r1").unwrap(),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            prompt: SpawnPromptMetadata {
+                present: false,
+                byte_len: 0,
+            },
+            bundle_id: None,
+            context_id: None,
+            environment_profile_id: None,
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("request-a").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+            provenance: SpawnResolutionProvenance {
+                provider: SpawnFieldProvenance::Profile,
+                mode: SpawnFieldProvenance::Profile,
+                terminal_size: SpawnFieldProvenance::Profile,
+                prompt: SpawnFieldProvenance::Profile,
+                bundle_id: SpawnFieldProvenance::Profile,
+                context_id: SpawnFieldProvenance::Profile,
+                environment_profile_id: SpawnFieldProvenance::Profile,
+            },
+        }
+    }
+
     #[test]
     fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v3() {
         let offer = client_compatibility_offer().unwrap();
@@ -1305,6 +1394,9 @@ mod tests {
         ));
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
+        ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
         ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
@@ -1459,6 +1551,48 @@ mod tests {
                 &challenge,
                 &offer,
                 ClientRole::Observer,
+                &client_nonce,
+                access_token,
+            ),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("server failed access-token proof")
+        ));
+    }
+
+    #[test]
+    fn spawn_spec_capability_is_bound_to_authentication_proof() {
+        let (mut offer, mut selected) = negotiated_fixture();
+        let capability =
+            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        offer.capabilities.push(capability.clone());
+        selected.capabilities.push(capability);
+        let client_nonce = [5; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [8; NODE_AUTH_NONCE_BYTES];
+        let access_token = "spawn-spec-auth-token";
+        let server_proof = negotiated_auth_proof(
+            access_token.as_bytes(),
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        selected.capabilities.retain(|candidate| {
+            candidate.as_str() != NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+        });
+        let challenge = ServerChallenge {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            server_nonce,
+            server_proof,
+            compatibility: Some(selected),
+        };
+        assert!(matches!(
+            prepare_negotiated_authentication(
+                &challenge,
+                &offer,
+                ClientRole::Operator,
                 &client_nonce,
                 access_token,
             ),
@@ -1919,6 +2053,54 @@ mod tests {
         let capabilities = vec![
             CapabilityId::new(NODE_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
         ];
+        assert!(ensure_server_frame_required_capability(&frame, &capabilities).is_ok());
+    }
+
+    #[test]
+    fn unnegotiated_spawn_spec_request_and_receipt_fail_closed() {
+        let request = spawn_spec_request();
+        let mut next_request_id = 73;
+        let error = reserve_request_id(
+            &mut next_request_id,
+            &request,
+            false,
+            false,
+            false,
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeClientError::UnsupportedCapability(capability)
+                if capability == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+        ));
+        assert_eq!(next_request_id, 73);
+
+        let capabilities = vec![
+            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
+        ];
+        assert_eq!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &capabilities,
+            )
+            .unwrap(),
+            73,
+        );
+        assert_eq!(next_request_id, 74);
+
+        let frame = response_frame(NodeResponse::SpawnSpecAccepted {
+            receipt: spawn_spec_receipt(),
+        });
+        assert!(matches!(
+            ensure_server_frame_required_capability(&frame, &[]),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+        ));
         assert!(ensure_server_frame_required_capability(&frame, &capabilities).is_ok());
     }
 

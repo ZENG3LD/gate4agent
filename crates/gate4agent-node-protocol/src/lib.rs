@@ -30,6 +30,13 @@ pub const NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str = "provider-contract-
 pub const NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str = "provider-runtime-status-v1";
 pub const NODE_PROVIDER_ID_OPEN_CAPABILITY: &str = "provider-id.open-v1";
 pub const NODE_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = "terminal-frame-events-v1";
+pub const NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
+    "spawn-spec.defaults-overrides-v1";
+pub const SPAWN_RUNTIME_RAW_PTY_LIFECYCLE: &str = "raw-pty-lifecycle";
+pub const SPAWN_RUNTIME_SEMANTIC_READINESS: &str = "semantic-readiness";
+pub const SPAWN_RUNTIME_STRUCTURED_PROMPT: &str = "structured-prompt";
+pub const SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY: &str = "provider-session-identity";
+pub const SPAWN_RUNTIME_SEMANTIC_RESUME: &str = "semantic-resume";
 pub const NODE_LEGACY_PROVIDER_IDS: [&str; 3] = ["claude", "codex", "kimi"];
 pub const MAX_NODE_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_COMPATIBILITY_IDENTIFIER_BYTES: usize = 64;
@@ -47,6 +54,12 @@ pub const MAX_NODE_CLIENT_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_NODE_TEXT_BYTES: usize = 32 * 1024;
 pub const MAX_NODE_TERMINAL_BYTES: usize = 64;
 pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
+pub const MAX_SPAWN_PROFILE_ID_BYTES: usize = 64;
+pub const MAX_SPAWN_PROFILE_REVISION_BYTES: usize = 128;
+pub const MAX_SPAWN_RESOURCE_ID_BYTES: usize = 128;
+pub const MAX_SPAWN_IDEMPOTENCY_KEY_BYTES: usize = 128;
+pub const MAX_SPAWN_REQUIRED_CAPABILITIES: usize = 16;
+pub const MAX_SPAWN_DEADLINE_MS: u64 = 120_000;
 pub const MAX_WORKSPACE_ROOT_BYTES: usize = gate4agent_types::WORKING_DIRECTORY_MAX_BYTES;
 pub const MAX_REPOSITORY_PATH_BYTES: usize = 1_024;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
@@ -313,6 +326,620 @@ pub enum ProviderRuntimeStatusError {
 pub enum SessionMode {
     Pty,
     Inline,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnProfileId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnProfileRevision(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnBundleId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnContextId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnEnvironmentProfileId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnIdempotencyKey(String);
+
+macro_rules! spawn_identifier_impl {
+    ($type:ident, $label:literal, $max:ident) => {
+        impl $type {
+            pub fn new(value: impl Into<String>) -> Result<Self, SpawnIdentifierError> {
+                let value = value.into();
+                validate_spawn_identifier($label, &value, $max)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl FromStr for $type {
+            type Err = SpawnIdentifierError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $type {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+spawn_identifier_impl!(SpawnProfileId, "spawn profile", MAX_SPAWN_PROFILE_ID_BYTES);
+spawn_identifier_impl!(
+    SpawnProfileRevision,
+    "spawn profile revision",
+    MAX_SPAWN_PROFILE_REVISION_BYTES
+);
+spawn_identifier_impl!(SpawnBundleId, "spawn bundle", MAX_SPAWN_RESOURCE_ID_BYTES);
+spawn_identifier_impl!(SpawnContextId, "spawn context", MAX_SPAWN_RESOURCE_ID_BYTES);
+spawn_identifier_impl!(
+    SpawnEnvironmentProfileId,
+    "spawn environment profile",
+    MAX_SPAWN_RESOURCE_ID_BYTES
+);
+spawn_identifier_impl!(
+    SpawnIdempotencyKey,
+    "spawn idempotency key",
+    MAX_SPAWN_IDEMPOTENCY_KEY_BYTES
+);
+
+fn validate_spawn_identifier(
+    label: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), SpawnIdentifierError> {
+    if value.is_empty() {
+        return Err(SpawnIdentifierError::Empty { label });
+    }
+    if value.len() > max {
+        return Err(SpawnIdentifierError::TooLong {
+            label,
+            len: value.len(),
+            max,
+        });
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+    {
+        return Err(SpawnIdentifierError::InvalidCharacters {
+            label,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SpawnIdentifierError {
+    #[error("{label} cannot be empty")]
+    Empty { label: &'static str },
+    #[error("{label} length {len} exceeds the {max}-byte limit")]
+    TooLong {
+        label: &'static str,
+        len: usize,
+        max: usize,
+    },
+    #[error("{label} must contain printable non-whitespace ASCII without path separators: {value}")]
+    InvalidCharacters { label: &'static str, value: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SpawnPrompt(String);
+
+impl SpawnPrompt {
+    pub fn new(value: impl Into<String>) -> Result<Self, SpawnPromptError> {
+        let value = value.into();
+        if value.len() > MAX_NODE_TEXT_BYTES {
+            return Err(SpawnPromptError::TooLong {
+                len: value.len(),
+                max: MAX_NODE_TEXT_BYTES,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'de> Deserialize<'de> for SpawnPrompt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SpawnPromptError {
+    #[error("spawn prompt length {len} exceeds the {max}-byte limit")]
+    TooLong { len: usize, max: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SpawnDeadlineMs(u64);
+
+impl SpawnDeadlineMs {
+    pub fn new(value: u64) -> Result<Self, SpawnDeadlineError> {
+        if value == 0 || value > MAX_SPAWN_DEADLINE_MS {
+            return Err(SpawnDeadlineError::OutOfRange {
+                value,
+                max: MAX_SPAWN_DEADLINE_MS,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SpawnDeadlineMs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SpawnDeadlineError {
+    #[error("spawn deadline {value}ms is outside 1..={max}ms")]
+    OutOfRange { value: u64, max: u64 },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SpawnRequiredCapabilities(Vec<CapabilityId>);
+
+impl SpawnRequiredCapabilities {
+    pub fn new(
+        capabilities: impl IntoIterator<Item = CapabilityId>,
+    ) -> Result<Self, SpawnRequiredCapabilitiesError> {
+        let mut bounded = Vec::with_capacity(MAX_SPAWN_REQUIRED_CAPABILITIES);
+        for capability in capabilities {
+            if bounded.len() == MAX_SPAWN_REQUIRED_CAPABILITIES {
+                return Err(SpawnRequiredCapabilitiesError::TooMany {
+                    max: MAX_SPAWN_REQUIRED_CAPABILITIES,
+                });
+            }
+            if bounded.contains(&capability) {
+                return Err(SpawnRequiredCapabilitiesError::Duplicate { capability });
+            }
+            bounded.push(capability);
+        }
+        bounded.sort();
+        Ok(Self(bounded))
+    }
+
+    pub fn as_slice(&self) -> &[CapabilityId] {
+        &self.0
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &CapabilityId> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for SpawnRequiredCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CapabilitiesVisitor;
+
+        impl<'de> Visitor<'de> for CapabilitiesVisitor {
+            type Value = SpawnRequiredCapabilities;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "at most {MAX_SPAWN_REQUIRED_CAPABILITIES} unique spawn capabilities",
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut capabilities = Vec::with_capacity(MAX_SPAWN_REQUIRED_CAPABILITIES);
+                while let Some(capability) = sequence.next_element::<CapabilityId>()? {
+                    if capabilities.len() == MAX_SPAWN_REQUIRED_CAPABILITIES {
+                        return Err(serde::de::Error::custom(
+                            SpawnRequiredCapabilitiesError::TooMany {
+                                max: MAX_SPAWN_REQUIRED_CAPABILITIES,
+                            },
+                        ));
+                    }
+                    if capabilities.contains(&capability) {
+                        return Err(serde::de::Error::custom(
+                            SpawnRequiredCapabilitiesError::Duplicate { capability },
+                        ));
+                    }
+                    capabilities.push(capability);
+                }
+                capabilities.sort();
+                Ok(SpawnRequiredCapabilities(capabilities))
+            }
+        }
+
+        deserializer.deserialize_seq(CapabilitiesVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SpawnRequiredCapabilitiesError {
+    #[error("spawn required capabilities exceed the {max}-entry limit")]
+    TooMany { max: usize },
+    #[error("spawn required capabilities contain duplicate {capability}")]
+    Duplicate { capability: CapabilityId },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnTarget {
+    pub node_id: NodeId,
+    pub workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<WorkspaceId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SpawnOverride<T> {
+    Inherit,
+    Set { value: T },
+    Clear,
+}
+
+impl<T> Default for SpawnOverride<T> {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpawnOverrides {
+    pub provider: SpawnOverride<AgentId>,
+    pub mode: SpawnOverride<SessionMode>,
+    pub terminal_size: SpawnOverride<TerminalSize>,
+    pub prompt: SpawnOverride<SpawnPrompt>,
+    pub bundle_id: SpawnOverride<SpawnBundleId>,
+    pub context_id: SpawnOverride<SpawnContextId>,
+    pub environment_profile_id: SpawnOverride<SpawnEnvironmentProfileId>,
+}
+
+impl Default for SpawnOverrides {
+    fn default() -> Self {
+        Self {
+            provider: SpawnOverride::Inherit,
+            mode: SpawnOverride::Inherit,
+            terminal_size: SpawnOverride::Inherit,
+            prompt: SpawnOverride::Inherit,
+            bundle_id: SpawnOverride::Inherit,
+            context_id: SpawnOverride::Inherit,
+            environment_profile_id: SpawnOverride::Inherit,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnProfileDefaults {
+    pub profile_id: SpawnProfileId,
+    pub revision: SpawnProfileRevision,
+    pub provider: AgentId,
+    pub mode: SessionMode,
+    pub terminal_size: TerminalSize,
+    pub prompt: Option<SpawnPrompt>,
+    pub bundle_id: Option<SpawnBundleId>,
+    pub context_id: Option<SpawnContextId>,
+    pub environment_profile_id: Option<SpawnEnvironmentProfileId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnSpec {
+    pub target: SpawnTarget,
+    pub profile_id: SpawnProfileId,
+    #[serde(default)]
+    pub overrides: SpawnOverrides,
+    /// Node-local processing budget. It starts when the authenticated Node accepts the
+    /// first request for this idempotency key; relay queueing is outside this budget.
+    pub deadline_ms: SpawnDeadlineMs,
+    pub idempotency_key: SpawnIdempotencyKey,
+    #[serde(default)]
+    pub required_capabilities: SpawnRequiredCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpawnFieldProvenance {
+    Profile,
+    Override,
+    Cleared,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnResolutionProvenance {
+    pub provider: SpawnFieldProvenance,
+    pub mode: SpawnFieldProvenance,
+    pub terminal_size: SpawnFieldProvenance,
+    pub prompt: SpawnFieldProvenance,
+    pub bundle_id: SpawnFieldProvenance,
+    pub context_id: SpawnFieldProvenance,
+    pub environment_profile_id: SpawnFieldProvenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedSpawnSpec {
+    pub target: SpawnTarget,
+    pub profile_id: SpawnProfileId,
+    pub profile_revision: SpawnProfileRevision,
+    pub provider: AgentId,
+    pub mode: SessionMode,
+    pub terminal_size: TerminalSize,
+    pub prompt: Option<SpawnPrompt>,
+    pub bundle_id: Option<SpawnBundleId>,
+    pub context_id: Option<SpawnContextId>,
+    pub environment_profile_id: Option<SpawnEnvironmentProfileId>,
+    pub deadline_ms: SpawnDeadlineMs,
+    pub idempotency_key: SpawnIdempotencyKey,
+    pub required_capabilities: SpawnRequiredCapabilities,
+    pub provenance: SpawnResolutionProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct SpawnPromptMetadata {
+    pub present: bool,
+    pub byte_len: u32,
+}
+
+impl<'de> Deserialize<'de> for SpawnPromptMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireMetadata {
+            present: bool,
+            byte_len: u32,
+        }
+
+        let wire = WireMetadata::deserialize(deserializer)?;
+        if usize::try_from(wire.byte_len).unwrap_or(usize::MAX) > MAX_NODE_TEXT_BYTES {
+            return Err(serde::de::Error::custom(
+                "spawn prompt metadata exceeds the prompt byte limit",
+            ));
+        }
+        if !wire.present && wire.byte_len != 0 {
+            return Err(serde::de::Error::custom(
+                "absent spawn prompt metadata must report zero bytes",
+            ));
+        }
+        Ok(Self {
+            present: wire.present,
+            byte_len: wire.byte_len,
+        })
+    }
+}
+
+impl SpawnPromptMetadata {
+    pub fn from_prompt(prompt: Option<&SpawnPrompt>) -> Self {
+        Self {
+            present: prompt.is_some(),
+            byte_len: prompt
+                .map(SpawnPrompt::byte_len)
+                .and_then(|len| u32::try_from(len).ok())
+                .unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedSpawnReceipt {
+    pub incarnation_id: NodeIncarnationId,
+    pub session: SessionAddress,
+    pub target: SpawnTarget,
+    pub profile_id: SpawnProfileId,
+    pub profile_revision: SpawnProfileRevision,
+    pub provider: AgentId,
+    pub mode: SessionMode,
+    pub terminal_size: TerminalSize,
+    pub prompt: SpawnPromptMetadata,
+    pub bundle_id: Option<SpawnBundleId>,
+    pub context_id: Option<SpawnContextId>,
+    pub environment_profile_id: Option<SpawnEnvironmentProfileId>,
+    pub deadline_ms: SpawnDeadlineMs,
+    pub idempotency_key: SpawnIdempotencyKey,
+    pub required_capabilities: SpawnRequiredCapabilities,
+    pub provenance: SpawnResolutionProvenance,
+}
+
+impl SpawnSpec {
+    pub fn resolve(
+        &self,
+        defaults: &SpawnProfileDefaults,
+    ) -> Result<ResolvedSpawnSpec, SpawnSpecResolveError> {
+        if self.profile_id != defaults.profile_id {
+            return Err(SpawnSpecResolveError::ProfileMismatch {
+                requested: self.profile_id.clone(),
+                loaded: defaults.profile_id.clone(),
+            });
+        }
+        let (provider, provider_source) = resolve_required_spawn_field(
+            "provider",
+            &defaults.provider,
+            &self.overrides.provider,
+        )?;
+        let (mode, mode_source) = resolve_required_spawn_field(
+            "mode",
+            &defaults.mode,
+            &self.overrides.mode,
+        )?;
+        let (terminal_size, terminal_size_source) = resolve_required_spawn_field(
+            "terminal_size",
+            &defaults.terminal_size,
+            &self.overrides.terminal_size,
+        )?;
+        if !terminal_size.is_valid() {
+            return Err(SpawnSpecResolveError::InvalidTerminalSize);
+        }
+        let (prompt, prompt_source) = resolve_optional_spawn_field(
+            &defaults.prompt,
+            &self.overrides.prompt,
+        );
+        let (bundle_id, bundle_source) = resolve_optional_spawn_field(
+            &defaults.bundle_id,
+            &self.overrides.bundle_id,
+        );
+        let (context_id, context_source) = resolve_optional_spawn_field(
+            &defaults.context_id,
+            &self.overrides.context_id,
+        );
+        let (environment_profile_id, environment_profile_source) =
+            resolve_optional_spawn_field(
+                &defaults.environment_profile_id,
+                &self.overrides.environment_profile_id,
+            );
+        Ok(ResolvedSpawnSpec {
+            target: self.target.clone(),
+            profile_id: self.profile_id.clone(),
+            profile_revision: defaults.revision.clone(),
+            provider,
+            mode,
+            terminal_size,
+            prompt,
+            bundle_id,
+            context_id,
+            environment_profile_id,
+            deadline_ms: self.deadline_ms,
+            idempotency_key: self.idempotency_key.clone(),
+            required_capabilities: self.required_capabilities.clone(),
+            provenance: SpawnResolutionProvenance {
+                provider: provider_source,
+                mode: mode_source,
+                terminal_size: terminal_size_source,
+                prompt: prompt_source,
+                bundle_id: bundle_source,
+                context_id: context_source,
+                environment_profile_id: environment_profile_source,
+            },
+        })
+    }
+}
+
+impl ResolvedSpawnSpec {
+    pub fn receipt(
+        &self,
+        incarnation_id: NodeIncarnationId,
+        session: SessionAddress,
+    ) -> ResolvedSpawnReceipt {
+        ResolvedSpawnReceipt {
+            incarnation_id,
+            session,
+            target: self.target.clone(),
+            profile_id: self.profile_id.clone(),
+            profile_revision: self.profile_revision.clone(),
+            provider: self.provider.clone(),
+            mode: self.mode,
+            terminal_size: self.terminal_size,
+            prompt: SpawnPromptMetadata::from_prompt(self.prompt.as_ref()),
+            bundle_id: self.bundle_id.clone(),
+            context_id: self.context_id.clone(),
+            environment_profile_id: self.environment_profile_id.clone(),
+            deadline_ms: self.deadline_ms,
+            idempotency_key: self.idempotency_key.clone(),
+            required_capabilities: self.required_capabilities.clone(),
+            provenance: self.provenance.clone(),
+        }
+    }
+}
+
+fn resolve_required_spawn_field<T: Clone>(
+    field: &'static str,
+    default: &T,
+    override_value: &SpawnOverride<T>,
+) -> Result<(T, SpawnFieldProvenance), SpawnSpecResolveError> {
+    match override_value {
+        SpawnOverride::Inherit => Ok((default.clone(), SpawnFieldProvenance::Profile)),
+        SpawnOverride::Set { value } => Ok((value.clone(), SpawnFieldProvenance::Override)),
+        SpawnOverride::Clear => Err(SpawnSpecResolveError::RequiredFieldCleared { field }),
+    }
+}
+
+fn resolve_optional_spawn_field<T: Clone>(
+    default: &Option<T>,
+    override_value: &SpawnOverride<T>,
+) -> (Option<T>, SpawnFieldProvenance) {
+    match override_value {
+        SpawnOverride::Inherit => (default.clone(), SpawnFieldProvenance::Profile),
+        SpawnOverride::Set { value } => {
+            (Some(value.clone()), SpawnFieldProvenance::Override)
+        }
+        SpawnOverride::Clear => (None, SpawnFieldProvenance::Cleared),
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SpawnSpecResolveError {
+    #[error("spawn profile {requested} does not match loaded profile {loaded}")]
+    ProfileMismatch {
+        requested: SpawnProfileId,
+        loaded: SpawnProfileId,
+    },
+    #[error("required spawn field {field} cannot be cleared")]
+    RequiredFieldCleared { field: &'static str },
+    #[error("resolved spawn terminal size is invalid")]
+    InvalidTerminalSize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1522,6 +2149,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_PROVIDER_ID_OPEN_CAPABILITY,
             NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
             NODE_REPOSITORY_PATH_CAPABILITY,
+            NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             NODE_WORKSPACE_FILE_READ_CAPABILITY,
         ]
@@ -2018,6 +2646,9 @@ pub enum NodeRequest {
         terminal_size: TerminalSize,
         initial_prompt: Option<String>,
     },
+    SpawnSpec {
+        spec: SpawnSpec,
+    },
     Resume {
         session: SessionAddress,
         terminal_size: TerminalSize,
@@ -2051,6 +2682,7 @@ impl NodeRequest {
     pub fn required_capability(&self) -> Option<&'static str> {
         match self {
             Self::ReadWorkspaceFile { .. } => Some(NODE_WORKSPACE_FILE_READ_CAPABILITY),
+            Self::SpawnSpec { .. } => Some(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
             Self::Snapshot
             | Self::Resync { .. }
             | Self::InspectWorkspace { .. }
@@ -2109,6 +2741,9 @@ pub enum NodeResponse {
     },
     SpawnAccepted {
         session: SessionAddress,
+    },
+    SpawnSpecAccepted {
+        receipt: ResolvedSpawnReceipt,
     },
     SessionRecordUpdated {
         record: ManagedSessionRecord,
@@ -2170,6 +2805,12 @@ pub enum NodeFailureCode {
     WorktreeProtected,
     WorktreeDirty,
     WorktreeLocked,
+    UnknownSpawnProfile,
+    SpawnTargetMismatch,
+    SpawnIdempotencyConflict,
+    SpawnIdempotencyCapacity,
+    SpawnDeadlineExceeded,
+    UnsupportedSpawnCapability,
     UnknownSession,
     UnknownSessionRecord,
     SessionRecordNotResumable,
@@ -2387,6 +3028,163 @@ mod tests {
     fn legacy_hello_omits_compatibility_instead_of_synthesizing_a_selection() {
         let hello = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
         assert_eq!(hello.compatibility, None);
+    }
+
+    #[test]
+    fn legacy_spawn_json_remains_exact_after_spawn_spec() {
+        let request = NodeRequest::Spawn {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            initial_prompt: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"kind":"spawn","workspace_id":"primary","provider":"claude","mode":"pty","terminal_size":{"rows":24,"columns":80},"initial_prompt":null}"#,
+        );
+        assert_eq!(request.required_capability(), None);
+
+        let response = NodeResponse::SpawnAccepted {
+            session: SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(1),
+                },
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"kind":"spawn-accepted","session":{"workspace_id":"primary","session":{"instance_id":7,"generation":1}}}"#,
+        );
+    }
+
+    #[test]
+    fn spawn_spec_defaults_overrides_are_deterministic() {
+        let profile_id = SpawnProfileId::new("review-default").unwrap();
+        let defaults = SpawnProfileDefaults {
+            profile_id: profile_id.clone(),
+            revision: SpawnProfileRevision::new("review-default.r3").unwrap(),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            prompt: Some(SpawnPrompt::new("profile prompt").unwrap()),
+            bundle_id: Some(SpawnBundleId::new("review-bundle").unwrap()),
+            context_id: Some(SpawnContextId::new("repo-context").unwrap()),
+            environment_profile_id: Some(
+                SpawnEnvironmentProfileId::new("local-default").unwrap(),
+            ),
+        };
+        let spec = SpawnSpec {
+            target: SpawnTarget {
+                node_id: NodeId::new("node-a").unwrap(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: Some(WorkspaceId::new("review-tree").unwrap()),
+            },
+            profile_id,
+            overrides: SpawnOverrides {
+                provider: SpawnOverride::Inherit,
+                mode: SpawnOverride::Set {
+                    value: SessionMode::Inline,
+                },
+                terminal_size: SpawnOverride::Set {
+                    value: TerminalSize {
+                        rows: 31,
+                        columns: 97,
+                    },
+                },
+                prompt: SpawnOverride::Set {
+                    value: SpawnPrompt::new("private prompt text").unwrap(),
+                },
+                bundle_id: SpawnOverride::Clear,
+                context_id: SpawnOverride::Inherit,
+                environment_profile_id: SpawnOverride::Clear,
+            },
+            deadline_ms: SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("request-0001").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::new([
+                CapabilityId::new(SPAWN_RUNTIME_STRUCTURED_PROMPT).unwrap(),
+                CapabilityId::new(SPAWN_RUNTIME_RAW_PTY_LIFECYCLE).unwrap(),
+            ])
+            .unwrap(),
+        };
+
+        let first = spec.resolve(&defaults).unwrap();
+        let second = spec.resolve(&defaults).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.provider, agent("claude"));
+        assert_eq!(first.mode, SessionMode::Inline);
+        assert_eq!(first.terminal_size.rows, 31);
+        assert_eq!(first.prompt.as_ref().unwrap().as_str(), "private prompt text");
+        assert_eq!(first.bundle_id, None);
+        assert_eq!(
+            first.context_id.as_ref().map(SpawnContextId::as_str),
+            Some("repo-context"),
+        );
+        assert_eq!(first.environment_profile_id, None);
+        assert_eq!(first.provenance.provider, SpawnFieldProvenance::Profile);
+        assert_eq!(first.provenance.mode, SpawnFieldProvenance::Override);
+        assert_eq!(first.provenance.prompt, SpawnFieldProvenance::Override);
+        assert_eq!(first.provenance.bundle_id, SpawnFieldProvenance::Cleared);
+        assert_eq!(first.provenance.context_id, SpawnFieldProvenance::Profile);
+        assert_eq!(
+            first.required_capabilities.as_slice(),
+            &[
+                CapabilityId::new(SPAWN_RUNTIME_RAW_PTY_LIFECYCLE).unwrap(),
+                CapabilityId::new(SPAWN_RUNTIME_STRUCTURED_PROMPT).unwrap(),
+            ],
+        );
+
+        let receipt = first.receipt(
+            NodeIncarnationId::from_bytes([9; NODE_INCARNATION_ID_BYTES]),
+            SessionAddress {
+                workspace_id: WorkspaceId::new("review-tree").unwrap(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(11),
+                    generation: SessionGeneration(1),
+                },
+            },
+        );
+        assert_eq!(receipt.prompt, SpawnPromptMetadata {
+            present: true,
+            byte_len: 19,
+        });
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(
+            receipt_json,
+            r#"{"incarnation_id":"09090909090909090909090909090909","session":{"workspace_id":"review-tree","session":{"instance_id":11,"generation":1}},"target":{"node_id":"node-a","workspace_id":"primary","worktree_id":"review-tree"},"profile_id":"review-default","profile_revision":"review-default.r3","provider":"claude","mode":"inline","terminal_size":{"rows":31,"columns":97},"prompt":{"present":true,"byte_len":19},"bundle_id":null,"context_id":"repo-context","environment_profile_id":null,"deadline_ms":30000,"idempotency_key":"request-0001","required_capabilities":["raw-pty-lifecycle","structured-prompt"],"provenance":{"provider":"profile","mode":"override","terminal_size":"override","prompt":"override","bundle_id":"cleared","context_id":"profile","environment_profile_id":"cleared"}}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<ResolvedSpawnReceipt>(&receipt_json).unwrap(),
+            receipt,
+        );
+        assert!(!receipt_json.contains("private prompt text"));
+        assert!(!receipt_json.contains("profile prompt"));
+
+        let mut clear_required = spec.clone();
+        clear_required.overrides.provider = SpawnOverride::Clear;
+        assert!(matches!(
+            clear_required.resolve(&defaults),
+            Err(SpawnSpecResolveError::RequiredFieldCleared { field: "provider" }),
+        ));
+
+        let minimal_json = r#"{"target":{"node_id":"node-a","workspace_id":"primary"},"profile_id":"review-default","deadline_ms":1,"idempotency_key":"request-0002"}"#;
+        let minimal = serde_json::from_str::<SpawnSpec>(minimal_json).unwrap();
+        assert_eq!(minimal.overrides, SpawnOverrides::default());
+        assert!(minimal.required_capabilities.is_empty());
+        assert!(SpawnDeadlineMs::new(MAX_SPAWN_DEADLINE_MS + 1).is_err());
+        assert!(SpawnProfileId::new("unsafe/profile").is_err());
+        assert!(serde_json::from_str::<SpawnOverride<AgentId>>(
+            r#"{"kind":"set","value":"claude","typo":true}"#,
+        )
+        .is_err());
     }
 
     #[test]

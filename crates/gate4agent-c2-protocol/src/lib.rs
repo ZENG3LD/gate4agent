@@ -8,7 +8,13 @@ pub use gate4agent_node_protocol::{
     ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
     ProviderRuntimeContractId, ProviderRuntimeMode, ProviderRuntimeStatus,
     ProviderRuntimeStatuses, ProviderRuntimeVersion,
-    NODE_PROVIDER_ID_OPEN_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    ResolvedSpawnReceipt, ResolvedSpawnSpec, SpawnBundleId, SpawnContextId, SpawnDeadlineMs,
+    SpawnEnvironmentProfileId, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
+    SpawnOverrides, SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision, SpawnPrompt,
+    SpawnPromptMetadata, SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnSpec,
+    SpawnTarget,
+    NODE_PROVIDER_ID_OPEN_CAPABILITY,
+    NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     ProtocolNegotiationError, ProtocolRange,
 };
@@ -39,6 +45,8 @@ pub const C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str =
 pub const C2_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY;
 pub const C2_PROVIDER_ID_OPEN_CAPABILITY: &str = NODE_PROVIDER_ID_OPEN_CAPABILITY;
+pub const C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
+    NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY;
 pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
@@ -122,6 +130,12 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::WorktreeProtected => "worktree protected",
             NodeFailureCode::WorktreeDirty => "worktree dirty",
             NodeFailureCode::WorktreeLocked => "worktree locked",
+            NodeFailureCode::SpawnTargetMismatch => "spawn target mismatch",
+            NodeFailureCode::UnknownSpawnProfile => "spawn profile unavailable",
+            NodeFailureCode::SpawnIdempotencyConflict => "spawn idempotency conflict",
+            NodeFailureCode::SpawnIdempotencyCapacity => "spawn idempotency capacity exhausted",
+            NodeFailureCode::SpawnDeadlineExceeded => "spawn deadline exceeded",
+            NodeFailureCode::UnsupportedSpawnCapability => "spawn capability unavailable",
             NodeFailureCode::UnknownSession => "session unavailable",
             NodeFailureCode::UnknownSessionRecord => "managed session unavailable",
             NodeFailureCode::SessionRecordNotResumable => "managed session cannot resume",
@@ -587,6 +601,7 @@ pub enum C2NodeResponse {
         controller: Option<gate4agent_node_protocol::ControllerState>,
     },
     SpawnAccepted { session: SessionAddress },
+    SpawnSpecAccepted { receipt: ResolvedSpawnReceipt },
     SessionRecordUpdated { record: C2ManagedSessionRecord },
     SessionRecordResumed {
         record: C2ManagedSessionRecord,
@@ -632,6 +647,9 @@ impl From<&NodeResponse> for C2NodeResponse {
                 controller: controller.clone(),
             },
             NodeResponse::SpawnAccepted { session } => Self::SpawnAccepted { session: session.clone() },
+            NodeResponse::SpawnSpecAccepted { receipt } => Self::SpawnSpecAccepted {
+                receipt: receipt.clone(),
+            },
             NodeResponse::SessionRecordUpdated { record } => Self::SessionRecordUpdated {
                 record: C2ManagedSessionRecord::from(record),
             },
@@ -1739,6 +1757,71 @@ mod tests {
                 "060064617277696e0700616172636836340201",
             ),
         );
+    }
+
+    #[test]
+    fn c2_spawn_spec_defaults_overrides_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(
+            C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+            "spawn-spec.defaults-overrides-v1",
+        );
+        assert_eq!(
+            C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+            NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+        );
+        let capability =
+            CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let bound = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        let without_spawn_spec = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &ClientCompatibilityOffer {
+                protocol_versions: offer.protocol_versions,
+                capabilities: Vec::new(),
+                state_schema: None,
+            },
+            &NegotiatedC2ControlCompatibility {
+                protocol_version: selected.protocol_version,
+                capabilities: Vec::new(),
+                host: selected.host.clone(),
+                path_semantics: selected.path_semantics.clone(),
+            },
+        )
+        .unwrap();
+        assert_ne!(bound, without_spawn_spec);
+        assert!(bound.windows(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.len()).any(
+            |window| window == C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.as_bytes()
+        ));
     }
 
     #[test]

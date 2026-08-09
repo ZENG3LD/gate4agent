@@ -8,6 +8,7 @@ use gate4agent_c2_protocol::{
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
@@ -44,6 +45,8 @@ const WORKSPACE_FILE_READ_NOT_NEGOTIATED: &str =
     "workspace file reads require negotiated C2 capability";
 const OPEN_PROVIDER_ID_NOT_NEGOTIATED: &str =
     "open provider IDs require negotiated C2 capability";
+const SPAWN_SPEC_NOT_NEGOTIATED: &str =
+    "spawn spec defaults/overrides require negotiated C2 capability";
 const TERMINAL_FRAME_EVENTS_NOT_NEGOTIATED: &str =
     "terminal frame events require negotiated C2 capability";
 
@@ -53,6 +56,7 @@ struct NegotiatedPathCapabilities {
     repository_paths: bool,
     workspace_file_read: bool,
     provider_ids_open: bool,
+    spawn_spec_defaults_overrides: bool,
     terminal_frame_events: bool,
 }
 
@@ -109,6 +113,8 @@ fn control_request_deadline(request: &NodeRequest) -> Duration {
         NodeRequest::Spawn { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::Stop { .. } => Duration::from_secs(15),
+        NodeRequest::SpawnSpec { spec } =>
+            Duration::from_millis(spec.deadline_ms.get()) + RELAY_REPLY_HEADROOM,
         NodeRequest::ResumeSessionRecord { .. } => Duration::from_secs(35),
         _ => Duration::from_secs(10),
     };
@@ -266,6 +272,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
@@ -331,6 +339,8 @@ fn negotiated_path_capabilities(
         repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
         workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
         provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
+        spawn_spec_defaults_overrides:
+            selected_has(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -345,7 +355,8 @@ fn reject_unnegotiated_outbound_path(
         ));
     }
     if !capabilities.provider_ids_open
-        && matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
+        && (matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
+            || spawn_spec_requires_open_provider_capability(request))
     {
         return Err(C2ControlError::Protocol(
             OPEN_PROVIDER_ID_NOT_NEGOTIATED.to_owned(),
@@ -354,11 +365,19 @@ fn reject_unnegotiated_outbound_path(
     let required_capability_available = match request.required_capability() {
         None => true,
         Some(C2_WORKSPACE_FILE_READ_CAPABILITY) => capabilities.workspace_file_read,
+        Some(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY) => {
+            capabilities.spawn_spec_defaults_overrides
+        }
         Some(_) => false,
     };
     if !required_capability_available {
         return Err(C2ControlError::Protocol(
-            WORKSPACE_FILE_READ_NOT_NEGOTIATED.to_owned(),
+            match request.required_capability() {
+                Some(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY) => {
+                    SPAWN_SPEC_NOT_NEGOTIATED.to_owned()
+                }
+                _ => WORKSPACE_FILE_READ_NOT_NEGOTIATED.to_owned(),
+            },
         ));
     }
     if !capabilities.repository_paths && node_request_has_unix_repository_path(request) {
@@ -367,6 +386,19 @@ fn reject_unnegotiated_outbound_path(
         ));
     }
     Ok(())
+}
+
+fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
+    let NodeRequest::SpawnSpec { spec } = request else {
+        return false;
+    };
+    match &spec.overrides.provider {
+        gate4agent_node_protocol::SpawnOverride::Set { value } => {
+            !provider_id_is_legacy(value)
+        }
+        gate4agent_node_protocol::SpawnOverride::Inherit
+        | gate4agent_node_protocol::SpawnOverride::Clear => true,
+    }
 }
 
 fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
@@ -382,6 +414,7 @@ fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -414,6 +447,7 @@ fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -455,6 +489,7 @@ fn c2_node_response_has_terminal_frame_event(response: &C2NodeResponse) -> bool 
         | C2NodeResponse::WorkspaceFileRead { .. }
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SpawnSpecAccepted { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
@@ -507,6 +542,7 @@ fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
         }
         C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SpawnSpecAccepted { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
@@ -540,6 +576,7 @@ fn c2_node_response_has_unix_repository_path(response: &C2NodeResponse) -> bool 
         | C2NodeResponse::Resync { .. }
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SpawnSpecAccepted { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
@@ -555,6 +592,12 @@ fn c2_node_response_has_unix_repository_path(response: &C2NodeResponse) -> bool 
 fn routed_response_requires_workspace_file_read(response: &RoutedNodeResponse) -> bool {
     response.response.as_ref().is_ok_and(|response| {
         matches!(response, C2NodeResponse::WorkspaceFileRead { .. })
+    })
+}
+
+fn routed_response_requires_spawn_spec(response: &RoutedNodeResponse) -> bool {
+    response.response.as_ref().is_ok_and(|response| {
+        matches!(response, C2NodeResponse::SpawnSpecAccepted { .. })
     })
 }
 
@@ -665,6 +708,9 @@ fn c2_node_response_has_open_provider_id(response: &C2NodeResponse) -> bool {
         C2NodeResponse::SessionRecordUpdated { record }
         | C2NodeResponse::SessionRecordResumed { record, .. } => {
             !provider_id_is_legacy(&record.provider)
+        }
+        C2NodeResponse::SpawnSpecAccepted { receipt } => {
+            !provider_id_is_legacy(&receipt.provider)
         }
         C2NodeResponse::WorkspaceRegistered { workspace }
         | C2NodeResponse::WorktreeCreated { workspace, .. } => {
@@ -821,6 +867,17 @@ async fn control_owner(
                             )));
                             break;
                         }
+                        if !path_capabilities.spawn_spec_defaults_overrides
+                            && reply
+                                .result
+                                .as_ref()
+                                .is_ok_and(routed_response_requires_spawn_spec)
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                SPAWN_SPEC_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
@@ -948,7 +1005,10 @@ mod tests {
         ArchitectureId, C2GitSnapshot, C2WorkspaceInspection, C2WorkspaceSnapshot,
         C2ServerChallenge, HostDescriptor, NodeCursor, NodeId, OpaqueHostPath,
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle, RepositoryPath,
-        WorkspaceFileContent, WorkspaceFileRead,
+        ResolvedSpawnReceipt, SpawnDeadlineMs, SpawnFieldProvenance,
+        SpawnIdempotencyKey, SpawnOverrides, SpawnProfileId, SpawnProfileRevision,
+        SpawnPromptMetadata, SpawnRequiredCapabilities, SpawnResolutionProvenance,
+        SpawnSpec, SpawnTarget, WorkspaceFileContent, WorkspaceFileRead,
     };
     use gate4agent_node_protocol::{
         GitStatusEntry, NodeIncarnationId, SessionMode, WorkspaceEntry, WorkspaceEntryKind,
@@ -1029,12 +1089,63 @@ mod tests {
         }
     }
 
+    fn spawn_spec(node_id: &str) -> SpawnSpec {
+        SpawnSpec {
+            target: SpawnTarget {
+                node_id: NodeId::new(node_id).unwrap(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            overrides: SpawnOverrides::default(),
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+        }
+    }
+
+    fn spawn_receipt() -> ResolvedSpawnReceipt {
+        ResolvedSpawnReceipt {
+            incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            session: gate4agent_node_protocol::SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: gate4agent_node_protocol::SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(2),
+                },
+            },
+            target: spawn_spec("node-a").target,
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            profile_revision: SpawnProfileRevision::new("r1").unwrap(),
+            provider: gate4agent_c2_protocol::AgentId::new("claude").unwrap(),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize { rows: 24, columns: 80 },
+            prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
+            bundle_id: None,
+            context_id: None,
+            environment_profile_id: None,
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+            provenance: SpawnResolutionProvenance {
+                provider: SpawnFieldProvenance::Profile,
+                mode: SpawnFieldProvenance::Profile,
+                terminal_size: SpawnFieldProvenance::Profile,
+                prompt: SpawnFieldProvenance::Profile,
+                bundle_id: SpawnFieldProvenance::Profile,
+                context_id: SpawnFieldProvenance::Profile,
+                environment_profile_id: SpawnFieldProvenance::Profile,
+            },
+        }
+    }
+
     fn no_path_capabilities() -> NegotiatedPathCapabilities {
         NegotiatedPathCapabilities {
             opaque_host_paths: false,
             repository_paths: false,
             workspace_file_read: false,
             provider_ids_open: false,
+            spawn_spec_defaults_overrides: false,
             terminal_frame_events: false,
         }
     }
@@ -1045,6 +1156,7 @@ mod tests {
             repository_paths: true,
             workspace_file_read: true,
             provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
             terminal_frame_events: true,
         }
     }
@@ -1191,6 +1303,7 @@ mod tests {
                 CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
             ],
         );
@@ -1549,6 +1662,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_spawn_spec_before_write() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx,
+            no_path_capabilities(),
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::SpawnSpec { spec: spawn_spec("node-a") },
+            reply: reply_tx,
+        }).await.unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == SPAWN_SPEC_NOT_NEGOTIATED
+        ));
+        assert!(writer_rx.try_recv().is_err());
+        drop(commands_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_owner_rejects_unnegotiated_spawn_spec_reply_and_closes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let mut capabilities = all_path_capabilities();
+        capabilities.spawn_spec_defaults_overrides = false;
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, capabilities,
+        ));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(OwnerInput::Frame(C2ServerFrame::Reply(
+            gate4agent_c2_protocol::C2ReplyEnvelope {
+                request_id: C2RequestId(1),
+                result: Ok(RoutedNodeResponse {
+                    node_id: NodeId::new("node-a").unwrap(),
+                    incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                    response: Ok(C2NodeResponse::SpawnSpecAccepted {
+                        receipt: spawn_receipt(),
+                    }),
+                }),
+            },
+        ))).await.unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Err(C2ControlError::Protocol(ref message))
+                if message == SPAWN_SPEC_NOT_NEGOTIATED
+        ));
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+        assert!(commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: oneshot::channel().0,
+        }).await.is_err());
+    }
+
+    #[tokio::test]
     async fn control_owner_rejects_unnegotiated_open_provider_reply_and_closes() {
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (events_tx, _events_rx) = mpsc::channel(1);
@@ -1654,6 +1842,7 @@ mod tests {
             repository_paths: false,
             workspace_file_read: true,
             provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -1666,6 +1855,7 @@ mod tests {
             repository_paths: true,
             workspace_file_read: false,
             provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
             terminal_frame_events: true,
         };
         assert!(matches!(

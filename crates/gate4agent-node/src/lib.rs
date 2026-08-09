@@ -12,11 +12,16 @@ mod workspace_file_unix;
 
 mod platform;
 mod provider_runtime;
+mod spawn_spec;
 mod server;
 
 pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
     NodeShutdownHandle, WorkspaceConfig,
+};
+pub use spawn_spec::{
+    SpawnProfileRegistry, SpawnProfileRegistryError, DEFAULT_SPAWN_PROFILE_ID,
+    MAX_SPAWN_PROFILES,
 };
 
 #[cfg(windows)]

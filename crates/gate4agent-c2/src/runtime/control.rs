@@ -9,6 +9,7 @@ use crate::protocol::{
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_WORKSPACE_FILE_READ_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
@@ -40,6 +41,7 @@ struct NegotiatedPathCapabilities {
     workspace_file_read: bool,
     provider_runtime_status: bool,
     provider_ids_open: bool,
+    spawn_spec_defaults_overrides: bool,
     terminal_frame_events: bool,
 }
 
@@ -472,6 +474,12 @@ async fn control_writer<W>(
                 TerminalFramePayload::None => {}
             }
         }
+        if !path_capabilities.spawn_spec_defaults_overrides
+            && server_frame_contains_spawn_spec_response(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
         }
@@ -528,6 +536,8 @@ fn negotiated_path_capabilities(
         workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
         provider_runtime_status: selected_has(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY),
         provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
+        spawn_spec_defaults_overrides:
+            selected_has(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -552,6 +562,7 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
                     | C2NodeResponse::WorkspaceFileRead { .. }
                     | C2NodeResponse::Controller { .. }
                     | C2NodeResponse::SpawnAccepted { .. }
+                    | C2NodeResponse::SpawnSpecAccepted { .. }
                     | C2NodeResponse::SessionRecordUpdated { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
@@ -596,6 +607,9 @@ fn unnegotiated_request_failure(
     let required_capability_available = match request.required_capability() {
         None => true,
         Some(C2_WORKSPACE_FILE_READ_CAPABILITY) => capabilities.workspace_file_read,
+        Some(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY) => {
+            capabilities.spawn_spec_defaults_overrides
+        }
         Some(_) => false,
     };
     if !required_capability_available {
@@ -606,7 +620,8 @@ fn unnegotiated_request_failure(
         ));
     }
     if !capabilities.provider_ids_open
-        && matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
+        && (matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
+            || spawn_spec_requires_open_provider_capability(request))
     {
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
@@ -627,6 +642,19 @@ fn unnegotiated_request_failure(
     None
 }
 
+fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
+    let NodeRequest::SpawnSpec { spec } = request else {
+        return false;
+    };
+    match &spec.overrides.provider {
+        gate4agent_node_protocol::SpawnOverride::Set { value } => {
+            !provider_id_is_legacy(value)
+        }
+        gate4agent_node_protocol::SpawnOverride::Inherit
+        | gate4agent_node_protocol::SpawnOverride::Clear => true,
+    }
+}
+
 fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
     match request {
         NodeRequest::RegisterWorkspace { root, .. } => root.as_unix_bytes().is_some(),
@@ -640,6 +668,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
@@ -692,6 +721,7 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                     | C2NodeResponse::Resync { .. }
                     | C2NodeResponse::Controller { .. }
                     | C2NodeResponse::SpawnAccepted { .. }
+                    | C2NodeResponse::SpawnSpecAccepted { .. }
                     | C2NodeResponse::SessionRecordUpdated { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
@@ -727,6 +757,21 @@ fn server_frame_contains_workspace_file_read(frame: &C2ServerFrame) -> bool {
     }
 }
 
+fn server_frame_contains_spawn_spec_response(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(|response| {
+                matches!(response, C2NodeResponse::SpawnSpecAccepted { .. })
+            })
+        }),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Event(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
 fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
     match response {
         C2NodeResponse::Snapshot { snapshot, .. } => c2_snapshot_contains_opaque_unix_path(snapshot),
@@ -748,6 +793,7 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         C2NodeResponse::WorktreeRemoved { target_root, .. } => target_root.as_unix_bytes().is_some(),
         C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SpawnSpecAccepted { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
@@ -848,6 +894,15 @@ fn dispatch_start(
 ) -> DispatchStart {
     if matches!(request.request, NodeRequest::AcquireController { .. } | NodeRequest::ReleaseController | NodeRequest::Shutdown) {
         return DispatchStart::Immediate(Err(relay_failure(C2RelayFailureCode::RequestForbidden, "C2 owns node controller leases and node lifecycle", None)));
+    }
+    if matches!(&request.request, NodeRequest::SpawnSpec { spec }
+        if spec.target.node_id != request.route.node_id)
+    {
+        return DispatchStart::Immediate(Err(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "spawn target node does not match C2 route",
+            None,
+        )));
     }
     let Some(relay) = relays.get(&request.route.node_id).cloned() else {
         return DispatchStart::Immediate(Err(relay_failure(C2RelayFailureCode::UnknownNode, "node is not configured in C2", None)));
@@ -957,6 +1012,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
@@ -1053,6 +1110,7 @@ fn request_targets_unavailable_provider(
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::Spawn { .. }
+        | NodeRequest::SpawnSpec { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -1198,6 +1256,9 @@ fn project_legacy_response(
         | C2NodeResponse::SessionRecordResumed { record, .. } => {
             provider_id_is_legacy(&record.provider)
         }
+        C2NodeResponse::SpawnSpecAccepted { receipt } => {
+            provider_id_is_legacy(&receipt.provider)
+        }
         C2NodeResponse::WorkspaceRegistered { workspace }
         | C2NodeResponse::WorktreeCreated { workspace, .. } => {
             retain_legacy_workspace(workspace);
@@ -1313,6 +1374,7 @@ fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
         | C2NodeResponse::WorkspaceFileRead { .. }
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SpawnSpecAccepted { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
@@ -1333,7 +1395,11 @@ mod tests {
         C2SessionSnapshot, C2SessionStatus, C2WorkspaceInspection, C2WorkspaceSnapshot,
         C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
-        RepositoryPath, SlimManagedSessionRecord, WorkspaceFileContent, WorkspaceFileRead,
+        RepositoryPath, ResolvedSpawnReceipt, SlimManagedSessionRecord, SpawnDeadlineMs,
+        SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides, SpawnProfileId,
+        SpawnProfileRevision, SpawnPromptMetadata, SpawnRequiredCapabilities,
+        SpawnResolutionProvenance, SpawnSpec, SpawnTarget, WorkspaceFileContent,
+        WorkspaceFileRead,
     };
     use gate4agent_node_protocol::{
         GitStatusEntry, ManagedSessionState, SessionAddress, SessionKey, SessionMode,
@@ -1401,6 +1467,50 @@ mod tests {
             session: SessionKey {
                 instance_id: AgentInstanceId(instance_id),
                 generation: SessionGeneration(1),
+            },
+        }
+    }
+
+    fn spawn_spec(node_id: &str) -> SpawnSpec {
+        SpawnSpec {
+            target: SpawnTarget {
+                node_id: NodeId::new(node_id).unwrap(),
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            overrides: SpawnOverrides::default(),
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+        }
+    }
+
+    fn spawn_receipt() -> ResolvedSpawnReceipt {
+        ResolvedSpawnReceipt {
+            incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            session: address(7),
+            target: spawn_spec("node-a").target,
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            profile_revision: SpawnProfileRevision::new("r1").unwrap(),
+            provider: AgentId::new("claude").unwrap(),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize { rows: 24, columns: 80 },
+            prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
+            bundle_id: None,
+            context_id: None,
+            environment_profile_id: None,
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+            provenance: SpawnResolutionProvenance {
+                provider: SpawnFieldProvenance::Profile,
+                mode: SpawnFieldProvenance::Profile,
+                terminal_size: SpawnFieldProvenance::Profile,
+                prompt: SpawnFieldProvenance::Profile,
+                bundle_id: SpawnFieldProvenance::Profile,
+                context_id: SpawnFieldProvenance::Profile,
+                environment_profile_id: SpawnFieldProvenance::Profile,
             },
         }
     }
@@ -1516,6 +1626,7 @@ mod tests {
                 CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
             ],
         );
@@ -1539,6 +1650,114 @@ mod tests {
             [8; crate::protocol::C2_AUTH_NONCE_BYTES],
         )).unwrap();
         assert!(legacy.capabilities.is_empty());
+    }
+
+    #[test]
+    fn c2_spawn_spec_gate_rejects_unnegotiated_request() {
+        let request = NodeRequest::SpawnSpec { spec: spawn_spec("node-a") };
+        let mut capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            terminal_frame_events: true,
+        };
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+        capabilities.provider_ids_open = false;
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "open provider IDs require negotiated C2 capability"
+        ));
+        let mut explicit_legacy = spawn_spec("node-a");
+        explicit_legacy.overrides.provider =
+            gate4agent_node_protocol::SpawnOverride::Set { value: AgentId::new("claude").unwrap() };
+        assert!(unnegotiated_request_failure(
+            &NodeRequest::SpawnSpec { spec: explicit_legacy },
+            capabilities,
+        ).is_none());
+        capabilities.provider_ids_open = true;
+        capabilities.spawn_spec_defaults_overrides = false;
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "request capability was not negotiated with C2"
+        ));
+    }
+
+    #[test]
+    fn spawn_spec_route_target_mismatch_is_rejected_before_relay_lookup() {
+        let incarnation_id = NodeIncarnationId::from_bytes([7; 16]);
+        let (_status_tx, status_rx) = watch::channel(Arc::new(status(
+            NodeTransportState::Online,
+            Some(incarnation_id),
+        )));
+        let request = crate::protocol::RoutedNodeRequest {
+            route: crate::protocol::NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: incarnation_id,
+            },
+            request: NodeRequest::SpawnSpec { spec: spawn_spec("node-b") },
+        };
+        let DispatchStart::Immediate(Err(failure)) = dispatch_start(
+            1,
+            request,
+            &BTreeMap::new(),
+            &status_rx,
+        ) else {
+            panic!("route mismatch reached relay lookup");
+        };
+        assert_eq!(failure.code, C2RelayFailureCode::RequestForbidden);
+        assert_eq!(failure.message, "spawn target node does not match C2 route");
+    }
+
+    #[tokio::test]
+    async fn control_writer_rejects_unnegotiated_spawn_spec_reply_recursively() {
+        let frame = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(3),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Ok(C2NodeResponse::SpawnSpecAccepted {
+                    receipt: spawn_receipt(),
+                }),
+            }),
+        });
+        assert!(server_frame_contains_spawn_spec_response(&frame));
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender.send(queued(frame, &budget).unwrap()).await.unwrap();
+        let (disconnect, disconnected) = watch::channel(false);
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: true,
+                repository_paths: true,
+                workspace_file_read: true,
+                provider_runtime_status: true,
+                provider_ids_open: true,
+                spawn_spec_defaults_overrides: false,
+                terminal_frame_events: true,
+            },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        ).await;
+        assert!(*disconnected.borrow());
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1704,6 +1923,7 @@ mod tests {
             workspace_file_read: true,
             provider_runtime_status: true,
             provider_ids_open: false,
+            spawn_spec_defaults_overrides: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -1889,6 +2109,7 @@ mod tests {
                 workspace_file_read: false,
                 provider_runtime_status: false,
                 provider_ids_open: false,
+                spawn_spec_defaults_overrides: false,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -1921,6 +2142,7 @@ mod tests {
                 workspace_file_read: true,
                 provider_runtime_status: true,
                 provider_ids_open: true,
+                spawn_spec_defaults_overrides: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -1953,6 +2175,7 @@ mod tests {
                 workspace_file_read: true,
                 provider_runtime_status: true,
                 provider_ids_open: true,
+                spawn_spec_defaults_overrides: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2003,6 +2226,7 @@ mod tests {
             workspace_file_read: false,
             provider_runtime_status: true,
             provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2015,6 +2239,7 @@ mod tests {
             workspace_file_read: true,
             provider_runtime_status: true,
             provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2027,6 +2252,7 @@ mod tests {
             workspace_file_read: true,
             provider_runtime_status: true,
             provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
@@ -2058,6 +2284,7 @@ mod tests {
                 workspace_file_read: false,
                 provider_runtime_status: true,
                 provider_ids_open: true,
+                spawn_spec_defaults_overrides: true,
                 terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,

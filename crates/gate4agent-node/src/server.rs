@@ -22,6 +22,7 @@ use crate::provider_runtime::{
     require_policy, ProviderRuntimeAdmissionError, ProviderRuntimeMonitor,
     ProviderRuntimeRequirement,
 };
+use crate::spawn_spec::SpawnProfileRegistry;
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
@@ -34,20 +35,24 @@ use crate::protocol::{
     ProtocolRange,
     ProviderAdapterContractSupport,
     ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
-    ProviderRuntimeStatuses, ResponseEnvelope,
+    ProviderRuntimeStatuses, ResolvedSpawnReceipt, ResolvedSpawnSpec, ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
     ManagedSessionState, SessionRecordId, StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFileContent, WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
+    SpawnIdempotencyKey, SpawnRequiredCapabilities, SpawnSpec, WorkspaceFileContent,
+    WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     DEFAULT_CONTROLLER_LEASE_MS,
     MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
-    NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V3,
+    SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
+    SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
+    SPAWN_RUNTIME_STRUCTURED_PROMPT,
 };
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
@@ -59,7 +64,8 @@ use gate4agent_node_wire::{
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
     ControlCommand, ControlEvent, ControlEventKind, InputAction, PromptFraming, PromptPayload, ResumeLaunchRequest,
-    ProviderRuntimePolicy, ResumeTarget, SessionGeneration, StartRequest, TerminalControl, TerminalText,
+    ProviderRuntimeCapability, ProviderRuntimePolicy, ResumeTarget, SessionGeneration, StartRequest,
+    TerminalControl, TerminalText,
     TerminalFrame, TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
     WORKING_DIRECTORY_MAX_BYTES,
 };
@@ -90,6 +96,8 @@ const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 const CONNECTION_SHUTDOWN_GRACE_MS: u64 = 250;
 const SPAWN_DISPATCH_TIMEOUT_MS: u64 = 2_000;
+const SPAWN_IDEMPOTENCY_MAX_ENTRIES: usize = 256;
+const SPAWN_IDEMPOTENCY_TTL_MS: u64 = 15 * 60 * 1_000;
 const PROVIDER_RUNTIME_ADMISSION_TIMEOUT_MS: u64 = 2_500;
 const MUTATION_SETTLE_TIMEOUT_MS: u64 = 5_000;
 const READINESS_SETTLE_HEADROOM_MS: u64 = 2_000;
@@ -217,6 +225,7 @@ pub struct NodeServerConfig {
     access_token: String,
     pub runtime: NativeRuntimeConfig,
     state_path: Option<PathBuf>,
+    spawn_profiles: SpawnProfileRegistry,
 }
 
 impl NodeServerConfig {
@@ -269,6 +278,7 @@ impl NodeServerConfig {
             access_token,
             runtime: NativeRuntimeConfig::default(),
             state_path: None,
+            spawn_profiles: SpawnProfileRegistry::default(),
         })
     }
 
@@ -295,6 +305,11 @@ impl NodeServerConfig {
         }
         self.state_path = Some(state_path);
         Ok(self)
+    }
+
+    pub fn with_spawn_profiles(mut self, spawn_profiles: SpawnProfileRegistry) -> Self {
+        self.spawn_profiles = spawn_profiles;
+        self
     }
 }
 
@@ -434,6 +449,13 @@ impl NodeServer {
         config: NodeServerConfig,
         catalog: AgentRegistry,
     ) -> Result<Self, NodeServerError> {
+        for profile in config.spawn_profiles.iter() {
+            if catalog.get(&profile.provider).is_none() {
+                return Err(NodeServerError::Registry(
+                    "spawn profile references an unavailable provider".to_owned(),
+                ));
+            }
+        }
         let input_settle_timeout_ms = catalog
             .iter()
             .map(|spec| spec.readiness.timeout_ms)
@@ -482,6 +504,7 @@ impl NodeServer {
             Some(provider_runtime_monitor),
             provider_contracts,
             provider_adapter_contracts,
+            config.spawn_profiles.clone(),
             config.state_path.clone(),
             records,
             persistence_warning,
@@ -916,6 +939,8 @@ struct NodeShared {
     provider_runtime_monitor: Option<Arc<ProviderRuntimeMonitor>>,
     provider_contracts: Vec<ProviderContractSupport>,
     provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
+    spawn_profiles: SpawnProfileRegistry,
+    spawn_idempotency: Mutex<SpawnIdempotencyCache>,
     controller: Mutex<Option<ControllerLease>>,
     history: Mutex<NodeEventHistory>,
     event_tx: broadcast::Sender<NodeEventEnvelope>,
@@ -950,6 +975,16 @@ struct SessionBinding {
 
 struct SessionRecords {
     records: BTreeMap<SessionRecordId, ManagedSessionRecord>,
+}
+
+struct SpawnIdempotencyCache {
+    entries: BTreeMap<SpawnIdempotencyKey, SpawnIdempotencyEntry>,
+}
+
+struct SpawnIdempotencyEntry {
+    spec: SpawnSpec,
+    result: Result<ResolvedSpawnReceipt, NodeFailure>,
+    expires_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -988,6 +1023,7 @@ impl NodeShared {
         provider_runtime_monitor: Option<Arc<ProviderRuntimeMonitor>>,
         provider_contracts: Vec<ProviderContractSupport>,
         provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
+        spawn_profiles: SpawnProfileRegistry,
         state_path: Option<PathBuf>,
         records: Vec<ManagedSessionRecord>,
         persistence_warning: Option<String>,
@@ -1021,6 +1057,10 @@ impl NodeShared {
             provider_runtime_monitor,
             provider_contracts,
             provider_adapter_contracts,
+            spawn_profiles,
+            spawn_idempotency: Mutex::new(SpawnIdempotencyCache {
+                entries: BTreeMap::new(),
+            }),
             controller: Mutex::new(None),
             history: Mutex::new(NodeEventHistory::new(record_providers)),
             event_tx,
@@ -1071,6 +1111,7 @@ impl NodeShared {
             None,
             Vec::new(),
             Vec::new(),
+            SpawnProfileRegistry::default(),
             None,
             Vec::new(),
             None,
@@ -1137,6 +1178,114 @@ impl NodeShared {
                 "provider runtime probe is already in progress",
             ),
         })
+    }
+
+    fn replay_spawn_spec(
+        &self,
+        spec: &SpawnSpec,
+        now: Instant,
+    ) -> Result<Option<Result<ResolvedSpawnReceipt, NodeFailure>>, NodeFailure> {
+        let mut cache = self
+            .spawn_idempotency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.entries.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.entries.get(&spec.idempotency_key) {
+            if entry.spec != *spec {
+                return Err(failure(
+                    NodeFailureCode::SpawnIdempotencyConflict,
+                    "spawn idempotency key was reused with a different specification",
+                ));
+            }
+            return Ok(Some(entry.result.clone()));
+        }
+        if cache.entries.len() >= SPAWN_IDEMPOTENCY_MAX_ENTRIES {
+            return Err(failure(
+                NodeFailureCode::SpawnIdempotencyCapacity,
+                "spawn idempotency cache reached its bounded capacity",
+            ));
+        }
+        Ok(None)
+    }
+
+    fn remember_spawn_spec(
+        &self,
+        spec: SpawnSpec,
+        result: Result<ResolvedSpawnReceipt, NodeFailure>,
+        accepted_at: Instant,
+    ) {
+        self
+            .spawn_idempotency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .insert(
+                spec.idempotency_key.clone(),
+                SpawnIdempotencyEntry {
+                    spec,
+                    result,
+                    expires_at: accepted_at + Duration::from_millis(SPAWN_IDEMPOTENCY_TTL_MS),
+                },
+            );
+    }
+
+    fn resolve_spawn_spec(&self, spec: &SpawnSpec) -> Result<ResolvedSpawnSpec, NodeFailure> {
+        if spec.target.node_id != self.node_id {
+            return Err(failure(
+                NodeFailureCode::SpawnTargetMismatch,
+                "spawn target does not match this node",
+            ));
+        }
+        let defaults = self.spawn_profiles.get(&spec.profile_id).ok_or_else(|| {
+            failure(
+                NodeFailureCode::UnknownSpawnProfile,
+                "spawn profile is unavailable on this node",
+            )
+        })?;
+        let resolved = spec.resolve(defaults).map_err(|_| {
+            failure(
+                NodeFailureCode::InvalidRequest,
+                "spawn specification could not be resolved",
+            )
+        })?;
+        if resolved.target.worktree_id.is_some()
+            || resolved.bundle_id.is_some()
+            || resolved.context_id.is_some()
+            || resolved.environment_profile_id.is_some()
+        {
+            return Err(failure(
+                NodeFailureCode::UnsupportedSpawnCapability,
+                "spawn materialization capability is not available",
+            ));
+        }
+        Ok(resolved)
+    }
+
+    async fn spawn_from_spec(
+        &self,
+        spec: SpawnSpec,
+    ) -> Result<ResolvedSpawnReceipt, NodeFailure> {
+        let accepted_at = Instant::now();
+        if let Some(replayed) = self.replay_spawn_spec(&spec, accepted_at)? {
+            return replayed;
+        }
+        let resolved = self.resolve_spawn_spec(&spec)?;
+        let required_capabilities = spawn_runtime_capabilities(&resolved.required_capabilities)?;
+        let deadline = accepted_at + Duration::from_millis(resolved.deadline_ms.get());
+        let result = self
+            .spawn_session_with_deadline(
+                resolved.target.workspace_id.clone(),
+                resolved.provider.clone(),
+                resolved.mode,
+                resolved.terminal_size,
+                resolved.prompt.as_ref().map(|prompt| prompt.as_str().to_owned()),
+                Some(deadline),
+                &required_capabilities,
+            )
+            .await
+            .map(|session| resolved.receipt(self.incarnation_id, session));
+        self.remember_spawn_spec(spec, result.clone(), accepted_at);
+        result
     }
 
     fn set_persistence_error(&self, error: Option<String>) {
@@ -3285,14 +3434,62 @@ impl NodeShared {
         terminal_size: gate4agent_types::TerminalSize,
         initial_prompt: Option<String>,
     ) -> Result<SessionAddress, NodeFailure> {
+        self
+            .spawn_session_with_deadline(
+                workspace_id,
+                provider,
+                mode,
+                terminal_size,
+                initial_prompt,
+                None,
+                &[],
+            )
+            .await
+    }
+
+    async fn spawn_session_with_deadline(
+        &self,
+        workspace_id: WorkspaceId,
+        provider: AgentId,
+        mode: SessionMode,
+        terminal_size: gate4agent_types::TerminalSize,
+        initial_prompt: Option<String>,
+        deadline: Option<Instant>,
+        required_capabilities: &[ProviderRuntimeCapability],
+    ) -> Result<SessionAddress, NodeFailure> {
         let runtime_requirement = match (mode, initial_prompt.is_some()) {
             (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
             (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPrompt,
             (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
         };
-        let runtime_policy = self
-            .admit_provider_runtime(&provider, runtime_requirement)
-            .await?;
+        let runtime_policy = if let Some(deadline) = deadline {
+            let remaining = spawn_deadline_remaining(deadline)?;
+            timeout(
+                remaining,
+                self.admit_provider_runtime(&provider, runtime_requirement),
+            )
+            .await
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::SpawnDeadlineExceeded,
+                    "provider admission exceeded the spawn deadline",
+                )
+            })??
+        } else {
+            self.admit_provider_runtime(&provider, runtime_requirement).await?
+        };
+        if required_capabilities
+            .iter()
+            .any(|capability| !runtime_policy.admits(*capability))
+        {
+            return Err(failure(
+                NodeFailureCode::UnsupportedSpawnCapability,
+                "provider runtime does not admit a required spawn capability",
+            ));
+        }
+        if let Some(deadline) = deadline {
+            spawn_deadline_remaining(deadline)?;
+        }
         self.ensure_binding_capacity()?;
         let working_directory = self.workspace_root(&workspace_id)?;
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
@@ -3315,7 +3512,7 @@ impl NodeShared {
             SessionMode::Inline => TransportKind::Pipe,
         };
         let agent_id = provider;
-        let dispatch_timeout = Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
+        let dispatch_timeout = spawn_dispatch_timeout(deadline)?;
         if let Err(error) = self.dispatch_bounded(
             ControlCommand::Register {
                 instance_id,
@@ -3329,8 +3526,36 @@ impl NodeShared {
             if let Some(record_id) = record_id.as_ref() {
                 self.discard_record(record_id)?;
             }
-            return Err(error);
+            return Err(spawn_dispatch_error(error, deadline));
         }
+        let start_timeout = match spawn_dispatch_timeout(deadline) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                let recovery = self
+                    .rollback_spawn(
+                        &address,
+                        Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
+                    )
+                    .await;
+                return match recovery {
+                    Ok(()) => {
+                        if let Some(record_id) = record_id.as_ref() {
+                            self.discard_record(record_id)?;
+                        }
+                        Err(error)
+                    }
+                    Err(recovery_error) => {
+                        if let Some(record_id) = record_id.as_ref() {
+                            self.mark_record_error(
+                                record_id,
+                                "spawn deadline elapsed and registration recovery failed",
+                            )?;
+                        }
+                        Err(recovery_error)
+                    }
+                };
+            }
+        };
         let start_result = self
             .dispatch_bounded(
                 ControlCommand::Start {
@@ -3343,11 +3568,17 @@ impl NodeShared {
                         session_options: None,
                     },
                 },
-                dispatch_timeout,
+                start_timeout,
             )
             .await;
         if let Err(start_error) = start_result {
-            let recovery = self.rollback_spawn(&address, dispatch_timeout).await;
+            let start_error = spawn_dispatch_error(start_error, deadline);
+            let recovery = self
+                .rollback_spawn(
+                    &address,
+                    Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
+                )
+                .await;
             return match recovery {
                 Ok(()) => {
                     if let Some(record_id) = record_id.as_ref() {
@@ -3368,7 +3599,7 @@ impl NodeShared {
             };
         }
 
-        let deadline = Instant::now() + dispatch_timeout;
+        let commit_deadline = deadline.unwrap_or_else(|| Instant::now() + dispatch_timeout);
         loop {
             if let Some(current) = self
                 .handle
@@ -3384,8 +3615,11 @@ impl NodeShared {
                     return Ok(address);
                 }
             }
-            if Instant::now() >= deadline {
-                self.rollback_spawn(&address, dispatch_timeout).await.map_err(|error| {
+            if Instant::now() >= commit_deadline {
+                self.rollback_spawn(
+                    &address,
+                    Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
+                ).await.map_err(|error| {
                         failure(
                             error.code,
                             &format!(
@@ -3398,7 +3632,11 @@ impl NodeShared {
                     self.discard_record(record_id)?;
                 }
                 return Err(failure(
-                    NodeFailureCode::BackendBusy,
+                    if deadline.is_some() {
+                        NodeFailureCode::SpawnDeadlineExceeded
+                    } else {
+                        NodeFailureCode::BackendBusy
+                    },
                     "start did not commit before the bounded deadline; registration was removed",
                 ));
             }
@@ -3951,6 +4189,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_PROVIDER_ID_OPEN_CAPABILITY,
         NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
         NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+        NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
@@ -3991,6 +4230,11 @@ fn project_negotiated_provider_ids(compatibility: &mut NegotiatedNodeCompatibili
 }
 
 fn request_requires_open_provider_ids(shared: &NodeShared, request: &NodeRequest) -> bool {
+    if let NodeRequest::SpawnSpec { spec } = request {
+        return shared
+            .resolve_spawn_spec(spec)
+            .is_ok_and(|resolved| !provider_id_is_legacy(&resolved.provider));
+    }
     request_requires_open_provider_ids_with(
         request,
         |session| shared.validate_address(session).ok(),
@@ -4005,6 +4249,7 @@ fn request_requires_open_provider_ids_with(
 ) -> bool {
     match request {
         NodeRequest::Spawn { provider, .. } => !provider_id_is_legacy(provider),
+        NodeRequest::SpawnSpec { .. } => false,
         NodeRequest::Resume { session, .. }
         | NodeRequest::Prompt { session, .. }
         | NodeRequest::Paste { session, .. }
@@ -4061,6 +4306,9 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
         | Ok(NodeResponse::SessionRecordResumed { record, .. }) => {
             !provider_id_is_legacy(&record.provider)
         }
+        Ok(NodeResponse::SpawnSpecAccepted { receipt }) => {
+            !provider_id_is_legacy(&receipt.provider)
+        }
         _ => false,
     };
     if contains_open_record {
@@ -4094,6 +4342,7 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
         | NodeResponse::WorkspaceFileRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -4148,6 +4397,7 @@ fn clear_response_provider_runtime_status(reply: &mut ResponseEnvelope) {
         | NodeResponse::WorkspaceFileRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
+        | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -4654,6 +4904,11 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
                 .await?;
             Ok(NodeResponse::SpawnAccepted { session })
         }
+        NodeRequest::SpawnSpec { spec } => {
+            shared.require_controller(connection_id, role)?;
+            let receipt = shared.spawn_from_spec(spec).await?;
+            Ok(NodeResponse::SpawnSpecAccepted { receipt })
+        }
         NodeRequest::Resume { session, terminal_size, initial_prompt } => {
             let provider = controlled_session(shared, connection_id, role, &session)?;
             if let Some(prompt) = initial_prompt.as_deref() {
@@ -4953,6 +5208,58 @@ fn failure(code: NodeFailureCode, _message: &str) -> NodeFailure {
     }
 }
 
+fn spawn_deadline_remaining(deadline: Instant) -> Result<Duration, NodeFailure> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(failure(
+            NodeFailureCode::SpawnDeadlineExceeded,
+            "spawn deadline elapsed",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn spawn_dispatch_timeout(deadline: Option<Instant>) -> Result<Duration, NodeFailure> {
+    let bounded = Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
+    match deadline {
+        Some(deadline) => Ok(spawn_deadline_remaining(deadline)?.min(bounded)),
+        None => Ok(bounded),
+    }
+}
+
+fn spawn_dispatch_error(error: NodeFailure, deadline: Option<Instant>) -> NodeFailure {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        failure(
+            NodeFailureCode::SpawnDeadlineExceeded,
+            "spawn dispatch exceeded the spawn deadline",
+        )
+    } else {
+        error
+    }
+}
+
+fn spawn_runtime_capabilities(
+    capabilities: &SpawnRequiredCapabilities,
+) -> Result<Vec<ProviderRuntimeCapability>, NodeFailure> {
+    capabilities
+        .iter()
+        .map(|capability| match capability.as_str() {
+            SPAWN_RUNTIME_RAW_PTY_LIFECYCLE => Ok(ProviderRuntimeCapability::RawPtyLifecycle),
+            SPAWN_RUNTIME_SEMANTIC_READINESS => Ok(ProviderRuntimeCapability::SemanticReadiness),
+            SPAWN_RUNTIME_STRUCTURED_PROMPT => Ok(ProviderRuntimeCapability::StructuredPrompt),
+            SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY => {
+                Ok(ProviderRuntimeCapability::ProviderSessionIdentity)
+            }
+            SPAWN_RUNTIME_SEMANTIC_RESUME => Ok(ProviderRuntimeCapability::SemanticResume),
+            _ => Err(failure(
+                NodeFailureCode::UnsupportedSpawnCapability,
+                "spawn required capability is unknown",
+            )),
+        })
+        .collect()
+}
+
 fn persistence_failure(_error: io::Error) -> NodeFailure {
     NodeFailure {
         code: NodeFailureCode::BackendOperationFailed,
@@ -4975,6 +5282,12 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::RepositoryPathUnsafe => "repository-path-unsafe",
         NodeFailureCode::RepositoryFileReadTimedOut => "repository-file-read-timed-out",
         NodeFailureCode::RepositoryFileReadFailed => "repository-file-read-failed",
+        NodeFailureCode::UnknownSpawnProfile => "unknown-spawn-profile",
+        NodeFailureCode::SpawnTargetMismatch => "spawn-target-mismatch",
+        NodeFailureCode::SpawnIdempotencyConflict => "spawn-idempotency-conflict",
+        NodeFailureCode::SpawnIdempotencyCapacity => "spawn-idempotency-capacity",
+        NodeFailureCode::SpawnDeadlineExceeded => "spawn-deadline-exceeded",
+        NodeFailureCode::UnsupportedSpawnCapability => "unsupported-spawn-capability",
         NodeFailureCode::InvalidWorkspaceRoot => "invalid-workspace-root",
         NodeFailureCode::DuplicateWorkspaceId => "duplicate-workspace-id",
         NodeFailureCode::DuplicateWorkspaceRoot => "duplicate-workspace-root",
@@ -5132,6 +5445,91 @@ mod tests {
                 generation: SessionGeneration(generation),
             },
         }
+    }
+
+    fn spawn_spec_fixture() -> SpawnSpec {
+        SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id: NodeId::new("node-terminal-test").unwrap(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: crate::protocol::SpawnProfileId::new("default").unwrap(),
+            overrides: crate::protocol::SpawnOverrides::default(),
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("spawn-spec-fixture").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_spec_validation_fails_before_session_mutation() {
+        let shared = terminal_test_shared();
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+        }));
+
+        let mut target_mismatch = spawn_spec_fixture();
+        target_mismatch.target.node_id = NodeId::new("other-node").unwrap();
+        let failure = shared.spawn_from_spec(target_mismatch).await.unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::SpawnTargetMismatch);
+
+        let mut unknown_profile = spawn_spec_fixture();
+        unknown_profile.idempotency_key = SpawnIdempotencyKey::new("unknown-profile").unwrap();
+        unknown_profile.profile_id = crate::protocol::SpawnProfileId::new("missing").unwrap();
+        let failure = shared.spawn_from_spec(unknown_profile).await.unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::UnknownSpawnProfile);
+
+        let mut unsupported_materializer = spawn_spec_fixture();
+        unsupported_materializer.idempotency_key =
+            SpawnIdempotencyKey::new("unsupported-materializer").unwrap();
+        unsupported_materializer.overrides.bundle_id = crate::protocol::SpawnOverride::Set {
+            value: crate::protocol::SpawnBundleId::new("bundle-v1").unwrap(),
+        };
+        let failure = shared
+            .spawn_from_spec(unsupported_materializer)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::UnsupportedSpawnCapability);
+
+        let failure = shared
+            .spawn_session_with_deadline(
+                WorkspaceId::new("primary").unwrap(),
+                agent("claude"),
+                SessionMode::Pty,
+                gate4agent_types::TerminalSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                None,
+                Some(Instant::now()),
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::SpawnDeadlineExceeded);
+        assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
+        assert!(shared.handle.snapshot().sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_spec_idempotency_replays_receipt_and_conflicts_before_session_mutation() {
+        let shared = terminal_test_shared();
+        let spec = spawn_spec_fixture();
+        let receipt = shared
+            .resolve_spawn_spec(&spec)
+            .unwrap()
+            .receipt(shared.incarnation_id, terminal_address(1));
+        shared.remember_spawn_spec(spec.clone(), Ok(receipt.clone()), Instant::now());
+
+        assert_eq!(shared.spawn_from_spec(spec.clone()).await.unwrap(), receipt);
+
+        let mut conflicting = spec;
+        conflicting.deadline_ms = crate::protocol::SpawnDeadlineMs::new(31_000).unwrap();
+        let failure = shared.spawn_from_spec(conflicting).await.unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::SpawnIdempotencyConflict);
+        assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
+        assert!(shared.handle.snapshot().sessions.is_empty());
     }
 
     fn terminal_frame(sequence: u64) -> TerminalFrame {
@@ -6562,6 +6960,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            SpawnProfileRegistry::default(),
             Some(state_path.clone()),
             Vec::new(),
             None,
@@ -6712,6 +7111,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            SpawnProfileRegistry::default(),
             None,
             loaded.records,
             loaded.warning,

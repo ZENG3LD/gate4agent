@@ -1,6 +1,7 @@
 use crate::protocol::{
     C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
-    NodeIncarnationId, NodeRequest, RoutedNodeEvent, RoutedNodeResponse,
+    NodeIncarnationId, NodeRequest, ResolvedSpawnReceipt, RoutedNodeEvent, RoutedNodeResponse,
+    SpawnOverride, SpawnSpec,
     NodeTransportState, ObservedNode, ProviderAdapterContractSupport, ProviderContractSupport,
     ReadyResponse, SanitizedError, SlimNodeInventory, StatusResponse,
     C2_API_VERSION, C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
@@ -756,6 +757,8 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
         NodeRequest::Spawn { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::Stop { .. } => Duration::from_secs(15),
+        NodeRequest::SpawnSpec { spec } =>
+            Duration::from_millis(spec.deadline_ms.get()) + NODE_REQUEST_IO_HEADROOM,
         NodeRequest::ResumeSessionRecord { .. } =>
             MANAGED_RESUME_SETTLE_DEADLINE + NODE_REQUEST_IO_HEADROOM,
         _ => Duration::from_secs(10),
@@ -817,6 +820,10 @@ async fn handle_relay_command(
     match command {
         RelayCommand::Request { operator_connection_id, expected_incarnation_id, request, reply } => {
             let relay_deadline = relay_request_deadline(&request, Instant::now());
+            let expected_spawn_spec = match &request {
+                NodeRequest::SpawnSpec { spec } => Some(spec.clone()),
+                _ => None,
+            };
             if !hub.is_active(operator_connection_id) {
                 let _ = reply.send(Err(relay_failure(C2RelayFailureCode::ClientLagged, "C2 operator connection is no longer active", Some(incarnation_id))));
                 return Ok(());
@@ -866,6 +873,18 @@ async fn handle_relay_command(
                     return Err(error);
                 }
             };
+            if let Err(message) = validate_spawn_spec_response(
+                expected_spawn_spec.as_ref(),
+                &response,
+                incarnation_id,
+            ) {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::NodeOffline,
+                    "node relay returned an invalid spawn receipt",
+                    Some(incarnation_id),
+                )));
+                return Err(NodeClientError::Protocol(message.to_owned()));
+            }
             drain_pending_events(client, node_id, cursor, hub, ingress, false, relay_deadline).await?;
             update_inventory_from_response(node_id, cursor, &response, ingress).await
                 .map_err(NodeClientError::Io)?;
@@ -876,6 +895,87 @@ async fn handle_relay_command(
         }
     }
     Ok(())
+}
+
+fn validate_spawn_spec_response(
+    expected: Option<&SpawnSpec>,
+    response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
+    relay_incarnation_id: NodeIncarnationId,
+) -> Result<(), &'static str> {
+    let receipt = match (expected, response) {
+        (Some(spec), Ok(NodeResponse::SpawnSpecAccepted { receipt })) => (spec, receipt),
+        (Some(_), Ok(_)) => return Err("spawn spec request returned a different response"),
+        (Some(_), Err(_)) => return Ok(()),
+        (None, Ok(NodeResponse::SpawnSpecAccepted { .. })) => {
+            return Err("unexpected spawn receipt for a different node request");
+        }
+        (None, _) => return Ok(()),
+    };
+    validate_spawn_receipt(receipt.0, receipt.1, relay_incarnation_id)
+}
+
+fn validate_spawn_receipt(
+    spec: &SpawnSpec,
+    receipt: &ResolvedSpawnReceipt,
+    relay_incarnation_id: NodeIncarnationId,
+) -> Result<(), &'static str> {
+    if receipt.incarnation_id != relay_incarnation_id
+        || receipt.target != spec.target
+        || receipt.profile_id != spec.profile_id
+        || receipt.idempotency_key != spec.idempotency_key
+        || receipt.deadline_ms != spec.deadline_ms
+        || receipt.required_capabilities != spec.required_capabilities
+        || &receipt.session.workspace_id
+            != spec
+                .target
+                .worktree_id
+                .as_ref()
+                .unwrap_or(&spec.target.workspace_id)
+    {
+        return Err("spawn receipt does not match routed request");
+    }
+    if !required_override_matches(&spec.overrides.provider, &receipt.provider)
+        || !required_override_matches(&spec.overrides.mode, &receipt.mode)
+        || !required_override_matches(&spec.overrides.terminal_size, &receipt.terminal_size)
+        || !optional_override_matches(&spec.overrides.bundle_id, &receipt.bundle_id)
+        || !optional_override_matches(&spec.overrides.context_id, &receipt.context_id)
+        || !optional_override_matches(
+            &spec.overrides.environment_profile_id,
+            &receipt.environment_profile_id,
+        )
+    {
+        return Err("spawn receipt contradicts explicit overrides");
+    }
+    match &spec.overrides.prompt {
+        SpawnOverride::Inherit => {}
+        SpawnOverride::Set { value }
+            if receipt.prompt.present
+                && receipt.prompt.byte_len == u32::try_from(value.byte_len()).unwrap_or(0) => {}
+        SpawnOverride::Clear if !receipt.prompt.present && receipt.prompt.byte_len == 0 => {}
+        SpawnOverride::Set { .. } | SpawnOverride::Clear => {
+            return Err("spawn receipt contradicts explicit prompt override");
+        }
+    }
+    Ok(())
+}
+
+fn required_override_matches<T: Eq>(override_value: &SpawnOverride<T>, actual: &T) -> bool {
+    match override_value {
+        SpawnOverride::Inherit => true,
+        SpawnOverride::Set { value } => value == actual,
+        SpawnOverride::Clear => false,
+    }
+}
+
+fn optional_override_matches<T: Eq>(
+    override_value: &SpawnOverride<T>,
+    actual: &Option<T>,
+) -> bool {
+    match override_value {
+        SpawnOverride::Inherit => true,
+        SpawnOverride::Set { value } => actual.as_ref() == Some(value),
+        SpawnOverride::Clear => actual.is_none(),
+    }
 }
 
 fn relay_node_failure(error: &NodeClientError) -> Option<C2NodeFailure> {
@@ -1489,12 +1589,122 @@ mod endpoint_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use gate4agent_node_protocol::SessionRecordId;
-    use gate4agent_types::TerminalSize;
+    use gate4agent_node_protocol::{
+        AgentId, CapabilityId, SessionAddress, SessionKey, SessionMode, SessionRecordId,
+        SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
+        SpawnProfileId, SpawnProfileRevision, SpawnPrompt, SpawnPromptMetadata,
+        SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnTarget, WorkspaceId,
+    };
+    use gate4agent_types::{AgentInstanceId, SessionGeneration, TerminalSize};
     use std::collections::BTreeMap;
 
     fn agent(value: &str) -> gate4agent_node_protocol::AgentId {
         gate4agent_node_protocol::AgentId::new(value).unwrap()
+    }
+
+    #[test]
+    fn spawn_spec_receipt_correlation_rejects_mismatches_before_forwarding() {
+        let incarnation_id = NodeIncarnationId::from_bytes([7; 16]);
+        let terminal_size = TerminalSize { rows: 24, columns: 80 };
+        let prompt = SpawnPrompt::new("hi").unwrap();
+        let required_capabilities = SpawnRequiredCapabilities::new([
+            CapabilityId::new("raw-pty-lifecycle").unwrap(),
+        ]).unwrap();
+        let spec = SpawnSpec {
+            target: SpawnTarget {
+                node_id: NodeId::new("node-a").unwrap(),
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            overrides: SpawnOverrides {
+                provider: SpawnOverride::Set { value: AgentId::new("codex").unwrap() },
+                mode: SpawnOverride::Set { value: SessionMode::Pty },
+                terminal_size: SpawnOverride::Set { value: terminal_size },
+                prompt: SpawnOverride::Set { value: prompt.clone() },
+                bundle_id: SpawnOverride::Clear,
+                context_id: SpawnOverride::Clear,
+                environment_profile_id: SpawnOverride::Clear,
+            },
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
+            required_capabilities: required_capabilities.clone(),
+        };
+        let receipt = ResolvedSpawnReceipt {
+            incarnation_id,
+            session: SessionAddress {
+                workspace_id: spec.target.workspace_id.clone(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(1),
+                },
+            },
+            target: spec.target.clone(),
+            profile_id: spec.profile_id.clone(),
+            profile_revision: SpawnProfileRevision::new("r1").unwrap(),
+            provider: AgentId::new("codex").unwrap(),
+            mode: SessionMode::Pty,
+            terminal_size,
+            prompt: SpawnPromptMetadata::from_prompt(Some(&prompt)),
+            bundle_id: None,
+            context_id: None,
+            environment_profile_id: None,
+            deadline_ms: spec.deadline_ms,
+            idempotency_key: spec.idempotency_key.clone(),
+            required_capabilities,
+            provenance: SpawnResolutionProvenance {
+                provider: SpawnFieldProvenance::Override,
+                mode: SpawnFieldProvenance::Override,
+                terminal_size: SpawnFieldProvenance::Override,
+                prompt: SpawnFieldProvenance::Override,
+                bundle_id: SpawnFieldProvenance::Cleared,
+                context_id: SpawnFieldProvenance::Cleared,
+                environment_profile_id: SpawnFieldProvenance::Cleared,
+            },
+        };
+        let response = |receipt| Ok(NodeResponse::SpawnSpecAccepted { receipt });
+        assert!(validate_spawn_spec_response(
+            Some(&spec),
+            &response(receipt.clone()),
+            incarnation_id,
+        ).is_ok());
+
+        let mut mismatches = Vec::new();
+        let mut changed = receipt.clone();
+        changed.incarnation_id = NodeIncarnationId::from_bytes([8; 16]);
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.target.node_id = NodeId::new("node-b").unwrap();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.profile_id = SpawnProfileId::new("other").unwrap();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.idempotency_key = SpawnIdempotencyKey::new("spawn-2").unwrap();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.deadline_ms = SpawnDeadlineMs::new(4_999).unwrap();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.required_capabilities = SpawnRequiredCapabilities::default();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.session.workspace_id = WorkspaceId::new("other").unwrap();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.provider = AgentId::new("claude").unwrap();
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.prompt = SpawnPromptMetadata { present: false, byte_len: 0 };
+        mismatches.push(changed);
+
+        for mismatch in mismatches {
+            assert!(validate_spawn_spec_response(
+                Some(&spec),
+                &response(mismatch),
+                incarnation_id,
+            ).is_err());
+        }
     }
 
     #[test]

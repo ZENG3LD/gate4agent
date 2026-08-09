@@ -8,10 +8,14 @@ use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
-    ControlEventKind, InputAction, PreparedInputKind, PromptFraming, PromptPayload, SessionStatus,
-    StartRequest, TerminalControl, TerminalSize, TerminalText, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    ControlEventKind, InputAction, PreparedInputKind, PromptFraming, PromptPayload,
+    ProviderRuntimePolicy, SessionStatus, StartRequest, TerminalControl, TerminalSize,
+    TerminalText, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
+
+fn semantic_runtime_policy() -> ProviderRuntimePolicy {
+    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+}
 
 const LIVE_CANARY_ENV: &str = "GATE4AGENT_VENDOR_PTY_CANARY";
 const LIVE_LAUNCHER_ENV: &str = "GATE4AGENT_VENDOR_CANARY_LAUNCHER";
@@ -832,6 +836,7 @@ async fn run_pty_canary(agent_id: &str, instance_id: u64) {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: working_directory.to_string_lossy().into_owned(),
                     terminal_size: initial_size,
@@ -921,6 +926,7 @@ async fn run_codex_whole_chunk_transport_canary(instance_id: u64) {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: working_directory.to_string_lossy().into_owned(),
                     terminal_size: TerminalSize {
@@ -1054,6 +1060,7 @@ async fn run_expected_startup_block_canary(
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: working_directory.to_string_lossy().into_owned(),
                     terminal_size: TerminalSize {
@@ -1192,6 +1199,7 @@ async fn windows_live_parallel_codex_kimi_pty_process_isolation() {
                 command_id,
                 ControlCommand::Start {
                     instance_id,
+                    runtime_policy: semantic_runtime_policy(),
                     request: StartRequest {
                         working_directory: working_directory.to_string_lossy().into_owned(),
                         terminal_size: TerminalSize {

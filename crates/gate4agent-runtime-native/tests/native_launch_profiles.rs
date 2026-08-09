@@ -16,7 +16,8 @@ use gate4agent_testkit::{
 };
 use gate4agent_types::{
     AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId, ControlCommand,
-    SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ProviderRuntimePolicy, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 const PROFILE_SENTINEL: &str = "GATE4AGENT_TEST_PROFILE_SENTINEL";
@@ -221,6 +222,7 @@ fn register_and_start_agent(
             command_id + 1,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -725,6 +727,7 @@ async fn selected_native_launch_profile_overlays_only_future_exact_pty_spawns() 
             8,
             ControlCommand::Start {
                 instance_id: mismatched_instance,
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

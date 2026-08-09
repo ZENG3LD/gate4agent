@@ -9,9 +9,13 @@ use gate4agent_shell_native::NativeEffectShell;
 use gate4agent_testkit::interactive_agent_spec;
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
-    ControlObservation, ProviderEvent, ProviderSessionKey, StartRequest, TerminalSize,
-    TransportKind, CONTROL_PROTOCOL_VERSION,
+    ControlObservation, ProviderEvent, ProviderRuntimePolicy, ProviderSessionKey, StartRequest,
+    TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
+
+fn semantic_runtime_policy() -> ProviderRuntimePolicy {
+    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+}
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
@@ -67,6 +71,7 @@ async fn kimi_pty_probes_status_and_emits_only_the_authoritative_session_identit
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

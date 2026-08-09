@@ -13,10 +13,14 @@ use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEvent, ControlEventKind, ForegroundAuthority, ForegroundProcessKind, InputAction,
     PreparedInputKind, PromptFraming, PromptPayload, ProviderActivity, ProviderEvent,
-    ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus, ProviderSource,
-    SessionStatus, ShellCommand, StartRequest, TerminalControl, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
+    ProviderRuntimePolicy, ProviderSource, SessionStatus, ShellCommand, StartRequest,
+    TerminalControl, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
+
+fn semantic_runtime_policy() -> ProviderRuntimePolicy {
+    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+}
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
@@ -80,6 +84,7 @@ async fn pipe_one_shot_reaches_public_snapshot_with_semantic_events() {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -148,6 +153,7 @@ async fn acp_multi_turn_prompt_streams_and_stops_through_public_handle() {
             11,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -254,6 +260,7 @@ async fn pty_classification_uses_the_same_provider_event_contract() {
             21,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -354,6 +361,7 @@ async fn public_handle_shell_command_requires_and_uses_live_shell_route() {
             41,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -457,6 +465,7 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
             31,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -669,6 +678,7 @@ async fn loopback_hook_listener_injects_a_route_and_reaches_the_public_snapshot(
             61,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -741,6 +751,7 @@ async fn hook_listener_rejects_a_late_start_after_spawn_dispatch() {
             71,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

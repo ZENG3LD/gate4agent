@@ -5,8 +5,9 @@ use gate4agent_runtime_native::{
 };
 use gate4agent_types::{
     AdapterId, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
-    ControlEventKind, HistoryQuery, LaunchSpec, ProcessMatcher, ResumeLaunchRequest, ResumeTarget,
-    SessionStatus, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ControlEventKind, HistoryQuery, LaunchSpec, ProcessMatcher, ProviderRuntimePolicy,
+    ResumeLaunchRequest, ResumeTarget, SessionStatus, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -342,6 +343,8 @@ async fn loaded_history_resume_is_authorized_then_spawned_with_exact_provider_ar
             ControlCommand::Resume {
                 instance_id,
                 target: ResumeTarget::HistoryCandidate { candidate_id },
+                runtime_policy: ProviderRuntimePolicy::new(true, false, false, true, true)
+                    .unwrap(),
                 request: ResumeLaunchRequest {
                     working_directory,
                     terminal_size: TerminalSize {

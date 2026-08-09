@@ -6,11 +6,15 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_testkit::{interactive_agent_spec, CONTROL_FIXTURE_ID};
 use gate4agent_types::{
     AgentCommand, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
-    ControlEvent, InitialPromptMode, InputAction, SessionStatus, StartRequest, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    ControlEvent, InitialPromptMode, InputAction, ProviderRuntimePolicy, SessionStatus,
+    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn semantic_runtime_policy() -> ProviderRuntimePolicy {
+    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+}
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
@@ -64,6 +68,7 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -246,6 +251,7 @@ async fn after_ready_initial_prompt_is_delivered_before_native_session_runs() {
             21,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -359,6 +365,7 @@ async fn two_agent_instances_progress_on_independent_effect_workers() {
                 101 + (index as u64 * 2),
                 ControlCommand::Start {
                     instance_id,
+                    runtime_policy: ProviderRuntimePolicy::raw_pty(),
                     request: StartRequest {
                         working_directory: std::env::current_dir()
                             .expect("current directory")

@@ -30,6 +30,7 @@ pub use control::{
     ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
     ProviderInteractionOutcome, ProviderInteractionResponse, ProviderInteractionResponseError,
     ProviderInteractionResponseKind, ProviderInteractionStatus, ProviderInteractionTarget,
+    ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderRuntimePolicyError,
     ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
     ProviderSourceCursor, ProviderSubagent, SessionGeneration, SessionSnapshot, SessionStatus,
     StartRequest, TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize, TokenUsage,

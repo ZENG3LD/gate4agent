@@ -2,7 +2,8 @@ use gate4agent_handle::bounded_port;
 use gate4agent_kernel::Gate4AgentKernel;
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
-    SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ProviderRuntimePolicy, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 #[test]
@@ -27,6 +28,7 @@ fn handle_drives_kernel_and_publishes_one_authoritative_snapshot() {
             id: CommandId(2),
             command: ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
                 request: StartRequest {
                     working_directory: ".".to_owned(),
                     terminal_size: TerminalSize {

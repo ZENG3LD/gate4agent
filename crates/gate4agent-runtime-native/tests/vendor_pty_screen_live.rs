@@ -20,8 +20,8 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 #[cfg(unix)]
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
-    ControlEventKind, InputAction, PreparedInputKind, SessionStatus, StartRequest,
-    TerminalControl, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ControlEventKind, InputAction, PreparedInputKind, ProviderRuntimePolicy, SessionStatus,
+    StartRequest, TerminalControl, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]
@@ -576,6 +576,7 @@ async fn run_live_vendor_screen(agent_id: &str, instance_id: u64) {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory,
                     terminal_size: initial_size,

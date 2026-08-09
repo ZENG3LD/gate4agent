@@ -13,8 +13,8 @@ use gate4agent_tool_protocol::{
 };
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlObservation,
-    ObservationEnvelope, SessionGeneration, StartRequest, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
+    ObservationEnvelope, ProviderRuntimePolicy, SessionGeneration, StartRequest, TerminalSize,
+    TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 use std::sync::mpsc::TryRecvError;
 
@@ -132,6 +132,7 @@ fn start_running(
         2,
         ControlCommand::Start {
             instance_id: instance(),
+            runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
             request: StartRequest {
                 working_directory: ".".to_owned(),
                 terminal_size: TerminalSize {

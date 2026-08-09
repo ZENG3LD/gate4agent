@@ -53,8 +53,9 @@ use gate4agent_tool_engine::{
 use gate4agent_types::{
     AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect, ControlObservation,
     EffectEnvelope, HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole,
-    HistorySessionRecord, ObservationEnvelope, ResumeAuthorityTarget, ResumeLaunchRequest,
-    SessionGeneration, SessionStatus, CONTROL_PROTOCOL_VERSION,
+    HistorySessionRecord, ObservationEnvelope, ProviderRuntimeCapability, ProviderRuntimePolicy,
+    ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration, SessionStatus, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 use launch_profiles::NativeLaunchProfiles;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -686,6 +687,11 @@ impl NativeEffectDispatcher {
             return;
         }
         self.workers.retain(|_, worker| !worker.sender.is_closed());
+        if let Err(message) = validate_effect_runtime_policy(&effect.effect) {
+            self.pending_failures
+                .push_back(effect_failure(effect, message));
+            return;
+        }
         let instance_id = effect.instance_id;
         let pty_env = match self.compose_pty_spawn_environment(&effect) {
             Ok(environment) => environment,
@@ -831,13 +837,15 @@ impl NativeEffectDispatcher {
             ControlEffect::Spawn {
                 agent_id,
                 transport: gate4agent_types::TransportKind::Pty,
+                runtime_policy,
                 ..
             }
             | ControlEffect::SpawnResume {
                 agent_id,
                 transport: gate4agent_types::TransportKind::Pty,
+                runtime_policy,
                 ..
-            } => agent_id,
+            } if runtime_policy.provider_session_identity => agent_id,
             _ => return Ok(Vec::new()),
         };
         let control = self
@@ -1494,6 +1502,63 @@ fn update_active_count(counter: &AtomicUsize, before: usize, after: usize) {
     }
 }
 
+fn validate_effect_runtime_policy(effect: &ControlEffect) -> Result<(), String> {
+    let (transport, policy, has_initial_prompt, is_resume) = match effect {
+        ControlEffect::Spawn {
+            transport,
+            runtime_policy,
+            request,
+            ..
+        } => (*transport, *runtime_policy, request.initial_prompt.is_some(), false),
+        ControlEffect::SpawnResume {
+            transport,
+            runtime_policy,
+            request,
+            ..
+        } => (*transport, *runtime_policy, request.initial_prompt.is_some(), true),
+        ControlEffect::Stop { .. }
+        | ControlEffect::WriteInput { .. }
+        | ControlEffect::SubmitPrompt { .. }
+        | ControlEffect::Interrupt
+        | ControlEffect::Resize { .. }
+        | ControlEffect::ObserveForeground
+        | ControlEffect::ProbeCapabilities { .. }
+        | ControlEffect::DiscoverHistory { .. }
+        | ControlEffect::LoadHistory { .. }
+        | ControlEffect::AuthorizeResume { .. }
+        | ControlEffect::ResolveInteraction { .. } => return Ok(()),
+    };
+    policy
+        .validate()
+        .map_err(|error| format!("provider runtime policy is invalid: {error}"))?;
+    require_runtime_capability(policy, ProviderRuntimeCapability::RawPtyLifecycle)?;
+    if transport != TransportKind::Pty {
+        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+    }
+    if has_initial_prompt {
+        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+        require_runtime_capability(policy, ProviderRuntimeCapability::StructuredPrompt)?;
+    }
+    if is_resume {
+        require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
+        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
+    }
+    Ok(())
+}
+
+fn require_runtime_capability(
+    policy: ProviderRuntimePolicy,
+    capability: ProviderRuntimeCapability,
+) -> Result<(), String> {
+    if policy.admits(capability) {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider runtime capability {capability:?} is not admitted"
+        ))
+    }
+}
+
 fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelope {
     let observation = match effect.effect {
         ControlEffect::Spawn { .. } | ControlEffect::SpawnResume { .. } => {
@@ -1526,5 +1591,72 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
         instance_id: effect.instance_id,
         generation: effect.generation,
         observation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gate4agent_types::{OperationId, StartRequest, TerminalSize};
+
+    #[test]
+    fn runtime_dispatcher_rejects_raw_semantic_prompt_before_worker_dispatch() {
+        let mut dispatcher = NativeEffectDispatcher::new(
+            AgentRegistry::new([]).unwrap(),
+            NativeRuntimeConfig::default(),
+            None,
+        );
+        dispatcher.dispatch(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: OperationId(1),
+            instance_id: AgentInstanceId(1),
+            generation: SessionGeneration(1),
+            effect: ControlEffect::Spawn {
+                agent_id: AgentId::new("unknown-provider").unwrap(),
+                transport: TransportKind::Pty,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
+                request: StartRequest {
+                    working_directory: ".".to_owned(),
+                    terminal_size: TerminalSize { rows: 24, columns: 80 },
+                    initial_prompt: Some("must-not-run".to_owned()),
+                    session_options: None,
+                },
+            },
+        });
+
+        let (observations, terminal_frames) = dispatcher.drain_observations(1);
+        assert_eq!(terminal_frames, 0);
+        assert!(dispatcher.workers.is_empty());
+        assert!(matches!(
+            observations.as_slice(),
+            [ObservationEnvelope {
+                observation: ControlObservation::SpawnFailed { message },
+                ..
+            }] if message.contains("SemanticReadiness")
+        ));
+    }
+
+    #[test]
+    fn runtime_policy_requires_identity_and_resume_before_spawn_resume() {
+        let raw = ProviderRuntimePolicy::raw_pty();
+        let effect = ControlEffect::SpawnResume {
+            agent_id: AgentId::new("unknown-provider").unwrap(),
+            transport: TransportKind::Pty,
+            provider_session: gate4agent_types::ProviderSessionIdentity {
+                key: gate4agent_types::ProviderSessionKey::SessionId,
+                id: "session-1".to_owned(),
+                transcript_path: None,
+            },
+            runtime_policy: raw,
+            request: ResumeLaunchRequest {
+                working_directory: ".".to_owned(),
+                terminal_size: gate4agent_types::TerminalSize { rows: 24, columns: 80 },
+                initial_prompt: None,
+            },
+        };
+
+        assert!(validate_effect_runtime_policy(&effect)
+            .unwrap_err()
+            .contains("ProviderSessionIdentity"));
     }
 }

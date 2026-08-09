@@ -6,7 +6,7 @@ use gate4agent_catalog::AgentRegistry;
 use gate4agent_runtime_native::{
     VendorContractResolution, VendorRuntimeMode, VendorVersionProbeCache,
 };
-use gate4agent_types::AgentId;
+use gate4agent_types::{AgentId, ProviderRuntimePolicy};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,9 +17,10 @@ const VERSION_PROBE_DEADLINE: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderRuntimeRequirement {
     RawPty,
-    SemanticPty,
+    SemanticPrompt,
     Inline,
     Resume,
+    ResumeWithPrompt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,16 +31,38 @@ pub(crate) enum ProviderRuntimeAdmissionError {
 }
 
 pub(crate) struct ProviderRuntimeMonitor {
-    launch_programs: BTreeMap<AgentId, String>,
+    providers: BTreeMap<AgentId, ProviderStaticCapabilities>,
     probe_cache: Mutex<VendorVersionProbeCache>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderStaticCapabilities {
+    launch_program: String,
+    raw_pty: bool,
+    semantic_pty_adapter: bool,
+    resume_adapter: bool,
 }
 
 impl ProviderRuntimeMonitor {
     pub(crate) fn new(catalog: &AgentRegistry) -> Self {
         Self {
-            launch_programs: catalog
+            providers: catalog
                 .iter()
-                .map(|spec| (spec.id.clone(), spec.launch.program.clone()))
+                .map(|spec| {
+                    (
+                        spec.id.clone(),
+                        ProviderStaticCapabilities {
+                            launch_program: spec.launch.program.clone(),
+                            raw_pty: spec.capabilities.transports.pty,
+                            semantic_pty_adapter: spec
+                                .capabilities
+                                .transports
+                                .pty_adapter
+                                .is_some(),
+                            resume_adapter: spec.capabilities.adapters.resume.is_some(),
+                        },
+                    )
+                })
                 .collect(),
             probe_cache: Mutex::new(VendorVersionProbeCache::default()),
         }
@@ -47,10 +70,10 @@ impl ProviderRuntimeMonitor {
 
     pub(crate) fn collect(&self) -> ProviderRuntimeStatuses {
         ProviderRuntimeStatuses::new(
-            self.launch_programs
+            self.providers
                 .keys()
                 .map(|provider| {
-                    self.evaluate(provider, ProviderRuntimeRequirement::RawPty)
+                    self.evaluate(provider)
                         .0
                         .expect("startup provider probe cache is uncontended")
                 }),
@@ -61,15 +84,17 @@ impl ProviderRuntimeMonitor {
     pub(crate) fn evaluate(
         &self,
         provider: &AgentId,
-        requirement: ProviderRuntimeRequirement,
-    ) -> (Option<ProviderRuntimeStatus>, Result<(), ProviderRuntimeAdmissionError>) {
-        let Some(program) = self.launch_programs.get(provider) else {
+    ) -> (
+        Option<ProviderRuntimeStatus>,
+        Result<ProviderRuntimePolicy, ProviderRuntimeAdmissionError>,
+    ) {
+        let Some(static_capabilities) = self.providers.get(provider) else {
             return (
                 Some(ProviderRuntimeStatus::unavailable(provider.clone())),
                 Err(ProviderRuntimeAdmissionError::LauncherUnavailable),
             );
         };
-        let Some(launcher) = resolve_local_launcher(program) else {
+        let Some(launcher) = resolve_local_launcher(&static_capabilities.launch_program) else {
             return (
                 Some(ProviderRuntimeStatus::unavailable(provider.clone())),
                 Err(ProviderRuntimeAdmissionError::LauncherUnavailable),
@@ -89,12 +114,8 @@ impl ProviderRuntimeMonitor {
         );
         let resolution = probe.resolution();
         let status = status_from_resolution(provider.clone(), resolution);
-        let admission = if resolution_admits(resolution, requirement) {
-            Ok(())
-        } else {
-            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified)
-        };
-        (Some(status), admission)
+        let policy = policy_from_resolution(static_capabilities, resolution);
+        (Some(status), Ok(policy))
     }
 }
 
@@ -102,43 +123,99 @@ pub(crate) fn admit_status(
     statuses: &ProviderRuntimeStatuses,
     provider: &AgentId,
     requirement: ProviderRuntimeRequirement,
-) -> Result<(), ProviderRuntimeAdmissionError> {
+) -> Result<ProviderRuntimePolicy, ProviderRuntimeAdmissionError> {
     let Some(status) = statuses
         .iter()
         .find(|status| status.provider() == provider)
     else {
         return Err(ProviderRuntimeAdmissionError::LauncherUnavailable);
     };
-    match (status.mode(), requirement) {
-        (ProviderRuntimeMode::Unavailable, _) => {
-            Err(ProviderRuntimeAdmissionError::LauncherUnavailable)
+    let policy = match status.mode() {
+        ProviderRuntimeMode::Unavailable => {
+            return Err(ProviderRuntimeAdmissionError::LauncherUnavailable);
         }
-        (ProviderRuntimeMode::RawPassthrough, ProviderRuntimeRequirement::RawPty)
-        | (
-            ProviderRuntimeMode::VerifiedSemantic,
-            ProviderRuntimeRequirement::RawPty | ProviderRuntimeRequirement::SemanticPty,
-        ) => Ok(()),
-        (ProviderRuntimeMode::RawPassthrough, _)
-        | (ProviderRuntimeMode::VerifiedSemantic, _) => {
-            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified)
+        ProviderRuntimeMode::RawPassthrough => ProviderRuntimePolicy::raw_pty(),
+        ProviderRuntimeMode::VerifiedSemantic => ProviderRuntimePolicy::new(
+            true,
+            true,
+            true,
+            false,
+            false,
+        )
+        .expect("coarse verified semantic fallback policy is internally valid"),
+    };
+    require_policy(policy, requirement).map(|()| policy)
+}
+
+pub(crate) fn require_policy(
+    policy: ProviderRuntimePolicy,
+    requirement: ProviderRuntimeRequirement,
+) -> Result<(), ProviderRuntimeAdmissionError> {
+    let admitted = match requirement {
+        ProviderRuntimeRequirement::RawPty => policy.raw_pty_lifecycle,
+        ProviderRuntimeRequirement::SemanticPrompt => {
+            policy.semantic_readiness && policy.structured_prompt
         }
+        ProviderRuntimeRequirement::Inline => false,
+        ProviderRuntimeRequirement::Resume => {
+            policy.provider_session_identity && policy.semantic_resume
+        }
+        ProviderRuntimeRequirement::ResumeWithPrompt => {
+            policy.provider_session_identity
+                && policy.semantic_resume
+                && policy.semantic_readiness
+                && policy.structured_prompt
+        }
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified)
     }
 }
 
-fn resolution_admits(
+fn policy_from_resolution(
+    static_capabilities: &ProviderStaticCapabilities,
     resolution: &VendorContractResolution,
-    requirement: ProviderRuntimeRequirement,
-) -> bool {
+) -> ProviderRuntimePolicy {
     let capabilities = resolution.capabilities();
-    match requirement {
-        ProviderRuntimeRequirement::RawPty => resolution.admits_raw_pty_lifecycle(),
-        ProviderRuntimeRequirement::SemanticPty => {
-            capabilities.semantic_readiness.is_verified()
-                && capabilities.structured_prompt.is_verified()
-        }
-        ProviderRuntimeRequirement::Inline => false,
-        ProviderRuntimeRequirement::Resume => capabilities.semantic_resume.is_verified(),
-    }
+    policy_from_capability_flags(
+        static_capabilities,
+        resolution.admits_raw_pty_lifecycle(),
+        capabilities.semantic_readiness.is_verified(),
+        capabilities.structured_prompt.is_verified(),
+        capabilities.provider_session_identity.is_verified(),
+        capabilities.semantic_resume.is_verified(),
+    )
+}
+
+fn policy_from_capability_flags(
+    static_capabilities: &ProviderStaticCapabilities,
+    live_raw_pty_lifecycle: bool,
+    live_semantic_readiness: bool,
+    live_structured_prompt: bool,
+    live_provider_session_identity: bool,
+    live_semantic_resume: bool,
+) -> ProviderRuntimePolicy {
+    let raw_pty_lifecycle = static_capabilities.raw_pty && live_raw_pty_lifecycle;
+    let semantic_readiness = raw_pty_lifecycle
+        && static_capabilities.semantic_pty_adapter
+        && live_semantic_readiness;
+    let structured_prompt = semantic_readiness && live_structured_prompt;
+    let provider_session_identity = raw_pty_lifecycle
+        && static_capabilities.semantic_pty_adapter
+        && live_provider_session_identity;
+    let semantic_resume = provider_session_identity
+        && static_capabilities.resume_adapter
+        && live_semantic_resume;
+    ProviderRuntimePolicy::new(
+        raw_pty_lifecycle,
+        semantic_readiness,
+        structured_prompt,
+        provider_session_identity,
+        semantic_resume,
+    )
+    .expect("static and live provider capability intersection is internally valid")
 }
 
 fn status_from_resolution(
@@ -260,8 +337,9 @@ mod tests {
 
         for provider in [&unknown, &future, &verified] {
             assert_eq!(
-                admit_status(&statuses, provider, ProviderRuntimeRequirement::RawPty),
-                Ok(()),
+                admit_status(&statuses, provider, ProviderRuntimeRequirement::RawPty)
+                    .map(|policy| policy.raw_pty_lifecycle),
+                Ok(true),
             );
         }
         for provider in [&unknown, &future] {
@@ -269,7 +347,7 @@ mod tests {
                 admit_status(
                     &statuses,
                     provider,
-                    ProviderRuntimeRequirement::SemanticPty,
+                    ProviderRuntimeRequirement::SemanticPrompt,
                 ),
                 Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
             );
@@ -278,9 +356,9 @@ mod tests {
             admit_status(
                 &statuses,
                 &verified,
-                ProviderRuntimeRequirement::SemanticPty,
+                ProviderRuntimeRequirement::SemanticPrompt,
             ),
-            Ok(()),
+            Ok(ProviderRuntimePolicy::new(true, true, true, false, false).unwrap()),
         );
         assert_eq!(
             admit_status(&statuses, &unavailable, ProviderRuntimeRequirement::RawPty),
@@ -310,15 +388,13 @@ mod tests {
         let monitor = ProviderRuntimeMonitor::new(&catalog);
         let provider = AgentId::new("grok").unwrap();
 
-        let (available, admitted) =
-            monitor.evaluate(&provider, ProviderRuntimeRequirement::RawPty);
+        let (available, admitted) = monitor.evaluate(&provider);
         let available = available.unwrap();
         assert_eq!(available.mode(), ProviderRuntimeMode::RawPassthrough);
-        assert_eq!(admitted, Ok(()));
+        assert!(admitted.unwrap().raw_pty_lifecycle);
 
         std::fs::remove_file(&launcher).unwrap();
-        let (missing, rejected) =
-            monitor.evaluate(&provider, ProviderRuntimeRequirement::RawPty);
+        let (missing, rejected) = monitor.evaluate(&provider);
         let missing = missing.unwrap();
         assert_eq!(missing.mode(), ProviderRuntimeMode::Unavailable);
         assert_eq!(
@@ -341,14 +417,77 @@ mod tests {
         let monitor = ProviderRuntimeMonitor::new(&catalog);
         let cache_guard = monitor.probe_cache.lock().unwrap();
 
-        let (status, admission) = monitor.evaluate(
-            &AgentId::new("grok").unwrap(),
-            ProviderRuntimeRequirement::RawPty,
-        );
+        let (status, admission) = monitor.evaluate(&AgentId::new("grok").unwrap());
         assert!(status.is_none());
         assert_eq!(admission, Err(ProviderRuntimeAdmissionError::ProbeBusy));
 
         drop(cache_guard);
         std::fs::remove_file(launcher).unwrap();
+    }
+
+    #[test]
+    fn composite_runtime_policy_intersects_live_and_static_capabilities() {
+        let full_static = ProviderStaticCapabilities {
+            launch_program: "fixture".to_owned(),
+            raw_pty: true,
+            semantic_pty_adapter: true,
+            resume_adapter: true,
+        };
+        let full = policy_from_capability_flags(
+            &full_static,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(
+            full,
+            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+        );
+
+        let no_static_resume = ProviderStaticCapabilities {
+            resume_adapter: false,
+            ..full_static.clone()
+        };
+        assert_eq!(
+            policy_from_capability_flags(
+                &no_static_resume,
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
+            ProviderRuntimePolicy::new(true, true, true, true, false).unwrap(),
+        );
+
+        assert_eq!(
+            policy_from_capability_flags(
+                &full_static,
+                true,
+                false,
+                true,
+                true,
+                true,
+            ),
+            ProviderRuntimePolicy::new(true, false, false, true, true).unwrap(),
+        );
+
+        let no_semantic_adapter = ProviderStaticCapabilities {
+            semantic_pty_adapter: false,
+            ..full_static
+        };
+        assert_eq!(
+            policy_from_capability_flags(
+                &no_semantic_adapter,
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
+            ProviderRuntimePolicy::raw_pty(),
+        );
     }
 }

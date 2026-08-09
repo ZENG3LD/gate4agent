@@ -5,10 +5,10 @@ use crate::{
     PreparedInput, PreparedInputKind, ResumeAuthorityTarget, ResumeLaunchRequest,
     ResumeSessionSummary, ResumeSnapshot, ResumeTarget, SessionOptionSelection,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 26;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 27;
 pub const CONTROL_SESSIONS_MAX: usize = 512;
 pub const CONTROL_INSTANCE_IDENTITIES_CAPACITY: u32 = 4_096;
 pub const CONTROL_INSTANCE_IDENTITIES_MAX: usize = CONTROL_INSTANCE_IDENTITIES_CAPACITY as usize;
@@ -51,6 +51,122 @@ pub struct StartRequest {
     pub initial_prompt: Option<String>,
     #[serde(default)]
     pub session_options: Option<SessionOptionSelection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderRuntimePolicy {
+    pub raw_pty_lifecycle: bool,
+    pub semantic_readiness: bool,
+    pub structured_prompt: bool,
+    pub provider_session_identity: bool,
+    pub semantic_resume: bool,
+}
+
+impl ProviderRuntimePolicy {
+    pub fn new(
+        raw_pty_lifecycle: bool,
+        semantic_readiness: bool,
+        structured_prompt: bool,
+        provider_session_identity: bool,
+        semantic_resume: bool,
+    ) -> Result<Self, ProviderRuntimePolicyError> {
+        let policy = Self {
+            raw_pty_lifecycle,
+            semantic_readiness,
+            structured_prompt,
+            provider_session_identity,
+            semantic_resume,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub const fn raw_pty() -> Self {
+        Self {
+            raw_pty_lifecycle: true,
+            semantic_readiness: false,
+            structured_prompt: false,
+            provider_session_identity: false,
+            semantic_resume: false,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), ProviderRuntimePolicyError> {
+        if (self.semantic_readiness
+            || self.structured_prompt
+            || self.provider_session_identity
+            || self.semantic_resume)
+            && !self.raw_pty_lifecycle
+        {
+            return Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty);
+        }
+        if self.structured_prompt && !self.semantic_readiness {
+            return Err(ProviderRuntimePolicyError::StructuredPromptRequiresReadiness);
+        }
+        if self.semantic_resume && !self.provider_session_identity {
+            return Err(ProviderRuntimePolicyError::ResumeRequiresSessionIdentity);
+        }
+        Ok(())
+    }
+
+    pub const fn admits(self, capability: ProviderRuntimeCapability) -> bool {
+        match capability {
+            ProviderRuntimeCapability::RawPtyLifecycle => self.raw_pty_lifecycle,
+            ProviderRuntimeCapability::SemanticReadiness => self.semantic_readiness,
+            ProviderRuntimeCapability::StructuredPrompt => self.structured_prompt,
+            ProviderRuntimeCapability::ProviderSessionIdentity => {
+                self.provider_session_identity
+            }
+            ProviderRuntimeCapability::SemanticResume => self.semantic_resume,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderRuntimePolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WirePolicy {
+            raw_pty_lifecycle: bool,
+            semantic_readiness: bool,
+            structured_prompt: bool,
+            provider_session_identity: bool,
+            semantic_resume: bool,
+        }
+
+        let wire = WirePolicy::deserialize(deserializer)?;
+        Self::new(
+            wire.raw_pty_lifecycle,
+            wire.semantic_readiness,
+            wire.structured_prompt,
+            wire.provider_session_identity,
+            wire.semantic_resume,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRuntimePolicyError {
+    #[error("semantic provider capabilities require the raw PTY lifecycle")]
+    SemanticCapabilityRequiresRawPty,
+    #[error("structured prompts require semantic readiness")]
+    StructuredPromptRequiresReadiness,
+    #[error("semantic resume requires provider session identity")]
+    ResumeRequiresSessionIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRuntimeCapability {
+    RawPtyLifecycle,
+    SemanticReadiness,
+    StructuredPrompt,
+    ProviderSessionIdentity,
+    SemanticResume,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -166,6 +282,7 @@ pub enum ControlCommand {
     },
     Start {
         instance_id: AgentInstanceId,
+        runtime_policy: ProviderRuntimePolicy,
         request: StartRequest,
     },
     Stop {
@@ -198,6 +315,7 @@ pub enum ControlCommand {
     Resume {
         instance_id: AgentInstanceId,
         target: ResumeTarget,
+        runtime_policy: ProviderRuntimePolicy,
         request: ResumeLaunchRequest,
     },
     ResolveInteraction {
@@ -268,6 +386,7 @@ pub enum ControlEffect {
     Spawn {
         agent_id: AgentId,
         transport: TransportKind,
+        runtime_policy: ProviderRuntimePolicy,
         request: StartRequest,
     },
     Stop {
@@ -306,6 +425,7 @@ pub enum ControlEffect {
         agent_id: AgentId,
         transport: TransportKind,
         provider_session: ProviderSessionIdentity,
+        runtime_policy: ProviderRuntimePolicy,
         request: ResumeLaunchRequest,
     },
     ResolveInteraction {
@@ -1155,6 +1275,9 @@ pub enum ObservationIgnoredReason {
     InvalidHistoryObservation,
     InvalidResumeObservation,
     InvalidInteractionObservation,
+    ProviderRuntimePolicyDenied {
+        capability: ProviderRuntimeCapability,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
@@ -1213,6 +1336,12 @@ pub enum ControlError {
     },
     #[error("agent input was rejected: {error}")]
     InputRejected { error: InputPrepareError },
+    #[error("provider runtime policy is invalid: {error}")]
+    InvalidProviderRuntimePolicy { error: ProviderRuntimePolicyError },
+    #[error("provider runtime capability {capability:?} is not admitted")]
+    ProviderRuntimePolicyDenied {
+        capability: ProviderRuntimeCapability,
+    },
     #[error("terminal size is outside the supported bounded range")]
     InvalidTerminalSize,
     #[error("working directory is empty, too large, or contains a NUL byte")]
@@ -1294,10 +1423,63 @@ mod tests {
     use super::{
         ForegroundProcess, ForegroundProcessKind, ProviderEvent, ProviderEventValidationError,
         ProviderInteractionKind, ProviderInteractionResponse, ProviderInteractionResponseError,
+        ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderRuntimePolicyError,
         ProviderSessionIdentity, ProviderSessionKey, TerminalFrame, TerminalMouseProtocolEncoding,
         FOREGROUND_PROCESS_NAME_MAX_BYTES, PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
     };
     use crate::AgentId;
+
+    #[test]
+    fn provider_runtime_policy_enforces_semantic_invariants() {
+        let raw = ProviderRuntimePolicy::raw_pty();
+        assert!(raw.admits(ProviderRuntimeCapability::RawPtyLifecycle));
+        assert!(!raw.admits(ProviderRuntimeCapability::SemanticReadiness));
+        assert_eq!(raw.validate(), Ok(()));
+
+        assert_eq!(
+            ProviderRuntimePolicy::new(false, true, false, false, false),
+            Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty),
+        );
+        assert_eq!(
+            ProviderRuntimePolicy::new(true, false, true, false, false),
+            Err(ProviderRuntimePolicyError::StructuredPromptRequiresReadiness),
+        );
+        assert_eq!(
+            ProviderRuntimePolicy::new(true, true, true, false, true),
+            Err(ProviderRuntimePolicyError::ResumeRequiresSessionIdentity),
+        );
+        assert!(ProviderRuntimePolicy::new(true, true, true, true, true).is_ok());
+    }
+
+    #[test]
+    fn provider_runtime_policy_serde_requires_every_field_and_revalidates() {
+        let raw = ProviderRuntimePolicy::raw_pty();
+        let encoded = serde_json::to_string(&raw).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":false,"provider_session_identity":false,"semantic_resume":false}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderRuntimePolicy>(&encoded).unwrap(),
+            raw,
+        );
+        assert!(serde_json::from_str::<ProviderRuntimePolicy>(
+            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":false,"provider_session_identity":false}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ProviderRuntimePolicy>(
+            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":true,"provider_session_identity":false,"semantic_resume":false}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<super::ControlCommand>(
+            r#"{"kind":"start","instance_id":1,"request":{"working_directory":"C:\\repo","terminal_size":{"rows":24,"columns":80}}}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<super::ControlEffect>(
+            r#"{"kind":"spawn","agent_id":"claude","transport":"pty","request":{"working_directory":"C:\\repo","terminal_size":{"rows":24,"columns":80}}}"#,
+        )
+        .is_err());
+    }
 
     #[test]
     fn foreground_process_is_bounded_and_agent_bound() {

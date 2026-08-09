@@ -10,11 +10,15 @@ use gate4agent_testkit::{
 use gate4agent_types::{
     AgentCommand, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEventKind, ControlObservation, DraftReadySignal, InitialPromptMode, InputAction,
-    PreparedInputKind, PromptFraming, PromptPayload, SessionStatus, ShellCommand, StartRequest,
-    TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    PreparedInputKind, PromptFraming, PromptPayload, ProviderRuntimePolicy, SessionStatus,
+    ShellCommand, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn semantic_runtime_policy() -> ProviderRuntimePolicy {
+    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+}
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     gate4agent_testkit::suppress_windows_fault_dialogs_for_test();
@@ -106,6 +110,7 @@ async fn pty_child_normalizes_a_verbatim_requested_workspace() {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: workspace.to_string_lossy().into_owned(),
                     terminal_size: TerminalSize {
@@ -188,6 +193,7 @@ async fn kernel_effects_drive_real_pty_input_resize_and_tree_stop() {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -350,6 +356,7 @@ async fn real_pty_scrollback_reaches_terminal_frame() {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -436,6 +443,7 @@ async fn terminal_bytes_reach_real_conpty_as_alt_key() {
             9,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -527,6 +535,7 @@ async fn followup_prompt_waits_for_a_fresh_composer_after_the_turn_becomes_busy(
             71,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -640,6 +649,7 @@ async fn after_ready_initial_prompt_is_delivered_before_spawn_is_published() {
             21,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -716,6 +726,7 @@ async fn after_ready_initial_prompt_failure_returns_spawn_failed_without_owned_s
             31,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -787,6 +798,7 @@ async fn startup_operator_gate_blocks_deferred_initial_prompt_and_owns_no_sessio
             41,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -857,6 +869,7 @@ async fn late_claude_onboarding_gate_is_not_confirmed_by_initial_prompt() {
             61,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -927,6 +940,7 @@ async fn windows_codex_initial_prompt_waits_for_terminal_render_before_submit() 
             51,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -998,6 +1012,7 @@ async fn natural_exit_is_collected_as_generation_bound_observation() {
                 2,
                 ControlCommand::Start {
                     instance_id,
+                    runtime_policy: ProviderRuntimePolicy::raw_pty(),
                     request: StartRequest {
                         working_directory: std::env::current_dir()
                             .expect("current directory")
@@ -1069,6 +1084,7 @@ async fn shell_command_writes_only_after_fresh_shell_foreground_proof() {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -1158,6 +1174,7 @@ async fn shell_command_is_rejected_when_the_agent_owns_foreground() {
             11,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

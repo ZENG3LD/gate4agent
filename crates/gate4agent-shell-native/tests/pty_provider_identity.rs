@@ -6,8 +6,13 @@ use gate4agent_shell_native::NativeEffectShell;
 use gate4agent_testkit::{pty_provider_agent_spec, PTY_PROVIDER_FIXTURE_ID};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlObservation,
-    ProviderEvent, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ProviderEvent, ProviderRuntimePolicy, StartRequest, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
+
+fn semantic_runtime_policy() -> ProviderRuntimePolicy {
+    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+}
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
@@ -40,6 +45,7 @@ async fn fresh_codex_pty_does_not_publish_a_transport_local_provider_identity() 
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

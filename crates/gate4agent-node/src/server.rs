@@ -19,7 +19,8 @@ use crate::workspace_file_windows::{
 };
 use crate::platform;
 use crate::provider_runtime::{
-    ProviderRuntimeAdmissionError, ProviderRuntimeMonitor, ProviderRuntimeRequirement,
+    require_policy, ProviderRuntimeAdmissionError, ProviderRuntimeMonitor,
+    ProviderRuntimeRequirement,
 };
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
@@ -58,7 +59,7 @@ use gate4agent_node_wire::{
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
     ControlCommand, ControlEvent, ControlEventKind, InputAction, PromptFraming, PromptPayload, ResumeLaunchRequest,
-    ResumeTarget, SessionGeneration, StartRequest, TerminalControl, TerminalText,
+    ProviderRuntimePolicy, ResumeTarget, SessionGeneration, StartRequest, TerminalControl, TerminalText,
     TerminalFrame, TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
     WORKING_DIRECTORY_MAX_BYTES,
 };
@@ -942,7 +943,8 @@ struct NodeShared {
 struct SessionBinding {
     workspace_id: WorkspaceId,
     generation: SessionGeneration,
-    pending_resume: Option<(SessionGeneration, CommandId)>,
+    runtime_policy: ProviderRuntimePolicy,
+    pending_resume: Option<(SessionGeneration, CommandId, ProviderRuntimePolicy)>,
     record_id: Option<SessionRecordId>,
 }
 
@@ -1087,12 +1089,10 @@ impl NodeShared {
         &self,
         provider: &AgentId,
         requirement: ProviderRuntimeRequirement,
-    ) -> Result<(), NodeFailure> {
+    ) -> Result<ProviderRuntimePolicy, NodeFailure> {
         let admission = if let Some(monitor) = self.provider_runtime_monitor.clone() {
             let provider = provider.clone();
-            let refresh = tokio::task::spawn_blocking(move || {
-                monitor.evaluate(&provider, requirement)
-            });
+            let refresh = tokio::task::spawn_blocking(move || monitor.evaluate(&provider));
             let (status, admission) = timeout(
                 Duration::from_millis(PROVIDER_RUNTIME_ADMISSION_TIMEOUT_MS),
                 refresh,
@@ -1113,7 +1113,9 @@ impl NodeShared {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(status.provider().clone(), status);
             }
-            admission
+            admission.and_then(|policy| {
+                require_policy(policy, requirement).map(|()| policy)
+            })
         } else {
             crate::provider_runtime::admit_status(
                 &self.provider_runtime_statuses,
@@ -1241,15 +1243,30 @@ impl NodeShared {
         workspace_id: WorkspaceId,
         generation: SessionGeneration,
     ) {
+        self.bind_session_with_policy(
+            &SessionAddress {
+                workspace_id,
+                session: SessionKey { instance_id, generation },
+            },
+            ProviderRuntimePolicy::raw_pty(),
+        );
+    }
+
+    fn bind_session_with_policy(
+        &self,
+        address: &SessionAddress,
+        runtime_policy: ProviderRuntimePolicy,
+    ) {
         let mut bindings = self
             .session_bindings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         debug_assert!(bindings.len() < CONTROL_SESSIONS_MAX);
-        debug_assert!(!bindings.contains_key(&instance_id));
-        bindings.insert(instance_id, SessionBinding {
-            workspace_id,
-            generation,
+        debug_assert!(!bindings.contains_key(&address.session.instance_id));
+        bindings.insert(address.session.instance_id, SessionBinding {
+            workspace_id: address.workspace_id.clone(),
+            generation: address.session.generation,
+            runtime_policy,
             pending_resume: None,
             record_id: None,
         });
@@ -1259,6 +1276,7 @@ impl NodeShared {
         &self,
         address: &SessionAddress,
         record_id: SessionRecordId,
+        runtime_policy: ProviderRuntimePolicy,
     ) {
         let mut bindings = self
             .session_bindings
@@ -1271,10 +1289,46 @@ impl NodeShared {
             SessionBinding {
                 workspace_id: address.workspace_id.clone(),
                 generation: address.session.generation,
+                runtime_policy,
                 pending_resume: None,
                 record_id: Some(record_id),
             },
         );
+    }
+
+    fn bind_spawn_session(
+        &self,
+        address: &SessionAddress,
+        provider: AgentId,
+        mode: SessionMode,
+        runtime_policy: ProviderRuntimePolicy,
+    ) -> Result<Option<SessionRecordId>, NodeFailure> {
+        if !runtime_policy.provider_session_identity {
+            self.bind_session_with_policy(address, runtime_policy);
+            return Ok(None);
+        }
+        let record = self.new_record(
+            address,
+            provider,
+            mode,
+            ManagedSessionState::IdentityPending,
+            None,
+        )?;
+        let record_id = record.record_id.clone();
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.insert_record(record.clone())?;
+        self.bind_managed_session(address, record_id.clone(), runtime_policy);
+        if let Err(error) = self.persist_state_locked() {
+            self.remove_binding(address);
+            self.remove_record_memory(&record_id);
+            return Err(persistence_failure(error));
+        }
+        drop(transaction);
+        self.publish_record(record);
+        Ok(Some(record_id))
     }
 
     fn allocate_record_id(&self) -> Result<SessionRecordId, NodeFailure> {
@@ -1630,16 +1684,16 @@ impl NodeShared {
                 ));
             }
         }
-        self.admit_provider_runtime(
+        let runtime_requirement = if initial_prompt.is_some() {
+            ProviderRuntimeRequirement::ResumeWithPrompt
+        } else {
+            ProviderRuntimeRequirement::Resume
+        };
+        let runtime_policy = self.admit_provider_runtime(
             &record.provider,
-            ProviderRuntimeRequirement::Resume,
+            runtime_requirement,
         )
         .await?;
-        if let Some(stale_address) = self.bound_address_for_record(record_id) {
-            self.remove_session(&stale_address).await?;
-        }
-        self.ensure_binding_capacity()?;
-
         let request = ResumeLaunchRequest {
             working_directory,
             terminal_size,
@@ -1648,6 +1702,10 @@ impl NodeShared {
         request
             .validate()
             .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        if let Some(stale_address) = self.bound_address_for_record(record_id) {
+            self.remove_session(&stale_address).await?;
+        }
+        self.ensure_binding_capacity()?;
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
         let address = SessionAddress {
             workspace_id: record.workspace_id.clone(),
@@ -1672,7 +1730,7 @@ impl NodeShared {
                 "managed session became active while resume was being prepared",
             ));
         }
-        self.bind_managed_session(&address, record_id.clone());
+        self.bind_managed_session(&address, record_id.clone(), runtime_policy);
         drop(transaction);
 
         let transport = match record.mode {
@@ -1698,10 +1756,11 @@ impl NodeShared {
         let command = self.prepare_command(ControlCommand::Resume {
             instance_id,
             target: ResumeTarget::ProviderSession { identity },
+            runtime_policy,
             request,
         });
         let started_after = self.current_sequence();
-        if let Err(error) = self.arm_resume(&address, command.id) {
+        if let Err(error) = self.arm_resume(&address, command.id, runtime_policy) {
             self.rollback_spawn(&address, dispatch_timeout).await?;
             return Err(error);
         }
@@ -2224,6 +2283,35 @@ impl NodeShared {
         self.workspace_root(&address.workspace_id)
     }
 
+    fn require_session_runtime_policy(
+        &self,
+        address: &SessionAddress,
+        requirement: ProviderRuntimeRequirement,
+    ) -> Result<ProviderRuntimePolicy, NodeFailure> {
+        let bindings = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let binding = bindings
+            .get(&address.session.instance_id)
+            .ok_or_else(|| failure(NodeFailureCode::UnknownSession, "session instance does not exist"))?;
+        if binding.workspace_id != address.workspace_id {
+            return Err(failure(
+                NodeFailureCode::SessionWorkspaceMismatch,
+                "session belongs to another workspace",
+            ));
+        }
+        if binding.generation != address.session.generation {
+            return Err(failure(NodeFailureCode::StaleGeneration, "session generation is stale"));
+        }
+        require_policy(binding.runtime_policy, requirement)
+            .map(|()| binding.runtime_policy)
+            .map_err(|_| failure(
+                NodeFailureCode::UnsupportedCapability,
+                "session runtime policy does not admit this semantic operation",
+            ))
+    }
+
     fn remove_binding(&self, address: &SessionAddress) {
         let mut bindings = self
             .session_bindings
@@ -2272,6 +2360,7 @@ impl NodeShared {
         &self,
         address: &SessionAddress,
         command_id: CommandId,
+        runtime_policy: ProviderRuntimePolicy,
     ) -> Result<(), NodeFailure> {
         let mut bindings = self
             .session_bindings
@@ -2289,7 +2378,7 @@ impl NodeShared {
         if binding.generation != address.session.generation {
             return Err(failure(NodeFailureCode::StaleGeneration, "session generation is stale"));
         }
-        binding.pending_resume = Some((binding.generation, command_id));
+        binding.pending_resume = Some((binding.generation, command_id, runtime_policy));
         Ok(())
     }
 
@@ -2308,7 +2397,7 @@ impl NodeShared {
     }
 
     fn publish_control(&self, event: ControlEvent) {
-        let (address, previous_address, record_id, resume_command_rejected) = {
+        let (address, previous_address, record_id, identity_admitted, resume_command_rejected) = {
             let mut bindings = self
                 .session_bindings
                 .lock()
@@ -2325,7 +2414,7 @@ impl NodeShared {
             };
             let mut resume_command_rejected = false;
             if binding.generation == event.generation {
-                if let Some((pending_generation, pending_command_id)) = binding.pending_resume {
+                if let Some((pending_generation, pending_command_id, _)) = binding.pending_resume {
                     let rejected_resume = matches!(
                         &event.event,
                         ControlEventKind::CommandRejected { .. }
@@ -2345,7 +2434,7 @@ impl NodeShared {
             } else {
                 let expected = binding.generation.0.checked_add(1);
                 let authorized = matches!(&event.event, ControlEventKind::ResumeAuthorized { .. });
-                if !binding.pending_resume.is_some_and(|(generation, _)| {
+                if !binding.pending_resume.is_some_and(|(generation, _, _)| {
                     generation == binding.generation
                 })
                     || expected != Some(event.generation.0)
@@ -2353,7 +2442,11 @@ impl NodeShared {
                 {
                     return;
                 }
+                let (_, _, runtime_policy) = binding
+                    .pending_resume
+                    .expect("authorized resume retains its pending runtime policy");
                 binding.generation = event.generation;
+                binding.runtime_policy = runtime_policy;
                 binding.pending_resume = None;
             }
             (
@@ -2367,6 +2460,7 @@ impl NodeShared {
                 (previous_address.session.generation != event.generation)
                     .then_some(previous_address),
                 binding.record_id.clone(),
+                binding.runtime_policy.provider_session_identity,
                 resume_command_rejected,
             )
         };
@@ -2378,6 +2472,7 @@ impl NodeShared {
                 &record_id,
                 &address,
                 &event,
+                identity_admitted,
                 resume_command_rejected,
             );
         }
@@ -2389,6 +2484,7 @@ impl NodeShared {
         record_id: &SessionRecordId,
         address: &SessionAddress,
         event: &ControlEvent,
+        identity_admitted: bool,
         resume_command_rejected: bool,
     ) {
         let _transaction = self
@@ -2399,7 +2495,7 @@ impl NodeShared {
             ControlEventKind::ProviderEvent {
                 event: gate4agent_types::ProviderEvent::SessionIdentityObserved { identity },
                 ..
-            } => Some(identity.clone()),
+            } if identity_admitted => Some(identity.clone()),
             _ => None,
         };
         let replacement_id = observed_identity
@@ -3191,10 +3287,12 @@ impl NodeShared {
     ) -> Result<SessionAddress, NodeFailure> {
         let runtime_requirement = match (mode, initial_prompt.is_some()) {
             (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
-            (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPty,
+            (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPrompt,
             (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
         };
-        self.admit_provider_runtime(&provider, runtime_requirement).await?;
+        let runtime_policy = self
+            .admit_provider_runtime(&provider, runtime_requirement)
+            .await?;
         self.ensure_binding_capacity()?;
         let working_directory = self.workspace_root(&workspace_id)?;
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
@@ -3206,27 +3304,12 @@ impl NodeShared {
             workspace_id: workspace_id.clone(),
             session,
         };
-        let record = self.new_record(
+        let record_id = self.bind_spawn_session(
             &address,
             provider.clone(),
             mode,
-            ManagedSessionState::IdentityPending,
-            None,
+            runtime_policy,
         )?;
-        let record_id = record.record_id.clone();
-        let transaction = self
-            .state_transaction
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.insert_record(record.clone())?;
-        self.bind_managed_session(&address, record_id.clone());
-        if let Err(error) = self.persist_state_locked() {
-            self.remove_binding(&address);
-            self.remove_record_memory(&record_id);
-            return Err(persistence_failure(error));
-        }
-        drop(transaction);
-        self.publish_record(record);
         let transport = match mode {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
@@ -3243,13 +3326,16 @@ impl NodeShared {
         )
         .await {
             self.remove_binding(&address);
-            self.discard_record(&record_id)?;
+            if let Some(record_id) = record_id.as_ref() {
+                self.discard_record(record_id)?;
+            }
             return Err(error);
         }
         let start_result = self
             .dispatch_bounded(
                 ControlCommand::Start {
                     instance_id,
+                    runtime_policy,
                     request: StartRequest {
                         working_directory,
                         terminal_size,
@@ -3264,7 +3350,9 @@ impl NodeShared {
             let recovery = self.rollback_spawn(&address, dispatch_timeout).await;
             return match recovery {
                 Ok(()) => {
-                    self.discard_record(&record_id)?;
+                    if let Some(record_id) = record_id.as_ref() {
+                        self.discard_record(record_id)?;
+                    }
                     Err(start_error)
                 }
                 Err(recovery_error) => {
@@ -3272,7 +3360,9 @@ impl NodeShared {
                         "start failed and registration recovery failed: {}",
                         recovery_error.message,
                     );
-                    self.mark_record_error(&record_id, &diagnostic)?;
+                    if let Some(record_id) = record_id.as_ref() {
+                        self.mark_record_error(record_id, &diagnostic)?;
+                    }
                     Err(failure(recovery_error.code, &diagnostic))
                 }
             };
@@ -3304,7 +3394,9 @@ impl NodeShared {
                             ),
                         )
                     })?;
-                self.discard_record(&record_id)?;
+                if let Some(record_id) = record_id.as_ref() {
+                    self.discard_record(record_id)?;
+                }
                 return Err(failure(
                     NodeFailureCode::BackendBusy,
                     "start did not commit before the bounded deadline; registration was removed",
@@ -4564,14 +4656,18 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         }
         NodeRequest::Resume { session, terminal_size, initial_prompt } => {
             let provider = controlled_session(shared, connection_id, role, &session)?;
-            shared.admit_provider_runtime(
-                &provider,
-                ProviderRuntimeRequirement::Resume,
-            )
-            .await?;
             if let Some(prompt) = initial_prompt.as_deref() {
                 validate_node_text("resume initial prompt", prompt)?;
             }
+            let runtime_requirement = if initial_prompt.is_some() {
+                ProviderRuntimeRequirement::ResumeWithPrompt
+            } else {
+                ProviderRuntimeRequirement::Resume
+            };
+            shared.require_session_runtime_policy(&session, runtime_requirement)?;
+            let runtime_policy = shared
+                .admit_provider_runtime(&provider, runtime_requirement)
+                .await?;
             let working_directory = shared.bound_workspace_root(&session)?;
             let request = ResumeLaunchRequest {
                 working_directory,
@@ -4584,9 +4680,10 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             let command = shared.prepare_command(ControlCommand::Resume {
                 instance_id: session.session.instance_id,
                 target: ResumeTarget::CurrentProvider,
+                runtime_policy,
                 request,
             });
-            shared.arm_resume(&session, command.id)?;
+            shared.arm_resume(&session, command.id, runtime_policy)?;
             let dispatch = shared.dispatch_envelope(command);
             if let Err(error) = dispatch {
                 shared.clear_armed_resume(&session);
@@ -4628,6 +4725,10 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         NodeRequest::Prompt { session, text } => {
             let agent_id = controlled_session(shared, connection_id, role, &session)?;
             validate_node_text("prompt", &text)?;
+            shared.require_session_runtime_policy(
+                &session,
+                ProviderRuntimeRequirement::SemanticPrompt,
+            )?;
             let framing = prompt_framing(&agent_id);
             shared
                 .dispatch_input_bounded(
@@ -4640,6 +4741,10 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         NodeRequest::Paste { session, text } => {
             controlled_session(shared, connection_id, role, &session)?;
             validate_node_text("paste", &text)?;
+            shared.require_session_runtime_policy(
+                &session,
+                ProviderRuntimeRequirement::SemanticPrompt,
+            )?;
             shared
                 .dispatch_input_bounded(
                     &session,
@@ -5882,6 +5987,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_spawn_binding_is_visible_without_a_durable_identity_pending_record() {
+        let catalog = active_registry().unwrap();
+        let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let workspace = WorkspaceConfig::new(
+            workspace_id.clone(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-raw-spawn-record").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let address = SessionAddress {
+            workspace_id,
+            session: SessionKey {
+                instance_id: AgentInstanceId(71),
+                generation: SessionGeneration::default(),
+            },
+        };
+
+        assert_eq!(
+            shared
+                .bind_spawn_session(
+                    &address,
+                    agent("claude"),
+                    SessionMode::Pty,
+                    ProviderRuntimePolicy::raw_pty(),
+                )
+                .unwrap(),
+            None,
+        );
+        shared
+            .handle
+            .dispatch(shared.prepare_command(ControlCommand::Register {
+                instance_id: address.session.instance_id,
+                agent_id: agent("claude"),
+                transport: TransportKind::Pty,
+            }))
+            .unwrap();
+        runtime.tick().await;
+
+        assert!(shared.handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == address.session.instance_id
+                && session.generation == address.session.generation
+        }));
+        assert!(shared
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .is_empty());
+        assert!(shared.snapshot().session_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_runtime_policy_rejects_prompt_paste_and_resume_before_mutation() {
+        let catalog = active_registry().unwrap();
+        let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let workspace = WorkspaceConfig::new(
+            workspace_id.clone(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-raw-semantic-gate").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        shared.provider_runtime_statuses = ProviderRuntimeStatuses::new([
+            crate::protocol::ProviderRuntimeStatus::raw_passthrough(agent("claude"), None),
+        ])
+        .unwrap();
+        shared
+            .acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS)
+            .unwrap();
+        let address = SessionAddress {
+            workspace_id,
+            session: SessionKey {
+                instance_id: AgentInstanceId(72),
+                generation: SessionGeneration::default(),
+            },
+        };
+        shared.bind_session_with_policy(&address, ProviderRuntimePolicy::raw_pty());
+        shared
+            .handle
+            .dispatch(shared.prepare_command(ControlCommand::Register {
+                instance_id: address.session.instance_id,
+                agent_id: agent("claude"),
+                transport: TransportKind::Pty,
+            }))
+            .unwrap();
+        runtime.tick().await;
+        let command_id_before = shared.next_command_id.load(Ordering::Acquire);
+        let revision_before = shared.handle.snapshot().revision;
+        let history_sequence_before = shared.current_sequence();
+        let terminal_size = gate4agent_types::TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+
+        for request in [
+            NodeRequest::Prompt {
+                session: address.clone(),
+                text: "prompt".to_owned(),
+            },
+            NodeRequest::Paste {
+                session: address.clone(),
+                text: "paste".to_owned(),
+            },
+            NodeRequest::Resume {
+                session: address.clone(),
+                terminal_size,
+                initial_prompt: None,
+            },
+        ] {
+            let error = process_request_inner(
+                &shared,
+                77,
+                ClientRole::Operator,
+                request,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, NodeFailureCode::UnsupportedCapability);
+        }
+
+        assert_eq!(shared.next_command_id.load(Ordering::Acquire), command_id_before);
+        assert_eq!(shared.handle.snapshot().revision, revision_before);
+        assert_eq!(shared.current_sequence(), history_sequence_before);
+        let bindings = shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let binding = bindings.get(&address.session.instance_id).unwrap();
+        assert_eq!(binding.generation, address.session.generation);
+        assert!(binding.pending_resume.is_none());
+        assert!(binding.record_id.is_none());
+    }
+
+    #[tokio::test]
     async fn windows_rejects_unix_bytes_workspace_path_before_filesystem_access() {
         let catalog = active_registry().unwrap();
         let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
@@ -6093,6 +6345,82 @@ mod tests {
     }
 
     #[test]
+    fn provider_identity_update_is_ignored_without_exact_session_policy() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-identity-policy").unwrap(),
+            vec![workspace.clone()],
+            vec![agent("claude")],
+        );
+        let address = SessionAddress {
+            workspace_id: workspace.workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(90),
+                generation: SessionGeneration(1),
+            },
+        };
+        let record_id = SessionRecordId::new("sr-policy-denied").unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: record_id.clone(),
+                display_name: "policy denied".to_owned(),
+                provider: agent("claude"),
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::IdentityPending,
+                workspace_id: workspace.workspace_id,
+                canonical_root: opaque_windows_path(workspace.canonical_root),
+                provider_session: None,
+                active_session: Some(address.clone()),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_error: None,
+            })
+            .unwrap();
+        let event = ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 1,
+            command_id: None,
+            instance_id: address.session.instance_id,
+            generation: address.session.generation,
+            event: ControlEventKind::ProviderEvent {
+                sequence: 1,
+                source: gate4agent_types::ProviderSource {
+                    family: AdapterFamily::PtySemantic,
+                    binding: AdapterBinding::new(
+                        gate4agent_types::AdapterId::new("claude").unwrap(),
+                        "fixture/v1",
+                        gate4agent_types::AdapterVerification::SyntheticFixture,
+                    )
+                    .unwrap(),
+                },
+                source_sequence: 1,
+                event: gate4agent_types::ProviderEvent::SessionIdentityObserved {
+                    identity: gate4agent_types::ProviderSessionIdentity {
+                        key: gate4agent_types::ProviderSessionKey::SessionId,
+                        id: "provider-session".to_owned(),
+                        transcript_path: None,
+                    },
+                },
+            },
+        };
+
+        shared.reconcile_managed_record(&record_id, &address, &event, false, false);
+
+        let record = shared.record(&record_id).unwrap();
+        assert!(record.provider_session.is_none());
+        assert_eq!(record.state, ManagedSessionState::IdentityPending);
+        assert_eq!(record.active_session.as_ref(), Some(&address));
+    }
+
+    #[test]
     fn provider_identity_cannot_rebind_a_record_across_workspaces() {
         let secondary_root = temporary_workspace_root("identity-scope");
         std::fs::create_dir_all(&secondary_root).unwrap();
@@ -6161,7 +6489,11 @@ mod tests {
                 last_error: None,
             })
             .unwrap();
-        shared.bind_managed_session(&address, current_id.clone());
+        shared.bind_managed_session(
+            &address,
+            current_id.clone(),
+            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+        );
         let event = ControlEvent {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 1,
@@ -6185,7 +6517,7 @@ mod tests {
                 },
             },
         };
-        shared.reconcile_managed_record(&current_id, &address, &event, false);
+        shared.reconcile_managed_record(&current_id, &address, &event, true, false);
 
         let binding = shared
             .session_bindings
@@ -6281,7 +6613,11 @@ mod tests {
                 last_error: None,
             })
             .unwrap();
-        shared.bind_managed_session(&address, pending_id.clone());
+        shared.bind_managed_session(
+            &address,
+            pending_id.clone(),
+            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+        );
         let observed_identity = gate4agent_types::ProviderSessionIdentity {
             transcript_path: Some(r"C:\private\provider-transcript.jsonl".to_owned()),
             ..persisted_identity
@@ -6309,7 +6645,7 @@ mod tests {
                 },
             },
         };
-        shared.reconcile_managed_record(&pending_id, &address, &event, false);
+        shared.reconcile_managed_record(&pending_id, &address, &event, true, false);
 
         let snapshot = shared.snapshot();
         assert_eq!(snapshot.session_records.len(), 1);
@@ -6579,7 +6915,13 @@ mod tests {
             original.workspace_id.clone(),
             original.session.generation,
         );
-        shared.arm_resume(&original, CommandId(41)).unwrap();
+        shared
+            .arm_resume(
+                &original,
+                CommandId(41),
+                ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            )
+            .unwrap();
 
         shared.publish_control(ControlEvent {
             protocol_version: CONTROL_PROTOCOL_VERSION,

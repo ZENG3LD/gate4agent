@@ -982,6 +982,7 @@ impl Gate4AgentKernel {
         if let ControlCommand::Start {
             instance_id,
             request,
+            ..
         } = &mut command.command
         {
             if let Some(session) = self.engine.session_snapshot(*instance_id) {
@@ -1149,13 +1150,18 @@ mod tests {
     };
     use gate4agent_types::{
         AgentInstanceId, CapabilityProbeRequest, ControlObservation, HistoryQuery,
-        ObservationEnvelope, ProviderActivity, ProviderEvent, ProviderSource, ResumeLaunchRequest,
-        ResumeTarget, SessionGeneration, SessionOptionSelection, SessionStatus, StartRequest,
-        TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+        ObservationEnvelope, ProviderActivity, ProviderEvent, ProviderRuntimePolicy,
+        ProviderSource, ResumeLaunchRequest, ResumeTarget, SessionGeneration,
+        SessionOptionSelection, SessionStatus, StartRequest, TerminalSize, TransportKind,
+        CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
         AgentInstanceId(11)
+    }
+
+    fn verified_runtime_policy() -> ProviderRuntimePolicy {
+        ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
     }
 
     fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
@@ -1344,6 +1350,7 @@ mod tests {
                     2,
                     ControlCommand::Start {
                         instance_id: instance(),
+                        runtime_policy: verified_runtime_policy(),
                         request: StartRequest {
                             working_directory: ".".to_owned(),
                             terminal_size: TerminalSize {
@@ -1405,6 +1412,7 @@ mod tests {
                 2,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1432,6 +1440,7 @@ mod tests {
                 2,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1461,6 +1470,7 @@ mod tests {
                 2,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1502,6 +1512,7 @@ mod tests {
                 2,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1543,6 +1554,7 @@ mod tests {
                 2,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1587,6 +1599,7 @@ mod tests {
                 4,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1623,6 +1636,7 @@ mod tests {
                 6,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1699,6 +1713,7 @@ mod tests {
                 2,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1857,6 +1872,7 @@ mod tests {
                 ControlCommand::Resume {
                     instance_id: instance(),
                     target: ResumeTarget::CurrentProvider,
+                    runtime_policy: verified_runtime_policy(),
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -1913,6 +1929,7 @@ mod tests {
                     2,
                     ControlCommand::Start {
                         instance_id: instance(),
+                        runtime_policy: verified_runtime_policy(),
                         request: StartRequest {
                             working_directory: ".".to_owned(),
                             terminal_size: TerminalSize {
@@ -1975,6 +1992,7 @@ mod tests {
                     2,
                     ControlCommand::Start {
                         instance_id: instance(),
+                        runtime_policy: verified_runtime_policy(),
                         request: StartRequest {
                             working_directory: ".".to_owned(),
                             terminal_size: TerminalSize {
@@ -2043,6 +2061,7 @@ mod tests {
                         2,
                         ControlCommand::Start {
                             instance_id: instance(),
+                            runtime_policy: verified_runtime_policy(),
                             request: StartRequest {
                                 working_directory: ".".to_owned(),
                                 terminal_size: TerminalSize {
@@ -2078,6 +2097,7 @@ mod tests {
                 2,
                 ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -2110,6 +2130,7 @@ mod tests {
                     2,
                     ControlCommand::Start {
                         instance_id: instance(),
+                        runtime_policy: verified_runtime_policy(),
                         request: StartRequest {
                             working_directory: ".".to_owned(),
                             terminal_size: TerminalSize {

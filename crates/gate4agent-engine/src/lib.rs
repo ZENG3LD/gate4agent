@@ -13,7 +13,8 @@ use gate4agent_types::{
     ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
     ProviderInteractionOutcome, ProviderInteractionResponse, ProviderInteractionResponseKind,
     ProviderInteractionStatus, ProviderInteractionTarget, ProviderSessionIdentity,
-    ProviderSessionKey, ProviderSnapshot, ProviderSource, ProviderSourceCursor, ProviderSubagent,
+    ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionKey, ProviderSnapshot,
+    ProviderSource, ProviderSourceCursor, ProviderSubagent,
     ResumeAuthorityTarget, ResumeLaunchRequest, ResumePhase, ResumeSessionSummary, ResumeSnapshot,
     ResumeTarget, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl,
     TerminalSize, TokenUsage, TransportKind, CONTROL_INSTANCE_IDENTITIES_CAPACITY,
@@ -32,6 +33,7 @@ const CONTROL_EVENT_HEADROOM: u64 = PROVIDER_INGRESS_EVENTS_MAX as u64
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionState {
     snapshot: SessionSnapshot,
+    runtime_policy: ProviderRuntimePolicy,
     pending_terminal_size: Option<TerminalSize>,
     pending_interrupt: bool,
     pending_resume_identity: Option<ProviderSessionIdentity>,
@@ -146,6 +148,7 @@ impl Gate4AgentEngine {
                             foreground: ForegroundSnapshot::default(),
                             provider: ProviderSnapshot::default(),
                         },
+                        runtime_policy: ProviderRuntimePolicy::raw_pty(),
                         pending_terminal_size: None,
                         pending_interrupt: false,
                         pending_resume_identity: None,
@@ -163,8 +166,9 @@ impl Gate4AgentEngine {
             }
             ControlCommand::Start {
                 instance_id,
+                runtime_policy,
                 request,
-            } => self.start(command_id, instance_id, request),
+            } => self.start(command_id, instance_id, runtime_policy, request),
             ControlCommand::Stop { instance_id, force } => {
                 self.stop(command_id, instance_id, force)
             }
@@ -192,8 +196,9 @@ impl Gate4AgentEngine {
             ControlCommand::Resume {
                 instance_id,
                 target,
+                runtime_policy,
                 request,
-            } => self.resume(command_id, instance_id, target, request),
+            } => self.resume(command_id, instance_id, target, runtime_policy, request),
             ControlCommand::ResolveInteraction {
                 instance_id,
                 generation,
@@ -261,7 +266,7 @@ impl Gate4AgentEngine {
             );
             return;
         }
-        let Some(current) = self.sessions.get(&instance_id).map(|state| &state.snapshot) else {
+        let Some(current_state) = self.sessions.get(&instance_id) else {
             self.emit_ignored(
                 instance_id,
                 generation,
@@ -269,6 +274,8 @@ impl Gate4AgentEngine {
             );
             return;
         };
+        let runtime_policy = current_state.runtime_policy;
+        let current = &current_state.snapshot;
 
         let capability_generation_matches = is_capability_observation(&envelope.observation)
             && current
@@ -281,6 +288,16 @@ impl Gate4AgentEngine {
                 instance_id,
                 generation,
                 ObservationIgnoredReason::StaleGeneration,
+            );
+            return;
+        }
+
+        if let Some(capability) = denied_observation_capability(runtime_policy, &envelope.observation)
+        {
+            self.emit_ignored(
+                instance_id,
+                generation,
+                ObservationIgnoredReason::ProviderRuntimePolicyDenied { capability },
             );
             return;
         }
@@ -621,6 +638,7 @@ impl Gate4AgentEngine {
                             agent_id,
                             transport,
                             provider_session,
+                            runtime_policy,
                             request: pending.request,
                         },
                     });
@@ -1286,8 +1304,12 @@ impl Gate4AgentEngine {
         &mut self,
         command_id: CommandId,
         instance_id: AgentInstanceId,
+        runtime_policy: ProviderRuntimePolicy,
         mut request: StartRequest,
     ) -> Result<(), ControlError> {
+        runtime_policy
+            .validate()
+            .map_err(|error| ControlError::InvalidProviderRuntimePolicy { error })?;
         if !request.terminal_size.is_valid() {
             return Err(ControlError::InvalidTerminalSize);
         }
@@ -1303,6 +1325,9 @@ impl Gate4AgentEngine {
             .ok_or(ControlError::UnknownInstance { instance_id })?;
         let status = session.snapshot.status.clone();
         let transport = session.snapshot.transport;
+        if transport == TransportKind::Pty {
+            require_runtime_capability(runtime_policy, ProviderRuntimeCapability::RawPtyLifecycle)?;
+        }
         if let Some(operation_id) = session.snapshot.pending_operation {
             return Err(ControlError::OperationPending {
                 instance_id,
@@ -1338,6 +1363,9 @@ impl Gate4AgentEngine {
         {
             return Err(ControlError::MissingInitialPrompt);
         }
+        if request.initial_prompt.as_deref().is_some_and(|prompt| !prompt.is_empty()) {
+            require_structured_prompt_policy(runtime_policy)?;
+        }
 
         let generation_watermark =
             self.generation_watermark(instance_id, session.snapshot.generation);
@@ -1357,6 +1385,7 @@ impl Gate4AgentEngine {
             state.pending_terminal_size = Some(request.terminal_size);
             state.pending_interrupt = false;
             state.pending_resume_identity = None;
+            state.runtime_policy = runtime_policy;
             let session = &mut state.snapshot;
             session.history = HistorySnapshot::default();
             session.resume = ResumeSnapshot::default();
@@ -1382,6 +1411,7 @@ impl Gate4AgentEngine {
             effect: ControlEffect::Spawn {
                 agent_id,
                 transport,
+                runtime_policy,
                 request,
             },
         });
@@ -1487,6 +1517,15 @@ impl Gate4AgentEngine {
 
         let agent_id = state.snapshot.agent_id.clone();
         let transport = state.snapshot.transport;
+        let runtime_policy = state.runtime_policy;
+        if matches!(
+            &action,
+            InputAction::InsertDraft(_)
+                | InputAction::SubmitPrompt(_)
+                | InputAction::AgentCommand(_)
+        ) {
+            require_structured_prompt_policy(runtime_policy)?;
+        }
         let interrupt_requested = matches!(
             &action,
             InputAction::TerminalControl(TerminalControl::Interrupt)
@@ -1882,8 +1921,17 @@ impl Gate4AgentEngine {
         command_id: CommandId,
         instance_id: AgentInstanceId,
         target: ResumeTarget,
+        runtime_policy: ProviderRuntimePolicy,
         mut request: ResumeLaunchRequest,
     ) -> Result<(), ControlError> {
+        runtime_policy
+            .validate()
+            .map_err(|error| ControlError::InvalidProviderRuntimePolicy { error })?;
+        require_runtime_capability(
+            runtime_policy,
+            ProviderRuntimeCapability::ProviderSessionIdentity,
+        )?;
+        require_runtime_capability(runtime_policy, ProviderRuntimeCapability::SemanticResume)?;
         request.initial_prompt = request
             .initial_prompt
             .as_deref()
@@ -1897,6 +1945,9 @@ impl Gate4AgentEngine {
             .map_err(|error| ControlError::InvalidResumeRequest {
                 message: error.to_string(),
             })?;
+        if request.initial_prompt.as_deref().is_some_and(|prompt| !prompt.is_empty()) {
+            require_structured_prompt_policy(runtime_policy)?;
+        }
         target
             .validate()
             .map_err(|error| ControlError::InvalidResumeRequest {
@@ -1984,6 +2035,7 @@ impl Gate4AgentEngine {
                 .get_mut(&instance_id)
                 .expect("validated session");
             state.pending_resume_identity = None;
+            state.runtime_policy = runtime_policy;
             let session = &mut state.snapshot;
             session.pending_operation = Some(operation_id);
             session.resume.pending = Some(PendingResumeOperation {
@@ -2083,6 +2135,25 @@ impl Gate4AgentEngine {
             .checked_sub(current_source_sequence)
             .and_then(|difference| difference.checked_sub(1))
             .expect("source sequence ordering was validated");
+        if missed > 0
+            || events
+                .iter()
+                .any(|event| !matches!(event, ProviderEvent::SessionIdentityObserved { .. }))
+        {
+            require_runtime_capability(
+                state.runtime_policy,
+                ProviderRuntimeCapability::SemanticReadiness,
+            )?;
+        }
+        if events
+            .iter()
+            .any(provider_event_carries_session_identity)
+        {
+            require_runtime_capability(
+                state.runtime_policy,
+                ProviderRuntimeCapability::ProviderSessionIdentity,
+            )?;
+        }
         let canonical_steps = events.len() as u64 + u64::from(missed > 0);
         if state
             .snapshot
@@ -2498,6 +2569,63 @@ fn is_resume_authority_observation(observation: &ControlObservation) -> bool {
         ControlObservation::ResumeAuthorized { .. }
             | ControlObservation::ResumeDenied { .. }
             | ControlObservation::ResumeFailed { .. }
+    )
+}
+
+fn require_runtime_capability(
+    runtime_policy: ProviderRuntimePolicy,
+    capability: ProviderRuntimeCapability,
+) -> Result<(), ControlError> {
+    if runtime_policy.admits(capability) {
+        Ok(())
+    } else {
+        Err(ControlError::ProviderRuntimePolicyDenied { capability })
+    }
+}
+
+fn require_structured_prompt_policy(
+    runtime_policy: ProviderRuntimePolicy,
+) -> Result<(), ControlError> {
+    require_runtime_capability(
+        runtime_policy,
+        ProviderRuntimeCapability::SemanticReadiness,
+    )?;
+    require_runtime_capability(runtime_policy, ProviderRuntimeCapability::StructuredPrompt)
+}
+
+fn denied_observation_capability(
+    runtime_policy: ProviderRuntimePolicy,
+    observation: &ControlObservation,
+) -> Option<ProviderRuntimeCapability> {
+    let capability = match observation {
+        ControlObservation::ProviderEvent {
+            event: ProviderEvent::SessionIdentityObserved { .. },
+            ..
+        } => ProviderRuntimeCapability::ProviderSessionIdentity,
+        ControlObservation::ProviderEvent { event, .. } => {
+            if !runtime_policy.admits(ProviderRuntimeCapability::SemanticReadiness) {
+                ProviderRuntimeCapability::SemanticReadiness
+            } else if provider_event_carries_session_identity(event)
+                && !runtime_policy.admits(ProviderRuntimeCapability::ProviderSessionIdentity)
+            {
+                ProviderRuntimeCapability::ProviderSessionIdentity
+            } else {
+                return None;
+            }
+        }
+        ControlObservation::ProviderGap { .. } => ProviderRuntimeCapability::SemanticReadiness,
+        ControlObservation::ResumeAuthorized { .. }
+        | ControlObservation::ResumeDenied { .. }
+        | ControlObservation::ResumeFailed { .. } => ProviderRuntimeCapability::SemanticResume,
+        _ => return None,
+    };
+    (!runtime_policy.admits(capability)).then_some(capability)
+}
+
+fn provider_event_carries_session_identity(event: &ProviderEvent) -> bool {
+    matches!(
+        event,
+        ProviderEvent::SessionStarted { .. } | ProviderEvent::SessionIdentityObserved { .. }
     )
 }
 
@@ -3198,12 +3326,24 @@ mod tests {
         register_instance(command_id, instance())
     }
 
+    fn verified_runtime_policy() -> ProviderRuntimePolicy {
+        ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+    }
+
     fn start(command_id: u64) -> CommandEnvelope {
+        start_with_policy(command_id, verified_runtime_policy())
+    }
+
+    fn start_with_policy(
+        command_id: u64,
+        runtime_policy: ProviderRuntimePolicy,
+    ) -> CommandEnvelope {
         CommandEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(command_id),
             command: ControlCommand::Start {
                 instance_id: instance(),
+                runtime_policy,
                 request: StartRequest {
                     working_directory: ".".to_owned(),
                     terminal_size: TerminalSize {
@@ -3231,10 +3371,16 @@ mod tests {
     }
 
     fn running_engine() -> (Gate4AgentEngine, EffectEnvelope) {
+        running_engine_with_policy(verified_runtime_policy())
+    }
+
+    fn running_engine_with_policy(
+        runtime_policy: ProviderRuntimePolicy,
+    ) -> (Gate4AgentEngine, EffectEnvelope) {
         let mut engine = Gate4AgentEngine::new();
         engine.apply_command(register(1)).unwrap();
         engine.drain_events();
-        engine.apply_command(start(2)).unwrap();
+        engine.apply_command(start_with_policy(2, runtime_policy)).unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -3246,6 +3392,188 @@ mod tests {
             },
         });
         (engine, effect)
+    }
+
+    #[test]
+    fn runtime_policy_keeps_raw_input_and_rejects_structured_prompt() {
+        let (mut engine, spawn) = running_engine_with_policy(ProviderRuntimePolicy::raw_pty());
+        assert!(matches!(
+            &spawn.effect,
+            ControlEffect::Spawn { runtime_policy, .. }
+                if *runtime_policy == ProviderRuntimePolicy::raw_pty()
+        ));
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::TerminalBytes(vec![0x1b, b'[', b'A']),
+                },
+            })
+            .unwrap();
+        let raw_input = engine.drain_effects().pop().unwrap();
+        assert!(matches!(raw_input.effect, ControlEffect::WriteInput { .. }));
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(raw_input.operation_id),
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::InputCompleted,
+        });
+
+        assert_eq!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(4),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::SubmitPrompt(PromptPayload {
+                        text: "semantic prompt".to_owned(),
+                        framing: PromptFraming::Literal,
+                    }),
+                },
+            }),
+            Err(ControlError::ProviderRuntimePolicyDenied {
+                capability: ProviderRuntimeCapability::SemanticReadiness,
+            })
+        );
+        assert!(engine.drain_effects().is_empty());
+    }
+
+    #[test]
+    fn runtime_policy_fail_closed_provider_observations_and_ingress() {
+        let (mut engine, spawn) = running_engine_with_policy(ProviderRuntimePolicy::raw_pty());
+        for (event, expected_capability) in [
+            (
+                ProviderEvent::WorkingObserved,
+                ProviderRuntimeCapability::SemanticReadiness,
+            ),
+            (
+                ProviderEvent::SessionIdentityObserved {
+                    identity: ProviderSessionIdentity {
+                        key: ProviderSessionKey::SessionId,
+                        id: "provider-session".to_owned(),
+                        transcript_path: None,
+                    },
+                },
+                ProviderRuntimeCapability::ProviderSessionIdentity,
+            ),
+        ] {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: instance(),
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: provider_source(),
+                    sequence: 1,
+                    event,
+                },
+            });
+            assert!(engine.drain_events().iter().any(|event| matches!(
+                event.event,
+                ControlEventKind::ObservationIgnored {
+                    reason: ObservationIgnoredReason::ProviderRuntimePolicyDenied { capability }
+                } if capability == expected_capability
+            )));
+        }
+        assert_eq!(engine.snapshot().sessions[0].provider.sequence, 0);
+
+        assert_eq!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(5),
+                command: ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation: spawn.generation,
+                    source: provider_source(),
+                    source_sequence: 1,
+                    events: vec![ProviderEvent::WorkingObserved],
+                },
+            }),
+            Err(ControlError::ProviderRuntimePolicyDenied {
+                capability: ProviderRuntimeCapability::SemanticReadiness,
+            })
+        );
+        assert_eq!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(6),
+                command: ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation: spawn.generation,
+                    source: provider_source(),
+                    source_sequence: 1,
+                    events: vec![ProviderEvent::SessionIdentityObserved {
+                        identity: ProviderSessionIdentity {
+                            key: ProviderSessionKey::SessionId,
+                            id: "provider-session".to_owned(),
+                            transcript_path: None,
+                        },
+                    }],
+                },
+            }),
+            Err(ControlError::ProviderRuntimePolicyDenied {
+                capability: ProviderRuntimeCapability::ProviderSessionIdentity,
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_policy_rejects_invalid_start_contract() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        let invalid = ProviderRuntimePolicy {
+            raw_pty_lifecycle: false,
+            semantic_readiness: true,
+            structured_prompt: false,
+            provider_session_identity: false,
+            semantic_resume: false,
+        };
+        assert_eq!(
+            engine.apply_command(start_with_policy(2, invalid)),
+            Err(ControlError::InvalidProviderRuntimePolicy {
+                error: gate4agent_types::ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty,
+            })
+        );
+        assert!(engine.drain_effects().is_empty());
+    }
+
+    #[test]
+    fn runtime_policy_requires_resume_identity_and_resume_capability() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        let request = ResumeLaunchRequest {
+            working_directory: ".".to_owned(),
+            terminal_size: TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+            initial_prompt: None,
+        };
+        assert_eq!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::ProviderSession {
+                        identity: ProviderSessionIdentity {
+                            key: ProviderSessionKey::SessionId,
+                            id: "provider-session".to_owned(),
+                            transcript_path: None,
+                        },
+                    },
+                    runtime_policy: ProviderRuntimePolicy::raw_pty(),
+                    request,
+                },
+            }),
+            Err(ControlError::ProviderRuntimePolicyDenied {
+                capability: ProviderRuntimeCapability::ProviderSessionIdentity,
+            })
+        );
+        assert!(engine.drain_effects().is_empty());
     }
 
     fn resolving_interaction(
@@ -3468,6 +3796,7 @@ mod tests {
                 id: CommandId(2),
                 command: ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request: StartRequest {
                         working_directory: ".".to_owned(),
                         terminal_size: TerminalSize {
@@ -3499,6 +3828,7 @@ mod tests {
                 id: CommandId(2),
                 command: ControlCommand::Start {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     request,
                 },
             })
@@ -6181,6 +6511,7 @@ mod tests {
                 id: CommandId(10),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::CurrentProvider,
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
@@ -6228,8 +6559,10 @@ mod tests {
             ControlEffect::SpawnResume {
                 transport: TransportKind::Pty,
                 provider_session,
+                runtime_policy,
                 ..
             } if provider_session == &identity
+                && *runtime_policy == verified_runtime_policy()
         ));
         assert_eq!(
             engine.snapshot().sessions[0].status,
@@ -6276,6 +6609,7 @@ mod tests {
                 id: CommandId(2),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::ProviderSession {
                         identity: identity.clone(),
                     },
@@ -6353,6 +6687,7 @@ mod tests {
             id: CommandId(20),
             command: ControlCommand::Resume {
                 instance_id: instance(),
+                runtime_policy: verified_runtime_policy(),
                 target: ResumeTarget::CurrentProvider,
                 request: ResumeLaunchRequest {
                     working_directory: ".".to_owned(),
@@ -6374,6 +6709,7 @@ mod tests {
                 id: CommandId(21),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::CurrentProvider,
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
@@ -6398,6 +6734,7 @@ mod tests {
                 id: CommandId(22),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::CurrentProvider,
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
@@ -6448,6 +6785,7 @@ mod tests {
                 id: CommandId(10),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::CurrentProvider,
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
@@ -6497,6 +6835,7 @@ mod tests {
                 id: CommandId(12),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::CurrentProvider,
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
@@ -6543,6 +6882,7 @@ mod tests {
                 id: CommandId(13),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::CurrentProvider,
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
@@ -6571,6 +6911,7 @@ mod tests {
                 id: CommandId(11),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::CurrentProvider,
                     request: ResumeLaunchRequest {
                         working_directory: ".".to_owned(),
@@ -6650,6 +6991,7 @@ mod tests {
                 id: CommandId(3),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::HistoryCandidate {
                         candidate_id: "hist_resume_1".to_owned(),
                     },
@@ -6693,6 +7035,7 @@ mod tests {
                 id: CommandId(5),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
                     target: ResumeTarget::HistoryCandidate {
                         candidate_id: "hist_resume_1".to_owned(),
                     },

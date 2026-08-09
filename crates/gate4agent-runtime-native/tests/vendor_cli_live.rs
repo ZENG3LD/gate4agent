@@ -5,9 +5,13 @@ use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
-    ControlEventKind, ProviderEvent, ResumeLaunchRequest, ResumeTarget, SessionStatus,
-    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ResumeLaunchRequest, ResumeTarget,
+    SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
+
+fn semantic_runtime_policy() -> ProviderRuntimePolicy {
+    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+}
 
 const LIVE_CANARY_ENV: &str = "GATE4AGENT_VENDOR_CANARY";
 const LIVE_LAUNCHER_ENV: &str = "GATE4AGENT_VENDOR_CANARY_LAUNCHER";
@@ -408,6 +412,7 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: working_directory.path().to_string_lossy().into_owned(),
                     terminal_size: TerminalSize {
@@ -511,6 +516,7 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
             ControlCommand::Resume {
                 instance_id,
                 target: ResumeTarget::CurrentProvider,
+                runtime_policy: semantic_runtime_policy(),
                 request: ResumeLaunchRequest {
                     working_directory: working_directory.path().to_string_lossy().into_owned(),
                     terminal_size: TerminalSize {
@@ -662,6 +668,7 @@ async fn windows_live_parallel_codex_inline_process_isolation() {
                 index as u64 + 3,
                 ControlCommand::Start {
                     instance_id,
+                    runtime_policy: semantic_runtime_policy(),
                     request: StartRequest {
                         working_directory: directories[index]
                             .path()
@@ -755,6 +762,7 @@ async fn windows_live_codex_inline_inflight_stop() {
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: semantic_runtime_policy(),
                 request: StartRequest {
                     working_directory: working_directory.path().to_string_lossy().into_owned(),
                     terminal_size: TerminalSize {

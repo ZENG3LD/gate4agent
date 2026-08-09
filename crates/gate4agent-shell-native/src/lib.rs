@@ -39,9 +39,10 @@ use gate4agent_types::{
     ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
     ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderEvent, ProviderInteractionKind,
-    ProviderSessionIdentity, ProviderSessionKey, ProviderSource, ResumeLaunchRequest,
-    SessionGeneration, StartRequest, TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize,
-    TokenUsage, TransportKind, CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
+    ProviderSource, ResumeLaunchRequest, SessionGeneration, StartRequest, TerminalFrame,
+    TerminalMouseProtocolEncoding, TerminalSize, TokenUsage, TransportKind,
+    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
@@ -61,6 +62,7 @@ struct NativeSpawnRequest {
     agent_id: AgentId,
     transport: TransportKind,
     request: StartRequest,
+    runtime_policy: ProviderRuntimePolicy,
     launch_extra_args: Vec<OsString>,
     resumed_provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
 }
@@ -70,6 +72,7 @@ struct OwnedPtySession {
     spawn_operation_id: OperationId,
     last_terminal_sequence: u64,
     terminal_stale_published: bool,
+    runtime_policy: ProviderRuntimePolicy,
     provider: Option<OwnedPtyProvider>,
 }
 
@@ -82,6 +85,7 @@ struct OwnedPtyProvider {
     pipeline: Mutex<ClassificationPipeline>,
     rate_limits: RateLimitDetector,
     kimi_identity: Option<KimiPtySessionIdentityExtractor>,
+    semantic_events: bool,
     provider_session_started: bool,
     next_provider_sequence: u64,
 }
@@ -134,6 +138,7 @@ struct OwnedProviderSession<S> {
     pending_events: VecDeque<AgentEvent>,
     next_provider_sequence: u64,
     observed_exit_code: Option<i32>,
+    runtime_policy: ProviderRuntimePolicy,
 }
 
 /// Executes native effects and returns exactly one completion observation for
@@ -229,6 +234,7 @@ impl NativeEffectShell {
                 ControlEffect::Spawn {
                     agent_id,
                     transport,
+                    runtime_policy,
                     request,
                 } => {
                     self.spawn_native(
@@ -238,6 +244,7 @@ impl NativeEffectShell {
                             agent_id,
                             transport,
                             request,
+                            runtime_policy,
                             launch_extra_args: Vec::new(),
                             resumed_provider_session: None,
                         },
@@ -249,6 +256,7 @@ impl NativeEffectShell {
                     agent_id,
                     transport,
                     provider_session,
+                    runtime_policy,
                     request,
                 } => {
                     self.spawn_resume(
@@ -257,6 +265,7 @@ impl NativeEffectShell {
                         agent_id,
                         transport,
                         provider_session,
+                        runtime_policy,
                         request,
                         pty_env,
                     )
@@ -286,11 +295,18 @@ impl NativeEffectShell {
                         ForegroundRequirement::Shell
                             if input.kind() == PreparedInputKind::ShellCommand =>
                         {
-                            match owned.session.send_shell_input(input).await {
-                                Ok(()) => ControlObservation::InputCompleted,
-                                Err(error) => ControlObservation::InputFailed {
-                                    message: error.to_string(),
-                                },
+                            if !owned.runtime_policy.semantic_readiness {
+                                ControlObservation::InputFailed {
+                                    message: "semantic shell input is not admitted by the provider runtime policy"
+                                        .to_owned(),
+                                }
+                            } else {
+                                match owned.session.send_shell_input(input).await {
+                                    Ok(()) => ControlObservation::InputCompleted,
+                                    Err(error) => ControlObservation::InputFailed {
+                                        message: error.to_string(),
+                                    },
+                                }
                             }
                         }
                         ForegroundRequirement::Agent { agent_id }
@@ -301,6 +317,19 @@ impl NativeEffectShell {
                                     | PreparedInputKind::AgentCommand
                             ) && &agent_id == owned.session.agent_id() =>
                         {
+                            if !owned.runtime_policy.semantic_readiness
+                                || !owned.runtime_policy.structured_prompt
+                            {
+                                return completion_observation(
+                                    operation_id,
+                                    instance_id,
+                                    generation,
+                                    ControlObservation::InputFailed {
+                                        message: "semantic input is not admitted by the provider runtime policy"
+                                            .to_owned(),
+                                    },
+                                );
+                            }
                             let intent = match input.kind() {
                                 PreparedInputKind::InsertDraft
                                 | PreparedInputKind::AgentCommand => ReadinessIntent::DraftPaste,
@@ -352,6 +381,12 @@ impl NativeEffectShell {
                     },
                 },
                 ControlEffect::SubmitPrompt { prompt } => match self.acp_sessions.get(&key) {
+                    Some(owned) if !owned.runtime_policy.structured_prompt => {
+                        ControlObservation::InputFailed {
+                            message: "structured prompt is not admitted by the provider runtime policy"
+                                .to_owned(),
+                        }
+                    }
                     Some(owned) => match owned.session.start_prompt(&prompt).await {
                         Ok(()) => ControlObservation::InputCompleted,
                         Err(error) => ControlObservation::InputFailed {
@@ -444,9 +479,18 @@ impl NativeEffectShell {
             agent_id,
             transport,
             request,
+            runtime_policy,
             mut launch_extra_args,
             resumed_provider_session,
         } = spawn;
+        if let Err(message) = validate_spawn_runtime_policy(
+            runtime_policy,
+            transport,
+            request.initial_prompt.is_some(),
+            resumed_provider_session.is_some(),
+        ) {
+            return ControlObservation::SpawnFailed { message };
+        }
         if self.session_exists(key) {
             return ControlObservation::SpawnFailed {
                 message: format!(
@@ -485,25 +529,24 @@ impl NativeEffectShell {
                 let fresh_provider_session = prepare_fresh_pty_provider_session(
                     spec.capabilities.transports.pty_adapter.as_ref(),
                     resumed_provider_session.is_some(),
+                    runtime_policy.provider_session_identity,
                     &mut launch_extra_args,
                 );
                 let mut authoritative_provider_session = resumed_provider_session
                     .clone()
                     .or(fresh_provider_session);
-                let probe_kimi_identity = authoritative_provider_session.is_none()
-                    && spec
-                        .capabilities
-                        .transports
-                        .pty_adapter
-                        .as_ref()
-                        .is_some_and(|adapter| adapter.id.as_str() == "kimi");
-                let probe_codex_identity = authoritative_provider_session.is_none()
-                    && spec
-                        .capabilities
-                        .transports
-                        .pty_adapter
-                        .as_ref()
-                        .is_some_and(|adapter| adapter.id.as_str() == "codex");
+                let probe_kimi_identity = should_probe_pty_identity(
+                    runtime_policy,
+                    spec.capabilities.transports.pty_adapter.as_ref(),
+                    authoritative_provider_session.is_some(),
+                    "kimi",
+                );
+                let probe_codex_identity = should_probe_pty_identity(
+                    runtime_policy,
+                    spec.capabilities.transports.pty_adapter.as_ref(),
+                    authoritative_provider_session.is_some(),
+                    "codex",
+                );
                 match PtySession::spawn_agent_with_size(
                     &spec,
                     LaunchRequest {
@@ -561,6 +604,7 @@ impl NativeEffectShell {
                     }
                     let process_id = session.root_pid();
                     let provider = match spec.capabilities.transports.pty_adapter.as_ref() {
+                        _ if !should_attach_pty_provider_stream(runtime_policy) => None,
                         Some(adapter) => {
                             let tool = match self
                                 .legacy_adapters
@@ -601,8 +645,11 @@ impl NativeEffectShell {
                                         utf8: Utf8ChunkDecoder::default(),
                                         pipeline: Mutex::new(create_pipeline(tool)),
                                         rate_limits: RateLimitDetector::new_for_tool(tool),
-                                        kimi_identity: (is_kimi && !provider_session_started)
+                                        kimi_identity: (runtime_policy.provider_session_identity
+                                            && is_kimi
+                                            && !provider_session_started)
                                             .then(KimiPtySessionIdentityExtractor::default),
+                                        semantic_events: runtime_policy.semantic_readiness,
                                         provider_session_started,
                                         next_provider_sequence: 1,
                                     })
@@ -624,6 +671,7 @@ impl NativeEffectShell {
                             spawn_operation_id: operation_id,
                             last_terminal_sequence: 0,
                             terminal_stale_published: false,
+                            runtime_policy,
                             provider,
                         },
                     );
@@ -680,6 +728,7 @@ impl NativeEffectShell {
                                     pending_events: VecDeque::new(),
                                     next_provider_sequence: 1,
                                     observed_exit_code: None,
+                                    runtime_policy,
                                 },
                             );
                             ControlObservation::Spawned { process_id }
@@ -757,6 +806,7 @@ impl NativeEffectShell {
                                 pending_events,
                                 next_provider_sequence: 1,
                                 observed_exit_code: None,
+                                runtime_policy,
                             },
                         );
                         ControlObservation::Spawned { process_id }
@@ -830,6 +880,7 @@ impl NativeEffectShell {
                                 }]),
                                 next_provider_sequence: 1,
                                 observed_exit_code: None,
+                                runtime_policy,
                             },
                         );
                         ControlObservation::Spawned { process_id }
@@ -849,9 +900,18 @@ impl NativeEffectShell {
         agent_id: AgentId,
         transport: TransportKind,
         provider_session: gate4agent_types::ProviderSessionIdentity,
+        runtime_policy: ProviderRuntimePolicy,
         request: ResumeLaunchRequest,
         pty_env: Vec<EnvMutation>,
     ) -> ControlObservation {
+        if let Err(message) = validate_spawn_runtime_policy(
+            runtime_policy,
+            transport,
+            request.initial_prompt.is_some(),
+            true,
+        ) {
+            return ControlObservation::SpawnFailed { message };
+        }
         if let Err(error) = request.validate() {
             return ControlObservation::SpawnFailed {
                 message: error.to_string(),
@@ -907,6 +967,7 @@ impl NativeEffectShell {
                 agent_id,
                 transport,
                 request: start,
+                runtime_policy,
                 launch_extra_args: if transport == TransportKind::Pty {
                     plan.args.into_iter().map(OsString::from).collect()
                 } else {
@@ -1100,13 +1161,68 @@ fn missing_session_message(key: NativeSessionKey) -> String {
     )
 }
 
+fn validate_spawn_runtime_policy(
+    policy: ProviderRuntimePolicy,
+    transport: TransportKind,
+    has_initial_prompt: bool,
+    is_resume: bool,
+) -> Result<(), String> {
+    policy
+        .validate()
+        .map_err(|error| format!("provider runtime policy is invalid: {error}"))?;
+    require_runtime_capability(policy, ProviderRuntimeCapability::RawPtyLifecycle)?;
+    if transport != TransportKind::Pty {
+        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+    }
+    if has_initial_prompt {
+        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+        require_runtime_capability(policy, ProviderRuntimeCapability::StructuredPrompt)?;
+    }
+    if is_resume {
+        require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
+        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
+    }
+    Ok(())
+}
+
+fn require_runtime_capability(
+    policy: ProviderRuntimePolicy,
+    capability: ProviderRuntimeCapability,
+) -> Result<(), String> {
+    if policy.admits(capability) {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider runtime capability {capability:?} is not admitted"
+        ))
+    }
+}
+
+fn should_attach_pty_provider_stream(policy: ProviderRuntimePolicy) -> bool {
+    policy.semantic_readiness || policy.provider_session_identity
+}
+
+fn should_probe_pty_identity(
+    policy: ProviderRuntimePolicy,
+    adapter: Option<&gate4agent_types::AdapterBinding>,
+    authoritative_identity_present: bool,
+    expected_adapter: &str,
+) -> bool {
+    !authoritative_identity_present
+        && policy.semantic_readiness
+        && policy.structured_prompt
+        && policy.provider_session_identity
+        && adapter.is_some_and(|adapter| adapter.id.as_str() == expected_adapter)
+}
+
 fn prepare_fresh_pty_provider_session(
     adapter: Option<&gate4agent_types::AdapterBinding>,
     is_resume: bool,
+    identity_permitted: bool,
     launch_extra_args: &mut Vec<OsString>,
 ) -> Option<ProviderSessionIdentity> {
     let adapter = adapter?;
-    if is_resume || adapter.id.as_str() != "claude-code" {
+    if is_resume || !identity_permitted || adapter.id.as_str() != "claude-code" {
         return None;
     }
     let identity = ProviderSessionIdentity {
@@ -1142,8 +1258,15 @@ fn drain_pty_provider(
                 if raw.is_empty() {
                     continue;
                 }
-                if let Some(info) = provider.rate_limits.detect(&raw) {
-                    push_provider_observation(key, provider, rate_limit_event(info), observations);
+                if provider.semantic_events {
+                    if let Some(info) = provider.rate_limits.detect(&raw) {
+                        push_provider_observation(
+                            key,
+                            provider,
+                            rate_limit_event(info),
+                            observations,
+                        );
+                    }
                 }
                 let identity = provider
                     .kimi_identity
@@ -1170,14 +1293,16 @@ fn drain_pty_provider(
                         observations,
                     );
                 }
-                let messages = provider
-                    .pipeline
-                    .get_mut()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .process(&raw);
-                for message in messages {
-                    if let Some(event) = parsed_provider_event(message) {
-                        push_provider_observation(key, provider, event, observations);
+                if provider.semantic_events {
+                    let messages = provider
+                        .pipeline
+                        .get_mut()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .process(&raw);
+                    for message in messages {
+                        if let Some(event) = parsed_provider_event(message) {
+                            push_provider_observation(key, provider, event, observations);
+                        }
                     }
                 }
             }
@@ -2367,11 +2492,14 @@ fn elapsed_ms(started: Instant) -> u64 {
 mod tests {
     use super::{
         prepare_fresh_pty_provider_session, prompt_render_probe, prompt_rendered,
-        startup_operator_gate, terminal_frame, ReadinessDiagnostics, Utf8ChunkDecoder,
+        should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
+        terminal_frame, validate_spawn_runtime_policy, ReadinessDiagnostics, Utf8ChunkDecoder,
     };
     use gate4agent_adapters::builtin_adapter_registry;
     use gate4agent::pty::event::PtyMouseProtocolEncoding;
-    use gate4agent_types::{AdapterFamily, TerminalMouseProtocolEncoding};
+    use gate4agent_types::{
+        AdapterFamily, ProviderRuntimePolicy, TerminalMouseProtocolEncoding, TransportKind,
+    };
     use std::ffi::OsString;
 
     fn snapshot(sequence: u64, contents: &str) -> super::PtyTerminalSnapshot {
@@ -2494,7 +2622,7 @@ mod tests {
             .binding(AdapterFamily::PtySemantic, "claude-code")
             .expect("Claude PTY binding");
         let mut args = Vec::new();
-        let identity = prepare_fresh_pty_provider_session(Some(claude), false, &mut args)
+        let identity = prepare_fresh_pty_provider_session(Some(claude), false, true, &mut args)
             .expect("fresh Claude provider identity");
         let parsed = uuid::Uuid::parse_str(&identity.id).expect("valid Claude UUID");
         assert_eq!(parsed.get_version_num(), 4);
@@ -2513,15 +2641,113 @@ mod tests {
             .binding(AdapterFamily::PtySemantic, "claude-code")
             .expect("Claude PTY binding");
         let mut codex_args = Vec::new();
-        assert!(prepare_fresh_pty_provider_session(Some(codex), false, &mut codex_args).is_none());
+        assert!(prepare_fresh_pty_provider_session(Some(codex), false, true, &mut codex_args)
+            .is_none());
         assert!(codex_args.is_empty());
 
         let mut resume_args = vec![OsString::from("--resume"), OsString::from("vendor-id")];
-        assert!(prepare_fresh_pty_provider_session(Some(claude), true, &mut resume_args).is_none());
+        assert!(prepare_fresh_pty_provider_session(Some(claude), true, true, &mut resume_args)
+            .is_none());
         assert_eq!(
             resume_args,
             [OsString::from("--resume"), OsString::from("vendor-id")]
         );
+    }
+
+    #[test]
+    fn raw_pty_policy_omits_all_identity_and_semantic_startup_paths() {
+        let adapters = builtin_adapter_registry();
+        let claude = adapters
+            .binding(AdapterFamily::PtySemantic, "claude-code")
+            .expect("Claude PTY binding");
+        let codex = adapters
+            .binding(AdapterFamily::PtySemantic, "codex")
+            .expect("Codex PTY binding");
+        let kimi = adapters
+            .binding(AdapterFamily::PtySemantic, "kimi")
+            .expect("Kimi PTY binding");
+        let policy = ProviderRuntimePolicy::raw_pty();
+        let mut args = Vec::new();
+
+        assert!(prepare_fresh_pty_provider_session(Some(claude), false, false, &mut args)
+            .is_none());
+        assert!(args.is_empty());
+        assert!(!should_probe_pty_identity(policy, Some(codex), false, "codex"));
+        assert!(!should_probe_pty_identity(policy, Some(kimi), false, "kimi"));
+        assert!(!should_attach_pty_provider_stream(policy));
+    }
+
+    #[test]
+    fn identity_probe_requires_structured_prompt_for_codex_and_kimi() {
+        let adapters = builtin_adapter_registry();
+        let codex = adapters
+            .binding(AdapterFamily::PtySemantic, "codex")
+            .expect("Codex PTY binding");
+        let kimi = adapters
+            .binding(AdapterFamily::PtySemantic, "kimi")
+            .expect("Kimi PTY binding");
+        let without_structured_prompt =
+            ProviderRuntimePolicy::new(true, true, false, true, false)
+                .expect("identity observation policy without structured prompt");
+
+        assert!(!should_probe_pty_identity(
+            without_structured_prompt,
+            Some(codex),
+            false,
+            "codex",
+        ));
+        assert!(!should_probe_pty_identity(
+            without_structured_prompt,
+            Some(kimi),
+            false,
+            "kimi",
+        ));
+
+        let with_structured_prompt =
+            ProviderRuntimePolicy::new(true, true, true, true, false)
+                .expect("identity probe policy");
+        assert!(should_probe_pty_identity(
+            with_structured_prompt,
+            Some(codex),
+            false,
+            "codex",
+        ));
+        assert!(should_probe_pty_identity(
+            with_structured_prompt,
+            Some(kimi),
+            false,
+            "kimi",
+        ));
+    }
+
+    #[test]
+    fn runtime_policy_denies_semantic_prompt_and_resume_before_spawn() {
+        let raw = ProviderRuntimePolicy::raw_pty();
+        assert!(validate_spawn_runtime_policy(raw, TransportKind::Pty, false, false).is_ok());
+        assert!(validate_spawn_runtime_policy(raw, TransportKind::Pty, true, false)
+            .unwrap_err()
+            .contains("SemanticReadiness"));
+        assert!(validate_spawn_runtime_policy(raw, TransportKind::Pty, false, true)
+            .unwrap_err()
+            .contains("ProviderSessionIdentity"));
+
+        let resume_without_prompt = ProviderRuntimePolicy::new(true, false, false, true, true)
+            .expect("identity and resume policy");
+        assert!(validate_spawn_runtime_policy(
+            resume_without_prompt,
+            TransportKind::Pty,
+            false,
+            true,
+        )
+        .is_ok());
+        assert!(validate_spawn_runtime_policy(
+            resume_without_prompt,
+            TransportKind::Pty,
+            true,
+            true,
+        )
+        .unwrap_err()
+        .contains("SemanticReadiness"));
     }
 
     #[test]

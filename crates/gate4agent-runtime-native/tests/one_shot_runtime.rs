@@ -5,8 +5,8 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_testkit::{one_shot_agent_spec, ONE_SHOT_FIXTURE_ID};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
-    ControlEventKind, ProviderEvent, ProviderSource, SessionStatus, StartRequest, TerminalSize,
-    TransportKind, CONTROL_PROTOCOL_VERSION,
+    ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ProviderSource, SessionStatus,
+    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
@@ -44,6 +44,7 @@ async fn bounded_plain_text_one_shot_crosses_the_public_control_plane() {
             102,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

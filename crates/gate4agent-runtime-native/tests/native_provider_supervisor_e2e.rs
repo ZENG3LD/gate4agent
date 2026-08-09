@@ -15,8 +15,9 @@ use gate4agent_tool_engine::{
     ResourceScopeId, ToolActorId, ToolAuthorityCommand, ToolCapabilityId, ToolProviderId,
 };
 use gate4agent_types::{
-    AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, SessionGeneration,
-    SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ProviderRuntimePolicy,
+    SessionGeneration, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    CONTROL_PROTOCOL_VERSION,
 };
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -277,6 +278,7 @@ async fn native_provider_supervisor_reaps_cancelled_child_before_detach_and_high
             2,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")
@@ -746,6 +748,7 @@ async fn coordinated_shutdown_drains_exact_cancel_beyond_one_work_quantum() {
             12,
             ControlCommand::Start {
                 instance_id,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .expect("current directory")

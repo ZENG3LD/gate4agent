@@ -27,7 +27,7 @@ impl fmt::Debug for EnvMutation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LaunchRequest {
     pub working_dir: PathBuf,
     pub prompt: Option<String>,
@@ -35,6 +35,20 @@ pub struct LaunchRequest {
     pub env: Vec<EnvMutation>,
     pub platform: RuntimePlatform,
     pub session_options: Option<SessionOptionSelection>,
+}
+
+impl fmt::Debug for LaunchRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchRequest")
+            .field("working_dir", &self.working_dir)
+            .field("has_prompt", &self.prompt.is_some())
+            .field("extra_args_len", &self.extra_args.len())
+            .field("env", &self.env)
+            .field("platform", &self.platform)
+            .field("has_session_options", &self.session_options.is_some())
+            .finish()
+    }
 }
 
 impl Default for LaunchRequest {
@@ -318,6 +332,7 @@ mod tests {
     fn environment_and_launch_debug_preserve_names_and_actions_without_values() {
         let spec = builtin_registry().get_by_id("codex").unwrap();
         let mut request = request("prompt-value-must-be-redacted");
+        request.extra_args = vec![OsString::from("extra-arg-value-must-be-redacted")];
         request.env = vec![
             EnvMutation {
                 key: OsString::from("EXPLICIT_SECRET"),
@@ -328,6 +343,16 @@ mod tests {
                 value: None,
             },
         ];
+        let request_debug = format!("{request:?}");
+        assert!(request_debug.contains("EXPLICIT_SECRET"));
+        assert!(request_debug.contains("AMBIENT_SECRET"));
+        assert!(request_debug.contains("action: \"set\""));
+        assert!(request_debug.contains("action: \"remove\""));
+        assert!(request_debug.contains("has_prompt: true"));
+        assert!(request_debug.contains("extra_args_len: 1"));
+        assert!(!request_debug.contains("environment-value-must-be-redacted"));
+        assert!(!request_debug.contains("prompt-value-must-be-redacted"));
+        assert!(!request_debug.contains("extra-arg-value-must-be-redacted"));
         let plan = plan_launch(spec, request).unwrap();
 
         let debug = format!("{plan:?}");

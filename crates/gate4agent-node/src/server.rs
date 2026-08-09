@@ -18,6 +18,9 @@ use crate::workspace_file_windows::{
     WorkspaceFileReadError, WorkspaceFileReadErrorKind,
 };
 use crate::platform;
+use crate::provider_runtime::{
+    ProviderRuntimeAdmissionError, ProviderRuntimeMonitor, ProviderRuntimeRequirement,
+};
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
@@ -82,6 +85,7 @@ const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 const CONNECTION_SHUTDOWN_GRACE_MS: u64 = 250;
 const SPAWN_DISPATCH_TIMEOUT_MS: u64 = 2_000;
+const PROVIDER_RUNTIME_ADMISSION_TIMEOUT_MS: u64 = 2_500;
 const MUTATION_SETTLE_TIMEOUT_MS: u64 = 5_000;
 const READINESS_SETTLE_HEADROOM_MS: u64 = 2_000;
 const MANAGED_RESUME_SETTLE_TIMEOUT_MS: u64 = 30_000;
@@ -447,7 +451,8 @@ impl NodeServer {
             .iter()
             .map(|contract| contract.provider.clone())
             .collect();
-        let provider_runtime_statuses = crate::provider_runtime::collect(&catalog);
+        let provider_runtime_monitor = Arc::new(ProviderRuntimeMonitor::new(&catalog));
+        let provider_runtime_statuses = provider_runtime_monitor.collect();
         let state_path_lock =
             session_registry::StatePathLock::acquire(config.state_path.as_deref())
                 .map_err(|error| {
@@ -469,6 +474,7 @@ impl NodeServer {
             workspaces,
             enabled_providers,
             provider_runtime_statuses,
+            Some(provider_runtime_monitor),
             provider_contracts,
             provider_adapter_contracts,
             config.state_path.clone(),
@@ -899,6 +905,9 @@ struct NodeShared {
     workspaces: RwLock<BTreeMap<WorkspaceId, String>>,
     enabled_providers: Vec<AgentId>,
     provider_runtime_statuses: ProviderRuntimeStatuses,
+    provider_runtime_status_updates:
+        RwLock<BTreeMap<AgentId, crate::protocol::ProviderRuntimeStatus>>,
+    provider_runtime_monitor: Option<Arc<ProviderRuntimeMonitor>>,
     provider_contracts: Vec<ProviderContractSupport>,
     provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
     controller: Mutex<Option<ControllerLease>>,
@@ -966,6 +975,7 @@ impl NodeShared {
         workspaces: Vec<WorkspaceConfig>,
         enabled_providers: Vec<AgentId>,
         provider_runtime_statuses: ProviderRuntimeStatuses,
+        provider_runtime_monitor: Option<Arc<ProviderRuntimeMonitor>>,
         provider_contracts: Vec<ProviderContractSupport>,
         provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
         state_path: Option<PathBuf>,
@@ -996,6 +1006,8 @@ impl NodeShared {
             ),
             enabled_providers,
             provider_runtime_statuses,
+            provider_runtime_status_updates: RwLock::new(BTreeMap::new()),
+            provider_runtime_monitor,
             provider_contracts,
             provider_adapter_contracts,
             controller: Mutex::new(None),
@@ -1043,6 +1055,7 @@ impl NodeShared {
             workspaces,
             enabled_providers,
             ProviderRuntimeStatuses::default(),
+            None,
             Vec::new(),
             Vec::new(),
             None,
@@ -1057,6 +1070,60 @@ impl NodeShared {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    async fn admit_provider_runtime(
+        &self,
+        provider: &AgentId,
+        requirement: ProviderRuntimeRequirement,
+    ) -> Result<(), NodeFailure> {
+        let admission = if let Some(monitor) = self.provider_runtime_monitor.clone() {
+            let provider = provider.clone();
+            let refresh = tokio::task::spawn_blocking(move || {
+                monitor.evaluate(&provider, requirement)
+            });
+            let (status, admission) = timeout(
+                Duration::from_millis(PROVIDER_RUNTIME_ADMISSION_TIMEOUT_MS),
+                refresh,
+            )
+            .await
+            .map_err(|_| failure(
+                NodeFailureCode::BackendBusy,
+                "provider runtime probe exceeded its bounded deadline",
+            ))?
+            .map_err(|_| failure(
+                NodeFailureCode::BackendOperationFailed,
+                "provider runtime probe task failed",
+            ))?;
+            if let Some(status) = status {
+                self
+                    .provider_runtime_status_updates
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(status.provider().clone(), status);
+            }
+            admission
+        } else {
+            crate::provider_runtime::admit_status(
+                &self.provider_runtime_statuses,
+                provider,
+                requirement,
+            )
+        };
+        admission.map_err(|error| match error {
+            ProviderRuntimeAdmissionError::LauncherUnavailable => failure(
+                NodeFailureCode::BackendOperationFailed,
+                "provider launcher is unavailable",
+            ),
+            ProviderRuntimeAdmissionError::SemanticCapabilityUnverified => failure(
+                NodeFailureCode::UnsupportedCapability,
+                "provider semantic capability is not verified",
+            ),
+            ProviderRuntimeAdmissionError::ProbeBusy => failure(
+                NodeFailureCode::BackendBusy,
+                "provider runtime probe is already in progress",
+            ),
+        })
     }
 
     fn set_persistence_error(&self, error: Option<String>) {
@@ -1552,6 +1619,11 @@ impl NodeShared {
                 ));
             }
         }
+        self.admit_provider_runtime(
+            &record.provider,
+            ProviderRuntimeRequirement::Resume,
+        )
+        .await?;
         if let Some(stale_address) = self.bound_address_for_record(record_id) {
             self.remove_session(&stale_address).await?;
         }
@@ -2591,7 +2663,20 @@ impl NodeShared {
         NodeSnapshot {
             node_id: self.node_id.clone(),
             enabled_providers: self.enabled_providers.clone(),
-            provider_runtime_statuses: self.provider_runtime_statuses.clone(),
+            provider_runtime_statuses: {
+                let updates = self
+                    .provider_runtime_status_updates
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                ProviderRuntimeStatuses::new(
+                    self.provider_runtime_statuses
+                        .iter()
+                        .filter(|status| !updates.contains_key(status.provider()))
+                        .cloned()
+                        .chain(updates.values().cloned()),
+                )
+                .expect("refreshed provider runtime inventory remains bounded and unique")
+            },
             workspaces: workspaces.into_values().collect(),
             session_records: self
                 .session_records
@@ -2986,6 +3071,12 @@ impl NodeShared {
         terminal_size: gate4agent_types::TerminalSize,
         initial_prompt: Option<String>,
     ) -> Result<SessionAddress, NodeFailure> {
+        let runtime_requirement = match (mode, initial_prompt.is_some()) {
+            (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
+            (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPty,
+            (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
+        };
+        self.admit_provider_runtime(&provider, runtime_requirement).await?;
         self.ensure_binding_capacity()?;
         let working_directory = self.workspace_root(&workspace_id)?;
         let instance_id = AgentInstanceId(self.next_instance_id.fetch_add(1, Ordering::AcqRel));
@@ -4209,7 +4300,12 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             Ok(NodeResponse::SpawnAccepted { session })
         }
         NodeRequest::Resume { session, terminal_size, initial_prompt } => {
-            controlled_session(shared, connection_id, role, &session)?;
+            let provider = controlled_session(shared, connection_id, role, &session)?;
+            shared.admit_provider_runtime(
+                &provider,
+                ProviderRuntimeRequirement::Resume,
+            )
+            .await?;
             if let Some(prompt) = initial_prompt.as_deref() {
                 validate_node_text("resume initial prompt", prompt)?;
             }
@@ -5223,6 +5319,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_spawn_admission_rejects_before_session_mutation() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-provider-admission").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        shared.provider_runtime_statuses = ProviderRuntimeStatuses::new([
+            crate::protocol::ProviderRuntimeStatus::unavailable(agent("claude")),
+        ])
+        .unwrap();
+        let terminal_size = gate4agent_types::TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+
+        let unavailable = shared
+            .spawn_session(
+                WorkspaceId::new("primary").unwrap(),
+                agent("claude"),
+                SessionMode::Pty,
+                terminal_size,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.code, NodeFailureCode::BackendOperationFailed);
+        assert_eq!(unavailable.message, "backend-operation-failed");
+
+        shared.provider_runtime_statuses = ProviderRuntimeStatuses::new([
+            crate::protocol::ProviderRuntimeStatus::raw_passthrough(
+                agent("claude"),
+                Some(crate::protocol::ProviderRuntimeVersion::new("999.0.0").unwrap()),
+            ),
+        ])
+        .unwrap();
+        let semantic = shared
+            .spawn_session(
+                WorkspaceId::new("primary").unwrap(),
+                agent("claude"),
+                SessionMode::Inline,
+                terminal_size,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(semantic.code, NodeFailureCode::UnsupportedCapability);
+        assert_eq!(semantic.message, "unsupported-capability");
+
+        assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
+        assert!(shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(shared
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .is_empty());
+        assert!(shared.handle.snapshot().sessions.is_empty());
+    }
+
+    #[tokio::test]
     async fn windows_rejects_unix_bytes_workspace_path_before_filesystem_access() {
         let catalog = active_registry().unwrap();
         let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
@@ -5568,6 +5737,7 @@ mod tests {
             vec![workspace.clone()],
             vec![agent("claude")],
             ProviderRuntimeStatuses::default(),
+            None,
             Vec::new(),
             Vec::new(),
             Some(state_path.clone()),
@@ -5713,6 +5883,7 @@ mod tests {
             vec![workspace],
             vec![agent("claude")],
             ProviderRuntimeStatuses::default(),
+            None,
             Vec::new(),
             Vec::new(),
             None,

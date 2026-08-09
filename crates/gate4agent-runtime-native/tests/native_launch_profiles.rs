@@ -1314,6 +1314,20 @@ fn native_launch_environment_overlay_rejects_invalid_bindings_before_resolver_or
         control
             .install_native_launch_environment_overlay(
                 instance_id,
+                NativeLaunchEnvironmentOverlay::new(
+                    AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                    TransportKind::Pty,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap_err(),
+        NativeLaunchProfileError::EnvironmentOverlaySelectionMissing
+    );
+    assert_eq!(
+        control
+            .install_native_launch_environment_overlay(
+                instance_id,
                 overlay(CONTROL_FIXTURE_ID, OVERLAY_SENTINEL),
             )
             .unwrap_err(),
@@ -1539,7 +1553,7 @@ fn native_launch_environment_overlay_debug_surfaces_never_expose_values() {
 }
 
 #[tokio::test]
-async fn native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
+async fn bundle_only_native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
     let mut spec = interactive_agent_spec();
     let original_script = spec
         .launch
@@ -1600,53 +1614,37 @@ async fn native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
             ..NativeRuntimeConfig::default()
         },
     );
-    runtime
-        .upsert_native_launch_profile(
-            NativeLaunchProfile::new(
-                profile_id(),
-                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
-                TransportKind::Pty,
-                vec![
-                    OsString::from(PROFILE_SENTINEL),
-                    OsString::from(REMOVE_SENTINEL),
-                    OsString::from(CHILD_SENTINEL),
-                ],
-                Arc::new(SentinelResolver {
-                    generation: Arc::new(AtomicUsize::new(3)),
-                    calls: Arc::new(AtomicUsize::new(0)),
-                }),
-            )
-            .unwrap(),
-        )
-        .unwrap();
     let control = runtime.native_launch_profile_control();
     let selected_instance = AgentInstanceId(8505);
     let default_instance = AgentInstanceId(8506);
     control
-        .select_native_launch_profile(selected_instance, profile_id())
-        .unwrap();
-    assert_eq!(
-        control
-            .install_native_instance_launch_overlay(
+        .install_native_instance_launch_overlay(
             selected_instance,
             NativeInstanceLaunchOverlay::new(
                 AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
                 TransportKind::Pty,
-                vec![EnvMutation {
-                    key: OsString::from(PROFILE_SENTINEL),
-                    value: Some(OsString::from("overlay-profile")),
-                }],
-                vec![
-                    OsString::from("--bundle-mode"),
-                    OsString::from("portable"),
-                ],
+                Vec::new(),
+                vec![OsString::from("stale-bundle-argv")],
             )
             .unwrap(),
+        )
+        .unwrap();
+    assert!(control.clear_native_instance_launch_overlay(selected_instance));
+    assert!(!control.clear_native_instance_launch_overlay(selected_instance));
+    control
+        .install_native_instance_launch_overlay(
+            selected_instance,
+            NativeInstanceLaunchOverlay::new(
+                AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                Vec::new(),
+                vec![OsString::from("cleanup-only-bundle-argv")],
             )
-            .unwrap_err(),
-        NativeLaunchProfileError::EnvironmentOverlayKeyConflict
-    );
-
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(control.clear_native_launch_profile_selection(selected_instance));
+    assert!(!control.clear_native_launch_profile_selection(selected_instance));
     control
         .install_native_instance_launch_overlay(
             selected_instance,
@@ -1655,8 +1653,8 @@ async fn native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
                 TransportKind::Pty,
                 Vec::new(),
                 vec![
-                    OsString::from("--bundle-mode"),
-                    OsString::from("portable"),
+                    OsString::from("--bundle-root"),
+                    OsString::from("exact-private-bundle-path"),
                 ],
             )
             .unwrap(),
@@ -1680,14 +1678,18 @@ async fn native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
         let selected_ready = snapshot.sessions.iter().any(|session| {
             session.instance_id == selected_instance
                 && session.terminal_frame.as_ref().is_some_and(|frame| {
-                    frame.contents.contains("argv=--bundle-mode|portable;")
+                    frame
+                        .contents
+                        .contains("argv=--bundle-root|exact-private-bundle-path;")
+                        && !frame.contents.contains("stale-bundle-argv")
+                        && !frame.contents.contains("cleanup-only-bundle-argv")
                 })
         });
         let default_ready = snapshot.sessions.iter().any(|session| {
             session.instance_id == default_instance
                 && session.terminal_frame.as_ref().is_some_and(|frame| {
                     frame.contents.contains("fixture-ready>")
-                        && !frame.contents.contains("portable")
+                        && !frame.contents.contains("exact-private-bundle-path")
                 })
         });
         selected_ready && default_ready
@@ -1714,7 +1716,8 @@ async fn native_instance_launch_overlay_argv_reaches_exact_pty_child_only() {
 }
 
 #[test]
-fn native_instance_launch_overlay_rejects_unbounded_or_authority_conflicting_argv() {
+fn native_instance_launch_overlay_rejects_bounds_binding_and_reserved_argv_before_resolver_or_child(
+) {
     assert_eq!(
         NativeInstanceLaunchOverlay::new(
             AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
@@ -1766,10 +1769,22 @@ fn native_instance_launch_overlay_rejects_unbounded_or_authority_conflicting_arg
         );
     }
 
-    let (_handle, mut runtime) = NativeRuntime::new(
+    struct CountingEmptyResolver(Arc<AtomicUsize>);
+
+    impl NativeChildEnvironmentResolver for CountingEmptyResolver {
+        fn resolve_child_environment(
+            &self,
+        ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(Vec::new())
+        }
+    }
+
+    let (handle, mut runtime) = NativeRuntime::new(
         AgentRegistry::new([interactive_agent_spec()]).expect("fixture registry"),
         NativeRuntimeConfig::default(),
     );
+    let resolver_calls = Arc::new(AtomicUsize::new(0));
     runtime
         .upsert_native_launch_profile(
             NativeLaunchProfile::new(
@@ -1777,7 +1792,7 @@ fn native_instance_launch_overlay_rejects_unbounded_or_authority_conflicting_arg
                 AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
                 TransportKind::Pty,
                 vec![OsString::from(PROFILE_SENTINEL)],
-                Arc::new(EmptyResolver),
+                Arc::new(CountingEmptyResolver(Arc::clone(&resolver_calls))),
             )
             .unwrap(),
         )
@@ -1802,6 +1817,64 @@ fn native_instance_launch_overlay_rejects_unbounded_or_authority_conflicting_arg
             .unwrap_err(),
         NativeLaunchProfileError::EnvironmentOverlayBindingMismatch
     );
+    assert_eq!(resolver_calls.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.active_native_sessions(), 0);
+    assert!(handle.snapshot().sessions.is_empty());
+}
+
+#[tokio::test]
+async fn bundle_only_native_instance_launch_overlay_mismatch_fails_before_child() {
+    let (handle, mut runtime) = NativeRuntime::new(
+        AgentRegistry::new([interactive_agent_spec()]).expect("fixture registry"),
+        NativeRuntimeConfig::default(),
+    );
+    let instance_id = AgentInstanceId(8509);
+    runtime
+        .native_launch_profile_control()
+        .install_native_instance_launch_overlay(
+            instance_id,
+            NativeInstanceLaunchOverlay::new(
+                AgentId::new(HOOK_POSTING_FIXTURE_ID).unwrap(),
+                TransportKind::Pty,
+                Vec::new(),
+                vec![
+                    OsString::from("--bundle-root"),
+                    OsString::from("must-not-spawn"),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    register_and_start_agent(
+        &handle,
+        116,
+        instance_id,
+        AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
+    );
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == instance_id
+                && matches!(session.status, SessionStatus::Failed { .. })
+        })
+    })
+    .await;
+
+    let failure = handle
+        .snapshot()
+        .sessions
+        .iter()
+        .find(|session| session.instance_id == instance_id)
+        .and_then(|session| match &session.status {
+            SessionStatus::Failed { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("bundle-only binding mismatch must fail before spawn");
+    assert_eq!(
+        failure,
+        NativeLaunchProfileError::EnvironmentOverlayBindingMismatch.to_string()
+    );
+    assert_eq!(runtime.active_native_sessions(), 0);
 }
 
 #[test]
@@ -1819,7 +1892,10 @@ fn native_instance_launch_overlay_debug_surfaces_never_expose_argv() {
     let overlay = NativeInstanceLaunchOverlay::new(
         AgentId::new(CONTROL_FIXTURE_ID).unwrap(),
         TransportKind::Pty,
-        Vec::new(),
+        vec![EnvMutation {
+            key: OsString::from(OVERLAY_SENTINEL),
+            value: None,
+        }],
         vec![OsString::from(SECRET_ARG)],
     )
     .unwrap();

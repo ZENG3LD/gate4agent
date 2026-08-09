@@ -501,9 +501,9 @@ impl NativeLaunchProfiles {
     }
 
     pub(crate) fn clear_selection(&mut self, instance_id: AgentInstanceId) -> bool {
-        let removed = self.selections.remove(&instance_id).is_some();
-        self.instance_overlays.remove(&instance_id);
-        removed
+        let selection_removed = self.selections.remove(&instance_id).is_some();
+        let overlay_removed = self.instance_overlays.remove(&instance_id).is_some();
+        selection_removed || overlay_removed
     }
 
     pub(crate) fn install_environment_overlay(
@@ -511,6 +511,9 @@ impl NativeLaunchProfiles {
         instance_id: AgentInstanceId,
         overlay: NativeLaunchEnvironmentOverlay,
     ) -> Result<(), NativeLaunchProfileError> {
+        if !self.selections.contains_key(&instance_id) {
+            return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
+        }
         self.install_instance_overlay(instance_id, overlay.into_instance_overlay())
     }
 
@@ -519,17 +522,16 @@ impl NativeLaunchProfiles {
         instance_id: AgentInstanceId,
         overlay: NativeInstanceLaunchOverlay,
     ) -> Result<(), NativeLaunchProfileError> {
-        let profile_id = self
-            .selections
-            .get(&instance_id)
-            .ok_or(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing)?;
-        let profile = self
-            .profiles
-            .get(profile_id)
-            .ok_or_else(|| NativeLaunchProfileError::UnknownProfile {
-                profile_id: profile_id.clone(),
+        if let Some(profile_id) = self.selections.get(&instance_id) {
+            let profile = self.profiles.get(profile_id).ok_or_else(|| {
+                NativeLaunchProfileError::UnknownProfile {
+                    profile_id: profile_id.clone(),
+                }
             })?;
-        validate_instance_overlay_binding(profile, &overlay)?;
+            validate_instance_overlay_binding(profile, &overlay)?;
+        } else if !overlay.environment.is_empty() {
+            return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
+        }
         if !self.instance_overlays.contains_key(&instance_id)
             && self.instance_overlays.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
         {
@@ -544,6 +546,10 @@ impl NativeLaunchProfiles {
         Ok(())
     }
 
+    pub(crate) fn clear_instance_overlay(&mut self, instance_id: AgentInstanceId) -> bool {
+        self.instance_overlays.remove(&instance_id).is_some()
+    }
+
     fn profile_for_spawn(
         &self,
         instance_id: AgentInstanceId,
@@ -551,34 +557,45 @@ impl NativeLaunchProfiles {
         transport: TransportKind,
         pipe_binding_is_exact_one_shot: bool,
     ) -> Result<Option<NativeLaunchSpawnEnvironment>, NativeLaunchProfileError> {
-        let Some(profile_id) = self.selections.get(&instance_id) else {
-            return Ok(None);
-        };
-        let profile = self
-            .profiles
-            .get(profile_id)
-            .ok_or_else(|| NativeLaunchProfileError::UnknownProfile {
-                profile_id: profile_id.clone(),
-            })?;
-        if profile.agent_id() != agent_id || profile.transport() != transport {
-            return Err(NativeLaunchProfileError::BindingMismatch);
-        }
-        if transport == TransportKind::Pipe && !pipe_binding_is_exact_one_shot {
-            return Err(NativeLaunchProfileError::UnsupportedTransport);
-        }
         let overlay = self.instance_overlays.get(&instance_id).cloned();
+        let profile = if let Some(profile_id) = self.selections.get(&instance_id) {
+            let profile = self
+                .profiles
+                .get(profile_id)
+                .ok_or_else(|| NativeLaunchProfileError::UnknownProfile {
+                    profile_id: profile_id.clone(),
+                })?;
+            if profile.agent_id() != agent_id || profile.transport() != transport {
+                return Err(NativeLaunchProfileError::BindingMismatch);
+            }
+            if transport == TransportKind::Pipe && !pipe_binding_is_exact_one_shot {
+                return Err(NativeLaunchProfileError::UnsupportedTransport);
+            }
+            if let Some(overlay) = &overlay {
+                validate_instance_overlay_binding(profile, overlay)?;
+            }
+            Some(profile.clone())
+        } else {
+            None
+        };
         if let Some(overlay) = &overlay {
-            validate_instance_overlay_binding(profile, overlay)?;
+            validate_instance_overlay_spawn_binding(agent_id, transport, overlay)?;
+            if profile.is_none() && !overlay.environment.is_empty() {
+                return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
+            }
+        }
+        if profile.is_none() && overlay.is_none() {
+            return Ok(None);
         }
         Ok(Some(NativeLaunchSpawnEnvironment {
-            profile: profile.clone(),
+            profile,
             overlay,
         }))
     }
 }
 
 struct NativeLaunchSpawnEnvironment {
-    profile: NativeLaunchProfile,
+    profile: Option<NativeLaunchProfile>,
     overlay: Option<Arc<NativeInstanceLaunchOverlay>>,
 }
 
@@ -643,13 +660,21 @@ impl NativeLaunchProfileControl {
         self.lock().install_environment_overlay(instance_id, overlay)
     }
 
-    /// Installs or replaces one host-only PTY launch overlay for an exact selection.
+    /// Installs or replaces one host-only PTY launch overlay for an exact instance.
+    ///
+    /// An argv-only overlay does not require an environment profile selection.
+    /// Environment mutations retain the existing exact-selection requirement.
     pub fn install_native_instance_launch_overlay(
         &self,
         instance_id: AgentInstanceId,
         overlay: NativeInstanceLaunchOverlay,
     ) -> Result<(), NativeLaunchProfileError> {
         self.lock().install_instance_overlay(instance_id, overlay)
+    }
+
+    /// Clears one host-only instance launch overlay for future spawns only.
+    pub fn clear_native_instance_launch_overlay(&self, instance_id: AgentInstanceId) -> bool {
+        self.lock().clear_instance_overlay(instance_id)
     }
 
     pub(crate) fn resolve_launch_overlay(
@@ -673,9 +698,11 @@ impl NativeLaunchProfileControl {
                 extra_args: Vec::new(),
             });
         };
-        let mut environment = spawn_environment
-            .profile
-            .resolve_environment(agent_id, transport)?;
+        let mut environment = if let Some(profile) = spawn_environment.profile {
+            profile.resolve_environment(agent_id, transport)?
+        } else {
+            Vec::new()
+        };
         let mut extra_args = Vec::new();
         if let Some(overlay) = spawn_environment.overlay {
             environment.extend(overlay.environment.iter().cloned());
@@ -807,9 +834,7 @@ fn validate_instance_overlay_binding(
     profile: &NativeLaunchProfile,
     overlay: &NativeInstanceLaunchOverlay,
 ) -> Result<(), NativeLaunchProfileError> {
-    if profile.agent_id() != &overlay.agent_id || profile.transport() != overlay.transport {
-        return Err(NativeLaunchProfileError::EnvironmentOverlayBindingMismatch);
-    }
+    validate_instance_overlay_spawn_binding(profile.agent_id(), profile.transport(), overlay)?;
     let profile_keys = profile
         .owned_env_keys
         .iter()
@@ -823,6 +848,17 @@ fn validate_instance_overlay_binding(
             .is_some_and(|key| profile_keys.contains(&key.to_ascii_uppercase()))
     }) {
         return Err(NativeLaunchProfileError::EnvironmentOverlayKeyConflict);
+    }
+    Ok(())
+}
+
+fn validate_instance_overlay_spawn_binding(
+    agent_id: &AgentId,
+    transport: TransportKind,
+    overlay: &NativeInstanceLaunchOverlay,
+) -> Result<(), NativeLaunchProfileError> {
+    if agent_id != &overlay.agent_id || transport != overlay.transport {
+        return Err(NativeLaunchProfileError::EnvironmentOverlayBindingMismatch);
     }
     Ok(())
 }

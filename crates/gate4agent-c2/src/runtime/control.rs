@@ -9,6 +9,7 @@ use crate::protocol::{
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+    C2_HISTORY_CONTEXT_PACK_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
@@ -50,6 +51,7 @@ struct NegotiatedPathCapabilities {
     managed_worktree_lifecycle: bool,
     child_environment_profile: bool,
     session_bundle_materialization: bool,
+    history_context_pack: bool,
     terminal_frame_events: bool,
 }
 
@@ -518,6 +520,12 @@ async fn control_writer<W>(
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
+        if !path_capabilities.history_context_pack
+            && !project_server_frame_without_history_context_pack(&mut frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
         }
@@ -583,6 +591,7 @@ fn negotiated_path_capabilities(
             selected_has(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY),
         session_bundle_materialization:
             selected_has(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY),
+        history_context_pack: selected_has(C2_HISTORY_CONTEXT_PACK_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
     }
 }
@@ -613,6 +622,10 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
                     | C2NodeResponse::SessionRecordUpdated { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
+                    | C2NodeResponse::HistoryDiscovered { .. }
+                    | C2NodeResponse::HistoryLoaded { .. }
+                    | C2NodeResponse::ContextPackExported { .. }
+                    | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
                     | C2NodeResponse::WorkspaceUnregistered { .. }
                     | C2NodeResponse::WorktreeCreated { .. }
@@ -653,6 +666,13 @@ fn unnegotiated_request_failure(
     request: &NodeRequest,
     capabilities: NegotiatedPathCapabilities,
 ) -> Option<C2RelayFailure> {
+    if !request.history_context_pack_contract_is_valid() {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "invalid history context pack request",
+            None,
+        ));
+    }
     let required_capability_available = match request.required_capability() {
         None => true,
         Some(C2_WORKSPACE_FILE_READ_CAPABILITY) => capabilities.workspace_file_read,
@@ -662,6 +682,7 @@ fn unnegotiated_request_failure(
         Some(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY) => {
             capabilities.managed_worktree_lifecycle
         }
+        Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => capabilities.history_context_pack,
         Some(_) => false,
     };
     if !required_capability_available {
@@ -707,9 +728,19 @@ fn unnegotiated_request_failure(
             None,
         ));
     }
+    if request.requires_history_context_pack_capability()
+        && !capabilities.history_context_pack
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "history context pack capability was not negotiated with C2",
+            None,
+        ));
+    }
     if !capabilities.provider_ids_open
         && (matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
-            || spawn_spec_requires_open_provider_capability(request))
+            || spawn_spec_requires_open_provider_capability(request)
+            || matches!(request, NodeRequest::ForgetContextPack { .. }))
     {
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
@@ -777,6 +808,10 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::DiscoverHistory { .. }
+        | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPack { .. }
+        | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -831,6 +866,10 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                     | C2NodeResponse::SessionRecordUpdated { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
+                    | C2NodeResponse::HistoryDiscovered { .. }
+                    | C2NodeResponse::HistoryLoaded { .. }
+                    | C2NodeResponse::ContextPackExported { .. }
+                    | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
                     | C2NodeResponse::WorkspaceUnregistered { .. }
                     | C2NodeResponse::WorktreeCreated { .. }
@@ -979,6 +1018,97 @@ fn status_contains_session_bundle_materialization(status: &StatusResponse) -> bo
     })
 }
 
+fn project_server_frame_without_history_context_pack(frame: &mut C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => {
+            let Ok(routed) = reply.result.as_mut() else {
+                return true;
+            };
+            match routed.response.as_mut() {
+                Ok(response) => strip_history_context_pack_from_response(response),
+                Err(failure) => !matches!(
+                    failure.code,
+                    NodeFailureCode::UnknownContextPack
+                        | NodeFailureCode::ContextPackBusy
+                        | NodeFailureCode::ContextPackMaterializationFailed
+                ),
+            }
+        }
+        C2ServerFrame::Event(event) => {
+            strip_history_context_pack_from_event(&mut event.event);
+            true
+        }
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => true,
+    }
+}
+
+fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bool {
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. } => {
+            strip_history_context_pack_from_snapshot(snapshot);
+            true
+        }
+        C2NodeResponse::Resync { snapshot, events, .. } => {
+            strip_history_context_pack_from_snapshot(snapshot);
+            for event in events {
+                strip_history_context_pack_from_event(&mut event.event);
+            }
+            true
+        }
+        C2NodeResponse::SpawnSpecAccepted { receipt } => {
+            receipt.context_id = None;
+            receipt.context = None;
+            true
+        }
+        C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
+            receipt.spawn.context_id = None;
+            receipt.spawn.context = None;
+            true
+        }
+        C2NodeResponse::SessionRecordUpdated { record }
+        | C2NodeResponse::SessionRecordResumed { record, .. } => {
+            strip_history_context_pack_from_record(record);
+            true
+        }
+        C2NodeResponse::HistoryDiscovered { .. }
+        | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackExported { .. }
+        | C2NodeResponse::ContextPackForgotten { .. } => false,
+        C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeCleanup { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::WorkspaceRegistered { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::WorktreeCreated { .. }
+        | C2NodeResponse::WorktreeRemoved { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => true,
+    }
+}
+
+fn strip_history_context_pack_from_snapshot(snapshot: &mut crate::protocol::C2NodeSnapshot) {
+    for record in &mut snapshot.session_records {
+        strip_history_context_pack_from_record(record);
+    }
+}
+
+fn strip_history_context_pack_from_event(event: &mut C2NodeEvent) {
+    if let C2NodeEvent::SessionRecordUpserted { record } = event {
+        strip_history_context_pack_from_record(record);
+    }
+}
+
+fn strip_history_context_pack_from_record(record: &mut crate::protocol::C2ManagedSessionRecord) {
+    record.context_id = None;
+    record.context = None;
+}
+
 fn c2_response_contains_managed_worktree(response: &C2NodeResponse) -> bool {
     match response {
         C2NodeResponse::Snapshot { snapshot, .. } => !snapshot.managed_worktrees.is_empty(),
@@ -1029,6 +1159,10 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::HistoryDiscovered { .. }
+        | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackExported { .. }
+        | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::Accepted
         | C2NodeResponse::ShuttingDown => false,
@@ -1260,6 +1394,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
             operating_system: OperatingSystemId::new(std::env::consts::OS)
@@ -1332,6 +1468,9 @@ fn request_targets_unavailable_provider(
         | NodeRequest::Input { session, .. }
         | NodeRequest::TerminalBytes { session, .. }
         | NodeRequest::TerminalControl { session, .. }
+        | NodeRequest::DiscoverHistory { session, .. }
+        | NodeRequest::LoadHistory { session, .. }
+        | NodeRequest::ExportContextPack { session }
         | NodeRequest::Resize { session, .. }
         | NodeRequest::Interrupt { session }
         | NodeRequest::Stop { session, .. }
@@ -1343,6 +1482,7 @@ fn request_targets_unavailable_provider(
         | NodeRequest::ForgetSessionRecord { record_id } => {
             !status_record_is_legacy(status, node_id, record_id)
         }
+        NodeRequest::ForgetContextPack { .. } => true,
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
         | NodeRequest::InspectWorkspace { .. }
@@ -1471,8 +1611,44 @@ fn retain_legacy_snapshot(snapshot: &mut crate::protocol::C2NodeSnapshot) {
     for workspace in &mut snapshot.workspaces {
         retain_legacy_workspace(workspace);
     }
-    snapshot.session_records
-        .retain(|record| provider_id_is_legacy(&record.provider));
+    snapshot.session_records.retain_mut(project_legacy_record_provider);
+}
+
+fn context_receipt_provider_is_legacy(
+    context: &gate4agent_node_protocol::ResolvedContextPackReceipt,
+) -> bool {
+    provider_id_is_legacy(&context.lineage.source_provider)
+}
+
+fn project_legacy_record_provider(
+    record: &mut crate::protocol::C2ManagedSessionRecord,
+) -> bool {
+    if !provider_id_is_legacy(&record.provider) {
+        return false;
+    }
+    if record
+        .context
+        .as_ref()
+        .is_some_and(|context| !context_receipt_provider_is_legacy(context))
+    {
+        strip_history_context_pack_from_record(record);
+    }
+    true
+}
+
+fn project_legacy_spawn_provider(receipt: &mut ResolvedSpawnReceipt) -> bool {
+    if !provider_id_is_legacy(&receipt.provider) {
+        return false;
+    }
+    if receipt
+        .context
+        .as_ref()
+        .is_some_and(|context| !context_receipt_provider_is_legacy(context))
+    {
+        receipt.context_id = None;
+        receipt.context = None;
+    }
+    true
 }
 
 fn project_legacy_response(
@@ -1500,13 +1676,16 @@ fn project_legacy_response(
         }
         C2NodeResponse::SessionRecordUpdated { record }
         | C2NodeResponse::SessionRecordResumed { record, .. } => {
-            provider_id_is_legacy(&record.provider)
+            project_legacy_record_provider(record)
         }
         C2NodeResponse::SpawnSpecAccepted { receipt } => {
-            provider_id_is_legacy(&receipt.provider)
+            project_legacy_spawn_provider(receipt)
         }
         C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
-            provider_id_is_legacy(&receipt.spawn.provider)
+            project_legacy_spawn_provider(&mut receipt.spawn)
+        }
+        C2NodeResponse::ContextPackExported { context } => {
+            context_receipt_provider_is_legacy(context)
         }
         C2NodeResponse::WorkspaceRegistered { workspace }
         | C2NodeResponse::WorktreeCreated { workspace, .. } => {
@@ -1519,6 +1698,9 @@ fn project_legacy_response(
         | C2NodeResponse::SpawnAccepted { .. }
         | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::HistoryDiscovered { .. }
+        | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::WorktreeRemoved { .. }
         | C2NodeResponse::Accepted
@@ -1542,7 +1724,7 @@ fn project_legacy_event(
             true
         }
         C2NodeEvent::SessionRecordUpserted { record } => {
-            provider_id_is_legacy(&record.provider)
+            project_legacy_record_provider(record)
         }
         C2NodeEvent::SessionRecordRemoved { record_id } => {
             record_is_legacy(status, node_id, snapshot, record_id)
@@ -1632,6 +1814,10 @@ fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
         | C2NodeResponse::SessionRecordUpdated { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::HistoryDiscovered { .. }
+        | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackExported { .. }
+        | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::WorktreeCreated { .. }
@@ -1755,6 +1941,7 @@ mod tests {
             bundle_id: None,
             bundle: None,
             context_id: None,
+            context: None,
             environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
@@ -1768,6 +1955,26 @@ mod tests {
                 context_id: SpawnFieldProvenance::Profile,
                 environment_profile_id: SpawnFieldProvenance::Profile,
             },
+        }
+    }
+
+    fn context_receipt() -> crate::protocol::ResolvedContextPackReceipt {
+        crate::protocol::ResolvedContextPackReceipt {
+            id: crate::protocol::SpawnContextId::new("context-1").unwrap(),
+            digest: crate::protocol::SpawnContextDigest::new(format!(
+                "sha256:{}",
+                "a".repeat(64),
+            ))
+            .unwrap(),
+            lineage: crate::protocol::ContextPackLineageReceipt {
+                source_node_id: NodeId::new("node-a").unwrap(),
+                source_session: address(7),
+                source_provider: AgentId::new("claude").unwrap(),
+            },
+            source_message_count: 2,
+            retained_message_count: 2,
+            byte_len: 32,
+            truncated: false,
         }
     }
 
@@ -1891,6 +2098,7 @@ mod tests {
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -1929,6 +2137,7 @@ mod tests {
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_none());
@@ -2052,6 +2261,7 @@ mod tests {
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
             session_bundle_materialization: false,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         let inherited = spawn_spec("node-a");
@@ -2086,6 +2296,99 @@ mod tests {
     }
 
     #[test]
+    fn c2_history_context_pack_gate_and_legacy_projection_are_fail_closed() {
+        let request = NodeRequest::DiscoverHistory {
+            session: address(7),
+            limit: 1,
+        };
+        let mut capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            child_environment_profile: true,
+            session_bundle_materialization: true,
+            history_context_pack: false,
+            terminal_frame_events: true,
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "request capability was not negotiated with C2"
+        ));
+        capabilities.history_context_pack = true;
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+
+        let invalid = NodeRequest::DiscoverHistory {
+            session: address(7),
+            limit: 0,
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&invalid, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "invalid history context pack request"
+        ));
+
+        capabilities.provider_ids_open = false;
+        let forget = NodeRequest::ForgetContextPack {
+            context_id: gate4agent_node_protocol::SpawnContextId::new("context-a").unwrap(),
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&forget, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "open provider IDs require negotiated C2 capability"
+        ));
+        capabilities.provider_ids_open = true;
+        assert!(unnegotiated_request_failure(&forget, capabilities).is_none());
+
+        let context = context_receipt();
+        let mut receipt = spawn_receipt();
+        receipt.context_id = Some(context.id.clone());
+        receipt.context = Some(context);
+        let mut nested = C2NodeResponse::SpawnSpecAccepted { receipt };
+        assert!(strip_history_context_pack_from_response(&mut nested));
+        let C2NodeResponse::SpawnSpecAccepted { receipt } = nested else {
+            unreachable!("constructed spawn response");
+        };
+        assert!(receipt.context_id.is_none());
+        assert!(receipt.context.is_none());
+
+        let mut standalone = C2NodeResponse::HistoryLoaded {
+            session: address(7),
+            session_id: "session-1".to_owned(),
+            message_count: 2,
+        };
+        assert!(!strip_history_context_pack_from_response(&mut standalone));
+        let mut failure = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(9),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Err(C2NodeFailure {
+                    code: NodeFailureCode::UnknownContextPack,
+                    message: "context pack unavailable".to_owned(),
+                }),
+            }),
+        });
+        assert!(!project_server_frame_without_history_context_pack(
+            &mut failure,
+        ));
+    }
+
+    #[test]
     fn managed_worktree_partial_capability_intersections_fail_closed() {
         let request = NodeRequest::SpawnManagedWorktree {
             request: crate::protocol::ManagedWorktreeSpawnRequest {
@@ -2105,6 +2408,7 @@ mod tests {
             managed_worktree_lifecycle: false,
             child_environment_profile: true,
             session_bundle_materialization: true,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_some());
@@ -2196,8 +2500,9 @@ mod tests {
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
-                session_bundle_materialization: true,
-                terminal_frame_events: true,
+            session_bundle_materialization: true,
+            history_context_pack: true,
+            terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
@@ -2249,6 +2554,7 @@ mod tests {
             managed_worktree_lifecycle: true,
             child_environment_profile: false,
             session_bundle_materialization: true,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         control_writer(
@@ -2300,8 +2606,9 @@ mod tests {
                 worktree_selection: false,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
-                session_bundle_materialization: true,
-                terminal_frame_events: true,
+            session_bundle_materialization: true,
+            history_context_pack: true,
+            terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
@@ -2481,6 +2788,7 @@ mod tests {
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2671,6 +2979,7 @@ mod tests {
                 managed_worktree_lifecycle: false,
                 child_environment_profile: false,
                 session_bundle_materialization: false,
+                history_context_pack: false,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2708,6 +3017,7 @@ mod tests {
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
                 session_bundle_materialization: true,
+                history_context_pack: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2745,6 +3055,7 @@ mod tests {
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
                 session_bundle_materialization: true,
+                history_context_pack: true,
                 terminal_frame_events: false,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
@@ -2800,6 +3111,7 @@ mod tests {
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2817,6 +3129,7 @@ mod tests {
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         assert!(matches!(
@@ -2834,6 +3147,7 @@ mod tests {
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
+            history_context_pack: true,
             terminal_frame_events: true,
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
@@ -2869,8 +3183,9 @@ mod tests {
                 worktree_selection: true,
                 managed_worktree_lifecycle: true,
                 child_environment_profile: true,
-                session_bundle_materialization: true,
-                terminal_frame_events: true,
+            session_bundle_materialization: true,
+            history_context_pack: true,
+            terminal_frame_events: true,
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;

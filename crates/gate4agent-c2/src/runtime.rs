@@ -964,6 +964,7 @@ fn validate_spawn_receipt(
     relay_incarnation_id: NodeIncarnationId,
 ) -> Result<(), &'static str> {
     if receipt.incarnation_id != relay_incarnation_id
+        || !receipt.context_binding_is_valid()
         || receipt.target != spec.target
         || receipt.profile_id != spec.profile_id
         || receipt.idempotency_key != spec.idempotency_key
@@ -1816,6 +1817,7 @@ mod tests {
             bundle_id: None,
             bundle: None,
             context_id: None,
+            context: None,
             environment_profile: None,
             deadline_ms: spec.deadline_ms,
             idempotency_key: spec.idempotency_key.clone(),
@@ -1895,6 +1897,26 @@ mod tests {
                 "a".repeat(64),
             ))
             .unwrap(),
+        });
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.context = Some(gate4agent_node_protocol::ResolvedContextPackReceipt {
+            id: gate4agent_node_protocol::SpawnContextId::new("unexpected-context")
+                .unwrap(),
+            digest: gate4agent_node_protocol::SpawnContextDigest::new(format!(
+                "sha256:{}",
+                "b".repeat(64),
+            ))
+            .unwrap(),
+            lineage: gate4agent_node_protocol::ContextPackLineageReceipt {
+                source_node_id: NodeId::new("node-a").unwrap(),
+                source_session: receipt.session.clone(),
+                source_provider: AgentId::new("codex").unwrap(),
+            },
+            source_message_count: 1,
+            retained_message_count: 1,
+            byte_len: 16,
+            truncated: false,
         });
         mismatches.push(changed);
 
@@ -1989,6 +2011,7 @@ mod tests {
             bundle_id: None,
             bundle: None,
             context_id: None,
+            context: None,
             environment_profile: None,
             deadline_ms: spec.deadline_ms,
             idempotency_key: spec.idempotency_key.clone(),

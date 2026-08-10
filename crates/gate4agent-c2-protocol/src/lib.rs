@@ -12,6 +12,7 @@ pub use gate4agent_node_protocol::{
     ProviderRuntimeContractId, ProviderRuntimeMode, ProviderRuntimeStatus,
     ProviderRuntimeStatuses, ProviderRuntimeVersion,
     ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt,
+    ContextPackLineageReceipt, ResolvedContextPackReceipt, SpawnContextDigest,
     ResolvedSpawnSpec, SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision,
     SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId,
     SpawnEnvironmentProfileRevision, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
@@ -22,6 +23,7 @@ pub use gate4agent_node_protocol::{
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+    NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
@@ -36,6 +38,7 @@ use gate4agent_types::{
     AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity, SessionGeneration,
     SessionStatus, TerminalFrame, TerminalSize, TransportKind,
 };
+pub use gate4agent_types::HistoryCandidateSummary;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -66,6 +69,7 @@ pub const C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY;
 pub const C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY;
+pub const C2_HISTORY_CONTEXT_PACK_CAPABILITY: &str = NODE_HISTORY_CONTEXT_PACK_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -183,6 +187,11 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::SessionRecordBusy => "managed session busy",
             NodeFailureCode::SessionRecordConflict => "managed session conflict",
             NodeFailureCode::SessionWorkspaceMismatch => "session workspace mismatch",
+            NodeFailureCode::UnknownContextPack => "context pack unavailable",
+            NodeFailureCode::ContextPackBusy => "context pack busy",
+            NodeFailureCode::ContextPackMaterializationFailed => {
+                "context pack materialization failed"
+            }
             NodeFailureCode::StaleGeneration => "stale session generation",
             NodeFailureCode::BackendBusy => "node backend busy",
             NodeFailureCode::BackendDisconnected => "node backend disconnected",
@@ -193,7 +202,19 @@ impl From<&NodeFailure> for C2NodeFailure {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+impl C2NodeFailure {
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        use gate4agent_node_protocol::NodeFailureCode;
+        matches!(
+            self.code,
+            NodeFailureCode::UnknownContextPack
+                | NodeFailureCode::ContextPackBusy
+                | NodeFailureCode::ContextPackMaterializationFailed
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct C2ManagedSessionRecord {
     pub record_id: SessionRecordId,
     pub display_name: String,
@@ -206,9 +227,82 @@ pub struct C2ManagedSessionRecord {
     pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<ResolvedBundleReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<SpawnContextId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ResolvedContextPackReceipt>,
     pub provider_identity_present: bool,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+}
+
+impl C2ManagedSessionRecord {
+    pub fn context_binding_is_valid(&self) -> bool {
+        match (self.context_id.as_ref(), self.context.as_ref()) {
+            (None, None) => true,
+            (Some(context_id), Some(context)) => {
+                &context.id == context_id && context.is_valid()
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        self.context_id.is_some() || self.context.is_some()
+    }
+}
+
+impl<'de> Deserialize<'de> for C2ManagedSessionRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireRecord {
+            record_id: SessionRecordId,
+            display_name: String,
+            provider: AgentId,
+            mode: SessionMode,
+            state: ManagedSessionState,
+            workspace_id: WorkspaceId,
+            active_session: Option<SessionAddress>,
+            #[serde(default)]
+            environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+            #[serde(default)]
+            bundle: Option<ResolvedBundleReceipt>,
+            #[serde(default)]
+            context_id: Option<SpawnContextId>,
+            #[serde(default)]
+            context: Option<ResolvedContextPackReceipt>,
+            provider_identity_present: bool,
+            created_at_unix_ms: u64,
+            updated_at_unix_ms: u64,
+        }
+
+        let wire = WireRecord::deserialize(deserializer)?;
+        let record = Self {
+            record_id: wire.record_id,
+            display_name: wire.display_name,
+            provider: wire.provider,
+            mode: wire.mode,
+            state: wire.state,
+            workspace_id: wire.workspace_id,
+            active_session: wire.active_session,
+            environment_profile: wire.environment_profile,
+            bundle: wire.bundle,
+            context_id: wire.context_id,
+            context: wire.context,
+            provider_identity_present: wire.provider_identity_present,
+            created_at_unix_ms: wire.created_at_unix_ms,
+            updated_at_unix_ms: wire.updated_at_unix_ms,
+        };
+        if !record.context_binding_is_valid() {
+            return Err(serde::de::Error::custom(
+                "C2 managed session context id and materialization receipt are not correlated",
+            ));
+        }
+        Ok(record)
+    }
 }
 
 impl From<&ManagedSessionRecord> for C2ManagedSessionRecord {
@@ -223,6 +317,8 @@ impl From<&ManagedSessionRecord> for C2ManagedSessionRecord {
             active_session: record.active_session.clone(),
             environment_profile: record.environment_profile.clone(),
             bundle: record.bundle.clone(),
+            context_id: record.context_id.clone(),
+            context: record.context.clone(),
             provider_identity_present: record.provider_session.is_some(),
             created_at_unix_ms: record.created_at_unix_ms,
             updated_at_unix_ms: record.updated_at_unix_ms,
@@ -335,6 +431,12 @@ impl C2NodeSnapshot {
         self.session_records
             .iter()
             .any(|record| record.bundle.is_some())
+    }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        self.session_records
+            .iter()
+            .any(C2ManagedSessionRecord::requires_history_context_pack_capability)
     }
 }
 
@@ -642,6 +744,11 @@ impl C2NodeEvent {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.bundle.is_some())
     }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        matches!(self, Self::SessionRecordUpserted { record }
+            if record.requires_history_context_pack_capability())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -747,6 +854,19 @@ pub enum C2NodeResponse {
         session: SessionAddress,
     },
     SessionRecordForgotten { record_id: SessionRecordId },
+    HistoryDiscovered {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_c2_history_candidates")]
+        candidates: Vec<HistoryCandidateSummary>,
+    },
+    HistoryLoaded {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_c2_history_session_id")]
+        session_id: String,
+        message_count: u64,
+    },
+    ContextPackExported { context: ResolvedContextPackReceipt },
+    ContextPackForgotten { context_id: SpawnContextId },
     WorkspaceRegistered {
         workspace: C2WorkspaceSnapshot,
     },
@@ -807,6 +927,25 @@ impl From<&NodeResponse> for C2NodeResponse {
             NodeResponse::SessionRecordForgotten { record_id } => Self::SessionRecordForgotten {
                 record_id: record_id.clone(),
             },
+            NodeResponse::HistoryDiscovered { session, candidates } => Self::HistoryDiscovered {
+                session: session.clone(),
+                candidates: candidates.clone(),
+            },
+            NodeResponse::HistoryLoaded {
+                session,
+                session_id,
+                message_count,
+            } => Self::HistoryLoaded {
+                session: session.clone(),
+                session_id: session_id.clone(),
+                message_count: *message_count,
+            },
+            NodeResponse::ContextPackExported { context } => Self::ContextPackExported {
+                context: context.clone(),
+            },
+            NodeResponse::ContextPackForgotten { context_id } => Self::ContextPackForgotten {
+                context_id: context_id.clone(),
+            },
             NodeResponse::WorkspaceRegistered { workspace } => Self::WorkspaceRegistered {
                 workspace: C2WorkspaceSnapshot::from(workspace),
             },
@@ -855,6 +994,10 @@ impl C2NodeResponse {
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::HistoryDiscovered { .. }
+            | Self::HistoryLoaded { .. }
+            | Self::ContextPackExported { .. }
+            | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
@@ -887,6 +1030,10 @@ impl C2NodeResponse {
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::HistoryDiscovered { .. }
+            | Self::HistoryLoaded { .. }
+            | Self::ContextPackExported { .. }
+            | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
@@ -895,6 +1042,92 @@ impl C2NodeResponse {
             | Self::ShuttingDown => false,
         }
     }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.requires_history_context_pack_capability()
+            }
+            Self::Resync {
+                snapshot, events, ..
+            } => {
+                snapshot.requires_history_context_pack_capability()
+                    || events.iter().any(|event| {
+                        event.event.requires_history_context_pack_capability()
+                    })
+            }
+            Self::SpawnSpecAccepted { receipt } => {
+                receipt.context_id.is_some() || receipt.context.is_some()
+            }
+            Self::ManagedWorktreeSpawnAccepted { receipt } => {
+                receipt.spawn.context_id.is_some() || receipt.spawn.context.is_some()
+            }
+            Self::SessionRecordUpdated { record }
+            | Self::SessionRecordResumed { record, .. } => {
+                record.requires_history_context_pack_capability()
+            }
+            Self::HistoryDiscovered { .. }
+            | Self::HistoryLoaded { .. }
+            | Self::ContextPackExported { .. }
+            | Self::ContextPackForgotten { .. } => true,
+            Self::WorkspaceInspected { .. }
+            | Self::WorkspaceFileRead { .. }
+            | Self::Controller { .. }
+            | Self::SpawnAccepted { .. }
+            | Self::ManagedWorktreeCleanup { .. }
+            | Self::SessionRecordForgotten { .. }
+            | Self::WorkspaceRegistered { .. }
+            | Self::WorkspaceUnregistered { .. }
+            | Self::WorktreeCreated { .. }
+            | Self::WorktreeRemoved { .. }
+            | Self::Accepted
+            | Self::ShuttingDown => false,
+        }
+    }
+}
+
+fn deserialize_c2_history_candidates<'de, D>(
+    deserializer: D,
+) -> Result<Vec<HistoryCandidateSummary>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let candidates = Vec::<HistoryCandidateSummary>::deserialize(deserializer)?;
+    if candidates.len() > usize::from(gate4agent_types::HISTORY_DISCOVERY_LIMIT_MAX) {
+        return Err(serde::de::Error::custom(
+            "C2 history candidate count exceeds the discovery limit",
+        ));
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        candidate.validate().map_err(serde::de::Error::custom)?;
+        if candidates[..index]
+            .iter()
+            .any(|existing| existing.id == candidate.id)
+        {
+            return Err(serde::de::Error::custom(
+                "C2 history candidates contain a duplicate candidate ID",
+            ));
+        }
+    }
+    Ok(candidates)
+}
+
+fn deserialize_c2_history_session_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let session_id = String::deserialize(deserializer)?;
+    let validation = gate4agent_types::HistorySessionRecord {
+        session_id: session_id.clone(),
+        title: None,
+        cwd: None,
+        model: None,
+        message_count: 0,
+        total_tokens: 0,
+        messages: Vec::new(),
+    };
+    validation.validate().map_err(serde::de::Error::custom)?;
+    Ok(session_id)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1572,6 +1805,7 @@ impl From<&ManagedSessionRecord> for SlimManagedSessionRecord {
         let (display_name, display_name_truncated) =
             truncate_utf8(&record.display_name, MAX_C2_SESSION_DISPLAY_NAME_BYTES);
         Self {
+            // Legacy Slim inventory deliberately strips context_id and context receipts.
             record_id: record.record_id.clone(),
             display_name,
             display_name_truncated,
@@ -1593,6 +1827,7 @@ impl From<&C2ManagedSessionRecord> for SlimManagedSessionRecord {
         let (display_name, display_name_truncated) =
             truncate_utf8(&record.display_name, MAX_C2_SESSION_DISPLAY_NAME_BYTES);
         Self {
+            // Legacy Slim inventory deliberately strips context_id and context receipts.
             record_id: record.record_id.clone(),
             display_name,
             display_name_truncated,
@@ -1754,9 +1989,33 @@ mod tests {
                 .unwrap(),
             }),
             bundle: None,
+            context_id: None,
+            context: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
             last_error: Some("private-error-with-secret-token".to_owned()),
+        }
+    }
+
+    fn context_pack_receipt() -> ResolvedContextPackReceipt {
+        ResolvedContextPackReceipt {
+            id: SpawnContextId::new("context-review-7").unwrap(),
+            digest: SpawnContextDigest::new(format!("sha256:{}", "c".repeat(64))).unwrap(),
+            lineage: ContextPackLineageReceipt {
+                source_node_id: NodeId::new("node-source").unwrap(),
+                source_session: SessionAddress {
+                    workspace_id: WorkspaceId::new("source-workspace").unwrap(),
+                    session: gate4agent_node_protocol::SessionKey {
+                        instance_id: AgentInstanceId(17),
+                        generation: SessionGeneration(4),
+                    },
+                },
+                source_provider: provider("codex"),
+            },
+            source_message_count: 9,
+            retained_message_count: 7,
+            byte_len: 4096,
+            truncated: true,
         }
     }
 
@@ -2286,6 +2545,233 @@ mod tests {
         assert_private_record_fields_absent(&json);
         assert!(C2NodeEvent::SessionRecordUpserted { record: projected }
             .requires_session_bundle_materialization_capability());
+    }
+
+    #[test]
+    fn c2_history_context_pack_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(C2_HISTORY_CONTEXT_PACK_CAPABILITY, "history-context-pack-v1");
+        assert_eq!(
+            C2_HISTORY_CONTEXT_PACK_CAPABILITY,
+            NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+        );
+        let capability = CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let bound = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        assert!(bound
+            .windows(C2_HISTORY_CONTEXT_PACK_CAPABILITY.len())
+            .any(|window| window == C2_HISTORY_CONTEXT_PACK_CAPABILITY.as_bytes()));
+
+        for code in [
+            NodeFailureCode::UnknownContextPack,
+            NodeFailureCode::ContextPackBusy,
+            NodeFailureCode::ContextPackMaterializationFailed,
+        ] {
+            let failure = C2NodeFailure::from(&NodeFailure {
+                code,
+                message: "private context backend detail".to_owned(),
+            });
+            assert!(failure.requires_history_context_pack_capability());
+            assert!(!failure.message.contains("private"));
+        }
+        assert!(!C2NodeFailure::from(&NodeFailure {
+            code: NodeFailureCode::UnknownSession,
+            message: "private session backend detail".to_owned(),
+        })
+        .requires_history_context_pack_capability());
+    }
+
+    #[test]
+    fn c2_history_context_pack_requests_are_exact_and_capability_gated() {
+        let session = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(3),
+            },
+        };
+        let requests = [
+            (
+                NodeRequest::DiscoverHistory { session: session.clone(), limit: 4 },
+                r#"{"kind":"discover-history","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"limit":4}"#,
+            ),
+            (
+                NodeRequest::LoadHistory {
+                    session: session.clone(),
+                    candidate_id: "candidate-7".to_owned(),
+                },
+                r#"{"kind":"load-history","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"candidate_id":"candidate-7"}"#,
+            ),
+            (
+                NodeRequest::ExportContextPack { session },
+                r#"{"kind":"export-context-pack","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}}}"#,
+            ),
+            (
+                NodeRequest::ForgetContextPack {
+                    context_id: SpawnContextId::new("context-review-7").unwrap(),
+                },
+                r#"{"kind":"forget-context-pack","context_id":"context-review-7"}"#,
+            ),
+        ];
+
+        for (request, expected) in requests {
+            assert_eq!(request.required_capability(), Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY));
+            assert!(request.requires_history_context_pack_capability());
+            assert_eq!(serde_json::to_string(&request).unwrap(), expected);
+            assert_eq!(serde_json::from_str::<NodeRequest>(expected).unwrap(), request);
+        }
+        assert!(serde_json::from_str::<NodeRequest>(
+            r#"{"kind":"export-context-pack","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"path":"private.jsonl"}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn c2_context_metadata_projects_through_records_snapshots_events_and_responses() {
+        let context = context_pack_receipt();
+        let mut source = private_session_record();
+        source.context_id = Some(context.id.clone());
+        source.context = Some(context.clone());
+        let projected = C2ManagedSessionRecord::from(&source);
+        assert!(projected.context_binding_is_valid());
+        assert!(projected.requires_history_context_pack_capability());
+        assert_eq!(projected.context_id.as_ref(), Some(&context.id));
+        assert_eq!(projected.context.as_ref(), Some(&context));
+
+        let record_json = serde_json::to_string(&projected).unwrap();
+        assert_private_record_fields_absent(&record_json);
+        assert_eq!(
+            serde_json::from_str::<C2ManagedSessionRecord>(&record_json).unwrap(),
+            projected,
+        );
+        let mut mismatched = serde_json::from_str::<serde_json::Value>(&record_json).unwrap();
+        mismatched["context_id"] = serde_json::json!("context-other");
+        assert!(serde_json::from_value::<C2ManagedSessionRecord>(mismatched).is_err());
+
+        let snapshot = C2NodeSnapshot::from(&NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: vec![source.clone()],
+            managed_worktrees: Vec::new(),
+        });
+        assert!(snapshot.requires_history_context_pack_capability());
+        let event = C2NodeEvent::from(&NodeEvent::SessionRecordUpserted {
+            record: source.clone(),
+        });
+        assert!(event.requires_history_context_pack_capability());
+
+        let updated = C2NodeResponse::from(&NodeResponse::SessionRecordUpdated {
+            record: source,
+        });
+        assert!(updated.requires_history_context_pack_capability());
+        assert!(serde_json::to_string(&updated).unwrap().contains("context-review-7"));
+
+        let exported = C2NodeResponse::from(&NodeResponse::ContextPackExported {
+            context: context.clone(),
+        });
+        assert!(exported.requires_history_context_pack_capability());
+        let json = serde_json::to_string(&exported).unwrap();
+        assert!(json.contains(r#""kind":"context-pack-exported""#));
+        assert!(json.contains(r#""source_message_count":9"#));
+        assert!(!json.contains("messages"));
+        assert!(!json.contains("path"));
+        assert_eq!(serde_json::from_str::<C2NodeResponse>(&json).unwrap(), exported);
+    }
+
+    #[test]
+    fn c2_history_responses_are_exact_bounded_metadata_without_messages_or_paths() {
+        let session = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(3),
+            },
+        };
+        let discovered = C2NodeResponse::from(&NodeResponse::HistoryDiscovered {
+            session: session.clone(),
+            candidates: vec![HistoryCandidateSummary {
+                id: "candidate-7".to_owned(),
+                session_id_hint: "session-hint-7".to_owned(),
+                modified_at_unix_ms: Some(77),
+            }],
+        });
+        let loaded = C2NodeResponse::from(&NodeResponse::HistoryLoaded {
+            session,
+            session_id: "session-loaded-7".to_owned(),
+            message_count: 12,
+        });
+        let forgotten = C2NodeResponse::from(&NodeResponse::ContextPackForgotten {
+            context_id: SpawnContextId::new("context-review-7").unwrap(),
+        });
+        assert_eq!(
+            serde_json::to_string(&discovered).unwrap(),
+            r#"{"kind":"history-discovered","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"candidates":[{"id":"candidate-7","session_id_hint":"session-hint-7","modified_at_unix_ms":77}]}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            r#"{"kind":"history-loaded","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"session_id":"session-loaded-7","message_count":12}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&forgotten).unwrap(),
+            r#"{"kind":"context-pack-forgotten","context_id":"context-review-7"}"#,
+        );
+        for response in [discovered, loaded, forgotten] {
+            assert!(response.requires_history_context_pack_capability());
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("messages"));
+            assert!(!json.contains("path"));
+            assert_eq!(serde_json::from_str::<C2NodeResponse>(&json).unwrap(), response);
+        }
+        assert!(serde_json::from_str::<C2NodeResponse>(
+            r#"{"kind":"history-discovered","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"candidates":[{"id":"duplicate","session_id_hint":"one","modified_at_unix_ms":null},{"id":"duplicate","session_id_hint":"two","modified_at_unix_ms":null}]}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_slim_projection_deliberately_strips_context_metadata() {
+        let context = context_pack_receipt();
+        let mut source = private_session_record();
+        source.context_id = Some(context.id.clone());
+        source.context = Some(context);
+        let c2 = C2ManagedSessionRecord::from(&source);
+
+        for json in [
+            serde_json::to_value(SlimManagedSessionRecord::from(&source)).unwrap(),
+            serde_json::to_value(SlimManagedSessionRecord::from(&c2)).unwrap(),
+        ] {
+            assert!(json.get("context_id").is_none());
+            assert!(json.get("context").is_none());
+        }
     }
 
     #[test]
@@ -3191,6 +3677,8 @@ mod tests {
             active_session: None,
             environment_profile: None,
             bundle: None,
+            context_id: None,
+            context: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
             last_error: Some("private backend diagnostic".to_owned()),
@@ -3256,6 +3744,8 @@ mod tests {
                 active_session: None,
                 environment_profile: None,
                 bundle: None,
+                context_id: None,
+                context: None,
                 created_at_unix_ms: index as u64,
                 updated_at_unix_ms: index as u64,
                 last_error: None,

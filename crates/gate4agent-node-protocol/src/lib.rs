@@ -1,6 +1,8 @@
 //! Bounded wire contract for the local Gate4Agent node.
 
-pub use gate4agent_types::{AdapterFamily, AdapterId, AgentId};
+pub use gate4agent_types::{
+    AdapterFamily, AdapterId, AgentId, HistoryCandidateSummary, HISTORY_DISCOVERY_LIMIT_MAX,
+};
 use gate4agent_types::{
     AgentInstanceId, ControlEvent, ProviderSessionIdentity, SessionGeneration, SessionSnapshot,
     TerminalControl, TerminalFrame, TerminalSize,
@@ -18,7 +20,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-pub const NODE_PROTOCOL_VERSION: u16 = 8;
+pub const NODE_PROTOCOL_VERSION: u16 = 9;
 pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_STATE_SCHEMA_V3: u16 = 3;
@@ -26,6 +28,7 @@ pub const NODE_STATE_SCHEMA_V4: u16 = 4;
 pub const NODE_STATE_SCHEMA_V5: u16 = 5;
 pub const NODE_STATE_SCHEMA_V6: u16 = 6;
 pub const NODE_STATE_SCHEMA_V7: u16 = 7;
+pub const NODE_STATE_SCHEMA_V8: u16 = 8;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
@@ -43,6 +46,7 @@ pub const NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
     "child-environment-profile-v1";
 pub const NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
     "session-bundle-materialization-v1";
+pub const NODE_HISTORY_CONTEXT_PACK_CAPABILITY: &str = "history-context-pack-v1";
 pub const SPAWN_RUNTIME_RAW_PTY_LIFECYCLE: &str = "raw-pty-lifecycle";
 pub const SPAWN_RUNTIME_SEMANTIC_READINESS: &str = "semantic-readiness";
 pub const SPAWN_RUNTIME_STRUCTURED_PROMPT: &str = "structured-prompt";
@@ -72,6 +76,9 @@ pub const MAX_SPAWN_BUNDLE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_RESOURCE_ID_BYTES: usize = 128;
 pub const MAX_SPAWN_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub const MAX_SPAWN_REQUIRED_CAPABILITIES: usize = 16;
+pub const MAX_CONTEXT_PACK_BYTES: u32 = 256 * 1024;
+pub const MAX_CONTEXT_PACK_RETAINED_MESSAGES: u64 =
+    gate4agent_types::HISTORY_MESSAGES_MAX as u64;
 pub const MAX_WORKTREE_PROFILE_ID_BYTES: usize = 64;
 pub const MAX_WORKTREE_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_MANAGED_WORKTREE_LEASE_ID_BYTES: usize = 128;
@@ -371,6 +378,10 @@ pub struct SpawnContextId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+pub struct SpawnContextDigest(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct SpawnEnvironmentProfileId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -488,6 +499,55 @@ impl<'de> Deserialize<'de> for SpawnBundleDigest {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("spawn bundle digest must be sha256: followed by exactly 64 lowercase hexadecimal characters")]
 pub struct SpawnBundleDigestError;
+
+impl SpawnContextDigest {
+    pub fn new(value: impl Into<String>) -> Result<Self, SpawnContextDigestError> {
+        let value = value.into();
+        let digest = value
+            .strip_prefix("sha256:")
+            .ok_or(SpawnContextDigestError)?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(SpawnContextDigestError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SpawnContextDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SpawnContextDigest {
+    type Err = SpawnContextDigestError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for SpawnContextDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("spawn context digest must be sha256: followed by exactly 64 lowercase hexadecimal characters")]
+pub struct SpawnContextDigestError;
 spawn_identifier_impl!(
     SpawnEnvironmentProfileRevision,
     "spawn environment profile revision",
@@ -1131,6 +1191,86 @@ pub struct ResolvedBundleReceipt {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ContextPackLineageReceipt {
+    pub source_node_id: NodeId,
+    pub source_session: SessionAddress,
+    pub source_provider: AgentId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedContextPackReceipt {
+    pub id: SpawnContextId,
+    pub digest: SpawnContextDigest,
+    pub lineage: ContextPackLineageReceipt,
+    pub source_message_count: u64,
+    pub retained_message_count: u64,
+    pub byte_len: u32,
+    pub truncated: bool,
+}
+
+impl<'de> Deserialize<'de> for ResolvedContextPackReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireReceipt {
+            id: SpawnContextId,
+            digest: SpawnContextDigest,
+            lineage: ContextPackLineageReceipt,
+            source_message_count: u64,
+            retained_message_count: u64,
+            byte_len: u32,
+            truncated: bool,
+        }
+
+        let wire = WireReceipt::deserialize(deserializer)?;
+        let receipt = Self {
+            id: wire.id,
+            digest: wire.digest,
+            lineage: wire.lineage,
+            source_message_count: wire.source_message_count,
+            retained_message_count: wire.retained_message_count,
+            byte_len: wire.byte_len,
+            truncated: wire.truncated,
+        };
+        if !receipt.is_valid() {
+            return Err(serde::de::Error::custom(
+                "context pack receipt is empty, inconsistent, or exceeds protocol limits",
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+impl ResolvedContextPackReceipt {
+    pub fn is_valid(&self) -> bool {
+        self.source_message_count > 0
+            && self.retained_message_count > 0
+            && self.retained_message_count <= self.source_message_count
+            && self.retained_message_count <= MAX_CONTEXT_PACK_RETAINED_MESSAGES
+            && self.byte_len > 0
+            && self.byte_len <= MAX_CONTEXT_PACK_BYTES
+            && self.truncated
+                == (self.source_message_count > self.retained_message_count)
+    }
+}
+
+fn context_receipt_binding_is_valid(
+    context_id: Option<&SpawnContextId>,
+    context: Option<&ResolvedContextPackReceipt>,
+) -> bool {
+    match (context_id, context) {
+        (None, None) => true,
+        (Some(context_id), Some(context)) => &context.id == context_id && context.is_valid(),
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedSpawnReceipt {
     pub incarnation_id: NodeIncarnationId,
     pub session: SessionAddress,
@@ -1145,12 +1285,81 @@ pub struct ResolvedSpawnReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<ResolvedBundleReceipt>,
     pub context_id: Option<SpawnContextId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ResolvedContextPackReceipt>,
     #[serde(rename = "environment_profile_id")]
     pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     pub deadline_ms: SpawnDeadlineMs,
     pub idempotency_key: SpawnIdempotencyKey,
     pub required_capabilities: SpawnRequiredCapabilities,
     pub provenance: SpawnResolutionProvenance,
+}
+
+impl ResolvedSpawnReceipt {
+    pub fn context_binding_is_valid(&self) -> bool {
+        context_receipt_binding_is_valid(self.context_id.as_ref(), self.context.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedSpawnReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireReceipt {
+            incarnation_id: NodeIncarnationId,
+            session: SessionAddress,
+            target: SpawnTarget,
+            profile_id: SpawnProfileId,
+            profile_revision: SpawnProfileRevision,
+            provider: AgentId,
+            mode: SessionMode,
+            terminal_size: TerminalSize,
+            prompt: SpawnPromptMetadata,
+            bundle_id: Option<SpawnBundleId>,
+            #[serde(default)]
+            bundle: Option<ResolvedBundleReceipt>,
+            context_id: Option<SpawnContextId>,
+            #[serde(default)]
+            context: Option<ResolvedContextPackReceipt>,
+            #[serde(rename = "environment_profile_id")]
+            environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+            deadline_ms: SpawnDeadlineMs,
+            idempotency_key: SpawnIdempotencyKey,
+            required_capabilities: SpawnRequiredCapabilities,
+            provenance: SpawnResolutionProvenance,
+        }
+
+        let wire = WireReceipt::deserialize(deserializer)?;
+        let receipt = Self {
+            incarnation_id: wire.incarnation_id,
+            session: wire.session,
+            target: wire.target,
+            profile_id: wire.profile_id,
+            profile_revision: wire.profile_revision,
+            provider: wire.provider,
+            mode: wire.mode,
+            terminal_size: wire.terminal_size,
+            prompt: wire.prompt,
+            bundle_id: wire.bundle_id,
+            bundle: wire.bundle,
+            context_id: wire.context_id,
+            context: wire.context,
+            environment_profile: wire.environment_profile,
+            deadline_ms: wire.deadline_ms,
+            idempotency_key: wire.idempotency_key,
+            required_capabilities: wire.required_capabilities,
+            provenance: wire.provenance,
+        };
+        if !receipt.context_binding_is_valid() {
+            return Err(serde::de::Error::custom(
+                "spawn receipt context id and materialization receipt are not correlated",
+            ));
+        }
+        Ok(receipt)
+    }
 }
 
 impl SpawnSpec {
@@ -1232,7 +1441,7 @@ impl ResolvedSpawnSpec {
         incarnation_id: NodeIncarnationId,
         session: SessionAddress,
     ) -> ResolvedSpawnReceipt {
-        self.receipt_with_materialization(incarnation_id, session, None, None)
+        self.receipt_with_materialization(incarnation_id, session, None, None, None)
     }
 
     pub fn receipt_with_environment(
@@ -1246,6 +1455,7 @@ impl ResolvedSpawnSpec {
             session,
             environment_profile,
             None,
+            None,
         )
     }
 
@@ -1255,6 +1465,7 @@ impl ResolvedSpawnSpec {
         session: SessionAddress,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
         bundle: Option<ResolvedBundleReceipt>,
+        context: Option<ResolvedContextPackReceipt>,
     ) -> ResolvedSpawnReceipt {
         ResolvedSpawnReceipt {
             incarnation_id,
@@ -1269,6 +1480,7 @@ impl ResolvedSpawnSpec {
             bundle_id: self.bundle_id.clone(),
             bundle,
             context_id: self.context_id.clone(),
+            context,
             environment_profile,
             deadline_ms: self.deadline_ms,
             idempotency_key: self.idempotency_key.clone(),
@@ -2525,6 +2737,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_REPOSITORY_PATH_CAPABILITY,
             NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
             NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+            NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -2537,7 +2750,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V7,
+                maximum: NODE_STATE_SCHEMA_V8,
             },
         }),
     }
@@ -2746,7 +2959,7 @@ pub enum ManagedSessionState {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ManagedSessionRecord {
     pub record_id: SessionRecordId,
     pub display_name: String,
@@ -2761,9 +2974,76 @@ pub struct ManagedSessionRecord {
     pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<ResolvedBundleReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<SpawnContextId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ResolvedContextPackReceipt>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub last_error: Option<String>,
+}
+
+impl ManagedSessionRecord {
+    pub fn context_binding_is_valid(&self) -> bool {
+        context_receipt_binding_is_valid(self.context_id.as_ref(), self.context.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedSessionRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireRecord {
+            record_id: SessionRecordId,
+            display_name: String,
+            provider: AgentId,
+            mode: SessionMode,
+            state: ManagedSessionState,
+            workspace_id: WorkspaceId,
+            canonical_root: OpaqueHostPath,
+            provider_session: Option<ProviderSessionIdentity>,
+            active_session: Option<SessionAddress>,
+            #[serde(default)]
+            environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+            #[serde(default)]
+            bundle: Option<ResolvedBundleReceipt>,
+            #[serde(default)]
+            context_id: Option<SpawnContextId>,
+            #[serde(default)]
+            context: Option<ResolvedContextPackReceipt>,
+            created_at_unix_ms: u64,
+            updated_at_unix_ms: u64,
+            last_error: Option<String>,
+        }
+
+        let wire = WireRecord::deserialize(deserializer)?;
+        let record = Self {
+            record_id: wire.record_id,
+            display_name: wire.display_name,
+            provider: wire.provider,
+            mode: wire.mode,
+            state: wire.state,
+            workspace_id: wire.workspace_id,
+            canonical_root: wire.canonical_root,
+            provider_session: wire.provider_session,
+            active_session: wire.active_session,
+            environment_profile: wire.environment_profile,
+            bundle: wire.bundle,
+            context_id: wire.context_id,
+            context: wire.context,
+            created_at_unix_ms: wire.created_at_unix_ms,
+            updated_at_unix_ms: wire.updated_at_unix_ms,
+            last_error: wire.last_error,
+        };
+        if !record.context_binding_is_valid() {
+            return Err(serde::de::Error::custom(
+                "managed session context id and materialization receipt are not correlated",
+            ));
+        }
+        Ok(record)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2931,6 +3211,79 @@ impl NodeSnapshot {
             .iter()
             .any(|record| record.bundle.is_some())
     }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        self.session_records.iter().any(|record| {
+            record.context_id.is_some() || record.context.is_some()
+        })
+    }
+}
+
+fn deserialize_history_discovery_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let limit = u16::deserialize(deserializer)?;
+    if !(1..=HISTORY_DISCOVERY_LIMIT_MAX).contains(&limit) {
+        return Err(serde::de::Error::custom(
+            "history discovery limit is outside the supported bounded range",
+        ));
+    }
+    Ok(limit)
+}
+
+fn deserialize_history_candidate_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let candidate_id = String::deserialize(deserializer)?;
+    gate4agent_types::validate_candidate_id(&candidate_id)
+        .map_err(serde::de::Error::custom)?;
+    Ok(candidate_id)
+}
+
+fn deserialize_history_session_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let session_id = String::deserialize(deserializer)?;
+    let validation = gate4agent_types::HistorySessionRecord {
+        session_id: session_id.clone(),
+        title: None,
+        cwd: None,
+        model: None,
+        message_count: 0,
+        total_tokens: 0,
+        messages: Vec::new(),
+    };
+    validation.validate().map_err(serde::de::Error::custom)?;
+    Ok(session_id)
+}
+
+fn deserialize_history_candidates<'de, D>(
+    deserializer: D,
+) -> Result<Vec<HistoryCandidateSummary>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let candidates = Vec::<HistoryCandidateSummary>::deserialize(deserializer)?;
+    if candidates.len() > usize::from(HISTORY_DISCOVERY_LIMIT_MAX) {
+        return Err(serde::de::Error::custom(
+            "history candidate count exceeds the discovery limit",
+        ));
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        candidate.validate().map_err(serde::de::Error::custom)?;
+        if candidates[..index]
+            .iter()
+            .any(|existing| existing.id == candidate.id)
+        {
+            return Err(serde::de::Error::custom(
+                "history candidates contain a duplicate candidate ID",
+            ));
+        }
+    }
+    Ok(candidates)
 }
 
 fn deserialize_managed_worktree_leases<'de, D>(
@@ -3129,6 +3482,22 @@ pub enum NodeRequest {
     ForgetSessionRecord {
         record_id: SessionRecordId,
     },
+    DiscoverHistory {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_history_discovery_limit")]
+        limit: u16,
+    },
+    LoadHistory {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_history_candidate_id")]
+        candidate_id: String,
+    },
+    ExportContextPack {
+        session: SessionAddress,
+    },
+    ForgetContextPack {
+        context_id: SpawnContextId,
+    },
     Prompt { session: SessionAddress, text: String },
     Paste { session: SessionAddress, text: String },
     Input { session: SessionAddress, text: String },
@@ -3142,6 +3511,47 @@ pub enum NodeRequest {
 }
 
 impl NodeRequest {
+    pub fn history_context_pack_contract_is_valid(&self) -> bool {
+        match self {
+            Self::DiscoverHistory { limit, .. } => {
+                (1..=HISTORY_DISCOVERY_LIMIT_MAX).contains(limit)
+            }
+            Self::LoadHistory { candidate_id, .. } => {
+                gate4agent_types::validate_candidate_id(candidate_id).is_ok()
+            }
+            Self::Snapshot
+            | Self::Resync { .. }
+            | Self::InspectWorkspace { .. }
+            | Self::ReadWorkspaceFile { .. }
+            | Self::AcquireController { .. }
+            | Self::ReleaseController
+            | Self::RegisterWorkspace { .. }
+            | Self::UnregisterWorkspace { .. }
+            | Self::CreateWorktree { .. }
+            | Self::RemoveWorktree { .. }
+            | Self::Spawn { .. }
+            | Self::SpawnSpec { .. }
+            | Self::SpawnManagedWorktree { .. }
+            | Self::CleanupManagedWorktree { .. }
+            | Self::Resume { .. }
+            | Self::RenameSessionRecord { .. }
+            | Self::ResumeSessionRecord { .. }
+            | Self::ForgetSessionRecord { .. }
+            | Self::ExportContextPack { .. }
+            | Self::ForgetContextPack { .. }
+            | Self::Prompt { .. }
+            | Self::Paste { .. }
+            | Self::Input { .. }
+            | Self::TerminalBytes { .. }
+            | Self::TerminalControl { .. }
+            | Self::Resize { .. }
+            | Self::Interrupt { .. }
+            | Self::Stop { .. }
+            | Self::Remove { .. }
+            | Self::Shutdown => true,
+        }
+    }
+
     pub fn required_capability(&self) -> Option<&'static str> {
         match self {
             Self::ReadWorkspaceFile { .. } => Some(NODE_WORKSPACE_FILE_READ_CAPABILITY),
@@ -3149,6 +3559,12 @@ impl NodeRequest {
             Self::SpawnManagedWorktree { .. }
             | Self::CleanupManagedWorktree { .. } => {
                 Some(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
+            }
+            Self::DiscoverHistory { .. }
+            | Self::LoadHistory { .. }
+            | Self::ExportContextPack { .. }
+            | Self::ForgetContextPack { .. } => {
+                Some(NODE_HISTORY_CONTEXT_PACK_CAPABILITY)
             }
             Self::Snapshot
             | Self::Resync { .. }
@@ -3213,6 +3629,22 @@ impl NodeRequest {
         };
         !matches!(spec.overrides.bundle_id, SpawnOverride::Clear)
     }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        match self {
+            Self::DiscoverHistory { .. }
+            | Self::LoadHistory { .. }
+            | Self::ExportContextPack { .. }
+            | Self::ForgetContextPack { .. } => true,
+            Self::SpawnSpec { spec } => {
+                !matches!(spec.overrides.context_id, SpawnOverride::Clear)
+            }
+            Self::SpawnManagedWorktree { request } => {
+                !matches!(request.spawn_spec.overrides.context_id, SpawnOverride::Clear)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3264,6 +3696,23 @@ pub enum NodeResponse {
     },
     SessionRecordForgotten {
         record_id: SessionRecordId,
+    },
+    HistoryDiscovered {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_history_candidates")]
+        candidates: Vec<HistoryCandidateSummary>,
+    },
+    HistoryLoaded {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_history_session_id")]
+        session_id: String,
+        message_count: u64,
+    },
+    ContextPackExported {
+        context: ResolvedContextPackReceipt,
+    },
+    ContextPackForgotten {
+        context_id: SpawnContextId,
     },
     WorkspaceRegistered {
         workspace: WorkspaceSnapshot,
@@ -3328,6 +3777,10 @@ impl NodeResponse {
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::HistoryDiscovered { .. }
+            | Self::HistoryLoaded { .. }
+            | Self::ContextPackExported { .. }
+            | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
@@ -3354,6 +3807,52 @@ impl NodeResponse {
             Self::ManagedWorktreeSpawnAccepted { receipt } => receipt.spawn.bundle.is_some(),
             Self::SessionRecordUpdated { record }
             | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
+            Self::WorkspaceInspected { .. }
+            | Self::WorkspaceFileRead { .. }
+            | Self::Controller { .. }
+            | Self::SpawnAccepted { .. }
+            | Self::ManagedWorktreeCleanup { .. }
+            | Self::SessionRecordForgotten { .. }
+            | Self::HistoryDiscovered { .. }
+            | Self::HistoryLoaded { .. }
+            | Self::ContextPackExported { .. }
+            | Self::ContextPackForgotten { .. }
+            | Self::WorkspaceRegistered { .. }
+            | Self::WorkspaceUnregistered { .. }
+            | Self::WorktreeCreated { .. }
+            | Self::WorktreeRemoved { .. }
+            | Self::Accepted
+            | Self::ShuttingDown => false,
+        }
+    }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.requires_history_context_pack_capability()
+            }
+            Self::Resync {
+                snapshot, events, ..
+            } => {
+                snapshot.requires_history_context_pack_capability()
+                    || events.iter().any(|event| {
+                        event.event.requires_history_context_pack_capability()
+                    })
+            }
+            Self::SpawnSpecAccepted { receipt } => {
+                receipt.context_id.is_some() || receipt.context.is_some()
+            }
+            Self::ManagedWorktreeSpawnAccepted { receipt } => {
+                receipt.spawn.context_id.is_some() || receipt.spawn.context.is_some()
+            }
+            Self::SessionRecordUpdated { record }
+            | Self::SessionRecordResumed { record, .. } => {
+                record.context_id.is_some() || record.context.is_some()
+            }
+            Self::HistoryDiscovered { .. }
+            | Self::HistoryLoaded { .. }
+            | Self::ContextPackExported { .. }
+            | Self::ContextPackForgotten { .. } => true,
             Self::WorkspaceInspected { .. }
             | Self::WorkspaceFileRead { .. }
             | Self::Controller { .. }
@@ -3408,6 +3907,9 @@ pub enum NodeFailureCode {
     ManagedWorktreeRecoveryRequired,
     UnknownSpawnProfile,
     UnknownBundle,
+    UnknownContextPack,
+    ContextPackBusy,
+    ContextPackMaterializationFailed,
     UnknownEnvironmentProfile,
     BundleBindingMismatch,
     EnvironmentProfileBindingMismatch,
@@ -3461,6 +3963,11 @@ impl NodeEvent {
     pub fn requires_session_bundle_materialization_capability(&self) -> bool {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.bundle.is_some())
+    }
+
+    pub fn requires_history_context_pack_capability(&self) -> bool {
+        matches!(self, Self::SessionRecordUpserted { record }
+            if record.context_id.is_some() || record.context.is_some())
     }
 }
 
@@ -3594,6 +4101,35 @@ mod tests {
         RepositoryPath::utf8(value.to_owned()).unwrap()
     }
 
+    fn session_address(workspace_id: &str, instance_id: u64) -> SessionAddress {
+        SessionAddress {
+            workspace_id: WorkspaceId::new(workspace_id).unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(instance_id),
+                generation: SessionGeneration(1),
+            },
+        }
+    }
+
+    fn context_receipt(
+        id: &str,
+        source_session: SessionAddress,
+    ) -> ResolvedContextPackReceipt {
+        ResolvedContextPackReceipt {
+            id: SpawnContextId::new(id).unwrap(),
+            digest: SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            lineage: ContextPackLineageReceipt {
+                source_node_id: NodeId::new("node-a").unwrap(),
+                source_session,
+                source_provider: agent("claude"),
+            },
+            source_message_count: 3,
+            retained_message_count: 2,
+            byte_len: 32,
+            truncated: true,
+        }
+    }
+
     fn portable_node_support() -> NodeCompatibilitySupport {
         NodeCompatibilitySupport {
             protocol_versions: ProtocolRange::new(7, 9).unwrap(),
@@ -3627,11 +4163,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_hello_json_remains_exactly_protocol_v8() {
+    fn legacy_hello_json_remains_exactly_protocol_v9() {
         let client = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
         assert_eq!(
             serde_json::to_string(&client).unwrap(),
-            r#"{"protocol_version":8,"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+            r#"{"protocol_version":9,"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
         );
 
         let challenge = ServerChallenge {
@@ -3763,15 +4299,13 @@ mod tests {
             ],
         );
 
-        let receipt = first.receipt(
+        let source_session = session_address("primary", 7);
+        let receipt = first.receipt_with_materialization(
             NodeIncarnationId::from_bytes([9; NODE_INCARNATION_ID_BYTES]),
-            SessionAddress {
-                workspace_id: WorkspaceId::new("review-tree").unwrap(),
-                session: SessionKey {
-                    instance_id: AgentInstanceId(11),
-                    generation: SessionGeneration(1),
-                },
-            },
+            session_address("review-tree", 11),
+            None,
+            None,
+            Some(context_receipt("repo-context", source_session)),
         );
         assert_eq!(receipt.prompt, SpawnPromptMetadata {
             present: true,
@@ -3780,7 +4314,7 @@ mod tests {
         let receipt_json = serde_json::to_string(&receipt).unwrap();
         assert_eq!(
             receipt_json,
-            r#"{"incarnation_id":"09090909090909090909090909090909","session":{"workspace_id":"review-tree","session":{"instance_id":11,"generation":1}},"target":{"node_id":"node-a","workspace_id":"primary","worktree_id":"review-tree"},"profile_id":"review-default","profile_revision":"review-default.r3","provider":"claude","mode":"inline","terminal_size":{"rows":31,"columns":97},"prompt":{"present":true,"byte_len":19},"bundle_id":null,"context_id":"repo-context","environment_profile_id":null,"deadline_ms":30000,"idempotency_key":"request-0001","required_capabilities":["raw-pty-lifecycle","structured-prompt"],"provenance":{"provider":"profile","mode":"override","terminal_size":"override","prompt":"override","bundle_id":"cleared","context_id":"profile","environment_profile_id":"cleared"}}"#,
+            r#"{"incarnation_id":"09090909090909090909090909090909","session":{"workspace_id":"review-tree","session":{"instance_id":11,"generation":1}},"target":{"node_id":"node-a","workspace_id":"primary","worktree_id":"review-tree"},"profile_id":"review-default","profile_revision":"review-default.r3","provider":"claude","mode":"inline","terminal_size":{"rows":31,"columns":97},"prompt":{"present":true,"byte_len":19},"bundle_id":null,"context_id":"repo-context","context":{"id":"repo-context","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lineage":{"source_node_id":"node-a","source_session":{"workspace_id":"primary","session":{"instance_id":7,"generation":1}},"source_provider":"claude"},"source_message_count":3,"retained_message_count":2,"byte_len":32,"truncated":true},"environment_profile_id":null,"deadline_ms":30000,"idempotency_key":"request-0001","required_capabilities":["raw-pty-lifecycle","structured-prompt"],"provenance":{"provider":"profile","mode":"override","terminal_size":"override","prompt":"override","bundle_id":"cleared","context_id":"profile","environment_profile_id":"cleared"}}"#,
         );
         assert_eq!(
             serde_json::from_str::<ResolvedSpawnReceipt>(&receipt_json).unwrap(),
@@ -3796,10 +4330,12 @@ mod tests {
             )
             .unwrap(),
         };
-        let environment_receipt = first.receipt_with_environment(
+        let environment_receipt = first.receipt_with_materialization(
             NodeIncarnationId::from_bytes([9; NODE_INCARNATION_ID_BYTES]),
             receipt.session.clone(),
             Some(environment_profile.clone()),
+            None,
+            receipt.context.clone(),
         );
         let environment_json = serde_json::to_string(&environment_receipt).unwrap();
         assert!(environment_json.contains(
@@ -3862,8 +4398,9 @@ mod tests {
 
     #[test]
     fn session_bundle_materialization_contract_is_bounded_exact_and_dual_gated() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 8);
+        assert_eq!(NODE_PROTOCOL_VERSION, 9);
         assert_eq!(NODE_STATE_SCHEMA_V7, 7);
+        assert_eq!(NODE_STATE_SCHEMA_V8, 8);
         assert_eq!(
             NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
             "session-bundle-materialization-v1",
@@ -4049,7 +4586,7 @@ mod tests {
     #[test]
     fn compatibility_negotiation_rejects_an_active_wire_outside_either_range() {
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::new(9, 10).unwrap(),
+            protocol_versions: ProtocolRange::new(10, 11).unwrap(),
             capabilities: Vec::new(),
             state_schema: None,
         };
@@ -4080,7 +4617,7 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":10},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":8,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":10},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":9,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}"#,
         );
     }
 
@@ -4107,7 +4644,7 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["provider-contract-manifest-v1"]},"selected":{"protocol_version":8,"capabilities":["provider-contract-manifest-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}],"provider_adapter_contracts":[{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["provider-contract-manifest-v1"]},"selected":{"protocol_version":9,"capabilities":["provider-contract-manifest-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}],"provider_adapter_contracts":[{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}]}}"#,
         );
     }
 
@@ -4134,7 +4671,7 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":8,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"qwen","revision":"qwen.2026-08"}]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":9,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"qwen","revision":"qwen.2026-08"}]}}"#,
         );
     }
 
@@ -4711,8 +5248,166 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 8);
+    fn history_context_pack_wire_is_bounded_path_free_and_auth_bound() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 9);
+        assert_eq!(NODE_HISTORY_CONTEXT_PACK_CAPABILITY, "history-context-pack-v1");
+        let capability = CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .contains(&capability));
+        let mut support = portable_node_support();
+        support.capabilities = vec![capability.clone()];
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let binding = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
+        assert!(binding
+            .windows(NODE_HISTORY_CONTEXT_PACK_CAPABILITY.len())
+            .any(|window| window == NODE_HISTORY_CONTEXT_PACK_CAPABILITY.as_bytes()));
+
+        let request = NodeRequest::DiscoverHistory {
+            session: session_address("primary", 3),
+            limit: HISTORY_DISCOVERY_LIMIT_MAX,
+        };
+        assert_eq!(
+            request.required_capability(),
+            Some(NODE_HISTORY_CONTEXT_PACK_CAPABILITY),
+        );
+        assert!(request.history_context_pack_contract_is_valid());
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("working_directory"));
+        assert!(!json.contains("path"));
+        assert_eq!(serde_json::from_str::<NodeRequest>(&json).unwrap(), request);
+
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["limit"] = serde_json::Value::from(0);
+        assert!(serde_json::from_value::<NodeRequest>(invalid).is_err());
+        assert!(!NodeRequest::DiscoverHistory {
+            session: session_address("primary", 3),
+            limit: 0,
+        }
+        .history_context_pack_contract_is_valid());
+        assert!(!NodeRequest::LoadHistory {
+            session: session_address("primary", 3),
+            candidate_id: String::new(),
+        }
+        .history_context_pack_contract_is_valid());
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["limit"] = serde_json::Value::from(u64::from(HISTORY_DISCOVERY_LIMIT_MAX) + 1);
+        assert!(serde_json::from_value::<NodeRequest>(invalid).is_err());
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["working_directory"] =
+            serde_json::Value::String(r"C:\attacker-selected-root".to_owned());
+        assert!(serde_json::from_value::<NodeRequest>(invalid).is_err());
+
+        let response = NodeResponse::HistoryDiscovered {
+            session: session_address("primary", 3),
+            candidates: vec![HistoryCandidateSummary {
+                id: "candidate-1".to_owned(),
+                session_id_hint: "session-1".to_owned(),
+                modified_at_unix_ms: Some(1),
+            }],
+        };
+        assert!(response.requires_history_context_pack_capability());
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert!(!response_json.contains("messages"));
+        assert!(!response_json.contains("working_directory"));
+        assert!(!response_json.contains("path"));
+        assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn context_receipts_are_nonempty_and_strictly_correlated() {
+        assert!(SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).is_ok());
+        assert!(SpawnContextDigest::new(format!("sha256:{}", "A".repeat(64))).is_err());
+        let context = context_receipt("context-1", session_address("primary", 7));
+        let record = ManagedSessionRecord {
+            record_id: SessionRecordId::new("session-1").unwrap(),
+            display_name: "review".to_owned(),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            canonical_root: host_path(r"C:\repo"),
+            provider_session: None,
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: Some(context.id.clone()),
+            context: Some(context.clone()),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            last_error: None,
+        };
+        assert!(record.context_binding_is_valid());
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(serde_json::from_value::<ManagedSessionRecord>(json.clone()).unwrap(), record);
+
+        let mut metadata_without_id = json.clone();
+        metadata_without_id["context_id"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ManagedSessionRecord>(metadata_without_id).is_err());
+        let mut id_without_metadata = json.clone();
+        id_without_metadata["context"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ManagedSessionRecord>(id_without_metadata).is_err());
+        let mut mismatched = json.clone();
+        mismatched["context_id"] = serde_json::Value::String("context-2".to_owned());
+        assert!(serde_json::from_value::<ManagedSessionRecord>(mismatched).is_err());
+        let mut missing_truncation = json.clone();
+        missing_truncation["context"]["truncated"] = serde_json::Value::Bool(false);
+        assert!(serde_json::from_value::<ManagedSessionRecord>(missing_truncation).is_err());
+        let mut false_truncation = json.clone();
+        false_truncation["context"]["retained_message_count"] =
+            false_truncation["context"]["source_message_count"].clone();
+        assert!(serde_json::from_value::<ManagedSessionRecord>(false_truncation).is_err());
+        let mut empty = json;
+        empty["context"]["retained_message_count"] = serde_json::Value::from(0);
+        assert!(serde_json::from_value::<ManagedSessionRecord>(empty).is_err());
+
+        let receipt = ResolvedSpawnReceipt {
+            incarnation_id: NodeIncarnationId::from_bytes([9; NODE_INCARNATION_ID_BYTES]),
+            session: session_address("primary", 8),
+            target: SpawnTarget {
+                node_id: NodeId::new("node-a").unwrap(),
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                worktree_id: None,
+            },
+            profile_id: SpawnProfileId::new("default").unwrap(),
+            profile_revision: SpawnProfileRevision::new("default.r1").unwrap(),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            terminal_size: TerminalSize { rows: 24, columns: 80 },
+            prompt: SpawnPromptMetadata { present: false, byte_len: 0 },
+            bundle_id: None,
+            bundle: None,
+            context_id: Some(context.id.clone()),
+            context: Some(context),
+            environment_profile: None,
+            deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+            provenance: SpawnResolutionProvenance {
+                provider: SpawnFieldProvenance::Profile,
+                mode: SpawnFieldProvenance::Profile,
+                terminal_size: SpawnFieldProvenance::Profile,
+                prompt: SpawnFieldProvenance::Profile,
+                bundle_id: SpawnFieldProvenance::Profile,
+                context_id: SpawnFieldProvenance::Profile,
+                environment_profile_id: SpawnFieldProvenance::Profile,
+            },
+        };
+        assert!(receipt.context_binding_is_valid());
+        let mut mismatched = serde_json::to_value(&receipt).unwrap();
+        mismatched["context_id"] = serde_json::Value::String("context-2".to_owned());
+        assert!(serde_json::from_value::<ResolvedSpawnReceipt>(mismatched).is_err());
+    }
+
+    #[test]
+    fn protocol_v9_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 9);
         assert_eq!(MAX_WORKSPACE_ROOT_BYTES, gate4agent_types::WORKING_DIRECTORY_MAX_BYTES);
 
         let register = NodeRequest::RegisterWorkspace {
@@ -4822,7 +5517,7 @@ mod tests {
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol_version":8,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}"#,
+            r#"{"protocol_version":9,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}"#,
         );
         assert_eq!(serde_json::from_str::<NodeHello>(&json).unwrap(), hello);
     }
@@ -4833,7 +5528,7 @@ mod tests {
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             "managed-worktree-lifecycle-v1",
         );
-        assert_eq!(NODE_PROTOCOL_VERSION, 8);
+        assert_eq!(NODE_PROTOCOL_VERSION, 9);
         assert_eq!(NODE_STATE_SCHEMA_V4, 4);
         assert_eq!(NODE_STATE_SCHEMA_V5, 5);
         assert_eq!(NODE_STATE_SCHEMA_V6, 6);
@@ -5085,7 +5780,7 @@ mod tests {
                 encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
             )
             .unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":8,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":9,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
         );
     }
 
@@ -5160,7 +5855,7 @@ mod tests {
                 encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
             )
             .unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":8},"capabilities":["worktree-selection-v1"]},"selected":{"protocol_version":8,"capabilities":["worktree-selection-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["worktree-selection-v1"]},"selected":{"protocol_version":9,"capabilities":["worktree-selection-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
         );
     }
 
@@ -5460,6 +6155,8 @@ mod tests {
             active_session: None,
             environment_profile: None,
             bundle: None,
+            context_id: None,
+            context: None,
             created_at_unix_ms: 1_723_000_000_000,
             updated_at_unix_ms: 1_723_000_000_123,
             last_error: None,

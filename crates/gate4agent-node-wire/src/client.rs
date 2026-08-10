@@ -4,12 +4,14 @@ use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, validate_provider_contract_manifest,
     write_json_frame_limited, CapabilityId,
     ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
-    FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure, NodeHello,
-    NodeId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope, WorkspaceSnapshot,
+    FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure,
+    NodeFailureCode, NodeHello, NodeId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope,
+    WorkspaceSnapshot,
     ServerChallenge, ServerFrame,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES,
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+    NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
@@ -27,7 +29,7 @@ use crate::{
 #[cfg(test)]
 use gate4agent_node_protocol::{
     NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V7,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V8,
 };
 #[cfg(test)]
 use crate::auth_proof;
@@ -296,6 +298,10 @@ impl LocalNodeClient {
             &hello,
             &negotiated_capabilities,
         )?;
+        ensure_node_hello_history_context_pack_capability(
+            &hello,
+            &negotiated_capabilities,
+        )?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
                 "node identity mismatch: expected '{}', received '{}'",
@@ -526,6 +532,11 @@ fn reserve_request_id(
     open_provider_ids_enabled: bool,
     negotiated_capabilities: &[CapabilityId],
 ) -> Result<u64, NodeClientError> {
+    if !request.history_context_pack_contract_is_valid() {
+        return Err(NodeClientError::Protocol(
+            "invalid history context pack request".to_owned(),
+        ));
+    }
     ensure_node_request_required_capability(request, negotiated_capabilities)?;
     ensure_node_request_path_capability(
         request,
@@ -586,6 +597,16 @@ fn ensure_node_request_required_capability(
     {
         return Err(NodeClientError::UnsupportedCapability(
             NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY.to_owned(),
+        ));
+    }
+    if request.requires_history_context_pack_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_HISTORY_CONTEXT_PACK_CAPABILITY.to_owned(),
         ));
     }
     Ok(())
@@ -684,6 +705,38 @@ fn ensure_server_frame_required_capability(
     {
         return Err(NodeClientError::Protocol(
             "node sent session bundle materialization metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    let contains_history_context_pack = match frame {
+        ServerFrame::Hello(hello) => hello
+            .snapshot
+            .requires_history_context_pack_capability(),
+        ServerFrame::Reply(reply) => {
+            reply.result.as_ref().ok().is_some_and(
+                NodeResponse::requires_history_context_pack_capability,
+            ) || reply.result.as_ref().err().is_some_and(|failure| {
+                matches!(
+                    failure.code,
+                    NodeFailureCode::UnknownContextPack
+                        | NodeFailureCode::ContextPackBusy
+                        | NodeFailureCode::ContextPackMaterializationFailed
+                )
+            })
+        }
+        ServerFrame::Event(event) => event
+            .event
+            .requires_history_context_pack_capability(),
+        ServerFrame::Challenge(_) => false,
+    };
+    if contains_history_context_pack
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent history context pack metadata without negotiating the capability"
                 .to_owned(),
         ));
     }
@@ -847,6 +900,26 @@ fn ensure_node_hello_bundle_materialization_capability(
     Ok(())
 }
 
+fn ensure_node_hello_history_context_pack_capability(
+    hello: &NodeHello,
+    negotiated_capabilities: &[CapabilityId],
+) -> Result<(), NodeClientError> {
+    if hello
+        .snapshot
+        .requires_history_context_pack_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent history context pack metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_node_request_provider_capability(
     request: &NodeRequest,
     open_provider_ids_enabled: bool,
@@ -868,7 +941,41 @@ fn ensure_node_request_provider_capability(
                 ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
             }
         }
-        _ => {}
+        NodeRequest::ForgetContextPack { .. } => {
+            if !open_provider_ids_enabled {
+                return Err(NodeClientError::UnsupportedCapability(
+                    NODE_PROVIDER_ID_OPEN_CAPABILITY.to_owned(),
+                ));
+            }
+        }
+        NodeRequest::Snapshot
+        | NodeRequest::Resync { .. }
+        | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::AcquireController { .. }
+        | NodeRequest::ReleaseController
+        | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::UnregisterWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
+        | NodeRequest::RemoveWorktree { .. }
+        | NodeRequest::CleanupManagedWorktree { .. }
+        | NodeRequest::Resume { .. }
+        | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::ResumeSessionRecord { .. }
+        | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::DiscoverHistory { .. }
+        | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPack { .. }
+        | NodeRequest::Prompt { .. }
+        | NodeRequest::Paste { .. }
+        | NodeRequest::Input { .. }
+        | NodeRequest::TerminalBytes { .. }
+        | NodeRequest::TerminalControl { .. }
+        | NodeRequest::Resize { .. }
+        | NodeRequest::Interrupt { .. }
+        | NodeRequest::Stop { .. }
+        | NodeRequest::Remove { .. }
+        | NodeRequest::Shutdown => {}
     }
     Ok(())
 }
@@ -956,6 +1063,10 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::DiscoverHistory { .. }
+        | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPack { .. }
+        | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -993,17 +1104,20 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
         }
         NodeResponse::SessionRecordUpdated { record }
         | NodeResponse::SessionRecordResumed { record, .. } => {
-            !provider_id_is_legacy(&record.provider)
+            managed_session_record_contains_open_provider_id(record)
         }
         NodeResponse::WorkspaceRegistered { workspace }
         | NodeResponse::WorktreeCreated { workspace, .. } => {
             workspace_contains_open_provider_id(workspace)
         }
         NodeResponse::SpawnSpecAccepted { receipt } => {
-            !provider_id_is_legacy(&receipt.provider)
+            resolved_spawn_receipt_contains_open_provider_id(receipt)
         }
         NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
-            !provider_id_is_legacy(&receipt.spawn.provider)
+            resolved_spawn_receipt_contains_open_provider_id(&receipt.spawn)
+        }
+        NodeResponse::ContextPackExported { context } => {
+            context_pack_contains_open_provider_id(context)
         }
         NodeResponse::WorkspaceInspected { .. }
         | NodeResponse::WorkspaceFileRead { .. }
@@ -1011,6 +1125,9 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::HistoryDiscovered { .. }
+        | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeRemoved { .. }
         | NodeResponse::Accepted
@@ -1023,9 +1140,33 @@ fn node_snapshot_contains_open_provider_id(snapshot: &NodeSnapshot) -> bool {
         !provider_id_is_legacy(provider)
     }) || snapshot.provider_runtime_statuses.iter().any(|status| {
         !provider_id_is_legacy(status.provider())
-    }) || snapshot.session_records.iter().any(|record| {
-        !provider_id_is_legacy(&record.provider)
-    }) || snapshot.workspaces.iter().any(workspace_contains_open_provider_id)
+    }) || snapshot.session_records.iter().any(
+        managed_session_record_contains_open_provider_id,
+    ) || snapshot.workspaces.iter().any(workspace_contains_open_provider_id)
+}
+
+fn managed_session_record_contains_open_provider_id(
+    record: &gate4agent_node_protocol::ManagedSessionRecord,
+) -> bool {
+    !provider_id_is_legacy(&record.provider)
+        || record.context.as_ref().is_some_and(
+            context_pack_contains_open_provider_id,
+        )
+}
+
+fn resolved_spawn_receipt_contains_open_provider_id(
+    receipt: &gate4agent_node_protocol::ResolvedSpawnReceipt,
+) -> bool {
+    !provider_id_is_legacy(&receipt.provider)
+        || receipt.context.as_ref().is_some_and(
+            context_pack_contains_open_provider_id,
+        )
+}
+
+fn context_pack_contains_open_provider_id(
+    context: &gate4agent_node_protocol::ResolvedContextPackReceipt,
+) -> bool {
+    !provider_id_is_legacy(&context.lineage.source_provider)
 }
 
 fn workspace_contains_open_provider_id(workspace: &WorkspaceSnapshot) -> bool {
@@ -1040,7 +1181,7 @@ fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
             workspace_contains_open_provider_id(workspace)
         }
         NodeEvent::SessionRecordUpserted { record } => {
-            !provider_id_is_legacy(&record.provider)
+            managed_session_record_contains_open_provider_id(record)
         }
         NodeEvent::Control { .. }
         | NodeEvent::TerminalFrame { .. }
@@ -1073,6 +1214,10 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::ResumeSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::DiscoverHistory { .. }
+        | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPack { .. }
+        | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -1129,6 +1274,10 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::HistoryDiscovered { .. }
+        | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackExported { .. }
+        | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeCreated { .. }
@@ -1173,6 +1322,10 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::HistoryDiscovered { .. }
+        | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackExported { .. }
+        | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::Accepted
         | NodeResponse::ShuttingDown => false,
@@ -1207,7 +1360,15 @@ fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
 }
 
 fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, NodeClientError> {
-    Ok(production_node_client_compatibility_offer())
+    let mut offer = production_node_client_compatibility_offer();
+    let history_context_pack =
+        CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).map_err(|error| {
+            NodeClientError::Protocol(error.to_string())
+        })?;
+    if !offer.capabilities.contains(&history_context_pack) {
+        offer.capabilities.push(history_context_pack);
+    }
+    Ok(offer)
 }
 
 fn prepare_negotiated_authentication(
@@ -1375,6 +1536,7 @@ mod tests {
     use super::*;
     use gate4agent_node_protocol::{
         AdapterContractRevision, AdapterFamily, AdapterId, AgentId, ArchitectureId,
+        ContextPackLineageReceipt,
         GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, HostDescriptor, LocalTransportKind,
         ManagedSessionRecord, ManagedSessionState, NodeCompatibilitySupport, OpaqueHostPath,
         ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
@@ -1383,10 +1545,12 @@ mod tests {
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
-        ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt,
+        ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedEnvironmentProfileReceipt,
+        ResolvedSpawnReceipt,
         SessionAddress, SessionKey,
         SessionMode, SessionRecordId,
         SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision, SpawnDeadlineMs,
+        SpawnContextDigest, SpawnContextId,
         SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
         SpawnEnvironmentProfileId, SpawnEnvironmentProfileRevision, SpawnProfileId,
         SpawnProfileRevision, SpawnPromptMetadata, SpawnRequiredCapabilities,
@@ -1494,6 +1658,8 @@ mod tests {
             active_session: None,
             environment_profile: None,
             bundle: None,
+            context_id: None,
+            context: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
             last_error: None,
@@ -1547,6 +1713,8 @@ mod tests {
     }
 
     fn spawn_spec_request() -> NodeRequest {
+        let mut overrides = SpawnOverrides::default();
+        overrides.context_id = gate4agent_node_protocol::SpawnOverride::Clear;
         NodeRequest::SpawnSpec {
             spec: SpawnSpec {
                 target: SpawnTarget {
@@ -1555,7 +1723,7 @@ mod tests {
                     worktree_id: None,
                 },
                 profile_id: SpawnProfileId::new("default").unwrap(),
-                overrides: SpawnOverrides::default(),
+                overrides,
                 deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
                 idempotency_key: SpawnIdempotencyKey::new("request-a").unwrap(),
                 required_capabilities: SpawnRequiredCapabilities::default(),
@@ -1593,6 +1761,7 @@ mod tests {
             bundle_id: None,
             bundle: None,
             context_id: None,
+            context: None,
             environment_profile: None,
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("request-a").unwrap(),
@@ -1609,8 +1778,31 @@ mod tests {
         }
     }
 
+    fn context_pack_receipt() -> ResolvedContextPackReceipt {
+        ResolvedContextPackReceipt {
+            id: SpawnContextId::new("context-a").unwrap(),
+            digest: SpawnContextDigest::new(format!("sha256:{}", "c".repeat(64)))
+                .unwrap(),
+            lineage: ContextPackLineageReceipt {
+                source_node_id: NodeId::new("node-a").unwrap(),
+                source_session: SessionAddress {
+                    workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                    session: SessionKey {
+                        instance_id: AgentInstanceId(7),
+                        generation: SessionGeneration(2),
+                    },
+                },
+                source_provider: agent("claude"),
+            },
+            source_message_count: 4,
+            retained_message_count: 3,
+            byte_len: 128,
+            truncated: true,
+        }
+    }
+
     #[test]
-    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v6() {
+    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v8() {
         let offer = client_compatibility_offer().unwrap();
         assert_eq!(
             offer.protocol_versions,
@@ -1646,9 +1838,12 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
         ));
+        assert!(offer.capabilities.contains(
+            &CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
+        ));
         assert_eq!(
             offer.state_schema.unwrap().versions,
-            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V7).unwrap(),
+            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V8).unwrap(),
         );
     }
 
@@ -1829,6 +2024,47 @@ mod tests {
         .unwrap();
         selected.capabilities.retain(|candidate| {
             candidate.as_str() != NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+        });
+        let challenge = ServerChallenge {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            server_nonce,
+            server_proof,
+            compatibility: Some(selected),
+        };
+        assert!(matches!(
+            prepare_negotiated_authentication(
+                &challenge,
+                &offer,
+                ClientRole::Operator,
+                &client_nonce,
+                access_token,
+            ),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("server failed access-token proof")
+        ));
+    }
+
+    #[test]
+    fn history_context_pack_capability_is_bound_to_authentication_proof() {
+        let (mut offer, mut selected) = negotiated_fixture();
+        let capability = CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
+        offer.capabilities.push(capability.clone());
+        selected.capabilities.push(capability);
+        let client_nonce = [6; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [9; NODE_AUTH_NONCE_BYTES];
+        let access_token = "history-context-auth-token";
+        let server_proof = negotiated_auth_proof(
+            access_token.as_bytes(),
+            AuthDirection::Server,
+            ClientRole::Operator,
+            &client_nonce,
+            &server_nonce,
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        selected.capabilities.retain(|candidate| {
+            candidate.as_str() != NODE_HISTORY_CONTEXT_PACK_CAPABILITY
         });
         let challenge = ServerChallenge {
             protocol_version: NODE_PROTOCOL_VERSION,
@@ -2220,6 +2456,12 @@ mod tests {
             workspace: legacy_workspace,
         });
         assert!(ensure_server_frame_provider_capability(&legacy_frame, false).is_ok());
+
+        let mut context = context_pack_receipt();
+        context.lineage.source_provider = agent("qwen");
+        let context_frame = response_frame(NodeResponse::ContextPackExported { context });
+        assert!(ensure_server_frame_provider_capability(&context_frame, false).is_err());
+        assert!(ensure_server_frame_provider_capability(&context_frame, true).is_ok());
     }
 
     #[test]
@@ -2567,6 +2809,227 @@ mod tests {
         assert!(ensure_server_frame_required_capability(
             &frame,
             &[spawn_capability, bundle_capability],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn history_context_pack_requests_and_responses_fail_closed() {
+        let session = SessionAddress {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(2),
+            },
+        };
+        let context_id = SpawnContextId::new("context-a").unwrap();
+        let requests = [
+            NodeRequest::DiscoverHistory {
+                session: session.clone(),
+                limit: 8,
+            },
+            NodeRequest::LoadHistory {
+                session: session.clone(),
+                candidate_id: "candidate-a".to_owned(),
+            },
+            NodeRequest::ExportContextPack {
+                session: session.clone(),
+            },
+            NodeRequest::ForgetContextPack {
+                context_id: context_id.clone(),
+            },
+        ];
+        let capability = CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
+        for request in requests {
+            assert!(matches!(
+                ensure_node_request_required_capability(&request, &[]),
+                Err(NodeClientError::UnsupportedCapability(ref required))
+                    if required == NODE_HISTORY_CONTEXT_PACK_CAPABILITY
+            ));
+            assert!(ensure_node_request_required_capability(
+                &request,
+                std::slice::from_ref(&capability),
+            )
+            .is_ok());
+        }
+
+        let mut next_request_id = 41;
+        let invalid = NodeRequest::DiscoverHistory {
+            session: session.clone(),
+            limit: 0,
+        };
+        assert!(matches!(
+            reserve_request_id(
+                &mut next_request_id,
+                &invalid,
+                false,
+                false,
+                true,
+                std::slice::from_ref(&capability),
+            ),
+            Err(NodeClientError::Protocol(ref message))
+                if message == "invalid history context pack request"
+        ));
+        assert_eq!(next_request_id, 41);
+
+        let forget = NodeRequest::ForgetContextPack {
+            context_id: context_id.clone(),
+        };
+        assert!(matches!(
+            reserve_request_id(
+                &mut next_request_id,
+                &forget,
+                false,
+                false,
+                false,
+                std::slice::from_ref(&capability),
+            ),
+            Err(NodeClientError::UnsupportedCapability(ref required))
+                if required == NODE_PROVIDER_ID_OPEN_CAPABILITY
+        ));
+        assert_eq!(next_request_id, 41);
+        assert_eq!(
+            reserve_request_id(
+                &mut next_request_id,
+                &forget,
+                false,
+                false,
+                true,
+                std::slice::from_ref(&capability),
+            )
+            .unwrap(),
+            41,
+        );
+
+        let responses = [
+            NodeResponse::HistoryDiscovered {
+                session: session.clone(),
+                candidates: Vec::new(),
+            },
+            NodeResponse::HistoryLoaded {
+                session,
+                session_id: "provider-session-a".to_owned(),
+                message_count: 4,
+            },
+            NodeResponse::ContextPackExported {
+                context: context_pack_receipt(),
+            },
+            NodeResponse::ContextPackForgotten { context_id },
+        ];
+        for response in responses {
+            let frame = response_frame(response);
+            assert!(matches!(
+                ensure_server_frame_required_capability(&frame, &[]),
+                Err(NodeClientError::Protocol(ref message))
+                    if message.contains("history context pack metadata")
+            ));
+            assert!(ensure_server_frame_required_capability(
+                &frame,
+                std::slice::from_ref(&capability),
+            )
+            .is_ok());
+        }
+
+        for code in [
+            NodeFailureCode::UnknownContextPack,
+            NodeFailureCode::ContextPackBusy,
+            NodeFailureCode::ContextPackMaterializationFailed,
+        ] {
+            let frame = ServerFrame::Reply(ResponseEnvelope {
+                request_id: 1,
+                result: Err(NodeFailure {
+                    code,
+                    message: "typed F7 failure".to_owned(),
+                }),
+            });
+            assert!(matches!(
+                ensure_server_frame_required_capability(&frame, &[]),
+                Err(NodeClientError::Protocol(ref message))
+                    if message.contains("history context pack metadata")
+            ));
+            assert!(ensure_server_frame_required_capability(
+                &frame,
+                std::slice::from_ref(&capability),
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn history_context_pack_nested_metadata_fails_closed() {
+        let history_capability =
+            CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
+        let spawn_capability =
+            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        let bundle_capability =
+            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        let mut request = spawn_spec_request();
+        let NodeRequest::SpawnSpec { spec } = &mut request else {
+            unreachable!("spawn spec helper changed variant");
+        };
+        spec.overrides.context_id = gate4agent_node_protocol::SpawnOverride::Set {
+            value: SpawnContextId::new("context-a").unwrap(),
+        };
+        assert!(matches!(
+            ensure_node_request_required_capability(
+                &request,
+                &[spawn_capability.clone(), bundle_capability.clone()],
+            ),
+            Err(NodeClientError::UnsupportedCapability(ref required))
+                if required == NODE_HISTORY_CONTEXT_PACK_CAPABILITY
+        ));
+        assert!(ensure_node_request_required_capability(
+            &request,
+            &[
+                spawn_capability.clone(),
+                bundle_capability,
+                history_capability.clone(),
+            ],
+        )
+        .is_ok());
+
+        let context = context_pack_receipt();
+        let mut receipt = spawn_spec_receipt();
+        receipt.context_id = Some(context.id.clone());
+        receipt.context = Some(context.clone());
+        let receipt_frame = response_frame(NodeResponse::SpawnSpecAccepted { receipt });
+        assert!(matches!(
+            ensure_server_frame_required_capability(
+                &receipt_frame,
+                std::slice::from_ref(&spawn_capability),
+            ),
+            Err(NodeClientError::Protocol(ref message))
+                if message.contains("history context pack metadata")
+        ));
+        assert!(ensure_server_frame_required_capability(
+            &receipt_frame,
+            &[spawn_capability, history_capability.clone()],
+        )
+        .is_ok());
+
+        let mut record = session_record_with_path(utf8_path());
+        record.context_id = Some(context.id.clone());
+        record.context = Some(context);
+        let event_frame = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 1,
+            event: NodeEvent::SessionRecordUpserted {
+                record: record.clone(),
+            },
+        });
+        assert!(ensure_server_frame_required_capability(&event_frame, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &event_frame,
+            std::slice::from_ref(&history_capability),
+        )
+        .is_ok());
+
+        let mut snapshot = empty_snapshot();
+        snapshot.session_records.push(record);
+        let hello = hello_with_snapshot(snapshot);
+        assert!(ensure_node_hello_history_context_pack_capability(&hello, &[]).is_err());
+        assert!(ensure_node_hello_history_context_pack_capability(
+            &hello,
+            std::slice::from_ref(&history_capability),
         )
         .is_ok());
     }

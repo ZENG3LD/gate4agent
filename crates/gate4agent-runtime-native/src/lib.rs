@@ -35,6 +35,7 @@ use gate4agent_provider_ports::{
 use gate4agent_shell_capabilities::NativeCapabilityProbeAuthority;
 use gate4agent_shell_history::NativeHistoryAuthority;
 pub use gate4agent_shell_history::{NativeHistoryConfig, NativeHistoryRoot};
+pub use gate4agent_adapters::HistorySourceLayout;
 pub use gate4agent_shell_hooks::{HookIngressConfig, HookIngressEndpoint};
 use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
 pub use gate4agent_shell_native::{

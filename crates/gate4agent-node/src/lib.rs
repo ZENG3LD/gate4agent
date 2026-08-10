@@ -2,6 +2,8 @@
 
 mod bundle_catalog;
 
+mod context_pack;
+
 mod bundle_provider;
 
 mod git_worktree;
@@ -52,6 +54,9 @@ pub use worktree_service::ManagedWorktreeProfile;
 pub use spawn_spec::{
     SpawnProfileRegistry, SpawnProfileRegistryError, DEFAULT_SPAWN_PROFILE_ID,
     MAX_SPAWN_PROFILES,
+};
+pub use gate4agent_runtime_native::{
+    HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot,
 };
 
 #[cfg(windows)]

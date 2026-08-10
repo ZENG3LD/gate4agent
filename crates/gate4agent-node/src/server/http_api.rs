@@ -1,4 +1,4 @@
-use super::NodeShared;
+use super::{clear_snapshot_context_packs, project_snapshot_history_for_wire, NodeShared};
 use crate::protocol::{MAX_NODE_FRAME_BYTES, NODE_PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use std::io;
@@ -155,8 +155,11 @@ fn ready_body(shared: &NodeShared) -> Value {
 }
 
 fn status_body(shared: &NodeShared) -> Value {
+    let mut snapshot = shared.snapshot();
+    project_snapshot_history_for_wire(&mut snapshot, false);
+    clear_snapshot_context_packs(&mut snapshot);
     json!({
-        "snapshot": shared.snapshot(),
+        "snapshot": snapshot,
         "incarnation_id": shared.incarnation_id,
         "event_sequence": shared.current_sequence(),
         "controller_active": shared.controller_state().is_some(),

@@ -1,11 +1,12 @@
 use crate::protocol::{
     AgentId, ManagedSessionRecord, ManagedSessionState, NodeId, OpaqueHostPath,
-    ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, SessionAddress, SessionMode,
+    ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedEnvironmentProfileReceipt,
+    SessionAddress, SessionMode,
     SessionRecordId, WorkspaceId,
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3, NODE_STATE_SCHEMA_V4,
     NODE_STATE_SCHEMA_V5,
-    NODE_STATE_SCHEMA_V6, NODE_STATE_SCHEMA_V7,
+    NODE_STATE_SCHEMA_V6, NODE_STATE_SCHEMA_V7, NODE_STATE_SCHEMA_V8,
 };
 use crate::worktree_service::ManagedWorktreeLeaseRecord;
 use crate::session_environment::{
@@ -289,6 +290,17 @@ struct PersistedNodeStateV7 {
     materializations: Vec<PersistedMaterializationRecordV7>,
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedNodeStateV8 {
+    version: u16,
+    node_id: NodeId,
+    workspaces: Vec<PersistedWorkspaceV2>,
+    session_records: Vec<ManagedSessionRecord>,
+    managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+    materializations: Vec<PersistedMaterializationRecordV8>,
+}
+
 struct DecodedNodeState {
     node_id: NodeId,
     workspaces: Vec<(WorkspaceId, String)>,
@@ -484,6 +496,25 @@ struct PersistedMaterializationRecordV7 {
     updated_at_unix_ms: u64,
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedMaterializationRecordV8 {
+    materialization_id: MaterializationId,
+    environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
+    bundle: Option<ResolvedBundleReceipt>,
+    context: Option<ResolvedContextPackReceipt>,
+    owner: MaterializationOwner,
+    managed_lease_id: Option<crate::protocol::ManagedWorktreeLeaseId>,
+    state: MaterializationState,
+    root: OpaqueHostPath,
+    provider_home: OpaqueHostPath,
+    bundle_root: OpaqueHostPath,
+    plugin_data: OpaqueHostPath,
+    declared_paths: Vec<MaterializedPathDeclaration>,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+}
+
 pub(crate) fn load(path: Option<&Path>, expected_node_id: &NodeId) -> io::Result<LoadedNodeState> {
     let Some(path) = path else {
         return Ok(LoadedNodeState::empty());
@@ -662,6 +693,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v7_state(state)
         }
+        NODE_STATE_SCHEMA_V8 => {
+            let state: PersistedNodeStateV8 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v8_state(state)
+        }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             StateLoadRefusalError::UnsupportedSchema(version),
@@ -696,6 +732,8 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
                     active_session: record.active_session,
                     environment_profile: None,
                     bundle: None,
+                    context_id: None,
+                    context: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -738,6 +776,8 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
                     active_session: record.active_session,
                     environment_profile: None,
                     bundle: None,
+                    context_id: None,
+                    context: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -780,6 +820,8 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
                     active_session: record.active_session,
                     environment_profile: None,
                     bundle: None,
+                    context_id: None,
+                    context: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -870,6 +912,7 @@ fn decode_v6_state(state: PersistedNodeStateV6) -> io::Result<DecodedNodeState> 
             record.materialization_id,
             Some(record.environment_profile),
             None,
+            None,
             record.owner,
             record.managed_lease_id,
             record.state,
@@ -893,11 +936,60 @@ fn decode_v6_state(state: PersistedNodeStateV6) -> io::Result<DecodedNodeState> 
 }
 
 fn decode_v7_state(state: PersistedNodeStateV7) -> io::Result<DecodedNodeState> {
+    let session_records = state.session_records.into_iter().map(|mut record| {
+        record.context_id = None;
+        record.context = None;
+        record
+    }).collect::<Vec<_>>();
     let materializations = state.materializations.into_iter().map(|record| {
         MaterializationOwnershipRecord::from_persisted(
             record.materialization_id,
             record.environment_profile,
             record.bundle,
+            None,
+            record.owner,
+            record.managed_lease_id,
+            record.state,
+            opaque_to_path(&record.root)?,
+            opaque_to_path(&record.provider_home)?,
+            opaque_to_path(&record.bundle_root)?,
+            opaque_to_path(&record.plugin_data)?,
+            record.declared_paths,
+            record.created_at_unix_ms,
+            record.updated_at_unix_ms,
+        ).map_err(|error| invalid_data(format!("durable state materialization record is invalid: {error}")))
+    }).collect::<io::Result<Vec<_>>>()?;
+    validate_managed_worktree_records(&state.managed_worktrees, false)?;
+    validate_managed_worktree_records(&state.managed_worktree_tombstones, true)?;
+    validate_managed_worktree_identity_sets(
+        &state.managed_worktrees,
+        &state.managed_worktree_tombstones,
+    )?;
+    validate_materialization_records(
+        &materializations,
+        &session_records,
+        &state.managed_worktrees,
+        &state.managed_worktree_tombstones,
+    )?;
+    Ok(DecodedNodeState {
+        node_id: state.node_id,
+        workspaces: state.workspaces.into_iter().map(|workspace| {
+            Ok((workspace.workspace_id, require_utf8_state_path(&workspace.canonical_root)?.to_owned()))
+        }).collect::<io::Result<_>>()?,
+        session_records,
+        managed_worktrees: state.managed_worktrees,
+        managed_worktree_tombstones: state.managed_worktree_tombstones,
+        materializations,
+    })
+}
+
+fn decode_v8_state(state: PersistedNodeStateV8) -> io::Result<DecodedNodeState> {
+    let materializations = state.materializations.into_iter().map(|record| {
+        MaterializationOwnershipRecord::from_persisted(
+            record.materialization_id,
+            record.environment_profile,
+            record.bundle,
+            record.context,
             record.owner,
             record.managed_lease_id,
             record.state,
@@ -960,6 +1052,11 @@ fn validate_materialization_records(
     let mut owners = BTreeSet::new();
     for record in records {
         record.validate().map_err(|error| invalid_data(format!("durable state materialization record is invalid: {error}")))?;
+        if record.context().is_some_and(|context| !context.is_valid()) {
+            return Err(invalid_data(
+                "durable state materialization context receipt is invalid",
+            ));
+        }
         let (owner_key, record_workspace) = match record.owner() {
             MaterializationOwner::Session { incarnation_id, instance_id, generation } => {
                 (
@@ -975,6 +1072,7 @@ fn validate_materialization_records(
                 })?;
                 if record.environment_profile() != managed_record.environment_profile.as_ref()
                     || record.bundle() != managed_record.bundle.as_ref()
+                    || record.context() != managed_record.context.as_ref()
                 {
                     return Err(invalid_data(
                         "durable state materialization receipt disagrees with its session record",
@@ -1012,7 +1110,9 @@ fn validate_materialization_records(
             return Err(invalid_data("durable state contains duplicate materialization ownership"));
         }
     }
-    for record in session_records.iter().filter(|record| record.bundle.is_some()) {
+    for record in session_records.iter().filter(|record| {
+        record.bundle.is_some() || record.context.is_some()
+    }) {
         if !records.iter().any(|materialization| {
             materialization.owner()
                 == &MaterializationOwner::Record {
@@ -1020,9 +1120,10 @@ fn validate_materialization_records(
                 }
                 && materialization.bundle() == record.bundle.as_ref()
                 && materialization.environment_profile() == record.environment_profile.as_ref()
+                && materialization.context() == record.context.as_ref()
         }) {
             return Err(invalid_data(
-                "durable bundle-bound session record lacks exact materialization ownership",
+                "durable bound session record lacks exact materialization ownership",
             ));
         }
     }
@@ -1360,6 +1461,7 @@ pub(crate) fn save_v5(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
+#[cfg(test)]
 pub(crate) fn save_v7(
     path: Option<&Path>,
     node_id: &NodeId,
@@ -1372,6 +1474,13 @@ pub(crate) fn save_v7(
     let Some(path) = path else {
         return Ok(None);
     };
+    if records.iter().any(|record| record.context_id.is_some() || record.context.is_some())
+        || materializations.iter().any(|record| record.context().is_some())
+    {
+        return Err(invalid_data(
+            "refusing to persist context metadata in legacy durable state v7",
+        ));
+    }
     if workspaces.len() > MAX_PERSISTED_WORKSPACES {
         return Err(invalid_data("refusing to persist too many workspaces"));
     }
@@ -1459,6 +1568,106 @@ pub(crate) fn save_v7(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
+pub(crate) fn save_v8(
+    path: Option<&Path>,
+    node_id: &NodeId,
+    workspaces: &BTreeMap<WorkspaceId, String>,
+    records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+    materializations: &[MaterializationOwnershipRecord],
+) -> io::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if workspaces.len() > MAX_PERSISTED_WORKSPACES {
+        return Err(invalid_data("refusing to persist too many workspaces"));
+    }
+    if records.len() > MAX_MANAGED_SESSION_RECORDS {
+        return Err(invalid_data("refusing to persist too many session records"));
+    }
+    validate_managed_worktree_records(managed_worktrees, false)?;
+    validate_managed_worktree_records(managed_worktree_tombstones, true)?;
+    validate_managed_worktree_identity_sets(
+        managed_worktrees,
+        managed_worktree_tombstones,
+    )?;
+    validate_materialization_records(
+        materializations,
+        records,
+        managed_worktrees,
+        managed_worktree_tombstones,
+    )?;
+    let mut persisted_records = Vec::with_capacity(records.len());
+    let mut provider_sessions = BTreeSet::new();
+    for record in records {
+        let mut persisted = record.clone();
+        persisted.active_session = None;
+        if let Some(identity) = &mut persisted.provider_session {
+            if !provider_sessions.insert(provider_session_semantic_key(&persisted.provider, identity)) {
+                return Err(invalid_data("refusing to persist duplicate provider sessions"));
+            }
+            identity.transcript_path = None;
+        }
+        persisted.last_error = persisted.last_error.as_deref().map(sanitized_record_error_summary);
+        validate_record(&persisted)?;
+        persisted.state = if persisted.provider_session.is_some() {
+            ManagedSessionState::Dormant
+        } else {
+            ManagedSessionState::Unavailable
+        };
+        persisted_records.push(persisted);
+    }
+    let state = PersistedNodeStateV8 {
+        version: NODE_STATE_SCHEMA_V8,
+        node_id: node_id.clone(),
+        workspaces: workspaces.iter().map(|(workspace_id, canonical_root)| {
+            Ok(PersistedWorkspaceV2 {
+                workspace_id: workspace_id.clone(),
+                canonical_root: OpaqueHostPath::utf8(canonical_root.clone()).map_err(|error| {
+                    invalid_data(format!("refusing to persist an invalid workspace path: {error}"))
+                })?,
+            })
+        }).collect::<io::Result<_>>()?,
+        session_records: persisted_records,
+        managed_worktrees: managed_worktrees.to_vec(),
+        managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
+        materializations: materializations.iter().map(|record| {
+            Ok(PersistedMaterializationRecordV8 {
+                materialization_id: record.id().clone(),
+                environment_profile: record.environment_profile().cloned(),
+                bundle: record.bundle().cloned(),
+                context: record.context().cloned(),
+                owner: record.owner().clone(),
+                managed_lease_id: record.managed_lease_id().cloned(),
+                state: record.state(),
+                root: path_to_opaque(record.root())?,
+                provider_home: path_to_opaque(record.provider_home())?,
+                bundle_root: path_to_opaque(record.bundle_root())?,
+                plugin_data: path_to_opaque(record.plugin_data())?,
+                declared_paths: record.declared_paths().to_vec(),
+                created_at_unix_ms: record.created_at_unix_ms(),
+                updated_at_unix_ms: record.updated_at_unix_ms(),
+            })
+        }).collect::<io::Result<Vec<_>>>()?,
+    };
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| invalid_data(format!("durable state encoding failed: {error}")))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(invalid_data("refusing to persist oversized durable state"));
+    }
+    let previous_primary_valid = if !path.exists() {
+        true
+    } else {
+        match load_one(path, node_id) {
+            Ok(_) => true,
+            Err(error) if is_authoritative_state_error(&error) => return Err(error),
+            Err(_) => false,
+        }
+    };
+    atomic_write(path, &bytes, previous_primary_valid)
+}
+
 #[cfg(test)]
 fn persisted_v3_record(record: ManagedSessionRecord) -> PersistedManagedSessionRecordV3 {
     PersistedManagedSessionRecordV3 {
@@ -1513,6 +1722,11 @@ fn validate_record(record: &ManagedSessionRecord) -> io::Result<()> {
     validate_root(require_utf8_state_path(&record.canonical_root)?)?;
     if record.created_at_unix_ms > record.updated_at_unix_ms {
         return Err(invalid_data("session record timestamps are inconsistent"));
+    }
+    if !record.context_binding_is_valid() {
+        return Err(invalid_data(
+            "session record context id and receipt are not correlated",
+        ));
     }
     if let Some(identity) = &record.provider_session {
         identity
@@ -1918,6 +2132,8 @@ mod tests {
             active_session: None,
             environment_profile: None,
             bundle: None,
+            context_id: None,
+            context: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 11,
             last_error: None,
@@ -1966,6 +2182,7 @@ mod tests {
                     .unwrap(),
             }),
             None,
+            None,
             owner,
             managed_lease_id,
             MaterializationState::Ready,
@@ -1995,6 +2212,62 @@ mod tests {
             created_at_unix_ms: record.created_at_unix_ms(),
             updated_at_unix_ms: record.updated_at_unix_ms(),
         }
+    }
+
+    fn context_receipt(id: &str, digest_byte: char) -> ResolvedContextPackReceipt {
+        ResolvedContextPackReceipt {
+            id: crate::protocol::SpawnContextId::new(id).unwrap(),
+            digest: crate::protocol::SpawnContextDigest::new(format!(
+                "sha256:{}",
+                digest_byte.to_string().repeat(64),
+            ))
+            .unwrap(),
+            lineage: crate::protocol::ContextPackLineageReceipt {
+                source_node_id: NodeId::new("source-node").unwrap(),
+                source_session: SessionAddress {
+                    workspace_id: WorkspaceId::new("source-workspace").unwrap(),
+                    session: crate::protocol::SessionKey {
+                        instance_id: gate4agent_types::AgentInstanceId(7),
+                        generation: gate4agent_types::SessionGeneration(3),
+                    },
+                },
+                source_provider: agent("qwen"),
+            },
+            source_message_count: 12,
+            retained_message_count: 9,
+            byte_len: 4096,
+            truncated: true,
+        }
+    }
+
+    fn context_materialization(
+        path: &Path,
+        id: &str,
+        record_id: SessionRecordId,
+        context: ResolvedContextPackReceipt,
+    ) -> MaterializationOwnershipRecord {
+        let root = path
+            .parent()
+            .unwrap()
+            .join("session-environments")
+            .join(id);
+        MaterializationOwnershipRecord::from_persisted(
+            MaterializationId::new(id).unwrap(),
+            None,
+            None,
+            Some(context),
+            MaterializationOwner::Record { record_id },
+            None,
+            MaterializationState::Ready,
+            root.clone(),
+            root.join("home"),
+            root.join("bundle"),
+            root.join("plugin-data"),
+            Vec::new(),
+            10,
+            11,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2127,6 +2400,7 @@ mod tests {
                 profile_id: crate::protocol::SpawnEnvironmentProfileId::new("local-claude").unwrap(),
                 profile_revision: crate::protocol::SpawnEnvironmentProfileRevision::new("r1").unwrap(),
             }),
+            None,
             None,
             MaterializationOwner::Session {
                 incarnation_id: crate::protocol::NodeIncarnationId::from_bytes([3; crate::protocol::NODE_INCARNATION_ID_BYTES]),
@@ -3208,6 +3482,7 @@ mod tests {
             MaterializationId::new("bundle-record").unwrap(),
             Some(environment_profile),
             Some(bundle.clone()),
+            None,
             MaterializationOwner::Record { record_id: record.record_id.clone() },
             None,
             MaterializationState::Ready,
@@ -3238,6 +3513,184 @@ mod tests {
             serde_json::Value::String(format!("sha256:{}", "1".repeat(64)));
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(load(Some(&path), &node_id).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v7_to_v8_migration_defaults_context_metadata_to_none() {
+        let path = temp_path("v7-to-v8-context-migration");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, record) = fixture(&path);
+        save_v7(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let loaded_v7 = load(Some(&path), &node_id).unwrap();
+        assert!(loaded_v7.records[0].context_id.is_none());
+        assert!(loaded_v7.records[0].context.is_none());
+        assert!(loaded_v7.materializations.is_empty());
+        save_v8(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &loaded_v7.records,
+            &[],
+            &[],
+            &loaded_v7.materializations,
+        )
+        .unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let header: PersistedNodeStateHeader = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V8);
+        let loaded_v8 = load(Some(&path), &node_id).unwrap();
+        assert!(loaded_v8.records[0].context_id.is_none());
+        assert!(loaded_v8.records[0].context.is_none());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v8_roundtrip_preserves_only_opaque_context_metadata() {
+        let path = temp_path("v8-context-roundtrip");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, mut record) = fixture(&path);
+        let context = context_receipt("ctx-qwen-codex", 'a');
+        record.context_id = Some(context.id.clone());
+        record.context = Some(context.clone());
+        let ownership = context_materialization(
+            &path,
+            "context-record",
+            record.record_id.clone(),
+            context.clone(),
+        );
+
+        save_v8(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+            &[ownership.clone()],
+        )
+        .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let serialized: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serialized["version"], NODE_STATE_SCHEMA_V8);
+        assert_eq!(
+            serialized["session_records"][0]["context"]["id"],
+            "ctx-qwen-codex",
+        );
+        assert!(serialized["session_records"][0]["context"].get("messages").is_none());
+        assert!(serialized["materializations"][0]["context"].get("messages").is_none());
+        assert!(!String::from_utf8(bytes).unwrap().contains("bounded-history-message-body"));
+
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert_eq!(loaded.records[0].context_id.as_ref(), Some(&context.id));
+        assert_eq!(loaded.records[0].context.as_ref(), Some(&context));
+        assert!(loaded.materializations == vec![ownership]);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v8_save_rejects_context_id_and_receipt_mismatch() {
+        let path = temp_path("v8-context-id-mismatch");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, mut record) = fixture(&path);
+        let context = context_receipt("ctx-receipt", 'b');
+        record.context_id = Some(crate::protocol::SpawnContextId::new("ctx-other").unwrap());
+        record.context = Some(context.clone());
+        let ownership = context_materialization(
+            &path,
+            "context-mismatch",
+            record.record_id.clone(),
+            context,
+        );
+
+        let error = save_v8(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+            &[ownership],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v8_save_rejects_mismatched_context_materialization_reference() {
+        let path = temp_path("v8-context-materialization-mismatch");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, mut record) = fixture(&path);
+        let record_context = context_receipt("ctx-record", 'd');
+        record.context_id = Some(record_context.id.clone());
+        record.context = Some(record_context);
+        let ownership = context_materialization(
+            &path,
+            "context-foreign",
+            record.record_id.clone(),
+            context_receipt("ctx-foreign", 'e'),
+        );
+
+        let error = save_v8(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+            &[ownership],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v8_load_rejects_invalid_context_receipt() {
+        let path = temp_path("v8-context-invalid-receipt");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, mut record) = fixture(&path);
+        let context = context_receipt("ctx-valid", 'c');
+        record.context_id = Some(context.id.clone());
+        record.context = Some(context.clone());
+        let ownership = context_materialization(
+            &path,
+            "context-invalid",
+            record.record_id.clone(),
+            context,
+        );
+        save_v8(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+            &[ownership],
+        )
+        .unwrap();
+
+        let mut invalid: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        invalid["materializations"][0]["context"]["byte_len"] = serde_json::Value::from(0);
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert_eq!(
+            load(Some(&path), &node_id).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

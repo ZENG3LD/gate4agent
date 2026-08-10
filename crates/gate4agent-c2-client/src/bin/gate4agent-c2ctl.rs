@@ -70,6 +70,15 @@ enum SeedError {
     Snapshot,
     #[error("provider {provider} session identity did not match")]
     SessionMismatch { provider: AgentId },
+    #[error(
+        "provider {provider} readiness incomplete (running_pid={observed_running_pid}, pty_output={pty_output}, final_status={final_status})"
+    )]
+    ProviderReadinessTimedOut {
+        provider: AgentId,
+        observed_running_pid: bool,
+        pty_output: bool,
+        final_status: &'static str,
+    },
     #[error("provider sessions did not produce a visible terminal screen")]
     ReadinessTimedOut,
     #[error("provider seed operation timed out")]
@@ -273,6 +282,26 @@ fn evidence_is_ready(evidence: &SeedEvidence) -> bool {
     evidence.observed_running_pid && evidence.pty_output
 }
 
+fn readiness_timeout_error(sessions: &[SeededSession]) -> SeedError {
+    let Some(session) = sessions
+        .iter()
+        .find(|session| !evidence_is_ready(&session.evidence))
+    else {
+        return SeedError::ReadinessTimedOut;
+    };
+    SeedError::ProviderReadinessTimedOut {
+        provider: session.provider.clone(),
+        observed_running_pid: session.evidence.observed_running_pid,
+        pty_output: session.evidence.pty_output,
+        final_status: session
+            .evidence
+            .final_status
+            .as_ref()
+            .map(status_name)
+            .unwrap_or("unobserved"),
+    }
+}
+
 fn status_name(status: &C2SessionStatus) -> &'static str {
     match status {
         C2SessionStatus::Registered => "registered",
@@ -360,7 +389,7 @@ async fn seed_connected(
         });
     }
 
-    timeout(READINESS_DEADLINE, async {
+    let readiness = timeout(READINESS_DEADLINE, async {
         loop {
             let current = snapshot(control, &route).await?;
             if evaluate_readiness(&current, &options.workspace_id, &mut sessions)? {
@@ -369,8 +398,11 @@ async fn seed_connected(
             sleep(POLL_INTERVAL).await;
         }
     })
-    .await
-    .map_err(|_| SeedError::ReadinessTimedOut)??;
+    .await;
+    match readiness {
+        Ok(result) => result?,
+        Err(_) => return Err(readiness_timeout_error(&sessions)),
+    }
     Ok(sessions)
 }
 
@@ -719,5 +751,26 @@ mod tests {
         assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
         assert!(seeded[0].evidence.observed_running_pid);
         assert!(!seeded[0].evidence.pty_output);
+    }
+
+    #[test]
+    fn seed_vendor_pty_timeout_reports_only_safe_first_pending_evidence() {
+        let workspace = WorkspaceId::new("workspace-a").unwrap();
+        let mut seeded = vec![
+            seeded_session(agent("claude"), &workspace, 1),
+            seeded_session(agent("codex"), &workspace, 2),
+        ];
+        seeded[0].evidence.observed_running_pid = true;
+        seeded[0].evidence.final_status = Some(C2SessionStatus::Exited {
+            exit_code: Some(1),
+        });
+        seeded[1].evidence.observed_running_pid = true;
+        seeded[1].evidence.pty_output = true;
+        seeded[1].evidence.final_status = Some(C2SessionStatus::Running);
+
+        assert_eq!(
+            readiness_timeout_error(&seeded).to_string(),
+            "provider claude readiness incomplete (running_pid=true, pty_output=false, final_status=exited)"
+        );
     }
 }

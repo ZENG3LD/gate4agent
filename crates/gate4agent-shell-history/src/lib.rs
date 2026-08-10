@@ -273,6 +273,11 @@ pub fn orca_home_roots(
         HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson,
         home.join(".kimi-code").join("sessions"),
     )?;
+    push(
+        "qwen-code",
+        HistorySourceLayout::SingleNdjson,
+        home.join(".qwen").join("projects"),
+    )?;
     Ok(roots)
 }
 

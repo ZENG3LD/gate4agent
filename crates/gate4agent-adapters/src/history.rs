@@ -1,5 +1,6 @@
 use gate4agent_types::AdapterId;
 use serde_json::{Map, Value};
+use std::collections::VecDeque;
 use thiserror::Error;
 
 pub const HISTORY_METADATA_MAX_BYTES: usize = 1_048_576;
@@ -127,7 +128,7 @@ pub fn history_source_variants(
 
     match adapter_id.as_str() {
         "claude-code" | "copilot" | "cursor" | "openclaw" | "pi" | "omp" | "droid"
-        | "antigravity" => Ok(&[NDJSON]),
+        | "antigravity" | "qwen-code" => Ok(&[NDJSON]),
         "codex" => Ok(&[CODEX]),
         "gemini" => Ok(&[JSON_OR_NDJSON]),
         "hermes" | "devin" => Ok(&[JSON]),
@@ -156,6 +157,7 @@ pub fn parse_history(
         "devin" => parse_devin(document),
         "grok" => parse_grok(document),
         "kimi" => parse_kimi(document),
+        "qwen-code" => parse_qwen(document),
         "copilot" => parse_copilot(document),
         "droid" => parse_droid(document),
         "cursor" => parse_cursor(document),
@@ -521,6 +523,60 @@ fn parse_kimi(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapt
     Ok(session.finish())
 }
 
+fn parse_qwen(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
+    let records = qwen_active_records(&document.transcript);
+    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    let mut custom_title = None;
+
+    for record in records {
+        if let Some(id) = string(&record, &["sessionId"]) {
+            session.session_id = select_session_id(Some(id), &session.session_id)?;
+        }
+        session.cwd = string(&record, &["cwd"]).or(session.cwd);
+        match (
+            record.get("type").and_then(Value::as_str),
+            record.get("provenance").and_then(Value::as_str),
+        ) {
+            (Some("user"), Some("real_user"))
+                if matches!(
+                    record.get("subtype").and_then(Value::as_str),
+                    None | Some("mid_turn_user_message")
+                ) =>
+            {
+                let text = qwen_message_text(&record).filter(|text| {
+                    !is_known_harness_injected_user_turn(text)
+                });
+                session.push(HistoryRole::User, text);
+            }
+            (Some("assistant"), Some("assistant_output"))
+                if record.get("subtype").is_none() =>
+            {
+                session.model = string(&record, &["model"]).or(session.model);
+                if let Some(usage) = record.get("usageMetadata") {
+                    session.total_tokens = session
+                        .total_tokens
+                        .saturating_add(qwen_usage_total(usage));
+                }
+                session.push(HistoryRole::Assistant, qwen_message_text(&record));
+            }
+            (Some("system"), _)
+                if record.get("subtype").and_then(Value::as_str)
+                    == Some("custom_title") =>
+            {
+                custom_title = record
+                    .get("systemPayload")
+                    .and_then(Value::as_object)
+                    .and_then(|payload| string(payload, &["customTitle"]))
+                    .and_then(normalize_title)
+                    .or(custom_title);
+            }
+            _ => {}
+        }
+    }
+    session.title = custom_title.or(session.title);
+    Ok(session.finish())
+}
+
 fn parse_copilot(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
     let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
     for record in ndjson_records(&document.transcript) {
@@ -873,7 +929,7 @@ struct SessionBuilder {
     model: Option<String>,
     message_count: u64,
     total_tokens: u64,
-    messages: Vec<HistoryMessage>,
+    messages: VecDeque<HistoryMessage>,
 }
 
 impl SessionBuilder {
@@ -885,7 +941,7 @@ impl SessionBuilder {
             model: None,
             message_count: 0,
             total_tokens: 0,
-            messages: Vec::new(),
+            messages: VecDeque::new(),
         }
     }
 
@@ -895,10 +951,11 @@ impl SessionBuilder {
         if role == HistoryRole::User && self.title.is_none() {
             self.title = text.clone().and_then(normalize_title);
         }
-        if self.messages.len() < HISTORY_STORED_MESSAGES_MAX {
-            if let Some(text) = text {
-                self.messages.push(HistoryMessage { role, text });
+        if let Some(text) = text {
+            if self.messages.len() == HISTORY_STORED_MESSAGES_MAX {
+                self.messages.pop_front();
             }
+            self.messages.push_back(HistoryMessage { role, text });
         }
     }
 
@@ -910,7 +967,7 @@ impl SessionBuilder {
             model: self.model,
             message_count: self.message_count,
             total_tokens: self.total_tokens,
-            messages: self.messages,
+            messages: self.messages.into_iter().collect(),
         }
     }
 }
@@ -1271,6 +1328,71 @@ fn grok_content_text(value: &Value) -> Option<String> {
     normalize_message(text[start..end].to_owned()).or(Some(text))
 }
 
+fn qwen_active_records(content: &str) -> Vec<Map<String, Value>> {
+    let records = ndjson_records(content).collect::<Vec<_>>();
+    let by_uuid = records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            string(record, &["uuid"]).map(|uuid| (uuid, index))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let Some(mut current) = records
+        .iter()
+        .rev()
+        .find_map(|record| string(record, &["uuid"]))
+    else {
+        return Vec::new();
+    };
+    let mut active = std::collections::HashSet::new();
+    while let Some(index) = by_uuid.get(&current).copied() {
+        if !active.insert(index) {
+            break;
+        }
+        let Some(parent) = records[index]
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|parent| !parent.is_empty())
+        else {
+            break;
+        };
+        current = parent.to_owned();
+    }
+    records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, record)| active.contains(&index).then_some(record))
+        .collect()
+}
+
+fn qwen_message_text(record: &Map<String, Value>) -> Option<String> {
+    let parts = record
+        .get("message")
+        .and_then(Value::as_object)?
+        .get("parts")
+        .and_then(Value::as_array)?;
+    let text = parts
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|part| part.get("thought").and_then(Value::as_bool) != Some(true))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_message(text)
+}
+
+fn qwen_usage_total(value: &Value) -> u64 {
+    let Some(usage) = value.as_object() else {
+        return 0;
+    };
+    u64_value(usage, &["totalTokenCount"])
+        .filter(|total| *total > 0)
+        .unwrap_or_else(|| {
+            sum_named_numbers(usage, &["promptTokenCount", "candidatesTokenCount"])
+        })
+}
+
 fn content_text(value: &Value) -> Option<String> {
     content_text_at_depth(value, 0).and_then(normalize_message)
 }
@@ -1564,6 +1686,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_qwen_active_real_user_and_assistant_output_chain() {
+        let transcript = [
+            r#"{"uuid":"u1","parentUuid":null,"sessionId":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-10T00:00:00Z","type":"user","provenance":"real_user","cwd":"C:/repo","version":"0.21.6","gitBranch":"main","message":{"role":"user","parts":[{"text":"ship the adapter"}]}}"#,
+            r#"{"uuid":"ignored-user","parentUuid":"u1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","provenance":"system","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"internal notification"}]}}"#,
+            r#"{"uuid":"notification","parentUuid":"ignored-user","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","subtype":"notification","provenance":"system","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"background"}]}}"#,
+            r#"{"uuid":"a1","parentUuid":"notification","sessionId":"11111111-1111-4111-8111-111111111111","type":"assistant","provenance":"assistant_output","cwd":"C:/repo","model":"qwen3-coder","usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7},"message":{"role":"model","parts":[{"text":"private chain of thought","thought":true},{"text":"adapter ready"},{"functionCall":{"name":"hidden_tool"}}]}}"#,
+            r#"{"uuid":"stale","parentUuid":"u1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","provenance":"real_user","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"stale branch"}]}}"#,
+            r#"{"uuid":"injected","parentUuid":"a1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","provenance":"real_user","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"<teammate-message>hidden harness</teammate-message>"}]}}"#,
+            r#"{"uuid":"title","parentUuid":"injected","sessionId":"11111111-1111-4111-8111-111111111111","type":"system","subtype":"custom_title","cwd":"C:/repo","version":"0.21.6","systemPayload":{"customTitle":"Qwen context pack","titleSource":"manual"}}"#,
+        ]
+        .join("\n");
+        let session = parse_history(
+            &id("qwen-code"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(session.session_id, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(session.title.as_deref(), Some("Qwen context pack"));
+        assert_eq!(session.cwd.as_deref(), Some("C:/repo"));
+        assert_eq!(session.model.as_deref(), Some("qwen3-coder"));
+        assert_eq!(session.total_tokens, 7);
+        assert_eq!(session.message_count, 3);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].text, "ship the adapter");
+        assert_eq!(session.messages[1].text, "adapter ready");
+        assert!(!session.messages.iter().any(|message| {
+            message.text.contains("private chain of thought")
+        }));
+    }
+
+    #[test]
     fn parses_copilot_droid_and_cursor_ndjson_shapes() {
         let fixtures = [
             (
@@ -1788,6 +1946,40 @@ mod tests {
             HISTORY_MESSAGE_MAX_CHARS
         );
         assert!(session.messages[0].text.starts_with("привет"));
+    }
+
+    #[test]
+    fn retained_history_keeps_the_most_recent_tail_in_chronological_order() {
+        let transcript = (0..HISTORY_STORED_MESSAGES_MAX + 2)
+            .map(|index| {
+                serde_json::json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("message-{index}")
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_history(
+            &id("cursor"),
+            &HistoryDocument {
+                session_id_hint: "cursor-tail".to_owned(),
+                metadata_json: None,
+                transcript,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            session.message_count,
+            u64::try_from(HISTORY_STORED_MESSAGES_MAX + 2).unwrap()
+        );
+        assert_eq!(session.messages.len(), HISTORY_STORED_MESSAGES_MAX);
+        assert_eq!(session.messages[0].text, "message-2");
+        assert_eq!(
+            session.messages.last().unwrap().text,
+            format!("message-{}", HISTORY_STORED_MESSAGES_MAX + 1)
+        );
     }
 
     #[test]

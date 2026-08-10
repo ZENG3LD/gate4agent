@@ -56,7 +56,7 @@ fn orca_roots_cover_pinned_native_sources_without_exposing_paths_in_debug() {
     let fixture = FixtureDir::new("roots");
     let roots = orca_home_roots(fixture.path()).unwrap();
 
-    assert_eq!(roots.len(), 19);
+    assert_eq!(roots.len(), 20);
     assert_eq!(
         roots
             .iter()
@@ -263,6 +263,59 @@ fn kimi_load_uses_index_cwd_and_primary_agent_wire() {
     assert_eq!(parsed.cwd.as_deref(), Some("/repo/kimi"));
     assert_eq!(parsed.model.as_deref(), Some("kimi-k2"));
     assert_eq!(parsed.messages.len(), 2);
+}
+
+#[test]
+fn qwen_project_chat_load_is_bounded_to_the_active_real_user_chain() {
+    let fixture = FixtureDir::new("qwen");
+    let projects = fixture.path().join("projects");
+    let chats = projects.join("c--repo").join("chats");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    write(
+        &chats.join(format!("{session_id}.jsonl")),
+        &[
+            r#"{"uuid":"u1","parentUuid":null,"sessionId":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-10T00:00:00Z","type":"user","provenance":"real_user","cwd":"C:/repo","version":"0.21.6","gitBranch":"main","message":{"role":"user","parts":[{"text":"<system-reminder>internal</system-reminder> real request"}]}}"#,
+            r#"{"uuid":"system-user","parentUuid":"u1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","subtype":"notification","provenance":"system","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"hidden notification"}]}}"#,
+            r#"{"uuid":"a1","parentUuid":"system-user","sessionId":"11111111-1111-4111-8111-111111111111","type":"assistant","provenance":"assistant_output","cwd":"C:/repo","model":"qwen3-coder","usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":5,"totalTokenCount":9},"message":{"role":"model","parts":[{"text":"private chain of thought","thought":true},{"text":"visible answer"},{"functionCall":{"name":"hidden_tool"}}]}}"#,
+            r#"{"uuid":"tool","parentUuid":"a1","sessionId":"11111111-1111-4111-8111-111111111111","type":"tool_result","provenance":"tool_result","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"secret tool output"}]}}"#,
+            r#"{"uuid":"title","parentUuid":"tool","sessionId":"11111111-1111-4111-8111-111111111111","type":"system","subtype":"custom_title","cwd":"C:/repo","version":"0.21.6","systemPayload":{"customTitle":"Qwen native history","titleSource":"manual"}}"#,
+        ]
+        .join("\n"),
+    );
+    write(
+        &chats
+            .join("archive")
+            .join("22222222-2222-4222-8222-222222222222.jsonl"),
+        "{}",
+    );
+    write(&chats.join("not-a-session.jsonl"), "{}");
+    let mut authority = NativeHistoryAuthority::new(
+        NativeHistoryConfig::new(vec![root(
+            "qwen-code",
+            HistorySourceLayout::SingleNdjson,
+            &projects,
+        )])
+        .unwrap(),
+    );
+    let discovery = request("qwen-code", 8);
+    let candidates = discover_history(&mut authority, &discovery).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].session_id_hint(), session_id);
+    let load = HistoryLoadRequest::new(&discovery, candidates[0].clone()).unwrap();
+    let parsed = load_history_session(&mut authority, &load).unwrap();
+
+    assert_eq!(parsed.session_id, session_id);
+    assert_eq!(parsed.title.as_deref(), Some("Qwen native history"));
+    assert_eq!(parsed.cwd.as_deref(), Some("C:/repo"));
+    assert_eq!(parsed.model.as_deref(), Some("qwen3-coder"));
+    assert_eq!(parsed.total_tokens, 9);
+    assert_eq!(parsed.message_count, 2);
+    assert_eq!(parsed.messages.len(), 2);
+    assert_eq!(parsed.messages[0].text, "real request");
+    assert_eq!(parsed.messages[1].text, "visible answer");
+    assert!(!parsed.messages.iter().any(|message| {
+        message.text.contains("private chain of thought")
+    }));
 }
 
 #[test]

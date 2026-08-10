@@ -661,7 +661,8 @@ mod tests {
         let qwen = registry.get_by_id("qwen-code").unwrap();
         assert_eq!(qwen.prompt.initial, InitialPromptMode::AfterReady);
         assert!(qwen.capabilities.adapters.hook.is_none());
-        assert!(qwen.capabilities.adapters.history.is_none());
+        assert!(qwen.capabilities.adapters.history.is_some());
+        assert!(qwen.capabilities.adapters.resume.is_none());
         assert!(qwen.capabilities.transports.pty_adapter.is_none());
     }
 }

@@ -374,6 +374,7 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
         "pi",
         "omp",
         "devin",
+        "qwen-code",
     ] {
         descriptors.push(descriptor(AdapterFamily::History, id));
     }
@@ -485,6 +486,9 @@ mod tests {
             assert!(registry.get(AdapterFamily::Hook, &id).is_none());
             assert!(registry.get(AdapterFamily::History, &id).is_some());
         }
+        let qwen = AdapterId::new("qwen-code").unwrap();
+        assert!(registry.get(AdapterFamily::Hook, &qwen).is_none());
+        assert!(registry.get(AdapterFamily::History, &qwen).is_some());
     }
 
     #[test]
@@ -510,6 +514,7 @@ mod tests {
             "opencode",
             "openclaw",
             "pi",
+            "qwen-code",
             "rovo",
         ]
         .into_iter()

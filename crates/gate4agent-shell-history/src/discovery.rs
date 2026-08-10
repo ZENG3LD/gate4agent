@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+use uuid::Uuid;
 
 pub(crate) struct DiscoveryResult {
     pub(crate) candidates: Vec<DiscoveredCandidate>,
@@ -214,6 +215,7 @@ fn matches_file(adapter_id: &str, path: &Path) -> bool {
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("session_"))
         }
+        "qwen-code" => qwen_session_id(path).is_some(),
         "cursor" => extension == "jsonl" && has_component(path, "agent-transcripts"),
         "openclaw" => extension == "jsonl" && has_component(path, "sessions"),
         "antigravity" => antigravity_session_id(path).is_some(),
@@ -239,6 +241,13 @@ fn should_descend(adapter_id: &str, path: &Path, parent_depth: usize) -> bool {
             _ => false,
         };
     }
+    if adapter_id == "qwen-code" {
+        return match parent_depth {
+            0 => true,
+            1 => name == "chats",
+            _ => false,
+        };
+    }
     true
 }
 
@@ -246,6 +255,7 @@ fn session_id_hint(adapter_id: &str, path: &Path) -> Option<String> {
     let hint = match adapter_id {
         "antigravity" => antigravity_session_id(path)?,
         "grok" | "rovo" | "kimi" => path.parent()?.file_name()?.to_str()?.to_owned(),
+        "qwen-code" => qwen_session_id(path)?,
         _ => path.file_stem()?.to_str()?.to_owned(),
     };
     let hint = hint.trim();
@@ -265,6 +275,15 @@ fn antigravity_session_id(path: &Path) -> Option<String> {
         return None;
     }
     Some(generated.parent()?.file_name()?.to_str()?.to_owned())
+}
+
+fn qwen_session_id(path: &Path) -> Option<String> {
+    if path.parent()?.file_name()?.to_str()? != "chats" {
+        return None;
+    }
+    let session_id = path.file_stem()?.to_str()?.trim();
+    Uuid::parse_str(session_id).ok()?;
+    Some(session_id.to_owned())
 }
 
 fn has_component(path: &Path, expected: &str) -> bool {

@@ -1,6 +1,7 @@
 //! Pipe-mode Codex bindings: NDJSON parser + spawn builder.
 
 use super::traits::{CliEvent, NdjsonParser};
+use crate::core::types::ContextWindowUsage;
 use crate::utils::truncate_str;
 use crate::transport::SpawnOptions;
 
@@ -23,6 +24,36 @@ impl Default for CodexNdjsonParser {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn exact_context_window_usage(info: &serde_json::Value) -> Option<ContextWindowUsage> {
+    let usage = info.get("last_token_usage")?;
+    let capacity_tokens = info
+        .get("model_context_window")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|capacity| *capacity > 0)?;
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let cache_read_tokens = usage.get("cached_input_tokens")?.as_u64()?;
+    let output_tokens = usage.get("output_tokens")?.as_u64()?;
+    let used_tokens = usage.get("total_tokens")?.as_u64()?;
+    let uncached_input_tokens = input_tokens.checked_sub(cache_read_tokens)?;
+    let known_tokens = uncached_input_tokens
+        .checked_add(cache_read_tokens)?
+        .checked_add(output_tokens)?;
+    let unattributed_tokens = used_tokens.checked_sub(known_tokens)?;
+    let normalized_sum = uncached_input_tokens
+        .checked_add(cache_read_tokens)?
+        .checked_add(output_tokens)?
+        .checked_add(unattributed_tokens)?;
+    (normalized_sum == used_tokens).then_some(ContextWindowUsage {
+        uncached_input_tokens,
+        cache_read_tokens,
+        cache_write_tokens: 0,
+        output_tokens,
+        unattributed_tokens,
+        used_tokens,
+        capacity_tokens,
+    })
 }
 
 impl NdjsonParser for CodexNdjsonParser {
@@ -90,6 +121,7 @@ impl NdjsonParser for CodexNdjsonParser {
                 if let Some(payload) = v.get("payload") {
                     if payload.get("type").and_then(|t| t.as_str()) == Some("token_count") {
                         if let Some(info) = payload.get("info") {
+                            let context_window_usage = exact_context_window_usage(info);
                             let usage = info.get("total_token_usage");
                             let input = usage
                                 .and_then(|u| u.get("input_tokens"))
@@ -124,6 +156,9 @@ impl NdjsonParser for CodexNdjsonParser {
                                 context_window: ctx_window,
                                 is_cumulative: true,
                             });
+                            if let Some(usage) = context_window_usage {
+                                events.push(CliEvent::ContextWindowUsage { usage });
+                            }
                         }
                     }
                 }
@@ -281,14 +316,45 @@ impl NdjsonParser for CodexNdjsonParser {
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            events.push(CliEvent::ToolCallResult {
-                                id,
-                                output: "file changed".to_string(),
-                                is_error: false,
-                                duration_ms: None,
-                            });
+                            match item.get("status").and_then(|s| s.as_str()) {
+                                Some("completed") => events.push(CliEvent::ToolCallResult {
+                                    id,
+                                    output: String::new(),
+                                    is_error: false,
+                                    duration_ms: None,
+                                }),
+                                Some("failed") => events.push(CliEvent::ToolCallResult {
+                                    id,
+                                    output: String::new(),
+                                    is_error: true,
+                                    duration_ms: None,
+                                }),
+                                _ => {}
+                            }
                         }
-                        Some("mcp_tool_call") | Some("web_search") | Some("plan_update") => {
+                        Some("plan_update") => {
+                            let id = item
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            match item.get("status").and_then(|s| s.as_str()) {
+                                Some("completed") => events.push(CliEvent::ToolCallResult {
+                                    id,
+                                    output: String::new(),
+                                    is_error: false,
+                                    duration_ms: None,
+                                }),
+                                Some("failed") => events.push(CliEvent::ToolCallResult {
+                                    id,
+                                    output: String::new(),
+                                    is_error: true,
+                                    duration_ms: None,
+                                }),
+                                _ => {}
+                            }
+                        }
+                        Some("mcp_tool_call") | Some("web_search") => {
                             let id = item
                                 .get("id")
                                 .and_then(|s| s.as_str())
@@ -627,6 +693,43 @@ mod tests {
         assert!(events.is_empty(), "non-token_count event_msg must produce no events, got {:?}", events);
     }
 
+    #[test]
+    fn codex_token_count_emits_exact_current_context_with_truthful_segments() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"output_tokens":200,"cached_input_tokens":300},"last_token_usage":{"input_tokens":100,"output_tokens":30,"cached_input_tokens":20,"total_tokens":140},"model_context_window":128}}}"#;
+        let events = parser.parse_line(line);
+        assert!(matches!(events.first(), Some(CliEvent::TurnComplete { is_cumulative: true, .. })));
+        assert!(matches!(
+            events.get(1),
+            Some(CliEvent::ContextWindowUsage {
+                usage: ContextWindowUsage {
+                    uncached_input_tokens: 80,
+                    cache_read_tokens: 20,
+                    cache_write_tokens: 0,
+                    output_tokens: 30,
+                    unattributed_tokens: 10,
+                    used_tokens: 140,
+                    capacity_tokens: 128,
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn codex_exact_context_fails_closed_without_consistent_atomic_usage() {
+        let mut parser = CodexNdjsonParser::new();
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10},"last_token_usage":{"input_tokens":100,"output_tokens":30,"cached_input_tokens":20,"total_tokens":129},"model_context_window":128000}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10},"last_token_usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":20,"total_tokens":12},"model_context_window":128000}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10},"last_token_usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":0,"total_tokens":12},"model_context_window":0}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10},"last_token_usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":0},"model_context_window":128000}}}"#,
+        ] {
+            let events = parser.parse_line(line);
+            assert_eq!(events.len(), 1, "ordinary cumulative accounting must remain available");
+            assert!(matches!(events[0], CliEvent::TurnComplete { is_cumulative: true, .. }));
+        }
+    }
+
     // ── Builder tests ─────────────────────────────────────────────────────────
 
     fn make_opts(permission_mode: Option<&str>) -> SpawnOptions {
@@ -675,6 +778,61 @@ mod tests {
         let opts = make_opts(Some("full-auto"));
         let args = args_of(builder.build_command(&opts));
         assert!(args.windows(2).any(|pair| pair == ["-s", "danger-full-access"]), "danger-full-access sandbox must be present, args: {args:?}");
+    }
+
+    #[test]
+    fn codex_workflow_items_without_structured_detail_remain_generic() {
+        let mut parser = CodexNdjsonParser::new();
+        let plan = r#"{"type":"item.started","item":{"id":"plan_1","type":"plan_update","summary":"Step 1: analyze","status":"in_progress"}}"#;
+        let file = r#"{"type":"item.started","item":{"id":"file_1","type":"file_change","status":"in_progress"}}"#;
+
+        let plan_events = parser.parse_line(plan);
+        assert!(matches!(
+            plan_events.as_slice(),
+            [CliEvent::ToolCallStart { name, input, .. }]
+                if name == "plan_update"
+                    && input.get("summary").and_then(|value| value.as_str())
+                        == Some("Step 1: analyze")
+                    && input.get("items").is_none()
+        ));
+        let file_events = parser.parse_line(file);
+        assert!(matches!(
+            file_events.as_slice(),
+            [CliEvent::ToolCallStart { name, input, .. }]
+                if name == "FileChange"
+                    && input.get("path").is_none()
+                    && input.get("changes").is_none()
+        ));
+    }
+
+    #[test]
+    fn codex_workflow_items_require_authoritative_status_for_completion() {
+        let mut parser = CodexNdjsonParser::new();
+        for line in [
+            r#"{"type":"item.completed","item":{"id":"plan_1","type":"plan_update","summary":"Step 1: analyze"}}"#,
+            r#"{"type":"item.completed","item":{"id":"file_1","type":"file_change"}}"#,
+        ] {
+            assert!(
+                parser.parse_line(line).is_empty(),
+                "missing status must not invent successful workflow completion"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_file_change_completion_does_not_invent_path_or_output() {
+        let mut parser = CodexNdjsonParser::new();
+        let line = r#"{"type":"item.completed","item":{"id":"file_1","type":"file_change","status":"completed"}}"#;
+        let events = parser.parse_line(line);
+        assert!(matches!(
+            events.as_slice(),
+            [CliEvent::ToolCallResult {
+                id,
+                output,
+                is_error: false,
+                ..
+            }] if id == "file_1" && output.is_empty()
+        ));
     }
 
     #[test]

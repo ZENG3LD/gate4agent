@@ -1,17 +1,17 @@
 #![cfg(windows)]
 
 use gate4agent_c2::protocol::{
-    C2NodeEvent, C2NodeResponse, C2NodeSnapshot, C2SessionStatus, NodeId, NodeRoute,
-    NodeTransportState, RoutedNodeEvent, C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
-    C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    C2ManagedSessionRecord, C2NodeEvent, C2NodeResponse, C2NodeSnapshot, C2SessionStatus,
+    NodeId, NodeRoute, NodeTransportState, RoutedNodeEvent,
+    C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY, C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
 };
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlHandle};
 use gate4agent_node::protocol::{
-    CapabilityId, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseSnapshot,
-    ManagedWorktreeLeaseState, ManagedWorktreeRetention, ManagedWorktreeSpawnRequest,
-    NodeFailureCode, NodeRequest, SessionAddress, SessionMode, SpawnDeadlineMs,
-    SpawnIdempotencyKey, SpawnOverride, SpawnOverrides, SpawnProfileId,
+    CapabilityId, ManagedSessionState, ManagedWorktreeCleanupFailure,
+    ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
+    ManagedWorktreeSpawnRequest, NodeFailureCode, NodeRequest, SessionAddress, SessionMode,
+    SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides, SpawnProfileId,
     SpawnRequiredCapabilities, SpawnSpec, SpawnTarget, WorktreeProfileId,
     WorktreeProfileRevision, WorkspaceId, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
 };
@@ -197,6 +197,8 @@ fn spawn_request(node_id: &NodeId, workspace_id: &WorkspaceId) -> ManagedWorktre
                 worktree_id: None,
             },
             profile_id: SpawnProfileId::new("default").unwrap(),
+            expected_profile_revision:
+                gate4agent_node::protocol::SpawnProfileRevision::new("builtin-v1").unwrap(),
             overrides: SpawnOverrides {
                 provider: SpawnOverride::Set {
                     value: agent("claude"),
@@ -382,6 +384,38 @@ fn find_lease<'a>(
         .managed_worktrees
         .iter()
         .find(|candidate| candidate.lease_id == lease.lease_id)
+}
+
+fn find_record<'a>(
+    snapshot: &'a C2NodeSnapshot,
+    record_id: &gate4agent_node::protocol::SessionRecordId,
+) -> Option<&'a C2ManagedSessionRecord> {
+    snapshot
+        .session_records
+        .iter()
+        .find(|record| &record.record_id == record_id)
+}
+
+fn assert_raw_inventory_record(
+    record: &C2ManagedSessionRecord,
+    session: Option<&SessionAddress>,
+    workspace_id: &WorkspaceId,
+    expected_state: ManagedSessionState,
+    expected_name: &str,
+) {
+    assert_eq!(record.display_name, expected_name);
+    assert_eq!(record.provider, agent("claude"));
+    assert_eq!(record.mode, SessionMode::Pty);
+    assert_eq!(record.state, expected_state);
+    assert_eq!(&record.workspace_id, workspace_id);
+    assert_eq!(record.active_session.as_ref(), session);
+    assert!(record.environment_profile.is_none());
+    assert!(record.bundle.is_none());
+    assert!(record.context_id.is_none());
+    assert!(record.context.is_none());
+    assert!(!record.provider_identity_present);
+    assert!(record.created_at_unix_ms > 0);
+    assert!(record.updated_at_unix_ms >= record.created_at_unix_ms);
 }
 
 async fn wait_running(
@@ -629,6 +663,10 @@ async fn spawn_managed_worktree_is_durable_path_free_and_safely_cleaned_end_to_e
         }
     });
     wait_relay_ready(&control, &route).await;
+    let initial = snapshot(&control, &route).await;
+    assert_eq!(session_count(&initial), 0);
+    assert!(initial.session_records.is_empty());
+    assert!(initial.managed_worktrees.is_empty());
 
     let managed_request = spawn_request(&node_id, &source_workspace_id);
     assert_request_is_path_free(&managed_request);
@@ -651,9 +689,28 @@ async fn spawn_managed_worktree_is_durable_path_free_and_safely_cleaned_end_to_e
     assert_eq!(receipt.lease.retention, ManagedWorktreeRetention::Retain);
     assert_eq!(receipt.lease.state, ManagedWorktreeLeaseState::InUse);
     assert_eq!(receipt.lease.active_session_count, 1);
+    assert_eq!(receipt.lease.managed_record_count, 0);
     assert_eq!(receipt.spawn.session.workspace_id, receipt.lease.workspace_id);
-    assert_eq!(session_count(&snapshot(&control, &route).await), 1);
     wait_running(&control, &route, &receipt.spawn.session).await;
+    let active = snapshot(&control, &route).await;
+    assert_eq!(session_count(&active), 1);
+    assert_eq!(active.session_records.len(), 1);
+    let live_record = &active.session_records[0];
+    let record_id = live_record.record_id.clone();
+    let record_name = live_record.display_name.clone();
+    assert_raw_inventory_record(
+        live_record,
+        Some(&receipt.spawn.session),
+        &receipt.lease.workspace_id,
+        ManagedSessionState::Live,
+        &record_name,
+    );
+    assert_eq!(
+        find_lease(&active, &receipt.lease)
+            .expect("active managed lease disappeared")
+            .managed_record_count,
+        0,
+    );
 
     let listed = listed_worktrees(&repository);
     assert_eq!(listed.len(), 2);
@@ -730,6 +787,15 @@ async fn spawn_managed_worktree_is_durable_path_free_and_safely_cleaned_end_to_e
     }
     let after_replay = snapshot(&control, &route).await;
     assert_eq!(session_count(&after_replay), 1);
+    assert_eq!(after_replay.session_records.len(), 1);
+    assert_raw_inventory_record(
+        find_record(&after_replay, &record_id)
+            .expect("idempotent replay replaced the raw inventory record"),
+        Some(&receipt.spawn.session),
+        &receipt.lease.workspace_id,
+        ManagedSessionState::Live,
+        &record_name,
+    );
     assert_eq!(after_replay.managed_worktrees.len(), 1);
 
     assert!(matches!(
@@ -751,6 +817,16 @@ async fn spawn_managed_worktree_is_durable_path_free_and_safely_cleaned_end_to_e
     let stopped_lease = find_lease(&after_stop, &receipt.lease)
         .expect("Stop alone removed the managed lease");
     assert_eq!(stopped_lease.active_session_count, 1);
+    assert_eq!(stopped_lease.managed_record_count, 0);
+    assert_eq!(after_stop.session_records.len(), 1);
+    assert_raw_inventory_record(
+        find_record(&after_stop, &record_id)
+            .expect("stopped raw inventory record disappeared"),
+        None,
+        &receipt.lease.workspace_id,
+        ManagedSessionState::Unavailable,
+        &record_name,
+    );
     assert!(target.is_dir(), "Stop alone removed the physical worktree");
     assert_eq!(listed_worktrees(&repository).len(), 2);
 
@@ -769,6 +845,17 @@ async fn spawn_managed_worktree_is_durable_path_free_and_safely_cleaned_end_to_e
     ));
     let released = wait_released(&control, &route, &receipt.lease).await;
     assert!(target.is_dir(), "Retain policy removed the released worktree");
+    let after_remove = snapshot(&control, &route).await;
+    assert_eq!(session_count(&after_remove), 0);
+    assert_eq!(after_remove.session_records.len(), 1);
+    assert_raw_inventory_record(
+        find_record(&after_remove, &record_id)
+            .expect("Remove discarded the durable raw inventory record"),
+        None,
+        &receipt.lease.workspace_id,
+        ManagedSessionState::Unavailable,
+        &record_name,
+    );
 
     node_shutdown.request_shutdown().await.unwrap();
     timeout(Duration::from_secs(10), node_task)
@@ -802,6 +889,15 @@ async fn spawn_managed_worktree_is_durable_path_free_and_safely_cleaned_end_to_e
     assert_eq!(recovered_lease.state, ManagedWorktreeLeaseState::Retained);
     assert_eq!(recovered_lease.active_session_count, 0);
     assert_eq!(recovered_lease.managed_record_count, 0);
+    assert_eq!(recovered.session_records.len(), 1);
+    assert_raw_inventory_record(
+        find_record(&recovered, &record_id)
+            .expect("durable raw inventory record was absent after Node restart"),
+        None,
+        &receipt.lease.workspace_id,
+        ManagedSessionState::Unavailable,
+        &record_name,
+    );
     assert!(target.is_dir());
     assert_eq!(listed_worktrees(&repository).len(), 2);
 
@@ -861,6 +957,15 @@ async fn spawn_managed_worktree_is_durable_path_free_and_safely_cleaned_end_to_e
     assert_eq!(final_worktrees[0].branch.as_deref(), Some("main"));
     let final_snapshot = snapshot(&control, &route).await;
     assert_eq!(session_count(&final_snapshot), 0);
+    assert_eq!(final_snapshot.session_records.len(), 1);
+    assert_raw_inventory_record(
+        find_record(&final_snapshot, &record_id)
+            .expect("worktree cleanup discarded the durable raw inventory record"),
+        None,
+        &receipt.lease.workspace_id,
+        ManagedSessionState::Unavailable,
+        &record_name,
+    );
     assert!(final_snapshot.managed_worktrees.is_empty());
     assert_eq!(final_snapshot.workspaces.len(), 1);
     assert_eq!(final_snapshot.workspaces[0].workspace_id, source_workspace_id);

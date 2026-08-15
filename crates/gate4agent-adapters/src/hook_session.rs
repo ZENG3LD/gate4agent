@@ -522,12 +522,14 @@ impl HookSessionReducer {
                     self.tool_correlations.clear();
                 }
                 ProviderEvent::Text { .. }
+                | ProviderEvent::ContextWindowUsage { .. }
                 | ProviderEvent::SessionIdentityObserved { .. }
                 | ProviderEvent::WorkingObserved
                 | ProviderEvent::Thinking { .. }
                 | ProviderEvent::Error { .. }
                 | ProviderEvent::Ready
                 | ProviderEvent::InteractionRequested { .. }
+                | ProviderEvent::InteractionResolved { .. }
                 | ProviderEvent::SubagentStarted { .. }
                 | ProviderEvent::SubagentStopped { .. }
                 | ProviderEvent::RateLimited { .. } => {}

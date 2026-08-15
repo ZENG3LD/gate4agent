@@ -7,6 +7,8 @@ use gate4agent_types::{
     DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec, PipePromptDelivery,
     PipeProtocol, PipeTransportSpec, ProcessMatcher, PromptSpec, SpecVerification,
 };
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 pub const CONTROL_FIXTURE_ID: &str = "control-fixture";
 pub const PIPE_FIXTURE_ID: &str = "pipe-fixture";
@@ -14,6 +16,45 @@ pub const ONE_SHOT_FIXTURE_ID: &str = "one-shot-fixture";
 pub const ACP_FIXTURE_ID: &str = "acp-fixture";
 pub const PTY_PROVIDER_FIXTURE_ID: &str = "pty-provider-fixture";
 pub const HOOK_POSTING_FIXTURE_ID: &str = "hook-posting-fixture";
+pub const MONITORING_HOOK_FIXTURE_ID: &str = "monitoring-hook-fixture";
+pub const CLEAN_EXIT_FIXTURE_ID: &str = "clean-exit-fixture";
+pub const MONITORING_PROMPT_CANARY: &str = "g4a-private-prompt-canary";
+pub const MONITORING_TOOL_INPUT_CANARY: &str = "g4a-private-tool-input-canary";
+pub const MONITORING_TOOL_OUTPUT_CANARY: &str = "g4a-private-tool-output-canary";
+pub const MONITORING_PROVIDER_SESSION_CANARY: &str = "g4a-private-provider-session-canary";
+
+const FIXTURE_PATH_MAX_BYTES: usize = 4_096;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlledExitFixtureError {
+    InvalidRoot,
+    InvalidTarget(&'static str),
+    TargetExists(&'static str),
+    DuplicateTargets,
+}
+
+impl fmt::Display for ControlledExitFixtureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRoot => formatter.write_str(
+                "controlled-exit fixture root must be an absolute real directory",
+            ),
+            Self::InvalidTarget(name) => write!(
+                formatter,
+                "controlled-exit fixture {name} must be a bounded absolute path inside the fixture root",
+            ),
+            Self::TargetExists(name) => write!(
+                formatter,
+                "controlled-exit fixture {name} must not already exist",
+            ),
+            Self::DuplicateTargets => formatter.write_str(
+                "controlled-exit fixture marker and release paths must differ",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlledExitFixtureError {}
 
 /// Prevent automated Windows fault paths from opening modal UI.
 ///
@@ -68,6 +109,94 @@ pub fn exiting_agent_spec() -> AgentSpec {
     #[cfg(not(windows))]
     let script = "printf 'fixture-exit'; exit 7";
     fixture_spec(script)
+}
+
+pub fn controlled_clean_exit_agent_spec(
+    fixture_root: &Path,
+    started_marker: &Path,
+    release_signal: &Path,
+) -> Result<AgentSpec, ControlledExitFixtureError> {
+    validate_fixture_root(fixture_root)?;
+    let started_marker = validate_fixture_target(
+        fixture_root,
+        started_marker,
+        "started marker",
+    )?;
+    let release_signal = validate_fixture_target(
+        fixture_root,
+        release_signal,
+        "release signal",
+    )?;
+    if started_marker == release_signal {
+        return Err(ControlledExitFixtureError::DuplicateTargets);
+    }
+
+    #[cfg(windows)]
+    let launch = LaunchSpec {
+        program: "powershell.exe".to_owned(),
+        fixed_args: vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-ExecutionPolicy".to_owned(),
+            "Bypass".to_owned(),
+            "-Command".to_owned(),
+            r#"& { param([string]$startedMarker, [string]$releaseSignal)
+$ErrorActionPreference = 'Stop'
+$bytes = [Text.Encoding]::UTF8.GetBytes("started`n")
+$marker = [IO.File]::Open($startedMarker, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+try { $marker.Write($bytes, 0, $bytes.Length) } finally { $marker.Dispose() }
+while (-not (Test-Path -LiteralPath $releaseSignal -PathType Leaf)) {
+    Start-Sleep -Milliseconds 25
+}
+$release = Get-Item -LiteralPath $releaseSignal -Force
+if (($release -isnot [IO.FileInfo]) -or (($release.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { exit 81 }
+exit 0
+}"#.to_owned(),
+            started_marker,
+            release_signal,
+        ],
+    };
+
+    #[cfg(not(windows))]
+    let launch = LaunchSpec {
+        program: "python3".to_owned(),
+        fixed_args: vec![
+            "-u".to_owned(),
+            "-c".to_owned(),
+            r#"import os,stat,sys,time
+marker=sys.argv[1]
+release=sys.argv[2]
+fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+try:
+ os.write(fd,b'started\n')
+finally:
+ os.close(fd)
+while True:
+ try:
+  mode=os.lstat(release).st_mode
+ except FileNotFoundError:
+  time.sleep(0.025)
+  continue
+ if not stat.S_ISREG(mode):
+  sys.exit(81)
+ sys.exit(0)"#.to_owned(),
+            started_marker,
+            release_signal,
+        ],
+    };
+
+    Ok(provider_spec(
+        CLEAN_EXIT_FIXTURE_ID,
+        "Controlled clean-exit fixture",
+        launch,
+        AgentTransportCapabilities {
+            pty: true,
+            pty_adapter: None,
+            pipe: None,
+            acp: None,
+        },
+    ))
 }
 
 pub fn pipe_agent_spec() -> AgentSpec {
@@ -283,6 +412,146 @@ pub fn hook_posting_agent_spec() -> AgentSpec {
     spec
 }
 
+pub fn monitoring_hook_agent_spec() -> AgentSpec {
+    #[cfg(windows)]
+    let script = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
+$headers = @{
+    'X-Gate4Agent-Hook-Token' = $env:GATE4AGENT_HOOK_TOKEN
+    'X-Gate4Agent-Hook-Route' = $env:GATE4AGENT_HOOK_ROUTE
+}
+function Send-FixtureHook([string]$eventName, [string]$eventId, [hashtable]$payload) {
+    $payload['hook_event_name'] = $eventName
+    $body = @{
+        hook_event_name = $eventName
+        event_id = $eventId
+        payload = $payload
+    } | ConvertTo-Json -Compress -Depth 12
+    Invoke-WebRequest -UseBasicParsing -Method Post -Uri $env:GATE4AGENT_HOOK_URL -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
+}
+Send-FixtureHook 'SessionStart' 'monitoring-hook-1' @{
+    session_id = 'g4a-private-provider-session-canary'
+    model = 'fixture-model'
+}
+Send-FixtureHook 'UserPromptSubmit' 'monitoring-hook-2' @{
+    prompt = 'g4a-private-prompt-canary'
+}
+Send-FixtureHook 'PreToolUse' 'monitoring-hook-3' @{
+    tool_name = 'PowerShell'
+    tool_use_id = 'fixture-tool-1'
+    tool_input = @{ command = 'g4a-private-tool-input-canary' }
+}
+Send-FixtureHook 'PostToolUse' 'monitoring-hook-4' @{
+    tool_name = 'PowerShell'
+    tool_use_id = 'fixture-tool-1'
+    tool_response = @{ stdout = 'g4a-private-tool-output-canary' }
+    duration_ms = 17
+}
+Send-FixtureHook 'Stop' 'monitoring-hook-5' @{
+    last_assistant_message = 'fixture monitoring complete'
+}
+[Console]::Write('fixture-monitoring-hooks-posted')
+Start-Sleep -Seconds 60"#;
+    #[cfg(not(windows))]
+    let script = "printf 'monitoring hook fixture is Windows-only'; sleep 60";
+    let launch = provider_launch(script);
+    let mut spec = provider_spec(
+        MONITORING_HOOK_FIXTURE_ID,
+        "Production monitoring Hook fixture",
+        launch,
+        AgentTransportCapabilities {
+            pty: true,
+            pty_adapter: None,
+            pipe: None,
+            acp: None,
+        },
+    );
+    spec.capabilities.adapters.hook = Some(adapter(AdapterFamily::Hook, "claude-code"));
+    spec
+}
+
+fn validate_fixture_root(root: &Path) -> Result<(), ControlledExitFixtureError> {
+    if !valid_fixture_path_text(root) || !root.is_absolute() {
+        return Err(ControlledExitFixtureError::InvalidRoot);
+    }
+    for ancestor in root.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|_| ControlledExitFixtureError::InvalidRoot)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse(&metadata)
+        {
+            return Err(ControlledExitFixtureError::InvalidRoot);
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixture_target(
+    root: &Path,
+    target: &Path,
+    name: &'static str,
+) -> Result<String, ControlledExitFixtureError> {
+    if !valid_fixture_path_text(target) || !target.is_absolute() {
+        return Err(ControlledExitFixtureError::InvalidTarget(name));
+    }
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| ControlledExitFixtureError::InvalidTarget(name))?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ControlledExitFixtureError::InvalidTarget(name));
+    }
+
+    let mut parent = PathBuf::from(root);
+    for component in &components[..components.len() - 1] {
+        parent.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&parent)
+            .map_err(|_| ControlledExitFixtureError::InvalidTarget(name))?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse(&metadata)
+        {
+            return Err(ControlledExitFixtureError::InvalidTarget(name));
+        }
+    }
+
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => return Err(ControlledExitFixtureError::TargetExists(name)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(ControlledExitFixtureError::InvalidTarget(name)),
+    }
+    Ok(target
+        .to_str()
+        .expect("validated fixture target must be Unicode")
+        .to_owned())
+}
+
+fn valid_fixture_path_text(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some(value) if !value.is_empty()
+            && value.len() <= FIXTURE_PATH_MAX_BYTES
+            && !value.contains('\0')
+    )
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(_: &std::fs::Metadata) -> bool {
+    false
+}
+
 fn provider_launch(script: &str) -> LaunchSpec {
     #[cfg(windows)]
     return LaunchSpec {
@@ -395,10 +664,26 @@ fn fixture_spec(script: &str) -> AgentSpec {
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn unix_interactive_fixture_argv_is_nul_free_and_retains_terminal_escapes() {
         let spec = interactive_agent_spec();
@@ -410,5 +695,66 @@ mod tests {
         let script = spec.launch.fixed_args.last().unwrap();
         assert!(script.contains(r"\033[?2004h"));
         assert!(script.contains(r"\033[?25h"));
+    }
+
+    #[test]
+    fn controlled_clean_exit_fixture_marks_waits_and_exits_zero_after_release() {
+        suppress_windows_fault_dialogs_for_test();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-clean-exit-fixture-{}-{}",
+            std::process::id(),
+            FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let started_marker = root.join("started.marker");
+        let release_signal = root.join("release.signal");
+        let outside = root.parent().unwrap().join("outside.signal");
+        assert!(matches!(
+            controlled_clean_exit_agent_spec(&root, &started_marker, &outside),
+            Err(ControlledExitFixtureError::InvalidTarget("release signal"))
+        ));
+
+        let spec = controlled_clean_exit_agent_spec(&root, &started_marker, &release_signal)
+            .unwrap();
+        let child = Command::new(&spec.launch.program)
+            .args(&spec.launch.fixed_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let marker_deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read(&started_marker).ok().as_deref() != Some(b"started\n")
+            && Instant::now() < marker_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&started_marker).unwrap(), b"started\n");
+        assert!(child.0.try_wait().unwrap().is_none());
+
+        let mut release = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_signal)
+            .unwrap();
+        release.write_all(b"release\n").unwrap();
+        release.sync_all().unwrap();
+        drop(release);
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= exit_deadline {
+                panic!("controlled clean-exit fixture did not exit after release");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(0));
+
+        std::fs::remove_file(release_signal).unwrap();
+        std::fs::remove_file(started_marker).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }

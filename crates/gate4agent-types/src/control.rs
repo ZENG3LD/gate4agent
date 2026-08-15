@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 27;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 28;
 pub const CONTROL_SESSIONS_MAX: usize = 512;
 pub const CONTROL_INSTANCE_IDENTITIES_CAPACITY: u32 = 4_096;
 pub const CONTROL_INSTANCE_IDENTITIES_MAX: usize = CONTROL_INSTANCE_IDENTITIES_CAPACITY as usize;
@@ -524,6 +524,7 @@ pub enum ControlObservation {
     },
     ProviderGap {
         source: ProviderSource,
+        source_sequence: u64,
         missed: u64,
     },
 }
@@ -581,6 +582,39 @@ pub struct TokenUsage {
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub context_window: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextWindowUsage {
+    pub uncached_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub unattributed_tokens: u64,
+    pub used_tokens: u64,
+    pub capacity_tokens: u64,
+}
+
+impl ContextWindowUsage {
+    pub fn validate(&self) -> Result<(), ProviderEventValidationError> {
+        if self.capacity_tokens == 0 {
+            return Err(ProviderEventValidationError::ZeroContextWindowCapacity);
+        }
+        let segment_sum = self
+            .uncached_input_tokens
+            .checked_add(self.cache_read_tokens)
+            .and_then(|sum| sum.checked_add(self.cache_write_tokens))
+            .and_then(|sum| sum.checked_add(self.output_tokens))
+            .and_then(|sum| sum.checked_add(self.unattributed_tokens))
+            .ok_or(ProviderEventValidationError::ContextWindowSegmentsOverflow)?;
+        if segment_sum != self.used_tokens {
+            return Err(ProviderEventValidationError::ContextWindowSegmentsMismatch {
+                segment_sum,
+                used_tokens: self.used_tokens,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -759,6 +793,9 @@ pub enum ProviderEvent {
         usage: TokenUsage,
         is_cumulative: bool,
     },
+    ContextWindowUsage {
+        usage: ContextWindowUsage,
+    },
     TurnInterrupted,
     SessionEnded {
         result: String,
@@ -775,6 +812,10 @@ pub enum ProviderEvent {
         tool_name: String,
         prompt: String,
         agent_id: Option<String>,
+    },
+    InteractionResolved {
+        request_id: String,
+        outcome: ProviderInteractionOutcome,
     },
     SubagentStarted {
         agent_id: String,
@@ -881,6 +922,26 @@ impl ProviderEvent {
                 }
                 validate_optional_agent_id(agent_id)?;
             }
+            Self::InteractionResolved {
+                request_id,
+                outcome,
+            } => {
+                validate_required(
+                    "interaction request id",
+                    request_id,
+                    PROVIDER_EVENT_ID_MAX_BYTES,
+                )?;
+                if !matches!(
+                    outcome,
+                    ProviderInteractionOutcome::Approved | ProviderInteractionOutcome::Denied
+                ) {
+                    return Err(
+                        ProviderEventValidationError::InvalidInteractionResolutionOutcome {
+                            outcome: *outcome,
+                        },
+                    );
+                }
+            }
             Self::SubagentStarted {
                 agent_id,
                 agent_type,
@@ -926,6 +987,7 @@ impl ProviderEvent {
             | Self::TurnCompleted { .. }
             | Self::TurnInterrupted
             | Self::Ready => {}
+            Self::ContextWindowUsage { usage } => usage.validate()?,
         }
         Ok(())
     }
@@ -995,6 +1057,14 @@ pub enum ProviderEventValidationError {
     InvalidField { field: &'static str, max: usize },
     #[error("provider event tool count {count} exceeds {max}")]
     TooManyTools { count: usize, max: usize },
+    #[error("provider interaction resolution outcome {outcome:?} is not exact")]
+    InvalidInteractionResolutionOutcome { outcome: ProviderInteractionOutcome },
+    #[error("context-window capacity must be non-zero")]
+    ZeroContextWindowCapacity,
+    #[error("context-window token segments overflow u64")]
+    ContextWindowSegmentsOverflow,
+    #[error("context-window token segments sum to {segment_sum}, not used_tokens {used_tokens}")]
+    ContextWindowSegmentsMismatch { segment_sum: u64, used_tokens: u64 },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1227,6 +1297,7 @@ pub enum ControlEventKind {
     ProviderGap {
         sequence: u64,
         source: ProviderSource,
+        source_sequence: u64,
         missed: u64,
     },
     InteractionRequested {
@@ -1420,14 +1491,55 @@ impl Default for ControlSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use crate::AgentId;
     use super::{
-        ForegroundProcess, ForegroundProcessKind, ProviderEvent, ProviderEventValidationError,
-        ProviderInteractionKind, ProviderInteractionResponse, ProviderInteractionResponseError,
-        ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderRuntimePolicyError,
+        ContextWindowUsage, ForegroundProcess, ForegroundProcessKind, ProviderEvent,
+        ProviderEventValidationError,
+        ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionResponse,
+        ProviderInteractionResponseError, ProviderRuntimeCapability, ProviderRuntimePolicy,
+        ProviderRuntimePolicyError,
         ProviderSessionIdentity, ProviderSessionKey, TerminalFrame, TerminalMouseProtocolEncoding,
         FOREGROUND_PROCESS_NAME_MAX_BYTES, PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
     };
-    use crate::AgentId;
+
+    #[test]
+    fn context_window_usage_ingress_requires_exact_bounded_segments() {
+        let event = |usage| ProviderEvent::ContextWindowUsage { usage };
+        let valid = ContextWindowUsage {
+            uncached_input_tokens: 70,
+            cache_read_tokens: 20,
+            cache_write_tokens: 0,
+            output_tokens: 10,
+            unattributed_tokens: 5,
+            used_tokens: 105,
+            capacity_tokens: 100,
+        };
+        assert_eq!(event(valid).validate_ingress(), Ok(()));
+        assert_eq!(
+            event(ContextWindowUsage { capacity_tokens: 0, ..valid }).validate_ingress(),
+            Err(ProviderEventValidationError::ZeroContextWindowCapacity)
+        );
+        assert_eq!(
+            event(ContextWindowUsage { used_tokens: 104, ..valid }).validate_ingress(),
+            Err(ProviderEventValidationError::ContextWindowSegmentsMismatch {
+                segment_sum: 105,
+                used_tokens: 104,
+            })
+        );
+        assert_eq!(
+            event(ContextWindowUsage {
+                uncached_input_tokens: u64::MAX,
+                cache_read_tokens: 1,
+                cache_write_tokens: 0,
+                output_tokens: 0,
+                unattributed_tokens: 0,
+                used_tokens: u64::MAX,
+                capacity_tokens: 1,
+            })
+            .validate_ingress(),
+            Err(ProviderEventValidationError::ContextWindowSegmentsOverflow)
+        );
+    }
 
     #[test]
     fn provider_runtime_policy_enforces_semantic_invariants() {
@@ -1552,6 +1664,43 @@ mod tests {
                 field: "interaction prompt"
             })
         ));
+
+        for outcome in [
+            ProviderInteractionOutcome::Approved,
+            ProviderInteractionOutcome::Denied,
+        ] {
+            assert_eq!(
+                ProviderEvent::InteractionResolved {
+                    request_id: "approval-1".to_owned(),
+                    outcome,
+                }
+                .validate_ingress(),
+                Ok(())
+            );
+        }
+        assert!(matches!(
+            ProviderEvent::InteractionResolved {
+                request_id: "bad\nrequest".to_owned(),
+                outcome: ProviderInteractionOutcome::Approved,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "interaction request id",
+                ..
+            })
+        ));
+        assert_eq!(
+            ProviderEvent::InteractionResolved {
+                request_id: "approval-1".to_owned(),
+                outcome: ProviderInteractionOutcome::TurnEnded,
+            }
+            .validate_ingress(),
+            Err(
+                ProviderEventValidationError::InvalidInteractionResolutionOutcome {
+                    outcome: ProviderInteractionOutcome::TurnEnded,
+                }
+            )
+        );
     }
 
     #[test]

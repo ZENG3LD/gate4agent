@@ -1,17 +1,18 @@
 #![cfg(windows)]
 
 use gate4agent_c2::protocol::{
-    C2NodeResponse, C2NodeSnapshot, C2SessionStatus, NodeId, NodeRoute,
-    NodeTransportState, C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+    C2ManagedSessionRecord, C2NodeResponse, C2NodeSnapshot, C2SessionStatus, NodeId,
+    NodeRoute, NodeTransportState, C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
 };
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlHandle};
 use gate4agent_node::protocol::{
-    CapabilityId, NodeFailureCode, NodeRequest, SessionAddress, SessionMode, SpawnBundleId,
-    SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId, SpawnFieldProvenance,
-    SpawnIdempotencyKey, SpawnOverride, SpawnOverrides, SpawnProfileDefaults, SpawnProfileId,
-    SpawnProfileRevision, SpawnPrompt, SpawnRequiredCapabilities, SpawnSpec, SpawnTarget,
-    WorkspaceId, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
+    CapabilityId, ManagedSessionState, NodeFailureCode, NodeRequest, SessionAddress,
+    SessionMode, SpawnBundleId, SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId,
+    SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides,
+    SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision, SpawnPrompt,
+    SpawnRequiredCapabilities, SpawnSpec, SpawnTarget, WorkspaceId,
+    SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, SpawnProfileRegistry, WorkspaceConfig};
 use gate4agent_types::{AgentId, TerminalSize, TransportKind};
@@ -116,6 +117,8 @@ async fn assert_failure_without_session_mutation(
     expected: NodeFailureCode,
     expected_session_count: usize,
 ) {
+    let before = snapshot(control, route).await;
+    assert_eq!(session_count(&before), expected_session_count);
     let response = control
         .request(route.clone(), NodeRequest::SpawnSpec { spec })
         .await
@@ -126,6 +129,56 @@ async fn assert_failure_without_session_mutation(
     }
     let current = snapshot(control, route).await;
     assert_eq!(session_count(&current), expected_session_count);
+    assert_eq!(current.session_records, before.session_records);
+}
+
+fn assert_live_raw_inventory_record(
+    record: &C2ManagedSessionRecord,
+    session: &SessionAddress,
+    workspace_id: &WorkspaceId,
+    expected_name: &str,
+) {
+    assert_eq!(record.display_name, expected_name);
+    assert_eq!(record.provider, agent("claude"));
+    assert_eq!(record.mode, SessionMode::Pty);
+    assert_eq!(record.state, ManagedSessionState::Live);
+    assert_eq!(&record.workspace_id, workspace_id);
+    assert_eq!(record.active_session.as_ref(), Some(session));
+    assert!(record.environment_profile.is_none());
+    assert!(record.bundle.is_none());
+    assert!(record.context_id.is_none());
+    assert!(record.context.is_none());
+    assert!(!record.provider_identity_present);
+    assert!(record.created_at_unix_ms > 0);
+    assert!(record.updated_at_unix_ms >= record.created_at_unix_ms);
+}
+
+async fn wait_unavailable_record(
+    control: &C2ControlHandle,
+    route: &NodeRoute,
+    record_id: &gate4agent_node::protocol::SessionRecordId,
+    expected_name: &str,
+) -> C2ManagedSessionRecord {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let current = snapshot(control, route).await;
+            let record = current
+                .session_records
+                .iter()
+                .find(|record| &record.record_id == record_id)
+                .expect("raw SpawnSpec inventory record disappeared after Stop");
+            if record.state == ManagedSessionState::Unavailable
+                && record.active_session.is_none()
+            {
+                assert_eq!(record.display_name, expected_name);
+                assert!(!record.provider_identity_present);
+                return record.clone();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("raw SpawnSpec inventory record did not detach after Stop")
 }
 
 async fn wait_raw_pty_session(
@@ -319,6 +372,7 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
     let accepted_spec = SpawnSpec {
         target: target.clone(),
         profile_id: selected_profile.clone(),
+        expected_profile_revision: profile_revision.clone(),
         overrides: SpawnOverrides {
             provider: SpawnOverride::Set {
                 value: agent("claude"),
@@ -385,7 +439,41 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
     wait_raw_pty_session(&control, &route, &receipt.session, resolved_size).await;
     let after_first = snapshot(&control, &route).await;
     assert_eq!(session_count(&after_first), 1);
-    assert!(after_first.session_records.is_empty());
+    assert_eq!(after_first.session_records.len(), 1);
+    let live_record = &after_first.session_records[0];
+    assert_live_raw_inventory_record(
+        live_record,
+        &receipt.session,
+        &workspace_id,
+        "claude #1",
+    );
+    let record_id = live_record.record_id.clone();
+    let renamed_display_name = "raw SpawnSpec inventory";
+    let renamed = control
+        .request(
+            route.clone(),
+            NodeRequest::RenameSessionRecord {
+                record_id: record_id.clone(),
+                display_name: renamed_display_name.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let renamed_record = match renamed.response {
+        Ok(C2NodeResponse::SessionRecordUpdated { record }) => record,
+        response => panic!("raw SpawnSpec inventory rename failed: {response:?}"),
+    };
+    assert_eq!(renamed_record.record_id, record_id);
+    assert_live_raw_inventory_record(
+        &renamed_record,
+        &receipt.session,
+        &workspace_id,
+        renamed_display_name,
+    );
+    assert_eq!(
+        snapshot(&control, &route).await.session_records,
+        vec![renamed_record.clone()],
+    );
 
     let replay = control
         .request(
@@ -402,7 +490,9 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
         }) => assert_eq!(replayed_receipt, receipt),
         response => panic!("idempotent replay returned an unexpected response: {response:?}"),
     }
-    assert_eq!(session_count(&snapshot(&control, &route).await), 1);
+    let after_replay = snapshot(&control, &route).await;
+    assert_eq!(session_count(&after_replay), 1);
+    assert_eq!(after_replay.session_records, vec![renamed_record.clone()]);
 
     let mut conflicting_spec = accepted_spec.clone();
     conflicting_spec.overrides.terminal_size = SpawnOverride::Set {
@@ -441,7 +531,7 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
         &control,
         &route,
         unavailable_materializer_spec,
-        NodeFailureCode::UnsupportedSpawnCapability,
+        NodeFailureCode::UnknownBundle,
         1,
     )
     .await;
@@ -460,7 +550,10 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
 
     let healthy_after_failures = snapshot(&control, &route).await;
     assert_eq!(session_count(&healthy_after_failures), 1);
-    assert!(healthy_after_failures.session_records.is_empty());
+    assert_eq!(
+        healthy_after_failures.session_records,
+        vec![renamed_record.clone()],
+    );
 
     let legacy_session =
         spawn_legacy_after_runtime_probe_settles(&control, &route, &workspace_id).await;
@@ -476,8 +569,12 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
     .await;
     let final_snapshot = snapshot(&control, &route).await;
     assert_eq!(session_count(&final_snapshot), 2);
+    assert_eq!(final_snapshot.session_records, vec![renamed_record]);
+    assert!(!final_snapshot.session_records.iter().any(|record| {
+        record.active_session.as_ref() == Some(&legacy_session)
+    }));
 
-    for session in [receipt.session, legacy_session] {
+    for session in [receipt.session.clone(), legacy_session] {
         assert!(matches!(
             control
                 .request(
@@ -493,6 +590,20 @@ async fn spawn_spec_defaults_overrides_are_deterministic() {
             Ok(C2NodeResponse::Accepted)
         ));
     }
+    let detached = wait_unavailable_record(
+        &control,
+        &route,
+        &record_id,
+        renamed_display_name,
+    )
+    .await;
+    assert_eq!(detached.provider, agent("claude"));
+    assert_eq!(detached.mode, SessionMode::Pty);
+    assert_eq!(detached.workspace_id, workspace_id);
+    assert!(detached.environment_profile.is_none());
+    assert!(detached.bundle.is_none());
+    assert!(detached.context_id.is_none());
+    assert!(detached.context.is_none());
 
     let c2_shutdown = running.shutdown_handle();
     c2_shutdown.shutdown();

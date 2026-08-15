@@ -25,6 +25,13 @@ pub enum OneShotModelSource {
     Dynamic,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OneShotSessionPersistence {
+    #[default]
+    Ephemeral,
+    Persist,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OneShotThinkingLevel {
     pub id: String,
@@ -86,6 +93,22 @@ pub fn resolve_one_shot_plan(
     prompt: &str,
     selection: Option<&SessionOptionSelection>,
 ) -> Result<OneShotPlan, OneShotAdapterError> {
+    resolve_one_shot_plan_with_persistence(
+        adapter_id,
+        launch,
+        prompt,
+        selection,
+        OneShotSessionPersistence::Ephemeral,
+    )
+}
+
+pub fn resolve_one_shot_plan_with_persistence(
+    adapter_id: &AdapterId,
+    launch: &LaunchSpec,
+    prompt: &str,
+    selection: Option<&SessionOptionSelection>,
+    persistence: OneShotSessionPersistence,
+) -> Result<OneShotPlan, OneShotAdapterError> {
     if prompt.trim().is_empty()
         || prompt.len() > PROVIDER_EVENT_TEXT_MAX_BYTES
         || prompt.contains('\0')
@@ -100,6 +123,11 @@ pub fn resolve_one_shot_plan(
     }
 
     let spec = one_shot_spec(adapter_id)?;
+    if persistence == OneShotSessionPersistence::Persist && adapter_id.as_str() != "codex" {
+        return Err(OneShotAdapterError::PersistentSessionsUnsupported(
+            adapter_id.as_str().to_owned(),
+        ));
+    }
     let (model, thinking) = resolve_selection(&spec, selection)?;
     let mut args = launch.fixed_args.clone();
     match adapter_id.as_str() {
@@ -118,14 +146,12 @@ pub fn resolve_one_shot_plan(
             }
         }
         "codex" => {
+            args.push("exec".to_owned());
+            if persistence == OneShotSessionPersistence::Ephemeral {
+                args.push("--ephemeral".to_owned());
+            }
             args.extend(strings(&[
-                "exec",
-                "--ephemeral",
-                "--skip-git-repo-check",
-                "-s",
-                "read-only",
-                "--model",
-                &model,
+                "--skip-git-repo-check", "-s", "read-only", "--model", &model,
             ]));
             if let Some(thinking) = &thinking {
                 args.extend([
@@ -517,6 +543,8 @@ pub enum OneShotAdapterError {
     ThinkingUnsupported(String),
     #[error("one-shot thinking level '{0}' is not declared by the model")]
     UnknownThinkingLevel(String),
+    #[error("one-shot adapter '{0}' does not support persistent sessions")]
+    PersistentSessionsUnsupported(String),
 }
 
 #[cfg(test)]
@@ -653,6 +681,71 @@ mod tests {
             qwen.args,
             ["fixed", "-p", "prompt in argv", "--output-format", "text"]
         );
+    }
+
+    #[test]
+    fn codex_persistence_is_explicit_and_preserves_the_exact_safe_plan() {
+        assert_eq!(
+            OneShotSessionPersistence::default(),
+            OneShotSessionPersistence::Ephemeral
+        );
+        let adapter_id = AdapterId::new("codex").unwrap();
+        let selection = SessionOptionSelection::new("gpt-5.4")
+            .with_value(ONE_SHOT_THINKING_OPTION_ID, "xhigh");
+        let legacy = resolve_one_shot_plan(
+            &adapter_id,
+            &launch("codex"),
+            "prompt",
+            Some(&selection),
+        )
+        .unwrap();
+        let ephemeral = resolve_one_shot_plan_with_persistence(
+            &adapter_id,
+            &launch("codex"),
+            "prompt",
+            Some(&selection),
+            OneShotSessionPersistence::Ephemeral,
+        )
+        .unwrap();
+        assert_eq!(legacy, ephemeral);
+
+        let persistent = resolve_one_shot_plan_with_persistence(
+            &adapter_id,
+            &launch("codex"),
+            "prompt",
+            Some(&selection),
+            OneShotSessionPersistence::Persist,
+        )
+        .unwrap();
+        assert_eq!(
+            persistent.args,
+            [
+                "fixed",
+                "exec",
+                "--skip-git-repo-check",
+                "-s",
+                "read-only",
+                "--model",
+                "gpt-5.4",
+                "-c",
+                "model_reasoning_effort=xhigh",
+            ]
+        );
+        assert_eq!(persistent.stdin_payload.as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn persistent_sessions_fail_closed_for_non_codex_adapters() {
+        assert!(matches!(
+            resolve_one_shot_plan_with_persistence(
+                &AdapterId::new("claude").unwrap(),
+                &launch("claude"),
+                "prompt",
+                None,
+                OneShotSessionPersistence::Persist,
+            ),
+            Err(OneShotAdapterError::PersistentSessionsUnsupported(id)) if id == "claude"
+        ));
     }
 
     #[test]

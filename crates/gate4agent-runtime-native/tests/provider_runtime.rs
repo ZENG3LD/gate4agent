@@ -654,7 +654,7 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
 }
 
 #[tokio::test]
-async fn loopback_hook_listener_injects_a_route_and_reaches_the_public_snapshot() {
+async fn loopback_hook_listener_injects_a_route_without_identity_authority() {
     let (handle, mut runtime) = runtime(hook_posting_agent_spec());
     let endpoint = runtime
         .start_hook_ingress(HookIngressConfig::default())
@@ -678,7 +678,8 @@ async fn loopback_hook_listener_injects_a_route_and_reaches_the_public_snapshot(
             61,
             ControlCommand::Start {
                 instance_id,
-                runtime_policy: semantic_runtime_policy(),
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, false, false)
+                    .unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

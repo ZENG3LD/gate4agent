@@ -4,8 +4,8 @@ use gate4agent::agent::EnvMutation;
 use gate4agent::child_environment::platform_minimal_child_environment;
 use gate4agent::AgentEvent;
 use gate4agent_adapters::{
-    resolve_one_shot_plan, OneShotAdapterError, OneShotPlan, ONE_SHOT_OUTPUT_MAX_BYTES,
-    ONE_SHOT_TIMEOUT_SECONDS,
+    resolve_one_shot_plan_with_persistence, OneShotAdapterError, OneShotPlan,
+    OneShotSessionPersistence, ONE_SHOT_OUTPUT_MAX_BYTES, ONE_SHOT_TIMEOUT_SECONDS,
 };
 use gate4agent_types::{
     AdapterBinding, AgentSpec, SessionOptionSelection, PROVIDER_EVENT_TEXT_MAX_BYTES,
@@ -82,6 +82,29 @@ impl NativeOneShotSession {
         working_directory: &Path,
         environment: &[EnvMutation],
     ) -> Result<Self, NativeOneShotError> {
+        Self::spawn_with_environment_and_persistence(
+            spec,
+            binding,
+            prompt,
+            selection,
+            working_directory,
+            environment,
+            OneShotSessionPersistence::Ephemeral,
+        )
+        .await
+    }
+
+    /// Spawn a one-shot child with an explicit provider session-persistence
+    /// policy and shell-owned environment mutations.
+    pub async fn spawn_with_environment_and_persistence(
+        spec: &AgentSpec,
+        binding: &AdapterBinding,
+        prompt: &str,
+        selection: Option<&SessionOptionSelection>,
+        working_directory: &Path,
+        environment: &[EnvMutation],
+        persistence: OneShotSessionPersistence,
+    ) -> Result<Self, NativeOneShotError> {
         Self::spawn_with_environment_and_config(
             spec,
             binding,
@@ -90,6 +113,7 @@ impl NativeOneShotSession {
             working_directory,
             environment,
             NativeOneShotConfig::default(),
+            persistence,
         )
         .await
     }
@@ -110,6 +134,7 @@ impl NativeOneShotSession {
             working_directory,
             &[],
             config,
+            OneShotSessionPersistence::Ephemeral,
         )
         .await
     }
@@ -122,6 +147,7 @@ impl NativeOneShotSession {
         working_directory: &Path,
         environment: &[EnvMutation],
         mut config: NativeOneShotConfig,
+        persistence: OneShotSessionPersistence,
     ) -> Result<Self, NativeOneShotError> {
         config.output_max_bytes = config.output_max_bytes.clamp(1, ONE_SHOT_OUTPUT_MAX_BYTES);
         let pipe = spec
@@ -134,8 +160,17 @@ impl NativeOneShotSession {
         {
             return Err(NativeOneShotError::BindingMismatch);
         }
-        let mut plan = resolve_one_shot_plan(&binding.id, &spec.launch, prompt, selection)?;
+        let mut plan = resolve_one_shot_plan_with_persistence(
+            &binding.id,
+            &spec.launch,
+            prompt,
+            selection,
+            persistence,
+        )?;
         if let Some(launch) = &pipe.launch_override {
+            if persistence == OneShotSessionPersistence::Persist {
+                return Err(NativeOneShotError::PersistentLaunchOverrideUnsupported);
+            }
             plan.program = launch.program.clone();
             plan.args = launch.fixed_args.clone();
             if plan.stdin_payload.is_none() {
@@ -703,6 +738,8 @@ pub enum NativeOneShotError {
     UnsafeWindowsBatchArguments,
     #[error("one-shot process executor became unavailable")]
     ExecutorUnavailable,
+    #[error("persistent one-shot sessions do not allow a launch override")]
+    PersistentLaunchOverrideUnsupported,
 }
 
 #[cfg(test)]
@@ -1012,6 +1049,30 @@ mod tests {
         )));
         session.kill().await.unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_session_with_launch_override_fails_closed_before_spawn() {
+        let mut spec = builtin_registry().get_by_id("codex").unwrap().clone();
+        let binding = spec.capabilities.adapters.one_shot.clone().unwrap();
+        let pipe = spec.capabilities.transports.pipe.as_mut().unwrap();
+        pipe.adapter = binding.clone();
+        pipe.protocol = PipeProtocol::OneShotText;
+        pipe.launch_override = Some(spec.launch.clone());
+
+        assert!(matches!(
+            NativeOneShotSession::spawn_with_environment_and_persistence(
+                &spec,
+                &binding,
+                "prompt",
+                None,
+                Path::new("."),
+                &[],
+                OneShotSessionPersistence::Persist,
+            )
+            .await,
+            Err(NativeOneShotError::PersistentLaunchOverrideUnsupported)
+        ));
     }
 
     #[cfg(windows)]

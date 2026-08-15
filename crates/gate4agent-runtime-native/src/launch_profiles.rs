@@ -1,3 +1,4 @@
+use gate4agent_adapters::OneShotSessionPersistence;
 use gate4agent_catalog::EnvMutation;
 use gate4agent_types::{AgentId, AgentInstanceId, TransportKind};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,14 @@ const NATIVE_INSTANCE_LAUNCH_ARGS_MAX: usize = 128;
 const NATIVE_INSTANCE_LAUNCH_ARG_MAX_BYTES: usize = 65_536;
 const NATIVE_INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES: usize = 262_144;
 const RESERVED_HOOK_ENV_PREFIX: &str = "GATE4AGENT_HOOK_";
+const CONTEXT_ROOT_ENVIRONMENT_KEY: &str = "GATE4AGENT_CONTEXT_ROOT";
+pub const HARNESS_MCP_SESSION_ENDPOINT_ENV: &str =
+    "GATE4AGENT_HARNESS_SESSION_ENDPOINT";
+pub const HARNESS_MCP_SESSION_TOKEN_ENV: &str =
+    "GATE4AGENT_HARNESS_SESSION_TOKEN";
+pub const HARNESS_MCP_PROGRAM_ENV: &str = "GATE4AGENT_HARNESS_MCP_PROGRAM";
+pub const LEGACY_HARNESS_READ_ENDPOINT_ENV: &str = "GATE4AGENT_HARNESS_READ_ENDPOINT";
+pub const LEGACY_HARNESS_READ_CREDENTIAL_ENV: &str = "GATE4AGENT_HARNESS_READ_CREDENTIAL";
 const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
     "--continue",
     "--print",
@@ -198,6 +207,7 @@ pub struct NativeLaunchProfile {
     owned_env_keys: Vec<OsString>,
     resolver: Arc<dyn NativeChildEnvironmentResolver>,
     contract: NativeLaunchProfileContract,
+    one_shot_session_persistence: OneShotSessionPersistence,
 }
 
 /// Host-only launch mutations applied to one exact native PTY instance.
@@ -210,6 +220,50 @@ pub struct NativeInstanceLaunchOverlay {
     transport: TransportKind,
     environment: Vec<EnvMutation>,
     extra_args: Vec<OsString>,
+    profile_selection_required: bool,
+}
+
+/// Dedicated host-only H3B child environment for one exact PTY instance.
+///
+/// Endpoint, token, and reviewed helper path never enter generic launch-profile
+/// ownership, wire state, or diagnostics.
+pub struct NativeHarnessMcpLaunchOverlay {
+    agent_id: AgentId,
+    environment: Vec<EnvMutation>,
+}
+
+impl NativeHarnessMcpLaunchOverlay {
+    pub fn new(
+        agent_id: AgentId,
+        endpoint: OsString,
+        token: OsString,
+        program: OsString,
+    ) -> Result<Self, NativeLaunchProfileError> {
+        let environment = vec![
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
+                value: Some(endpoint),
+            },
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_SESSION_TOKEN_ENV),
+                value: Some(token),
+            },
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
+                value: Some(program),
+            },
+            EnvMutation {
+                key: OsString::from(LEGACY_HARNESS_READ_ENDPOINT_ENV),
+                value: None,
+            },
+            EnvMutation {
+                key: OsString::from(LEGACY_HARNESS_READ_CREDENTIAL_ENV),
+                value: None,
+            },
+        ];
+        validate_environment_mutations(&environment)?;
+        Ok(Self { agent_id, environment })
+    }
 }
 
 impl NativeInstanceLaunchOverlay {
@@ -224,11 +278,13 @@ impl NativeInstanceLaunchOverlay {
         }
         validate_environment_mutations(&environment)?;
         validate_launch_arguments(&agent_id, &extra_args)?;
+        let profile_selection_required = !environment.is_empty();
         Ok(Self {
             agent_id,
             transport,
             environment,
             extra_args,
+            profile_selection_required,
         })
     }
 }
@@ -241,6 +297,7 @@ pub struct NativeLaunchEnvironmentOverlay {
     agent_id: AgentId,
     transport: TransportKind,
     environment: Vec<EnvMutation>,
+    profile_selection_required: bool,
 }
 
 impl NativeLaunchEnvironmentOverlay {
@@ -253,11 +310,35 @@ impl NativeLaunchEnvironmentOverlay {
             return Err(NativeLaunchProfileError::UnsupportedTransport);
         }
         validate_environment_mutations(&environment)?;
+        let profile_selection_required = !environment.is_empty();
         Ok(Self {
             agent_id,
             transport,
             environment,
+            profile_selection_required,
         })
+    }
+
+    /// Creates the one unprofiled environment overlay authorized by Node-owned
+    /// ContextPack materialization. All generic environment overlays remain
+    /// bound to an explicitly selected native launch profile.
+    pub fn new_context_root(
+        agent_id: AgentId,
+        transport: TransportKind,
+        environment: Vec<EnvMutation>,
+    ) -> Result<Self, NativeLaunchProfileError> {
+        let exact_context_root = match environment.as_slice() {
+            [mutation]
+                if mutation.key == OsStr::new(CONTEXT_ROOT_ENVIRONMENT_KEY)
+                    && mutation.value.as_ref().is_some_and(|value| !value.is_empty()) => true,
+            _ => false,
+        };
+        if !exact_context_root {
+            return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
+        }
+        let mut overlay = Self::new(agent_id, transport, environment)?;
+        overlay.profile_selection_required = false;
+        Ok(overlay)
     }
 
     fn into_instance_overlay(self) -> NativeInstanceLaunchOverlay {
@@ -266,6 +347,7 @@ impl NativeLaunchEnvironmentOverlay {
             transport: self.transport,
             environment: self.environment,
             extra_args: Vec::new(),
+            profile_selection_required: self.profile_selection_required,
         }
     }
 }
@@ -307,7 +389,23 @@ impl NativeLaunchProfile {
             owned_env_keys,
             resolver,
             contract,
+            one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
         })
+    }
+
+    /// Selects whether an exact Codex OneShotText Pipe launch may retain its
+    /// vendor session for later resume.
+    pub fn with_one_shot_session_persistence(
+        mut self,
+        policy: OneShotSessionPersistence,
+    ) -> Result<Self, NativeLaunchProfileError> {
+        if policy == OneShotSessionPersistence::Persist
+            && (self.agent_id.as_str() != "codex" || self.transport != TransportKind::Pipe)
+        {
+            return Err(NativeLaunchProfileError::OneShotSessionPersistenceBindingMismatch);
+        }
+        self.one_shot_session_persistence = policy;
+        Ok(self)
     }
 
     pub fn id(&self) -> &NativeLaunchProfileId {
@@ -397,8 +495,12 @@ pub enum NativeLaunchProfileError {
     UnknownProfile { profile_id: NativeLaunchProfileId },
     #[error("native launch profile does not match the exact agent and transport binding")]
     BindingMismatch,
+    #[error("persistent one-shot sessions require exact agent 'codex' and Pipe transport")]
+    OneShotSessionPersistenceBindingMismatch,
     #[error("native instance launch overlay supports PTY transport only")]
     InstanceOverlayUnsupportedTransport,
+    #[error("native harness MCP launch overlay requires PTY transport and the exact provider binding")]
+    HarnessMcpOverlayBindingMismatch,
     #[error("native launch profile selection capacity is {max}")]
     SelectionCapacityExceeded { max: usize },
     #[error("native launch environment overlay requires an existing profile selection")]
@@ -429,6 +531,7 @@ pub(crate) struct NativeLaunchProfiles {
     profiles: BTreeMap<NativeLaunchProfileId, NativeLaunchProfile>,
     selections: BTreeMap<AgentInstanceId, NativeLaunchProfileId>,
     instance_overlays: BTreeMap<AgentInstanceId, Arc<NativeInstanceLaunchOverlay>>,
+    harness_mcp_overlays: BTreeMap<AgentInstanceId, Arc<NativeHarnessMcpLaunchOverlay>>,
 }
 
 impl NativeLaunchProfiles {
@@ -437,6 +540,7 @@ impl NativeLaunchProfiles {
             profiles: BTreeMap::new(),
             selections: BTreeMap::new(),
             instance_overlays: BTreeMap::new(),
+            harness_mcp_overlays: BTreeMap::new(),
         }
     }
 
@@ -511,7 +615,7 @@ impl NativeLaunchProfiles {
         instance_id: AgentInstanceId,
         overlay: NativeLaunchEnvironmentOverlay,
     ) -> Result<(), NativeLaunchProfileError> {
-        if !self.selections.contains_key(&instance_id) {
+        if overlay.profile_selection_required && !self.selections.contains_key(&instance_id) {
             return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
         }
         self.install_instance_overlay(instance_id, overlay.into_instance_overlay())
@@ -529,7 +633,7 @@ impl NativeLaunchProfiles {
                 }
             })?;
             validate_instance_overlay_binding(profile, &overlay)?;
-        } else if !overlay.environment.is_empty() {
+        } else if overlay.profile_selection_required {
             return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
         }
         if !self.instance_overlays.contains_key(&instance_id)
@@ -550,6 +654,27 @@ impl NativeLaunchProfiles {
         self.instance_overlays.remove(&instance_id).is_some()
     }
 
+    pub(crate) fn install_harness_mcp_overlay(
+        &mut self,
+        instance_id: AgentInstanceId,
+        overlay: NativeHarnessMcpLaunchOverlay,
+    ) -> Result<(), NativeLaunchProfileError> {
+        if !self.harness_mcp_overlays.contains_key(&instance_id)
+            && self.harness_mcp_overlays.len() >= NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX
+        {
+            return Err(NativeLaunchProfileError::EnvironmentOverlayCapacityExceeded {
+                max: NATIVE_LAUNCH_PROFILE_SELECTIONS_MAX,
+            });
+        }
+        self.harness_mcp_overlays
+            .insert(instance_id, Arc::new(overlay));
+        Ok(())
+    }
+
+    pub(crate) fn clear_harness_mcp_overlay(&mut self, instance_id: AgentInstanceId) -> bool {
+        self.harness_mcp_overlays.remove(&instance_id).is_some()
+    }
+
     fn profile_for_spawn(
         &self,
         instance_id: AgentInstanceId,
@@ -558,6 +683,7 @@ impl NativeLaunchProfiles {
         pipe_binding_is_exact_one_shot: bool,
     ) -> Result<Option<NativeLaunchSpawnEnvironment>, NativeLaunchProfileError> {
         let overlay = self.instance_overlays.get(&instance_id).cloned();
+        let harness_mcp_overlay = self.harness_mcp_overlays.get(&instance_id).cloned();
         let profile = if let Some(profile_id) = self.selections.get(&instance_id) {
             let profile = self
                 .profiles
@@ -580,16 +706,22 @@ impl NativeLaunchProfiles {
         };
         if let Some(overlay) = &overlay {
             validate_instance_overlay_spawn_binding(agent_id, transport, overlay)?;
-            if profile.is_none() && !overlay.environment.is_empty() {
+            if profile.is_none() && overlay.profile_selection_required {
                 return Err(NativeLaunchProfileError::EnvironmentOverlaySelectionMissing);
             }
         }
-        if profile.is_none() && overlay.is_none() {
+        if let Some(harness_mcp_overlay) = &harness_mcp_overlay {
+            if transport != TransportKind::Pty || harness_mcp_overlay.agent_id != *agent_id {
+                return Err(NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch);
+            }
+        }
+        if profile.is_none() && overlay.is_none() && harness_mcp_overlay.is_none() {
             return Ok(None);
         }
         Ok(Some(NativeLaunchSpawnEnvironment {
             profile,
             overlay,
+            harness_mcp_overlay,
         }))
     }
 }
@@ -597,11 +729,13 @@ impl NativeLaunchProfiles {
 struct NativeLaunchSpawnEnvironment {
     profile: Option<NativeLaunchProfile>,
     overlay: Option<Arc<NativeInstanceLaunchOverlay>>,
+    harness_mcp_overlay: Option<Arc<NativeHarnessMcpLaunchOverlay>>,
 }
 
 pub(crate) struct ResolvedNativeLaunchOverlay {
     pub(crate) environment: Vec<EnvMutation>,
     pub(crate) extra_args: Vec<OsString>,
+    pub(crate) one_shot_session_persistence: OneShotSessionPersistence,
 }
 
 /// Clonable host-local control for selecting profiles without mutable runtime access.
@@ -677,6 +811,20 @@ impl NativeLaunchProfileControl {
         self.lock().clear_instance_overlay(instance_id)
     }
 
+    /// Installs the dedicated H3B environment for one exact future PTY spawn.
+    pub fn install_native_harness_mcp_launch_overlay(
+        &self,
+        instance_id: AgentInstanceId,
+        overlay: NativeHarnessMcpLaunchOverlay,
+    ) -> Result<(), NativeLaunchProfileError> {
+        self.lock().install_harness_mcp_overlay(instance_id, overlay)
+    }
+
+    /// Clears one dedicated H3B environment before or after the child lifetime.
+    pub fn clear_native_harness_mcp_launch_overlay(&self, instance_id: AgentInstanceId) -> bool {
+        self.lock().clear_harness_mcp_overlay(instance_id)
+    }
+
     pub(crate) fn resolve_launch_overlay(
         &self,
         instance_id: AgentInstanceId,
@@ -696,8 +844,15 @@ impl NativeLaunchProfileControl {
             return Ok(ResolvedNativeLaunchOverlay {
                 environment: Vec::new(),
                 extra_args: Vec::new(),
+                one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
             });
         };
+        let one_shot_session_persistence = spawn_environment
+            .profile
+            .as_ref()
+            .map_or(OneShotSessionPersistence::Ephemeral, |profile| {
+                profile.one_shot_session_persistence
+            });
         let mut environment = if let Some(profile) = spawn_environment.profile {
             profile.resolve_environment(agent_id, transport)?
         } else {
@@ -708,11 +863,15 @@ impl NativeLaunchProfileControl {
             environment.extend(overlay.environment.iter().cloned());
             extra_args.extend(overlay.extra_args.iter().cloned());
         }
+        if let Some(overlay) = spawn_environment.harness_mcp_overlay {
+            environment.extend(overlay.environment.iter().cloned());
+        }
         validate_environment_mutations(&environment)?;
         validate_launch_arguments(agent_id, &extra_args)?;
         Ok(ResolvedNativeLaunchOverlay {
             environment,
             extra_args,
+            one_shot_session_persistence,
         })
     }
 
@@ -936,6 +1095,121 @@ fn validate_zai_glm_claude_environment(
         return Err(NativeLaunchProfileError::FixedEnvironmentValueMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CodexEnvironment;
+
+    impl NativeChildEnvironmentResolver for CodexEnvironment {
+        fn resolve_child_environment(
+            &self,
+        ) -> Result<Vec<EnvMutation>, NativeChildEnvironmentResolveError> {
+            Ok(vec![EnvMutation {
+                key: OsString::from("GATE4AGENT_TEST_CODEX_PROFILE"),
+                value: Some(OsString::from("selected")),
+            }])
+        }
+    }
+
+    fn persistent_codex_profile() -> NativeLaunchProfile {
+        NativeLaunchProfile::new(
+            NativeLaunchProfileId::new("persistent-codex").unwrap(),
+            AgentId::new("codex").unwrap(),
+            TransportKind::Pipe,
+            vec![OsString::from("GATE4AGENT_TEST_CODEX_PROFILE")],
+            Arc::new(CodexEnvironment),
+        )
+        .unwrap()
+        .with_one_shot_session_persistence(OneShotSessionPersistence::Persist)
+        .unwrap()
+    }
+
+    #[test]
+    fn selected_persistence_is_snapshotted_and_clear_restores_ephemeral_default() {
+        let control = NativeLaunchProfileControl::new();
+        let profile = persistent_codex_profile();
+        let profile_id = profile.id().clone();
+        control.upsert(profile).unwrap();
+        let selected = AgentInstanceId(1);
+        control
+            .select_native_launch_profile(selected, profile_id)
+            .unwrap();
+
+        let resolved = control
+            .resolve_launch_overlay(
+                selected,
+                &AgentId::new("codex").unwrap(),
+                TransportKind::Pipe,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.one_shot_session_persistence,
+            OneShotSessionPersistence::Persist
+        );
+
+        assert!(control.clear_native_launch_profile_selection(selected));
+        let cleared = control
+            .resolve_launch_overlay(
+                selected,
+                &AgentId::new("codex").unwrap(),
+                TransportKind::Pipe,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            cleared.one_shot_session_persistence,
+            OneShotSessionPersistence::Ephemeral
+        );
+
+        let unselected = control
+            .resolve_launch_overlay(
+                AgentInstanceId(2),
+                &AgentId::new("codex").unwrap(),
+                TransportKind::Pipe,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            unselected.one_shot_session_persistence,
+            OneShotSessionPersistence::Ephemeral
+        );
+    }
+
+    #[test]
+    fn harness_mcp_overlay_sets_only_h3b_and_scrubs_legacy_h2_environment() {
+        let control = NativeLaunchProfileControl::new();
+        let instance_id = AgentInstanceId(41);
+        control.install_native_harness_mcp_launch_overlay(
+            instance_id,
+            NativeHarnessMcpLaunchOverlay::new(
+                AgentId::new("codex").unwrap(),
+                OsString::from("private-endpoint"),
+                OsString::from("private-token"),
+                OsString::from("reviewed-program"),
+            ).unwrap(),
+        ).unwrap();
+        let resolved = control.resolve_launch_overlay(
+            instance_id,
+            &AgentId::new("codex").unwrap(),
+            TransportKind::Pty,
+            true,
+        ).unwrap();
+        assert_eq!(resolved.environment.len(), 5);
+        for key in [LEGACY_HARNESS_READ_ENDPOINT_ENV, LEGACY_HARNESS_READ_CREDENTIAL_ENV] {
+            assert!(resolved.environment.iter().any(|mutation| {
+                mutation.key == OsString::from(key) && mutation.value.is_none()
+            }));
+        }
+        for key in [HARNESS_MCP_SESSION_ENDPOINT_ENV, HARNESS_MCP_SESSION_TOKEN_ENV, HARNESS_MCP_PROGRAM_ENV] {
+            assert!(resolved.environment.iter().any(|mutation| {
+                mutation.key == OsString::from(key) && mutation.value.is_some()
+            }));
+        }
+    }
 }
 
 fn os_string_bytes(value: &OsStr) -> usize {

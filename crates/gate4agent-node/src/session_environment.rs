@@ -1247,7 +1247,7 @@ fn materialization_owner_marker(
     marker
 }
 
-fn ensure_materialization_root(root: &Path) -> io::Result<()> {
+pub(crate) fn ensure_materialization_root(root: &Path) -> io::Result<()> {
     if root.exists() {
         validate_secure_directory(root)
     } else {
@@ -1255,7 +1255,7 @@ fn ensure_materialization_root(root: &Path) -> io::Result<()> {
     }
 }
 
-fn secure_create_parent_directories(base: &Path, parent: Option<&Path>) -> io::Result<()> {
+pub(crate) fn secure_create_parent_directories(base: &Path, parent: Option<&Path>) -> io::Result<()> {
     let Some(parent) = parent else { return Ok(()); };
     let mut current = base.to_path_buf();
     for component in parent.components() {
@@ -1270,7 +1270,7 @@ fn secure_create_parent_directories(base: &Path, parent: Option<&Path>) -> io::R
     Ok(())
 }
 
-fn verify_or_create_exact_file(path: &Path, expected: &[u8]) -> io::Result<()> {
+pub(crate) fn verify_or_create_exact_file(path: &Path, expected: &[u8]) -> io::Result<()> {
     match secure_create_file(path, expected) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -1283,7 +1283,7 @@ fn verify_or_create_exact_file(path: &Path, expected: &[u8]) -> io::Result<()> {
     }
 }
 
-fn secure_replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn secure_replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     validate_secure_file(path)?;
     #[cfg(unix)]
     let mut file = {
@@ -1312,7 +1312,7 @@ fn remove_owned_tree(root: &Path, expected_marker: &[u8]) -> io::Result<()> {
     fs::remove_dir(root)
 }
 
-fn remove_tree_no_links(directory: &Path) -> io::Result<()> {
+pub(crate) fn remove_tree_no_links(directory: &Path) -> io::Result<()> {
     validate_secure_directory(directory)?;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -1335,7 +1335,7 @@ fn remove_tree_no_links(directory: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn secure_create_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn secure_create_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -1343,7 +1343,7 @@ fn secure_create_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_secure_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn validate_secure_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o7777 != 0o700 {
@@ -1353,7 +1353,7 @@ fn validate_secure_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn secure_create_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn secure_create_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let mut file = OpenOptions::new().create_new(true).write(true).mode(0o600).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)?;
     file.write_all(bytes)?;
@@ -1367,7 +1367,7 @@ fn secure_create_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_secure_file(path: &Path) -> io::Result<()> {
+pub(crate) fn validate_secure_file(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o7777 != 0o600 {
@@ -1380,23 +1380,23 @@ fn validate_secure_file(path: &Path) -> io::Result<()> {
 fn is_reparse_point(_: &fs::Metadata) -> bool { false }
 
 #[cfg(windows)]
-fn secure_create_directory(path: &Path) -> io::Result<()> { windows_secure::create_directory(path) }
+pub(crate) fn secure_create_directory(path: &Path) -> io::Result<()> { windows_secure::create_directory(path) }
 #[cfg(windows)]
-fn validate_secure_directory(path: &Path) -> io::Result<()> { windows_secure::validate_path(path, true) }
+pub(crate) fn validate_secure_directory(path: &Path) -> io::Result<()> { windows_secure::validate_path(path, true) }
 #[cfg(windows)]
-fn secure_create_file(path: &Path, bytes: &[u8]) -> io::Result<()> { windows_secure::create_file(path, bytes) }
+pub(crate) fn secure_create_file(path: &Path, bytes: &[u8]) -> io::Result<()> { windows_secure::create_file(path, bytes) }
 #[cfg(windows)]
-fn validate_secure_file(path: &Path) -> io::Result<()> { windows_secure::validate_path(path, false) }
+pub(crate) fn validate_secure_file(path: &Path) -> io::Result<()> { windows_secure::validate_path(path, false) }
 #[cfg(windows)]
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-struct MaterializationRootLock { file: Option<File>, #[cfg(windows)] path: PathBuf }
+pub(crate) struct MaterializationRootLock { file: Option<File>, #[cfg(windows)] path: PathBuf }
 
 impl MaterializationRootLock {
-    fn acquire(path: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
         verify_or_create_exact_file(path, b"")?;
         #[cfg(windows)]
         let file = {
@@ -2021,6 +2021,7 @@ mod tests {
             cwd: Some(r"C:\private\source".to_owned()),
             model: Some("qwen3-coder".to_owned()),
             message_count: 2,
+            completed_turn_count: None,
             total_tokens: 17,
             messages: vec![
                 gate4agent_types::HistoryMessageRecord {

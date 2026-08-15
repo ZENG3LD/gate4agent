@@ -48,6 +48,7 @@ const PROVIDER_HOME_KEY: &str = "GATE4AGENT_F55_PROVIDER_HOME";
 const SECRET_REFERENCE: &str = "fixture-secret-ref-f55";
 const SECRET_VALUE: &str = "fixture-secret-value-f55";
 const GENERATED_FILE: &str = "profile.ready";
+const SPAWN_PROFILE_REVISION: &str = "materialized-r1";
 const SECRET_FILE: &str = "credentials/secret.bin";
 
 struct StaticEnvironmentResolver;
@@ -236,7 +237,7 @@ fn node_config(
         .unwrap();
     let profiles = SpawnProfileRegistry::new([SpawnProfileDefaults {
         profile_id: spawn_profile_id.clone(),
-        revision: SpawnProfileRevision::new("materialized-r1").unwrap(),
+        revision: SpawnProfileRevision::new(SPAWN_PROFILE_REVISION).unwrap(),
         provider: agent("claude"),
         mode: SessionMode::Pty,
         terminal_size: TerminalSize {
@@ -275,6 +276,8 @@ fn spawn_request(
                 worktree_id: None,
             },
             profile_id: spawn_profile_id.clone(),
+            expected_profile_revision:
+                SpawnProfileRevision::new(SPAWN_PROFILE_REVISION).unwrap(),
             overrides: SpawnOverrides {
                 provider: SpawnOverride::Inherit,
                 mode: SpawnOverride::Inherit,

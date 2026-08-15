@@ -364,6 +364,9 @@ fn capabilities(id: &str) -> AgentCapabilities {
                 }),
         },
         adapters: AgentAdapterCapabilities {
+            pty_sidecar: matches!(id, "qwen-code")
+                .then(|| binding(AdapterFamily::Pipe, "qwen-code"))
+                .flatten(),
             hook: binding(AdapterFamily::Hook, adapter_id),
             managed_hook: binding(AdapterFamily::ManagedHook, id),
             one_shot: one_shot_adapter_id
@@ -519,6 +522,16 @@ mod tests {
         let qwen = registry.get_by_id("qwen-code").unwrap();
         assert!(qwen.capabilities.transports.pipe.is_none());
         assert!(qwen.capabilities.adapters.one_shot.is_none());
+        let sidecar = qwen.capabilities.adapters.pty_sidecar.as_ref().unwrap();
+        assert_eq!(sidecar.id.as_str(), "qwen-code");
+        assert_eq!(
+            sidecar.revision,
+            gate4agent_adapters::QWEN_DUAL_OUTPUT_REVISION
+        );
+        assert!(registry
+            .iter()
+            .filter(|spec| spec.capabilities.adapters.pty_sidecar.is_some())
+            .all(|spec| spec.id.as_str() == "qwen-code"));
         for id in ["gemini", "opencode"] {
             assert!(registry
                 .get_by_id(id)

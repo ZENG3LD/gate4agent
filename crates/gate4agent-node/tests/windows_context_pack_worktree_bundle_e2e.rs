@@ -46,6 +46,10 @@ const CONTEXT_USER: &str = "inspect the bounded Windows context transfer";
 const CONTEXT_ASSISTANT: &str = "bounded context is ready for the target worktree";
 const CONTEXT_SCHEMA: &str = "g4a-context-pack-v1";
 const CONTEXT_MARKER: &str = "F7_CODEX_BUNDLE_CONTEXT_VALIDATED";
+const REPOSITORY_COMMIT_SUMMARY: &str = "connect bounded context to git history";
+const REPOSITORY_README: &str =
+    "context pack fixture\nacceptance: correlate session intent with repository history\n";
+const REPOSITORY_DIRTY_PATH: &str = "review-notes.txt";
 
 struct UnusedSecretResolver;
 
@@ -164,7 +168,7 @@ fn initialize_repository(root: &Path) {
         "fixture Git repository initialization failed: {}",
         String::from_utf8_lossy(&output.stderr),
     );
-    write(&root.join("README.md"), b"context pack fixture\n");
+    write(&root.join("README.md"), REPOSITORY_README.as_bytes());
     assert_git_success(root, &["add", "--", "README.md"]);
     assert_git_success(
         root,
@@ -180,8 +184,12 @@ fn initialize_repository(root: &Path) {
             "commit",
             "--quiet",
             "-m",
-            "initial",
+            REPOSITORY_COMMIT_SUMMARY,
         ],
+    );
+    write(
+        &root.join(REPOSITORY_DIRTY_PATH),
+        b"uncommitted review evidence\n",
     );
 }
 
@@ -596,6 +604,7 @@ async fn discover_load_export(
         session,
         session_id,
         message_count,
+        ..
     } = &loaded
     else {
         panic!("history load returned another response");
@@ -943,6 +952,7 @@ fn managed_spawn_request(
                 worktree_id: None,
             },
             profile_id: profile_id.clone(),
+            expected_profile_revision: SpawnProfileRevision::new("context-target-r1").unwrap(),
             overrides: SpawnOverrides {
                 provider: SpawnOverride::Inherit,
                 mode: SpawnOverride::Inherit,
@@ -1098,6 +1108,9 @@ async fn windows_public_node_transfers_codex_context_into_managed_worktree_with_
             private_cwd.as_str(),
             CONTEXT_USER,
             CONTEXT_ASSISTANT,
+            REPOSITORY_COMMIT_SUMMARY,
+            REPOSITORY_README,
+            REPOSITORY_DIRTY_PATH,
             bundle_source.to_string_lossy().as_ref(),
             materialization_root.to_string_lossy().as_ref(),
             allocation_root.to_string_lossy().as_ref(),
@@ -1126,6 +1139,9 @@ async fn windows_public_node_transfers_codex_context_into_managed_worktree_with_
             private_cwd.as_str(),
             CONTEXT_USER,
             CONTEXT_ASSISTANT,
+            REPOSITORY_COMMIT_SUMMARY,
+            REPOSITORY_README,
+            REPOSITORY_DIRTY_PATH,
             bundle_source.to_string_lossy().as_ref(),
             materialization_root.to_string_lossy().as_ref(),
         ],
@@ -1159,6 +1175,32 @@ async fn windows_public_node_transfers_codex_context_into_managed_worktree_with_
         document["retained_messages"][1]["text"],
         CONTEXT_ASSISTANT,
     );
+    assert_eq!(document["repository"]["is_repository"], true);
+    assert_eq!(document["repository"]["branch"], "main");
+    assert_eq!(document["repository"]["truncated"], false);
+    assert!(document["repository"]["recent_commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|commit| commit["summary"] == REPOSITORY_COMMIT_SUMMARY));
+    assert!(document["repository"]["status"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["path"] == REPOSITORY_DIRTY_PATH
+                && entry["index_status"] == "?"
+                && entry["worktree_status"] == "?"
+        }));
+    let selected_readme = document["repository"]["selected_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "README.md")
+        .expect("ContextPack omitted selected README.md");
+    assert_eq!(selected_readme["content"], REPOSITORY_README);
+    assert_eq!(selected_readme["truncated"], false);
+    assert!(selected_readme.get("skipped").is_none());
 
     let proof = std::fs::read_to_string(&proof_path)
         .expect("Codex child omitted its context validation proof");

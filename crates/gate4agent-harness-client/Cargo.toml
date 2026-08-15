@@ -1,0 +1,14 @@
+[package]
+name = "gate4agent-harness-client"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_harness_client"
+
+[dependencies]
+gate4agent-harness-api = { path = "../gate4agent-harness-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

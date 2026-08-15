@@ -1,0 +1,16 @@
+[package]
+name = "gate4agent-observation-store"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_observation_store"
+
+[dependencies]
+gate4agent-observation-api = { path = "../gate4agent-observation-api" }
+gate4agent-observation-engine = { path = "../gate4agent-observation-engine" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

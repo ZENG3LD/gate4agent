@@ -193,6 +193,9 @@ fn validate_adapter_bindings(
     adapters: &AdapterRegistry,
 ) -> Result<(), RegistryError> {
     let transports = &spec.capabilities.transports;
+    if spec.capabilities.adapters.pty_sidecar.is_some() && !transports.pty {
+        return Err(RegistryError::PtySidecarRequiresPty(spec.id.clone()));
+    }
     let pipe_family = transports
         .pipe
         .as_ref()
@@ -202,6 +205,10 @@ fn validate_adapter_bindings(
         });
     for (family, binding) in [
         (AdapterFamily::PtySemantic, transports.pty_adapter.as_ref()),
+        (
+            AdapterFamily::Pipe,
+            spec.capabilities.adapters.pty_sidecar.as_ref(),
+        ),
         (
             pipe_family.unwrap_or(AdapterFamily::Pipe),
             transports.pipe.as_ref().map(|value| &value.adapter),
@@ -360,6 +367,8 @@ pub enum RegistryError {
         adapter_id: String,
         revision: String,
     },
+    #[error("agent '{0}' declares a PTY sidecar without PTY transport")]
+    PtySidecarRequiresPty(AgentId),
 }
 
 #[cfg(test)]
@@ -448,5 +457,43 @@ mod tests {
             Err(RegistryError::UnsupportedAdapterBinding { .. })
         ));
         AgentRegistry::new_with_adapters([custom], &adapters).unwrap();
+    }
+
+    #[test]
+    fn pty_sidecar_binding_is_validated_as_pipe_family() {
+        let binding = AdapterBinding::new(
+            AdapterId::new("custom-sidecar").unwrap(),
+            "custom-sidecar/v1",
+            AdapterVerification::SyntheticFixture,
+        )
+        .unwrap();
+        let adapters = AdapterRegistry::new([AdapterDescriptor {
+            family: AdapterFamily::Hook,
+            binding: binding.clone(),
+            agents: vec![AgentId::new("custom").unwrap()],
+        }])
+        .unwrap();
+        let mut custom = spec("custom", "custom");
+        custom.capabilities.transports.pty = true;
+        custom.capabilities.adapters.pty_sidecar = Some(binding);
+
+        assert!(matches!(
+            AgentRegistry::new_with_adapters([custom], &adapters),
+            Err(RegistryError::UnsupportedAdapterBinding {
+                family: AdapterFamily::Pipe,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn pty_sidecar_requires_pty_transport() {
+        let mut qwen = crate::builtin_registry().get_by_id("qwen-code").unwrap().clone();
+        qwen.capabilities.transports.pty = false;
+        assert!(matches!(
+            AgentRegistry::new([qwen]),
+            Err(RegistryError::PtySidecarRequiresPty(agent))
+                if agent.as_str() == "qwen-code"
+        ));
     }
 }

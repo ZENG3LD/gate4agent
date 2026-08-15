@@ -333,7 +333,11 @@ dependencies = [
  "gate4agent-node",
  "gate4agent-node-protocol",
  "gate4agent-node-wire",
+ "gate4agent-observation-api",
+ "gate4agent-observation-engine",
+ "gate4agent-observation-service",
  "gate4agent-runtime-native",
+ "gate4agent-testkit",
  "gate4agent-types",
  "serde",
  "serde_json",
@@ -394,6 +398,106 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-harness-api"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-harness-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-harness-client"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-harness-api",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-harness-delivery"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-node-protocol",
+ "libc",
+ "ring",
+ "thiserror 2.0.18",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "gate4agent-harness-engine"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-harness-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-harness-mcp"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-c2",
+ "gate4agent-c2-client",
+ "gate4agent-harness-client",
+ "gate4agent-harness-engine",
+ "gate4agent-harness-protocol",
+ "gate4agent-harness-service",
+ "gate4agent-node",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
+ "gate4agent-observation-service",
+ "gate4agent-testkit",
+ "gate4agent-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "gate4agent-harness-protocol"
+version = "0.2.37"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-harness-service"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-c2",
+ "gate4agent-c2-client",
+ "gate4agent-c2-protocol",
+ "gate4agent-harness-api",
+ "gate4agent-harness-client",
+ "gate4agent-harness-delivery",
+ "gate4agent-harness-engine",
+ "gate4agent-harness-protocol",
+ "gate4agent-node",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
+ "gate4agent-observation-api",
+ "gate4agent-observation-engine",
+ "gate4agent-observation-protocol",
+ "gate4agent-observation-service",
+ "gate4agent-types",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "gate4agent-kernel"
 version = "0.2.37"
 dependencies = [
@@ -429,6 +533,8 @@ dependencies = [
 name = "gate4agent-node-protocol"
 version = "0.2.37"
 dependencies = [
+ "gate4agent-harness-api",
+ "gate4agent-observation-protocol",
  "gate4agent-types",
  "serde",
  "serde_json",
@@ -447,6 +553,72 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "gate4agent-observation-api"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-node-protocol",
+ "gate4agent-observation-protocol",
+ "gate4agent-types",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-observation-engine"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-c2",
+ "gate4agent-c2-client",
+ "gate4agent-c2-protocol",
+ "gate4agent-node",
+ "gate4agent-node-protocol",
+ "gate4agent-node-wire",
+ "gate4agent-observation-api",
+ "gate4agent-observation-protocol",
+ "gate4agent-testkit",
+ "gate4agent-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "gate4agent-observation-protocol"
+version = "0.2.37"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-observation-service"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-node-protocol",
+ "gate4agent-observation-api",
+ "gate4agent-observation-engine",
+ "gate4agent-observation-protocol",
+ "gate4agent-observation-store",
+ "gate4agent-types",
+ "rusqlite",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gate4agent-observation-store"
+version = "0.2.37"
+dependencies = [
+ "gate4agent-observation-api",
+ "gate4agent-observation-engine",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

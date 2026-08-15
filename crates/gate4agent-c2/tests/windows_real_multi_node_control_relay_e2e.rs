@@ -10,11 +10,11 @@ use gate4agent_c2::protocol::{
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_node::protocol::{
     AgentId, ClientRole, ManagedSessionState, NodeFailureCode, NodeRequest,
-    NodeResponse, OpaqueHostPath, SessionMode, WorkspaceId,
+    NodeResponse, OpaqueHostPath, SessionMode, SessionTaskTargetV1, WorkspaceId,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
 use gate4agent_node_wire::NamedPipeNodeClient;
-use gate4agent_types::TerminalSize;
+use gate4agent_types::{ProviderSessionIdentity, ProviderSessionKey, TerminalSize};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -612,4 +612,202 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     restarted_shutdown_b.request_shutdown().await.unwrap();
     timeout(Duration::from_secs(5), task_a).await.unwrap().unwrap().unwrap();
     timeout(Duration::from_secs(5), restarted_task_b).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_real_multi_node_task_correlation_survives_restart_and_rejects_stale_revision() {
+    let endpoint_a = endpoint("task-a");
+    let endpoint_b = endpoint("task-b");
+    let control_endpoint = endpoint("task-control");
+    let id_a = NodeId::new("node-a").unwrap();
+    let id_b = NodeId::new("node-b").unwrap();
+    let token_a = "node-a-token";
+    let token_b = "node-b-token";
+    let c2_token = "c2-control-token";
+    let state_directory = durable_state_directory();
+    let _state_cleanup = RemoveStateDirectoryOnDrop(state_directory.clone());
+    let state_path_a = state_directory.join("node-a-state.json");
+    std::fs::create_dir_all(&state_directory).unwrap();
+    let c2_stderr_path = state_directory.join("c2.stderr.log");
+
+    let server_a = NodeServer::new_resume_fixture(durable_node_config(
+        id_a.as_str(),
+        &endpoint_a,
+        token_a,
+        &state_path_a,
+    )).unwrap();
+    let mut shutdown_a = server_a.shutdown_handle();
+    let mut task_a = tokio::spawn(server_a.run());
+    let server_b = NodeServer::new_resume_fixture(node_config(
+        id_b.as_str(),
+        &endpoint_b,
+        token_b,
+    )).unwrap();
+    let shutdown_b = server_b.shutdown_handle();
+    let task_b = tokio::spawn(server_b.run());
+
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let c2_addr = reservation.local_addr().unwrap();
+    drop(reservation);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gate4agent-c2"));
+    command.args([
+        "--api-listen", &c2_addr.to_string(),
+        "--control-endpoint", &control_endpoint,
+        "--node", &format!("{}={endpoint_a}", id_a.as_str()),
+        "--node", &format!("{}={endpoint_b}", id_b.as_str()),
+    ]);
+    command.env("GATE4AGENT_C2_TOKEN", c2_token)
+        .env("GATE4AGENT_NODE_TOKEN_NODE_A", token_a)
+        .env("GATE4AGENT_NODE_TOKEN_NODE_B", token_b)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&c2_stderr_path).unwrap()));
+    command.as_std_mut().creation_flags(0x08000000);
+    let mut c2_child = KillChildOnDrop(Some(command.spawn().unwrap()));
+    let http = wait_http(c2_addr, c2_token).await;
+    let initial = wait_status(&http, |status| {
+        status.ready && status.nodes.values().all(|node| node.transport == NodeTransportState::Online)
+    }).await;
+    let (control, mut events) = connect_local(&control_endpoint, c2_token).await.unwrap();
+    let event_drain = tokio::spawn(async move {
+        while events.recv().await.is_some() {}
+    });
+    let mut route_a = route(&initial, &id_a);
+    let route_b = route(&initial, &id_b);
+
+    let indexed_a = control.request(route_a.clone(), NodeRequest::IndexProviderSession {
+        workspace_id: WorkspaceId::new("primary").unwrap(),
+        provider: AgentId::new("claude").unwrap(),
+        identity: ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "task-e2e-node-a".to_owned(),
+            transcript_path: None,
+        },
+        display_name: "task e2e node A".to_owned(),
+    }).await.unwrap();
+    let record_id_a = match indexed_a.response {
+        Ok(C2NodeResponse::ProviderSessionIndexed { record }) => {
+            assert_eq!(record.state, ManagedSessionState::Dormant);
+            assert!(record.provider_identity_present);
+            record.record_id
+        }
+        response => panic!("unexpected node A index response: {response:?}"),
+    };
+    let indexed_b = control.request(route_b.clone(), NodeRequest::IndexProviderSession {
+        workspace_id: WorkspaceId::new("primary").unwrap(),
+        provider: AgentId::new("claude").unwrap(),
+        identity: ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "task-e2e-node-b".to_owned(),
+            transcript_path: None,
+        },
+        display_name: "task e2e node B".to_owned(),
+    }).await.unwrap();
+    let record_id_b = match indexed_b.response {
+        Ok(C2NodeResponse::ProviderSessionIndexed { record }) => {
+            assert_eq!(record.state, ManagedSessionState::Dormant);
+            assert!(record.provider_identity_present);
+            record.record_id
+        }
+        response => panic!("unexpected node B index response: {response:?}"),
+    };
+
+    wait_status(&http, |status| {
+        let indexed_a = status.nodes[&id_a].inventory.as_ref().is_some_and(|inventory| {
+            inventory.managed_sessions.iter().any(|record| {
+                record.record_id == record_id_a
+                    && record.provider_identity_present
+                    && record.state == ManagedSessionState::Dormant
+            })
+        });
+        let indexed_b = status.nodes[&id_b].inventory.as_ref().is_some_and(|inventory| {
+            inventory.managed_sessions.iter().any(|record| {
+                record.record_id == record_id_b
+                    && record.provider_identity_present
+                    && record.state == ManagedSessionState::Dormant
+            })
+        });
+        indexed_a && indexed_b
+    }).await;
+
+    let minted = control.request(route_a.clone(), NodeRequest::SetSessionTask {
+        record_id: record_id_a.clone(),
+        expected_revision: 0,
+        target: SessionTaskTargetV1::New,
+    }).await.unwrap();
+    let minted_record = match minted.response {
+        Ok(C2NodeResponse::SessionRecordUpdated { record }) => record,
+        response => panic!("unexpected node A task mint response: {response:?}"),
+    };
+    let minted_binding = minted_record.task_binding.clone().expect("node A task binding");
+    let task_id = minted_binding.task_id.clone().expect("minted task ID");
+    assert_eq!(minted_binding.revision, 1);
+    let task_hex = task_id.as_str().strip_prefix("task-").expect("task ID prefix");
+    assert_eq!(task_hex.len(), 24);
+    assert!(task_hex.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+
+    let assigned = control.request(route_b.clone(), NodeRequest::SetSessionTask {
+        record_id: record_id_b.clone(),
+        expected_revision: 0,
+        target: SessionTaskTargetV1::Existing { task_id: task_id.clone() },
+    }).await.unwrap();
+    assert!(matches!(assigned.response,
+        Ok(C2NodeResponse::SessionRecordUpdated { ref record })
+            if record.record_id == record_id_b
+                && record.task_binding.as_ref().is_some_and(|binding| {
+                    binding.revision == 1 && binding.task_id.as_ref() == Some(&task_id)
+                })));
+
+    let stale = control.request(route_a.clone(), NodeRequest::SetSessionTask {
+        record_id: record_id_a.clone(),
+        expected_revision: 0,
+        target: SessionTaskTargetV1::Clear,
+    }).await.unwrap();
+    assert!(matches!(stale.response, Err(ref failure)
+        if failure.code == NodeFailureCode::SessionRecordConflict));
+    let unchanged = control.request(route_a.clone(), NodeRequest::Snapshot).await.unwrap();
+    assert!(matches!(unchanged.response, Ok(C2NodeResponse::Snapshot { ref snapshot, .. })
+        if snapshot.session_records.iter().any(|record| {
+            record.record_id == record_id_a && record.task_binding.as_ref() == Some(&minted_binding)
+        })));
+
+    shutdown_a.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), task_a).await.unwrap().unwrap().unwrap();
+    wait_status(&http, |status| status.nodes[&id_a].transport != NodeTransportState::Online).await;
+    let restarted_a = NodeServer::new_resume_fixture(durable_node_config(
+        id_a.as_str(),
+        &endpoint_a,
+        token_a,
+        &state_path_a,
+    )).unwrap();
+    shutdown_a = restarted_a.shutdown_handle();
+    task_a = tokio::spawn(restarted_a.run());
+    let recovered = wait_status(&http, |status| {
+        status.nodes[&id_a].transport == NodeTransportState::Online
+            && status.nodes[&id_a].cursor.is_some_and(|cursor| {
+                cursor.incarnation_id != route_a.expected_incarnation_id
+            })
+            && status.nodes[&id_a]
+                .inventory
+                .as_ref()
+                .and_then(|inventory| inventory.managed_sessions.iter().find(|record| {
+                    record.record_id == record_id_a
+                }))
+                .is_some_and(|record| record.state == ManagedSessionState::Dormant)
+    }).await;
+    route_a = route(&recovered, &id_a);
+    let recovered_snapshot = control.request(route_a.clone(), NodeRequest::Snapshot).await.unwrap();
+    assert!(matches!(recovered_snapshot.response,
+        Ok(C2NodeResponse::Snapshot { ref snapshot, .. })
+            if snapshot.session_records.iter().any(|record| {
+                record.record_id == record_id_a
+                    && record.task_binding.as_ref() == Some(&minted_binding)
+            })));
+
+    c2_child.terminate().await;
+    drop(control);
+    timeout(Duration::from_secs(2), event_drain).await.unwrap().unwrap();
+    shutdown_a.request_shutdown().await.unwrap();
+    shutdown_b.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), task_a).await.unwrap().unwrap().unwrap();
+    timeout(Duration::from_secs(5), task_b).await.unwrap().unwrap().unwrap();
 }

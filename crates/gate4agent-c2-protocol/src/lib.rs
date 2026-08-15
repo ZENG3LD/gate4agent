@@ -2,16 +2,21 @@
 
 pub use gate4agent_node_protocol::{
     AdapterContractRevision, AdapterFamily, AdapterId, AgentId, ArchitectureId, CapabilityId,
-    ClientCompatibilityOffer, HostDescriptor,
-    ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
+    ClientCompatibilityOffer, HostDescriptor, HostDirectoryEntry, HostDirectoryListing,
+    ManagedWorktreeCleanupFailure, ManagedWorktreeGitScope, ManagedWorktreeLeaseId,
+    ManagedWorktreeLeaseSnapshot,
     ManagedWorktreeLeaseState, ManagedWorktreeRetention, ManagedWorktreeSpawnReceipt,
-    ManagedWorktreeSpawnRequest,
+    ManagedWorktreeSpawnRequest, ManagedWorktreeProfileSummary, WorktreeProfileInventory,
+    WorktreeServiceMode,
     provider_id_is_legacy, NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+    ObservationEvidenceV1, ObservationInteractionOutcomeV1, ObservationKindV1,
+    ObservationTodoItemV1, ObservationTodoStateV1, ObservationV1,
     ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
     ProviderRuntimeContractId, ProviderRuntimeMode, ProviderRuntimeStatus,
     ProviderRuntimeStatuses, ProviderRuntimeVersion,
-    ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, ResolvedSpawnReceipt,
+    LaunchInventory, ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt,
+    ResolvedSpawnReceipt, SpawnProfileSummary,
     ContextPackLineageReceipt, ResolvedContextPackReceipt, SpawnContextDigest,
     ResolvedSpawnSpec, SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision,
     SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId,
@@ -24,21 +29,46 @@ pub use gate4agent_node_protocol::{
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
-    NODE_PROVIDER_ID_OPEN_CAPABILITY,
-    NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    NODE_NATIVE_SESSION_CATALOG_CAPABILITY,
+    NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
+    NODE_NATIVE_SESSION_INDEX_CAPABILITY,
+    NODE_NATIVE_SESSION_PREVIEW_CAPABILITY,
+    NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
+    NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
+    NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
+    CAPABILITY_HOST_DIRECTORY_BROWSE_V1,
+    NODE_PROVIDER_ID_OPEN_CAPABILITY, NODE_SESSION_TASK_CORRELATION_CAPABILITY,
+    NODE_OBSERVATION_EVENTS_CAPABILITY, NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+    NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
+    NODE_SPAWN_PROFILE_REVISION_CAPABILITY, NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+    NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
-    RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
+    GitDiff, GitHistoryPage, RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
+    HistoryCandidateSummary, NativeSessionCatalogEntry, NativeSessionCatalogPage,
+    NativeSessionCatalogRoute, NativeSessionCatalogScope, NativeSessionCatalogSummary,
+    NativeSessionCatalogWindow, NativeSessionExternalGroup, NativeSessionExternalGroupKind,
+    NativeSessionPreview, NativeSessionSelection, SessionRecordPreview,
+    AgentProgressAttentionKindV1, AgentProgressAttentionV1, AgentProgressCurrentV1,
+    AgentProgressEventKindV1, AgentProgressUsageV1, AgentProgressV1, SessionAgentProgress,
+    SessionTaskBindingV1, SessionTaskTargetV1, TaskId,
+    DeliveryBlobChunkHexV1, DeliveryBlobDigestV1, DeliveryBlobReceiptV1,
+    DeliveryBundleManifestV2, DeliveryCommitReceiptV1, DeliveryManifestDigestV2,
+    DeliveryStageId,
+    NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
+    HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpRejectReasonV1,
+    HarnessMcpReplyChunkHexV1, HarnessMcpReservationId, HarnessReadRequestV1,
+    ResolvedHarnessMcpProxyReceiptV1,
+    NODE_HARNESS_MCP_READ_PROXY_CAPABILITY,
     ProtocolNegotiationError, ProtocolRange,
 };
 use gate4agent_node_protocol::{
-    ManagedSessionRecord, ManagedSessionState, NodeSnapshot, SessionAddress, SessionMode,
-    SessionRecordId, WorkspaceId,
+    ManagedSessionRecord, ManagedSessionState, NegotiatedNodeCompatibility, NodeSnapshot,
+    SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
 };
 use gate4agent_types::{
     AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity, SessionGeneration,
     SessionStatus, TerminalFrame, TerminalSize, TransportKind,
 };
-pub use gate4agent_types::HistoryCandidateSummary;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -46,7 +76,7 @@ use std::fmt;
 
 pub const C2_API_VERSION: u16 = 2;
 pub const DEFAULT_C2_API_LISTEN: &str = "127.0.0.1:18320";
-pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 2;
+pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 4;
 pub const C2_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const C2_OPAQUE_UNIX_PATH_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_OPAQUE_UNIX_PATH_CAPABILITY;
@@ -54,6 +84,11 @@ pub const C2_REPOSITORY_PATH_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_REPOSITORY_PATH_CAPABILITY;
 pub const C2_WORKSPACE_FILE_READ_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_WORKSPACE_FILE_READ_CAPABILITY;
+pub const C2_WORKSPACE_FILE_WRITE_CAPABILITY: &str =
+    gate4agent_node_protocol::NODE_WORKSPACE_FILE_WRITE_CAPABILITY;
+pub const C2_WORKSPACE_ENTRY_CREATE_CAPABILITY: &str =
+    NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY;
+pub const C2_GIT_READ_CAPABILITY: &str = gate4agent_node_protocol::NODE_GIT_READ_CAPABILITY;
 pub const C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY;
 pub const C2_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str =
@@ -61,6 +96,8 @@ pub const C2_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str =
 pub const C2_PROVIDER_ID_OPEN_CAPABILITY: &str = NODE_PROVIDER_ID_OPEN_CAPABILITY;
 pub const C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY;
+pub const C2_SPAWN_PROFILE_REVISION_CAPABILITY: &str =
+    NODE_SPAWN_PROFILE_REVISION_CAPABILITY;
 pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS_CAPABILITY;
 pub const C2_WORKTREE_SELECTION_CAPABILITY: &str = NODE_WORKTREE_SELECTION_CAPABILITY;
 pub const C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
@@ -70,6 +107,29 @@ pub const C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
 pub const C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY;
 pub const C2_HISTORY_CONTEXT_PACK_CAPABILITY: &str = NODE_HISTORY_CONTEXT_PACK_CAPABILITY;
+pub const C2_NATIVE_SESSION_CATALOG_CAPABILITY: &str = NODE_NATIVE_SESSION_CATALOG_CAPABILITY;
+pub const C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY: &str =
+    NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY;
+pub const C2_NATIVE_SESSION_PREVIEW_CAPABILITY: &str = NODE_NATIVE_SESSION_PREVIEW_CAPABILITY;
+pub const C2_NATIVE_SESSION_INDEX_CAPABILITY: &str = NODE_NATIVE_SESSION_INDEX_CAPABILITY;
+pub const C2_HOST_DIRECTORY_BROWSE_CAPABILITY: &str = CAPABILITY_HOST_DIRECTORY_BROWSE_V1;
+pub const C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY: &str =
+    NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY;
+pub const C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY: &str =
+    NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY;
+pub const C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY: &str =
+    gate4agent_node_protocol::NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY;
+pub const C2_SESSION_TASK_CORRELATION_CAPABILITY: &str =
+    NODE_SESSION_TASK_CORRELATION_CAPABILITY;
+pub const C2_OBSERVATION_EVENTS_CAPABILITY: &str = NODE_OBSERVATION_EVENTS_CAPABILITY;
+pub const C2_OBSERVATION_MANAGED_TARGET_CAPABILITY: &str =
+    NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY;
+pub const C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY: &str =
+    NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY;
+pub const C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY: &str =
+    NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY;
+pub const C2_HARNESS_MCP_READ_PROXY_CAPABILITY: &str =
+    NODE_HARNESS_MCP_READ_PROXY_CAPABILITY;
 pub const C2_AUTH_NONCE_BYTES: usize = 32;
 pub const C2_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_C2_AUTH_COMPATIBILITY_CAPABILITIES: usize = 64;
@@ -133,17 +193,54 @@ impl From<&NodeFailure> for C2NodeFailure {
         let message = match failure.code {
             NodeFailureCode::InvalidRequest => "invalid request",
             NodeFailureCode::UnsupportedCapability => "required capability unavailable",
+            NodeFailureCode::SpawnProfileRevisionMismatch => {
+                "spawn profile revision mismatch"
+            }
+            NodeFailureCode::HarnessMcpUnavailable => "harness MCP proxy unavailable",
+            NodeFailureCode::ReservationNotFound => "harness MCP reservation unavailable",
+            NodeFailureCode::ReservationConflict => "harness MCP reservation conflict",
+            NodeFailureCode::ReservationExpired => "harness MCP reservation expired",
+            NodeFailureCode::BindingMismatch => "harness MCP binding mismatch",
+            NodeFailureCode::NotActivated => "harness MCP reservation not activated",
+            NodeFailureCode::CallNotFound => "harness MCP call unavailable",
+            NodeFailureCode::ChunkOutOfOrder => "harness MCP reply chunk out of order",
+            NodeFailureCode::ResponseTooLarge => "harness MCP response too large",
+            NodeFailureCode::DeliveryManifestInvalid => "delivery manifest invalid",
+            NodeFailureCode::UnknownDeliveryStage => "delivery stage unavailable",
+            NodeFailureCode::DeliveryStageConflict => "delivery stage conflict",
+            NodeFailureCode::DeliveryBlobUnexpected => "delivery blob unexpected",
+            NodeFailureCode::DeliveryChunkOutOfOrder => "delivery chunk out of order",
+            NodeFailureCode::DeliveryBlobDigestMismatch => "delivery blob digest mismatch",
+            NodeFailureCode::DeliveryBundleDigestMismatch => "delivery bundle digest mismatch",
+            NodeFailureCode::DeliveryStageIncomplete => "delivery stage incomplete",
+            NodeFailureCode::DeliveryStageStorageFailed => "delivery stage storage failed",
             NodeFailureCode::Unauthorized => "authentication rejected",
             NodeFailureCode::ObserverReadOnly => "operator access required",
             NodeFailureCode::ControllerBusy => "controller busy",
             NodeFailureCode::ControllerRequired => "controller required",
             NodeFailureCode::UnknownWorkspace => "workspace unavailable",
+            NodeFailureCode::HostDirectoryInvalid => "host directory invalid",
+            NodeFailureCode::HostDirectoryReadFailed => "host directory read failed",
+            NodeFailureCode::HostDirectoryReadTimedOut => "host directory read timed out",
+            NodeFailureCode::StandaloneWorkspaceRecoveryRequired => {
+                "standalone workspace recovery required"
+            }
             NodeFailureCode::InvalidRepositoryPath => "repository path invalid",
             NodeFailureCode::RepositoryFileNotFound => "repository file unavailable",
             NodeFailureCode::RepositoryFileNotRegular => "repository path is not a regular file",
             NodeFailureCode::RepositoryPathUnsafe => "repository path is unsafe",
             NodeFailureCode::RepositoryFileReadTimedOut => "repository file read timed out",
             NodeFailureCode::RepositoryFileReadFailed => "repository file read failed",
+            NodeFailureCode::RepositoryFileWriteTimedOut => "repository file write timed out",
+            NodeFailureCode::RepositoryFileWriteFailed => "repository file write failed",
+            NodeFailureCode::RepositoryFileRevisionConflict => "repository file changed since it was opened",
+            NodeFailureCode::RepositoryEntryAlreadyExists => "repository entry already exists",
+            NodeFailureCode::RepositoryParentNotFound => "repository parent directory unavailable",
+            NodeFailureCode::RepositoryParentNotDirectory => "repository parent path is not a directory",
+            NodeFailureCode::RepositoryEntryCreateTimedOut => "repository entry creation timed out",
+            NodeFailureCode::RepositoryEntryCreateFailed => "repository entry creation failed",
+            NodeFailureCode::GitReadTimedOut => "git read timed out",
+            NodeFailureCode::GitReadFailed => "git read failed",
             NodeFailureCode::InvalidWorkspaceRoot => "workspace root invalid",
             NodeFailureCode::DuplicateWorkspaceId => "workspace ID already registered",
             NodeFailureCode::DuplicateWorkspaceRoot => "workspace root already registered",
@@ -187,6 +284,10 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::SessionRecordBusy => "managed session busy",
             NodeFailureCode::SessionRecordConflict => "managed session conflict",
             NodeFailureCode::SessionWorkspaceMismatch => "session workspace mismatch",
+            NodeFailureCode::WorkspaceRegistrationRequired => {
+                "workspace registration required"
+            }
+            NodeFailureCode::StaleNativeSessionCatalog => "native session catalog is stale",
             NodeFailureCode::UnknownContextPack => "context pack unavailable",
             NodeFailureCode::ContextPackBusy => "context pack busy",
             NodeFailureCode::ContextPackMaterializationFailed => {
@@ -203,6 +304,30 @@ impl From<&NodeFailure> for C2NodeFailure {
 }
 
 impl C2NodeFailure {
+    pub fn requires_harness_mcp_proxy_capability(&self) -> bool {
+        use gate4agent_node_protocol::NodeFailureCode;
+        matches!(self.code,
+            NodeFailureCode::HarnessMcpUnavailable
+                | NodeFailureCode::ReservationNotFound
+                | NodeFailureCode::ReservationConflict
+                | NodeFailureCode::ReservationExpired
+                | NodeFailureCode::BindingMismatch
+                | NodeFailureCode::NotActivated
+                | NodeFailureCode::CallNotFound
+                | NodeFailureCode::ChunkOutOfOrder
+                | NodeFailureCode::ResponseTooLarge)
+    }
+
+    pub fn requires_host_directory_browse_capability(&self) -> bool {
+        use gate4agent_node_protocol::NodeFailureCode;
+        matches!(
+            self.code,
+            NodeFailureCode::HostDirectoryInvalid
+                | NodeFailureCode::HostDirectoryReadFailed
+                | NodeFailureCode::HostDirectoryReadTimedOut
+        )
+    }
+
     pub fn requires_history_context_pack_capability(&self) -> bool {
         use gate4agent_node_protocol::NodeFailureCode;
         matches!(
@@ -211,6 +336,10 @@ impl C2NodeFailure {
                 | NodeFailureCode::ContextPackBusy
                 | NodeFailureCode::ContextPackMaterializationFailed
         )
+    }
+
+    pub fn requires_native_session_catalog_paging_capability(&self) -> bool {
+        self.code == gate4agent_node_protocol::NodeFailureCode::StaleNativeSessionCatalog
     }
 }
 
@@ -231,6 +360,8 @@ pub struct C2ManagedSessionRecord {
     pub context_id: Option<SpawnContextId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ResolvedContextPackReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_binding: Option<SessionTaskBindingV1>,
     pub provider_identity_present: bool,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -249,6 +380,18 @@ impl C2ManagedSessionRecord {
 
     pub fn requires_history_context_pack_capability(&self) -> bool {
         self.context_id.is_some() || self.context.is_some()
+    }
+
+    pub fn requires_session_task_correlation_capability(&self) -> bool {
+        self.task_binding.is_some()
+    }
+
+    pub fn task_binding_is_valid(&self) -> bool {
+        self.task_binding.as_ref().map_or(true, |binding| {
+            binding.revision > 0
+                && binding.changed_at_unix_ms >= self.created_at_unix_ms
+                && binding.changed_at_unix_ms <= self.updated_at_unix_ms
+        })
     }
 }
 
@@ -274,6 +417,8 @@ impl<'de> Deserialize<'de> for C2ManagedSessionRecord {
             context_id: Option<SpawnContextId>,
             #[serde(default)]
             context: Option<ResolvedContextPackReceipt>,
+            #[serde(default)]
+            task_binding: Option<SessionTaskBindingV1>,
             provider_identity_present: bool,
             created_at_unix_ms: u64,
             updated_at_unix_ms: u64,
@@ -292,6 +437,7 @@ impl<'de> Deserialize<'de> for C2ManagedSessionRecord {
             bundle: wire.bundle,
             context_id: wire.context_id,
             context: wire.context,
+            task_binding: wire.task_binding,
             provider_identity_present: wire.provider_identity_present,
             created_at_unix_ms: wire.created_at_unix_ms,
             updated_at_unix_ms: wire.updated_at_unix_ms,
@@ -299,6 +445,11 @@ impl<'de> Deserialize<'de> for C2ManagedSessionRecord {
         if !record.context_binding_is_valid() {
             return Err(serde::de::Error::custom(
                 "C2 managed session context id and materialization receipt are not correlated",
+            ));
+        }
+        if !record.task_binding_is_valid() {
+            return Err(serde::de::Error::custom(
+                "C2 managed session task binding revision or timestamp is invalid",
             ));
         }
         Ok(record)
@@ -319,11 +470,17 @@ impl From<&ManagedSessionRecord> for C2ManagedSessionRecord {
             bundle: record.bundle.clone(),
             context_id: record.context_id.clone(),
             context: record.context.clone(),
+            task_binding: record.task_binding.clone().filter(|binding| {
+                binding.revision > 0
+                    && binding.changed_at_unix_ms >= record.created_at_unix_ms
+                    && binding.changed_at_unix_ms <= record.updated_at_unix_ms
+            }),
             provider_identity_present: record.provider_session.is_some(),
             created_at_unix_ms: record.created_at_unix_ms,
             updated_at_unix_ms: record.updated_at_unix_ms,
         }
     }
+
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -392,6 +549,10 @@ pub struct C2WorkspaceSnapshot {
     pub workspace_id: WorkspaceId,
     pub canonical_root: OpaqueHostPath,
     pub sessions: Vec<C2SessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_service_mode: Option<WorktreeServiceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree_profiles: Option<WorktreeProfileInventory>,
 }
 
 impl From<&gate4agent_node_protocol::WorkspaceSnapshot> for C2WorkspaceSnapshot {
@@ -400,7 +561,59 @@ impl From<&gate4agent_node_protocol::WorkspaceSnapshot> for C2WorkspaceSnapshot 
             workspace_id: workspace.workspace_id.clone(),
             canonical_root: workspace.canonical_root.clone(),
             sessions: workspace.sessions.iter().map(C2SessionSnapshot::from).collect(),
+            worktree_service_mode: workspace.worktree_service_mode,
+            managed_worktree_profiles: workspace.managed_worktree_profiles.clone(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct C2ObservationSupport {
+    pub events: bool,
+    #[serde(default)]
+    pub managed_target: bool,
+    pub workflow_detail: bool,
+}
+
+impl C2ObservationSupport {
+    pub fn from_node_capabilities(capabilities: &[CapabilityId]) -> Self {
+        let has = |expected| {
+            capabilities.iter().any(|capability| capability.as_str() == expected)
+        };
+        let events = has(NODE_OBSERVATION_EVENTS_CAPABILITY);
+        Self {
+            events,
+            managed_target: events && has(NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY),
+            workflow_detail: events && has(NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY),
+        }
+    }
+
+    pub fn from_node_compatibility(
+        compatibility: Option<&NegotiatedNodeCompatibility>,
+    ) -> Self {
+        Self::from_node_capabilities(
+            compatibility.map_or(&[], |compatibility| compatibility.capabilities.as_slice()),
+        )
+    }
+
+    pub const fn is_valid(self) -> bool {
+        (!self.managed_target || self.events) && (!self.workflow_detail || self.events)
+    }
+
+    pub const fn projected_for_downstream(
+        self,
+        include_events: bool,
+        include_managed_target: bool,
+        include_workflow_detail: bool,
+    ) -> Option<Self> {
+        if !include_events {
+            return None;
+        }
+        Some(Self {
+            events: self.events,
+            managed_target: self.managed_target && include_managed_target,
+            workflow_detail: self.workflow_detail && include_workflow_detail,
+        })
     }
 }
 
@@ -415,9 +628,19 @@ pub struct C2NodeSnapshot {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_c2_agent_progress_entries"
+    )]
+    pub agent_progress: Vec<SessionAgentProgress>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
         deserialize_with = "deserialize_c2_managed_worktree_leases"
     )]
     pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_inventory: Option<LaunchInventory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_support: Option<C2ObservationSupport>,
 }
 
 impl C2NodeSnapshot {
@@ -437,6 +660,12 @@ impl C2NodeSnapshot {
         self.session_records
             .iter()
             .any(C2ManagedSessionRecord::requires_history_context_pack_capability)
+    }
+
+    pub fn requires_session_task_correlation_capability(&self) -> bool {
+        self.session_records
+            .iter()
+            .any(C2ManagedSessionRecord::requires_session_task_correlation_capability)
     }
 }
 
@@ -489,6 +718,53 @@ where
     deserializer.deserialize_seq(ManagedWorktreesVisitor)
 }
 
+fn deserialize_c2_agent_progress_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SessionAgentProgress>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AgentProgressEntriesVisitor;
+
+    impl<'de> Visitor<'de> for AgentProgressEntriesVisitor {
+        type Value = Vec<SessionAgentProgress>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {} bounded agent progress entries",
+                gate4agent_node_protocol::MAX_AGENT_PROGRESS_ENTRIES,
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut entries = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(gate4agent_node_protocol::MAX_AGENT_PROGRESS_ENTRIES),
+            );
+            while let Some(entry) = sequence.next_element::<SessionAgentProgress>()? {
+                if entries.len() == gate4agent_node_protocol::MAX_AGENT_PROGRESS_ENTRIES {
+                    return Err(serde::de::Error::invalid_length(entries.len() + 1, &self));
+                }
+                if entries.iter().any(|existing: &SessionAgentProgress| {
+                    existing.address == entry.address
+                }) {
+                    continue;
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(AgentProgressEntriesVisitor)
+}
+
 impl From<&NodeSnapshot> for C2NodeSnapshot {
     fn from(snapshot: &NodeSnapshot) -> Self {
         Self {
@@ -499,7 +775,10 @@ impl From<&NodeSnapshot> for C2NodeSnapshot {
             session_records: snapshot.session_records.iter()
                 .map(C2ManagedSessionRecord::from)
                 .collect(),
+            agent_progress: snapshot.agent_progress.clone(),
             managed_worktrees: snapshot.managed_worktrees.clone(),
+            launch_inventory: snapshot.launch_inventory.clone(),
+            observation_support: None,
         }
     }
 }
@@ -538,11 +817,13 @@ pub enum C2ProviderEventKind {
     ToolStarted,
     ToolCompleted,
     TurnCompleted,
+    ContextWindowUsage,
     TurnInterrupted,
     SessionEnded,
     Error,
     Ready,
     InteractionRequested,
+    InteractionResolved,
     SubagentStarted,
     SubagentStopped,
     RateLimited,
@@ -561,11 +842,13 @@ impl From<&gate4agent_types::ProviderEvent> for C2ProviderEventKind {
             ProviderEvent::ToolStarted { .. } => Self::ToolStarted,
             ProviderEvent::ToolCompleted { .. } => Self::ToolCompleted,
             ProviderEvent::TurnCompleted { .. } => Self::TurnCompleted,
+            ProviderEvent::ContextWindowUsage { .. } => Self::ContextWindowUsage,
             ProviderEvent::TurnInterrupted => Self::TurnInterrupted,
             ProviderEvent::SessionEnded { .. } => Self::SessionEnded,
             ProviderEvent::Error { .. } => Self::Error,
             ProviderEvent::Ready => Self::Ready,
             ProviderEvent::InteractionRequested { .. } => Self::InteractionRequested,
+            ProviderEvent::InteractionResolved { .. } => Self::InteractionResolved,
             ProviderEvent::SubagentStarted { .. } => Self::SubagentStarted,
             ProviderEvent::SubagentStopped { .. } => Self::SubagentStopped,
             ProviderEvent::RateLimited { .. } => Self::RateLimited,
@@ -609,7 +892,7 @@ pub enum C2ControlEventKind {
     InteractionResolutionRequested,
     InteractionResolutionFailed,
     InteractionResolved,
-    Exited { forced: bool },
+    Exited { exit_code: Option<i32>, forced: bool },
     Failed,
     Removed,
     ObservationIgnored,
@@ -654,7 +937,10 @@ impl From<&gate4agent_types::ControlEvent> for C2ControlEvent {
             ControlEventKind::InteractionResolutionRequested { .. } => C2ControlEventKind::InteractionResolutionRequested,
             ControlEventKind::InteractionResolutionFailed { .. } => C2ControlEventKind::InteractionResolutionFailed,
             ControlEventKind::InteractionResolved { .. } => C2ControlEventKind::InteractionResolved,
-            ControlEventKind::Exited { forced, .. } => C2ControlEventKind::Exited { forced: *forced },
+            ControlEventKind::Exited { exit_code, forced } => C2ControlEventKind::Exited {
+                exit_code: *exit_code,
+                forced: *forced,
+            },
             ControlEventKind::Failed { .. } => C2ControlEventKind::Failed,
             ControlEventKind::Removed => C2ControlEventKind::Removed,
             ControlEventKind::ObservationIgnored { .. } => C2ControlEventKind::ObservationIgnored,
@@ -673,9 +959,26 @@ impl From<&gate4agent_types::ControlEvent> for C2ControlEvent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum C2NodeEvent {
+    HarnessMcpReadCall {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+        request: HarnessReadRequestV1,
+        deadline_unix_ms: u64,
+    },
     Control {
         address: SessionAddress,
         event: C2ControlEvent,
+    },
+    Observation {
+        address: SessionAddress,
+        observation: ObservationV1,
+    },
+    ManagedObservation {
+        record_id: SessionRecordId,
+        observation: ObservationV1,
     },
     TerminalFrame {
         address: SessionAddress,
@@ -698,10 +1001,37 @@ pub enum C2NodeEvent {
 impl From<&NodeEvent> for C2NodeEvent {
     fn from(event: &NodeEvent) -> Self {
         match event {
+            NodeEvent::HarnessMcpReadCall {
+                reservation_id,
+                activation_digest,
+                record_id,
+                session,
+                call_id,
+                request,
+                deadline_unix_ms,
+            } => Self::HarnessMcpReadCall {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                record_id: record_id.clone(),
+                session: session.clone(),
+                call_id: call_id.clone(),
+                request: request.clone(),
+                deadline_unix_ms: *deadline_unix_ms,
+            },
             NodeEvent::Control { address, event } => Self::Control {
                 address: address.clone(),
                 event: C2ControlEvent::from(event),
             },
+            NodeEvent::Observation { address, observation } => Self::Observation {
+                address: address.clone(),
+                observation: observation.clone(),
+            },
+            NodeEvent::ManagedObservation { record_id, observation } => {
+                Self::ManagedObservation {
+                    record_id: record_id.clone(),
+                    observation: observation.clone(),
+                }
+            }
             NodeEvent::TerminalFrame { address, frame } => Self::TerminalFrame {
                 address: address.clone(),
                 frame: frame.clone(),
@@ -735,6 +1065,59 @@ impl From<&NodeEvent> for C2NodeEvent {
 }
 
 impl C2NodeEvent {
+    pub fn requires_harness_mcp_proxy_capability(&self) -> bool {
+        matches!(self, Self::HarnessMcpReadCall { .. })
+    }
+
+    pub fn harness_mcp_contract_is_valid_at(&self, now_unix_ms: u64) -> bool {
+        match self {
+            Self::HarnessMcpReadCall {
+                reservation_id,
+                activation_digest,
+                record_id,
+                session,
+                call_id,
+                request,
+                deadline_unix_ms,
+            } => NodeEvent::HarnessMcpReadCall {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                record_id: record_id.clone(),
+                session: session.clone(),
+                call_id: call_id.clone(),
+                request: request.clone(),
+                deadline_unix_ms: *deadline_unix_ms,
+            }.harness_mcp_contract_is_valid_at(now_unix_ms),
+            _ => true,
+        }
+    }
+
+    pub fn requires_observation_events_capability(&self) -> bool {
+        matches!(self, Self::Observation { .. } | Self::ManagedObservation { .. })
+    }
+
+    pub fn requires_observation_managed_target_capability(&self) -> bool {
+        matches!(self, Self::ManagedObservation { .. })
+    }
+
+    pub fn requires_observation_workflow_detail_capability(&self) -> bool {
+        match self {
+            Self::Observation { address, observation } => NodeEvent::Observation {
+                address: address.clone(),
+                observation: observation.clone(),
+            }
+            .requires_observation_workflow_detail_capability(),
+            Self::ManagedObservation { record_id, observation } => {
+                NodeEvent::ManagedObservation {
+                    record_id: record_id.clone(),
+                    observation: observation.clone(),
+                }
+                .requires_observation_workflow_detail_capability()
+            }
+            _ => false,
+        }
+    }
+
     pub fn requires_child_environment_profile_capability(&self) -> bool {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.environment_profile.is_some())
@@ -748,6 +1131,11 @@ impl C2NodeEvent {
     pub fn requires_history_context_pack_capability(&self) -> bool {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.requires_history_context_pack_capability())
+    }
+
+    pub fn requires_session_task_correlation_capability(&self) -> bool {
+        matches!(self, Self::SessionRecordUpserted { record }
+            if record.requires_session_task_correlation_capability())
     }
 }
 
@@ -785,6 +1173,8 @@ pub struct C2GitSnapshot {
     pub status: Vec<gate4agent_node_protocol::GitStatusEntry>,
     pub recent_commits: Vec<gate4agent_node_protocol::GitCommitSummary>,
     pub worktrees: Vec<C2GitWorktreeSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree: Option<ManagedWorktreeGitScope>,
     pub truncated: bool,
     pub diagnostic_present: bool,
 }
@@ -797,13 +1187,27 @@ impl From<&gate4agent_node_protocol::GitSnapshot> for C2GitSnapshot {
             status: git.status.clone(),
             recent_commits: git.recent_commits.clone(),
             worktrees: git.worktrees.iter().map(C2GitWorktreeSnapshot::from).collect(),
+            managed_worktree: git.managed_worktree.clone(),
             truncated: git.truncated,
             diagnostic_present: git.diagnostic.is_some(),
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+impl C2GitSnapshot {
+    pub fn managed_worktree_is_valid_for(&self, workspace_id: &WorkspaceId) -> bool {
+        self.managed_worktree.as_ref().map_or(true, |scope| {
+            self.is_repository
+                && self.branch.as_deref() == Some(scope.branch.as_str())
+                && &scope.source_workspace_id != workspace_id
+                && (u32::from(scope.active_session_count)
+                    + u32::from(scope.managed_record_count))
+                    > 0
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct C2WorkspaceInspection {
     pub workspace_id: WorkspaceId,
     pub entries: Vec<gate4agent_node_protocol::WorkspaceEntry>,
@@ -811,14 +1215,49 @@ pub struct C2WorkspaceInspection {
     pub git: C2GitSnapshot,
 }
 
+impl<'de> Deserialize<'de> for C2WorkspaceInspection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireInspection {
+            workspace_id: WorkspaceId,
+            entries: Vec<gate4agent_node_protocol::WorkspaceEntry>,
+            tree_truncated: bool,
+            git: C2GitSnapshot,
+        }
+
+        let wire = WireInspection::deserialize(deserializer)?;
+        if !wire.git.managed_worktree_is_valid_for(&wire.workspace_id) {
+            return Err(serde::de::Error::custom(
+                "managed worktree git scope is inconsistent with workspace inspection",
+            ));
+        }
+        Ok(Self {
+            workspace_id: wire.workspace_id,
+            entries: wire.entries,
+            tree_truncated: wire.tree_truncated,
+            git: wire.git,
+        })
+    }
+}
+
 impl From<&gate4agent_node_protocol::WorkspaceInspection> for C2WorkspaceInspection {
     fn from(inspection: &gate4agent_node_protocol::WorkspaceInspection) -> Self {
-        Self {
+        let mut projected = Self {
             workspace_id: inspection.workspace_id.clone(),
             entries: inspection.entries.clone(),
             tree_truncated: inspection.tree_truncated,
             git: C2GitSnapshot::from(&inspection.git),
+        };
+        if !projected
+            .git
+            .managed_worktree_is_valid_for(&projected.workspace_id)
+        {
+            projected.git.managed_worktree = None;
         }
+        projected
     }
 }
 
@@ -832,14 +1271,88 @@ pub enum C2NodeResponse {
     },
     Resync {
         event_sequence: u64,
+        oldest_available_sequence: u64,
         snapshot: C2NodeSnapshot,
         events: Vec<C2NodeEventEnvelope>,
+    },
+    Armed {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        expires_at_unix_ms: u64,
+    },
+    Spawned {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        receipt: ResolvedSpawnReceipt,
+    },
+    Activated {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+    },
+    Aborted {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+    },
+    ReplyChunkAccepted {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+        next_offset: u32,
+        completed: bool,
+    },
+    CallRejected {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+    },
+    DeliveryStageBegun {
+        stage_id: DeliveryStageId,
+        manifest_digest: DeliveryManifestDigestV2,
+        missing_blobs: Vec<DeliveryBlobDigestV1>,
+    },
+    DeliveryBlobChunkAccepted {
+        stage_id: DeliveryStageId,
+        blob_digest: DeliveryBlobDigestV1,
+        next_offset: u64,
+    },
+    DeliveryCommitted {
+        receipt: DeliveryCommitReceiptV1,
+    },
+    DeliveryStageAborted {
+        stage_id: DeliveryStageId,
     },
     WorkspaceInspected {
         inspection: C2WorkspaceInspection,
     },
+    HostDirectoriesBrowsed {
+        listing: HostDirectoryListing,
+    },
     WorkspaceFileRead {
         file: WorkspaceFileRead,
+    },
+    WorkspaceFileWritten {
+        file: WorkspaceFileRead,
+    },
+    WorkspaceFileCreated {
+        file: WorkspaceFileRead,
+    },
+    WorkspaceDirectoryCreated {
+        workspace_id: WorkspaceId,
+        entry: gate4agent_node_protocol::WorkspaceEntry,
+    },
+    GitHistoryRead {
+        workspace_id: WorkspaceId,
+        page: GitHistoryPage,
+    },
+    GitDiffRead {
+        workspace_id: WorkspaceId,
+        diff: GitDiff,
     },
     Controller {
         controller: Option<gate4agent_node_protocol::ControllerState>,
@@ -849,11 +1362,42 @@ pub enum C2NodeResponse {
     ManagedWorktreeSpawnAccepted { receipt: ManagedWorktreeSpawnReceipt },
     ManagedWorktreeCleanup { lease: ManagedWorktreeLeaseSnapshot },
     SessionRecordUpdated { record: C2ManagedSessionRecord },
+    ProviderSessionIndexed { record: C2ManagedSessionRecord },
+    NativeSessionIndexed {
+        selection: NativeSessionSelection,
+        record: C2ManagedSessionRecord,
+    },
     SessionRecordResumed {
         record: C2ManagedSessionRecord,
         session: SessionAddress,
     },
     SessionRecordForgotten { record_id: SessionRecordId },
+    NativeSessionsCataloged {
+        route: NativeSessionCatalogRoute,
+        #[serde(deserialize_with = "deserialize_c2_native_session_catalog_entries")]
+        entries: Vec<NativeSessionCatalogEntry>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_c2_native_session_catalog_summary"
+        )]
+        summary: Option<NativeSessionCatalogSummary>,
+    },
+    NativeSessionsPaged {
+        route: NativeSessionCatalogRoute,
+        #[serde(deserialize_with = "deserialize_c2_native_session_catalog_page")]
+        page: NativeSessionCatalogPage,
+    },
+    NativeSessionPreviewed {
+        selection: NativeSessionSelection,
+        #[serde(deserialize_with = "deserialize_c2_native_session_preview")]
+        preview: NativeSessionPreview,
+    },
+    SessionRecordPreviewed {
+        record_id: SessionRecordId,
+        #[serde(deserialize_with = "deserialize_c2_session_record_preview")]
+        preview: SessionRecordPreview,
+    },
     HistoryDiscovered {
         session: SessionAddress,
         #[serde(deserialize_with = "deserialize_c2_history_candidates")]
@@ -864,10 +1408,15 @@ pub enum C2NodeResponse {
         #[serde(deserialize_with = "deserialize_c2_history_session_id")]
         session_id: String,
         message_count: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completed_turn_count: Option<u64>,
     },
     ContextPackExported { context: ResolvedContextPackReceipt },
     ContextPackForgotten { context_id: SpawnContextId },
     WorkspaceRegistered {
+        workspace: C2WorkspaceSnapshot,
+    },
+    StandaloneWorkspaceCreated {
         workspace: C2WorkspaceSnapshot,
     },
     WorkspaceUnregistered { workspace_id: WorkspaceId },
@@ -891,16 +1440,130 @@ impl From<&NodeResponse> for C2NodeResponse {
                 controller: controller.clone(),
                 snapshot: C2NodeSnapshot::from(snapshot),
             },
-            NodeResponse::Resync { event_sequence, snapshot, events } => Self::Resync {
+            NodeResponse::Resync {
+                event_sequence,
+                oldest_available_sequence,
+                snapshot,
+                events,
+            } => Self::Resync {
                 event_sequence: *event_sequence,
+                oldest_available_sequence: *oldest_available_sequence,
                 snapshot: C2NodeSnapshot::from(snapshot),
                 events: events.iter().map(C2NodeEventEnvelope::from).collect(),
+            },
+            NodeResponse::Armed {
+                reservation_id,
+                activation_digest,
+                expires_at_unix_ms,
+            } => Self::Armed {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                expires_at_unix_ms: *expires_at_unix_ms,
+            },
+            NodeResponse::Spawned { reservation_id, activation_digest, receipt } => {
+                Self::Spawned {
+                    reservation_id: reservation_id.clone(),
+                    activation_digest: activation_digest.clone(),
+                    receipt: receipt.clone(),
+                }
+            }
+            NodeResponse::Activated {
+                reservation_id,
+                activation_digest,
+                record_id,
+                session,
+            } => Self::Activated {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                record_id: record_id.clone(),
+                session: session.clone(),
+            },
+            NodeResponse::Aborted { reservation_id, activation_digest } => Self::Aborted {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+            },
+            NodeResponse::ReplyChunkAccepted {
+                reservation_id,
+                activation_digest,
+                record_id,
+                session,
+                call_id,
+                next_offset,
+                completed,
+            } => Self::ReplyChunkAccepted {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                record_id: record_id.clone(),
+                session: session.clone(),
+                call_id: call_id.clone(),
+                next_offset: *next_offset,
+                completed: *completed,
+            },
+            NodeResponse::CallRejected {
+                reservation_id,
+                activation_digest,
+                record_id,
+                session,
+                call_id,
+            } => Self::CallRejected {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                record_id: record_id.clone(),
+                session: session.clone(),
+                call_id: call_id.clone(),
+            },
+            NodeResponse::DeliveryStageBegun {
+                stage_id,
+                manifest_digest,
+                missing_blobs,
+            } => Self::DeliveryStageBegun {
+                stage_id: stage_id.clone(),
+                manifest_digest: manifest_digest.clone(),
+                missing_blobs: missing_blobs.clone(),
+            },
+            NodeResponse::DeliveryBlobChunkAccepted {
+                stage_id,
+                blob_digest,
+                next_offset,
+            } => Self::DeliveryBlobChunkAccepted {
+                stage_id: stage_id.clone(),
+                blob_digest: blob_digest.clone(),
+                next_offset: *next_offset,
+            },
+            NodeResponse::DeliveryCommitted { receipt } => Self::DeliveryCommitted {
+                receipt: receipt.clone(),
+            },
+            NodeResponse::DeliveryStageAborted { stage_id } => Self::DeliveryStageAborted {
+                stage_id: stage_id.clone(),
             },
             NodeResponse::WorkspaceInspected { inspection } => Self::WorkspaceInspected {
                 inspection: C2WorkspaceInspection::from(inspection),
             },
+            NodeResponse::HostDirectoriesBrowsed { listing } => Self::HostDirectoriesBrowsed {
+                listing: listing.clone(),
+            },
             NodeResponse::WorkspaceFileRead { file } => Self::WorkspaceFileRead {
                 file: file.clone(),
+            },
+            NodeResponse::WorkspaceFileWritten { file } => Self::WorkspaceFileWritten {
+                file: file.clone(),
+            },
+            NodeResponse::WorkspaceFileCreated { file } => Self::WorkspaceFileCreated {
+                file: file.clone(),
+            },
+            NodeResponse::WorkspaceDirectoryCreated { workspace_id, entry } => {
+                Self::WorkspaceDirectoryCreated {
+                    workspace_id: workspace_id.clone(),
+                    entry: entry.clone(),
+                }
+            }
+            NodeResponse::GitHistoryRead { workspace_id, page } => Self::GitHistoryRead {
+                workspace_id: workspace_id.clone(),
+                page: page.clone(),
+            },
+            NodeResponse::GitDiffRead { workspace_id, diff } => Self::GitDiffRead {
+                workspace_id: workspace_id.clone(),
+                diff: diff.clone(),
             },
             NodeResponse::Controller { controller } => Self::Controller {
                 controller: controller.clone(),
@@ -920,6 +1583,15 @@ impl From<&NodeResponse> for C2NodeResponse {
             NodeResponse::SessionRecordUpdated { record } => Self::SessionRecordUpdated {
                 record: C2ManagedSessionRecord::from(record),
             },
+            NodeResponse::ProviderSessionIndexed { record } => Self::ProviderSessionIndexed {
+                record: C2ManagedSessionRecord::from(record),
+            },
+            NodeResponse::NativeSessionIndexed { selection, record } => {
+                Self::NativeSessionIndexed {
+                    selection: selection.clone(),
+                    record: C2ManagedSessionRecord::from(record),
+                }
+            }
             NodeResponse::SessionRecordResumed { record, session } => Self::SessionRecordResumed {
                 record: C2ManagedSessionRecord::from(record),
                 session: session.clone(),
@@ -927,6 +1599,35 @@ impl From<&NodeResponse> for C2NodeResponse {
             NodeResponse::SessionRecordForgotten { record_id } => Self::SessionRecordForgotten {
                 record_id: record_id.clone(),
             },
+            NodeResponse::NativeSessionsCataloged {
+                route,
+                entries,
+                summary,
+            } => Self::NativeSessionsCataloged {
+                route: route.clone(),
+                entries: entries.clone(),
+                summary: summary.clone(),
+            },
+            NodeResponse::NativeSessionsPaged {
+                route,
+                page,
+            } => Self::NativeSessionsPaged {
+                route: route.clone(),
+                page: page.clone(),
+            },
+            NodeResponse::NativeSessionPreviewed {
+                selection,
+                preview,
+            } => Self::NativeSessionPreviewed {
+                selection: selection.clone(),
+                preview: preview.clone(),
+            },
+            NodeResponse::SessionRecordPreviewed { record_id, preview } => {
+                Self::SessionRecordPreviewed {
+                    record_id: record_id.clone(),
+                    preview: preview.clone(),
+                }
+            }
             NodeResponse::HistoryDiscovered { session, candidates } => Self::HistoryDiscovered {
                 session: session.clone(),
                 candidates: candidates.clone(),
@@ -935,10 +1636,12 @@ impl From<&NodeResponse> for C2NodeResponse {
                 session,
                 session_id,
                 message_count,
+                completed_turn_count,
             } => Self::HistoryLoaded {
                 session: session.clone(),
                 session_id: session_id.clone(),
                 message_count: *message_count,
+                completed_turn_count: *completed_turn_count,
             },
             NodeResponse::ContextPackExported { context } => Self::ContextPackExported {
                 context: context.clone(),
@@ -949,6 +1652,11 @@ impl From<&NodeResponse> for C2NodeResponse {
             NodeResponse::WorkspaceRegistered { workspace } => Self::WorkspaceRegistered {
                 workspace: C2WorkspaceSnapshot::from(workspace),
             },
+            NodeResponse::StandaloneWorkspaceCreated { workspace } => {
+                Self::StandaloneWorkspaceCreated {
+                    workspace: C2WorkspaceSnapshot::from(workspace),
+                }
+            }
             NodeResponse::WorkspaceUnregistered { workspace_id } => Self::WorkspaceUnregistered {
                 workspace_id: workspace_id.clone(),
             },
@@ -967,6 +1675,114 @@ impl From<&NodeResponse> for C2NodeResponse {
 }
 
 impl C2NodeResponse {
+    pub fn requires_harness_mcp_proxy_capability(&self) -> bool {
+        matches!(self,
+            Self::Armed { .. }
+                | Self::Spawned { .. }
+                | Self::Activated { .. }
+                | Self::Aborted { .. }
+                | Self::ReplyChunkAccepted { .. }
+                | Self::CallRejected { .. })
+            || matches!(self, Self::SpawnSpecAccepted { receipt }
+                if receipt.harness_mcp_proxy.is_some())
+            || matches!(self, Self::ManagedWorktreeSpawnAccepted { receipt }
+                if receipt.spawn.harness_mcp_proxy.is_some())
+    }
+
+    pub fn from_node_response_with_observation_support(
+        response: &NodeResponse,
+        observation_support: Option<C2ObservationSupport>,
+    ) -> Self {
+        let mut projected = Self::from(response);
+        match &mut projected {
+            Self::Snapshot { snapshot, .. } | Self::Resync { snapshot, .. } => {
+                snapshot.observation_support = observation_support;
+            }
+            _ => {}
+        }
+        projected
+    }
+}
+
+impl C2NodeResponse {
+    pub fn native_session_catalog_contract_is_valid(&self) -> bool {
+        match self {
+            Self::NativeSessionsCataloged { route, entries, summary } => {
+                route.validate().is_ok()
+                    && entries.len()
+                        <= usize::from(gate4agent_types::NATIVE_SESSION_CATALOG_LIMIT_MAX)
+                    && entries.iter().enumerate().all(|(index, entry)| {
+                        entry.validate_for_route(route).is_ok()
+                            && !entries[..index].iter().any(|existing| {
+                                existing.selection_id == entry.selection_id
+                                    || entry.record_id.as_ref().is_some_and(|record_id| {
+                                        existing.record_id.as_ref() == Some(record_id)
+                                    })
+                            })
+                    })
+                    && summary.as_ref().map_or(true, |summary| {
+                        summary.validate_initial_entries(entries.len()).is_ok()
+                    })
+            }
+            Self::NativeSessionsPaged { route, page } => {
+                page.validate_for_route(route).is_ok()
+            }
+            _ => true,
+        }
+    }
+
+    pub fn requires_native_session_catalog_capability(&self) -> bool {
+        matches!(self, Self::NativeSessionsCataloged { .. })
+    }
+
+    pub fn requires_native_session_catalog_paging_capability(&self) -> bool {
+        matches!(self, Self::NativeSessionsPaged { .. })
+    }
+
+    pub fn requires_native_session_preview_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeSessionPreviewed { .. } | Self::SessionRecordPreviewed { .. }
+        )
+    }
+
+    pub fn requires_native_session_index_capability(&self) -> bool {
+        matches!(self, Self::NativeSessionIndexed { .. })
+    }
+
+    pub fn native_session_index_contract_is_valid(&self) -> bool {
+        match self {
+            Self::NativeSessionIndexed { selection, record } => {
+                selection.validate().is_ok()
+                    && selection.route.scope == NativeSessionCatalogScope::Workspace
+                    && selection.route.workspace_id.as_ref() == Some(&record.workspace_id)
+                    && selection.route.provider == record.provider
+            }
+            _ => false,
+        }
+    }
+
+    pub fn native_session_preview_contract_is_valid(&self) -> bool {
+        match self {
+            Self::NativeSessionPreviewed { selection, preview } => {
+                selection.validate().is_ok() && preview.validate().is_ok()
+            }
+            Self::SessionRecordPreviewed { preview, .. } => preview.validate().is_ok(),
+            _ => true,
+        }
+    }
+
+    pub fn requires_host_directory_browse_capability(&self) -> bool {
+        matches!(self, Self::HostDirectoriesBrowsed { .. })
+    }
+
+    pub fn requires_workspace_entry_create_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkspaceFileCreated { .. } | Self::WorkspaceDirectoryCreated { .. }
+        )
+    }
+
     pub fn requires_child_environment_profile_capability(&self) -> bool {
         match self {
             Self::Snapshot { snapshot, .. } => {
@@ -980,25 +1796,48 @@ impl C2NodeResponse {
                         event.event.requires_child_environment_profile_capability()
                     })
             }
-            Self::SpawnSpecAccepted { receipt } => receipt.environment_profile.is_some(),
+            Self::SpawnSpecAccepted { receipt }
+            | Self::Spawned { receipt, .. } => receipt.environment_profile.is_some(),
             Self::ManagedWorktreeSpawnAccepted { receipt } => {
                 receipt.spawn.environment_profile.is_some()
             }
             Self::SessionRecordUpdated { record }
+            | Self::ProviderSessionIndexed { record }
+            | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => {
                 record.environment_profile.is_some()
             }
-            Self::WorkspaceInspected { .. }
+            Self::Armed { .. }
+            | Self::Activated { .. }
+            | Self::Aborted { .. }
+            | Self::ReplyChunkAccepted { .. }
+            | Self::CallRejected { .. }
+            | Self::WorkspaceInspected { .. }
+            | Self::DeliveryStageBegun { .. }
+            | Self::DeliveryBlobChunkAccepted { .. }
+            | Self::DeliveryCommitted { .. }
+            | Self::DeliveryStageAborted { .. }
+            | Self::HostDirectoriesBrowsed { .. }
             | Self::WorkspaceFileRead { .. }
+            | Self::WorkspaceFileWritten { .. }
+            | Self::WorkspaceFileCreated { .. }
+            | Self::WorkspaceDirectoryCreated { .. }
+            | Self::GitHistoryRead { .. }
+            | Self::GitDiffRead { .. }
             | Self::Controller { .. }
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::NativeSessionsCataloged { .. }
+            | Self::NativeSessionsPaged { .. }
+            | Self::NativeSessionPreviewed { .. }
+            | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
+            | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
             | Self::WorktreeRemoved { .. }
@@ -1020,21 +1859,44 @@ impl C2NodeResponse {
                         event.event.requires_session_bundle_materialization_capability()
                     })
             }
-            Self::SpawnSpecAccepted { receipt } => receipt.bundle.is_some(),
+            Self::SpawnSpecAccepted { receipt }
+            | Self::Spawned { receipt, .. } => receipt.bundle.is_some(),
             Self::ManagedWorktreeSpawnAccepted { receipt } => receipt.spawn.bundle.is_some(),
             Self::SessionRecordUpdated { record }
+            | Self::ProviderSessionIndexed { record }
+            | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
-            Self::WorkspaceInspected { .. }
+            Self::Armed { .. }
+            | Self::Activated { .. }
+            | Self::Aborted { .. }
+            | Self::ReplyChunkAccepted { .. }
+            | Self::CallRejected { .. }
+            | Self::WorkspaceInspected { .. }
+            | Self::DeliveryStageBegun { .. }
+            | Self::DeliveryBlobChunkAccepted { .. }
+            | Self::DeliveryCommitted { .. }
+            | Self::DeliveryStageAborted { .. }
+            | Self::HostDirectoriesBrowsed { .. }
             | Self::WorkspaceFileRead { .. }
+            | Self::WorkspaceFileWritten { .. }
+            | Self::WorkspaceFileCreated { .. }
+            | Self::WorkspaceDirectoryCreated { .. }
+            | Self::GitHistoryRead { .. }
+            | Self::GitDiffRead { .. }
             | Self::Controller { .. }
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::NativeSessionsCataloged { .. }
+            | Self::NativeSessionsPaged { .. }
+            | Self::NativeSessionPreviewed { .. }
+            | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
+            | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
             | Self::WorktreeRemoved { .. }
@@ -1056,13 +1918,16 @@ impl C2NodeResponse {
                         event.event.requires_history_context_pack_capability()
                     })
             }
-            Self::SpawnSpecAccepted { receipt } => {
+            Self::SpawnSpecAccepted { receipt }
+            | Self::Spawned { receipt, .. } => {
                 receipt.context_id.is_some() || receipt.context.is_some()
             }
             Self::ManagedWorktreeSpawnAccepted { receipt } => {
                 receipt.spawn.context_id.is_some() || receipt.spawn.context.is_some()
             }
             Self::SessionRecordUpdated { record }
+            | Self::ProviderSessionIndexed { record }
+            | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => {
                 record.requires_history_context_pack_capability()
             }
@@ -1070,13 +1935,33 @@ impl C2NodeResponse {
             | Self::HistoryLoaded { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. } => true,
-            Self::WorkspaceInspected { .. }
+            Self::Armed { .. }
+            | Self::Activated { .. }
+            | Self::Aborted { .. }
+            | Self::ReplyChunkAccepted { .. }
+            | Self::CallRejected { .. }
+            | Self::WorkspaceInspected { .. }
+            | Self::DeliveryStageBegun { .. }
+            | Self::DeliveryBlobChunkAccepted { .. }
+            | Self::DeliveryCommitted { .. }
+            | Self::DeliveryStageAborted { .. }
+            | Self::HostDirectoriesBrowsed { .. }
             | Self::WorkspaceFileRead { .. }
+            | Self::WorkspaceFileWritten { .. }
+            | Self::WorkspaceFileCreated { .. }
+            | Self::WorkspaceDirectoryCreated { .. }
+            | Self::GitHistoryRead { .. }
+            | Self::GitDiffRead { .. }
             | Self::Controller { .. }
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::NativeSessionsCataloged { .. }
+            | Self::NativeSessionsPaged { .. }
+            | Self::NativeSessionPreviewed { .. }
+            | Self::SessionRecordPreviewed { .. }
             | Self::WorkspaceRegistered { .. }
+            | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
             | Self::WorktreeRemoved { .. }
@@ -1084,6 +1969,104 @@ impl C2NodeResponse {
             | Self::ShuttingDown => false,
         }
     }
+
+    pub fn requires_session_task_correlation_capability(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.requires_session_task_correlation_capability()
+            }
+            Self::Resync { snapshot, events, .. } => {
+                snapshot.requires_session_task_correlation_capability()
+                    || events.iter().any(|event| {
+                        event.event.requires_session_task_correlation_capability()
+                    })
+            }
+            Self::SessionRecordUpdated { record }
+            | Self::ProviderSessionIndexed { record }
+            | Self::NativeSessionIndexed { record, .. }
+            | Self::SessionRecordResumed { record, .. } => {
+                record.requires_session_task_correlation_capability()
+            }
+            _ => false,
+        }
+    }
+}
+
+fn deserialize_c2_native_session_catalog_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<NativeSessionCatalogEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let entries = Vec::<NativeSessionCatalogEntry>::deserialize(deserializer)?;
+    if entries.len() > usize::from(gate4agent_types::NATIVE_SESSION_CATALOG_LIMIT_MAX) {
+        return Err(serde::de::Error::custom(
+            "C2 native session catalog exceeds the supported bounded range",
+        ));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        entry.validate().map_err(serde::de::Error::custom)?;
+        if entries[..index]
+            .iter()
+            .any(|existing| {
+                existing.selection_id == entry.selection_id
+                    || entry.record_id.as_ref().is_some_and(|record_id| {
+                        existing.record_id.as_ref() == Some(record_id)
+                    })
+            })
+        {
+            return Err(serde::de::Error::custom(
+                "C2 native session catalog contains a duplicate selection or managed record",
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn deserialize_optional_c2_native_session_catalog_summary<'de, D>(
+    deserializer: D,
+) -> Result<Option<NativeSessionCatalogSummary>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let summary = Option::<NativeSessionCatalogSummary>::deserialize(deserializer)?;
+    if let Some(summary) = summary.as_ref() {
+        summary.validate().map_err(serde::de::Error::custom)?;
+    }
+    Ok(summary)
+}
+
+fn deserialize_c2_native_session_catalog_page<'de, D>(
+    deserializer: D,
+) -> Result<NativeSessionCatalogPage, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let page = NativeSessionCatalogPage::deserialize(deserializer)?;
+    page.validate().map_err(serde::de::Error::custom)?;
+    Ok(page)
+}
+
+fn deserialize_c2_native_session_preview<'de, D>(
+    deserializer: D,
+) -> Result<NativeSessionPreview, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let preview = NativeSessionPreview::deserialize(deserializer)?;
+    preview.validate().map_err(serde::de::Error::custom)?;
+    Ok(preview)
+}
+
+fn deserialize_c2_session_record_preview<'de, D>(
+    deserializer: D,
+) -> Result<SessionRecordPreview, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let preview = SessionRecordPreview::deserialize(deserializer)?;
+    preview.validate().map_err(serde::de::Error::custom)?;
+    Ok(preview)
 }
 
 fn deserialize_c2_history_candidates<'de, D>(
@@ -1123,6 +2106,7 @@ where
         cwd: None,
         model: None,
         message_count: 0,
+        completed_turn_count: None,
         total_tokens: 0,
         messages: Vec::new(),
     };
@@ -1254,10 +2238,35 @@ pub struct C2Hello {
     pub compatibility: Option<NegotiatedC2ControlCompatibility>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum C2RelayRoute {
+    #[default]
+    Unknown,
+    LocalIpc,
+    SshForwardedLoopback,
+}
+
+impl C2RelayRoute {
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    fn from_transport_label(transport_label: &str) -> Self {
+        match transport_label {
+            "windows-named-pipe" | "unix-domain-socket" => Self::LocalIpc,
+            "ssh-forwarded-loopback" => Self::SshForwardedLoopback,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2TopologyNode {
     pub node_id: NodeId,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "C2RelayRoute::is_unknown")]
+    pub relay_route: C2RelayRoute,
     pub transport: NodeTransportState,
     pub current_incarnation_id: Option<NodeIncarnationId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1266,6 +2275,8 @@ pub struct C2TopologyNode {
     pub provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
     #[serde(default, skip_serializing_if = "ProviderRuntimeStatuses::is_empty")]
     pub provider_runtime_statuses: ProviderRuntimeStatuses,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_support: Option<C2ObservationSupport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1294,6 +2305,24 @@ impl C2Topology {
         include_provider_contracts: bool,
         include_provider_runtime_status: bool,
     ) -> Self {
+        Self::from_status_with_projection(
+            status,
+            include_provider_contracts,
+            include_provider_runtime_status,
+            true,
+            true,
+            true,
+        )
+    }
+
+    pub fn from_status_with_projection(
+        status: &StatusResponse,
+        include_provider_contracts: bool,
+        include_provider_runtime_status: bool,
+        include_observation_events: bool,
+        include_observation_managed_target: bool,
+        include_observation_workflow_detail: bool,
+    ) -> Self {
         let nodes = status.nodes.iter().take(MAX_C2_NODES).map(|(node_id, observed)| {
             let provider_contract_inventory = include_provider_contracts
                 .then_some(observed.inventory.as_ref())
@@ -1310,6 +2339,7 @@ impl C2Topology {
             C2TopologyNode {
                 node_id: node_id.clone(),
                 endpoint: observed.endpoint.clone(),
+                relay_route: C2RelayRoute::from_transport_label(&observed.transport_label),
                 transport: observed.transport,
                 current_incarnation_id: observed.cursor.map(|cursor| cursor.incarnation_id),
                 provider_contracts: provider_contract_inventory
@@ -1319,6 +2349,13 @@ impl C2Topology {
                     .map(|inventory| inventory.provider_adapter_contracts.clone())
                     .unwrap_or_default(),
                 provider_runtime_statuses,
+                observation_support: observed.observation_support.and_then(|support| {
+                    support.projected_for_downstream(
+                        include_observation_events,
+                        include_observation_managed_target,
+                        include_observation_workflow_detail,
+                    )
+                }),
             }
         }).collect();
         Self { nodes }
@@ -1597,6 +2634,10 @@ pub struct SlimWorkspace {
     pub sessions: Vec<SlimSession>,
     pub session_count: usize,
     pub sessions_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_service_mode: Option<WorktreeServiceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree_profiles: Option<WorktreeProfileInventory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1644,6 +2685,8 @@ pub struct SlimNodeInventory {
     pub managed_worktree_count: usize,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub managed_worktrees_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_inventory: Option<LaunchInventory>,
 }
 
 fn usize_is_zero(value: &usize) -> bool { *value == 0 }
@@ -1687,6 +2730,8 @@ impl SlimNodeInventory {
                 sessions: slim_sessions,
                 session_count: workspace.sessions.len(),
                 sessions_truncated: workspace.sessions.len() > take,
+                worktree_service_mode: workspace.worktree_service_mode,
+                managed_worktree_profiles: workspace.managed_worktree_profiles.clone(),
             });
         }
         let included_session_count = workspaces
@@ -1723,6 +2768,7 @@ impl SlimNodeInventory {
                 managed_worktrees.len() < managed_worktree_count,
             managed_worktrees,
             managed_worktree_count,
+            launch_inventory: snapshot.launch_inventory.clone(),
         }
     }
 
@@ -1762,6 +2808,8 @@ impl SlimNodeInventory {
                 sessions: slim_sessions,
                 session_count: workspace.sessions.len(),
                 sessions_truncated: workspace.sessions.len() > take,
+                worktree_service_mode: workspace.worktree_service_mode,
+                managed_worktree_profiles: workspace.managed_worktree_profiles.clone(),
             });
         }
         let included_session_count = workspaces.values()
@@ -1796,6 +2844,7 @@ impl SlimNodeInventory {
                 managed_worktrees.len() < managed_worktree_count,
             managed_worktrees,
             managed_worktree_count,
+            launch_inventory: snapshot.launch_inventory.clone(),
         }
     }
 }
@@ -1881,6 +2930,8 @@ pub struct ObservedNode {
     pub last_error: Option<SanitizedError>,
     pub gaps: Vec<NodeGap>,
     pub gaps_truncated: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_support: Option<C2ObservationSupport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1921,10 +2972,73 @@ mod tests {
     use gate4agent_types::{
         AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId, AgentInstanceId,
         CapabilitySnapshot, ControlEvent, ControlEventKind, ForegroundSnapshot, HistorySnapshot,
-        OperationId, PreparedInputKind, ProviderEvent, ProviderSessionIdentity,
-        ProviderSessionKey, ProviderSnapshot, ProviderSource, ResumeSessionSummary, ResumeSnapshot,
-        SessionGeneration, SessionSnapshot, SessionStatus, TerminalSize, TransportKind,
+        OperationId, PreparedInputKind, ProviderEvent, ProviderInteractionOutcome,
+        ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
+        ResumeSessionSummary, ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
+        TerminalSize, TransportKind,
     };
+
+    #[test]
+    fn c2_harness_mcp_projection_is_value_exact_and_sanitized() {
+        let reservation_id = HarnessMcpReservationId::new(format!(
+            "hmcpres_{}", "a".repeat(24),
+        )).unwrap();
+        let activation_digest = HarnessMcpActivationDigest::new(format!(
+            "sha256:{}", "b".repeat(64),
+        )).unwrap();
+        let call_id = HarnessMcpCallId::new(format!("hmcpcall_{}", "c".repeat(24))).unwrap();
+        let session = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(1),
+            },
+        };
+        let source = NodeEvent::HarnessMcpReadCall {
+            reservation_id: reservation_id.clone(),
+            activation_digest: activation_digest.clone(),
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            session: session.clone(),
+            call_id: call_id.clone(),
+            request: HarnessReadRequestV1::ContextGet,
+            deadline_unix_ms: 4_000,
+        };
+        let projected = C2NodeEvent::from(&source);
+        assert!(projected.requires_harness_mcp_proxy_capability());
+        assert!(projected.harness_mcp_contract_is_valid_at(1_000));
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("g4ah3_"));
+        assert!(!json.contains("endpoint"));
+        assert!(!json.contains("path"));
+        assert_eq!(serde_json::from_str::<C2NodeEvent>(&json).unwrap(), projected);
+
+        let response = NodeResponse::ReplyChunkAccepted {
+            reservation_id,
+            activation_digest,
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            session,
+            call_id,
+            next_offset: 2,
+            completed: true,
+        };
+        let projected_response = C2NodeResponse::from(&response);
+        assert!(projected_response.requires_harness_mcp_proxy_capability());
+        assert_eq!(
+            serde_json::from_value::<C2NodeResponse>(
+                serde_json::to_value(&projected_response).unwrap(),
+            ).unwrap(),
+            projected_response,
+        );
+
+        let failure = C2NodeFailure::from(&NodeFailure {
+            code: NodeFailureCode::ChunkOutOfOrder,
+            message: "secret raw detail".to_owned(),
+        });
+        assert_eq!(failure.message, "harness MCP reply chunk out of order");
+        assert!(!failure.message.contains("secret"));
+        assert!(failure.requires_harness_mcp_proxy_capability());
+        assert_eq!(C2_HARNESS_MCP_READ_PROXY_CAPABILITY, "harness-mcp-read-proxy-v1");
+    }
 
     fn host_path(value: impl Into<String>) -> OpaqueHostPath {
         OpaqueHostPath::utf8(value.into()).unwrap()
@@ -1960,6 +3074,105 @@ mod tests {
         }
     }
 
+    fn fixture_agent_progress() -> SessionAgentProgress {
+        SessionAgentProgress {
+            address: SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: gate4agent_node_protocol::SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(2),
+                },
+            },
+            progress: AgentProgressV1 {
+                provider_sequence: 19,
+                activity: ProviderActivity::Working,
+                completed_turns: 3,
+                usage: Some(AgentProgressUsageV1 {
+                    input_tokens: 101,
+                    output_tokens: 37,
+                    cache_read_tokens: 11,
+                    cache_write_tokens: 5,
+                    reasoning_tokens: 13,
+                }),
+                current: AgentProgressCurrentV1::Working,
+                active_tool_labels: vec!["shell".to_owned()],
+                active_tool_count: 1,
+                attention: None,
+                subagent_count: 2,
+                last_event_kind: Some(AgentProgressEventKindV1::ToolStarted),
+                gap_count: 0,
+                stale: false,
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn c2_agent_progress_snapshot_roundtrip_is_exact_and_private() {
+        assert_eq!(
+            C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+            "agent-progress-snapshot-v1",
+        );
+        assert_eq!(
+            C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+            gate4agent_node_protocol::NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+        );
+        let progress = fixture_agent_progress();
+        let snapshot = C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            agent_progress: vec![progress.clone()],
+            managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            observation_support: None,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let decoded = serde_json::from_str::<C2NodeSnapshot>(&json).unwrap();
+        assert_eq!(decoded.agent_progress, vec![progress]);
+        for forbidden in [
+            "prompt", "arguments", "contents", "transcript", "provider_session",
+            "canonical_root", "executable",
+        ] {
+            assert!(!json.contains(forbidden), "agent progress leaked {forbidden}");
+        }
+
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value["agent_progress"][0]["progress"]["prompt"] =
+            serde_json::json!("private prompt");
+        assert!(serde_json::from_value::<C2NodeSnapshot>(value).is_err());
+
+        let empty = serde_json::json!({
+            "node_id": "node-a",
+            "enabled_providers": [],
+            "workspaces": [],
+            "session_records": [],
+            "managed_worktrees": [],
+            "launch_inventory": null
+        });
+        let empty = serde_json::from_value::<C2NodeSnapshot>(empty).unwrap();
+        assert!(empty.agent_progress.is_empty());
+        assert!(serde_json::to_value(empty).unwrap().get("agent_progress").is_none());
+    }
+
+    #[test]
+    fn c2_workspace_event_does_not_synthesize_agent_progress() {
+        let event = C2NodeEvent::from(&NodeEvent::WorkspaceAdded {
+            workspace: WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                canonical_root: host_path(r"C:\private\workspace"),
+                sessions: vec![fixture_session()],
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
+            },
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("agent_progress"));
+        assert!(!json.contains("provider_sequence"));
+    }
+
     fn private_session_record() -> ManagedSessionRecord {
         ManagedSessionRecord {
             record_id: SessionRecordId::new("session-private").unwrap(),
@@ -1991,6 +3204,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            task_binding: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
             last_error: Some("private-error-with-secret-token".to_owned()),
@@ -2027,6 +3241,28 @@ mod tests {
         assert!(!json.contains("transcript-secret.jsonl"));
         assert!(!json.contains("last_error"));
         assert!(!json.contains("private-error-with-secret-token"));
+    }
+
+    #[test]
+    fn c2_task_binding_projection_is_exact_safe_and_legacy_slim_omits_it() {
+        let mut source = private_session_record();
+        source.task_binding = Some(SessionTaskBindingV1 {
+            revision: 3,
+            task_id: Some(TaskId::from_nonce([3; 12])),
+            changed_at_unix_ms: 15,
+        });
+        let projected = C2ManagedSessionRecord::from(&source);
+        assert_eq!(projected.task_binding, source.task_binding);
+        assert!(projected.task_binding_is_valid());
+        let slim = serde_json::to_value(SlimManagedSessionRecord::from(&projected)).unwrap();
+        assert!(slim.get("task_binding").is_none());
+
+        source.task_binding.as_mut().unwrap().changed_at_unix_ms = 21;
+        assert!(C2ManagedSessionRecord::from(&source).task_binding.is_none());
+
+        let mut invalid = serde_json::to_value(projected).unwrap();
+        invalid["task_binding"]["changed_at_unix_ms"] = serde_json::json!(9);
+        assert!(serde_json::from_value::<C2ManagedSessionRecord>(invalid).is_err());
     }
 
     fn routed_response(response: NodeResponse) -> RoutedNodeResponse {
@@ -2218,6 +3454,171 @@ mod tests {
     }
 
     #[test]
+    fn c2_observation_projection_roundtrips_exactly() {
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(3),
+            },
+        };
+        let observation = ObservationV1 {
+            source_sequence: 11,
+            observed_at_unix_ms: Some(17),
+            evidence: ObservationEvidenceV1::StructuredProvider,
+            kind: ObservationKindV1::ToolCompleted {
+                correlation_id: "tool-0123456789abcdef".to_owned(),
+                class: "shell".to_owned(),
+                success: true,
+                duration_ms: Some(23),
+            },
+            truncated: false,
+        };
+        let source = NodeEvent::Observation {
+            address: address.clone(),
+            observation: observation.clone(),
+        };
+
+        let projected = C2NodeEvent::from(&source);
+        assert_eq!(
+            projected,
+            C2NodeEvent::Observation {
+                address,
+                observation,
+            },
+        );
+        let encoded = serde_json::to_vec(&projected).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<C2NodeEvent>(&encoded).unwrap(),
+            projected,
+        );
+        assert!(projected.requires_observation_events_capability());
+    }
+
+    #[test]
+    fn managed_observation_direct_c2_projection_is_exact() {
+        let observation = ObservationV1 {
+            source_sequence: 13,
+            observed_at_unix_ms: Some(19),
+            evidence: ObservationEvidenceV1::ManagedHook,
+            kind: ObservationKindV1::Working,
+            truncated: false,
+        };
+        let source = NodeEvent::ManagedObservation {
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            observation: observation.clone(),
+        };
+        let projected = C2NodeEvent::from(&source);
+        assert_eq!(
+            projected,
+            C2NodeEvent::ManagedObservation {
+                record_id: SessionRecordId::new("record-a").unwrap(),
+                observation,
+            },
+        );
+        assert!(projected.requires_observation_events_capability());
+        assert!(projected.requires_observation_managed_target_capability());
+        let encoded = serde_json::to_vec(&projected).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<C2NodeEvent>(&encoded).unwrap(),
+            projected,
+        );
+    }
+
+    #[test]
+    fn c2_observation_support_derives_exact_node_capabilities_and_preserves_invariant() {
+        let events = CapabilityId::new(NODE_OBSERVATION_EVENTS_CAPABILITY).unwrap();
+        let managed = CapabilityId::new(NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY).unwrap();
+        let detail = CapabilityId::new(NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY).unwrap();
+
+        assert_eq!(
+            C2ObservationSupport::from_node_capabilities(&[]),
+            C2ObservationSupport::default(),
+        );
+        assert_eq!(
+            C2ObservationSupport::from_node_capabilities(std::slice::from_ref(&events)),
+            C2ObservationSupport {
+                events: true,
+                managed_target: false,
+                workflow_detail: false,
+            },
+        );
+        assert_eq!(
+            C2ObservationSupport::from_node_capabilities(std::slice::from_ref(&managed)),
+            C2ObservationSupport::default(),
+        );
+        assert_eq!(
+            C2ObservationSupport::from_node_capabilities(std::slice::from_ref(&detail)),
+            C2ObservationSupport::default(),
+        );
+        let full = C2ObservationSupport::from_node_capabilities(&[events, managed, detail]);
+        assert_eq!(full, C2ObservationSupport {
+            events: true,
+            managed_target: true,
+            workflow_detail: true,
+        });
+        assert!(full.is_valid());
+        assert!(!C2ObservationSupport {
+            events: false,
+            managed_target: true,
+            workflow_detail: false,
+        }.is_valid());
+        assert!(!C2ObservationSupport {
+            events: false,
+            managed_target: false,
+            workflow_detail: true,
+        }.is_valid());
+    }
+
+    #[test]
+    fn c2_observation_support_optional_wire_shape_is_absent_or_roundtrips_exactly() {
+        let snapshot = C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            agent_progress: Vec::new(),
+            managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            observation_support: None,
+        };
+        let legacy = serde_json::to_value(&snapshot).unwrap();
+        assert!(legacy.get("observation_support").is_none());
+        assert_eq!(
+            serde_json::from_value::<C2NodeSnapshot>(legacy)
+                .unwrap()
+                .observation_support,
+            None,
+        );
+
+        let legacy_support: C2ObservationSupport = serde_json::from_value(serde_json::json!({
+            "events": true,
+            "workflow_detail": true
+        })).unwrap();
+        assert_eq!(legacy_support, C2ObservationSupport {
+            events: true,
+            managed_target: false,
+            workflow_detail: true,
+        });
+
+        let support = C2ObservationSupport {
+            events: true,
+            managed_target: true,
+            workflow_detail: true,
+        };
+        let mut supported = snapshot;
+        supported.observation_support = Some(support);
+        let encoded = serde_json::to_vec(&supported).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<C2NodeSnapshot>(&encoded)
+                .unwrap()
+                .observation_support,
+            Some(support),
+        );
+    }
+
+    #[test]
     fn c2_terminal_frame_events_capability_is_optional_and_auth_bound_exactly() {
         assert_eq!(
             C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -2338,6 +3739,53 @@ mod tests {
         assert_ne!(bound, without_spawn_spec);
         assert!(bound.windows(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.len()).any(
             |window| window == C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn c2_spawn_profile_revision_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(
+            C2_SPAWN_PROFILE_REVISION_CAPABILITY,
+            "spawn-spec.profile-revision-v1",
+        );
+        assert_eq!(
+            C2_SPAWN_PROFILE_REVISION_CAPABILITY,
+            NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
+        );
+        let capability =
+            CapabilityId::new(C2_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer.clone(),
+            ))
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
+        let bound = c2_bound_auth_transcript(
+            C2AuthDirection::Server,
+            &[0x11; C2_AUTH_NONCE_BYTES],
+            &[0x22; C2_AUTH_NONCE_BYTES],
+            &offer,
+            &selected,
+        )
+        .unwrap();
+        assert!(bound.windows(C2_SPAWN_PROFILE_REVISION_CAPABILITY.len()).any(
+            |window| window == C2_SPAWN_PROFILE_REVISION_CAPABILITY.as_bytes()
         ));
     }
 
@@ -2682,6 +4130,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: vec![source.clone()],
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         assert!(snapshot.requires_history_context_pack_capability());
         let event = C2NodeEvent::from(&NodeEvent::SessionRecordUpserted {
@@ -2728,6 +4178,7 @@ mod tests {
             session,
             session_id: "session-loaded-7".to_owned(),
             message_count: 12,
+            completed_turn_count: Some(5),
         });
         let forgotten = C2NodeResponse::from(&NodeResponse::ContextPackForgotten {
             context_id: SpawnContextId::new("context-review-7").unwrap(),
@@ -2738,8 +4189,18 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&loaded).unwrap(),
-            r#"{"kind":"history-loaded","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"session_id":"session-loaded-7","message_count":12}"#,
+            r#"{"kind":"history-loaded","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"session_id":"session-loaded-7","message_count":12,"completed_turn_count":5}"#,
         );
+        let legacy_loaded_json = r#"{"kind":"history-loaded","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"session_id":"session-loaded-7","message_count":12}"#;
+        let legacy_loaded = serde_json::from_str::<C2NodeResponse>(legacy_loaded_json).unwrap();
+        assert_eq!(serde_json::to_string(&legacy_loaded).unwrap(), legacy_loaded_json);
+        assert!(matches!(
+            legacy_loaded,
+            C2NodeResponse::HistoryLoaded {
+                completed_turn_count: None,
+                ..
+            }
+        ));
         assert_eq!(
             serde_json::to_string(&forgotten).unwrap(),
             r#"{"kind":"context-pack-forgotten","context_id":"context-review-7"}"#,
@@ -2755,6 +4216,99 @@ mod tests {
             r#"{"kind":"history-discovered","session":{"workspace_id":"primary","session":{"instance_id":41,"generation":3}},"candidates":[{"id":"duplicate","session_id_hint":"one","modified_at_unix_ms":null},{"id":"duplicate","session_id_hint":"two","modified_at_unix_ms":null}]}"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn native_session_catalog_projection_is_exact_and_capability_bound() {
+        assert_eq!(
+            C2_NATIVE_SESSION_CATALOG_CAPABILITY,
+            "native-session-catalog-v2"
+        );
+        let route = NativeSessionCatalogRoute::workspace(
+            WorkspaceId::new("primary").unwrap(),
+            provider("codex"),
+        );
+        let projected = C2NodeResponse::from(&NodeResponse::NativeSessionsCataloged {
+            route: route.clone(),
+            entries: vec![NativeSessionCatalogEntry {
+                selection_id: "hist_selection_7".to_owned(),
+                title: Some("Review".to_owned()),
+                modified_at_unix_ms: Some(77),
+                model: Some("model-7".to_owned()),
+                message_count: 8,
+                completed_turn_count: Some(4),
+                external_group: None,
+                record_id: Some(SessionRecordId::new("record-7").unwrap()),
+            }],
+            summary: Some(NativeSessionCatalogSummary {
+                catalog_revision: 7,
+                recent_cutoff_unix_ms: 70,
+                recent_total_count: 1,
+                older_total_count: 3,
+                recent_next_after_selection_id: None,
+                recent_has_more: false,
+            }),
+        });
+        assert!(projected.requires_native_session_catalog_capability());
+        let json = serde_json::to_string(&projected).unwrap();
+        for forbidden in [
+            "session_id",
+            "cwd",
+            "candidate",
+            "path",
+            "messages",
+            "tokens",
+            "documents",
+            "raw",
+        ] {
+            assert!(!json.contains(forbidden));
+        }
+        assert_eq!(serde_json::from_str::<C2NodeResponse>(&json).unwrap(), projected);
+        assert!(serde_json::from_str::<C2NodeResponse>(
+            r#"{"kind":"native-sessions-cataloged","workspace_id":"primary","provider":"codex","entries":[]}"#,
+        )
+        .is_err());
+
+        let paged = C2NodeResponse::from(&NodeResponse::NativeSessionsPaged {
+            route,
+            page: NativeSessionCatalogPage {
+                window: NativeSessionCatalogWindow::Older,
+                revision: 7,
+                entries: Vec::new(),
+                next_after_selection_id: None,
+                remaining_count: 0,
+                has_more: false,
+            },
+        });
+        assert!(paged.requires_native_session_catalog_paging_capability());
+    }
+
+    #[test]
+    fn session_record_preview_projection_does_not_expose_native_identity() {
+        let response = NodeResponse::SessionRecordPreviewed {
+            record_id: SessionRecordId::new("record-7").unwrap(),
+            preview: gate4agent_types::SessionRecordPreview {
+                title: Some("Review".to_owned()),
+                modified_at_unix_ms: Some(77),
+                model: Some("model-7".to_owned()),
+                message_count: 3,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: true,
+                messages: vec![gate4agent_types::NativeSessionPreviewMessage {
+                    role: gate4agent_types::HistoryMessageRole::User,
+                    text: "visible dialogue".to_owned(),
+                }],
+            },
+        };
+        let projected = C2NodeResponse::from(&response);
+        assert!(projected.requires_native_session_preview_capability());
+        let json = serde_json::to_string(&projected).unwrap();
+        for forbidden in ["session_id", "provider", "workspace_id", "cwd", "path", "tokens"] {
+            assert!(!json.contains(forbidden));
+        }
+        assert_eq!(serde_json::from_str::<C2NodeResponse>(&json).unwrap(), projected);
     }
 
     #[test]
@@ -2918,9 +4472,13 @@ mod tests {
                 workspace_id: WorkspaceId::new("repo").unwrap(),
                 canonical_root: host_path("/srv/CaseSensitive/../literal-root"),
                 sessions: Vec::new(),
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
             }],
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         let json = serde_json::to_string(&(projected, negotiated)).unwrap();
         let (projected, negotiated) = serde_json::from_str::<(
@@ -2952,6 +4510,7 @@ mod tests {
                 status: Vec::new(),
                 recent_commits: Vec::new(),
                 worktrees: Vec::new(),
+                managed_worktree: None,
                 truncated: false,
                 diagnostic_present: false,
             },
@@ -2988,6 +4547,7 @@ mod tests {
                 }],
                 recent_commits: Vec::new(),
                 worktrees: Vec::new(),
+                managed_worktree: None,
                 truncated: false,
                 diagnostic_present: false,
             },
@@ -3001,21 +4561,78 @@ mod tests {
     }
 
     #[test]
+    fn c2_workspace_inspection_projects_and_validates_managed_git_scope_without_paths() {
+        let workspace_id = WorkspaceId::new("managed-a").unwrap();
+        let source_workspace_id = WorkspaceId::new("primary").unwrap();
+        let inspection = WorkspaceInspection {
+            workspace_id: workspace_id.clone(),
+            entries: Vec::new(),
+            tree_truncated: false,
+            git: GitSnapshot {
+                is_repository: true,
+                branch: Some("gate4agent/a".to_owned()),
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                worktrees: Vec::new(),
+                managed_worktree: Some(ManagedWorktreeGitScope {
+                    lease_id: ManagedWorktreeLeaseId::new("mw-a").unwrap(),
+                    source_workspace_id: source_workspace_id.clone(),
+                    branch: "gate4agent/a".to_owned(),
+                    base_commit: gate4agent_node_protocol::GitObjectId::new(
+                        "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                    )
+                    .unwrap(),
+                    active_session_count: 1,
+                    managed_record_count: 1,
+                }),
+                truncated: false,
+                diagnostic: None,
+            },
+        };
+        let projected = C2WorkspaceInspection::from(&inspection);
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(json.contains("\"managed_worktree\""));
+        assert!(json.contains("\"lease_id\":\"mw-a\""));
+        assert!(!json.contains("target_root"));
+        assert_eq!(
+            serde_json::from_str::<C2WorkspaceInspection>(&json).unwrap(),
+            projected,
+        );
+
+        let invalid = json.replace(
+            "\"source_workspace_id\":\"primary\"",
+            "\"source_workspace_id\":\"managed-a\"",
+        );
+        assert!(serde_json::from_str::<C2WorkspaceInspection>(&invalid).is_err());
+
+        let mut invalid_node = inspection;
+        invalid_node.git.branch = Some("gate4agent/b".to_owned());
+        assert!(C2WorkspaceInspection::from(&invalid_node)
+            .git
+            .managed_worktree
+            .is_none());
+    }
+
+    #[test]
     fn slim_inventory_is_deterministic_and_excludes_terminal_history() {
         let snapshot = NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
             enabled_providers: vec![provider("codex"), provider("claude"), provider("codex")],
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: vec![
-                WorkspaceSnapshot { workspace_id: WorkspaceId::new("z-work").unwrap(), canonical_root: host_path("z"), sessions: Vec::new() },
+                WorkspaceSnapshot { workspace_id: WorkspaceId::new("z-work").unwrap(), canonical_root: host_path("z"), sessions: Vec::new(), worktree_service_mode: None, managed_worktree_profiles: None },
                 WorkspaceSnapshot {
                     workspace_id: WorkspaceId::new("a-work").unwrap(),
                     canonical_root: host_path("a"),
                     sessions: vec![fixture_session()],
+                    worktree_service_mode: None,
+                    managed_worktree_profiles: None,
                 },
             ],
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         };
         let slim = SlimNodeInventory::from_snapshot(&snapshot);
         assert_eq!(slim.enabled_providers, vec![provider("claude"), provider("codex")]);
@@ -3032,6 +4649,87 @@ mod tests {
     }
 
     #[test]
+    fn c2_full_and_slim_snapshots_preserve_launch_and_worktree_inventory() {
+        let worktree_profiles = WorktreeProfileInventory {
+            profiles: vec![ManagedWorktreeProfileSummary {
+                id: WorktreeProfileId::new("review").unwrap(),
+                revision: WorktreeProfileRevision::new("v1").unwrap(),
+                retention: ManagedWorktreeRetention::Retain,
+            }],
+        };
+        let launch_inventory = LaunchInventory {
+            spawn_profiles: Some(vec![SpawnProfileSummary {
+                id: SpawnProfileId::new("default").unwrap(),
+                revision: SpawnProfileRevision::new("v1").unwrap(),
+            }]),
+            bundles: Some(vec![ResolvedBundleReceipt {
+                id: SpawnBundleId::new("review").unwrap(),
+                revision: SpawnBundleRevision::new("v1").unwrap(),
+                digest: SpawnBundleDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap(),
+            }]),
+        };
+        let snapshot = NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: vec![WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                canonical_root: host_path("repo"),
+                sessions: Vec::new(),
+                worktree_service_mode: Some(WorktreeServiceMode::Managed),
+                managed_worktree_profiles: Some(worktree_profiles.clone()),
+            }],
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            launch_inventory: Some(launch_inventory.clone()),
+            agent_progress: Vec::new(),
+        };
+
+        let full = C2NodeSnapshot::from(&snapshot);
+        let slim_from_node = SlimNodeInventory::from_snapshot(&snapshot);
+        let slim_from_c2 = SlimNodeInventory::from_c2_snapshot(&full);
+        assert_eq!(full.launch_inventory.as_ref(), Some(&launch_inventory));
+        assert_eq!(slim_from_node.launch_inventory.as_ref(), Some(&launch_inventory));
+        assert_eq!(slim_from_c2.launch_inventory.as_ref(), Some(&launch_inventory));
+        assert_eq!(
+            full.workspaces[0].worktree_service_mode,
+            Some(WorktreeServiceMode::Managed),
+        );
+        assert_eq!(
+            slim_from_node.workspaces[&WorkspaceId::new("repo").unwrap()]
+                .worktree_service_mode,
+            Some(WorktreeServiceMode::Managed),
+        );
+        assert_eq!(
+            slim_from_c2.workspaces[&WorkspaceId::new("repo").unwrap()]
+                .worktree_service_mode,
+            Some(WorktreeServiceMode::Managed),
+        );
+        assert_eq!(
+            full.workspaces[0].managed_worktree_profiles.as_ref(),
+            Some(&worktree_profiles),
+        );
+        assert_eq!(
+            slim_from_node.workspaces[&WorkspaceId::new("repo").unwrap()]
+                .managed_worktree_profiles
+                .as_ref(),
+            Some(&worktree_profiles),
+        );
+
+        let legacy = serde_json::from_value::<C2WorkspaceSnapshot>(serde_json::json!({
+            "workspace_id": "legacy",
+            "canonical_root": "legacy-root",
+            "sessions": [],
+        }))
+        .unwrap();
+        assert_eq!(legacy.worktree_service_mode, None);
+        assert_eq!(legacy.managed_worktree_profiles, None);
+        let encoded = serde_json::to_value(legacy).unwrap();
+        assert!(encoded.get("worktree_service_mode").is_none());
+        assert!(encoded.get("managed_worktree_profiles").is_none());
+    }
+
+    #[test]
     fn slim_inventory_provider_contract_projection_is_exact_and_private() {
         let mut slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
@@ -3040,6 +4738,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         let (provider_contracts, provider_adapter_contracts) =
             provider_contract_manifest();
@@ -3092,6 +4792,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         };
         let projected = C2NodeSnapshot::from(&snapshot);
         let inventory = SlimNodeInventory::from_snapshot(&snapshot);
@@ -3118,12 +4820,16 @@ mod tests {
                 workspace_id: WorkspaceId::new(format!("work-{index:02}")).unwrap(),
                 canonical_root: host_path(format!("root-{index:02}")),
                 sessions: Vec::new(),
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
             })
             .collect::<Vec<_>>();
         workspaces.push(WorkspaceSnapshot {
             workspace_id: WorkspaceId::new("work-zz").unwrap(),
             canonical_root: host_path("hidden-root"),
             sessions: vec![fixture_session()],
+            worktree_service_mode: None,
+            managed_worktree_profiles: None,
         });
         let slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
@@ -3132,6 +4838,8 @@ mod tests {
             workspaces,
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         assert!(slim.workspaces_truncated);
         assert_eq!(slim.session_count, 1);
@@ -3141,7 +4849,7 @@ mod tests {
     #[test]
     fn control_auth_transcript_is_direction_and_protocol_domain_separated() {
         assert_eq!(C2_API_VERSION, 2);
-        assert_eq!(C2_CONTROL_PROTOCOL_VERSION, 2);
+        assert_eq!(C2_CONTROL_PROTOCOL_VERSION, 4);
         let client_nonce = [3; C2_AUTH_NONCE_BYTES];
         let server_nonce = [7; C2_AUTH_NONCE_BYTES];
         let server = c2_auth_transcript(C2AuthDirection::Server, &client_nonce, &server_nonce);
@@ -3171,6 +4879,7 @@ mod tests {
                 last_error: None,
                 gaps: Vec::new(),
                 gaps_truncated: 0,
+                observation_support: None,
             };
             (node_id, observed)
         }).collect();
@@ -3196,6 +4905,21 @@ mod tests {
     }
 
     #[test]
+    fn topology_node_without_relay_route_decodes_as_unknown() {
+        let legacy = r#"{
+            "node_id":"node-a",
+            "endpoint":"legacy-endpoint",
+            "transport":"offline",
+            "current_incarnation_id":null
+        }"#;
+
+        let decoded: C2TopologyNode = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(decoded.relay_route, C2RelayRoute::Unknown);
+        assert!(!serde_json::to_string(&decoded).unwrap().contains("relay_route"));
+    }
+
+    #[test]
     fn topology_provider_contract_projection_is_capability_gated_and_change_sensitive() {
         let (provider_contracts, provider_adapter_contracts) =
             provider_contract_manifest();
@@ -3206,6 +4930,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         inventory.provider_contracts = provider_contracts;
         inventory.provider_adapter_contracts = provider_adapter_contracts;
@@ -3231,6 +4957,7 @@ mod tests {
                     last_error: None,
                     gaps: Vec::new(),
                     gaps_truncated: 0,
+                    observation_support: None,
                 },
             )]),
         };
@@ -3245,6 +4972,7 @@ mod tests {
         struct LegacyTopologyNode<'a> {
             node_id: &'a NodeId,
             endpoint: &'a str,
+            relay_route: C2RelayRoute,
             transport: NodeTransportState,
             current_incarnation_id: Option<NodeIncarnationId>,
         }
@@ -3256,6 +4984,7 @@ mod tests {
             nodes: legacy.nodes.iter().map(|node| LegacyTopologyNode {
                 node_id: &node.node_id,
                 endpoint: &node.endpoint,
+                relay_route: node.relay_route,
                 transport: node.transport,
                 current_incarnation_id: node.current_incarnation_id,
             }).collect(),
@@ -3281,6 +5010,15 @@ mod tests {
     fn routed_durable_session_responses_round_trip_without_private_record_fields() {
         let record = private_session_record();
         let session = record.active_session.clone().unwrap();
+        let native_selection = NativeSessionSelection {
+            route: NativeSessionCatalogRoute::workspace(
+                record.workspace_id.clone(),
+                record.provider.clone(),
+            ),
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 70,
+            selection_id: "selection-private".to_owned(),
+        };
         let responses = vec![
             NodeResponse::Snapshot {
                 event_sequence: 4,
@@ -3292,7 +5030,14 @@ mod tests {
                     workspaces: Vec::new(),
                     session_records: vec![record.clone()],
                     managed_worktrees: Vec::new(),
+                    launch_inventory: None,
+                    agent_progress: Vec::new(),
                 },
+            },
+            NodeResponse::ProviderSessionIndexed { record: record.clone() },
+            NodeResponse::NativeSessionIndexed {
+                selection: native_selection.clone(),
+                record: record.clone(),
             },
             NodeResponse::SessionRecordUpdated { record: record.clone() },
             NodeResponse::SessionRecordResumed {
@@ -3301,6 +5046,7 @@ mod tests {
             },
             NodeResponse::Resync {
                 event_sequence: 5,
+                oldest_available_sequence: 1,
                 snapshot: NodeSnapshot {
                     node_id: NodeId::new("node-a").unwrap(),
                     enabled_providers: vec![provider("codex")],
@@ -3308,6 +5054,8 @@ mod tests {
                     workspaces: Vec::new(),
                     session_records: vec![record.clone()],
                     managed_worktrees: Vec::new(),
+                    launch_inventory: None,
+                    agent_progress: Vec::new(),
                 },
                 events: vec![gate4agent_node_protocol::NodeEventEnvelope {
                     sequence: 5,
@@ -3327,7 +5075,9 @@ mod tests {
             let decoded = serde_json::from_str::<RoutedNodeResponse>(&json).unwrap();
             let decoded_record = match decoded.response.unwrap() {
                 C2NodeResponse::Snapshot { snapshot, .. } => snapshot.session_records.into_iter().next().unwrap(),
-                C2NodeResponse::SessionRecordUpdated { record }
+                C2NodeResponse::ProviderSessionIndexed { record }
+                | C2NodeResponse::NativeSessionIndexed { record, .. }
+                | C2NodeResponse::SessionRecordUpdated { record }
                 | C2NodeResponse::SessionRecordResumed { record, .. } => record,
                 C2NodeResponse::Resync { snapshot, events, .. } => {
                     assert!(matches!(events.into_iter().next().unwrap().event,
@@ -3342,6 +5092,39 @@ mod tests {
             assert_eq!(decoded_record.active_session.as_ref(), Some(&session));
             assert!(decoded_record.provider_identity_present);
         }
+    }
+
+    #[test]
+    fn c2_resync_projection_preserves_authoritative_replay_floor() {
+        let source = NodeResponse::Resync {
+            event_sequence: 12,
+            oldest_available_sequence: 9,
+            snapshot: NodeSnapshot {
+                node_id: NodeId::new("node-a").unwrap(),
+                enabled_providers: Vec::new(),
+                provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+                workspaces: Vec::new(),
+                session_records: Vec::new(),
+                managed_worktrees: Vec::new(),
+                launch_inventory: None,
+                agent_progress: Vec::new(),
+            },
+            events: Vec::new(),
+        };
+        let projected = C2NodeResponse::from(&source);
+        assert!(matches!(
+            projected,
+            C2NodeResponse::Resync {
+                event_sequence: 12,
+                oldest_available_sequence: 9,
+                ..
+            }
+        ));
+        let encoded = serde_json::to_vec(&projected).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<C2NodeResponse>(&encoded).unwrap(),
+            projected,
+        );
     }
 
     #[test]
@@ -3417,6 +5200,7 @@ mod tests {
                     status: Vec::new(),
                     recent_commits: Vec::new(),
                     worktrees: vec![worktree],
+                    managed_worktree: None,
                     truncated: false,
                     diagnostic: Some("diagnostic-secret C:\\private\\git.stderr".to_owned()),
                 },
@@ -3456,6 +5240,7 @@ mod tests {
                     text: "pub fn fixture() {}\n".to_owned(),
                     byte_len: 20,
                 },
+                revision: None,
             },
         });
 
@@ -3474,8 +5259,140 @@ mod tests {
                     text: "pub fn fixture() {}\n".to_owned(),
                     byte_len: 20,
                 },
+                revision: None,
             },
         }));
+    }
+
+    #[test]
+    fn workspace_entry_create_projects_exact_bounded_c2_contracts() {
+        assert_eq!(
+            C2_WORKSPACE_ENTRY_CREATE_CAPABILITY,
+            "workspace-entry-create-v1",
+        );
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let file = WorkspaceFileRead {
+            workspace_id: workspace_id.clone(),
+            path: repository_path("src/new.rs"),
+            content: WorkspaceFileContent::Utf8 {
+                text: String::new(),
+                byte_len: 0,
+            },
+            revision: Some(
+                gate4agent_node_protocol::WorkspaceFileRevision::new(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_owned(),
+                )
+                .unwrap(),
+            ),
+        };
+        let file_response = C2NodeResponse::from(
+            &NodeResponse::WorkspaceFileCreated { file: file.clone() },
+        );
+        assert_eq!(
+            file_response,
+            C2NodeResponse::WorkspaceFileCreated { file },
+        );
+        assert!(file_response.requires_workspace_entry_create_capability());
+
+        let entry = WorkspaceEntry {
+            relative_path: repository_path("src/new"),
+            kind: WorkspaceEntryKind::Directory,
+        };
+        let directory_response = C2NodeResponse::from(
+            &NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id: workspace_id.clone(),
+                entry: entry.clone(),
+            },
+        );
+        assert_eq!(
+            directory_response,
+            C2NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id,
+                entry,
+            },
+        );
+        assert!(directory_response.requires_workspace_entry_create_capability());
+        let encoded = serde_json::to_string(&directory_response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<C2NodeResponse>(&encoded).unwrap(),
+            directory_response,
+        );
+
+        for (code, message) in [
+            (NodeFailureCode::RepositoryEntryAlreadyExists, "repository entry already exists"),
+            (NodeFailureCode::RepositoryParentNotFound, "repository parent directory unavailable"),
+            (NodeFailureCode::RepositoryParentNotDirectory, "repository parent path is not a directory"),
+            (NodeFailureCode::RepositoryEntryCreateTimedOut, "repository entry creation timed out"),
+            (NodeFailureCode::RepositoryEntryCreateFailed, "repository entry creation failed"),
+        ] {
+            assert_eq!(
+                C2NodeFailure::from(&NodeFailure {
+                    code,
+                    message: "private node detail".to_owned(),
+                })
+                .message,
+                message,
+            );
+        }
+    }
+
+    #[test]
+    fn c2_host_directory_browse_projection_is_bounded_and_sanitizes_failures() {
+        assert_eq!(C2_HOST_DIRECTORY_BROWSE_CAPABILITY, "host-directory-browse-v1");
+        let directory = host_path(r"C:\Users");
+        let entry = HostDirectoryEntry {
+            path: host_path(r"C:\Users\Public"),
+            display_name: "Public".to_owned(),
+            is_link: false,
+        };
+        let response = routed_response(NodeResponse::HostDirectoriesBrowsed {
+            listing: HostDirectoryListing {
+                directory: Some(directory.clone()),
+                parent: Some(host_path(r"C:\")),
+                entries: vec![entry.clone()],
+                next_after: Some(entry.path.clone()),
+                incomplete: true,
+            },
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        let decoded = serde_json::from_str::<RoutedNodeResponse>(&json).unwrap();
+        assert_eq!(decoded, response);
+        assert!(matches!(
+            decoded.response,
+            Ok(C2NodeResponse::HostDirectoriesBrowsed {
+                listing: HostDirectoryListing {
+                    directory: Some(ref actual),
+                    incomplete: true,
+                    ..
+                }
+            }) if actual == &directory
+        ));
+
+        let mut oversized = serde_json::to_value(C2NodeResponse::HostDirectoriesBrowsed {
+            listing: HostDirectoryListing {
+                directory: None,
+                parent: None,
+                entries: vec![entry; gate4agent_node_protocol::MAX_HOST_DIRECTORY_ENTRIES + 1],
+                next_after: None,
+                incomplete: false,
+            },
+        }).unwrap();
+        assert!(serde_json::from_value::<C2NodeResponse>(oversized.take()).is_err());
+
+        for (code, expected) in [
+            (NodeFailureCode::HostDirectoryInvalid, "host directory invalid"),
+            (NodeFailureCode::HostDirectoryReadFailed, "host directory read failed"),
+            (NodeFailureCode::HostDirectoryReadTimedOut, "host directory read timed out"),
+        ] {
+            let failure = C2NodeFailure::from(&NodeFailure {
+                code,
+                message: r"private C:\Users\owner\secret".to_owned(),
+            });
+            assert_eq!(failure.message, expected);
+            assert!(failure.requires_host_directory_browse_capability());
+            assert!(!failure.message.contains("private"));
+        }
     }
 
     #[test]
@@ -3489,9 +5406,13 @@ mod tests {
                 workspace_id: WorkspaceId::new("repo").unwrap(),
                 canonical_root: opaque.clone(),
                 sessions: Vec::new(),
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
             }],
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
 
         let encoded = serde_json::to_string(&projected).unwrap();
@@ -3504,6 +5425,37 @@ mod tests {
         assert!(!display.chars().any(char::is_control));
         assert!(display.contains("\\n"));
         assert!(display.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn standalone_workspace_response_roundtrips_authoritative_snapshot() {
+        assert_eq!(
+            C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
+            NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
+        );
+        let workspace = WorkspaceSnapshot {
+            workspace_id: WorkspaceId::new("standalone").unwrap(),
+            canonical_root: host_path(r"C:\standalone"),
+            sessions: Vec::new(),
+            worktree_service_mode: Some(WorktreeServiceMode::Manual),
+            managed_worktree_profiles: Some(WorktreeProfileInventory {
+                profiles: Vec::new(),
+            }),
+        };
+        let projected = C2NodeResponse::from(
+            &NodeResponse::StandaloneWorkspaceCreated {
+                workspace: workspace.clone(),
+            },
+        );
+        let encoded = serde_json::to_string(&projected).unwrap();
+        let decoded = serde_json::from_str::<C2NodeResponse>(&encoded).unwrap();
+
+        assert_eq!(
+            decoded,
+            C2NodeResponse::StandaloneWorkspaceCreated {
+                workspace: C2WorkspaceSnapshot::from(&workspace),
+            },
+        );
     }
 
     #[test]
@@ -3525,6 +5477,8 @@ mod tests {
                 workspace_id: WorkspaceId::new("feature").unwrap(),
                 canonical_root: host_path(r"C:\work\feature"),
                 sessions: Vec::new(),
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
             },
         });
 
@@ -3595,6 +5549,34 @@ mod tests {
     }
 
     #[test]
+    fn routed_provider_interaction_resolution_is_categorical_only() {
+        let routed = routed_control_event(ControlEventKind::ProviderEvent {
+            sequence: 20,
+            source: provider_source(),
+            source_sequence: 8,
+            event: ProviderEvent::InteractionResolved {
+                request_id: "private-provider-request-id".to_owned(),
+                outcome: ProviderInteractionOutcome::Denied,
+            },
+        });
+
+        let json = serde_json::to_string(&routed).unwrap();
+        assert!(json.contains("interaction-resolved"));
+        assert!(!json.contains("private-provider-request-id"));
+        assert!(!json.contains("denied"));
+        let decoded = serde_json::from_str::<RoutedNodeEvent>(&json).unwrap();
+        assert!(matches!(decoded.event, C2NodeEvent::Control {
+            event: C2ControlEvent {
+                event: C2ControlEventKind::ProviderEvent {
+                    event: C2ProviderEventKind::InteractionResolved,
+                },
+                ..
+            },
+            ..
+        }));
+    }
+
+    #[test]
     fn routed_snapshot_recursively_omits_provider_identity_and_error_state() {
         let mut session = fixture_session();
         session.status = SessionStatus::Failed {
@@ -3628,9 +5610,13 @@ mod tests {
                     workspace_id: WorkspaceId::new("primary").unwrap(),
                     canonical_root: host_path(r"C:\workspace"),
                     sessions: vec![session],
+                    worktree_service_mode: None,
+                    managed_worktree_profiles: None,
                 }],
                 session_records: Vec::new(),
                 managed_worktrees: Vec::new(),
+                launch_inventory: None,
+                agent_progress: Vec::new(),
             },
         });
 
@@ -3679,6 +5665,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            task_binding: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
             last_error: Some("private backend diagnostic".to_owned()),
@@ -3693,6 +5680,8 @@ mod tests {
                 make_record("session-a", long_name),
             ],
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         };
 
         let slim = SlimNodeInventory::from_snapshot(&snapshot);
@@ -3746,6 +5735,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: index as u64,
                 updated_at_unix_ms: index as u64,
                 last_error: None,
@@ -3758,6 +5748,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records,
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         assert_eq!(slim.managed_session_count, MAX_C2_MANAGED_SESSIONS_PER_NODE + 1);
         assert_eq!(slim.managed_sessions.len(), MAX_C2_MANAGED_SESSIONS_PER_NODE);
@@ -3790,6 +5782,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: Vec::new(),
             managed_worktrees: vec![lease(0)],
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         let json = serde_json::to_string(&projected).unwrap();
         assert!(json.contains("managed_worktrees"));
@@ -3803,9 +5797,12 @@ mod tests {
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: Vec::new(),
             session_records: Vec::new(),
+            agent_progress: Vec::new(),
             managed_worktrees: (0..=MAX_C2_MANAGED_WORKTREES_PER_NODE)
                 .map(lease)
                 .collect(),
+            launch_inventory: None,
+            observation_support: None,
         };
         let encoded = serde_json::to_value(overflow).unwrap();
         assert!(serde_json::from_value::<C2NodeSnapshot>(encoded).is_err());

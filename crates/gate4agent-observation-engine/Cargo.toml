@@ -1,0 +1,26 @@
+[package]
+name = "gate4agent-observation-engine"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_observation_engine"
+
+[dependencies]
+gate4agent-observation-api = { path = "../gate4agent-observation-api" }
+gate4agent-observation-protocol = { path = "../gate4agent-observation-protocol" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+gate4agent-c2 = { path = "../gate4agent-c2" }
+gate4agent-c2-client = { path = "../gate4agent-c2-client" }
+gate4agent-c2-protocol = { path = "../gate4agent-c2-protocol" }
+gate4agent-node = { path = "../gate4agent-node", features = ["fixture"] }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-node-wire = { path = "../gate4agent-node-wire" }
+gate4agent-testkit = { path = "../gate4agent-testkit" }
+gate4agent-types = { path = "../gate4agent-types" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

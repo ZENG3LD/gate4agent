@@ -1,0 +1,32 @@
+[package]
+name = "gate4agent-harness-mcp"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_harness_mcp"
+
+[[bin]]
+name = "gate4agent-harness-mcp"
+path = "src/main.rs"
+
+[dependencies]
+gate4agent-harness-client = { path = "../gate4agent-harness-client" }
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-node-wire = { path = "../gate4agent-node-wire" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+gate4agent-c2 = { path = "../gate4agent-c2" }
+gate4agent-c2-client = { path = "../gate4agent-c2-client" }
+gate4agent-harness-engine = { path = "../gate4agent-harness-engine" }
+gate4agent-harness-protocol = { path = "../gate4agent-harness-protocol" }
+gate4agent-harness-service = { path = "../gate4agent-harness-service" }
+gate4agent-node = { path = "../gate4agent-node", features = ["fixture"] }
+gate4agent-observation-service = { path = "../gate4agent-observation-service" }
+gate4agent-testkit = { path = "../gate4agent-testkit" }
+gate4agent-types = { path = "../gate4agent-types" }
+tokio = { version = "1", features = ["full"] }

@@ -812,9 +812,17 @@ fn handle_request(shared: &HookIngressShared, request: HttpRequest) -> HttpStatu
     if reduction.events.is_empty() {
         route.reducer = reducer;
         route.next_receipt_sequence = route.next_receipt_sequence.saturating_add(1).max(1);
+        route.next_dispatch_sequence = route
+            .next_dispatch_sequence
+            .saturating_add(reduction.missed_before)
+            .max(1);
         return HttpStatus::NoContent;
     }
 
+    let dispatch_source_sequence = route
+        .next_dispatch_sequence
+        .saturating_add(reduction.missed_before)
+        .max(1);
     let command_counter = shared.next_command_id.fetch_add(1, Ordering::AcqRel);
     let command = CommandEnvelope {
         protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -826,7 +834,7 @@ fn handle_request(shared: &HookIngressShared, request: HttpRequest) -> HttpStatu
                 family: AdapterFamily::Hook,
                 binding: route.binding.clone(),
             },
-            source_sequence: route.next_dispatch_sequence,
+            source_sequence: dispatch_source_sequence,
             events: reduction.events,
         },
     };
@@ -834,7 +842,7 @@ fn handle_request(shared: &HookIngressShared, request: HttpRequest) -> HttpStatu
         Ok(()) => {
             route.reducer = reducer;
             route.next_receipt_sequence = route.next_receipt_sequence.saturating_add(1).max(1);
-            route.next_dispatch_sequence = route.next_dispatch_sequence.saturating_add(1).max(1);
+            route.next_dispatch_sequence = dispatch_source_sequence.saturating_add(1).max(1);
             HttpStatus::NoContent
         }
         Err(PortDispatchError::Full | PortDispatchError::Disconnected) => {
@@ -1151,6 +1159,81 @@ mod tests {
         server.stop().await;
         assert!(!control.is_running());
         assert_eq!(control.active_route_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn source_sequence_gap_is_forwarded_before_provider_batch() {
+        let (handle, port) = bounded_port(8);
+        let server = HookIngressServer::start(handle, HookIngressConfig::default())
+            .await
+            .unwrap();
+        let route = server
+            .control()
+            .register_route(AgentInstanceId(17), SessionGeneration(3), binding("grok"))
+            .unwrap();
+
+        let first = post(
+            server.endpoint(),
+            &route,
+            "/hook/grok",
+            &json!({
+                "event_name": "UserPromptSubmit",
+                "event_id": "gap-1",
+                "payload": {"prompt": "before gap"}
+            }),
+        )
+        .await;
+        assert!(first.starts_with("HTTP/1.1 204"));
+        assert!(matches!(
+            port.drain_commands(8).as_slice(),
+            [CommandEnvelope {
+                command: ControlCommand::IngestProvider {
+                    source_sequence: 1,
+                    ..
+                },
+                ..
+            }]
+        ));
+
+        {
+            let mut routes = server
+                .control
+                .shared
+                .routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            routes
+                .by_token
+                .get_mut(route.route_token.as_ref())
+                .unwrap()
+                .next_receipt_sequence = 4;
+        }
+
+        let after_gap = post(
+            server.endpoint(),
+            &route,
+            "/hook/grok",
+            &json!({
+                "event_name": "Stop",
+                "event_id": "gap-4",
+                "payload": {}
+            }),
+        )
+        .await;
+        assert!(after_gap.starts_with("HTTP/1.1 204"));
+        assert!(matches!(
+            port.drain_commands(8).as_slice(),
+            [CommandEnvelope {
+                command: ControlCommand::IngestProvider {
+                    source_sequence: 4,
+                    events,
+                    ..
+                },
+                ..
+            }] if matches!(events.as_slice(), [ProviderEvent::TurnCompleted { .. }])
+        ));
+
+        server.stop().await;
     }
 
     #[tokio::test]

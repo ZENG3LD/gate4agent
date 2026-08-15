@@ -6,9 +6,419 @@ use crate::{
 use gate4agent_adapters::{HistoryDocument, HistorySourceLayout};
 use serde_json::{Map, Value};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+const HISTORY_LOCATOR_PREFIX_MAX_BYTES: usize = 64 * 1024;
+const HISTORY_PREVIEW_TAIL_MAX_BYTES: usize = 512 * 1024;
+
+pub(crate) fn load_preview_document(
+    record: &CandidateRecord,
+    limits: NativeHistoryLimits,
+) -> Result<(HistoryDocument, bool), NativeHistoryError> {
+    let CandidateLocator::File {
+        root,
+        primary,
+        layout,
+    } = &record.key.locator
+    else {
+        return load_document(record, limits).map(|loaded| (loaded.document, false));
+    };
+    let adapter = record.key.source.binding.id.as_str();
+    let mut signatures = Vec::new();
+    let mut document = HistoryDocument {
+        session_id_hint: record.session_id_hint.clone(),
+        metadata_json: None,
+        transcript: String::new(),
+    };
+    let mut source_truncated = false;
+    match (adapter, layout) {
+        ("claude-code" | "qwen-code", HistorySourceLayout::SingleNdjson) => {
+            let source_generation = required_file_signature(primary)?;
+            let locator = load_ndjson_locator_document(
+                adapter,
+                root,
+                primary,
+                &record.session_id_hint,
+            )?;
+            let (tail, truncated) = read_tail(root, primary, HISTORY_PREVIEW_TAIL_MAX_BYTES)?;
+            document.transcript = format!(
+                "{}\n{}",
+                locator.transcript.trim_end(),
+                tail.trim_start(),
+            );
+            source_truncated = truncated;
+            ensure_generation(primary, &source_generation)?;
+        }
+        ("codex", HistorySourceLayout::NdjsonWithOptionalIndex) => {
+            let source_generation = required_file_signature(primary)?;
+            let locator = load_ndjson_locator_document(
+                adapter,
+                root,
+                primary,
+                &record.session_id_hint,
+            )?;
+            let (tail, truncated) = read_tail(root, primary, HISTORY_PREVIEW_TAIL_MAX_BYTES)?;
+            document.transcript = format!(
+                "{}\n{}",
+                locator.transcript.trim_end(),
+                tail.trim_start(),
+            );
+            source_truncated = truncated;
+            document.metadata_json = load_codex_index(
+                root,
+                &document.transcript,
+                &mut signatures,
+            )?;
+            ensure_generation(primary, &source_generation)?;
+        }
+        ("grok", HistorySourceLayout::SummaryJsonWithSiblingNdjson) => {
+            document.metadata_json = Some(read_required(
+                root,
+                primary,
+                primary_limit(*layout),
+                &mut signatures,
+            )?);
+            let sibling = primary.with_file_name("chat_history.jsonl");
+            if sibling.is_file() {
+                (document.transcript, source_truncated) =
+                    read_tail(root, &sibling, HISTORY_PREVIEW_TAIL_MAX_BYTES)?;
+            }
+        }
+        ("kimi", HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson) => {
+            let state_content = read_required(
+                root,
+                primary,
+                primary_limit(*layout),
+                &mut signatures,
+            )?;
+            let metadata = load_kimi_locator_metadata(
+                root,
+                state_content,
+                &record.session_id_hint,
+                &mut signatures,
+            )?;
+            let state = serde_json::from_str::<Value>(&metadata)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .ok_or(NativeHistoryError::ReadFailed)?;
+            let primary_agent = kimi_primary_agent_id(&state);
+            if !safe_component(&primary_agent) {
+                return Err(NativeHistoryError::SourceChanged);
+            }
+            let session_dir = primary.parent().ok_or(NativeHistoryError::SourceChanged)?;
+            let wire_path = session_dir
+                .join("agents")
+                .join(primary_agent)
+                .join("wire.jsonl");
+            if wire_path.is_file() {
+                (document.transcript, source_truncated) = read_tail(
+                    root,
+                    &wire_path,
+                    HISTORY_PREVIEW_TAIL_MAX_BYTES,
+                )?;
+            }
+            document.metadata_json = Some(metadata);
+        }
+        _ => return load_document(record, limits).map(|loaded| (loaded.document, false)),
+    }
+    Ok((document, source_truncated))
+}
+
+pub(crate) fn load_locator_document(
+    record: &CandidateRecord,
+    limits: NativeHistoryLimits,
+) -> Result<HistoryDocument, NativeHistoryError> {
+    match &record.key.locator {
+        CandidateLocator::File {
+            root,
+            primary,
+            layout,
+        } if matches!(
+            layout,
+            HistorySourceLayout::SingleJson
+                | HistorySourceLayout::SessionJsonWithSiblingMessageJson
+        ) => load_document(record, limits).map(|loaded| loaded.document),
+        CandidateLocator::File {
+            root,
+            primary,
+            layout,
+        } => load_file_locator(
+            record.key.source.binding.id.as_str(),
+            root,
+            primary,
+            *layout,
+            &record.session_id_hint,
+        ),
+        CandidateLocator::Sqlite { .. } => {
+            load_document(record, limits).map(|loaded| loaded.document)
+        }
+    }
+}
+
+fn load_file_locator(
+    adapter: &str,
+    root: &Path,
+    primary: &Path,
+    layout: HistorySourceLayout,
+    session_id_hint: &str,
+) -> Result<HistoryDocument, NativeHistoryError> {
+    let mut signatures = Vec::new();
+    let mut document = HistoryDocument {
+        session_id_hint: session_id_hint.to_owned(),
+        metadata_json: None,
+        transcript: String::new(),
+    };
+    match layout {
+        HistorySourceLayout::SingleNdjson
+        | HistorySourceLayout::NdjsonWithOptionalIndex
+        | HistorySourceLayout::JsonOrNdjson => {
+            document = load_ndjson_locator_document(
+                adapter,
+                root,
+                primary,
+                session_id_hint,
+            )?;
+        }
+        HistorySourceLayout::SummaryJsonWithSiblingNdjson
+        | HistorySourceLayout::MetadataJsonWithSiblingJson => {
+            document.metadata_json = Some(read_required(
+                root,
+                primary,
+                primary_limit(layout),
+                &mut signatures,
+            )?);
+        }
+        HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson => {
+            let state_content = read_required(
+                root,
+                primary,
+                primary_limit(layout),
+                &mut signatures,
+            )?;
+            document.metadata_json = Some(load_kimi_locator_metadata(
+                root,
+                state_content,
+                session_id_hint,
+                &mut signatures,
+            )?);
+        }
+        HistorySourceLayout::SingleJson
+        | HistorySourceLayout::SessionJsonWithSiblingMessageJson
+        | HistorySourceLayout::ReadOnlySqliteProjection => {
+            return Err(NativeHistoryError::SourceChanged);
+        }
+    }
+    Ok(document)
+}
+
+fn load_ndjson_locator_document(
+    adapter: &str,
+    root: &Path,
+    primary: &Path,
+    session_id_hint: &str,
+) -> Result<HistoryDocument, NativeHistoryError> {
+    let source_generation = required_file_signature(primary)?;
+    let prefix = read_raw_prefix(root, primary, HISTORY_LOCATOR_PREFIX_MAX_BYTES)?;
+    let id_key = if adapter == "codex" { "id" } else { "sessionId" };
+    let mut cwd = extract_json_string_field(&prefix, "cwd");
+    let mut session_id = extract_json_string_field(&prefix, id_key);
+    if cwd.is_none() || session_id.is_none() {
+        let tail = read_raw_tail(root, primary, HISTORY_LOCATOR_PREFIX_MAX_BYTES)?;
+        cwd = cwd.or_else(|| extract_json_string_field(&tail, "cwd"));
+        session_id = session_id.or_else(|| extract_json_string_field(&tail, id_key));
+    }
+    ensure_generation(primary, &source_generation)?;
+    let session_id = session_id.unwrap_or_else(|| session_id_hint.to_owned());
+    let record = match adapter {
+        "codex" => serde_json::json!({
+            "type": "session_meta",
+            "payload": { "id": session_id, "cwd": cwd },
+        }),
+        "qwen-code" => serde_json::json!({
+            "uuid": "gate4agent-locator",
+            "parentUuid": null,
+            "sessionId": session_id,
+            "type": "user",
+            "provenance": "system",
+            "cwd": cwd,
+        }),
+        _ => serde_json::json!({
+            "type": "progress",
+            "sessionId": session_id,
+            "cwd": cwd,
+        }),
+    };
+    Ok(HistoryDocument {
+        session_id_hint: session_id_hint.to_owned(),
+        metadata_json: None,
+        transcript: record.to_string(),
+    })
+}
+
+fn extract_json_string_field(content: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut rest = content;
+    while let Some(position) = rest.find(&needle) {
+        let after_key = &rest[position + needle.len()..];
+        let value = after_key.trim_start().strip_prefix(':')?.trim_start();
+        if !value.starts_with('"') {
+            rest = after_key;
+            continue;
+        }
+        let mut escaped = false;
+        for (index, character) in value[1..].char_indices() {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                return serde_json::from_str::<String>(&value[..index + 2]).ok();
+            }
+        }
+        return None;
+    }
+    None
+}
+
+fn load_kimi_locator_metadata(
+    sessions_root: &Path,
+    state_content: String,
+    session_id: &str,
+    signatures: &mut Vec<ComponentSignature>,
+) -> Result<String, NativeHistoryError> {
+    let mut state = serde_json::from_str::<Value>(&state_content)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or(NativeHistoryError::ReadFailed)?;
+    let home = sessions_root
+        .parent()
+        .ok_or(NativeHistoryError::SourceChanged)?;
+    let index_path = home.join("session_index.jsonl");
+    if let Some(index) = read_optional(
+        home,
+        &index_path,
+        HISTORY_AUXILIARY_INDEX_MAX_BYTES,
+        signatures,
+    )? {
+        if let Some(work_dir) = index
+            .lines()
+            .filter_map(json_object)
+            .filter_map(|record| {
+                let id = record.get("sessionId")?.as_str()?.trim();
+                if id != session_id {
+                    return None;
+                }
+                Some(record.get("workDir")?.as_str()?.trim().to_owned())
+            })
+            .rfind(|work_dir| !work_dir.is_empty())
+        {
+            state.insert("cwd".to_owned(), Value::String(work_dir));
+        }
+    }
+    Ok(Value::Object(state).to_string())
+}
+
+fn read_raw_prefix(
+    authorized_root: &Path,
+    path: &Path,
+    max: usize,
+) -> Result<String, NativeHistoryError> {
+    validate_root(authorized_root)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| NativeHistoryError::SourceChanged)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| NativeHistoryError::SourceChanged)?;
+    if !canonical.starts_with(authorized_root) {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    let file = File::open(&canonical).map_err(|_| NativeHistoryError::ReadFailed)?;
+    let mut bytes = Vec::with_capacity(max.min(metadata.len() as usize));
+    file.take((max as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| NativeHistoryError::ReadFailed)?;
+    bytes.truncate(max);
+    String::from_utf8(bytes).map_err(|_| NativeHistoryError::InvalidUtf8)
+}
+
+fn read_raw_tail(
+    authorized_root: &Path,
+    path: &Path,
+    max: usize,
+) -> Result<String, NativeHistoryError> {
+    validate_root(authorized_root)?;
+    let before = required_file_signature(path)?;
+    let canonical = fs::canonicalize(path).map_err(|_| NativeHistoryError::SourceChanged)?;
+    if !canonical.starts_with(authorized_root) {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    let mut file = File::open(&canonical).map_err(|_| NativeHistoryError::ReadFailed)?;
+    let len = file
+        .metadata()
+        .map_err(|_| NativeHistoryError::ReadFailed)?
+        .len();
+    let start = len.saturating_sub(max as u64);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| NativeHistoryError::ReadFailed)?;
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| NativeHistoryError::ReadFailed)?;
+    ensure_generation(path, &before)?;
+    String::from_utf8(bytes).map_err(|_| NativeHistoryError::InvalidUtf8)
+}
+
+fn required_file_signature(path: &Path) -> Result<ComponentSignature, NativeHistoryError> {
+    let signature = component_signature(path)?;
+    if !signature.present || signature.directory {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    Ok(signature)
+}
+
+fn ensure_generation(
+    path: &Path,
+    expected: &ComponentSignature,
+) -> Result<(), NativeHistoryError> {
+    if component_signature(path)? != *expected {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    Ok(())
+}
+
+fn read_tail(
+    authorized_root: &Path,
+    path: &Path,
+    max: usize,
+) -> Result<(String, bool), NativeHistoryError> {
+    validate_root(authorized_root)?;
+    let before = required_file_signature(path)?;
+    let canonical = fs::canonicalize(path).map_err(|_| NativeHistoryError::SourceChanged)?;
+    if !canonical.starts_with(authorized_root) {
+        return Err(NativeHistoryError::SourceChanged);
+    }
+    let mut file = File::open(&canonical).map_err(|_| NativeHistoryError::ReadFailed)?;
+    let len = file
+        .metadata()
+        .map_err(|_| NativeHistoryError::ReadFailed)?
+        .len();
+    let start = len.saturating_sub(max as u64);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| NativeHistoryError::ReadFailed)?;
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| NativeHistoryError::ReadFailed)?;
+    if start > 0 {
+        let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return Err(NativeHistoryError::ReadFailed);
+        };
+        bytes.drain(..=first_newline);
+    }
+    ensure_generation(path, &before)?;
+    let content = String::from_utf8(bytes).map_err(|_| NativeHistoryError::InvalidUtf8)?;
+    Ok((content, start > 0))
+}
 
 pub(crate) fn load_document(
     record: &CandidateRecord,

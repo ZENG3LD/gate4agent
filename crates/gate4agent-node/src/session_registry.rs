@@ -7,6 +7,7 @@ use crate::protocol::{
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3, NODE_STATE_SCHEMA_V4,
     NODE_STATE_SCHEMA_V5,
     NODE_STATE_SCHEMA_V6, NODE_STATE_SCHEMA_V7, NODE_STATE_SCHEMA_V8,
+    NODE_STATE_SCHEMA_V9,
 };
 use crate::worktree_service::ManagedWorktreeLeaseRecord;
 use crate::session_environment::{
@@ -300,6 +301,8 @@ struct PersistedNodeStateV8 {
     managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
     materializations: Vec<PersistedMaterializationRecordV8>,
 }
+
+type PersistedNodeStateV9 = PersistedNodeStateV8;
 
 struct DecodedNodeState {
     node_id: NodeId,
@@ -698,6 +701,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v8_state(state)
         }
+        NODE_STATE_SCHEMA_V9 => {
+            let state: PersistedNodeStateV9 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v9_state(state)
+        }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             StateLoadRefusalError::UnsupportedSchema(version),
@@ -734,6 +742,7 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
                     bundle: None,
                     context_id: None,
                     context: None,
+                    task_binding: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -778,6 +787,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
                     bundle: None,
                     context_id: None,
                     context: None,
+                    task_binding: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -822,6 +832,7 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
                     bundle: None,
                     context_id: None,
                     context: None,
+                    task_binding: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
                     last_error: record.last_error,
@@ -939,6 +950,7 @@ fn decode_v7_state(state: PersistedNodeStateV7) -> io::Result<DecodedNodeState> 
     let session_records = state.session_records.into_iter().map(|mut record| {
         record.context_id = None;
         record.context = None;
+        record.task_binding = None;
         record
     }).collect::<Vec<_>>();
     let materializations = state.materializations.into_iter().map(|record| {
@@ -983,7 +995,14 @@ fn decode_v7_state(state: PersistedNodeStateV7) -> io::Result<DecodedNodeState> 
     })
 }
 
-fn decode_v8_state(state: PersistedNodeStateV8) -> io::Result<DecodedNodeState> {
+fn decode_v8_state(mut state: PersistedNodeStateV8) -> io::Result<DecodedNodeState> {
+    for record in &mut state.session_records {
+        record.task_binding = None;
+    }
+    decode_v9_state(state)
+}
+
+fn decode_v9_state(state: PersistedNodeStateV9) -> io::Result<DecodedNodeState> {
     let materializations = state.materializations.into_iter().map(|record| {
         MaterializationOwnershipRecord::from_persisted(
             record.materialization_id,
@@ -1568,6 +1587,7 @@ pub(crate) fn save_v7(
     atomic_write(path, &bytes, previous_primary_valid)
 }
 
+#[cfg(test)]
 pub(crate) fn save_v8(
     path: Option<&Path>,
     node_id: &NodeId,
@@ -1576,6 +1596,54 @@ pub(crate) fn save_v8(
     managed_worktrees: &[ManagedWorktreeLeaseRecord],
     managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
     materializations: &[MaterializationOwnershipRecord],
+) -> io::Result<Option<String>> {
+    if records.iter().any(|record| record.task_binding.is_some()) {
+        return Err(invalid_data(
+            "refusing to persist task bindings in legacy durable state v8",
+        ));
+    }
+    save_current(
+        path,
+        node_id,
+        workspaces,
+        records,
+        managed_worktrees,
+        managed_worktree_tombstones,
+        materializations,
+        NODE_STATE_SCHEMA_V8,
+    )
+}
+
+pub(crate) fn save_v9(
+    path: Option<&Path>,
+    node_id: &NodeId,
+    workspaces: &BTreeMap<WorkspaceId, String>,
+    records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+    materializations: &[MaterializationOwnershipRecord],
+) -> io::Result<Option<String>> {
+    save_current(
+        path,
+        node_id,
+        workspaces,
+        records,
+        managed_worktrees,
+        managed_worktree_tombstones,
+        materializations,
+        NODE_STATE_SCHEMA_V9,
+    )
+}
+
+fn save_current(
+    path: Option<&Path>,
+    node_id: &NodeId,
+    workspaces: &BTreeMap<WorkspaceId, String>,
+    records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+    materializations: &[MaterializationOwnershipRecord],
+    version: u16,
 ) -> io::Result<Option<String>> {
     let Some(path) = path else {
         return Ok(None);
@@ -1618,8 +1686,8 @@ pub(crate) fn save_v8(
         };
         persisted_records.push(persisted);
     }
-    let state = PersistedNodeStateV8 {
-        version: NODE_STATE_SCHEMA_V8,
+    let state = PersistedNodeStateV9 {
+        version,
         node_id: node_id.clone(),
         workspaces: workspaces.iter().map(|(workspace_id, canonical_root)| {
             Ok(PersistedWorkspaceV2 {
@@ -1727,6 +1795,14 @@ fn validate_record(record: &ManagedSessionRecord) -> io::Result<()> {
         return Err(invalid_data(
             "session record context id and receipt are not correlated",
         ));
+    }
+    if !record.task_binding_is_valid()
+        || record.task_binding.as_ref().is_some_and(|binding| {
+            binding.changed_at_unix_ms < record.created_at_unix_ms
+                || binding.changed_at_unix_ms > record.updated_at_unix_ms
+        })
+    {
+        return Err(invalid_data("session record task binding is invalid"));
     }
     if let Some(identity) = &record.provider_session {
         identity
@@ -2134,6 +2210,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            task_binding: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 11,
             last_error: None,

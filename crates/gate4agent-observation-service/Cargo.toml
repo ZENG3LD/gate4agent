@@ -1,0 +1,20 @@
+[package]
+name = "gate4agent-observation-service"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_observation_service"
+
+[dependencies]
+gate4agent-observation-api = { path = "../gate4agent-observation-api" }
+gate4agent-observation-engine = { path = "../gate4agent-observation-engine" }
+gate4agent-observation-store = { path = "../gate4agent-observation-store" }
+thiserror = "2"
+
+[dev-dependencies]
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-observation-protocol = { path = "../gate4agent-observation-protocol" }
+gate4agent-types = { path = "../gate4agent-types" }
+rusqlite = { version = "0.31", features = ["bundled"] }

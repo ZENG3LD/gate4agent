@@ -36,10 +36,12 @@ pub struct OwnerOnlyLocalListener {
 
 impl OwnerOnlyLocalListener {
     pub async fn bind(endpoint: impl AsRef<Path>) -> io::Result<Self> {
+        let endpoint = endpoint.as_ref().to_owned();
+        let pending = create_current_user_pipe_server(&endpoint, true)?;
         Ok(Self {
-            endpoint: endpoint.as_ref().to_owned(),
-            pending: None,
-            first_instance: true,
+            endpoint,
+            pending: Some(pending),
+            first_instance: false,
         })
     }
 
@@ -404,16 +406,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn listener_creates_only_during_accept_and_survives_cancelled_accept() {
+    async fn listener_prebinds_and_survives_cancelled_accept() {
         let endpoint = test_endpoint("accept-cancel");
         let mut listener = OwnerOnlyLocalListener::bind(&endpoint)
             .await
             .expect("construct owner-only listener");
-        let before_accept = ClientOptions::new()
-            .open(&endpoint)
-            .expect_err("bind must not create a pipe before caller admission");
-        assert_eq!(before_accept.kind(), io::ErrorKind::NotFound);
-
         tokio::time::timeout(Duration::from_millis(1), listener.accept())
             .await
             .expect_err("first accept remains pending without a client");
@@ -439,6 +436,20 @@ mod tests {
 
         let collision = create_current_user_pipe_server(&endpoint, true)
             .expect_err("reject first-instance claim after pipe already exists");
+        assert_eq!(collision.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        drop(first);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_only_listener_prebind_rejects_exact_name_collision() {
+        let endpoint = test_endpoint("listener-prebind-collision");
+        let first = OwnerOnlyLocalListener::bind(&endpoint)
+            .await
+            .expect("reserve exact pipe name");
+        let collision = match OwnerOnlyLocalListener::bind(&endpoint).await {
+            Ok(_) => panic!("second listener must not race the reserved name"),
+            Err(error) => error,
+        };
         assert_eq!(collision.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
         drop(first);
     }

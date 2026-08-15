@@ -8,12 +8,25 @@ publish = false
 crossterm = "0.28"
 gate4agent-c2-client = { path = "../gate4agent-c2-client" }
 gate4agent-c2-protocol = { path = "../gate4agent-c2-protocol" }
+gate4agent-harness-client = { path = "../gate4agent-harness-client" }
+gate4agent-harness-protocol = { path = "../gate4agent-harness-protocol" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
-gate4agent-node-wire = { path = "../gate4agent-node-wire" }
+gate4agent-observation-api = { path = "../gate4agent-observation-api" }
+gate4agent-observation-engine = { path = "../gate4agent-observation-engine" }
+gate4agent-observation-service = { path = "../gate4agent-observation-service" }
 gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uzor-tui = { path = "../../../uzor/uzor-tui" }
 vt100 = "0.16"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [lib]
 name = "gate4agent_tui"
@@ -22,5 +35,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "gate4agent-tui"
 path = "src/main.rs"
+
+[[bin]]
+name = "gate4agent-tui-light"
+path = "src/bin/gate4agent-tui-light.rs"
 
 [workspace]

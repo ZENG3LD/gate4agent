@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::core::types::ContextWindowUsage;
+
 /// Unified event type from any AI CLI tool's NDJSON stream.
 #[derive(Debug, Clone)]
 pub enum CliEvent {
@@ -46,6 +48,8 @@ pub enum CliEvent {
         /// Consumer should SET counters, not ADD to them.
         is_cumulative: bool,
     },
+    /// Exact current context-window usage from one atomic structured event.
+    ContextWindowUsage { usage: ContextWindowUsage },
     /// Session ended.
     SessionEnd {
         result: String,

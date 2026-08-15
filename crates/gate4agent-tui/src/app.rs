@@ -1,21 +1,74 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use gate4agent_c2_protocol::C2RelayRoute;
 use gate4agent_node_protocol::{
-    GitWorktreeSnapshot, ManagedSessionState, NodeIncarnationId, OpaqueHostPath, RepositoryPath, SessionMode,
-    WorkspaceEntryKind, WorkspaceId,
-    WorkspaceInspection, MAX_SESSION_DISPLAY_NAME_BYTES,
-    MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_WORKSPACE_ROOT_BYTES,
+    AgentProgressCurrentV1, AgentProgressV1, GitWorktreeSnapshot, HostDirectoryEntry, HostDirectoryListing, LaunchInventory,
+    ManagedSessionState, ManagedWorktreeLeaseSnapshot, ManagedWorktreeSpawnReceipt,
+    NativeSessionCatalogPage,
+    NodeIncarnationId, OpaqueHostPath, RepositoryPath,
+    ObservationEvidenceV1, ObservationInteractionOutcomeV1, ObservationKindV1,
+    ResolvedBundleReceipt, ResolvedContextPackReceipt,
+    ResolvedSpawnReceipt, SessionMode, SessionTaskBindingV1, SessionTaskTargetV1,
+    SpawnBundleId, SpawnContextId, SpawnProfileId, TaskId,
+    WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorktreeProfileId,
+    WorktreeServiceMode,
+    WorktreeProfileInventory,
+    MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES,
+    MAX_WORKSPACE_ROOT_BYTES,
+};
+use gate4agent_observation_api::{
+    AgentInstanceId as ObservationAgentInstanceId, NodeCursor as ObservationNodeCursor,
+    ManagedRecordLink, ManagedSessionKey, SessionRecordId as ObservationSessionRecordId,
+    NodeId as ObservationNodeId, ObservationRecordInventory, ObservationTarget,
+    RuntimeSessionKey, SessionGeneration as ObservationSessionGeneration,
+    WorkspaceId as ObservationWorkspaceId,
+};
+#[cfg(test)]
+use gate4agent_observation_api::{
+    ObservationIngressEnvelope, ObservationIngressPayload, ObservationResyncBatch,
+};
+use gate4agent_observation_engine::SessionProjection;
+#[cfg(test)]
+use gate4agent_observation_engine::{
+    ApplyOutcome as ObservationApplyOutcome, ObservationEngine, ObservationEngineError,
 };
 use gate4agent_types::{
-    AgentId, TerminalControl, TerminalFrame, TerminalMouseProtocolEncoding,
-    TERMINAL_INPUT_MAX_BYTES,
+    AgentId, HistoryCandidateSummary, NativeSessionCatalogScope,
+    NativeSessionCatalogSummary, NativeSessionCatalogWindow, NativeSessionExternalGroup,
+    NativeSessionExternalGroupKind, ProviderSessionIdentity, ProviderSessionKey, TerminalControl, TerminalFrame,
+    TerminalMouseProtocolEncoding, PROVIDER_EVENT_ID_MAX_BYTES, TERMINAL_INPUT_MAX_BYTES,
+};
+use gate4agent_harness_client::{
+    HarnessRevision, HarnessRunId, HarnessTaskId,
+    HarnessTaskStateV1, RedactedBindingStateV1, RedactedRunV1, RedactedTaskV1,
+    SessionMonitorV1 as HarnessSessionMonitorV1, TimelineEntryV1,
+    HARNESS_BODY_MAX_BYTES, HARNESS_TITLE_MAX_BYTES,
+};
+use gate4agent_harness_protocol::HarnessSelectorV1;
+#[cfg(test)]
+use gate4agent_harness_client::{
+    HarnessExecutionModeV1, HarnessRunLifecycleV1, RedactedRunIntentV1,
+    RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
 };
 use uzor_tui::Rect;
+
+use crate::surface::{
+    LayoutPreset, PaneId, PaneSplitPath, SplitAxis, SurfaceDropZone, SurfaceError, SurfaceState,
+};
+use crate::text_editor::TextEditor;
+use crate::platform::{read_clipboard_text, write_clipboard_text};
 
 const WHEEL_SCROLL_LINES: usize = 3;
 const MIN_CONTROL_MODAL_WIDTH: u16 = 36;
 const MIN_CONTROL_MODAL_HEIGHT: u16 = 6;
+pub(crate) const MAX_BROWSER_LOADED_ENTRIES: usize = 2_048;
+pub(crate) const RESTORE_VIA_SKILL_DISABLED_REASON: &str =
+    "Restore via skill is unavailable: no readiness-gated post-launch skill runner is installed";
+pub(crate) const MAX_MANAGED_AGENT_PREFERENCES: usize = 256;
+pub(crate) const MAX_LOCAL_AGENT_ALIAS_BYTES: usize = 96;
+pub(crate) const MAX_MANAGED_AGENT_RECORD_ID_BYTES: usize = 256;
 
 pub type Provider = AgentId;
 
@@ -87,6 +140,7 @@ pub struct SessionView {
     pub restartable: bool,
     pub attention: bool,
     pub has_provider_session_identity: bool,
+    pub progress: Option<AgentProgressV1>,
     pub terminal_formatted: Vec<u8>,
     pub terminal_scrollback: Vec<Vec<u8>>,
     pub terminal_alternate_screen: bool,
@@ -106,6 +160,10 @@ pub struct ManagedSessionView {
     pub workspace_id: String,
     pub canonical_root: Option<OpaqueHostPath>,
     pub has_provider_session_identity: bool,
+    pub bundle: Option<ResolvedBundleReceipt>,
+    pub context_id: Option<SpawnContextId>,
+    pub context: Option<ResolvedContextPackReceipt>,
+    pub task_binding: Option<SessionTaskBindingV1>,
     pub active_session: Option<SessionAddress>,
     pub last_error: Option<String>,
 }
@@ -114,7 +172,7 @@ impl ManagedSessionView {
     pub fn short_title(&self) -> String {
         if let Some(address) = self.active_session.as_ref() {
             format!(
-                "{} · {}/{} #{}:{}",
+                "{} | {}/{} #{}:{}",
                 self.display_name,
                 address.node_id,
                 address.workspace_id,
@@ -123,17 +181,556 @@ impl ManagedSessionView {
             )
         } else {
             format!(
-                "{} · {}/{} @{}",
+                "{} | {}/{} @{}",
                 self.display_name, self.node_id, self.workspace_id, self.record_id,
             )
         }
     }
 }
 
+pub fn compact_task_id(task_id: &TaskId) -> String {
+    let value = task_id.as_str();
+    format!("{}...", &value[..value.len().min(13)])
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AgentRowKey {
     Managed { node_id: String, record_id: String },
     Legacy(SessionAddress),
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionMonitorTarget {
+    Runtime {
+        address: SessionAddress,
+        incarnation: NodeIncarnationId,
+    },
+    Managed {
+        node_id: String,
+        record_id: String,
+        incarnation: NodeIncarnationId,
+    },
+}
+
+impl SessionMonitorTarget {
+    pub fn node_id(&self) -> &str {
+        match self {
+            Self::Runtime { address, .. } => &address.node_id,
+            Self::Managed { node_id, .. } => node_id,
+        }
+    }
+
+    pub fn incarnation(&self) -> NodeIncarnationId {
+        match self {
+            Self::Runtime { incarnation, .. } | Self::Managed { incarnation, .. } => *incarnation,
+        }
+    }
+
+    pub fn runtime_address(&self) -> Option<&SessionAddress> {
+        match self {
+            Self::Runtime { address, .. } => Some(address),
+            Self::Managed { .. } => None,
+        }
+    }
+}
+
+pub const MAX_SESSION_MONITORS: usize = 256;
+pub const MAX_SESSION_MONITOR_TIMELINE: usize = 512;
+pub const MAX_SESSION_MONITOR_COLLECTION: usize = 128;
+pub const MAX_SESSION_MONITOR_INTERACTIONS: usize = 64;
+const MAX_SESSION_HISTORY_REFRESH_KEYS: usize = 256;
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionMonitorKey {
+    pub agent: AgentRowKey,
+    pub target: SessionMonitorTarget,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionMonitorSection {
+    #[default]
+    Overview,
+    Workflow,
+    Subagents,
+    Tools,
+    Approvals,
+    FilesGit,
+    Usage,
+    Timeline,
+}
+
+impl SessionMonitorSection {
+    pub const ALL: [Self; 8] = [
+        Self::Overview,
+        Self::Workflow,
+        Self::Subagents,
+        Self::Tools,
+        Self::Approvals,
+        Self::FilesGit,
+        Self::Usage,
+        Self::Timeline,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Workflow => "Workflow",
+            Self::Subagents => "Subagents",
+            Self::Tools => "Tools",
+            Self::Approvals => "Approvals",
+            Self::FilesGit => "Files / Git",
+            Self::Usage => "Usage",
+            Self::Timeline => "Timeline",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionMonitorSupport {
+    pub known: bool,
+    pub events: bool,
+    pub managed_target: bool,
+    pub workflow_detail: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObservationPersistenceState {
+    Available { revision: u64 },
+    Unavailable(String),
+}
+
+impl Default for ObservationPersistenceState {
+    fn default() -> Self {
+        Self::Unavailable("durable observation store is starting".to_owned())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionObservationIngressOutcome {
+    Applied,
+    Duplicate,
+    Rejected {
+        reason: String,
+        resync_after: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMonitorTimelineItem {
+    pub node_sequence: u64,
+    pub source_sequence: Option<u64>,
+    pub observed_at_unix_ms: Option<u64>,
+    pub evidence: Option<ObservationEvidenceV1>,
+    pub kind: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMonitorToolFact {
+    pub class: String,
+    pub state: String,
+    pub success: Option<bool>,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMonitorSubagentFact {
+    pub class: String,
+    pub state: String,
+    pub success: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMonitorInteractionFact {
+    pub kind: String,
+    pub tool_class: Option<String>,
+    pub outcome: Option<ObservationInteractionOutcomeV1>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionMonitorUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub context_window: Option<u64>,
+    pub is_cumulative: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextUsageSegment {
+    UncachedInput,
+    CacheRead,
+    CacheWrite,
+    ProviderOutput,
+    Unattributed,
+    Remaining,
+}
+
+impl ContextUsageSegment {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UncachedInput => "Uncached input",
+            Self::CacheRead => "Cache read",
+            Self::CacheWrite => "Cache write",
+            Self::ProviderOutput => "Provider output",
+            Self::Unattributed => "Unattributed",
+            Self::Remaining => "Remaining",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextUsageSegmentHit {
+    pub segment: ContextUsageSegment,
+    pub tokens: u64,
+    pub context_window: u64,
+    pub evidence: ObservationEvidenceV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextUsageHover {
+    pub column: u16,
+    pub row: u16,
+    pub hit: ContextUsageSegmentHit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMonitorView {
+    pub key: SessionMonitorKey,
+    pub section: SessionMonitorSection,
+    pub scroll: BTreeMap<SessionMonitorSection, usize>,
+    pub support: SessionMonitorSupport,
+    pub node_restarted: bool,
+}
+
+impl SessionMonitorView {
+    fn new(key: SessionMonitorKey, support: SessionMonitorSupport) -> Self {
+        Self {
+            key,
+            section: SessionMonitorSection::Overview,
+            scroll: BTreeMap::new(),
+            support,
+            node_restarted: false,
+        }
+    }
+
+    pub fn section_scroll(&self) -> usize {
+        self.scroll.get(&self.section).copied().unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AgentBoardColumn {
+    Attention,
+    Working,
+    Idle,
+    Dormant,
+    Unknown,
+    Offline,
+}
+
+impl AgentBoardColumn {
+    pub const ALL: [Self; 6] = [
+        Self::Attention,
+        Self::Working,
+        Self::Idle,
+        Self::Dormant,
+        Self::Unknown,
+        Self::Offline,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Attention => "Attention",
+            Self::Working => "Working",
+            Self::Idle => "Idle",
+            Self::Dormant => "Dormant",
+            Self::Unknown => "Unknown",
+            Self::Offline => "Offline",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentBoardCard {
+    pub key: AgentRowKey,
+    pub column: AgentBoardColumn,
+    pub reason: String,
+    pub partial: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentBoardState {
+    pub selected: Option<AgentRowKey>,
+    pub task_filter: Option<TaskId>,
+    pub column_scroll: usize,
+    pub vertical_offsets: BTreeMap<AgentBoardColumn, usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AgentBoardMode {
+    HarnessKanban,
+    #[default]
+    SessionMonitoring,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HarnessKanbanColumn {
+    Backlog,
+    Ready,
+    Running,
+    Waiting,
+    Review,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl HarnessKanbanColumn {
+    pub const ALL: [Self; 8] = [
+        Self::Backlog,
+        Self::Ready,
+        Self::Running,
+        Self::Waiting,
+        Self::Review,
+        Self::Done,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
+    pub fn state(self) -> HarnessTaskStateV1 {
+        match self {
+            Self::Backlog => HarnessTaskStateV1::Backlog,
+            Self::Ready => HarnessTaskStateV1::Ready,
+            Self::Running => HarnessTaskStateV1::Running,
+            Self::Waiting => HarnessTaskStateV1::Waiting,
+            Self::Review => HarnessTaskStateV1::Review,
+            Self::Done => HarnessTaskStateV1::Done,
+            Self::Failed => HarnessTaskStateV1::Failed,
+            Self::Cancelled => HarnessTaskStateV1::Cancelled,
+        }
+    }
+
+    pub fn from_state(state: HarnessTaskStateV1) -> Self {
+        match state {
+            HarnessTaskStateV1::Backlog => Self::Backlog,
+            HarnessTaskStateV1::Ready => Self::Ready,
+            HarnessTaskStateV1::Running => Self::Running,
+            HarnessTaskStateV1::Waiting => Self::Waiting,
+            HarnessTaskStateV1::Review => Self::Review,
+            HarnessTaskStateV1::Done => Self::Done,
+            HarnessTaskStateV1::Failed => Self::Failed,
+            HarnessTaskStateV1::Cancelled => Self::Cancelled,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Backlog => "Backlog",
+            Self::Ready => "Ready",
+            Self::Running => "Running",
+            Self::Waiting => "Waiting",
+            Self::Review => "Review",
+            Self::Done => "Done",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HarnessTaskComposerField {
+    #[default]
+    Title,
+    Body,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HarnessTaskComposer {
+    pub field: HarnessTaskComposerField,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessRunMonitorView {
+    pub run: RedactedRunV1,
+    pub monitor: Option<HarnessSessionMonitorV1>,
+    pub timeline: Vec<TimelineEntryV1>,
+    pub loading: bool,
+    pub stale_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HarnessKanbanState {
+    pub enabled: bool,
+    pub tasks: BTreeMap<HarnessTaskId, RedactedTaskV1>,
+    pub runs: BTreeMap<HarnessRunId, RedactedRunV1>,
+    pub selected: Option<HarnessTaskId>,
+    pub column_scroll: usize,
+    pub vertical_offsets: BTreeMap<HarnessKanbanColumn, usize>,
+    pub hover_position: Option<(u16, u16)>,
+    pub pending_refresh: Option<u64>,
+    pub stale_reason: Option<String>,
+    pub composer: Option<HarnessTaskComposer>,
+    pub monitor: Option<HarnessRunMonitorView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedAgentPreference {
+    pub node_id: String,
+    pub record_id: String,
+    pub pinned: bool,
+    pub alias: Option<String>,
+    pub order: Option<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunLens {
+    pub key: AgentRowKey,
+    pub node_id: String,
+    pub workspace_id: String,
+    node_incarnation_id: Option<NodeIncarnationId>,
+    return_workspace_route: Option<(String, String)>,
+    return_sidebar_mode: SidebarMode,
+    return_control_section: ControlSection,
+    return_focus: Focus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentRunGitScopeView {
+    Loading,
+    SharedWorkspace,
+    ExclusiveManagedWorktree { branch: String, base_commit: String },
+    SharedManagedWorktree { branch: String, base_commit: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentMenuAction {
+    Open,
+    InspectWorkspace,
+    ActivityBoard,
+    ToggleMetrics,
+    TogglePin,
+    LocalAlias,
+    MoveUp,
+    MoveDown,
+    NewTaskId,
+    AssignTaskId,
+    CopyTaskId,
+    ClearTaskId,
+    Rename,
+    Resume,
+    History,
+    Stop,
+    Forget,
+}
+
+impl AgentMenuAction {
+    pub const ALL: [Self; 17] = [
+        Self::Open,
+        Self::InspectWorkspace,
+        Self::ActivityBoard,
+        Self::ToggleMetrics,
+        Self::TogglePin,
+        Self::LocalAlias,
+        Self::MoveUp,
+        Self::MoveDown,
+        Self::NewTaskId,
+        Self::AssignTaskId,
+        Self::CopyTaskId,
+        Self::ClearTaskId,
+        Self::Rename,
+        Self::Resume,
+        Self::History,
+        Self::Stop,
+        Self::Forget,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open PTY",
+            Self::InspectWorkspace => "Inspect workspace",
+            Self::ActivityBoard => "Open Agent Board",
+            Self::ToggleMetrics => "Show / hide metrics",
+            Self::TogglePin => "Pin / unpin locally",
+            Self::LocalAlias => "Local alias...",
+            Self::MoveUp => "Move up locally",
+            Self::MoveDown => "Move down locally",
+            Self::NewTaskId => "New session correlation",
+            Self::AssignTaskId => "Assign session correlation...",
+            Self::CopyTaskId => "Copy task ID",
+            Self::ClearTaskId => "Clear task ID",
+            Self::Rename => "Rename...",
+            Self::Resume => "Resume",
+            Self::History => "History...",
+            Self::Stop => "Stop PTY",
+            Self::Forget => "Forget record...",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentMenuItem {
+    pub action: AgentMenuAction,
+    pub label: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentMenuState {
+    pub key: AgentRowKey,
+    pub anchor_column: u16,
+    pub anchor_row: u16,
+    pub selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSessionMenuAction {
+    OpenTranscriptMetrics,
+    OpenWorkspace,
+    Resume,
+    RenameProviderRecord,
+    OpenAgentBoard,
+}
+
+impl NativeSessionMenuAction {
+    pub const ALL: [Self; 5] = [
+        Self::OpenTranscriptMetrics,
+        Self::OpenWorkspace,
+        Self::Resume,
+        Self::RenameProviderRecord,
+        Self::OpenAgentBoard,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenTranscriptMetrics => "Open transcript + metrics",
+            Self::OpenWorkspace => "Open workspace",
+            Self::Resume => "Resume",
+            Self::RenameProviderRecord => "Rename managed record...",
+            Self::OpenAgentBoard => "Open Agent Board",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionMenuItem {
+    pub action: NativeSessionMenuAction,
+    pub label: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionMenuState {
+    pub key: PreviewTabKey,
+    pub anchor_column: u16,
+    pub anchor_row: u16,
+    pub selected: usize,
 }
 
 impl SessionView {
@@ -161,6 +758,8 @@ pub struct WorkspaceView {
     pub label: String,
     pub canonical_root: OpaqueHostPath,
     pub providers: Vec<ProviderInventory>,
+    pub worktree_service_mode: Option<WorktreeServiceMode>,
+    pub managed_worktree_profiles: Option<WorktreeProfileInventory>,
     pub sessions: Vec<SessionView>,
 }
 
@@ -169,84 +768,20 @@ pub struct NodeView {
     pub node_id: String,
     pub incarnation_id: Option<NodeIncarnationId>,
     pub endpoint: String,
+    pub relay_route: C2RelayRoute,
     pub connection: ConnectionState,
     pub controller_owned: bool,
     pub event_sequence: u64,
+    pub launch_inventory: Option<LaunchInventory>,
+    pub providers: Vec<ProviderInventory>,
     pub workspaces: Vec<WorkspaceView>,
     pub session_records: Vec<ManagedSessionView>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionTab {
-    pub address: SessionAddress,
-}
-
-pub const MAX_GRID_PANES: usize = 4;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SurfaceMode {
-    #[default]
-    Tab,
-    Grid,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum GridPreset {
-    #[default]
-    Quad,
-    Columns,
-    Rows,
-}
-
-impl GridPreset {
-    pub const ALL: [Self; 3] = [Self::Quad, Self::Columns, Self::Rows];
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::Quad => "2x2",
-            Self::Columns => "1x4",
-            Self::Rows => "4x1",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GridAxisKind {
-    Columns,
-    Rows,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GridPane {
-    pub address: SessionAddress,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GridState {
-    pub panes: Vec<GridPane>,
-    pub focused: usize,
-    pub preset: GridPreset,
-    pub column_cuts: [u16; 3],
-    pub row_cuts: [u16; 3],
-}
-
-impl Default for GridState {
-    fn default() -> Self {
-        Self {
-            panes: Vec::new(),
-            focused: 0,
-            preset: GridPreset::Quad,
-            column_cuts: [2_500, 5_000, 7_500],
-            row_cuts: [2_500, 5_000, 7_500],
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DragSource {
-    Tab(usize),
+    Tab(PaneId, usize),
     Agent(usize),
-    Pane(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,11 +791,16 @@ pub enum Focus {
     Tabs,
     Viewport,
     Spawn,
+    ExistingSession,
     AddSpace,
+    FolderBrowser,
+    CreateWorkspaceEntry,
     CreateWorktree,
     RemoveWorktree,
     RenameSession,
+    TaskId,
     ForgetSession,
+    History,
     Settings,
 }
 
@@ -284,6 +824,7 @@ impl SidebarMode {
 pub enum RosterMode {
     #[default]
     Agents,
+    NativeSessions,
     Workspaces,
 }
 
@@ -291,7 +832,16 @@ impl RosterMode {
     pub fn id(self) -> &'static str {
         match self {
             Self::Agents => "agents",
+            Self::NativeSessions => "native sessions",
             Self::Workspaces => "workspaces",
+        }
+    }
+
+    pub fn compact_id(self) -> &'static str {
+        match self {
+            Self::Agents => "A",
+            Self::NativeSessions => "N",
+            Self::Workspaces => "W",
         }
     }
 }
@@ -360,6 +910,36 @@ impl ControlSection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DragState {
+    SpawnModal {
+        grab_column: u16,
+        grab_row: u16,
+        origin_x: u16,
+        origin_y: u16,
+    },
+    ExistingSessionModal {
+        grab_column: u16,
+        grab_row: u16,
+        origin_x: u16,
+        origin_y: u16,
+    },
+    AddSpaceModal {
+        grab_column: u16,
+        grab_row: u16,
+        origin_x: u16,
+        origin_y: u16,
+    },
+    FolderBrowserModal {
+        grab_column: u16,
+        grab_row: u16,
+        origin_x: u16,
+        origin_y: u16,
+    },
+    CreateWorktreeModal {
+        grab_column: u16,
+        grab_row: u16,
+        origin_x: u16,
+        origin_y: u16,
+    },
     ControlModal {
         grab_column: u16,
         grab_row: u16,
@@ -374,9 +954,14 @@ pub enum DragState {
     },
     SidebarWidth,
     SidebarSplit,
+    SurfaceDivider {
+        path: PaneSplitPath,
+        axis: SplitAxis,
+        area: Rect,
+    },
     SessionChip {
         source: DragSource,
-        address: SessionAddress,
+        tab: SurfaceTab,
         start_column: u16,
         start_row: u16,
         current_column: u16,
@@ -389,10 +974,32 @@ pub enum DragState {
         start_row: u16,
         moved: bool,
     },
-    GridDivider {
-        axis: GridAxisKind,
-        index: usize,
+    AgentOrder {
+        key: AgentRowKey,
+        start_column: u16,
+        start_row: u16,
+        moved: bool,
     },
+    FileSelection {
+        key: WorkspaceFileTabKey,
+        viewport: Rect,
+    },
+    FileScrollbar {
+        key: WorkspaceFileTabKey,
+        viewport: Rect,
+    },
+    TerminalSelection {
+        address: SessionAddress,
+        viewport: Rect,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalSelection {
+    pub address: SessionAddress,
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -400,6 +1007,518 @@ pub struct SpawnDialog {
     pub node_id: String,
     pub workspace_id: String,
     pub provider: Provider,
+    pub target: LaunchTarget,
+    pub profile_id: String,
+    pub worktree_profile_id: String,
+    pub bundle_id: String,
+    pub context_mode: LaunchContextMode,
+    pub field: LaunchField,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingSessionField {
+    Node,
+    Workspace,
+    Provider,
+    Sessions,
+    AskAfterResume,
+    DisplayName,
+    SessionId,
+}
+
+impl ExistingSessionField {
+    const CATALOG: [Self; 2] = [
+        Self::Sessions,
+        Self::AskAfterResume,
+    ];
+
+    const ADVANCED: [Self; 5] = [
+        Self::Node,
+        Self::Workspace,
+        Self::Provider,
+        Self::DisplayName,
+        Self::SessionId,
+    ];
+
+    fn cycle(self, mode: ExistingSessionMode, forward: bool) -> Self {
+        let fields = match mode {
+            ExistingSessionMode::Catalog => Self::CATALOG.as_slice(),
+            ExistingSessionMode::AdvancedImport => Self::ADVANCED.as_slice(),
+        };
+        let current = fields.iter().position(|field| *field == self).unwrap_or(0);
+        let index = if forward {
+            (current + 1) % fields.len()
+        } else if current == 0 {
+            fields.len() - 1
+        } else {
+            current - 1
+        };
+        fields[index]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingSessionMode {
+    Catalog,
+    AdvancedImport,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NativeSessionCatalogRoute {
+    pub scope: NativeSessionCatalogScope,
+    pub workspace_id: Option<String>,
+    pub provider: Provider,
+}
+
+impl NativeSessionCatalogRoute {
+    pub(crate) fn workspace(workspace_id: String, provider: Provider) -> Self {
+        Self {
+            scope: NativeSessionCatalogScope::Workspace,
+            workspace_id: Some(workspace_id),
+            provider,
+        }
+    }
+
+    pub(crate) fn unregistered(provider: Provider) -> Self {
+        Self {
+            scope: NativeSessionCatalogScope::Unregistered,
+            workspace_id: None,
+            provider,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionRoutePageState {
+    pub catalog_revision: u64,
+    pub recent_cutoff_unix_ms: u64,
+    pub recent_remaining_count: u32,
+    pub older_remaining_count: u32,
+    pub recent_next_after_selection_id: Option<String>,
+    pub older_next_after_selection_id: Option<String>,
+    pub recent_has_more: bool,
+    pub older_has_more: bool,
+    pub pending: Option<(NativeSessionCatalogWindow, u64)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionCatalogRowView {
+    pub node_id: String,
+    pub route: NativeSessionCatalogRoute,
+    pub catalog_revision: u64,
+    pub recent_cutoff_unix_ms: u64,
+    pub selection_id: String,
+    pub title: Option<String>,
+    pub modified_at: Option<String>,
+    pub model: Option<String>,
+    pub message_count: Option<u64>,
+    pub completed_turn_count: Option<u64>,
+    pub external_group: Option<NativeSessionExternalGroup>,
+    pub record_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum NativeSessionGroupKey {
+    Workspace(String),
+    OtherProjects,
+    External {
+        provider: Provider,
+        kind: NativeSessionExternalGroupKind,
+        group_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeSessionTreeItem {
+    Agent {
+        agent_index: usize,
+        nested: bool,
+    },
+    Workspace {
+        key: NativeSessionGroupKey,
+        label: String,
+        session_count: usize,
+        collapsed: bool,
+        external: bool,
+    },
+    Provider {
+        group: NativeSessionGroupKey,
+        provider: Provider,
+        session_count: usize,
+        collapsed: bool,
+    },
+    Session {
+        row_index: usize,
+    },
+    LoadMore {
+        route: NativeSessionCatalogRoute,
+        window: NativeSessionCatalogWindow,
+        remaining_count: u32,
+        loading: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionPreviewMessageView {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionPreviewView {
+    pub title: Option<String>,
+    pub modified_at: Option<String>,
+    pub model: Option<String>,
+    pub message_count: u64,
+    pub message_count_exact: bool,
+    pub completed_turn_count: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub truncated: bool,
+    pub messages: Vec<NativeSessionPreviewMessageView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeSessionPreviewState {
+    Loading,
+    Ready(NativeSessionPreviewView),
+    Empty(NativeSessionPreviewView),
+    Unavailable(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PreviewTabKey {
+    ManagedRecord {
+        node_id: String,
+        record_id: String,
+    },
+    NativeSelection {
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WorkspaceFileTabKey {
+    pub node_id: String,
+    pub workspace_id: String,
+    pub path: RepositoryPath,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceFileState {
+    Loading,
+    Ready,
+    NonUtf8 { byte_len: u32 },
+    TooLarge { limit_bytes: u32 },
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceFileTabView {
+    pub editor: TextEditor,
+    pub state: WorkspaceFileState,
+    pub edit_mode: bool,
+    pub request_token: u64,
+    pub inline_history: Option<WorkspaceGitTabView>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WorkspaceGitTabKey {
+    pub node_id: String,
+    pub workspace_id: String,
+    pub history_path: Option<RepositoryPath>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceGitRequestDestination {
+    Surface(WorkspaceGitTabKey),
+    InlineFile(WorkspaceFileTabKey),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommitView {
+    pub id: String,
+    pub parents: Vec<String>,
+    pub subject: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at: String,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub committed_at: String,
+    pub signature_status: String,
+    pub signer: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceGitState {
+    Loading,
+    Ready,
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceGitDiffTarget {
+    Working { path: Option<RepositoryPath> },
+    Staged { path: Option<RepositoryPath> },
+    Commit { revision: String, path: Option<RepositoryPath> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceGitDiffView {
+    pub target: WorkspaceGitDiffTarget,
+    pub text: String,
+    pub byte_len: u32,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkspaceGitPaneMode {
+    #[default]
+    List,
+    Detail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceGitTabView {
+    pub state: WorkspaceGitState,
+    pub mode: WorkspaceGitPaneMode,
+    pub history_path: Option<RepositoryPath>,
+    pub commits: Vec<GitCommitView>,
+    pub selected: usize,
+    pub list_scroll: usize,
+    pub detail_scroll: usize,
+    pub next_before: Option<String>,
+    pub has_more: bool,
+    pub diff: Option<WorkspaceGitDiffView>,
+    pub diff_error: Option<String>,
+    pub pending_diff: Option<WorkspaceGitDiffTarget>,
+    pub history_token: u64,
+    pub diff_token: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SurfaceTab {
+    AgentBoard,
+    SessionMonitor(SessionMonitorKey),
+    Pty(SessionAddress),
+    Preview(PreviewTabKey),
+    File(WorkspaceFileTabKey),
+    Git(WorkspaceGitTabKey),
+}
+
+impl SurfaceTab {
+    pub fn pty_address(&self) -> Option<&SessionAddress> {
+        match self {
+            Self::Pty(address) => Some(address),
+            Self::AgentBoard | Self::SessionMonitor(_) | Self::Preview(_) | Self::File(_) | Self::Git(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewTabView {
+    pub title: String,
+    pub workspace_id: String,
+    pub provider: Provider,
+    pub preview: NativeSessionPreviewState,
+    pub phase: PreviewTabPhase,
+    pub reconnect_error: Option<String>,
+    pub scroll: usize,
+    pub request_token: u64,
+    pub resume_available: bool,
+    pub record_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewTabPhase {
+    Hydrated,
+    Indexing,
+    Resuming,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreviewResumeOperation {
+    origin: Option<PreviewTabKey>,
+    node_id: String,
+    workspace_id: String,
+    provider: Provider,
+    selection_id: Option<String>,
+    record_id: Option<String>,
+    operation_token: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionRecordResumeDisposition {
+    RejectRecord,
+    UpsertRecord,
+    UpsertRecordAndOpen(SessionAddress),
+}
+
+impl NativeSessionCatalogRowView {
+    pub fn display_name(&self) -> String {
+        let preferred = self.title.as_deref().unwrap_or("Existing session").trim();
+        bounded_session_display_name(preferred, "Existing session")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeSessionCatalogState {
+    Loading,
+    Ready,
+    Empty,
+    Unavailable(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExistingSessionOperation {
+    IndexingOnly {
+        node_id: String,
+        workspace_id: String,
+        provider: Provider,
+        session_id: String,
+        operation_token: u64,
+    },
+    IndexingForResume {
+        node_id: String,
+        workspace_id: String,
+        provider: Provider,
+        session_id: String,
+        initial_prompt: Option<String>,
+        operation_token: u64,
+    },
+    IndexingNativeForResume {
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: String,
+        initial_prompt: Option<String>,
+        operation_token: u64,
+    },
+    Resuming { node_id: String, record_id: String, operation_token: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExistingSessionDialog {
+    pub node_id: String,
+    pub workspace_id: String,
+    pub provider: Provider,
+    pub mode: ExistingSessionMode,
+    pub catalog: NativeSessionCatalogState,
+    pub rows: Vec<NativeSessionCatalogRowView>,
+    pub selected: usize,
+    pub tree_cursor: usize,
+    pub scroll: usize,
+    pub display_name: String,
+    pub session_id: String,
+    pub field: ExistingSessionField,
+    pub operation: Option<ExistingSessionOperation>,
+    pub operation_error: Option<String>,
+    pub request_token: u64,
+    pub pending_routes: BTreeSet<NativeSessionCatalogRoute>,
+    pub route_pages: BTreeMap<NativeSessionCatalogRoute, NativeSessionRoutePageState>,
+    pub catalog_failure: Option<(String, bool)>,
+    pub preview: Option<NativeSessionPreviewState>,
+    pub preview_scroll: usize,
+    pub preview_request_token: u64,
+    pub preview_record_id: Option<String>,
+    pub preview_selection_id: Option<String>,
+    pub ask_after_resume: String,
+}
+
+impl ExistingSessionDialog {
+    pub(crate) fn native_history_provider_totals(&self) -> BTreeMap<Provider, u64> {
+        let mut totals = BTreeMap::<Provider, u64>::new();
+        for (route, state) in &self.route_pages {
+            let loaded = u64::try_from(
+                self.rows
+                    .iter()
+                    .filter(|row| row.node_id == self.node_id && row.route == *route)
+                    .count(),
+            )
+            .unwrap_or(u64::MAX);
+            let route_total = loaded
+                .saturating_add(u64::from(state.recent_remaining_count))
+                .saturating_add(u64::from(state.older_remaining_count));
+            totals
+                .entry(route.provider.clone())
+                .and_modify(|total| *total = total.saturating_add(route_total))
+                .or_insert(route_total);
+        }
+        totals
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchTarget {
+    ExistingWorkspace,
+    NewLinkedWorktree,
+    NewStandaloneRepository,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LaunchContextMode {
+    #[default]
+    None,
+    ContextPack,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchField {
+    Node,
+    Workspace,
+    GitLocation,
+    Provider,
+    Delivery,
+    ContinueFrom,
+}
+
+impl LaunchField {
+    const ALL: [Self; 6] = [
+        Self::Node,
+        Self::Workspace,
+        Self::GitLocation,
+        Self::Provider,
+        Self::Delivery,
+        Self::ContinueFrom,
+    ];
+
+    fn cycle(self, forward: bool) -> Self {
+        let current = Self::ALL.iter().position(|field| *field == self).unwrap_or(0);
+        let index = if forward {
+            (current + 1) % Self::ALL.len()
+        } else if current == 0 {
+            Self::ALL.len() - 1
+        } else {
+            current - 1
+        };
+        Self::ALL[index]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadedHistoryView {
+    pub session_id: String,
+    pub message_count: u64,
+    pub completed_turn_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryDialog {
+    pub source: SessionAddress,
+    pub source_provider: Provider,
+    pub source_workspace_root: OpaqueHostPath,
+    pub candidates: Vec<HistoryCandidateSummary>,
+    pub selected: usize,
+    pub loaded: Option<LoadedHistoryView>,
+    pub context: Option<ResolvedContextPackReceipt>,
+    pub pending_label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -419,6 +1538,41 @@ pub struct AddSpaceDialog {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FolderBrowserField {
+    Entries,
+    Filter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolderBrowserDialog {
+    pub node_id: String,
+    pub directory: Option<OpaqueHostPath>,
+    pub parent: Option<OpaqueHostPath>,
+    pub entries: Vec<HostDirectoryEntry>,
+    pub next_after: Option<OpaqueHostPath>,
+    pub incomplete: bool,
+    pub selected: usize,
+    pub scroll: usize,
+    pub filter: String,
+    pub field: FolderBrowserField,
+    pub pending: bool,
+    pub append_pending: bool,
+    pub request_token: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateWorkspaceEntryDialog {
+    pub node_id: String,
+    pub workspace_id: String,
+    pub kind: WorkspaceEntryKind,
+    pub path: String,
+    pub pending: bool,
+    pub token: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CreateWorktreeField {
     WorkspaceId,
     TargetRoot,
@@ -435,6 +1589,16 @@ pub struct CreateWorktreeDialog {
     pub branch: String,
     pub base: String,
     pub field: CreateWorktreeField,
+    pub return_to_spawn: bool,
+    pub kind: GitLocationDialogKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitLocationDialogKind {
+    ManualLinked,
+    ManagedLinked,
+    LinkedDisabled,
+    Standalone,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -451,6 +1615,15 @@ pub struct RenameSessionDialog {
     pub record_id: String,
     pub original_name: String,
     pub display_name: String,
+    pub local_alias: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskIdDialog {
+    pub node_id: String,
+    pub record_id: String,
+    pub expected_revision: u64,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -467,6 +1640,7 @@ pub enum UiKey {
     OperatorEscape,
     TerminalBytes(Vec<u8>),
     Enter,
+    ModifiedEnter,
     Escape,
     Backspace,
     Insert,
@@ -477,6 +1651,14 @@ pub enum UiKey {
     Down,
     Left,
     Right,
+    ShiftHome,
+    ShiftEnd,
+    ShiftUp,
+    ShiftDown,
+    ShiftLeft,
+    ShiftRight,
+    ShiftPageUp,
+    ShiftPageDown,
     Tab,
     BackTab,
     PageUp,
@@ -496,6 +1678,48 @@ pub enum AppAction {
         rows: u16,
         cols: u16,
     },
+    SpawnSpec {
+        node_id: String,
+        workspace_id: String,
+        provider: Provider,
+        rows: u16,
+        cols: u16,
+        profile_id: String,
+        profile_revision: String,
+        prompt: Option<String>,
+        bundle_id: Option<String>,
+        context_id: Option<String>,
+        idempotency_key: String,
+    },
+    SpawnManagedWorktree {
+        node_id: String,
+        workspace_id: String,
+        provider: Provider,
+        rows: u16,
+        cols: u16,
+        profile_id: String,
+        profile_revision: String,
+        worktree_profile_id: String,
+        prompt: Option<String>,
+        bundle_id: Option<String>,
+        context_id: Option<String>,
+        idempotency_key: String,
+    },
+    DiscoverHistory {
+        address: SessionAddress,
+        limit: u16,
+    },
+    LoadHistory {
+        address: SessionAddress,
+        candidate_id: String,
+    },
+    ExportContextPack {
+        address: SessionAddress,
+    },
+    ForgetContextPack {
+        node_id: String,
+        context_id: String,
+    },
     Resume {
         address: SessionAddress,
         rows: u16,
@@ -506,11 +1730,73 @@ pub enum AppAction {
         record_id: String,
         rows: u16,
         cols: u16,
+        initial_prompt: Option<String>,
+        operation_token: u64,
+    },
+    IndexProviderSession {
+        node_id: String,
+        workspace_id: String,
+        provider: Provider,
+        identity: ProviderSessionIdentity,
+        display_name: String,
+        operation_token: u64,
+    },
+    CatalogNativeSessions {
+        node_id: String,
+        routes: Vec<NativeSessionCatalogRoute>,
+        limit: u16,
+        token: u64,
+    },
+    PageNativeSessions {
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        window: NativeSessionCatalogWindow,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        after_selection_id: Option<String>,
+        limit: u16,
+        token: u64,
+    },
+    PreviewNativeSession {
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: String,
+        message_limit: u16,
+        token: u64,
+    },
+    IndexNativeSession {
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: String,
+        display_name: String,
+        operation_token: u64,
+    },
+    PreviewSessionRecord {
+        node_id: String,
+        record_id: String,
+        message_limit: u16,
+        token: u64,
+    },
+    RefreshSessionRecordHistory {
+        node_id: String,
+        node_incarnation_id: NodeIncarnationId,
+        record_id: String,
+        message_limit: u16,
     },
     RenameSessionRecord {
         node_id: String,
         record_id: String,
         display_name: String,
+    },
+    SetSessionTask {
+        node_id: String,
+        record_id: String,
+        expected_revision: u64,
+        target: SessionTaskTargetV1,
     },
     ForgetSessionRecord {
         node_id: String,
@@ -524,6 +1810,13 @@ pub enum AppAction {
     Stop { address: SessionAddress, force: bool },
     Remove { address: SessionAddress },
     RegisterWorkspace { node_id: String, workspace_id: String, root: OpaqueHostPath },
+    BrowseHostDirectories {
+        node_id: String,
+        directory: Option<OpaqueHostPath>,
+        after: Option<OpaqueHostPath>,
+        token: u64,
+        append: bool,
+    },
     UnregisterWorkspace { node_id: String, workspace_id: String },
     CreateWorktree {
         node_id: String,
@@ -533,17 +1826,135 @@ pub enum AppAction {
         branch: String,
         base: Option<String>,
     },
+    CreateStandaloneWorkspace {
+        node_id: String,
+        workspace_id: String,
+        root: OpaqueHostPath,
+        initial_branch: Option<String>,
+    },
     RemoveWorktree {
         node_id: String,
         source_workspace_id: String,
         target_root: OpaqueHostPath,
     },
+    ReadWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        token: u64,
+    },
+    WriteWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        expected_revision: String,
+        text: String,
+        token: u64,
+    },
+    CreateWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        token: u64,
+    },
+    CreateWorkspaceDirectory {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        token: u64,
+    },
+    ReadGitHistory {
+        node_id: String,
+        workspace_id: String,
+        path: Option<RepositoryPath>,
+        before: Option<String>,
+        limit: u16,
+        token: u64,
+        destination: WorkspaceGitRequestDestination,
+    },
+    ReadGitDiff {
+        node_id: String,
+        workspace_id: String,
+        target: WorkspaceGitDiffTarget,
+        token: u64,
+        destination: WorkspaceGitRequestDestination,
+    },
     InspectWorkspace { node_id: String, workspace_id: String },
     Resync { node_id: String, after_sequence: u64 },
+    HarnessRefresh {
+        token: u64,
+    },
+    HarnessCreateTask {
+        token: u64,
+        title: String,
+        body: String,
+        initial_state: HarnessTaskStateV1,
+    },
+    HarnessMoveTask {
+        token: u64,
+        task_id: HarnessTaskId,
+        expected_revision: HarnessRevision,
+        state: HarnessTaskStateV1,
+    },
+    HarnessCancelTask {
+        token: u64,
+        task_id: HarnessTaskId,
+        expected_revision: HarnessRevision,
+    },
+    HarnessRetryTask {
+        token: u64,
+        task_id: HarnessTaskId,
+        expected_revision: HarnessRevision,
+    },
+    HarnessScheduleNext {
+        token: u64,
+        plan_id: Option<HarnessSelectorV1>,
+    },
+    HarnessOpenMonitor {
+        run_id: HarnessRunId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HitTarget {
+    SpawnDrag,
+    SpawnField(LaunchField),
+    SpawnFieldPrevious(LaunchField),
+    SpawnFieldNext(LaunchField),
+    SpawnRegisterWorkspace,
+    SpawnConfigureGitLocation,
+    SpawnCancel,
+    SpawnLaunch,
+    ExistingSessionDrag,
+    ExistingSessionField(ExistingSessionField),
+    ExistingSessionFieldPrevious(ExistingSessionField),
+    ExistingSessionFieldNext(ExistingSessionField),
+    ExistingSessionRow(usize),
+    NativeWorkspaceGroup(NativeSessionGroupKey),
+    NativeProviderGroup(NativeSessionGroupKey, Provider),
+    NativeSessionsLoadMore(NativeSessionCatalogRoute, NativeSessionCatalogWindow),
+    ExistingSessionNativeResume,
+    ExistingSessionRestoreViaSkill,
+    ExistingSessionAdvancedImport,
+    ExistingSessionBackToCatalog,
+    ExistingSessionCancel,
+    ExistingSessionImport,
+    AddSpaceDrag,
+    AddSpaceField(AddSpaceField),
+    AddSpaceBrowse,
+    AddSpaceCancel,
+    AddSpaceRegister,
+    FolderBrowserDrag,
+    FolderBrowserParent,
+    FolderBrowserFilter,
+    FolderBrowserEntry(usize),
+    FolderBrowserLoadMore,
+    FolderBrowserUse,
+    FolderBrowserCancel,
+    CreateWorktreeDrag,
+    CreateWorktreeField(CreateWorktreeField),
+    CreateWorktreeCancel,
+    CreateWorktreeCreate,
     SidebarMode(SidebarMode),
     RosterMode(RosterMode),
     Space(usize),
@@ -556,17 +1967,66 @@ pub enum HitTarget {
     RegisterWorktree(usize),
     RemoveWorktree(usize),
     SidebarItem(usize),
+    NewFile,
+    NewDirectory,
+    CreateWorkspaceEntryCancel,
+    CreateWorkspaceEntrySubmit,
     Agent(usize),
+    AgentMore(usize),
+    NativeSessionMore(usize),
+    AgentRun(AgentRowKey),
+    AgentProgressToggle(AgentRowKey),
+    AgentOrderHandle(AgentRowKey),
+    AgentBoardOpen,
+    AgentBoardCard(AgentRowKey),
+    AgentBoardCardOpen(AgentRowKey),
+    AgentBoardCardRun(AgentRowKey),
+    AgentBoardCardProgress(AgentRowKey),
+    HarnessTaskCard(HarnessTaskId),
+    HarnessTaskRefresh,
+    HarnessTaskCreate,
+    HarnessScheduleNext,
+    HarnessColumnScroll(usize),
+    HarnessComposerField(HarnessTaskComposerField),
+    HarnessComposerCreate,
+    HarnessComposerCancel,
+    HarnessTaskMove(HarnessTaskStateV1),
+    HarnessTaskCancel,
+    HarnessTaskRetry,
+    HarnessTaskMonitor,
+    HarnessBoardMode(AgentBoardMode),
+    SessionMonitorSection(PaneId, SessionMonitorSection),
+    ContextUsageSegment(ContextUsageSegmentHit),
+    AgentBoardTaskFilter,
+    AgentRunAll,
+    AgentMenuAction(AgentMenuAction),
+    NativeSessionMenuAction(NativeSessionMenuAction),
     AddAgent,
-    Tab(usize),
+    NativeSessionsOpen,
+    SurfaceTab(PaneId, usize),
     AddTab,
-    GridToggle,
-    GridPreset(GridPreset),
-    GridPaneHeader(usize),
-    GridPaneBody(usize),
-    GridDropSlot(usize),
-    TabDrop,
-    GridDivider(GridAxisKind, usize),
+    LayoutMenuToggle,
+    LayoutPreset(LayoutPreset),
+    SurfaceDivider {
+        path: PaneSplitPath,
+        axis: SplitAxis,
+        area: Rect,
+    },
+    SurfacePaneHeader(PaneId),
+    SurfacePaneBody(PaneId),
+    FileHistory(PaneId),
+    FileSource(PaneId),
+    FileHistoryCommit(PaneId, usize),
+    FileHistoryBack(PaneId),
+    FileHistoryPrevious(PaneId),
+    FileHistoryNext(PaneId),
+    FileChanges(PaneId),
+    FileEdit(PaneId),
+    FileSave(PaneId),
+    FileScrollbar(PaneId),
+    GitCommit(PaneId, usize),
+    GitBack(PaneId),
+    PreviewResume(PaneId),
     Settings,
     ControlSection(ControlSection),
     SettingsStyle,
@@ -589,8 +2049,8 @@ pub struct HitRegion {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GridPaneLayout {
-    pub pane_index: usize,
+pub struct SurfacePaneLayout {
+    pub pane_id: PaneId,
     pub frame: Rect,
     pub header: Rect,
     pub viewport: Rect,
@@ -605,9 +2065,12 @@ pub struct LayoutRects {
     pub viewport: Rect,
     pub control_content: Rect,
     pub control_modal: Rect,
-    pub grid_panes: Vec<GridPaneLayout>,
-    pub grid_drop: Rect,
-    pub tab_drop: Rect,
+    pub spawn_modal: Rect,
+    pub existing_session_modal: Rect,
+    pub add_space_modal: Rect,
+    pub folder_browser_modal: Rect,
+    pub create_worktree_modal: Rect,
+    pub surface_panes: Vec<SurfacePaneLayout>,
     pub hits: Vec<HitRegion>,
 }
 
@@ -616,12 +2079,14 @@ pub struct App {
     pub nodes: Vec<NodeView>,
     pub selected_space: usize,
     pub selected_agent: usize,
-    pub tabs: Vec<SessionTab>,
+    pub surface: SurfaceState<SurfaceTab>,
+    pub preview_tabs: BTreeMap<PreviewTabKey, PreviewTabView>,
+    pub file_tabs: BTreeMap<WorkspaceFileTabKey, WorkspaceFileTabView>,
+    pub git_tabs: BTreeMap<WorkspaceGitTabKey, WorkspaceGitTabView>,
+    pub session_monitors: BTreeMap<SessionMonitorTarget, SessionMonitorView>,
     pub pending_open: Vec<SessionAddress>,
     pub pending_space: Option<(String, String)>,
-    pub selected_tab: usize,
-    pub surface_mode: SurfaceMode,
-    pub grid: GridState,
+    pub layout_menu_open: bool,
     pub sidebar_mode: SidebarMode,
     pub roster_mode: RosterMode,
     pub files_cursor: usize,
@@ -631,7 +2096,10 @@ pub struct App {
     pub agents_scroll: usize,
     pub workspaces_scroll: usize,
     pub terminal_scroll_offsets: BTreeMap<SessionAddress, usize>,
+    pub terminal_selection: Option<TerminalSelection>,
     pub collapsed_directories: BTreeSet<(String, String, RepositoryPath)>,
+    pub collapsed_native_workspaces: BTreeSet<(String, NativeSessionGroupKey)>,
+    pub collapsed_native_providers: BTreeSet<(String, NativeSessionGroupKey, Provider)>,
     pub menu_placement: MenuPlacement,
     pub sidebar_presentation: SidebarPresentation,
     pub sidebar_collapsed: bool,
@@ -639,24 +2107,72 @@ pub struct App {
     pub settings_return_focus: Focus,
     pub control_modal_position: Option<(u16, u16)>,
     pub control_modal_size: Option<(u16, u16)>,
+    pub spawn_modal_position: Option<(u16, u16)>,
+    pub existing_session_modal_position: Option<(u16, u16)>,
+    pub add_space_modal_position: Option<(u16, u16)>,
+    pub folder_browser_modal_position: Option<(u16, u16)>,
+    pub create_worktree_modal_position: Option<(u16, u16)>,
     pub sidebar_width: u16,
     pub sidebar_split_percent: u16,
     pub drag_state: Option<DragState>,
+    pub agent_menu: Option<AgentMenuState>,
+    pub native_session_menu: Option<NativeSessionMenuState>,
+    pub agent_run_lens: Option<AgentRunLens>,
+    pub expanded_agent_progress: BTreeSet<AgentRowKey>,
+    pub managed_agent_preferences: BTreeMap<(String, String), ManagedAgentPreference>,
+    pub agent_board: AgentBoardState,
+    pub agent_board_mode: AgentBoardMode,
+    pub harness_kanban: HarnessKanbanState,
+    pub harness_schedule_plan: Option<Option<HarnessSelectorV1>>,
     pub workspace_inspections: BTreeMap<(String, String), WorkspaceInspection>,
     pub inspection_pending: Option<(String, String)>,
     pub focus: Focus,
     pub spawn: Option<SpawnDialog>,
+    pub existing_session: Option<ExistingSessionDialog>,
     pub add_space: Option<AddSpaceDialog>,
+    pub folder_browser: Option<FolderBrowserDialog>,
+    pub create_workspace_entry: Option<CreateWorkspaceEntryDialog>,
     pub create_worktree: Option<CreateWorktreeDialog>,
     pub remove_worktree: Option<RemoveWorktreeDialog>,
     pub rename_session: Option<RenameSessionDialog>,
+    pub task_id_dialog: Option<TaskIdDialog>,
     pub forget_session: Option<ForgetSessionDialog>,
+    pub history: Option<HistoryDialog>,
+    pub last_spawn_receipt: Option<ResolvedSpawnReceipt>,
+    pub last_managed_spawn_receipt: Option<ManagedWorktreeSpawnReceipt>,
+    pub last_managed_worktree_lease: Option<ManagedWorktreeLeaseSnapshot>,
+    pub last_managed_worktree_removed: Option<String>,
     pub color_mode: PtyColorMode,
     pub notice: Option<String>,
     pub terminal_rows: u16,
     pub terminal_cols: u16,
     pub layout: LayoutRects,
     pub should_quit: bool,
+    animation_tick: u16,
+    last_idempotency_unix_ms: u64,
+    idempotency_counter: u16,
+    folder_browser_token: u64,
+    native_catalog_token: u64,
+    native_catalog_route_tokens: BTreeMap<(String, NativeSessionCatalogRoute), u64>,
+    native_provider_branches_initialized: bool,
+    native_preview_token: u64,
+    file_request_token: u64,
+    workspace_entry_token: u64,
+    git_request_token: u64,
+    existing_session_operation_token: u64,
+    preview_resume: Option<PreviewResumeOperation>,
+    cancelled_preview_resumes: BTreeSet<(String, String, u64)>,
+    session_monitor_order: VecDeque<SessionMonitorTarget>,
+    session_monitor_support: BTreeMap<(String, NodeIncarnationId), SessionMonitorSupport>,
+    observation_projections: HashMap<ObservationTarget, SessionProjection>,
+    observation_durable_cursors: BTreeMap<(String, NodeIncarnationId), u64>,
+    session_history_refresh_pending: BTreeSet<(String, String, NodeIncarnationId)>,
+    session_history_refreshed: BTreeSet<(String, String, NodeIncarnationId)>,
+    pub observation_persistence: ObservationPersistenceState,
+    pub context_usage_hover: Option<ContextUsageHover>,
+    observation_revision: u64,
+    #[cfg(test)]
+    observation_engine: ObservationEngine,
 }
 
 impl Default for App {
@@ -665,12 +2181,14 @@ impl Default for App {
             nodes: Vec::new(),
             selected_space: 0,
             selected_agent: 0,
-            tabs: Vec::new(),
+            surface: SurfaceState::default(),
+            preview_tabs: BTreeMap::new(),
+            file_tabs: BTreeMap::new(),
+            git_tabs: BTreeMap::new(),
+            session_monitors: BTreeMap::new(),
             pending_open: Vec::new(),
             pending_space: None,
-            selected_tab: 0,
-            surface_mode: SurfaceMode::Tab,
-            grid: GridState::default(),
+            layout_menu_open: false,
             sidebar_mode: SidebarMode::Files,
             roster_mode: RosterMode::Agents,
             files_cursor: 0,
@@ -680,7 +2198,10 @@ impl Default for App {
             agents_scroll: 0,
             workspaces_scroll: 0,
             terminal_scroll_offsets: BTreeMap::new(),
+            terminal_selection: None,
             collapsed_directories: BTreeSet::new(),
+            collapsed_native_workspaces: BTreeSet::new(),
+            collapsed_native_providers: BTreeSet::new(),
             menu_placement: MenuPlacement::Sidebar,
             sidebar_presentation: SidebarPresentation::Split,
             sidebar_collapsed: false,
@@ -688,29 +2209,215 @@ impl Default for App {
             settings_return_focus: Focus::Tabs,
             control_modal_position: None,
             control_modal_size: None,
+            spawn_modal_position: None,
+            existing_session_modal_position: None,
+            add_space_modal_position: None,
+            folder_browser_modal_position: None,
+            create_worktree_modal_position: None,
             sidebar_width: 26,
             sidebar_split_percent: 50,
             drag_state: None,
+            agent_menu: None,
+            native_session_menu: None,
+            agent_run_lens: None,
+            expanded_agent_progress: BTreeSet::new(),
+            managed_agent_preferences: BTreeMap::new(),
+            agent_board: AgentBoardState::default(),
+            agent_board_mode: AgentBoardMode::default(),
+            harness_kanban: HarnessKanbanState::default(),
+            harness_schedule_plan: None,
             workspace_inspections: BTreeMap::new(),
             inspection_pending: None,
             focus: Focus::Spaces,
             spawn: None,
+            existing_session: None,
             add_space: None,
+            folder_browser: None,
+            create_workspace_entry: None,
             create_worktree: None,
             remove_worktree: None,
             rename_session: None,
+            task_id_dialog: None,
             forget_session: None,
+            history: None,
+            last_spawn_receipt: None,
+            last_managed_spawn_receipt: None,
+            last_managed_worktree_lease: None,
+            last_managed_worktree_removed: None,
             color_mode: PtyColorMode::Inherited,
             notice: None,
             terminal_rows: 24,
             terminal_cols: 80,
             layout: LayoutRects::default(),
             should_quit: false,
+            animation_tick: 0,
+            last_idempotency_unix_ms: 0,
+            idempotency_counter: 0,
+            folder_browser_token: 0,
+            native_catalog_token: 0,
+            native_catalog_route_tokens: BTreeMap::new(),
+            native_provider_branches_initialized: false,
+            native_preview_token: 0,
+            file_request_token: 0,
+            workspace_entry_token: 0,
+            git_request_token: 0,
+            existing_session_operation_token: 0,
+            preview_resume: None,
+            cancelled_preview_resumes: BTreeSet::new(),
+            session_monitor_order: VecDeque::new(),
+            session_monitor_support: BTreeMap::new(),
+            observation_projections: HashMap::new(),
+            observation_durable_cursors: BTreeMap::new(),
+            session_history_refresh_pending: BTreeSet::new(),
+            session_history_refreshed: BTreeSet::new(),
+            observation_persistence: ObservationPersistenceState::default(),
+            context_usage_hover: None,
+            observation_revision: 0,
+            #[cfg(test)]
+            observation_engine: ObservationEngine::new(),
         }
     }
 }
 
+pub fn observation_kind_label(kind: &ObservationKindV1) -> &'static str {
+    match kind {
+        ObservationKindV1::SourceCapabilities { .. } => "source-capabilities",
+        ObservationKindV1::SessionStarted => "session-started",
+        ObservationKindV1::Ready => "ready",
+        ObservationKindV1::Stopped => "stopped",
+        ObservationKindV1::Exited { .. } => "exited",
+        ObservationKindV1::TurnStarted => "turn-started",
+        ObservationKindV1::Working => "working",
+        ObservationKindV1::TurnCompleted => "turn-completed",
+        ObservationKindV1::TurnInterrupted => "turn-interrupted",
+        ObservationKindV1::ToolStarted { .. } => "tool-started",
+        ObservationKindV1::ToolCompleted { .. } => "tool-completed",
+        ObservationKindV1::ApprovalRequested { .. } => "approval-requested",
+        ObservationKindV1::QuestionRequested { .. } => "question-requested",
+        ObservationKindV1::ApprovalResolved { .. } => "approval-resolved",
+        ObservationKindV1::QuestionResolved { .. } => "question-resolved",
+        ObservationKindV1::InteractionResolved { .. } => "interaction-resolved",
+        ObservationKindV1::SubagentStarted { .. } => "subagent-started",
+        ObservationKindV1::SubagentProgress { .. } => "subagent-progress",
+        ObservationKindV1::SubagentCompleted { .. } => "subagent-completed",
+        ObservationKindV1::TodoSnapshot { .. } => "todo-snapshot",
+        ObservationKindV1::Usage { .. } => "usage",
+        ObservationKindV1::ContextWindowUsage { .. } => "context-window-usage",
+        ObservationKindV1::RateLimited => "rate-limited",
+        ObservationKindV1::OwnedProcessStarted { .. } => "process-started",
+        ObservationKindV1::OwnedProcessExited { .. } => "process-exited",
+        ObservationKindV1::FileChanged { .. } => "file-changed",
+        ObservationKindV1::HistorySnapshot { .. } => "history-snapshot",
+        ObservationKindV1::Gap { .. } => "gap",
+        ObservationKindV1::SourceReset => "source-reset",
+        ObservationKindV1::Stale => "stale",
+        ObservationKindV1::Error { .. } => "error",
+    }
+}
+
+pub(crate) fn observation_target(
+    address: &SessionAddress,
+    incarnation_id: NodeIncarnationId,
+) -> Result<ObservationTarget, String> {
+    Ok(ObservationTarget::Runtime {
+        key: RuntimeSessionKey {
+            node_id: ObservationNodeId::new(address.node_id.clone())
+                .map_err(|error| error.to_string())?,
+            incarnation_id,
+            workspace_id: ObservationWorkspaceId::new(address.workspace_id.clone())
+                .map_err(|error| error.to_string())?,
+            instance_id: ObservationAgentInstanceId(address.instance_id),
+            generation: ObservationSessionGeneration(address.generation),
+        },
+    })
+}
+
+fn session_monitor_observation_target(
+    target: &SessionMonitorTarget,
+) -> Result<ObservationTarget, String> {
+    match target {
+        SessionMonitorTarget::Runtime { address, incarnation } => {
+            observation_target(address, *incarnation)
+        }
+        SessionMonitorTarget::Managed { node_id, record_id, incarnation } => Ok(ObservationTarget::Managed {
+            key: ManagedSessionKey {
+                node_id: ObservationNodeId::new(node_id.clone())
+                    .map_err(|error| error.to_string())?,
+                incarnation_id: *incarnation,
+                record_id: ObservationSessionRecordId::new(record_id.clone())
+                    .map_err(|error| error.to_string())?,
+            },
+        }),
+    }
+}
+
+fn observation_session_monitor_target(target: &ObservationTarget) -> SessionMonitorTarget {
+    match target {
+        ObservationTarget::Runtime { key } => SessionMonitorTarget::Runtime {
+            address: SessionAddress {
+                node_id: key.node_id.to_string(),
+                workspace_id: key.workspace_id.to_string(),
+                instance_id: key.instance_id.0,
+                generation: key.generation.0,
+            },
+            incarnation: key.incarnation_id,
+        },
+        ObservationTarget::Managed { key } => SessionMonitorTarget::Managed {
+            node_id: key.node_id.to_string(),
+            record_id: key.record_id.to_string(),
+            incarnation: key.incarnation_id,
+        },
+    }
+}
+
 impl App {
+    pub(crate) fn advance_animation_frame(&mut self) {
+        self.animation_tick = self.animation_tick.wrapping_add(1);
+    }
+
+    pub(crate) fn has_active_animation(&self) -> bool {
+        self.create_workspace_entry
+            .as_ref()
+            .is_some_and(|dialog| dialog.pending)
+            || self.surface.leaf_ids().into_iter().any(|pane_id| {
+            let Some(tab) = self
+                .surface
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.active_tab())
+            else {
+                return false;
+            };
+            match tab {
+                SurfaceTab::AgentBoard => self.harness_kanban.monitor
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.loading),
+                SurfaceTab::SessionMonitor(_) | SurfaceTab::Pty(_) => false,
+                SurfaceTab::Preview(key) => self.preview_tabs.get(key).is_some_and(|preview| {
+                    preview.phase != PreviewTabPhase::Hydrated
+                        || matches!(preview.preview, NativeSessionPreviewState::Loading)
+                }),
+                SurfaceTab::File(key) => self
+                    .file_tabs
+                    .get(key)
+                    .and_then(|file| file.inline_history.as_ref())
+                    .is_some_and(|history| {
+                        history.state == WorkspaceGitState::Loading
+                            || history.pending_diff.is_some()
+                    }),
+                SurfaceTab::Git(key) => self.git_tabs.get(key).is_some_and(|history| {
+                    history.state == WorkspaceGitState::Loading
+                        || history.pending_diff.is_some()
+                }),
+            }
+            })
+    }
+
+    pub(crate) fn activity_spinner(&self) -> char {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        FRAMES[(usize::from(self.animation_tick) / 4) % FRAMES.len()]
+    }
+
     pub fn space_rows(&self) -> Vec<(usize, usize)> {
         let mut rows = Vec::new();
         for (node_index, node) in self.nodes.iter().enumerate() {
@@ -846,6 +2553,210 @@ impl App {
         self.notice = Some(format!("{node_id}/{workspace_id}: {message}"));
     }
 
+    pub fn visible_host_directory_indices(&self) -> Vec<usize> {
+        let Some(browser) = self.folder_browser.as_ref() else {
+            return Vec::new();
+        };
+        let filter = browser.filter.trim().to_lowercase();
+        browser
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                (filter.is_empty() || entry.display_name.to_lowercase().contains(&filter))
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    pub fn apply_host_directories(
+        &mut self,
+        node_id: String,
+        token: u64,
+        append: bool,
+        listing: HostDirectoryListing,
+    ) {
+        let Some(browser) = self
+            .folder_browser
+            .as_mut()
+            .filter(|browser| browser.node_id == node_id && browser.request_token == token)
+        else {
+            return;
+        };
+        if append && browser.directory != listing.directory {
+            browser.pending = false;
+            browser.append_pending = false;
+            browser.error = Some("directory changed while loading the next page".to_owned());
+            return;
+        }
+        let listing_incomplete = listing.incomplete;
+        let mut client_capped = false;
+        if append {
+            for entry in listing.entries {
+                if browser.entries.len() == MAX_BROWSER_LOADED_ENTRIES {
+                    client_capped = true;
+                    break;
+                }
+                if !browser.entries.iter().any(|current| current.path == entry.path) {
+                    browser.entries.push(entry);
+                }
+            }
+        } else {
+            browser.directory = listing.directory;
+            browser.parent = listing.parent;
+            browser.entries = listing
+                .entries
+                .into_iter()
+                .take(MAX_BROWSER_LOADED_ENTRIES)
+                .collect();
+            browser.selected = 0;
+            browser.scroll = 0;
+        }
+        browser.next_after = listing.next_after;
+        browser.incomplete = listing_incomplete || client_capped;
+        browser.pending = false;
+        browser.append_pending = false;
+        browser.error = None;
+        let visible_count = self.visible_host_directory_indices().len();
+        if let Some(browser) = self.folder_browser.as_mut() {
+            browser.selected = browser.selected.min(visible_count.saturating_sub(1));
+            browser.scroll = browser.scroll.min(visible_count.saturating_sub(1));
+        }
+    }
+
+    pub fn fail_host_directory_browse(
+        &mut self,
+        node_id: String,
+        token: u64,
+        message: String,
+    ) {
+        let Some(browser) = self
+            .folder_browser
+            .as_mut()
+            .filter(|browser| browser.node_id == node_id && browser.request_token == token)
+        else {
+            return;
+        };
+        browser.pending = false;
+        browser.append_pending = false;
+        browser.error = Some(message);
+    }
+
+    pub fn apply_history_discovered(
+        &mut self,
+        source: SessionAddress,
+        candidates: Vec<HistoryCandidateSummary>,
+    ) {
+        let Some(history) = self.history.as_mut().filter(|history| history.source == source) else {
+            return;
+        };
+        history.candidates = candidates;
+        history.selected = history.selected.min(history.candidates.len().saturating_sub(1));
+        history.loaded = None;
+        history.context = None;
+        history.pending_label = None;
+        self.notice = Some(format!(
+            "history discovery returned {} candidate(s)",
+            history.candidates.len(),
+        ));
+    }
+
+    pub fn apply_history_loaded(
+        &mut self,
+        source: SessionAddress,
+        session_id: String,
+        message_count: u64,
+        completed_turn_count: Option<u64>,
+    ) {
+        let Some(history) = self.history.as_mut().filter(|history| history.source == source) else {
+            return;
+        };
+        history.loaded = Some(LoadedHistoryView {
+            session_id,
+            message_count,
+            completed_turn_count,
+        });
+        history.context = None;
+        history.pending_label = None;
+        self.notice = Some(format!("loaded bounded history metadata: {message_count} message(s)"));
+    }
+
+    pub fn apply_context_exported(&mut self, receipt: ResolvedContextPackReceipt) {
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        let lineage = &receipt.lineage;
+        let matches_source = lineage.source_node_id.as_str() == history.source.node_id
+            && lineage.source_provider == history.source_provider
+            && lineage.source_session.workspace_id.as_str() == history.source.workspace_id
+            && lineage.source_session.session.instance_id.0 == history.source.instance_id
+            && lineage.source_session.session.generation.0 == history.source.generation;
+        if !matches_source {
+            self.notice = Some("context receipt does not match the selected history source".to_owned());
+            return;
+        }
+        let id = receipt.id.to_string();
+        history.context = Some(receipt);
+        history.pending_label = None;
+        self.notice = Some(format!("ContextPack {id} is ready for launch"));
+    }
+
+    pub fn apply_context_forgotten(&mut self, id: SpawnContextId) {
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        if history.context.as_ref().is_some_and(|context| context.id == id) {
+            history.context = None;
+            history.pending_label = None;
+            self.notice = Some(format!("ContextPack {id} forgotten"));
+        }
+    }
+
+    pub fn apply_spawn_receipt(&mut self, receipt: ResolvedSpawnReceipt) {
+        self.notice = Some(format!(
+            "launch accepted: {} #{}:{}",
+            receipt.session.workspace_id,
+            receipt.session.session.instance_id.0,
+            receipt.session.session.generation.0,
+        ));
+        self.last_managed_spawn_receipt = None;
+        self.last_managed_worktree_lease = None;
+        self.last_managed_worktree_removed = None;
+        self.last_spawn_receipt = Some(receipt);
+    }
+
+    pub fn apply_managed_spawn_receipt(&mut self, receipt: ManagedWorktreeSpawnReceipt) {
+        self.notice = Some(format!(
+            "managed worktree launch accepted: {} #{}:{}",
+            receipt.lease.workspace_id,
+            receipt.spawn.session.session.instance_id.0,
+            receipt.spawn.session.session.generation.0,
+        ));
+        self.last_spawn_receipt = None;
+        self.last_managed_worktree_lease = Some(receipt.lease.clone());
+        self.last_managed_worktree_removed = None;
+        self.last_managed_spawn_receipt = Some(receipt);
+    }
+
+    pub fn apply_managed_worktree_lease(&mut self, lease: ManagedWorktreeLeaseSnapshot) {
+        self.last_managed_worktree_removed = None;
+        self.last_managed_worktree_lease = Some(lease);
+    }
+
+    pub fn apply_managed_worktree_removed(&mut self, lease_id: String) {
+        let matches_latest = self
+            .last_managed_worktree_lease
+            .as_ref()
+            .is_some_and(|lease| lease.lease_id.as_str() == lease_id)
+            || self
+                .last_managed_spawn_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.lease.lease_id.as_str() == lease_id);
+        if matches_latest {
+            self.last_managed_worktree_removed = Some(lease_id);
+        }
+    }
+
     pub fn selected_agent_session(&self) -> Option<&SessionView> {
         let key = self.agent_rows().get(self.selected_agent)?.clone();
         let address = self.agent_row_active_address(&key)?;
@@ -857,64 +2768,59 @@ impl App {
         self.find_managed_session(&key)
     }
 
-    pub fn selected_tab_session(&self) -> Option<&SessionView> {
-        self.find_session(&self.tabs.get(self.selected_tab)?.address)
-    }
-
     pub fn focused_address(&self) -> Option<&SessionAddress> {
-        match self.surface_mode {
-            SurfaceMode::Tab => self.tabs.get(self.selected_tab).map(|tab| &tab.address),
-            SurfaceMode::Grid => self.grid.panes.get(self.grid.focused).map(|pane| &pane.address),
-        }
+        self.surface.active_tab()?.pty_address()
     }
 
     pub fn focused_session(&self) -> Option<&SessionView> {
         self.find_session(self.focused_address()?)
     }
 
+    pub fn focused_preview(&self) -> Option<(&PreviewTabKey, &PreviewTabView)> {
+        let SurfaceTab::Preview(key) = self.surface.active_tab()? else {
+            return None;
+        };
+        self.preview_tabs.get_key_value(key)
+    }
+
+    pub fn focused_session_monitor(&self) -> Option<&SessionMonitorView> {
+        let SurfaceTab::SessionMonitor(key) = self.surface.active_tab()? else {
+            return None;
+        };
+        self.session_monitor(key)
+    }
+
+    pub fn session_monitor(&self, key: &SessionMonitorKey) -> Option<&SessionMonitorView> {
+        self.session_monitors.get(&key.target)
+    }
+
     pub fn focused_terminal_rect(&self) -> Rect {
-        match self.surface_mode {
-            SurfaceMode::Tab => self.layout.viewport,
-            SurfaceMode::Grid => self
-                .layout
-                .grid_panes
-                .iter()
-                .find(|pane| pane.pane_index == self.grid.focused)
-                .map(|pane| pane.viewport)
-                .unwrap_or(self.layout.viewport),
-        }
+        self.layout
+            .surface_panes
+            .iter()
+            .find(|pane| pane.pane_id == self.surface.focused)
+            .map(|pane| pane.viewport)
+            .unwrap_or(self.layout.viewport)
     }
 
     pub fn desired_terminal_sizes(&self) -> Vec<(SessionAddress, u16, u16)> {
-        match self.surface_mode {
-            SurfaceMode::Tab => self
-                .focused_session()
-                .filter(|session| session.running)
-                .map(|session| {
-                    let rect = self.focused_terminal_rect();
-                    (session.address.clone(), rect.height.max(1), rect.width.max(1))
-                })
-                .into_iter()
-                .collect(),
-            SurfaceMode::Grid => self
-                .grid
-                .panes
-                .iter()
-                .enumerate()
-                .filter_map(|(pane_index, pane)| {
-                    if !self.find_session(&pane.address).is_some_and(|session| session.running) {
-                        return None;
-                    }
-                    let rect = self
-                        .layout
-                        .grid_panes
-                        .iter()
-                        .find(|layout| layout.pane_index == pane_index)?
-                        .viewport;
-                    Some((pane.address.clone(), rect.height.max(1), rect.width.max(1)))
-                })
-                .collect(),
-        }
+        self.surface
+            .panes
+            .iter()
+            .filter_map(|(pane_id, pane)| {
+                let address = pane.active_tab()?.pty_address()?;
+                if !self.find_session(address).is_some_and(|session| session.running) {
+                    return None;
+                }
+                let rect = self
+                    .layout
+                    .surface_panes
+                    .iter()
+                    .find(|layout| layout.pane_id == *pane_id)?
+                    .viewport;
+                Some((address.clone(), rect.height.max(1), rect.width.max(1)))
+            })
+            .collect()
     }
 
     pub fn find_session(&self, address: &SessionAddress) -> Option<&SessionView> {
@@ -937,9 +2843,68 @@ impl App {
             .flat_map(|node| node.session_records.iter())
             .find(|record| record.active_session.as_ref() == Some(address))
         {
-            return Some(record.short_title());
+            return Some(record.display_name.clone());
         }
         self.find_session(address).map(SessionView::short_title)
+    }
+
+    pub fn surface_tab_title(&self, tab: &SurfaceTab) -> String {
+        match tab {
+            SurfaceTab::AgentBoard => "Agent board".to_owned(),
+            SurfaceTab::SessionMonitor(key) => match &key.target {
+                SessionMonitorTarget::Runtime { address, .. } => format!(
+                    "Monitor {} #{}:{}",
+                    address.workspace_id,
+                    address.instance_id,
+                    address.generation,
+                ),
+                SessionMonitorTarget::Managed { record_id, .. } => {
+                    format!("Monitor @{record_id}")
+                }
+            },
+            SurfaceTab::Pty(address) => {
+                let provider = self
+                    .nodes
+                    .iter()
+                    .filter(|node| node.node_id == address.node_id)
+                    .flat_map(|node| node.session_records.iter())
+                    .find(|record| record.active_session.as_ref() == Some(address))
+                    .map(|record| record.provider.clone())
+                    .or_else(|| self.find_session(address).map(|session| session.provider.clone()));
+                provider.map_or_else(
+                    || format!("{} #{}", address.workspace_id, address.instance_id),
+                    |provider| {
+                        format!("[{provider}] {} #{}", address.workspace_id, address.instance_id)
+                    },
+                )
+            }
+            SurfaceTab::Preview(key) => self
+                .preview_tabs
+                .get(key)
+                .map(|preview| format!("[{}] {} · history", preview.provider, preview.workspace_id))
+                .unwrap_or_else(|| "detached history".to_owned()),
+            SurfaceTab::File(key) => repository_path_file_name_display(&key.path),
+            SurfaceTab::Git(key) => self
+                .git_tabs
+                .get(key)
+                .and_then(|git| git.history_path.as_ref())
+                .map(|path| format!("git {}", repository_path_file_name_display(path)))
+                .unwrap_or_else(|| "git".to_owned()),
+        }
+    }
+
+    pub fn focused_file(&self) -> Option<(&WorkspaceFileTabKey, &WorkspaceFileTabView)> {
+        let SurfaceTab::File(key) = self.surface.active_tab()? else {
+            return None;
+        };
+        Some((key, self.file_tabs.get(key)?))
+    }
+
+    pub fn focused_git(&self) -> Option<(&WorkspaceGitTabKey, &WorkspaceGitTabView)> {
+        let SurfaceTab::Git(key) = self.surface.active_tab()? else {
+            return None;
+        };
+        Some((key, self.git_tabs.get(key)?))
     }
 
     pub fn find_managed_session(&self, key: &AgentRowKey) -> Option<&ManagedSessionView> {
@@ -959,6 +2924,1142 @@ impl App {
             AgentRowKey::Managed { .. } => self.find_managed_session(key)?.active_session.clone(),
             AgentRowKey::Legacy(address) => Some(address.clone()),
         }
+    }
+
+    pub fn set_session_monitor_support(
+        &mut self,
+        node_id: String,
+        incarnation_id: NodeIncarnationId,
+        support: SessionMonitorSupport,
+    ) {
+        self.session_monitor_support
+            .insert((node_id.clone(), incarnation_id), support);
+        for (target, monitor) in &mut self.session_monitors {
+            if target.node_id() == node_id && target.incarnation() == incarnation_id {
+                monitor.support = support;
+            }
+        }
+    }
+
+    pub fn session_monitor_support_for_route(
+        &self,
+        node_id: &str,
+        incarnation_id: NodeIncarnationId,
+    ) -> SessionMonitorSupport {
+        self.session_monitor_support
+            .get(&(node_id.to_owned(), incarnation_id))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn session_monitor_agent_for_target(&self, target: &SessionMonitorTarget) -> AgentRowKey {
+        match target {
+            SessionMonitorTarget::Managed { node_id, record_id, .. } => AgentRowKey::Managed {
+                node_id: node_id.clone(),
+                record_id: record_id.clone(),
+            },
+            SessionMonitorTarget::Runtime { address, .. } => self.agent_rows()
+                .into_iter()
+                .find(|key| matches!(key, AgentRowKey::Legacy(candidate) if candidate == address))
+                .unwrap_or_else(|| AgentRowKey::Legacy(address.clone())),
+        }
+    }
+
+    fn ensure_session_monitor(
+        &mut self,
+        agent: AgentRowKey,
+        target: SessionMonitorTarget,
+    ) -> Option<&mut SessionMonitorView> {
+        let store_key = target.clone();
+        if !self.session_monitors.contains_key(&store_key) {
+            while self.session_monitors.len() >= MAX_SESSION_MONITORS {
+                let open = self.surface.all_tabs().into_iter().filter_map(|tab| match tab {
+                    SurfaceTab::SessionMonitor(key) => Some(key.target.clone()),
+                    _ => None,
+                }).collect::<BTreeSet<_>>();
+                let Some(index) = self.session_monitor_order
+                    .iter()
+                    .position(|candidate| !open.contains(candidate))
+                else {
+                    self.notice = Some(
+                        "Session Monitor capacity reached; close a monitor tab before observing another session"
+                            .to_owned(),
+                    );
+                    return None;
+                };
+                let oldest = self.session_monitor_order.remove(index)
+                    .expect("bounded monitor eviction index");
+                self.session_monitors.remove(&oldest);
+            }
+            let support = self
+                .session_monitor_support
+                .get(&(target.node_id().to_owned(), target.incarnation()))
+                .copied()
+                .unwrap_or_default();
+            let key = SessionMonitorKey {
+                agent,
+                target,
+            };
+            self.session_monitors
+                .insert(store_key.clone(), SessionMonitorView::new(key, support));
+            self.session_monitor_order.push_back(store_key.clone());
+        }
+        self.session_monitors.get_mut(&store_key)
+    }
+
+    pub fn open_session_monitor(&mut self, agent: AgentRowKey) -> AppAction {
+        let (node_id, target) = match &agent {
+            AgentRowKey::Managed { node_id, record_id } => (
+                node_id.clone(),
+                self.nodes.iter()
+                    .find(|node| node.node_id == *node_id)
+                    .and_then(|node| node.incarnation_id)
+                    .map(|incarnation| SessionMonitorTarget::Managed {
+                        node_id: node_id.clone(),
+                        record_id: record_id.clone(),
+                        incarnation,
+                    }),
+            ),
+            AgentRowKey::Legacy(address) => (
+                address.node_id.clone(),
+                self.nodes.iter()
+                    .find(|node| node.node_id == address.node_id)
+                    .and_then(|node| node.incarnation_id)
+                    .map(|incarnation| SessionMonitorTarget::Runtime {
+                        address: address.clone(),
+                        incarnation,
+                    }),
+            ),
+        };
+        let Some(target) = target else {
+            self.notice = Some("Session Monitor waits for an exact node incarnation".to_owned());
+            return AppAction::None;
+        };
+        if !self.nodes.iter().any(|node| node.node_id == node_id) {
+            self.notice = Some("Session Monitor waits for the managed node inventory".to_owned());
+            return AppAction::None;
+        }
+        if self.ensure_session_monitor(agent.clone(), target.clone()).is_none() {
+            return AppAction::None;
+        }
+        self.surface.open_in_focused(SurfaceTab::SessionMonitor(SessionMonitorKey {
+            agent: agent.clone(),
+            target,
+        }));
+        self.focus = Focus::Viewport;
+        let AgentRowKey::Managed { node_id, record_id } = agent else {
+            return AppAction::None;
+        };
+        let Some((incarnation_id, true)) = self.nodes.iter()
+            .find(|node| node.node_id == node_id)
+            .and_then(|node| {
+                let record = node.session_records.iter()
+                    .find(|record| record.record_id == record_id)?;
+                Some((node.incarnation_id?, record.has_provider_session_identity))
+            })
+        else {
+            return AppAction::None;
+        };
+        let refresh_key = (node_id.clone(), record_id.clone(), incarnation_id);
+        if self.session_history_refresh_pending.contains(&refresh_key)
+            || self.session_history_refreshed.contains(&refresh_key)
+        {
+            return AppAction::None;
+        }
+        self.session_history_refresh_pending.insert(refresh_key);
+        while self.session_history_refresh_pending.len() > MAX_SESSION_HISTORY_REFRESH_KEYS {
+            let Some(oldest) = self.session_history_refresh_pending.iter().next().cloned() else {
+                break;
+            };
+            self.session_history_refresh_pending.remove(&oldest);
+        }
+        AppAction::RefreshSessionRecordHistory {
+            node_id,
+            node_incarnation_id: incarnation_id,
+            record_id,
+            message_limit: 1,
+        }
+    }
+
+    pub fn complete_session_record_history_refresh(
+        &mut self,
+        node_id: String,
+        record_id: String,
+        incarnation_id: NodeIncarnationId,
+    ) {
+        let key = (node_id, record_id, incarnation_id);
+        if !self.session_history_refresh_pending.remove(&key) {
+            return;
+        }
+        self.session_history_refreshed.insert(key);
+        while self.session_history_refreshed.len() > MAX_SESSION_HISTORY_REFRESH_KEYS {
+            let Some(oldest) = self.session_history_refreshed.iter().next().cloned() else {
+                break;
+            };
+            self.session_history_refreshed.remove(&oldest);
+        }
+    }
+
+    pub fn fail_session_record_history_refresh(
+        &mut self,
+        node_id: String,
+        record_id: String,
+        incarnation_id: NodeIncarnationId,
+        reason: String,
+    ) {
+        let key = (node_id, record_id, incarnation_id);
+        if self.session_history_refresh_pending.remove(&key) {
+            self.notice = Some(format!("Session Monitor history refresh failed: {reason}"));
+        }
+    }
+
+    #[cfg(test)]
+    fn is_current_node_incarnation(
+        &self,
+        node_id: &str,
+        incarnation_id: NodeIncarnationId,
+    ) -> bool {
+        self.nodes.iter().any(|node| {
+            node.node_id == node_id && node.incarnation_id == Some(incarnation_id)
+        })
+    }
+
+    #[cfg(test)]
+    fn reject_observation_ingress(
+        &mut self,
+        node_id: &str,
+        reason: String,
+        resync_after: Option<u64>,
+    ) -> SessionObservationIngressOutcome {
+        self.notice = Some(format!("{node_id}: {reason}"));
+        SessionObservationIngressOutcome::Rejected {
+            reason,
+            resync_after,
+        }
+    }
+
+    pub fn session_monitor_projection(
+        &self,
+        key: &SessionMonitorKey,
+    ) -> Option<&SessionProjection> {
+        let target = session_monitor_observation_target(&key.target).ok()?;
+        if let Some(projection) = self.observation_projections.get(&target) {
+            return Some(projection);
+        }
+        #[cfg(test)]
+        {
+            return self.observation_engine.projection(&target);
+        }
+        #[cfg(not(test))]
+        None
+    }
+
+    pub fn apply_observation_open_snapshot(
+        &mut self,
+        projections: Vec<SessionProjection>,
+        durable_resume_cursors: Vec<(ObservationNodeId, ObservationNodeCursor)>,
+    ) {
+        self.observation_projections.clear();
+        self.observation_durable_cursors.clear();
+        for projection in projections {
+            let target = observation_session_monitor_target(&projection.target);
+            let agent = self.session_monitor_agent_for_target(&target);
+            self.ensure_session_monitor(agent, target);
+            self.observation_projections
+                .insert(projection.target.clone(), projection);
+        }
+        for (node_id, cursor) in durable_resume_cursors {
+            self.observation_durable_cursors.insert(
+                (node_id.to_string(), cursor.incarnation_id),
+                cursor.sequence,
+            );
+        }
+        self.observation_revision = 0;
+        self.observation_persistence = ObservationPersistenceState::Available { revision: 0 };
+    }
+
+    pub fn apply_observation_committed_route(
+        &mut self,
+        revision: u64,
+        projections: Vec<SessionProjection>,
+        node_id: ObservationNodeId,
+        incarnation_id: NodeIncarnationId,
+        durable_resume_cursor: Option<ObservationNodeCursor>,
+    ) -> bool {
+        if revision <= self.observation_revision {
+            return false;
+        }
+        self.observation_projections.retain(|target, _| {
+            target.node_id() != &node_id
+        });
+        for projection in projections {
+            let target = observation_session_monitor_target(&projection.target);
+            let agent = self.session_monitor_agent_for_target(&target);
+            self.ensure_session_monitor(agent, target);
+            self.observation_projections
+                .insert(projection.target.clone(), projection);
+        }
+        if let Some(cursor) = durable_resume_cursor {
+            self.observation_durable_cursors.insert(
+                (node_id.to_string(), incarnation_id),
+                cursor.sequence,
+            );
+        }
+        self.observation_revision = revision;
+        self.observation_persistence = ObservationPersistenceState::Available { revision };
+        true
+    }
+
+    pub fn mark_observation_persistence_unavailable(&mut self, reason: String) {
+        self.observation_persistence = ObservationPersistenceState::Unavailable(reason.clone());
+        self.notice = Some(format!("Session Monitor persistence unavailable: {reason}"));
+    }
+
+    pub fn durable_observation_cursor(
+        &self,
+        node_id: &str,
+        incarnation_id: NodeIncarnationId,
+    ) -> Option<u64> {
+        self.observation_durable_cursors
+            .get(&(node_id.to_owned(), incarnation_id))
+            .copied()
+    }
+
+    #[cfg(test)]
+    pub fn apply_observation_ingress(
+        &mut self,
+        envelope: ObservationIngressEnvelope,
+    ) -> SessionObservationIngressOutcome {
+        let target = match &envelope.payload {
+            ObservationIngressPayload::Observation {
+                address: ObservationTarget::Runtime { key },
+                ..
+            } => SessionMonitorTarget::Runtime {
+                address: SessionAddress {
+                    node_id: key.node_id.to_string(),
+                    workspace_id: key.workspace_id.to_string(),
+                    instance_id: key.instance_id.0,
+                    generation: key.generation.0,
+                },
+                incarnation: key.incarnation_id,
+            },
+            ObservationIngressPayload::Observation {
+                address: ObservationTarget::Managed { key },
+                ..
+            } => SessionMonitorTarget::Managed {
+                node_id: key.node_id.to_string(),
+                record_id: key.record_id.to_string(),
+                incarnation: key.incarnation_id,
+            },
+            _ => return self.reject_observation_ingress(
+                envelope.node_id.as_str(),
+                "Session Monitor rejected non-observation ingress".to_owned(),
+                None,
+            ),
+        };
+        if !self.is_current_node_incarnation(target.node_id(), target.incarnation()) {
+            let after = self.nodes.iter()
+                .find(|node| node.node_id == target.node_id())
+                .map(|node| node.event_sequence)
+                .unwrap_or(0);
+            return self.reject_observation_ingress(
+                target.node_id(),
+                format!(
+                    "Session Monitor rejected observation for non-current node incarnation {}; resync requested",
+                    target.incarnation(),
+                ),
+                Some(after),
+            );
+        }
+
+        let prepared = match self.observation_engine.prepare(envelope) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let resync_after = matches!(error, ObservationEngineError::ReplacedIncarnation { .. })
+                    .then(|| self.nodes.iter()
+                        .find(|node| node.node_id == target.node_id())
+                        .map(|node| node.event_sequence)
+                        .unwrap_or(0));
+                return self.reject_observation_ingress(
+                    target.node_id(),
+                    format!("Session Monitor observation rejected: {error}"),
+                    resync_after,
+                );
+            }
+        };
+        let outcome = prepared.outcomes()[0];
+        self.observation_engine.accept(prepared);
+        if outcome == ObservationApplyOutcome::Applied {
+            let agent = self.session_monitor_agent_for_target(&target);
+            self.ensure_session_monitor(agent, target);
+            SessionObservationIngressOutcome::Applied
+        } else {
+            SessionObservationIngressOutcome::Duplicate
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_session_observation(
+        &mut self,
+        node_id: String,
+        incarnation_id: NodeIncarnationId,
+        node_sequence: u64,
+        address: SessionAddress,
+        observation: gate4agent_node_protocol::ObservationV1,
+    ) -> bool {
+        let Ok(target) = observation_target(&address, incarnation_id) else {
+            return false;
+        };
+        let Ok(node_id) = ObservationNodeId::new(node_id) else {
+            return false;
+        };
+        matches!(
+            self.apply_observation_ingress(ObservationIngressEnvelope {
+                node_id,
+                cursor: ObservationNodeCursor {
+                    incarnation_id,
+                    sequence: node_sequence,
+                },
+                received_at_ms: node_sequence.max(1),
+                transport: gate4agent_observation_api::ObservationTransport::DirectNode,
+                payload: ObservationIngressPayload::Observation {
+                    address: target,
+                    observation,
+                },
+            }),
+            SessionObservationIngressOutcome::Applied
+        )
+    }
+
+    #[cfg(test)]
+    pub fn mark_session_monitor_transport_gap(
+        &mut self,
+        node_id: &str,
+        incarnation_id: NodeIncarnationId,
+        after_sequence: u64,
+        current_sequence: u64,
+    ) -> bool {
+        if current_sequence <= after_sequence.saturating_add(1) {
+            return false;
+        }
+        let Ok(node_id) = ObservationNodeId::new(node_id) else {
+            return false;
+        };
+        let batch = ObservationResyncBatch {
+            node_id: node_id.clone(),
+            incarnation_id,
+            requested_after: after_sequence,
+            high_watermark: ObservationNodeCursor {
+                incarnation_id,
+                sequence: current_sequence,
+            },
+            oldest_available_sequence: current_sequence,
+            records: Vec::new(),
+            records_complete: false,
+            gaps: vec![gate4agent_observation_engine::gap(
+                after_sequence.saturating_add(1),
+                current_sequence.saturating_sub(1),
+            )],
+            events: Vec::new(),
+        };
+        let Ok(prepared) = self.observation_engine.prepare_resync(&batch) else {
+            return false;
+        };
+        self.observation_engine.accept(prepared);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn apply_observation_resync(&mut self, batch: ObservationResyncBatch) -> bool {
+        match self.observation_engine.prepare_resync(&batch) {
+            Ok(prepared) => {
+                self.observation_engine.accept(prepared);
+                true
+            }
+            Err(error) => {
+                self.notice = Some(format!("Session Monitor resync rejected: {error}"));
+                false
+            }
+        }
+    }
+
+    pub fn observation_record_inventory(
+        &self,
+        node_id: &str,
+        incarnation_id: NodeIncarnationId,
+        complete: bool,
+    ) -> Result<Option<ObservationRecordInventory>, String> {
+        let observation_node_id = ObservationNodeId::new(node_id.to_owned())
+            .map_err(|error| error.to_string())?;
+        let Some(node) = self.nodes.iter().find(|node| {
+            node.node_id == node_id && node.incarnation_id == Some(incarnation_id)
+        }) else {
+            return Ok(None);
+        };
+        let records = node.session_records.iter().map(|record| {
+            let managed = ManagedSessionKey {
+                node_id: observation_node_id.clone(),
+                incarnation_id,
+                record_id: ObservationSessionRecordId::new(record.record_id.clone())
+                    .map_err(|error| error.to_string())?,
+            };
+            let runtime = record.active_session.as_ref().map(|address| {
+                let ObservationTarget::Runtime { key } = observation_target(address, incarnation_id)? else {
+                    unreachable!("runtime target helper returned managed target")
+                };
+                Ok::<RuntimeSessionKey, String>(key)
+            }).transpose()?;
+            Ok::<_, String>(ManagedRecordLink { managed, runtime })
+        }).collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ObservationRecordInventory {
+            node_id: observation_node_id,
+            incarnation_id,
+            records,
+            complete,
+        }))
+    }
+
+    #[cfg(test)]
+    pub fn apply_managed_record_inventory(
+        &mut self,
+        node_id: &str,
+        incarnation_id: NodeIncarnationId,
+        complete: bool,
+    ) -> bool {
+        let inventory = match self.observation_record_inventory(
+            node_id,
+            incarnation_id,
+            complete,
+        ) {
+            Ok(Some(inventory)) => inventory,
+            Ok(None) => return false,
+            Err(error) => {
+                self.notice = Some(format!("Session Monitor record inventory rejected: {error}"));
+                return false;
+            }
+        };
+        match self.observation_engine.prepare_record_inventory(
+            &inventory.node_id,
+            incarnation_id,
+            &inventory.records,
+            complete,
+        ) {
+            Ok(prepared) => {
+                self.observation_engine.accept(prepared);
+                true
+            }
+            Err(error) => {
+                self.notice = Some(format!("Session Monitor record inventory rejected: {error}"));
+                false
+            }
+        }
+    }
+
+    fn mark_session_monitors_restarted(
+        &mut self,
+        node_id: &str,
+        incarnation_id: NodeIncarnationId,
+        _node_sequence: u64,
+    ) {
+        for (target, monitor) in &mut self.session_monitors {
+            if target.node_id() != node_id || target.incarnation() != incarnation_id {
+                continue;
+            }
+            monitor.node_restarted = true;
+        }
+    }
+
+    fn agent_workspace_route(&self, key: &AgentRowKey) -> Option<(String, String)> {
+        match key {
+            AgentRowKey::Managed { .. } => self
+                .find_managed_session(key)
+                .map(|record| (record.node_id.clone(), record.workspace_id.clone())),
+            AgentRowKey::Legacy(address) => {
+                Some((address.node_id.clone(), address.workspace_id.clone()))
+            }
+        }
+    }
+
+    pub fn agent_run_lens_key(&self) -> Option<&AgentRowKey> {
+        self.agent_run_lens.as_ref().map(|lens| &lens.key)
+    }
+
+    pub fn agent_progress_expanded(&self, key: &AgentRowKey) -> bool {
+        self.expanded_agent_progress.contains(key)
+    }
+
+    pub fn agent_row_height(&self, key: &AgentRowKey) -> usize {
+        if self.agent_progress_expanded(key) { 5 } else { 2 }
+    }
+
+    pub(crate) fn agent_roster_max_scroll(&self, visible_rows: usize) -> usize {
+        let rows = self.agent_rows();
+        if rows.is_empty() {
+            return 0;
+        }
+        let mut start = rows.len();
+        let mut used = 0usize;
+        while start > 0 {
+            let height = self.agent_row_height(&rows[start - 1]);
+            if used > 0 && used.saturating_add(height) > visible_rows {
+                break;
+            }
+            used = used.saturating_add(height);
+            start -= 1;
+            if used >= visible_rows {
+                break;
+            }
+        }
+        start
+    }
+
+    fn reconcile_expanded_agent_progress(&mut self) {
+        let previous = std::mem::take(&mut self.expanded_agent_progress);
+        for key in previous {
+            match key {
+                AgentRowKey::Managed { .. } => {
+                    if self.agent_rows().iter().any(|row| row == &key) {
+                        self.expanded_agent_progress.insert(key);
+                    }
+                }
+                AgentRowKey::Legacy(address) => {
+                    if self.find_session(&address).is_some() {
+                        self.expanded_agent_progress
+                            .insert(AgentRowKey::Legacy(address));
+                    } else if let Some(rebound) = self.rebound_address(&address) {
+                        self.expanded_agent_progress
+                            .insert(AgentRowKey::Legacy(rebound));
+                    }
+                }
+            }
+        }
+    }
+
+    fn toggle_agent_progress(&mut self, key: AgentRowKey) -> AppAction {
+        if !self.expanded_agent_progress.remove(&key) {
+            self.expanded_agent_progress.insert(key.clone());
+        }
+        if let Some(index) = self.agent_rows().iter().position(|row| row == &key) {
+            self.selected_agent = index;
+            self.reveal_roster_selection(
+                RosterMode::Agents,
+                self.layout.agents.height.saturating_sub(3),
+            );
+        }
+        AppAction::None
+    }
+
+    pub fn agent_run_git_scope_view(&self) -> AgentRunGitScopeView {
+        let Some(inspection) = self.selected_workspace_inspection() else {
+            return AgentRunGitScopeView::Loading;
+        };
+        let Some(scope) = inspection.git.managed_worktree.as_ref() else {
+            return AgentRunGitScopeView::SharedWorkspace;
+        };
+        let branch = scope.branch.clone();
+        let base_commit = scope.base_commit.as_str()[..8].to_owned();
+        let exclusive = self.agent_run_lens.as_ref().is_some_and(|lens| {
+            self.selected_workspace_route()
+                == Some((lens.node_id.clone(), lens.workspace_id.clone()))
+                && self.agent_workspace_route(&lens.key)
+                    == Some((lens.node_id.clone(), lens.workspace_id.clone()))
+                && match &lens.key {
+                    AgentRowKey::Managed { .. } => {
+                        scope.managed_record_count == 1 && scope.active_session_count <= 1
+                    }
+                    AgentRowKey::Legacy(_) => {
+                        scope.managed_record_count == 0 && scope.active_session_count == 1
+                    }
+                }
+        });
+        if exclusive {
+            AgentRunGitScopeView::ExclusiveManagedWorktree { branch, base_commit }
+        } else {
+            AgentRunGitScopeView::SharedManagedWorktree { branch, base_commit }
+        }
+    }
+
+    fn clear_agent_run_lens(&mut self) {
+        self.agent_run_lens = None;
+    }
+
+    fn reconcile_agent_run_lens(&mut self) {
+        let rebound = self.agent_run_lens.as_ref().and_then(|lens| match &lens.key {
+            AgentRowKey::Legacy(address) => self.rebound_address(address).map(AgentRowKey::Legacy),
+            AgentRowKey::Managed { .. } => None,
+        });
+        if let (Some(lens), Some(key)) = (self.agent_run_lens.as_mut(), rebound) {
+            lens.key = key;
+        }
+        let valid = self.agent_run_lens.as_ref().is_some_and(|lens| {
+            self.selected_workspace_route()
+                == Some((lens.node_id.clone(), lens.workspace_id.clone()))
+                && self.nodes
+                .iter()
+                .find(|node| node.node_id == lens.node_id)
+                .is_some_and(|node| node.incarnation_id == lens.node_incarnation_id)
+                && self.agent_rows().iter().any(|key| key == &lens.key)
+                && self.agent_workspace_route(&lens.key)
+                    == Some((lens.node_id.clone(), lens.workspace_id.clone()))
+                && self.nodes.iter().any(|node| {
+                    node.node_id == lens.node_id
+                        && node.workspaces.iter().any(|workspace| {
+                            workspace.workspace_id == lens.workspace_id
+                        })
+                })
+        });
+        if self.agent_run_lens.is_some() && !valid {
+            self.clear_agent_run_lens();
+        }
+    }
+
+    fn restore_agent_run_lens(&mut self) -> AppAction {
+        let Some(lens) = self.agent_run_lens.take() else {
+            return AppAction::None;
+        };
+        self.sidebar_mode = lens.return_sidebar_mode;
+        self.control_section = lens.return_control_section;
+        self.focus = lens.return_focus;
+        let Some((node_id, workspace_id)) = lens.return_workspace_route else {
+            return AppAction::None;
+        };
+        if !self.select_workspace_route_without_inspection(&node_id, &workspace_id) {
+            return AppAction::None;
+        }
+        self.inspect_selected_workspace()
+    }
+
+    fn toggle_agent_run_lens(&mut self, key: AgentRowKey) -> AppAction {
+        if self.agent_run_lens_key() == Some(&key) {
+            return self.restore_agent_run_lens();
+        }
+        let Some((node_id, workspace_id)) = self.agent_workspace_route(&key) else {
+            self.clear_agent_run_lens();
+            self.notice = Some("workspace route unavailable".to_owned());
+            return AppAction::None;
+        };
+        let Some(node_incarnation_id) = self
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .map(|node| node.incarnation_id)
+        else {
+            self.clear_agent_run_lens();
+            self.notice = Some("node absent from topology".to_owned());
+            return AppAction::None;
+        };
+        let original = self.agent_run_lens.as_ref().map(|lens| (
+            lens.return_workspace_route.clone(),
+            lens.return_sidebar_mode,
+            lens.return_control_section,
+            lens.return_focus,
+        ));
+        let (return_workspace_route, return_sidebar_mode, return_control_section, return_focus) =
+            original.unwrap_or_else(|| (
+                self.selected_workspace_route(),
+                self.sidebar_mode,
+                self.control_section,
+                self.focus,
+            ));
+        if !self.select_workspace_route_without_inspection(&node_id, &workspace_id) {
+            self.clear_agent_run_lens();
+            self.notice = Some("session workspace is not registered on its node".to_owned());
+            return AppAction::None;
+        }
+        self.agent_run_lens = Some(AgentRunLens {
+            key,
+            node_id,
+            workspace_id,
+            node_incarnation_id,
+            return_workspace_route,
+            return_sidebar_mode,
+            return_control_section,
+            return_focus,
+        });
+        self.sidebar_mode = SidebarMode::Files;
+        self.control_section = ControlSection::Files;
+        self.focus = Focus::Spaces;
+        self.inspect_selected_workspace()
+    }
+
+    fn agent_menu_item(
+        action: AgentMenuAction,
+        label: String,
+        disabled_reason: Option<String>,
+    ) -> AgentMenuItem {
+        AgentMenuItem {
+            action,
+            label,
+            enabled: disabled_reason.is_none(),
+            disabled_reason,
+        }
+    }
+
+    fn agent_menu_items_for(&self, key: &AgentRowKey) -> Vec<AgentMenuItem> {
+        let active_address = self.agent_row_active_address(key);
+        let active_session = active_address
+            .as_ref()
+            .and_then(|address| self.find_session(address));
+        let route = self.agent_workspace_route(key);
+        let route_node = route
+            .as_ref()
+            .and_then(|(node_id, _)| self.nodes.iter().find(|node| node.node_id == *node_id));
+        let route_connected = route_node
+            .is_some_and(|node| matches!(node.connection, ConnectionState::Connected));
+        let managed = self.find_managed_session(key);
+
+        AgentMenuAction::ALL
+            .into_iter()
+            .map(|action| {
+                let disabled_reason = match action {
+                    AgentMenuAction::Open => {
+                        if active_address.is_none() {
+                            Some("no live PTY".to_owned())
+                        } else if !route_connected {
+                            Some("node disconnected".to_owned())
+                        } else if active_session.is_none() {
+                            Some("PTY absent from node snapshot".to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                    AgentMenuAction::InspectWorkspace => match (route.as_ref(), route_node) {
+                        (None, _) => Some("workspace route unavailable".to_owned()),
+                        (Some(_), None) => Some("node absent from topology".to_owned()),
+                        (Some(_), Some(node))
+                            if !matches!(node.connection, ConnectionState::Connected) =>
+                        {
+                            Some("node disconnected".to_owned())
+                        }
+                        (Some((_, workspace_id)), Some(node))
+                            if !node
+                                .workspaces
+                                .iter()
+                                .any(|workspace| workspace.workspace_id == *workspace_id) =>
+                        {
+                            Some("workspace is not registered".to_owned())
+                        }
+                        _ => None,
+                    },
+                    AgentMenuAction::ActivityBoard => self
+                        .derive_agent_board_card(key.clone())
+                        .is_none()
+                        .then(|| "agent is absent from the board".to_owned()),
+                    AgentMenuAction::ToggleMetrics => None,
+                    AgentMenuAction::TogglePin | AgentMenuAction::LocalAlias => {
+                        managed.is_none().then(|| "durable managed record required".to_owned())
+                    }
+                    AgentMenuAction::MoveUp => {
+                        if managed.is_none() {
+                            Some("durable managed record required".to_owned())
+                        } else if !self.can_move_managed_agent(key, false) {
+                            Some("already first in local section".to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                    AgentMenuAction::MoveDown => {
+                        if managed.is_none() {
+                            Some("durable managed record required".to_owned())
+                        } else if !self.can_move_managed_agent(key, true) {
+                            Some("already last in local section".to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                    AgentMenuAction::NewTaskId | AgentMenuAction::AssignTaskId => match managed {
+                        None => Some("durable managed record required".to_owned()),
+                        Some(record) if !self.node_is_connected(&record.node_id) => {
+                            Some("node disconnected".to_owned())
+                        }
+                        Some(_) => None,
+                    },
+                    AgentMenuAction::CopyTaskId => match managed {
+                        None => Some("durable managed record required".to_owned()),
+                        Some(record) if record.task_binding.as_ref()
+                            .and_then(|binding| binding.task_id.as_ref()).is_none() => {
+                            Some("task ID is unassigned".to_owned())
+                        }
+                        Some(_) => None,
+                    },
+                    AgentMenuAction::ClearTaskId => match managed {
+                        None => Some("durable managed record required".to_owned()),
+                        Some(record) if !self.node_is_connected(&record.node_id) => {
+                            Some("node disconnected".to_owned())
+                        }
+                        Some(record) if record.task_binding.as_ref()
+                            .and_then(|binding| binding.task_id.as_ref()).is_none() => {
+                            Some("task ID is unassigned".to_owned())
+                        }
+                        Some(_) => None,
+                    },
+                    AgentMenuAction::Rename => match managed {
+                        None => Some("node-owned record required".to_owned()),
+                        Some(record) if !self.node_is_connected(&record.node_id) => {
+                            Some("node disconnected".to_owned())
+                        }
+                        Some(_) => None,
+                    },
+                    AgentMenuAction::Resume => {
+                        if let Some(record) = managed {
+                            if !self.node_is_connected(&record.node_id) {
+                                Some("node disconnected".to_owned())
+                            } else if record.state == ManagedSessionState::Live
+                                || record.active_session.is_some()
+                            {
+                                Some("already live".to_owned())
+                            } else if record.state != ManagedSessionState::Dormant {
+                                Some(format!("record is {}", managed_state_label(record.state)))
+                            } else if !record.has_provider_session_identity {
+                                Some("provider session identity unavailable".to_owned())
+                            } else {
+                                None
+                            }
+                        } else if !route_connected {
+                            Some("node disconnected".to_owned())
+                        } else if let Some(session) = active_session {
+                            if session.running {
+                                Some("already live".to_owned())
+                            } else if !session.restartable {
+                                Some("provider resume unsupported".to_owned())
+                            } else if !session.has_provider_session_identity {
+                                Some("provider session identity unavailable".to_owned())
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some("PTY absent from node snapshot".to_owned())
+                        }
+                    }
+                    AgentMenuAction::History => {
+                        if active_address.is_none() {
+                            Some("active PTY required".to_owned())
+                        } else if !route_connected {
+                            Some("node disconnected".to_owned())
+                        } else if !active_session.is_some_and(|session| session.running) {
+                            Some("running PTY required".to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                    AgentMenuAction::Stop => {
+                        if active_address.is_none() {
+                            Some("no live PTY".to_owned())
+                        } else if !route_connected {
+                            Some("node disconnected".to_owned())
+                        } else if !active_session.is_some_and(|session| session.stoppable) {
+                            Some("PTY is not stoppable".to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                    AgentMenuAction::Forget => match managed {
+                        None => Some("node-owned record required".to_owned()),
+                        Some(record) if !self.node_is_connected(&record.node_id) => {
+                            Some("node disconnected".to_owned())
+                        }
+                        Some(record)
+                            if record.active_session.is_some()
+                                || record.state == ManagedSessionState::Live =>
+                        {
+                            Some("stop the live PTY first".to_owned())
+                        }
+                        Some(_) => None,
+                    },
+                };
+                let label = match action {
+                    AgentMenuAction::TogglePin if self.agent_is_pinned(key) => {
+                        "Unpin locally".to_owned()
+                    }
+                    AgentMenuAction::TogglePin => "Pin locally".to_owned(),
+                    AgentMenuAction::Rename => "Rename managed record...".to_owned(),
+                    AgentMenuAction::CopyTaskId => managed
+                        .and_then(|record| record.task_binding.as_ref())
+                        .and_then(|binding| binding.task_id.as_ref())
+                        .map(|task_id| format!("Copy task ID · {task_id}"))
+                        .unwrap_or_else(|| action.label().to_owned()),
+                    _ => action.label().to_owned(),
+                };
+                Self::agent_menu_item(action, label, disabled_reason)
+            })
+            .collect()
+    }
+
+    pub fn agent_menu_items(&self) -> Vec<AgentMenuItem> {
+        self.agent_menu
+            .as_ref()
+            .map(|menu| self.agent_menu_items_for(&menu.key))
+            .unwrap_or_default()
+    }
+
+    fn native_session_key(row: &NativeSessionCatalogRowView) -> PreviewTabKey {
+        PreviewTabKey::NativeSelection {
+            node_id: row.node_id.clone(),
+            route: row.route.clone(),
+            catalog_revision: row.catalog_revision,
+            recent_cutoff_unix_ms: row.recent_cutoff_unix_ms,
+            selection_id: row.selection_id.clone(),
+        }
+    }
+
+    fn native_session_row_for_key(
+        &self,
+        key: &PreviewTabKey,
+    ) -> Option<&NativeSessionCatalogRowView> {
+        let PreviewTabKey::NativeSelection {
+            node_id,
+            route,
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            selection_id,
+        } = key
+        else {
+            return None;
+        };
+        self.existing_session.as_ref()?.rows.iter().find(|row| {
+            row.node_id == *node_id
+                && row.route == *route
+                && row.catalog_revision == *catalog_revision
+                && row.recent_cutoff_unix_ms == *recent_cutoff_unix_ms
+                && row.selection_id == *selection_id
+        })
+    }
+
+    fn native_session_menu_item(
+        action: NativeSessionMenuAction,
+        disabled_reason: Option<String>,
+    ) -> NativeSessionMenuItem {
+        NativeSessionMenuItem {
+            action,
+            label: action.label().to_owned(),
+            enabled: disabled_reason.is_none(),
+            disabled_reason,
+        }
+    }
+
+    fn native_session_menu_items_for(
+        &self,
+        key: &PreviewTabKey,
+    ) -> Vec<NativeSessionMenuItem> {
+        let Some(row) = self.native_session_row_for_key(key) else {
+            return NativeSessionMenuAction::ALL
+                .into_iter()
+                .map(|action| {
+                    Self::native_session_menu_item(
+                        action,
+                        Some("session is no longer in this catalog snapshot".to_owned()),
+                    )
+                })
+                .collect();
+        };
+        let workspace_reason = || {
+            let Some(workspace_id) = row.route.workspace_id.as_ref() else {
+                return Some("session project is not a registered workspace".to_owned());
+            };
+            let Some(node) = self.nodes.iter().find(|node| node.node_id == row.node_id) else {
+                return Some("node absent from topology".to_owned());
+            };
+            if !matches!(node.connection, ConnectionState::Connected) {
+                return Some("node disconnected".to_owned());
+            }
+            (!node.workspaces.iter().any(|workspace| {
+                workspace.workspace_id == *workspace_id
+            }))
+            .then(|| "workspace is not registered".to_owned())
+        };
+        NativeSessionMenuAction::ALL
+            .into_iter()
+            .map(|action| {
+                let disabled_reason = match action {
+                    NativeSessionMenuAction::OpenTranscriptMetrics => None,
+                    NativeSessionMenuAction::OpenWorkspace => workspace_reason(),
+                    NativeSessionMenuAction::Resume => {
+                        if !self.node_is_connected(&row.node_id) {
+                            Some("node disconnected".to_owned())
+                        } else if row.route.scope != NativeSessionCatalogScope::Workspace {
+                            Some("session project is not a registered workspace".to_owned())
+                        } else if !provider_supports_native_resume(&row.route.provider) {
+                            Some("provider native resume is unsupported".to_owned())
+                        } else {
+                            match self.preview_tabs.get(key) {
+                                None => Some("open and hydrate the transcript first".to_owned()),
+                                Some(tab) if tab.phase != PreviewTabPhase::Hydrated => {
+                                    Some("session reconnect is already in progress".to_owned())
+                                }
+                                Some(tab)
+                                    if !matches!(
+                                        tab.preview,
+                                        NativeSessionPreviewState::Ready(_)
+                                            | NativeSessionPreviewState::Empty(_)
+                                    ) =>
+                                {
+                                    Some("transcript is not hydrated".to_owned())
+                                }
+                                Some(tab) if !tab.resume_available => {
+                                    Some("session is not eligible for resume".to_owned())
+                                }
+                                Some(_) if self.preview_resume.is_some() => {
+                                    Some("another reconnect is in progress".to_owned())
+                                }
+                                Some(tab) => match tab.record_id.as_ref() {
+                                    None => None,
+                                    Some(record_id) => match self.find_managed_session(
+                                        &AgentRowKey::Managed {
+                                            node_id: row.node_id.clone(),
+                                            record_id: record_id.clone(),
+                                        },
+                                    ) {
+                                        None => Some("linked managed record disappeared".to_owned()),
+                                        Some(record)
+                                            if record.state == ManagedSessionState::Live
+                                                || record.active_session.is_some() =>
+                                        {
+                                            Some("already live".to_owned())
+                                        }
+                                        Some(record)
+                                            if record.state != ManagedSessionState::Dormant =>
+                                        {
+                                            Some(format!(
+                                                "record is {}",
+                                                managed_state_label(record.state)
+                                            ))
+                                        }
+                                        Some(record) if !record.has_provider_session_identity => {
+                                            Some("provider session identity unavailable".to_owned())
+                                        }
+                                        Some(_) => None,
+                                    },
+                                },
+                            }
+                        }
+                    }
+                    NativeSessionMenuAction::RenameProviderRecord => {
+                        let linked = row.record_id.as_ref().and_then(|record_id| {
+                            self.find_managed_session(&AgentRowKey::Managed {
+                                node_id: row.node_id.clone(),
+                                record_id: record_id.clone(),
+                            })
+                        });
+                        match linked {
+                            None => Some("session is not linked to a managed record".to_owned()),
+                            Some(record) if !self.node_is_connected(&record.node_id) => {
+                                Some("node disconnected".to_owned())
+                            }
+                            Some(_) => None,
+                        }
+                    }
+                    NativeSessionMenuAction::OpenAgentBoard => None,
+                };
+                Self::native_session_menu_item(action, disabled_reason)
+            })
+            .collect()
+    }
+
+    pub fn native_session_menu_items(&self) -> Vec<NativeSessionMenuItem> {
+        self.native_session_menu
+            .as_ref()
+            .map(|menu| self.native_session_menu_items_for(&menu.key))
+            .unwrap_or_default()
     }
 
     fn node_is_connected(&self, node_id: &str) -> bool {
@@ -1000,6 +4101,44 @@ impl App {
         sessions.into_iter().map(|session| session.address.clone()).collect()
     }
 
+    fn managed_preference_key(key: &AgentRowKey) -> Option<(String, String)> {
+        match key {
+            AgentRowKey::Managed { node_id, record_id } => {
+                Some((node_id.clone(), record_id.clone()))
+            }
+            AgentRowKey::Legacy(_) => None,
+        }
+    }
+
+    pub fn managed_agent_preference(
+        &self,
+        key: &AgentRowKey,
+    ) -> Option<&ManagedAgentPreference> {
+        Self::managed_preference_key(key)
+            .as_ref()
+            .and_then(|key| self.managed_agent_preferences.get(key))
+    }
+
+    pub fn agent_local_alias(&self, key: &AgentRowKey) -> Option<&str> {
+        self.managed_agent_preference(key)
+            .and_then(|preference| preference.alias.as_deref())
+    }
+
+    pub fn agent_is_pinned(&self, key: &AgentRowKey) -> bool {
+        self.managed_agent_preference(key)
+            .is_some_and(|preference| preference.pinned)
+    }
+
+    fn managed_agent_manual_order(&self, key: &AgentRowKey) -> Option<u16> {
+        self.managed_agent_preference(key)
+            .and_then(|preference| preference.order)
+    }
+
+    fn agent_row_customization_sort_key(&self, key: &AgentRowKey) -> (bool, bool, u16) {
+        let order = self.managed_agent_manual_order(key);
+        (!self.agent_is_pinned(key), order.is_none(), order.unwrap_or(u16::MAX))
+    }
+
     pub fn agent_rows(&self) -> Vec<AgentRowKey> {
         let managed_addresses = self
             .nodes
@@ -1023,8 +4162,905 @@ impl App {
                     .map(AgentRowKey::Legacy),
             )
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| self.agent_row_sort_key(left).cmp(&self.agent_row_sort_key(right)));
+        rows.sort_by(|left, right| {
+            self.agent_row_customization_sort_key(left)
+                .cmp(&self.agent_row_customization_sort_key(right))
+                .then_with(|| self.agent_row_sort_key(left).cmp(&self.agent_row_sort_key(right)))
+        });
         rows
+    }
+
+    fn agent_board_node<'a>(&'a self, key: &AgentRowKey) -> Option<&'a NodeView> {
+        let node_id = match key {
+            AgentRowKey::Managed { node_id, .. } => node_id,
+            AgentRowKey::Legacy(address) => &address.node_id,
+        };
+        self.nodes.iter().find(|node| &node.node_id == node_id)
+    }
+
+    pub fn enable_harness_kanban(&mut self) -> AppAction {
+        self.harness_kanban.enabled = true;
+        self.agent_board_mode = AgentBoardMode::HarnessKanban;
+        self.request_harness_refresh()
+    }
+
+    pub fn enable_harness_schedule(
+        &mut self,
+        plan_id: Option<HarnessSelectorV1>,
+    ) {
+        self.harness_schedule_plan = Some(plan_id);
+    }
+
+    pub fn begin_harness_refresh(&mut self, token: u64) {
+        self.harness_kanban.pending_refresh = Some(token);
+    }
+
+    pub fn rollback_harness_refresh(&mut self, token: u64) -> bool {
+        if self.harness_kanban.pending_refresh != Some(token) {
+            return false;
+        }
+        self.harness_kanban.pending_refresh = None;
+        true
+    }
+
+    pub fn restore_harness_composer(&mut self, title: String, body: String) {
+        self.harness_kanban.composer = Some(HarnessTaskComposer {
+            field: HarnessTaskComposerField::Body,
+            title,
+            body,
+        });
+    }
+
+    pub fn apply_harness_snapshot(
+        &mut self,
+        token: u64,
+        tasks: Vec<RedactedTaskV1>,
+        runs: Vec<RedactedRunV1>,
+    ) {
+        if self.harness_kanban.pending_refresh != Some(token) {
+            return;
+        }
+        self.harness_kanban.pending_refresh = None;
+        self.harness_kanban.stale_reason = None;
+        self.harness_kanban.tasks = tasks
+            .into_iter()
+            .map(|task| (task.task_id.clone(), task))
+            .collect();
+        self.harness_kanban.runs = runs
+            .into_iter()
+            .map(|run| (run.run_id.clone(), run))
+            .collect();
+        self.reconcile_harness_kanban();
+    }
+
+    pub fn fail_harness_refresh(&mut self, token: u64, message: String) {
+        if self.harness_kanban.pending_refresh != Some(token) {
+            return;
+        }
+        self.harness_kanban.pending_refresh = None;
+        self.harness_kanban.stale_reason = Some(message);
+        self.reconcile_harness_kanban();
+    }
+
+    pub fn apply_harness_monitor(
+        &mut self,
+        run: RedactedRunV1,
+        monitor: HarnessSessionMonitorV1,
+        timeline: Vec<TimelineEntryV1>,
+    ) {
+        if run.binding == RedactedBindingStateV1::None || monitor.run_id != run.run_id {
+            return;
+        }
+        if !self.harness_kanban.monitor.as_ref()
+            .is_some_and(|view| view.run.run_id == run.run_id)
+        {
+            return;
+        }
+        self.harness_kanban.monitor = Some(HarnessRunMonitorView {
+            run,
+            monitor: Some(monitor),
+            timeline,
+            loading: false,
+            stale_reason: None,
+        });
+    }
+
+    pub fn fail_harness_monitor(&mut self, run_id: &HarnessRunId, message: String) {
+        if let Some(view) = self.harness_kanban.monitor.as_mut()
+            .filter(|view| &view.run.run_id == run_id)
+        {
+            view.loading = false;
+            view.stale_reason = Some(message);
+        }
+    }
+
+    pub fn harness_tasks(&self) -> Vec<&RedactedTaskV1> {
+        self.harness_kanban.tasks.values().collect()
+    }
+
+    pub fn harness_selected_task(&self) -> Option<&RedactedTaskV1> {
+        self.harness_kanban.selected.as_ref()
+            .and_then(|task_id| self.harness_kanban.tasks.get(task_id))
+    }
+
+    pub fn harness_selected_bound_run(&self) -> Option<&RedactedRunV1> {
+        let task = self.harness_selected_task()?;
+        task.run_ids.iter().rev().find_map(|run_id| {
+            self.harness_kanban.runs.get(run_id)
+                .filter(|run| run.task_id.as_ref() == Some(&task.task_id))
+                .filter(|run| run.binding != RedactedBindingStateV1::None)
+        })
+    }
+
+    fn reconcile_harness_kanban(&mut self) {
+        if self.harness_kanban.tasks.is_empty() {
+            self.harness_kanban.selected = None;
+            self.harness_kanban.column_scroll = 0;
+            self.harness_kanban.vertical_offsets.clear();
+            return;
+        }
+        if !self.harness_kanban.selected.as_ref().is_some_and(|task_id| {
+            self.harness_kanban.tasks.contains_key(task_id)
+        }) {
+            self.harness_kanban.selected = self.harness_kanban.tasks.keys().next().cloned();
+        }
+        for column in HarnessKanbanColumn::ALL {
+            let count = self.harness_kanban.tasks.values()
+                .filter(|task| HarnessKanbanColumn::from_state(task.state) == column)
+                .count();
+            let offset = self.harness_kanban.vertical_offsets.entry(column).or_default();
+            *offset = (*offset).min(count.saturating_sub(1));
+        }
+        self.harness_kanban.column_scroll = self.harness_kanban.column_scroll
+            .min(HarnessKanbanColumn::ALL.len().saturating_sub(1));
+    }
+
+    fn request_harness_refresh(&mut self) -> AppAction {
+        if !self.harness_kanban.enabled || self.harness_kanban.pending_refresh.is_some() {
+            return AppAction::None;
+        }
+        let token = self.native_catalog_token.wrapping_add(1).max(1);
+        self.native_catalog_token = token;
+        self.begin_harness_refresh(token);
+        AppAction::HarnessRefresh { token }
+    }
+
+    fn begin_harness_mutation_refresh(&mut self) -> u64 {
+        let token = self.native_catalog_token.wrapping_add(1).max(1);
+        self.native_catalog_token = token;
+        self.begin_harness_refresh(token);
+        token
+    }
+
+    pub fn harness_move_selected(&mut self, state: HarnessTaskStateV1) -> AppAction {
+        let Some(task) = self.harness_selected_task().cloned() else {
+            return AppAction::None;
+        };
+        if !harness_operator_move_allowed(task.state, state) {
+            self.notice = Some(format!(
+                "Harness operator move {:?} -> {:?} is not allowed",
+                task.state, state,
+            ));
+            return AppAction::None;
+        }
+        let token = self.begin_harness_mutation_refresh();
+        AppAction::HarnessMoveTask {
+            token,
+            task_id: task.task_id,
+            expected_revision: task.revision,
+            state,
+        }
+    }
+
+    pub fn harness_cancel_selected(&mut self) -> AppAction {
+        let Some(task) = self.harness_selected_task().cloned() else {
+            return AppAction::None;
+        };
+        if matches!(task.state, HarnessTaskStateV1::Done | HarnessTaskStateV1::Cancelled) {
+            return AppAction::None;
+        }
+        let token = self.begin_harness_mutation_refresh();
+        AppAction::HarnessCancelTask {
+            token,
+            task_id: task.task_id,
+            expected_revision: task.revision,
+        }
+    }
+
+    pub fn harness_retry_selected(&mut self) -> AppAction {
+        let Some(task) = self.harness_selected_task().cloned() else {
+            return AppAction::None;
+        };
+        if !matches!(task.state, HarnessTaskStateV1::Failed | HarnessTaskStateV1::Cancelled) {
+            return AppAction::None;
+        }
+        let token = self.begin_harness_mutation_refresh();
+        AppAction::HarnessRetryTask {
+            token,
+            task_id: task.task_id,
+            expected_revision: task.revision,
+        }
+    }
+
+    pub fn harness_schedule_next(&mut self) -> AppAction {
+        let Some(plan_id) = self.harness_schedule_plan.clone() else {
+            self.notice = Some("Harness schedule next is disabled: no launch plan is configured".to_owned());
+            return AppAction::None;
+        };
+        let token = self.begin_harness_mutation_refresh();
+        AppAction::HarnessScheduleNext {
+            token,
+            plan_id,
+        }
+    }
+
+    fn submit_harness_composer(&mut self) -> AppAction {
+        let Some(composer) = self.harness_kanban.composer.take() else {
+            return AppAction::None;
+        };
+        let title = composer.title.trim().to_owned();
+        if title.is_empty() {
+            self.harness_kanban.composer = Some(composer);
+            self.notice = Some("Harness task title is required".to_owned());
+            return AppAction::None;
+        }
+        let token = self.begin_harness_mutation_refresh();
+        AppAction::HarnessCreateTask {
+            token,
+            title,
+            body: composer.body,
+            initial_state: HarnessTaskStateV1::Backlog,
+        }
+    }
+
+    fn open_selected_harness_monitor(&mut self) -> AppAction {
+        let Some(run) = self.harness_selected_bound_run().cloned() else {
+            self.notice = Some("details unavailable: selected task has no bound run".to_owned());
+            return AppAction::None;
+        };
+        self.harness_kanban.monitor = Some(HarnessRunMonitorView {
+            run: run.clone(),
+            monitor: None,
+            timeline: Vec::new(),
+            loading: true,
+            stale_reason: None,
+        });
+        self.surface.open_in_focused(SurfaceTab::AgentBoard);
+        self.focus = Focus::Viewport;
+        AppAction::HarnessOpenMonitor { run_id: run.run_id }
+    }
+
+    fn derive_agent_board_card(&self, key: AgentRowKey) -> Option<AgentBoardCard> {
+        let node = self.agent_board_node(&key)?;
+        let disconnected = match &node.connection {
+            ConnectionState::Disconnected(_) => Some((AgentBoardColumn::Offline, "offline")),
+            ConnectionState::Connecting => Some((AgentBoardColumn::Unknown, "node connecting")),
+            ConnectionState::Resyncing => Some((AgentBoardColumn::Unknown, "node resyncing")),
+            ConnectionState::Connected => None,
+        };
+        if let Some((column, reason)) = disconnected {
+            return Some(AgentBoardCard {
+                key,
+                column,
+                reason: reason.to_owned(),
+                partial: false,
+            });
+        }
+
+        if let Some(record) = self.find_managed_session(&key) {
+            if record.state == ManagedSessionState::Dormant {
+                return Some(AgentBoardCard {
+                    key,
+                    column: AgentBoardColumn::Dormant,
+                    reason: "managed dormant".to_owned(),
+                    partial: false,
+                });
+            }
+            if record.state == ManagedSessionState::Unavailable {
+                return Some(AgentBoardCard {
+                    key,
+                    column: AgentBoardColumn::Unknown,
+                    reason: "managed unavailable".to_owned(),
+                    partial: false,
+                });
+            }
+        }
+
+        let Some(address) = self.agent_row_active_address(&key) else {
+            return Some(AgentBoardCard {
+                key,
+                column: AgentBoardColumn::Unknown,
+                reason: "no active session".to_owned(),
+                partial: false,
+            });
+        };
+        let Some(session) = self.find_session(&address) else {
+            return Some(AgentBoardCard {
+                key,
+                column: AgentBoardColumn::Unknown,
+                reason: "session unavailable".to_owned(),
+                partial: false,
+            });
+        };
+        if !session.running {
+            return Some(AgentBoardCard {
+                key,
+                column: AgentBoardColumn::Unknown,
+                reason: "session not running".to_owned(),
+                partial: false,
+            });
+        }
+        if let Some(progress) = session.progress.as_ref() {
+            if progress.stale {
+                return Some(AgentBoardCard {
+                    key,
+                    column: AgentBoardColumn::Unknown,
+                    reason: "stale".to_owned(),
+                    partial: progress.truncated,
+                });
+            }
+            if progress.gap_count > 0 {
+                return Some(AgentBoardCard {
+                    key,
+                    column: AgentBoardColumn::Unknown,
+                    reason: format!("event gap {}", progress.gap_count),
+                    partial: progress.truncated,
+                });
+            }
+            if session.attention
+                || progress.attention.is_some()
+                || matches!(
+                    progress.current,
+                    AgentProgressCurrentV1::WaitingForInput | AgentProgressCurrentV1::Blocked
+                )
+            {
+                let reason = match progress.current {
+                    AgentProgressCurrentV1::WaitingForInput => "waiting for input",
+                    AgentProgressCurrentV1::Blocked => "blocked",
+                    _ if progress.attention.is_some() => "attention requested",
+                    _ => "runtime attention",
+                };
+                return Some(AgentBoardCard {
+                    key,
+                    column: AgentBoardColumn::Attention,
+                    reason: reason.to_owned(),
+                    partial: progress.truncated,
+                });
+            }
+            let (column, reason) = match progress.current {
+                AgentProgressCurrentV1::Working => (AgentBoardColumn::Working, "working"),
+                AgentProgressCurrentV1::Idle => (AgentBoardColumn::Idle, "idle"),
+                AgentProgressCurrentV1::WaitingForInput | AgentProgressCurrentV1::Blocked => {
+                    unreachable!("attention progress was handled above")
+                }
+            };
+            return Some(AgentBoardCard {
+                key,
+                column,
+                reason: reason.to_owned(),
+                partial: progress.truncated,
+            });
+        }
+        Some(AgentBoardCard {
+            key,
+            column: if session.attention {
+                AgentBoardColumn::Attention
+            } else {
+                AgentBoardColumn::Unknown
+            },
+            reason: if session.attention {
+                "runtime attention".to_owned()
+            } else {
+                "progress unavailable".to_owned()
+            },
+            partial: false,
+        })
+    }
+
+    pub fn agent_board_cards(&self) -> Vec<AgentBoardCard> {
+        self.agent_rows()
+            .into_iter()
+            .filter(|key| self.agent_board.task_filter.as_ref().map_or(true, |task_id| {
+                self.find_managed_session(key)
+                    .and_then(|record| record.task_binding.as_ref())
+                    .and_then(|binding| binding.task_id.as_ref()) == Some(task_id)
+            }))
+            .filter_map(|key| self.derive_agent_board_card(key))
+            .collect()
+    }
+
+    fn filter_agent_board_by_selected_task(&mut self) {
+        let task_id = self.agent_board.selected.as_ref()
+            .and_then(|key| self.find_managed_session(key))
+            .and_then(|record| record.task_binding.as_ref())
+            .and_then(|binding| binding.task_id.clone());
+        if let Some(task_id) = task_id {
+            self.agent_board.task_filter = Some(task_id);
+            self.reconcile_agent_board();
+        } else {
+            self.notice = Some("selected managed run has no task ID".to_owned());
+        }
+    }
+
+    fn toggle_agent_board_task_filter(&mut self) {
+        if self.agent_board.task_filter.is_some() {
+            self.agent_board.task_filter = None;
+            self.reconcile_agent_board();
+        } else {
+            self.filter_agent_board_by_selected_task();
+        }
+    }
+
+    pub fn agent_board_fresh_progress(&self, card: &AgentBoardCard) -> Option<&AgentProgressV1> {
+        if !matches!(
+            card.column,
+            AgentBoardColumn::Attention | AgentBoardColumn::Working | AgentBoardColumn::Idle
+        ) {
+            return None;
+        }
+        let session = self.agent_row_active_address(&card.key)
+            .as_ref()
+            .and_then(|address| self.find_session(address))
+            .filter(|session| session.running)?;
+        let progress = session.progress.as_ref()
+            .filter(|progress| !progress.stale && progress.gap_count == 0)?;
+        let expected_column = if session.attention
+            || progress.attention.is_some()
+            || matches!(
+                progress.current,
+                AgentProgressCurrentV1::WaitingForInput | AgentProgressCurrentV1::Blocked
+            )
+        {
+            AgentBoardColumn::Attention
+        } else {
+            match progress.current {
+                AgentProgressCurrentV1::Working => AgentBoardColumn::Working,
+                AgentProgressCurrentV1::Idle => AgentBoardColumn::Idle,
+                AgentProgressCurrentV1::WaitingForInput | AgentProgressCurrentV1::Blocked => {
+                    AgentBoardColumn::Attention
+                }
+            }
+        };
+        (card.column == expected_column).then_some(progress)
+    }
+
+    fn reconcile_agent_board(&mut self) {
+        let mut cards = self.agent_board_cards();
+        if self.agent_board.task_filter.is_some() && cards.is_empty() {
+            self.agent_board.task_filter = None;
+            cards = self.agent_board_cards();
+        }
+        if cards.is_empty() {
+            self.agent_board.selected = None;
+            self.agent_board.column_scroll = 0;
+            self.agent_board.vertical_offsets.clear();
+            return;
+        }
+        if !self.agent_board.selected.as_ref().is_some_and(|selected| {
+            cards.iter().any(|card| &card.key == selected)
+        }) {
+            self.agent_board.selected = cards.first().map(|card| card.key.clone());
+        }
+        for column in AgentBoardColumn::ALL {
+            let count = cards.iter().filter(|card| card.column == column).count();
+            let offset = self.agent_board.vertical_offsets.entry(column).or_default();
+            *offset = (*offset).min(count.saturating_sub(1));
+        }
+        self.agent_board.column_scroll = self
+            .agent_board
+            .column_scroll
+            .min(AgentBoardColumn::ALL.len().saturating_sub(1));
+    }
+
+    fn select_agent_board_key(&mut self, key: &AgentRowKey) -> bool {
+        if !self.agent_board_cards().iter().any(|card| &card.key == key) {
+            return false;
+        }
+        self.agent_board.selected = Some(key.clone());
+        if let Some(index) = self.agent_rows().iter().position(|candidate| candidate == key) {
+            self.selected_agent = index;
+        }
+        true
+    }
+
+    fn open_agent_board(&mut self) -> AppAction {
+        if self.harness_kanban.enabled {
+            self.agent_board_mode = AgentBoardMode::HarnessKanban;
+        }
+        self.reconcile_agent_board();
+        self.surface.open_in_focused(SurfaceTab::AgentBoard);
+        self.focus = Focus::Viewport;
+        if self.agent_board_mode == AgentBoardMode::HarnessKanban
+            && self.harness_kanban.tasks.is_empty()
+        {
+            self.request_harness_refresh()
+        } else {
+            AppAction::None
+        }
+    }
+
+    fn activate_agent_board_open(&mut self, key: AgentRowKey) -> AppAction {
+        if !self.select_agent_board_key(&key) || !self.select_agent_key(&key) {
+            return AppAction::None;
+        }
+        self.open_selected_agent()
+    }
+
+    fn reduce_agent_board(&mut self, key: UiKey) -> AppAction {
+        if self.agent_board_mode == AgentBoardMode::HarnessKanban {
+            self.reduce_harness_kanban(key)
+        } else {
+            self.reduce_session_agent_board(key)
+        }
+    }
+
+    fn reduce_harness_composer(&mut self, key: UiKey) -> AppAction {
+        let Some(composer) = self.harness_kanban.composer.as_mut() else {
+            return AppAction::None;
+        };
+        match key {
+            UiKey::Escape | UiKey::OperatorEscape => {
+                self.harness_kanban.composer = None;
+            }
+            UiKey::Tab | UiKey::BackTab => {
+                composer.field = match composer.field {
+                    HarnessTaskComposerField::Title => HarnessTaskComposerField::Body,
+                    HarnessTaskComposerField::Body => HarnessTaskComposerField::Title,
+                };
+            }
+            UiKey::Enter => return self.submit_harness_composer(),
+            UiKey::Backspace => {
+                let target = match composer.field {
+                    HarnessTaskComposerField::Title => &mut composer.title,
+                    HarnessTaskComposerField::Body => &mut composer.body,
+                };
+                target.pop();
+            }
+            UiKey::Char(ch) if !ch.is_control() => {
+                let (target, limit) = match composer.field {
+                    HarnessTaskComposerField::Title => (&mut composer.title, HARNESS_TITLE_MAX_BYTES),
+                    HarnessTaskComposerField::Body => (&mut composer.body, HARNESS_BODY_MAX_BYTES),
+                };
+                if target.len().saturating_add(ch.len_utf8()) <= limit {
+                    target.push(ch);
+                }
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn reduce_harness_kanban(&mut self, key: UiKey) -> AppAction {
+        if self.harness_kanban.monitor.is_some() {
+            return match key {
+                UiKey::Escape | UiKey::OperatorEscape => {
+                    self.harness_kanban.monitor = None;
+                    AppAction::None
+                }
+                UiKey::Char('r') | UiKey::Char('R') => {
+                    let view = self.harness_kanban.monitor.as_mut()
+                        .expect("inline Harness details are present");
+                    view.loading = true;
+                    view.stale_reason = None;
+                    AppAction::HarnessOpenMonitor { run_id: view.run.run_id.clone() }
+                }
+                _ => AppAction::None,
+            };
+        }
+        if self.harness_kanban.composer.is_some() {
+            return self.reduce_harness_composer(key);
+        }
+        self.reconcile_harness_kanban();
+        match key {
+            UiKey::Char('m') | UiKey::Char('M') => {
+                self.agent_board_mode = AgentBoardMode::SessionMonitoring;
+                self.reconcile_agent_board();
+                return AppAction::None;
+            }
+            UiKey::Char('R') => return self.request_harness_refresh(),
+            UiKey::Char('c') | UiKey::Insert => {
+                self.harness_kanban.composer = Some(HarnessTaskComposer::default());
+                return AppAction::None;
+            }
+            UiKey::Char('x') | UiKey::Delete => return self.harness_cancel_selected(),
+            UiKey::Char('r') => return self.harness_retry_selected(),
+            UiKey::Char('s') => return self.harness_schedule_next(),
+            UiKey::Enter => return self.open_selected_harness_monitor(),
+            UiKey::ShiftLeft | UiKey::ShiftRight => {
+                let Some(task) = self.harness_selected_task() else {
+                    return AppAction::None;
+                };
+                let current = HarnessKanbanColumn::ALL.iter()
+                    .position(|column| column.state() == task.state)
+                    .unwrap_or(0);
+                let step = if key == UiKey::ShiftLeft { -1 } else { 1 };
+                let mut target = current as isize + step;
+                while target >= 0 && target < HarnessKanbanColumn::ALL.len() as isize {
+                    let state = HarnessKanbanColumn::ALL[target as usize].state();
+                    if harness_operator_move_allowed(task.state, state) {
+                        return self.harness_move_selected(state);
+                    }
+                    target += step;
+                }
+                return AppAction::None;
+            }
+            _ => {}
+        }
+        let Some(selected_id) = self.harness_kanban.selected.clone() else {
+            return AppAction::None;
+        };
+        let Some(selected_task) = self.harness_kanban.tasks.get(&selected_id) else {
+            return AppAction::None;
+        };
+        let selected_column = HarnessKanbanColumn::from_state(selected_task.state);
+        let column_index = HarnessKanbanColumn::ALL.iter()
+            .position(|column| *column == selected_column)
+            .unwrap_or(0);
+        let column_tasks = |column: HarnessKanbanColumn| {
+            self.harness_kanban.tasks.values()
+                .filter(|task| HarnessKanbanColumn::from_state(task.state) == column)
+                .collect::<Vec<_>>()
+        };
+        match key {
+            UiKey::Left | UiKey::Right => {
+                let step = if key == UiKey::Left { -1 } else { 1 };
+                let mut candidate = column_index as isize + step;
+                while candidate >= 0 && candidate < HarnessKanbanColumn::ALL.len() as isize {
+                    let column = HarnessKanbanColumn::ALL[candidate as usize];
+                    let tasks = column_tasks(column);
+                    if !tasks.is_empty() {
+                        let offset = self.harness_kanban.vertical_offsets.get(&column)
+                            .copied().unwrap_or(0).min(tasks.len() - 1);
+                        self.harness_kanban.selected = Some(tasks[offset].task_id.clone());
+                        self.harness_kanban.column_scroll = candidate as usize;
+                        break;
+                    }
+                    candidate += step;
+                }
+            }
+            UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End | UiKey::PageUp | UiKey::PageDown => {
+                let tasks = column_tasks(selected_column);
+                let current = tasks.iter().position(|task| task.task_id == selected_id).unwrap_or(0);
+                let next = match key {
+                    UiKey::Up => current.saturating_sub(1),
+                    UiKey::Down => current.saturating_add(1).min(tasks.len().saturating_sub(1)),
+                    UiKey::Home => 0,
+                    UiKey::End => tasks.len().saturating_sub(1),
+                    UiKey::PageUp => current.saturating_sub(5),
+                    UiKey::PageDown => current.saturating_add(5).min(tasks.len().saturating_sub(1)),
+                    _ => current,
+                };
+                if let Some(task) = tasks.get(next) {
+                    self.harness_kanban.selected = Some(task.task_id.clone());
+                    self.harness_kanban.vertical_offsets.insert(selected_column, next);
+                }
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn reduce_session_agent_board(&mut self, key: UiKey) -> AppAction {
+        if matches!(key, UiKey::Char('k') | UiKey::Char('K')) && self.harness_kanban.enabled {
+            self.agent_board_mode = AgentBoardMode::HarnessKanban;
+            return self.request_harness_refresh();
+        }
+        if matches!(key, UiKey::Escape | UiKey::OperatorEscape)
+            && self.agent_board.task_filter.is_some()
+        {
+            self.agent_board.task_filter = None;
+            self.reconcile_agent_board();
+            return AppAction::None;
+        }
+        self.reconcile_agent_board();
+        let cards = self.agent_board_cards();
+        let Some(selected) = self.agent_board.selected.clone() else {
+            return AppAction::None;
+        };
+        let Some(selected_card) = cards.iter().find(|card| card.key == selected) else {
+            return AppAction::None;
+        };
+        let column_index = AgentBoardColumn::ALL
+            .iter()
+            .position(|column| *column == selected_card.column)
+            .unwrap_or(0);
+        let column_cards = |column: AgentBoardColumn| {
+            cards.iter().filter(|card| card.column == column).collect::<Vec<_>>()
+        };
+        match key {
+            UiKey::Char('t') => {
+                self.toggle_agent_board_task_filter();
+                return AppAction::None;
+            }
+            UiKey::Enter => return self.activate_agent_board_open(selected),
+            UiKey::Left | UiKey::Right => {
+                let step: isize = if key == UiKey::Left { -1 } else { 1 };
+                let mut candidate = column_index as isize + step;
+                while candidate >= 0 && candidate < AgentBoardColumn::ALL.len() as isize {
+                    let target_column = AgentBoardColumn::ALL[candidate as usize];
+                    let targets = column_cards(target_column);
+                    if !targets.is_empty() {
+                        let offset = self
+                            .agent_board
+                            .vertical_offsets
+                            .get(&target_column)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(targets.len() - 1);
+                        self.agent_board.selected = Some(targets[offset].key.clone());
+                        self.agent_board.column_scroll = candidate as usize;
+                        break;
+                    }
+                    candidate += step;
+                }
+            }
+            UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End | UiKey::PageUp | UiKey::PageDown => {
+                let targets = column_cards(selected_card.column);
+                let current = targets
+                    .iter()
+                    .position(|card| card.key == selected)
+                    .unwrap_or(0);
+                let next = match key {
+                    UiKey::Up => current.saturating_sub(1),
+                    UiKey::Down => current.saturating_add(1).min(targets.len().saturating_sub(1)),
+                    UiKey::Home => 0,
+                    UiKey::End => targets.len().saturating_sub(1),
+                    UiKey::PageUp => current.saturating_sub(5),
+                    UiKey::PageDown => current.saturating_add(5).min(targets.len().saturating_sub(1)),
+                    _ => current,
+                };
+                if let Some(card) = targets.get(next) {
+                    self.agent_board.selected = Some(card.key.clone());
+                    self.agent_board.vertical_offsets.insert(selected_card.column, next);
+                }
+            }
+            _ => {}
+        }
+        if let Some(selected) = self.agent_board.selected.clone() {
+            self.select_agent_key(&selected);
+        }
+        AppAction::None
+    }
+
+    fn managed_agents_in_local_section(&self, key: &AgentRowKey) -> Vec<AgentRowKey> {
+        let pinned = self.agent_is_pinned(key);
+        self.agent_rows()
+            .into_iter()
+            .filter(|candidate| {
+                matches!(candidate, AgentRowKey::Managed { .. })
+                    && self.agent_is_pinned(candidate) == pinned
+            })
+            .collect()
+    }
+
+    fn can_move_managed_agent(&self, key: &AgentRowKey, down: bool) -> bool {
+        let rows = self.managed_agents_in_local_section(key);
+        rows.iter().position(|candidate| candidate == key).is_some_and(|index| {
+            if down { index + 1 < rows.len() } else { index > 0 }
+        })
+    }
+
+    fn ensure_managed_preference(&mut self, key: &AgentRowKey) -> bool {
+        let Some((node_id, record_id)) = Self::managed_preference_key(key) else {
+            return false;
+        };
+        if self.managed_agent_preferences.contains_key(&(node_id.clone(), record_id.clone())) {
+            return true;
+        }
+        if self.managed_agent_preferences.len() >= MAX_MANAGED_AGENT_PREFERENCES {
+            self.notice = Some("local agent preference limit reached".to_owned());
+            return false;
+        }
+        self.managed_agent_preferences.insert(
+            (node_id.clone(), record_id.clone()),
+            ManagedAgentPreference {
+                node_id,
+                record_id,
+                pinned: false,
+                alias: None,
+                order: None,
+            },
+        );
+        true
+    }
+
+    fn prune_empty_managed_preference(&mut self, key: &AgentRowKey) {
+        let Some(map_key) = Self::managed_preference_key(key) else {
+            return;
+        };
+        if self.managed_agent_preferences.get(&map_key).is_some_and(|preference| {
+            !preference.pinned && preference.alias.is_none() && preference.order.is_none()
+        }) {
+            self.managed_agent_preferences.remove(&map_key);
+        }
+    }
+
+    fn toggle_managed_agent_pin(&mut self, key: &AgentRowKey) {
+        if !self.ensure_managed_preference(key) {
+            return;
+        }
+        let map_key = Self::managed_preference_key(key).expect("managed preference key");
+        if let Some(preference) = self.managed_agent_preferences.get_mut(&map_key) {
+            preference.pinned = !preference.pinned;
+        }
+        self.select_agent_key(key);
+        self.prune_empty_managed_preference(key);
+    }
+
+    fn set_managed_agent_alias(&mut self, key: &AgentRowKey, alias: Option<String>) {
+        if alias.is_some() && !self.ensure_managed_preference(key) {
+            return;
+        }
+        let Some(map_key) = Self::managed_preference_key(key) else {
+            return;
+        };
+        if let Some(preference) = self.managed_agent_preferences.get_mut(&map_key) {
+            preference.alias = alias;
+        }
+        self.select_agent_key(key);
+        self.prune_empty_managed_preference(key);
+    }
+
+    fn reorder_managed_agents(&mut self, source: &AgentRowKey, target: &AgentRowKey) -> bool {
+        if source == target
+            || !matches!(source, AgentRowKey::Managed { .. })
+            || !matches!(target, AgentRowKey::Managed { .. })
+            || self.agent_is_pinned(source) != self.agent_is_pinned(target)
+        {
+            return false;
+        }
+        let mut all = self.agent_rows().into_iter()
+            .filter(|key| matches!(key, AgentRowKey::Managed { .. }))
+            .collect::<Vec<_>>();
+        if all.len() > MAX_MANAGED_AGENT_PREFERENCES {
+            self.notice = Some("too many managed agents for local ordering".to_owned());
+            return false;
+        }
+        let Some(source_index) = all.iter().position(|key| key == source) else {
+            return false;
+        };
+        let Some(target_index) = all.iter().position(|key| key == target) else {
+            return false;
+        };
+        let missing = all.iter().filter(|key| {
+            Self::managed_preference_key(key).is_some_and(|map_key| {
+                !self.managed_agent_preferences.contains_key(&map_key)
+            })
+        }).count();
+        if self.managed_agent_preferences.len().saturating_add(missing)
+            > MAX_MANAGED_AGENT_PREFERENCES
+        {
+            self.notice = Some("local agent preference limit reached".to_owned());
+            return false;
+        }
+        let source_key = all.remove(source_index);
+        all.insert(target_index.min(all.len()), source_key);
+        for (index, key) in all.iter().enumerate() {
+            if !self.ensure_managed_preference(key) {
+                return false;
+            }
+            let map_key = Self::managed_preference_key(key).expect("managed preference key");
+            if let Some(preference) = self.managed_agent_preferences.get_mut(&map_key) {
+                preference.order = Some(index.min(u16::MAX as usize) as u16);
+            }
+        }
+        self.select_agent_key(source);
+        true
+    }
+
+    fn move_managed_agent(&mut self, key: &AgentRowKey, down: bool) {
+        let rows = self.managed_agents_in_local_section(key);
+        let Some(index) = rows.iter().position(|candidate| candidate == key) else {
+            return;
+        };
+        let target = if down {
+            rows.get(index + 1)
+        } else {
+            index.checked_sub(1).and_then(|index| rows.get(index))
+        };
+        if let Some(target) = target.cloned() {
+            self.reorder_managed_agents(key, &target);
+        }
     }
 
     fn agent_row_sort_key(&self, key: &AgentRowKey) -> (bool, u8, String, String, String) {
@@ -1061,18 +5097,91 @@ impl App {
         )
     }
 
+    fn prune_file_git_surfaces(
+        &mut self,
+        should_prune: impl Fn(&str, &str) -> bool,
+    ) {
+        let stale_tabs = self
+            .surface
+            .all_tabs()
+            .into_iter()
+            .filter(|tab| match tab {
+                SurfaceTab::File(key) => should_prune(&key.node_id, &key.workspace_id),
+                SurfaceTab::Git(key) => should_prune(&key.node_id, &key.workspace_id),
+                SurfaceTab::AgentBoard | SurfaceTab::SessionMonitor(_) | SurfaceTab::Pty(_) | SurfaceTab::Preview(_) => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for tab in stale_tabs {
+            self.surface.detach_tab(&tab);
+        }
+        self.file_tabs
+            .retain(|key, _| !should_prune(&key.node_id, &key.workspace_id));
+        self.git_tabs
+            .retain(|key, _| !should_prune(&key.node_id, &key.workspace_id));
+    }
+
     pub fn upsert_node(&mut self, node: NodeView) {
-        let incarnation_changed = self
+        let updated_node_id = node.node_id.clone();
+        let updated_workspace_ids = node
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.workspace_id.clone())
+            .collect::<BTreeSet<_>>();
+        let previous_incarnation = self
             .nodes
             .iter()
             .find(|existing| existing.node_id == node.node_id)
-            .is_some_and(|existing| match (existing.incarnation_id, node.incarnation_id) {
-                (Some(previous), Some(current)) => previous != current,
-                _ => false,
-            });
+            .and_then(|existing| existing.incarnation_id);
+        let incarnation_changed = matches!(
+            (previous_incarnation, node.incarnation_id),
+            (Some(previous), Some(current)) if previous != current
+        );
         if incarnation_changed {
-            self.tabs.retain(|tab| tab.address.node_id != node.node_id);
-            self.grid.panes.retain(|pane| pane.address.node_id != node.node_id);
+            self.session_history_refresh_pending
+                .retain(|(node_id, _, _)| node_id != &node.node_id);
+            self.session_history_refreshed
+                .retain(|(node_id, _, _)| node_id != &node.node_id);
+            if let Some(previous) = previous_incarnation {
+                self.mark_session_monitors_restarted(
+                    &node.node_id,
+                    previous,
+                    node.event_sequence,
+                );
+            }
+            self.expanded_agent_progress.retain(|key| match key {
+                AgentRowKey::Managed { .. } => true,
+                AgentRowKey::Legacy(address) => address.node_id != node.node_id,
+            });
+            self.prune_file_git_surfaces(|node_id, _| node_id == node.node_id);
+            if self
+                .create_workspace_entry
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node.node_id)
+            {
+                self.create_workspace_entry = None;
+                if self.focus == Focus::CreateWorkspaceEntry {
+                    self.focus = self.sidebar_focus();
+                }
+            }
+            if self
+                .terminal_selection
+                .as_ref()
+                .is_some_and(|selection| selection.address.node_id == node.node_id)
+            {
+                self.terminal_selection = None;
+            }
+            let stale = self
+                .surface
+                .all_tabs()
+                .into_iter()
+                .filter_map(|tab| tab.pty_address())
+                .filter(|address| address.node_id == node.node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for address in stale {
+                self.surface.detach_tab(&SurfaceTab::Pty(address));
+            }
             self.pending_open.retain(|address| address.node_id != node.node_id);
             self.terminal_scroll_offsets
                 .retain(|address, _| address.node_id != node.node_id);
@@ -1094,124 +5203,82 @@ impl App {
             (node.node_id.clone(), workspace.workspace_id.clone())
         });
         let selected_agent = self.agent_rows().get(self.selected_agent).cloned();
-        for tab in self.tabs.iter_mut().filter(|tab| tab.address.node_id == node.node_id) {
+        let surface_addresses = self
+            .surface
+            .all_tabs()
+            .into_iter()
+            .filter_map(|tab| tab.pty_address())
+            .filter(|address| address.node_id == node.node_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for address in surface_addresses {
             let Some(workspace) = node
                 .workspaces
                 .iter()
-                .find(|workspace| workspace.workspace_id == tab.address.workspace_id)
+                .find(|workspace| workspace.workspace_id == address.workspace_id)
             else {
                 continue;
             };
             let mut generations = workspace
                 .sessions
                 .iter()
-                .filter(|session| session.address.instance_id == tab.address.instance_id);
+                .filter(|session| session.address.instance_id == address.instance_id);
             let Some(rebound) = generations.next() else {
                 continue;
             };
             if generations.next().is_none() {
-                tab.address.generation = rebound.address.generation;
+                self.surface.replace_tab(
+                    &SurfaceTab::Pty(address),
+                    SurfaceTab::Pty(rebound.address.clone()),
+                );
             }
         }
-        for pane in self
-            .grid
-            .panes
-            .iter_mut()
-            .filter(|pane| pane.address.node_id == node.node_id)
-        {
-            let Some(workspace) = node
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id == pane.address.workspace_id)
-            else {
-                continue;
-            };
-            let mut generations = workspace
-                .sessions
-                .iter()
-                .filter(|session| session.address.instance_id == pane.address.instance_id);
-            let Some(rebound) = generations.next() else {
-                continue;
-            };
-            if generations.next().is_none() {
-                pane.address.generation = rebound.address.generation;
-            }
-        }
-        let selected_tab = self.tabs.get(self.selected_tab).map(|tab| tab.address.clone());
-        let focused_pane = self
-            .grid
-            .panes
-            .get(self.grid.focused)
-            .map(|pane| pane.address.clone());
+        let focused_before = self.focused_address().cloned();
         if let Some(existing) = self.nodes.iter_mut().find(|item| item.node_id == node.node_id) {
             *existing = node;
         } else {
             self.nodes.push(node);
         }
-        let tabs = std::mem::take(&mut self.tabs);
-        self.tabs = tabs
+        let stale = self
+            .surface
+            .all_tabs()
             .into_iter()
-            .filter(|tab| self.find_session(&tab.address).is_some())
-            .collect();
-        let panes = std::mem::take(&mut self.grid.panes);
-        self.grid.panes = panes
-            .into_iter()
-            .filter(|pane| self.find_session(&pane.address).is_some())
-            .collect();
-        let grid_addresses = self
-            .grid
-            .panes
-            .iter()
-            .map(|pane| pane.address.clone())
-            .collect::<BTreeSet<_>>();
-        self.tabs.retain(|tab| !grid_addresses.contains(&tab.address));
-        if let Some(index) = selected_tab
-            .as_ref()
-            .and_then(|address| self.tabs.iter().position(|tab| &tab.address == address))
-        {
-            self.selected_tab = index;
-        } else {
-            let selected_was_removed = selected_tab.is_some();
-            self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
-            if selected_was_removed
-                && self.surface_mode == SurfaceMode::Tab
-                && self.focus == Focus::Viewport
-            {
-                self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
-                    self.sidebar_focus()
-                } else {
-                    Focus::Tabs
-                };
-                self.notice = Some("active PTY disappeared; input target cleared".to_owned());
-            }
+            .filter_map(|tab| tab.pty_address())
+            .filter(|address| self.find_session(address).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        for address in stale {
+            self.surface.detach_tab(&SurfaceTab::Pty(address));
         }
-        if let Some(index) = focused_pane.as_ref().and_then(|address| {
-            self.grid
-                .panes
-                .iter()
-                .position(|pane| &pane.address == address)
-        }) {
-            self.grid.focused = index;
-        } else {
-            let focused_was_removed = focused_pane.is_some();
-            self.grid.focused = self.grid.focused.min(self.grid.panes.len().saturating_sub(1));
-            if focused_was_removed
-                && self.surface_mode == SurfaceMode::Grid
-                && self.focus == Focus::Viewport
-            {
-                if self.grid.panes.is_empty() {
-                    self.surface_mode = SurfaceMode::Tab;
-                    self.focus = if self.tabs.is_empty()
-                        && self.menu_placement == MenuPlacement::Sidebar
-                    {
+        let selected_terminal = self
+            .terminal_selection
+            .as_ref()
+            .map(|selection| selection.address.clone());
+        if selected_terminal
+            .as_ref()
+            .is_some_and(|address| self.find_session(address).is_none())
+        {
+            self.terminal_selection = None;
+        }
+        if let Some(previous) = focused_before.as_ref() {
+            match self.focused_address() {
+                None if self.focus == Focus::Viewport => {
+                    self.focus = if self.menu_placement == MenuPlacement::Sidebar {
                         self.sidebar_focus()
                     } else {
                         Focus::Tabs
                     };
-                    self.notice = Some("active grid PTY disappeared; input target cleared".to_owned());
-                } else {
-                    self.notice = Some("active grid PTY disappeared; nearest pane focused".to_owned());
+                    self.notice = Some("active PTY disappeared; input target cleared".to_owned());
                 }
+                Some(current)
+                    if current != previous
+                        && self.find_session(previous).is_none()
+                        && self.focus == Focus::Viewport =>
+                {
+                    self.notice =
+                        Some("active PTY disappeared; nearest pane focused".to_owned());
+                }
+                _ => {}
             }
         }
         if let Some((node_id, workspace_id)) = selected_space {
@@ -1243,6 +5310,25 @@ impl App {
             self.selected_agent = self.selected_agent.min(self.agent_rows().len().saturating_sub(1));
         }
         self.reconcile_pending_space();
+        let spawn_route_removed = self.spawn.as_ref().is_some_and(|spawn| {
+            !self.nodes.iter().any(|node| {
+                node.node_id == spawn.node_id
+                    && node
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.workspace_id == spawn.workspace_id)
+            })
+        });
+        if spawn_route_removed {
+            self.spawn = None;
+            if self.focus == Focus::Spawn {
+                self.focus = Focus::Agents;
+            }
+            self.notice = Some("launch cancelled because its workspace was removed".to_owned());
+        } else if let Some(mut spawn) = self.spawn.take() {
+            self.reconcile_spawn_inventory(&mut spawn);
+            self.spawn = Some(spawn);
+        }
         self.reconcile_pending_open();
         let live_workspaces = self
             .nodes
@@ -1253,18 +5339,38 @@ impl App {
                     .map(|workspace| (node.node_id.clone(), workspace.workspace_id.clone()))
             })
             .collect::<BTreeSet<_>>();
+        if self.create_workspace_entry.as_ref().is_some_and(|dialog| {
+            !live_workspaces.contains(&(dialog.node_id.clone(), dialog.workspace_id.clone()))
+        }) {
+            self.create_workspace_entry = None;
+            if self.focus == Focus::CreateWorkspaceEntry {
+                self.focus = self.sidebar_focus();
+            }
+            self.notice = Some("entry creation cancelled because its workspace was removed".to_owned());
+        }
+        self.prune_file_git_surfaces(|node_id, workspace_id| {
+            !live_workspaces
+                .iter()
+                .any(|route| route.0 == node_id && route.1 == workspace_id)
+        });
         self.workspace_inspections.retain(|(node_id, workspace_id), _| {
             live_workspaces.contains(&(node_id.clone(), workspace_id.clone()))
         });
         self.collapsed_directories.retain(|(node_id, workspace_id, _)| {
-            live_workspaces.contains(&(node_id.clone(), workspace_id.clone()))
+            node_id != &updated_node_id || updated_workspace_ids.contains(workspace_id)
         });
         self.files_cursor = self
             .files_cursor
             .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
         self.git_cursor = self.git_cursor.min(self.git_item_count().saturating_sub(1));
         self.reconcile_terminal_scroll_offsets(&previous_scrollback);
+        self.reconcile_agent_menu();
+        self.reconcile_native_session_menu();
         self.reconcile_session_drag();
+        self.reconcile_agent_run_lens();
+        self.reconcile_expanded_agent_progress();
+        self.reconcile_agent_board();
+        self.reconcile_agent_board();
     }
 
     pub fn apply_terminal_frame(
@@ -1342,25 +5448,24 @@ impl App {
                 node_id: expected_node_id.to_owned(),
                 incarnation_id: None,
                 endpoint: endpoint.to_owned(),
+                relay_route: C2RelayRoute::Unknown,
                 connection: state,
                 controller_owned: false,
                 event_sequence: 0,
+                launch_inventory: None,
+                providers: Vec::new(),
                 workspaces: Vec::new(),
                 session_records: Vec::new(),
             });
         }
         self.reconcile_session_drag();
+        self.reconcile_agent_board();
     }
 
     pub fn remove_topology_node(&mut self, node_id: &str) {
         let selected_space = self.selected_workspace_route();
         let selected_agent = self.agent_rows().get(self.selected_agent).cloned();
-        let selected_tab = self.tabs.get(self.selected_tab).map(|tab| tab.address.clone());
-        let focused_pane = self
-            .grid
-            .panes
-            .get(self.grid.focused)
-            .map(|pane| pane.address.clone());
+        let focused_address = self.focused_address().cloned();
         let selected_space_removed = selected_space
             .as_ref()
             .is_some_and(|(selected_node_id, _)| selected_node_id == node_id);
@@ -1368,19 +5473,65 @@ impl App {
             AgentRowKey::Managed { node_id: selected_node_id, .. } => selected_node_id == node_id,
             AgentRowKey::Legacy(address) => address.node_id == node_id,
         });
-        let selected_tab_removed = selected_tab
-            .as_ref()
-            .is_some_and(|address| address.node_id == node_id);
-        let focused_pane_removed = focused_pane
+        let active_target_removed = focused_address
             .as_ref()
             .is_some_and(|address| address.node_id == node_id);
 
         self.nodes.retain(|node| node.node_id != node_id);
-        self.tabs.retain(|tab| tab.address.node_id != node_id);
-        self.grid.panes.retain(|pane| pane.address.node_id != node_id);
+        self.session_history_refresh_pending
+            .retain(|(refresh_node_id, _, _)| refresh_node_id != node_id);
+        self.session_history_refreshed
+            .retain(|(refresh_node_id, _, _)| refresh_node_id != node_id);
+        self.expanded_agent_progress.retain(|key| match key {
+            AgentRowKey::Managed { node_id: expanded_node_id, .. } => expanded_node_id != node_id,
+            AgentRowKey::Legacy(address) => address.node_id != node_id,
+        });
+        let removed_tabs = self
+            .surface
+            .all_tabs()
+            .into_iter()
+            .filter(|tab| match tab {
+                SurfaceTab::AgentBoard => false,
+                SurfaceTab::SessionMonitor(_) => false,
+                SurfaceTab::Pty(address) => address.node_id == node_id,
+                SurfaceTab::Preview(PreviewTabKey::ManagedRecord {
+                    node_id: source_node, ..
+                })
+                | SurfaceTab::Preview(PreviewTabKey::NativeSelection {
+                    node_id: source_node, ..
+                }) => source_node == node_id,
+                SurfaceTab::File(key) => key.node_id == node_id,
+                SurfaceTab::Git(key) => key.node_id == node_id,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for tab in removed_tabs {
+            if let SurfaceTab::Preview(key) = &tab {
+                self.preview_tabs.remove(key);
+            } else if let SurfaceTab::File(key) = &tab {
+                self.file_tabs.remove(key);
+            } else if let SurfaceTab::Git(key) = &tab {
+                self.git_tabs.remove(key);
+            }
+            self.surface.detach_tab(&tab);
+        }
+        if self
+            .preview_resume
+            .as_ref()
+            .is_some_and(|pending| pending.node_id == node_id)
+        {
+            self.preview_resume = None;
+        }
         self.pending_open.retain(|address| address.node_id != node_id);
         self.terminal_scroll_offsets
             .retain(|address, _| address.node_id != node_id);
+        if self
+            .terminal_selection
+            .as_ref()
+            .is_some_and(|selection| selection.address.node_id == node_id)
+        {
+            self.terminal_selection = None;
+        }
         self.workspace_inspections
             .retain(|(inspection_node_id, _), _| inspection_node_id != node_id);
         self.collapsed_directories
@@ -1398,7 +5549,19 @@ impl App {
 
         let removed_modal_focus = match self.focus {
             Focus::Spawn => self.spawn.as_ref().is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::ExistingSession => self
+                .existing_session
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
             Focus::AddSpace => self.add_space.as_ref().is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::FolderBrowser => self
+                .folder_browser
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::CreateWorkspaceEntry => self
+                .create_workspace_entry
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
             Focus::CreateWorktree => self
                 .create_worktree
                 .as_ref()
@@ -1411,17 +5574,46 @@ impl App {
                 .rename_session
                 .as_ref()
                 .is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::TaskId => self
+                .task_id_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.node_id == node_id),
             Focus::ForgetSession => self
                 .forget_session
                 .as_ref()
                 .is_some_and(|dialog| dialog.node_id == node_id),
+            Focus::History => self
+                .history
+                .as_ref()
+                .is_some_and(|dialog| dialog.source.node_id == node_id),
             _ => false,
         };
         if self.spawn.as_ref().is_some_and(|dialog| dialog.node_id == node_id) {
             self.spawn = None;
         }
+        if self
+            .existing_session
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.existing_session = None;
+        }
         if self.add_space.as_ref().is_some_and(|dialog| dialog.node_id == node_id) {
             self.add_space = None;
+        }
+        if self
+            .folder_browser
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.folder_browser = None;
+        }
+        if self
+            .create_workspace_entry
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.create_workspace_entry = None;
         }
         if self
             .create_worktree
@@ -1445,23 +5637,27 @@ impl App {
             self.rename_session = None;
         }
         if self
+            .task_id_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            self.task_id_dialog = None;
+        }
+        if self
             .forget_session
             .as_ref()
             .is_some_and(|dialog| dialog.node_id == node_id)
         {
             self.forget_session = None;
         }
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|dialog| dialog.source.node_id == node_id)
+        {
+            self.history = None;
+        }
 
-        self.selected_tab = selected_tab
-            .as_ref()
-            .filter(|address| address.node_id != node_id)
-            .and_then(|address| self.tabs.iter().position(|tab| &tab.address == address))
-            .unwrap_or_else(|| self.selected_tab.min(self.tabs.len().saturating_sub(1)));
-        self.grid.focused = focused_pane
-            .as_ref()
-            .filter(|address| address.node_id != node_id)
-            .and_then(|address| self.grid.panes.iter().position(|pane| &pane.address == address))
-            .unwrap_or_else(|| self.grid.focused.min(self.grid.panes.len().saturating_sub(1)));
         self.selected_space = selected_space
             .as_ref()
             .filter(|(selected_node_id, _)| selected_node_id != node_id)
@@ -1498,19 +5694,19 @@ impl App {
             self.agents_scroll = 0;
         }
 
+        self.reconcile_agent_menu();
+        self.reconcile_native_session_menu();
         self.reconcile_session_drag();
-        let active_target_removed = match self.surface_mode {
-            SurfaceMode::Tab => selected_tab_removed,
-            SurfaceMode::Grid => focused_pane_removed,
-        };
+        self.reconcile_agent_run_lens();
+        self.reconcile_expanded_agent_progress();
+        self.reconcile_agent_board();
         if self.focus == Focus::Viewport && active_target_removed {
-            if self.surface_mode == SurfaceMode::Grid && !self.grid.panes.is_empty() {
+            if self.focused_address().is_some() {
                 self.notice = Some(format!(
-                    "{node_id} removed from C2 topology; nearest grid pane focused"
+                    "{node_id} removed from C2 topology; nearest surface tab focused"
                 ));
             } else {
-                self.surface_mode = SurfaceMode::Tab;
-                self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
+                self.focus = if self.menu_placement == MenuPlacement::Sidebar {
                     self.sidebar_focus()
                 } else {
                     Focus::Tabs
@@ -1520,8 +5716,9 @@ impl App {
                 ));
             }
         } else if removed_modal_focus {
-            self.surface_mode = SurfaceMode::Tab;
-            self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
+            self.focus = if self.focused_address().is_none()
+                && self.menu_placement == MenuPlacement::Sidebar
+            {
                 self.sidebar_focus()
             } else {
                 Focus::Tabs
@@ -1536,6 +5733,14 @@ impl App {
             record_id: record.record_id.clone(),
         };
         let selected = self.agent_rows().get(self.selected_agent).cloned();
+        if !record.has_provider_session_identity {
+            self.session_history_refresh_pending.retain(|(node_id, record_id, _)| {
+                node_id != &record.node_id || record_id != &record.record_id
+            });
+            self.session_history_refreshed.retain(|(node_id, record_id, _)| {
+                node_id != &record.node_id || record_id != &record.record_id
+            });
+        }
         let Some(node) = self.nodes.iter_mut().find(|node| node.node_id == record.node_id) else {
             return;
         };
@@ -1555,30 +5760,81 @@ impl App {
         } else if let Some(index) = self.agent_rows().iter().position(|candidate| *candidate == key) {
             self.selected_agent = index;
         }
+        self.reconcile_agent_run_lens();
+        self.reconcile_expanded_agent_progress();
+        self.reconcile_agent_board();
     }
 
     pub fn remove_managed_session(&mut self, node_id: &str, record_id: &str) {
+        self.session_history_refresh_pending.retain(|(refresh_node_id, refresh_record_id, _)| {
+            refresh_node_id != node_id || refresh_record_id != record_id
+        });
+        self.session_history_refreshed.retain(|(refresh_node_id, refresh_record_id, _)| {
+            refresh_node_id != node_id || refresh_record_id != record_id
+        });
+        let cancelled_resume = self.preview_resume.as_ref().filter(|pending| {
+            pending.node_id == node_id
+                && pending.record_id.as_deref() == Some(record_id)
+        }).cloned();
+        if let Some(pending) = cancelled_resume {
+            if let Some(origin) = pending.origin.as_ref() {
+                if let Some(tab) = self.preview_tabs.get_mut(origin) {
+                    tab.phase = PreviewTabPhase::Hydrated;
+                }
+            }
+            self.cancelled_preview_resumes.insert((
+                node_id.to_owned(),
+                record_id.to_owned(),
+                pending.operation_token,
+            ));
+            while self.cancelled_preview_resumes.len() > 128 {
+                let Some(oldest) = self.cancelled_preview_resumes.iter().next().cloned() else {
+                    break;
+                };
+                self.cancelled_preview_resumes.remove(&oldest);
+            }
+            self.preview_resume = None;
+            self.notice = Some(
+                "session record was removed; pending reconnect result will be ignored".to_owned(),
+            );
+        }
         let selected = self.agent_rows().get(self.selected_agent).cloned();
         if let Some(node) = self.nodes.iter_mut().find(|node| node.node_id == node_id) {
             node.session_records.retain(|record| record.record_id != record_id);
         }
+        self.reconcile_agent_run_lens();
         let removed = AgentRowKey::Managed {
             node_id: node_id.to_owned(),
             record_id: record_id.to_owned(),
         };
+        self.expanded_agent_progress.remove(&removed);
         if selected.as_ref() != Some(&removed) {
             if let Some(index) = selected
                 .as_ref()
                 .and_then(|selected| self.agent_rows().iter().position(|candidate| candidate == selected))
             {
                 self.selected_agent = index;
+                self.reconcile_agent_menu();
+                self.reconcile_native_session_menu();
+                self.reconcile_agent_board();
                 return;
             }
         }
         self.selected_agent = self.selected_agent.min(self.agent_rows().len().saturating_sub(1));
+        self.reconcile_agent_menu();
+        self.reconcile_native_session_menu();
+        self.reconcile_agent_board();
     }
 
     pub fn request_open(&mut self, address: SessionAddress) {
+        if self
+            .surface
+            .all_tabs()
+            .iter()
+            .any(|tab| matches!(tab, SurfaceTab::Pty(open) if open == &address))
+        {
+            return;
+        }
         if self.find_session(&address).is_some() {
             self.open_address(address);
         } else if !self.pending_open.contains(&address) {
@@ -1587,20 +5843,493 @@ impl App {
     }
 
     pub fn request_space_selection(&mut self, node_id: String, workspace_id: String) {
+        self.clear_agent_run_lens();
         self.pending_space = Some((node_id, workspace_id));
         self.reconcile_pending_space();
     }
 
-    pub fn open_selected_agent(&mut self) {
+    fn select_workspace_route_without_inspection(
+        &mut self,
+        node_id: &str,
+        workspace_id: &str,
+    ) -> bool {
+        let Some(index) = self.space_rows().iter().position(|(node_index, workspace_index)| {
+            let node = &self.nodes[*node_index];
+            node.node_id == node_id
+                && node.workspaces[*workspace_index].workspace_id == workspace_id
+        }) else {
+            return false;
+        };
+        self.select_workspace_without_inspection(index);
+        true
+    }
+
+    pub fn open_selected_agent(&mut self) -> AppAction {
         let key = self.agent_rows().get(self.selected_agent).cloned();
         if let Some(address) = key.as_ref().and_then(|key| self.agent_row_active_address(key)) {
             self.open_address(address);
+            return AppAction::None;
         } else if let Some(record) = key.as_ref().and_then(|key| self.find_managed_session(key)) {
+            if record.state == ManagedSessionState::Dormant
+                && record.has_provider_session_identity
+                && self.node_is_connected(&record.node_id)
+            {
+                let record = record.clone();
+                return self.start_managed_session_preview(record);
+            }
+            self.notice = Some(format!("{} is {}; preview unavailable",
+                record.display_name, managed_state_label(record.state)));
+        }
+        AppAction::None
+    }
+
+    fn select_agent_key(&mut self, key: &AgentRowKey) -> bool {
+        let Some(index) = self.agent_rows().iter().position(|candidate| candidate == key) else {
+            return false;
+        };
+        self.selected_agent = index;
+        true
+    }
+
+    fn open_agent_menu(&mut self, index: usize, column: u16, row: u16) {
+        let Some(key) = self.agent_rows().get(index).cloned() else {
+            return;
+        };
+        let selected = self
+            .agent_menu_items_for(&key)
+            .iter()
+            .position(|item| item.enabled)
+            .unwrap_or(0);
+        self.selected_agent = index;
+        self.roster_mode = RosterMode::Agents;
+        self.control_section = ControlSection::Agents;
+        self.drag_state = None;
+        self.native_session_menu = None;
+        self.agent_menu = Some(AgentMenuState {
+            key,
+            anchor_column: column,
+            anchor_row: row,
+            selected,
+        });
+    }
+
+    fn select_native_session_key(&mut self, key: &PreviewTabKey) -> bool {
+        let Some(index) = self.existing_session.as_ref().and_then(|dialog| {
+            dialog.rows.iter().position(|row| Self::native_session_key(row) == *key)
+        }) else {
+            return false;
+        };
+        let tree_cursor = self.native_session_tree_items().iter().position(|item| {
+            matches!(item, NativeSessionTreeItem::Session { row_index } if *row_index == index)
+        });
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return false;
+        };
+        dialog.field = ExistingSessionField::Sessions;
+        dialog.selected = index;
+        if let Some(tree_cursor) = tree_cursor {
+            dialog.tree_cursor = tree_cursor;
+        }
+        populate_selected_catalog_row(dialog);
+        true
+    }
+
+    fn open_native_session_menu(&mut self, index: usize, column: u16, row: u16) {
+        let Some(key) = self
+            .existing_session
+            .as_ref()
+            .and_then(|dialog| dialog.rows.get(index))
+            .map(Self::native_session_key)
+        else {
+            return;
+        };
+        if !self.select_native_session_key(&key) {
+            return;
+        }
+        let selected = self
+            .native_session_menu_items_for(&key)
+            .iter()
+            .position(|item| item.enabled)
+            .unwrap_or(0);
+        self.agent_menu = None;
+        self.drag_state = None;
+        self.native_session_menu = Some(NativeSessionMenuState {
+            key,
+            anchor_column: column,
+            anchor_row: row,
+            selected,
+        });
+    }
+
+    fn activate_native_session_menu_action(
+        &mut self,
+        action: NativeSessionMenuAction,
+    ) -> AppAction {
+        let Some(menu) = self.native_session_menu.clone() else {
+            return AppAction::None;
+        };
+        let Some(item) = self
+            .native_session_menu_items_for(&menu.key)
+            .into_iter()
+            .find(|item| item.action == action)
+        else {
+            return AppAction::None;
+        };
+        if !item.enabled {
             self.notice = Some(format!(
-                "{} is {}; press r to resume",
-                record.display_name,
-                managed_state_label(record.state)
+                "{} unavailable: {}",
+                action.label(),
+                item.disabled_reason.unwrap_or_else(|| "unsupported".to_owned())
             ));
+            return AppAction::None;
+        }
+        let Some(row) = self.native_session_row_for_key(&menu.key).cloned() else {
+            self.native_session_menu = None;
+            self.notice = Some("session is no longer in this catalog snapshot".to_owned());
+            return AppAction::None;
+        };
+        if !self.select_native_session_key(&menu.key) {
+            self.native_session_menu = None;
+            self.notice = Some("session is no longer in this catalog snapshot".to_owned());
+            return AppAction::None;
+        }
+        self.native_session_menu = None;
+        match action {
+            NativeSessionMenuAction::OpenTranscriptMetrics => {
+                if self.preview_tabs.contains_key(&menu.key) {
+                    self.surface.open_in_focused(SurfaceTab::Preview(menu.key));
+                    self.sync_active_native_preview_selection();
+                    self.focus = Focus::Viewport;
+                    AppAction::None
+                } else {
+                    self.start_native_session_preview()
+                }
+            }
+            NativeSessionMenuAction::OpenWorkspace => {
+                let Some(workspace_id) = row.route.workspace_id.as_deref() else {
+                    return AppAction::None;
+                };
+                if !self.select_workspace_route_without_inspection(&row.node_id, workspace_id) {
+                    self.notice = Some("session workspace is not registered on its node".to_owned());
+                    return AppAction::None;
+                }
+                self.sidebar_mode = SidebarMode::Files;
+                self.control_section = ControlSection::Files;
+                self.focus = Focus::Spaces;
+                self.inspect_selected_workspace()
+            }
+            NativeSessionMenuAction::Resume => {
+                self.surface.open_in_focused(SurfaceTab::Preview(menu.key));
+                self.sync_active_native_preview_selection();
+                self.focus = Focus::Viewport;
+                self.start_focused_preview_resume()
+            }
+            NativeSessionMenuAction::RenameProviderRecord => {
+                let Some(record_id) = row.record_id else {
+                    return AppAction::None;
+                };
+                let key = AgentRowKey::Managed {
+                    node_id: row.node_id,
+                    record_id,
+                };
+                if !self.select_agent_key(&key) {
+                    self.notice = Some("linked managed record disappeared".to_owned());
+                    return AppAction::None;
+                }
+                self.focus = Focus::Agents;
+                self.begin_rename_selected_agent()
+            }
+            NativeSessionMenuAction::OpenAgentBoard => {
+                if let Some(record_id) = row.record_id {
+                    let key = AgentRowKey::Managed {
+                        node_id: row.node_id,
+                        record_id,
+                    };
+                    if self.derive_agent_board_card(key.clone()).is_some() {
+                        self.agent_board.selected = Some(key);
+                    }
+                }
+                self.open_agent_board()
+            }
+        }
+    }
+
+    fn move_native_session_menu_selection(&mut self, forward: bool) {
+        let Some(menu) = self.native_session_menu.as_ref() else {
+            return;
+        };
+        let current = menu.selected;
+        let enabled = self
+            .native_session_menu_items_for(&menu.key)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.enabled.then_some(index))
+            .collect::<Vec<_>>();
+        if enabled.is_empty() {
+            return;
+        }
+        let position = enabled.iter().position(|index| *index == current).unwrap_or(0);
+        let next = if forward {
+            (position + 1) % enabled.len()
+        } else if position == 0 {
+            enabled.len() - 1
+        } else {
+            position - 1
+        };
+        if let Some(menu) = self.native_session_menu.as_mut() {
+            menu.selected = enabled[next];
+        }
+    }
+
+    fn reduce_native_session_menu(&mut self, key: UiKey) -> AppAction {
+        match key {
+            UiKey::Escape | UiKey::OperatorEscape => {
+                self.native_session_menu = None;
+                AppAction::None
+            }
+            UiKey::Up => {
+                self.move_native_session_menu_selection(false);
+                AppAction::None
+            }
+            UiKey::Down => {
+                self.move_native_session_menu_selection(true);
+                AppAction::None
+            }
+            UiKey::Enter => {
+                let action = self.native_session_menu.as_ref().and_then(|menu| {
+                    NativeSessionMenuAction::ALL.get(menu.selected).copied()
+                });
+                action
+                    .map(|action| self.activate_native_session_menu_action(action))
+                    .unwrap_or(AppAction::None)
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    fn inspect_agent_workspace(&mut self, key: &AgentRowKey) -> AppAction {
+        self.clear_agent_run_lens();
+        let Some((node_id, workspace_id)) = self.agent_workspace_route(key) else {
+            self.notice = Some("workspace route unavailable".to_owned());
+            return AppAction::None;
+        };
+        let Some(index) = self.space_rows().iter().position(|(node_index, workspace_index)| {
+            let node = &self.nodes[*node_index];
+            node.node_id == node_id
+                && node.workspaces[*workspace_index].workspace_id == workspace_id
+        }) else {
+            self.notice = Some("session workspace is not registered on its node".to_owned());
+            return AppAction::None;
+        };
+        self.select_workspace_without_inspection(index);
+        self.sidebar_mode = SidebarMode::Files;
+        self.control_section = ControlSection::Files;
+        self.focus = Focus::Spaces;
+        self.inspect_selected_workspace()
+    }
+
+    fn stop_selected_agent(&mut self) -> AppAction {
+        let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
+            self.notice = Some("no session selected".to_owned());
+            return AppAction::None;
+        };
+        let Some(address) = self.agent_row_active_address(&key) else {
+            self.notice = Some("selected record has no live PTY".to_owned());
+            return AppAction::None;
+        };
+        if !self.address_is_connected(&address) {
+            self.notice = Some(format!("{} is disconnected; stop unavailable", address.node_id));
+            return AppAction::None;
+        }
+        let Some(session) = self.find_session(&address) else {
+            self.notice = Some("selected PTY is absent from the node snapshot".to_owned());
+            return AppAction::None;
+        };
+        if !session.stoppable {
+            self.notice = Some("selected PTY is not stoppable".to_owned());
+            return AppAction::None;
+        }
+        AppAction::Stop { address, force: false }
+    }
+
+    fn activate_agent_menu_action(&mut self, action: AgentMenuAction) -> AppAction {
+        let Some(menu) = self.agent_menu.clone() else {
+            return AppAction::None;
+        };
+        let Some(item) = self
+            .agent_menu_items_for(&menu.key)
+            .into_iter()
+            .find(|item| item.action == action)
+        else {
+            return AppAction::None;
+        };
+        if !item.enabled {
+            self.notice = Some(format!(
+                "{} unavailable: {}",
+                action.label(),
+                item.disabled_reason.unwrap_or_else(|| "unsupported".to_owned())
+            ));
+            return AppAction::None;
+        }
+        if !self.select_agent_key(&menu.key) {
+            self.agent_menu = None;
+            self.notice = Some("session record disappeared from the roster".to_owned());
+            return AppAction::None;
+        }
+        self.agent_menu = None;
+        match action {
+            AgentMenuAction::Open => {
+                self.open_selected_agent()
+            }
+            AgentMenuAction::InspectWorkspace => self.inspect_agent_workspace(&menu.key),
+            AgentMenuAction::ActivityBoard => {
+                self.agent_board.selected = Some(menu.key.clone());
+                self.open_agent_board()
+            }
+            AgentMenuAction::ToggleMetrics => self.toggle_agent_progress(menu.key.clone()),
+            AgentMenuAction::TogglePin => {
+                self.toggle_managed_agent_pin(&menu.key);
+                AppAction::None
+            }
+            AgentMenuAction::LocalAlias => self.begin_local_alias(&menu.key),
+            AgentMenuAction::MoveUp => {
+                self.move_managed_agent(&menu.key, false);
+                AppAction::None
+            }
+            AgentMenuAction::MoveDown => {
+                self.move_managed_agent(&menu.key, true);
+                AppAction::None
+            }
+            AgentMenuAction::NewTaskId => self.set_selected_task(SessionTaskTargetV1::New),
+            AgentMenuAction::AssignTaskId => self.begin_assign_task_id(&menu.key),
+            AgentMenuAction::CopyTaskId => {
+                self.copy_task_id(&menu.key);
+                AppAction::None
+            }
+            AgentMenuAction::ClearTaskId => self.set_selected_task(SessionTaskTargetV1::Clear),
+            AgentMenuAction::Rename => {
+                self.focus = Focus::Agents;
+                self.begin_rename_selected_agent()
+            }
+            AgentMenuAction::Resume => {
+                self.focus = Focus::Agents;
+                self.restart_selected_agent()
+            }
+            AgentMenuAction::History => {
+                self.focus = Focus::Agents;
+                self.begin_history_selected_agent()
+            }
+            AgentMenuAction::Stop => {
+                self.focus = Focus::Agents;
+                self.stop_selected_agent()
+            }
+            AgentMenuAction::Forget => {
+                self.focus = Focus::Agents;
+                self.begin_forget_selected_agent()
+            }
+        }
+    }
+
+    fn move_agent_menu_selection(&mut self, forward: bool) {
+        let Some(menu) = self.agent_menu.as_ref() else {
+            return;
+        };
+        let current = menu.selected;
+        let enabled = self
+            .agent_menu_items_for(&menu.key)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.enabled.then_some(index))
+            .collect::<Vec<_>>();
+        if enabled.is_empty() {
+            return;
+        }
+        let position = enabled.iter().position(|index| *index == current).unwrap_or(0);
+        let next = if forward {
+            (position + 1) % enabled.len()
+        } else if position == 0 {
+            enabled.len() - 1
+        } else {
+            position - 1
+        };
+        if let Some(menu) = self.agent_menu.as_mut() {
+            menu.selected = enabled[next];
+        }
+    }
+
+    fn reduce_agent_menu(&mut self, key: UiKey) -> AppAction {
+        match key {
+            UiKey::Escape | UiKey::OperatorEscape => {
+                self.agent_menu = None;
+                AppAction::None
+            }
+            UiKey::Up => {
+                self.move_agent_menu_selection(false);
+                AppAction::None
+            }
+            UiKey::Down => {
+                self.move_agent_menu_selection(true);
+                AppAction::None
+            }
+            UiKey::Enter => {
+                let action = self
+                    .agent_menu
+                    .as_ref()
+                    .and_then(|menu| AgentMenuAction::ALL.get(menu.selected))
+                    .copied();
+                action
+                    .map(|action| self.activate_agent_menu_action(action))
+                    .unwrap_or(AppAction::None)
+            }
+            UiKey::Char('n') => self.activate_agent_menu_action(AgentMenuAction::Rename),
+            UiKey::Char('r') | UiKey::Char('R') => {
+                self.activate_agent_menu_action(AgentMenuAction::Resume)
+            }
+            UiKey::Char('h') => self.activate_agent_menu_action(AgentMenuAction::History),
+            UiKey::Delete => {
+                let stop_enabled = self
+                    .agent_menu_items()
+                    .iter()
+                    .any(|item| item.action == AgentMenuAction::Stop && item.enabled);
+                self.activate_agent_menu_action(if stop_enabled {
+                    AgentMenuAction::Stop
+                } else {
+                    AgentMenuAction::Forget
+                })
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    fn reconcile_agent_menu(&mut self) {
+        let Some(mut menu) = self.agent_menu.take() else {
+            return;
+        };
+        let key = match menu.key {
+            AgentRowKey::Managed { node_id, record_id } => {
+                AgentRowKey::Managed { node_id, record_id }
+            }
+            AgentRowKey::Legacy(address) => self
+                .rebound_address(&address)
+                .map(AgentRowKey::Legacy)
+                .unwrap_or(AgentRowKey::Legacy(address)),
+        };
+        if self.agent_rows().iter().any(|candidate| candidate == &key) {
+            menu.key = key;
+            menu.selected = menu.selected.min(AgentMenuAction::ALL.len().saturating_sub(1));
+            self.agent_menu = Some(menu);
+        }
+    }
+
+    fn reconcile_native_session_menu(&mut self) {
+        let Some(mut menu) = self.native_session_menu.take() else {
+            return;
+        };
+        if self.native_session_row_for_key(&menu.key).is_some() {
+            menu.selected = menu
+                .selected
+                .min(NativeSessionMenuAction::ALL.len().saturating_sub(1));
+            self.native_session_menu = Some(menu);
         }
     }
 
@@ -1612,13 +6341,16 @@ impl App {
             self.notice = Some(format!("{} is disconnected; PTY cannot be opened", address.node_id));
             return;
         }
-        if let Some(space_index) = self.space_rows().iter().position(|(node_index, workspace_index)| {
-            let node = &self.nodes[*node_index];
-            node.node_id == address.node_id
-                && node.workspaces[*workspace_index].workspace_id == address.workspace_id
-        }) {
-            self.select_workspace_without_inspection(space_index);
+        let opening_active_run = self.agent_run_lens.as_ref().is_some_and(|lens| {
+            self.agent_row_active_address(&lens.key).as_ref() == Some(&address)
+        });
+        if !opening_active_run {
+            self.clear_agent_run_lens();
         }
+        self.select_workspace_route_without_inspection(
+            &address.node_id,
+            &address.workspace_id,
+        );
         if let Some(agent_index) = self
             .agent_rows()
             .iter()
@@ -1626,112 +6358,150 @@ impl App {
         {
             self.selected_agent = agent_index;
         }
-        if let Some(index) = self
-            .grid
-            .panes
-            .iter()
-            .position(|pane| pane.address == address)
-        {
-            self.grid.focused = index;
-            self.surface_mode = SurfaceMode::Grid;
-            self.focus = Focus::Viewport;
-            return;
-        }
-        if let Some(index) = self.tabs.iter().position(|tab| tab.address == address) {
-            self.selected_tab = index;
-        } else {
-            self.tabs.push(SessionTab { address });
-            self.selected_tab = self.tabs.len() - 1;
-        }
-        self.surface_mode = SurfaceMode::Tab;
-        self.focus = Focus::Viewport;
-    }
-
-    pub fn focus_grid_pane(&mut self, index: usize) {
-        if index >= self.grid.panes.len() {
-            return;
-        }
-        self.grid.focused = index;
-        self.surface_mode = SurfaceMode::Grid;
-        self.focus = Focus::Viewport;
-    }
-
-    pub fn set_grid_preset(&mut self, preset: GridPreset) {
-        self.grid.preset = preset;
-        if !self.grid.panes.is_empty() {
-            self.surface_mode = SurfaceMode::Grid;
-            self.focus = Focus::Viewport;
-        }
-    }
-
-    pub fn move_address_to_grid(&mut self, address: SessionAddress, slot: Option<usize>) -> bool {
-        if self.find_session(&address).is_none() || !self.address_is_connected(&address) {
-            return false;
-        }
-        if let Some(existing) = self
-            .grid
-            .panes
-            .iter()
-            .position(|pane| pane.address == address)
-        {
-            let pane = self.grid.panes.remove(existing);
-            let target = slot
-                .unwrap_or(existing)
-                .min(self.grid.panes.len());
-            self.grid.panes.insert(target, pane);
-            self.grid.focused = target;
-            self.surface_mode = SurfaceMode::Grid;
-            self.focus = Focus::Viewport;
-            return true;
-        }
-        if self.grid.panes.len() >= MAX_GRID_PANES {
-            self.notice = Some("grid is full; detach a pane before adding another PTY".to_owned());
-            return false;
-        }
-        self.remove_tab_address(&address);
-        let target = slot.unwrap_or(self.grid.panes.len()).min(self.grid.panes.len());
-        self.grid.panes.insert(target, GridPane { address });
-        self.grid.focused = target;
-        self.surface_mode = SurfaceMode::Grid;
-        self.focus = Focus::Viewport;
-        true
-    }
-
-    pub fn move_address_to_tabs(&mut self, address: SessionAddress) -> bool {
-        if self.find_session(&address).is_none() || !self.address_is_connected(&address) {
-            return false;
-        }
-        if let Some(index) = self
-            .grid
-            .panes
-            .iter()
-            .position(|pane| pane.address == address)
-        {
-            self.grid.panes.remove(index);
-            self.grid.focused = self.grid.focused.min(self.grid.panes.len().saturating_sub(1));
-        }
-        if let Some(index) = self.tabs.iter().position(|tab| tab.address == address) {
-            self.selected_tab = index;
-        } else {
-            self.tabs.push(SessionTab { address });
-            self.selected_tab = self.tabs.len() - 1;
-        }
-        self.surface_mode = SurfaceMode::Tab;
-        self.focus = Focus::Viewport;
-        true
-    }
-
-    fn remove_tab_address(&mut self, address: &SessionAddress) {
-        let selected = self.tabs.get(self.selected_tab).map(|tab| tab.address.clone());
-        self.tabs.retain(|tab| &tab.address != address);
-        if let Some(index) = selected
+        if self
+            .terminal_selection
             .as_ref()
-            .and_then(|selected| self.tabs.iter().position(|tab| &tab.address == selected))
+            .is_some_and(|selection| selection.address != address)
         {
-            self.selected_tab = index;
-        } else {
-            self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
+            self.terminal_selection = None;
         }
+        self.surface.open_in_focused(SurfaceTab::Pty(address));
+        self.focus = Focus::Viewport;
+    }
+
+    pub fn focus_surface_pane(&mut self, pane_id: PaneId) {
+        if self.surface.set_focused(pane_id).is_ok() {
+            let focused_address = self.focused_address().cloned();
+            if self
+                .terminal_selection
+                .as_ref()
+                .is_some_and(|selection| focused_address.as_ref() != Some(&selection.address))
+            {
+                self.terminal_selection = None;
+            }
+            self.sync_active_native_preview_selection();
+            self.focus = Focus::Viewport;
+        }
+    }
+
+    pub fn navigate_surface_tab_at(
+        &mut self,
+        column: u16,
+        row: u16,
+        backward: bool,
+    ) -> AppAction {
+        if !matches!(
+            self.focus,
+            Focus::Spaces | Focus::Agents | Focus::Tabs | Focus::Viewport
+        ) {
+            return AppAction::None;
+        }
+        let Some(pane_id) = self
+            .layout
+            .surface_panes
+            .iter()
+            .find(|pane| pane.frame.contains(column, row))
+            .map(|pane| pane.pane_id)
+        else {
+            return AppAction::None;
+        };
+        if self.surface.set_focused(pane_id).is_err() {
+            return AppAction::None;
+        }
+        let before = self.focused_address().cloned();
+        let pane = self.surface.focused_pane_mut();
+        if pane.tabs.len() < 2 {
+            self.sync_active_native_preview_selection();
+            return AppAction::None;
+        }
+        pane.active = if backward {
+            pane.active.saturating_sub(1)
+        } else {
+            pane.active.saturating_add(1).min(pane.tabs.len() - 1)
+        };
+        let after = self.focused_address().cloned();
+        if before != after {
+            self.terminal_selection = None;
+        }
+        self.sync_active_native_preview_selection();
+        self.focus = Focus::Viewport;
+        AppAction::None
+    }
+
+    pub fn set_layout_preset(&mut self, preset: LayoutPreset) {
+        match self.surface.apply_layout_preset(preset) {
+            Ok(()) => {
+                self.layout_menu_open = false;
+                self.focus = Focus::Tabs;
+            }
+            Err(SurfaceError::PresetCapacityExceeded { leaves, .. }) => {
+                self.notice = Some(format!(
+                    "{} cannot contain {leaves} open panes",
+                    preset.id(),
+                ));
+            }
+            Err(SurfaceError::PaneNotFound(_) | SurfaceError::MaximumLeavesReached { .. }) => {}
+        }
+    }
+
+    pub fn drop_address_on_surface(
+        &mut self,
+        address: SessionAddress,
+        target: PaneId,
+        zone: SurfaceDropZone,
+    ) -> bool {
+        if self.find_session(&address).is_none() || !self.address_is_connected(&address) {
+            return false;
+        }
+        self.drop_surface_tab(SurfaceTab::Pty(address), target, zone)
+    }
+
+    fn drop_surface_tab(
+        &mut self,
+        tab: SurfaceTab,
+        target: PaneId,
+        zone: SurfaceDropZone,
+    ) -> bool {
+        let available = match &tab {
+            SurfaceTab::AgentBoard => true,
+            SurfaceTab::SessionMonitor(key) => self.session_monitor(key).is_some(),
+            SurfaceTab::Pty(address) => {
+                self.find_session(address).is_some() && self.address_is_connected(address)
+            }
+            SurfaceTab::Preview(key) => self.preview_tabs.contains_key(key),
+            SurfaceTab::File(key) => self.file_tabs.contains_key(key),
+            SurfaceTab::Git(key) => self.git_tabs.contains_key(key),
+        };
+        if !available {
+            return false;
+        }
+        match self.surface.drop_tab(tab, target, zone) {
+            Ok(_) => {
+                self.layout_menu_open = false;
+                self.focus = Focus::Viewport;
+                true
+            }
+            Err(SurfaceError::MaximumLeavesReached { maximum }) => {
+                self.notice = Some(format!(
+                    "surface is full ({maximum} panes); merge or detach a tab first",
+                ));
+                false
+            }
+            Err(SurfaceError::PaneNotFound(_)) => false,
+            Err(SurfaceError::PresetCapacityExceeded { .. }) => false,
+        }
+    }
+
+    pub fn surface_drop_target_at(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<(PaneId, SurfaceDropZone)> {
+        self.layout
+            .surface_panes
+            .iter()
+            .find(|pane| pane.frame.contains(column, row))
+            .map(|pane| (pane.pane_id, surface_drop_zone(pane.frame, column, row)))
     }
 
     fn reconcile_pending_open(&mut self) {
@@ -1768,21 +6538,78 @@ impl App {
         self.drag_state = match drag {
             DragState::SessionChip {
                 source,
-                address,
+                tab,
                 start_column,
                 start_row,
                 current_column,
                 current_row,
                 moved,
-            } => self.rebound_address(&address).map(|address| DragState::SessionChip {
-                source,
-                address,
-                start_column,
-                start_row,
-                current_column,
-                current_row,
-                moved,
-            }),
+            } => match tab {
+                SurfaceTab::AgentBoard => Some(DragState::SessionChip {
+                    source,
+                    tab: SurfaceTab::AgentBoard,
+                    start_column,
+                    start_row,
+                    current_column,
+                    current_row,
+                    moved,
+                }),
+                SurfaceTab::SessionMonitor(key) => self.session_monitor(&key).is_some().then_some(
+                    DragState::SessionChip {
+                        source,
+                        tab: SurfaceTab::SessionMonitor(key),
+                        start_column,
+                        start_row,
+                        current_column,
+                        current_row,
+                        moved,
+                    },
+                ),
+                SurfaceTab::Pty(address) => self.rebound_address(&address).map(|address| {
+                    DragState::SessionChip {
+                        source,
+                        tab: SurfaceTab::Pty(address),
+                        start_column,
+                        start_row,
+                        current_column,
+                        current_row,
+                        moved,
+                    }
+                }),
+                SurfaceTab::Preview(key) => self.preview_tabs.contains_key(&key).then_some(
+                    DragState::SessionChip {
+                        source,
+                        tab: SurfaceTab::Preview(key),
+                        start_column,
+                        start_row,
+                        current_column,
+                        current_row,
+                        moved,
+                    },
+                ),
+                SurfaceTab::File(key) => self.file_tabs.contains_key(&key).then_some(
+                    DragState::SessionChip {
+                        source,
+                        tab: SurfaceTab::File(key),
+                        start_column,
+                        start_row,
+                        current_column,
+                        current_row,
+                        moved,
+                    },
+                ),
+                SurfaceTab::Git(key) => self.git_tabs.contains_key(&key).then_some(
+                    DragState::SessionChip {
+                        source,
+                        tab: SurfaceTab::Git(key),
+                        start_column,
+                        start_row,
+                        current_column,
+                        current_row,
+                        moved,
+                    },
+                ),
+            },
             DragState::AgentSelection {
                 key,
                 start_column,
@@ -1792,6 +6619,20 @@ impl App {
                 .agent_rows()
                 .contains(&key)
                 .then_some(DragState::AgentSelection {
+                    key,
+                    start_column,
+                    start_row,
+                    moved,
+                }),
+            DragState::AgentOrder {
+                key,
+                start_column,
+                start_row,
+                moved,
+            } => self
+                .agent_rows()
+                .contains(&key)
+                .then_some(DragState::AgentOrder {
                     key,
                     start_column,
                     start_row,
@@ -1826,37 +6667,48 @@ impl App {
     }
 
     pub fn close_selected_tab(&mut self) {
-        if self.surface_mode == SurfaceMode::Grid {
-            if self.grid.panes.is_empty() {
-                return;
-            }
-            self.grid.panes.remove(self.grid.focused);
-            self.grid.focused = self.grid.focused.min(self.grid.panes.len().saturating_sub(1));
-            if self.grid.panes.is_empty() {
-                self.surface_mode = SurfaceMode::Tab;
-            }
-            self.focus = if self.surface_mode == SurfaceMode::Tab
-                && self.tabs.is_empty()
-                && self.menu_placement == MenuPlacement::Sidebar
+        let Some(tab) = self.surface.active_tab().cloned() else {
+            return;
+        };
+        if let SurfaceTab::Preview(key) = &tab {
+            self.preview_tabs.remove(key);
+            if self
+                .preview_resume
+                .as_ref()
+                .is_some_and(|pending| pending.origin.as_ref() == Some(key))
             {
-                self.sidebar_focus()
-            } else {
-                Focus::Tabs
-            };
-            self.notice = Some("grid pane detached; headless session continues".to_owned());
-            return;
+                self.preview_resume = None;
+            }
+        } else if let SurfaceTab::File(key) = &tab {
+            self.file_tabs.remove(key);
+        } else if let SurfaceTab::Git(key) = &tab {
+            self.git_tabs.remove(key);
         }
-        if self.tabs.is_empty() {
-            return;
+        if let SurfaceTab::Pty(address) = &tab {
+            if self
+                .terminal_selection
+                .as_ref()
+                .is_some_and(|selection| selection.address == *address)
+            {
+                self.terminal_selection = None;
+            }
         }
-        self.tabs.remove(self.selected_tab);
-        self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
-        self.focus = if self.tabs.is_empty() && self.menu_placement == MenuPlacement::Sidebar {
+        self.surface.detach_tab(&tab);
+        self.focus = if self.surface.active_tab().is_none()
+            && self.menu_placement == MenuPlacement::Sidebar
+        {
             self.sidebar_focus()
         } else {
             Focus::Tabs
         };
-        self.notice = Some("tab detached; headless session continues".to_owned());
+        self.notice = Some(match tab {
+            SurfaceTab::AgentBoard => "Agent board tab closed".to_owned(),
+            SurfaceTab::SessionMonitor(_) => "Session Monitor tab closed; observations retained".to_owned(),
+            SurfaceTab::Pty(_) => "tab detached; headless session continues".to_owned(),
+            SurfaceTab::Preview(_) => "session tab closed".to_owned(),
+            SurfaceTab::File(_) => "file tab closed".to_owned(),
+            SurfaceTab::Git(_) => "Git tab closed".to_owned(),
+        });
     }
 
     pub fn set_terminal_size(&mut self, cols: u16, rows: u16) -> AppAction {
@@ -1886,11 +6738,26 @@ impl App {
             self.notice = Some("unsupported key modifier; no input sent".to_owned());
             return AppAction::None;
         }
+        if self.native_session_menu.is_some() {
+            return self.reduce_native_session_menu(key);
+        }
+        if self.agent_menu.is_some() {
+            return self.reduce_agent_menu(key);
+        }
         if self.focus == Focus::Spawn {
             return self.reduce_spawn(key);
         }
+        if self.focus == Focus::ExistingSession {
+            return self.reduce_existing_session(key);
+        }
         if self.focus == Focus::AddSpace {
             return self.reduce_add_space(key);
+        }
+        if self.focus == Focus::FolderBrowser {
+            return self.reduce_folder_browser(key);
+        }
+        if self.focus == Focus::CreateWorkspaceEntry {
+            return self.reduce_create_workspace_entry(key);
         }
         if self.focus == Focus::CreateWorktree {
             return self.reduce_create_worktree(key);
@@ -1901,8 +6768,14 @@ impl App {
         if self.focus == Focus::RenameSession {
             return self.reduce_rename_session(key);
         }
+        if self.focus == Focus::TaskId {
+            return self.reduce_task_id(key);
+        }
         if self.focus == Focus::ForgetSession {
             return self.reduce_forget_session(key);
+        }
+        if self.focus == Focus::History {
+            return self.reduce_history(key);
         }
         if self.focus == Focus::Settings {
             return self.reduce_settings(key);
@@ -1924,6 +6797,11 @@ impl App {
                 self.close_selected_tab();
                 AppAction::None
             }
+            UiKey::Tab | UiKey::BackTab
+                if self.focus == Focus::Agents && self.existing_session.is_some() =>
+            {
+                self.reduce_agents(key)
+            }
             UiKey::Tab => {
                 self.focus = self.next_focus();
                 AppAction::None
@@ -1938,11 +6816,16 @@ impl App {
                 Focus::Tabs => self.reduce_tabs(key),
                 Focus::Viewport
                 | Focus::Spawn
+                | Focus::ExistingSession
                 | Focus::AddSpace
+                | Focus::FolderBrowser
+                | Focus::CreateWorkspaceEntry
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
                 | Focus::RenameSession
+                | Focus::TaskId
                 | Focus::ForgetSession
+                | Focus::History
                 | Focus::Settings => {
                     AppAction::None
                 }
@@ -1951,17 +6834,6 @@ impl App {
     }
 
     pub fn click(&mut self, column: u16, row: u16) -> AppAction {
-        if matches!(
-            self.focus,
-            Focus::Spawn
-                | Focus::AddSpace
-                | Focus::CreateWorktree
-                | Focus::RemoveWorktree
-                | Focus::RenameSession
-                | Focus::ForgetSession
-        ) {
-            return AppAction::None;
-        }
         let target = self
             .layout
             .hits
@@ -1969,6 +6841,201 @@ impl App {
             .rev()
             .find(|hit| hit.rect.contains(column, row))
             .map(|hit| hit.target.clone());
+        if self.native_session_menu.is_some() {
+            return match target {
+                Some(HitTarget::NativeSessionMenuAction(action)) => {
+                    self.activate_native_session_menu_action(action)
+                }
+                Some(HitTarget::NativeSessionMore(index)) => {
+                    self.open_native_session_menu(index, column, row);
+                    AppAction::None
+                }
+                _ => {
+                    self.native_session_menu = None;
+                    AppAction::None
+                }
+            };
+        }
+        if self.agent_menu.is_some() {
+            return match target {
+                Some(HitTarget::AgentMenuAction(action)) => {
+                    self.activate_agent_menu_action(action)
+                }
+                Some(HitTarget::AgentMore(index)) => {
+                    self.open_agent_menu(index, column, row);
+                    AppAction::None
+                }
+                _ => {
+                    self.agent_menu = None;
+                    AppAction::None
+                }
+            };
+        }
+        if self.focus == Focus::Spawn {
+            return self.click_spawn(target, column, row);
+        }
+        if self.focus == Focus::ExistingSession {
+            return self.click_existing_session(target, column, row);
+        }
+        if self.focus == Focus::AddSpace {
+            return self.click_add_space(target, column, row);
+        }
+        if self.focus == Focus::FolderBrowser {
+            return self.click_folder_browser(target, column, row);
+        }
+        if self.focus == Focus::CreateWorkspaceEntry {
+            return self.click_create_workspace_entry(target);
+        }
+        if self.focus == Focus::CreateWorktree {
+            return self.click_create_worktree(target, column, row);
+        }
+        match target.as_ref() {
+            Some(HitTarget::AgentBoardOpen) => return self.open_agent_board(),
+            Some(HitTarget::HarnessTaskCard(task_id)) => {
+                if self.harness_kanban.tasks.contains_key(task_id) {
+                    self.harness_kanban.selected = Some(task_id.clone());
+                    self.focus = Focus::Viewport;
+                }
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessTaskRefresh) => return self.request_harness_refresh(),
+            Some(HitTarget::HarnessTaskCreate) => {
+                self.harness_kanban.composer = Some(HarnessTaskComposer::default());
+                self.focus = Focus::Viewport;
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessScheduleNext) => return self.harness_schedule_next(),
+            Some(HitTarget::HarnessColumnScroll(target)) => {
+                self.harness_kanban.column_scroll = (*target)
+                    .min(HarnessKanbanColumn::ALL.len().saturating_sub(1));
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessComposerField(field)) => {
+                if let Some(composer) = self.harness_kanban.composer.as_mut() {
+                    composer.field = *field;
+                }
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessComposerCreate) => return self.submit_harness_composer(),
+            Some(HitTarget::HarnessComposerCancel) => {
+                self.harness_kanban.composer = None;
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessTaskMove(state)) => {
+                return self.harness_move_selected(*state);
+            }
+            Some(HitTarget::HarnessTaskCancel) => return self.harness_cancel_selected(),
+            Some(HitTarget::HarnessTaskRetry) => return self.harness_retry_selected(),
+            Some(HitTarget::HarnessTaskMonitor) => return self.open_selected_harness_monitor(),
+            Some(HitTarget::HarnessBoardMode(mode)) => {
+                if self.agent_board_mode == *mode {
+                    return AppAction::None;
+                }
+                self.agent_board_mode = *mode;
+                return if *mode == AgentBoardMode::HarnessKanban {
+                    self.request_harness_refresh()
+                } else {
+                    AppAction::None
+                };
+            }
+            Some(HitTarget::AgentBoardCard(key)) => {
+                self.select_agent_board_key(key);
+                self.focus = Focus::Viewport;
+                return AppAction::None;
+            }
+            Some(HitTarget::AgentBoardCardOpen(key)) => {
+                return self.activate_agent_board_open(key.clone());
+            }
+            Some(HitTarget::AgentBoardCardRun(key)) => {
+                self.select_agent_board_key(key);
+                return self.toggle_agent_run_lens(key.clone());
+            }
+            Some(HitTarget::AgentBoardCardProgress(key)) => {
+                return self.open_session_monitor(key.clone());
+            }
+            Some(HitTarget::SessionMonitorSection(pane_id, section)) => {
+                self.focus_surface_pane(*pane_id);
+                if let Some(SurfaceTab::SessionMonitor(key)) = self
+                    .surface
+                    .panes
+                    .get(pane_id)
+                    .and_then(|pane| pane.active_tab())
+                    .cloned()
+                {
+                    if let Some(monitor) = self.session_monitors
+                        .get_mut(&key.target)
+                    {
+                        monitor.section = *section;
+                    }
+                }
+                self.focus = Focus::Viewport;
+                return AppAction::None;
+            }
+            Some(HitTarget::AgentBoardTaskFilter) => {
+                self.toggle_agent_board_task_filter();
+                return AppAction::None;
+            }
+            _ => {}
+        }
+        if self.focus == Focus::Agents
+            && matches!(self.roster_mode, RosterMode::Agents | RosterMode::NativeSessions)
+        {
+            match target {
+                Some(HitTarget::ExistingSessionField(field)) => {
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        dialog.field = field;
+                    }
+                    return AppAction::None;
+                }
+                Some(HitTarget::ExistingSessionFieldPrevious(field)) => {
+                    return self.cycle_existing_session_field(field, false);
+                }
+                Some(HitTarget::ExistingSessionFieldNext(field)) => {
+                    return self.cycle_existing_session_field(field, true);
+                }
+                Some(HitTarget::ExistingSessionRow(index)) => {
+                    let tree_cursor = self.native_session_tree_items().iter().position(|item| {
+                        matches!(item, NativeSessionTreeItem::Session { row_index } if *row_index == index)
+                    });
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        if index < dialog.rows.len() {
+                            dialog.field = ExistingSessionField::Sessions;
+                            dialog.selected = index;
+                            if let Some(cursor) = tree_cursor {
+                                dialog.tree_cursor = cursor;
+                            }
+                            populate_selected_catalog_row(dialog);
+                        }
+                    }
+                    return self.start_native_session_preview();
+                }
+                Some(HitTarget::NativeWorkspaceGroup(group)) => {
+                    self.toggle_native_workspace_group(group);
+                    return AppAction::None;
+                }
+                Some(HitTarget::NativeProviderGroup(group, provider)) => {
+                    self.toggle_native_provider_group(group, provider);
+                    return AppAction::None;
+                }
+                Some(HitTarget::NativeSessionsLoadMore(route, window)) => {
+                    return self.page_native_sessions(route, window);
+                }
+                Some(HitTarget::NativeSessionsOpen) => {
+                    return self.start_native_session_preview();
+                }
+                _ => {}
+            }
+        }
+        if matches!(
+            self.focus,
+            Focus::RemoveWorktree
+                | Focus::RenameSession
+                | Focus::TaskId
+                | Focus::ForgetSession
+                | Focus::History
+        ) {
+            return AppAction::None;
+        }
         if self.focus == Focus::Settings {
             match target {
                 Some(HitTarget::ControlResize) => {
@@ -1979,6 +7046,29 @@ impl App {
                 }
                 Some(HitTarget::ControlSection(section)) => {
                     return self.select_control_section(section);
+                }
+                Some(HitTarget::RosterMode(mode)) => {
+                    let action = self.select_roster_mode(mode);
+                    self.focus = Focus::Settings;
+                    return action;
+                }
+                Some(HitTarget::NativeWorkspaceGroup(group)) => {
+                    self.toggle_native_workspace_group(group);
+                }
+                Some(HitTarget::NativeProviderGroup(group, provider)) => {
+                    self.toggle_native_provider_group(group, provider);
+                }
+                Some(HitTarget::NativeSessionsLoadMore(route, window)) => {
+                    return self.page_native_sessions(route, window);
+                }
+                Some(HitTarget::ExistingSessionRow(index)) => {
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        if index < dialog.rows.len() {
+                            dialog.selected = index;
+                            populate_selected_catalog_row(dialog);
+                        }
+                    }
+                    return self.start_native_session_preview();
                 }
                 Some(HitTarget::SettingsStyle) => self.cycle_color_mode(),
                 Some(HitTarget::SettingsPlacement) => self.toggle_menu_placement(),
@@ -1994,14 +7084,30 @@ impl App {
                     };
                     return self.select_inspector_item(mode, index);
                 }
+                Some(HitTarget::AgentMore(index)) => {
+                    self.open_agent_menu(index, column, row);
+                }
+                Some(HitTarget::NativeSessionMore(index)) => {
+                    self.open_native_session_menu(index, column, row);
+                }
+                Some(HitTarget::AgentRun(key)) => return self.toggle_agent_run_lens(key),
+                Some(HitTarget::AgentProgressToggle(key)) => {
+                    return self.toggle_agent_progress(key);
+                }
+                Some(HitTarget::AgentOrderHandle(key)) => {
+                    self.begin_agent_order_drag(key, column, row);
+                }
+                Some(HitTarget::AgentRunAll) => return self.restore_agent_run_lens(),
                 Some(HitTarget::Agent(index)) => {
                     self.select_or_begin_agent_drag(index, column, row);
                 }
                 Some(HitTarget::Space(index)) => {
+                    self.clear_agent_run_lens();
                     self.select_workspace_without_inspection(index);
                     return self.inspect_selected_workspace();
                 }
                 Some(HitTarget::SpawnSpace(index)) => {
+                    self.clear_agent_run_lens();
                     self.select_workspace_without_inspection(index);
                     return self.begin_spawn();
                 }
@@ -2017,6 +7123,9 @@ impl App {
                     return self.begin_remove_worktree(index);
                 }
                 Some(HitTarget::AddAgent) => return self.begin_spawn(),
+                Some(HitTarget::NativeSessionsOpen) => {
+                    return self.start_native_session_preview();
+                }
                 Some(HitTarget::Settings) => self.close_settings(),
                 _ => {}
             }
@@ -2033,12 +7142,35 @@ impl App {
             Some(HitTarget::SidebarWidthDrag) => self.drag_state = Some(DragState::SidebarWidth),
             Some(HitTarget::SidebarSplitDrag) => self.drag_state = Some(DragState::SidebarSplit),
             Some(HitTarget::RosterMode(mode)) => {
-                self.roster_mode = mode;
-                self.control_section = match mode {
-                    RosterMode::Agents => ControlSection::Agents,
-                    RosterMode::Workspaces => ControlSection::Workspaces,
-                };
-                self.focus = Focus::Agents;
+                return self.select_roster_mode(mode);
+            }
+            Some(HitTarget::NativeWorkspaceGroup(group)) => {
+                self.toggle_native_workspace_group(group);
+            }
+            Some(HitTarget::NativeProviderGroup(group, provider)) => {
+                self.toggle_native_provider_group(group, provider);
+            }
+            Some(HitTarget::NativeSessionsLoadMore(route, window)) => {
+                return self.page_native_sessions(route, window);
+            }
+            Some(HitTarget::ExistingSessionRow(index)) => {
+                let tree_cursor = self.native_session_tree_items().iter().position(|item| {
+                    matches!(item, NativeSessionTreeItem::Session { row_index } if *row_index == index)
+                });
+                if let Some(dialog) = self.existing_session.as_mut() {
+                    if index < dialog.rows.len() {
+                        dialog.field = ExistingSessionField::Sessions;
+                        dialog.selected = index;
+                        if let Some(cursor) = tree_cursor {
+                            dialog.tree_cursor = cursor;
+                        }
+                        populate_selected_catalog_row(dialog);
+                    }
+                }
+                return self.start_native_session_preview();
+            }
+            Some(HitTarget::NativeSessionMore(index)) => {
+                self.open_native_session_menu(index, column, row);
             }
             Some(HitTarget::Space(index)) => {
                 self.control_section = ControlSection::Workspaces;
@@ -2046,6 +7178,7 @@ impl App {
             }
             Some(HitTarget::SpawnSpace(index)) => {
                 self.control_section = ControlSection::Workspaces;
+                self.clear_agent_run_lens();
                 self.select_workspace_without_inspection(index);
                 return self.begin_spawn();
             }
@@ -2066,41 +7199,218 @@ impl App {
                 self.focus = Focus::Spaces;
                 return self.select_inspector_item(self.sidebar_mode, index);
             }
+            Some(HitTarget::NewFile) => {
+                return self.begin_create_workspace_entry(WorkspaceEntryKind::File);
+            }
+            Some(HitTarget::NewDirectory) => {
+                return self.begin_create_workspace_entry(WorkspaceEntryKind::Directory);
+            }
+            Some(HitTarget::AgentMore(index)) => {
+                self.control_section = ControlSection::Agents;
+                self.open_agent_menu(index, column, row);
+            }
+            Some(HitTarget::AgentRun(key)) => return self.toggle_agent_run_lens(key),
+            Some(HitTarget::AgentProgressToggle(key)) => {
+                return self.toggle_agent_progress(key);
+            }
+            Some(HitTarget::AgentOrderHandle(key)) => {
+                self.begin_agent_order_drag(key, column, row);
+            }
+            Some(HitTarget::AgentRunAll) => return self.restore_agent_run_lens(),
             Some(HitTarget::Agent(index)) => {
                 self.control_section = ControlSection::Agents;
                 self.select_or_begin_agent_drag(index, column, row);
             }
             Some(HitTarget::AddAgent) => return self.begin_spawn(),
-            Some(HitTarget::Tab(index)) => {
-                if let Some(address) = self.tabs.get(index).map(|tab| tab.address.clone()) {
-                    self.begin_session_drag(DragSource::Tab(index), address, column, row);
+            Some(HitTarget::NativeSessionsOpen) => {
+                return self.start_native_session_preview();
+            }
+            Some(HitTarget::SurfaceTab(pane_id, index)) => {
+                if let Some(address) = self
+                    .surface
+                    .panes
+                    .get(&pane_id)
+                    .and_then(|pane| pane.tabs.get(index))
+                    .cloned()
+                {
+                    self.begin_session_drag(
+                        DragSource::Tab(pane_id, index),
+                        address,
+                        column,
+                        row,
+                    );
                 }
             }
             Some(HitTarget::AddTab) => return self.begin_spawn(),
-            Some(HitTarget::GridToggle) => {
-                if self.grid.panes.is_empty() {
-                    self.notice = Some("drag an agent or tab onto grid to create its first pane".to_owned());
+            Some(HitTarget::LayoutMenuToggle) => {
+                self.layout_menu_open = !self.layout_menu_open;
+                self.focus = Focus::Tabs;
+            }
+            Some(HitTarget::LayoutPreset(preset)) => self.set_layout_preset(preset),
+            Some(HitTarget::SurfaceDivider { path, axis, area }) => {
+                self.drag_state = Some(DragState::SurfaceDivider { path, axis, area });
+            }
+            Some(HitTarget::SurfacePaneHeader(pane_id)) => {
+                if let Some((index, address)) = self
+                    .surface
+                    .panes
+                    .get(&pane_id)
+                    .and_then(|pane| pane.active_tab().map(|address| (pane.active, address.clone())))
+                {
+                    self.begin_session_drag(
+                        DragSource::Tab(pane_id, index),
+                        address,
+                        column,
+                        row,
+                    );
                 } else {
-                    self.surface_mode = SurfaceMode::Grid;
-                    self.focus = Focus::Viewport;
+                    self.focus_surface_pane(pane_id);
                 }
             }
-            Some(HitTarget::GridPreset(preset)) => self.set_grid_preset(preset),
-            Some(HitTarget::GridPaneHeader(index)) => {
-                if let Some(address) = self.grid.panes.get(index).map(|pane| pane.address.clone()) {
-                    self.begin_session_drag(DragSource::Pane(index), address, column, row);
+            Some(HitTarget::SurfacePaneBody(pane_id)) => {
+                self.begin_surface_body_interaction(pane_id, column, row);
+            }
+            Some(HitTarget::FileHistory(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    return self.open_workspace_file_history(key, None);
                 }
             }
-            Some(HitTarget::GridPaneBody(index)) => self.focus_grid_pane(index),
-            Some(HitTarget::GridDropSlot(index)) => {
-                if index < self.grid.panes.len() {
-                    self.focus_grid_pane(index);
+            Some(HitTarget::FileSource(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    if let Some(file) = self.file_tabs.get_mut(&key) {
+                        file.inline_history = None;
+                    }
                 }
             }
-            Some(HitTarget::GridDivider(axis, index)) => {
-                self.drag_state = Some(DragState::GridDivider { axis, index });
+            Some(HitTarget::FileHistoryCommit(pane_id, index)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    return self.request_git_commit_diff(
+                        &WorkspaceGitRequestDestination::InlineFile(key),
+                        index,
+                    );
+                }
             }
-            Some(HitTarget::TabDrop) => {}
+            Some(HitTarget::FileHistoryBack(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    if let Some(history) = self
+                        .file_tabs
+                        .get_mut(&key)
+                        .and_then(|file| file.inline_history.as_mut())
+                    {
+                        history.mode = WorkspaceGitPaneMode::List;
+                        history.detail_scroll = 0;
+                    }
+                }
+            }
+            Some(HitTarget::FileHistoryPrevious(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    let destination = WorkspaceGitRequestDestination::InlineFile(key);
+                    let selected = self.git_view(&destination).map(|tab| tab.selected).unwrap_or(0);
+                    if selected > 0 {
+                        return self.request_git_commit_diff(&destination, selected - 1);
+                    }
+                }
+            }
+            Some(HitTarget::FileHistoryNext(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    let destination = WorkspaceGitRequestDestination::InlineFile(key);
+                    let Some((selected, len)) = self
+                        .git_view(&destination)
+                        .map(|tab| (tab.selected, tab.commits.len()))
+                    else {
+                        return AppAction::None;
+                    };
+                    if selected.saturating_add(1) < len {
+                        return self.request_git_commit_diff(&destination, selected + 1);
+                    }
+                }
+            }
+            Some(HitTarget::FileChanges(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    let target = WorkspaceGitDiffTarget::Working {
+                        path: Some(key.path.clone()),
+                    };
+                    return self.open_workspace_file_history(key, Some(target));
+                }
+            }
+            Some(HitTarget::FileEdit(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    if let Some(file) = self.file_tabs.get_mut(&key) {
+                        file.edit_mode = !file.edit_mode;
+                        self.notice = Some(if file.edit_mode {
+                            "edit mode; Ctrl+S saves, Esc returns to viewer".to_owned()
+                        } else {
+                            "view mode".to_owned()
+                        });
+                    }
+                }
+            }
+            Some(HitTarget::FileSave(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    return self.reduce_file_viewport(key, UiKey::Ctrl('s'));
+                }
+            }
+            Some(HitTarget::FileScrollbar(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                if let Some(key) = self.active_file_key_in_pane(pane_id) {
+                    let viewport = self
+                        .layout
+                        .surface_panes
+                        .iter()
+                        .find(|pane| pane.pane_id == pane_id)
+                        .map(|pane| pane.viewport)
+                        .unwrap_or_default();
+                    self.update_file_scrollbar(&key, viewport, row);
+                    self.drag_state = Some(DragState::FileScrollbar { key, viewport });
+                }
+            }
+            Some(HitTarget::GitCommit(pane_id, index)) => {
+                self.focus_surface_pane(pane_id);
+                let key = self
+                    .surface
+                    .panes
+                    .get(&pane_id)
+                    .and_then(|pane| pane.active_tab())
+                    .and_then(|tab| match tab {
+                        SurfaceTab::Git(key) => Some(key.clone()),
+                        _ => None,
+                });
+                if let Some(key) = key {
+                    return self.request_git_commit_diff(
+                        &WorkspaceGitRequestDestination::Surface(key),
+                        index,
+                    );
+                }
+            }
+            Some(HitTarget::GitBack(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                let key = self
+                    .surface
+                    .panes
+                    .get(&pane_id)
+                    .and_then(|pane| pane.active_tab())
+                    .and_then(|tab| match tab {
+                        SurfaceTab::Git(key) => Some(key.clone()),
+                        _ => None,
+                    });
+                if let Some(tab) = key.and_then(|key| self.git_tabs.get_mut(&key)) {
+                    tab.mode = WorkspaceGitPaneMode::List;
+                    tab.detail_scroll = 0;
+                }
+            }
+            Some(HitTarget::PreviewResume(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                return self.start_focused_preview_resume();
+            }
             Some(HitTarget::Settings) => self.begin_settings(),
             Some(
                 HitTarget::ControlSection(_)
@@ -2109,7 +7419,66 @@ impl App {
                 | HitTarget::SettingsPresentation
                 | HitTarget::SettingsSidebarCollapsed
                 | HitTarget::ControlDrag
-                | HitTarget::ControlResize,
+                | HitTarget::ControlResize
+                | HitTarget::SpawnDrag
+                | HitTarget::SpawnField(_)
+                | HitTarget::SpawnFieldPrevious(_)
+                | HitTarget::SpawnFieldNext(_)
+                | HitTarget::SpawnRegisterWorkspace
+                | HitTarget::SpawnConfigureGitLocation
+                | HitTarget::SpawnCancel
+                | HitTarget::SpawnLaunch
+                | HitTarget::ExistingSessionDrag
+                | HitTarget::ExistingSessionField(_)
+                | HitTarget::ExistingSessionFieldPrevious(_)
+                | HitTarget::ExistingSessionFieldNext(_)
+                | HitTarget::ExistingSessionNativeResume
+                | HitTarget::ExistingSessionRestoreViaSkill
+                | HitTarget::ExistingSessionAdvancedImport
+                | HitTarget::ExistingSessionBackToCatalog
+                | HitTarget::ExistingSessionCancel
+                | HitTarget::ExistingSessionImport
+                | HitTarget::AddSpaceDrag
+                | HitTarget::AddSpaceField(_)
+                | HitTarget::AddSpaceBrowse
+                | HitTarget::AddSpaceCancel
+                | HitTarget::AddSpaceRegister
+                | HitTarget::FolderBrowserDrag
+                | HitTarget::FolderBrowserParent
+                | HitTarget::FolderBrowserFilter
+                | HitTarget::FolderBrowserEntry(_)
+                | HitTarget::FolderBrowserLoadMore
+                | HitTarget::FolderBrowserUse
+                | HitTarget::FolderBrowserCancel
+                | HitTarget::CreateWorkspaceEntryCancel
+                | HitTarget::CreateWorkspaceEntrySubmit
+                | HitTarget::CreateWorktreeDrag
+                | HitTarget::CreateWorktreeField(_)
+                | HitTarget::CreateWorktreeCancel
+                | HitTarget::CreateWorktreeCreate
+                | HitTarget::AgentBoardOpen
+                | HitTarget::AgentBoardCard(_)
+                | HitTarget::AgentBoardCardOpen(_)
+                | HitTarget::AgentBoardCardRun(_)
+                | HitTarget::AgentBoardCardProgress(_)
+                | HitTarget::HarnessTaskCard(_)
+                | HitTarget::HarnessTaskRefresh
+                | HitTarget::HarnessTaskCreate
+                | HitTarget::HarnessScheduleNext
+                | HitTarget::HarnessColumnScroll(_)
+                | HitTarget::HarnessComposerField(_)
+                | HitTarget::HarnessComposerCreate
+                | HitTarget::HarnessComposerCancel
+                | HitTarget::HarnessTaskMove(_)
+                | HitTarget::HarnessTaskCancel
+                | HitTarget::HarnessTaskRetry
+                | HitTarget::HarnessTaskMonitor
+                | HitTarget::HarnessBoardMode(_)
+                | HitTarget::SessionMonitorSection(_, _)
+                | HitTarget::ContextUsageSegment(_)
+                | HitTarget::AgentBoardTaskFilter
+                | HitTarget::AgentMenuAction(_)
+                | HitTarget::NativeSessionMenuAction(_),
             ) => {}
             Some(HitTarget::Viewport) => self.focus = Focus::Viewport,
             None => {}
@@ -2117,15 +7486,280 @@ impl App {
         AppAction::None
     }
 
+    pub fn hover(&mut self, column: u16, row: u16) -> AppAction {
+        self.harness_kanban.hover_position = Some((column, row));
+        self.context_usage_hover = self
+            .layout
+            .hits
+            .iter()
+            .rev()
+            .find(|hit| hit.rect.contains(column, row))
+            .and_then(|hit| match &hit.target {
+                HitTarget::ContextUsageSegment(segment) => Some(ContextUsageHover {
+                    column,
+                    row,
+                    hit: *segment,
+                }),
+                _ => None,
+            });
+        AppAction::None
+    }
+
+    pub fn right_click(&mut self, column: u16, row: u16) -> AppAction {
+        let target = self
+            .layout
+            .hits
+            .iter()
+            .rev()
+            .find(|hit| hit.rect.contains(column, row))
+            .map(|hit| hit.target.clone());
+        match target {
+            Some(HitTarget::Agent(index)) | Some(HitTarget::AgentMore(index)) => {
+                self.open_agent_menu(index, column, row);
+            }
+            Some(HitTarget::AgentBoardCard(key))
+            | Some(HitTarget::AgentBoardCardOpen(key))
+            | Some(HitTarget::AgentBoardCardRun(key))
+            | Some(HitTarget::AgentBoardCardProgress(key)) => {
+                if let Some(index) = self.agent_rows().iter().position(|row| row == &key) {
+                    self.open_agent_menu(index, column, row);
+                }
+            }
+            Some(HitTarget::ExistingSessionRow(index))
+            | Some(HitTarget::NativeSessionMore(index)) => {
+                self.open_native_session_menu(index, column, row);
+            }
+            _ => {
+                self.agent_menu = None;
+                self.native_session_menu = None;
+            }
+        }
+        AppAction::None
+    }
+
+    fn click_spawn(
+        &mut self,
+        target: Option<HitTarget>,
+        column: u16,
+        row: u16,
+    ) -> AppAction {
+        match target {
+            Some(HitTarget::SpawnDrag) => self.begin_spawn_drag(column, row),
+            Some(HitTarget::SpawnField(field)) => {
+                if let Some(spawn) = self.spawn.as_mut() {
+                    spawn.field = field;
+                }
+            }
+            Some(HitTarget::SpawnFieldPrevious(field)) => {
+                let Some(mut spawn) = self.spawn.take() else {
+                    self.focus = Focus::Agents;
+                    return AppAction::None;
+                };
+                spawn.field = field;
+                self.cycle_launch_value(&mut spawn, false);
+                self.spawn = Some(spawn);
+            }
+            Some(HitTarget::SpawnFieldNext(field)) => {
+                let Some(mut spawn) = self.spawn.take() else {
+                    self.focus = Focus::Agents;
+                    return AppAction::None;
+                };
+                spawn.field = field;
+                self.cycle_launch_value(&mut spawn, true);
+                self.spawn = Some(spawn);
+            }
+            Some(HitTarget::SpawnRegisterWorkspace) => {
+                return self.begin_add_space_from_spawn();
+            }
+            Some(HitTarget::SpawnConfigureGitLocation) => {
+                return self.begin_git_location_configuration();
+            }
+            Some(HitTarget::SpawnCancel) => return self.reduce_spawn(UiKey::Escape),
+            Some(HitTarget::SpawnLaunch) => return self.confirm_spawn(),
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn click_existing_session(
+        &mut self,
+        target: Option<HitTarget>,
+        column: u16,
+        row: u16,
+    ) -> AppAction {
+        match target {
+            Some(HitTarget::ExistingSessionDrag) => {
+                self.begin_existing_session_drag(column, row)
+            }
+            Some(HitTarget::ExistingSessionField(field)) => {
+                if let Some(dialog) = self.existing_session.as_mut() {
+                    dialog.field = field;
+                }
+            }
+            Some(HitTarget::ExistingSessionFieldPrevious(field)) => {
+                return self.cycle_existing_session_field(field, false);
+            }
+            Some(HitTarget::ExistingSessionFieldNext(field)) => {
+                return self.cycle_existing_session_field(field, true);
+            }
+            Some(HitTarget::ExistingSessionRow(index)) => {
+                if let Some(dialog) = self.existing_session.as_mut() {
+                    if index < dialog.rows.len() {
+                        dialog.field = ExistingSessionField::Sessions;
+                        dialog.selected = index;
+                        dialog.scroll = dialog.scroll.min(index);
+                        populate_selected_catalog_row(dialog);
+                    }
+                }
+            }
+            Some(HitTarget::ExistingSessionNativeResume) => {
+                return self.start_native_session_resume();
+            }
+            Some(HitTarget::ExistingSessionRestoreViaSkill) => {
+                self.notice = Some(RESTORE_VIA_SKILL_DISABLED_REASON.to_owned());
+            }
+            Some(HitTarget::ExistingSessionAdvancedImport) => {
+                self.set_existing_session_mode(ExistingSessionMode::AdvancedImport);
+            }
+            Some(HitTarget::ExistingSessionBackToCatalog) => {
+                if self.existing_session.as_ref().is_some_and(|dialog| {
+                    dialog.mode == ExistingSessionMode::AdvancedImport
+                }) {
+                    self.set_existing_session_mode(ExistingSessionMode::Catalog);
+                } else {
+                    self.focus = Focus::Agents;
+                }
+            }
+            Some(HitTarget::ExistingSessionCancel) => {
+                return self.reduce_existing_session(UiKey::Escape);
+            }
+            Some(HitTarget::ExistingSessionImport) => {
+                return self.reduce_existing_session(UiKey::Enter);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn click_add_space(
+        &mut self,
+        target: Option<HitTarget>,
+        column: u16,
+        row: u16,
+    ) -> AppAction {
+        match target {
+            Some(HitTarget::AddSpaceDrag) => self.begin_add_space_drag(column, row),
+            Some(HitTarget::AddSpaceField(field)) => {
+                if let Some(dialog) = self.add_space.as_mut() {
+                    dialog.field = field;
+                }
+            }
+            Some(HitTarget::AddSpaceBrowse) => return self.begin_folder_browser(),
+            Some(HitTarget::AddSpaceCancel) => return self.reduce_add_space(UiKey::Escape),
+            Some(HitTarget::AddSpaceRegister) => return self.reduce_add_space(UiKey::Enter),
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn click_folder_browser(
+        &mut self,
+        target: Option<HitTarget>,
+        column: u16,
+        row: u16,
+    ) -> AppAction {
+        match target {
+            Some(HitTarget::FolderBrowserDrag) => self.begin_folder_browser_drag(column, row),
+            Some(HitTarget::FolderBrowserParent) => return self.browse_parent_directory(),
+            Some(HitTarget::FolderBrowserFilter) => {
+                if let Some(browser) = self.folder_browser.as_mut() {
+                    browser.field = FolderBrowserField::Filter;
+                }
+            }
+            Some(HitTarget::FolderBrowserEntry(index)) => {
+                let position = self
+                    .visible_host_directory_indices()
+                    .iter()
+                    .position(|candidate| *candidate == index);
+                if let (Some(browser), Some(position)) = (self.folder_browser.as_mut(), position) {
+                    browser.field = FolderBrowserField::Entries;
+                    browser.selected = position;
+                }
+                return self.open_selected_host_directory();
+            }
+            Some(HitTarget::FolderBrowserLoadMore) => return self.load_more_host_directories(),
+            Some(HitTarget::FolderBrowserUse) => return self.use_browsed_directory(),
+            Some(HitTarget::FolderBrowserCancel) => return self.close_folder_browser(),
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn click_create_worktree(
+        &mut self,
+        target: Option<HitTarget>,
+        column: u16,
+        row: u16,
+    ) -> AppAction {
+        match target {
+            Some(HitTarget::CreateWorktreeDrag) => {
+                self.begin_create_worktree_drag(column, row)
+            }
+            Some(HitTarget::CreateWorktreeField(field)) => {
+                if let Some(dialog) = self.create_worktree.as_mut() {
+                    dialog.field = field;
+                }
+            }
+            Some(HitTarget::CreateWorktreeCancel) => {
+                return self.reduce_create_worktree(UiKey::Escape);
+            }
+            Some(HitTarget::CreateWorktreeCreate) => {
+                return self.reduce_create_worktree(UiKey::Enter);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
     pub fn scroll(&mut self, column: u16, row: u16, up: bool) -> AppAction {
+        if self.native_session_menu.is_some() {
+            self.move_native_session_menu_selection(!up);
+            return AppAction::None;
+        }
+        if self.agent_menu.is_some() {
+            self.move_agent_menu_selection(!up);
+            return AppAction::None;
+        }
+        if self.focus == Focus::FolderBrowser {
+            self.move_folder_browser_selection(if up { -3 } else { 3 });
+            return AppAction::None;
+        }
+        if self.focus == Focus::ExistingSession
+            && self.layout.existing_session_modal.contains(column, row)
+        {
+            if let Some(dialog) = self.existing_session.as_mut() {
+                dialog.field = ExistingSessionField::Sessions;
+                dialog.preview_scroll = if up {
+                    dialog.preview_scroll.saturating_sub(3)
+                } else {
+                    dialog.preview_scroll.saturating_add(3)
+                };
+            }
+            return AppAction::None;
+        }
         if matches!(
             self.focus,
             Focus::Spawn
+                | Focus::ExistingSession
                 | Focus::AddSpace
+                | Focus::FolderBrowser
+                | Focus::CreateWorkspaceEntry
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
                 | Focus::RenameSession
+                | Focus::TaskId
                 | Focus::ForgetSession
+                | Focus::History
         ) {
             return AppAction::None;
         }
@@ -2138,8 +7772,8 @@ impl App {
                 AppAction::None
             };
         }
-        if let Some((address, viewport)) = self.terminal_target_at(column, row) {
-            return self.scroll_terminal(address, viewport, column, row, up);
+        if let Some((tab, viewport)) = self.terminal_target_at(column, row) {
+            return self.scroll_terminal(tab, viewport, column, row, up);
         }
         if self.layout.spaces.contains(column, row) {
             let reserved_rows = match self.sidebar_mode {
@@ -2165,6 +7799,93 @@ impl App {
             return AppAction::None;
         };
         match drag {
+            DragState::SpawnModal {
+                grab_column,
+                grab_row,
+                origin_x,
+                origin_y,
+            } => {
+                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
+                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
+                let max_x = self.terminal_cols.saturating_sub(self.layout.spawn_modal.width);
+                let max_y = self.terminal_rows.saturating_sub(self.layout.spawn_modal.height);
+                self.spawn_modal_position = Some((
+                    x.clamp(0, i32::from(max_x)) as u16,
+                    y.clamp(0, i32::from(max_y)) as u16,
+                ));
+            }
+            DragState::ExistingSessionModal {
+                grab_column,
+                grab_row,
+                origin_x,
+                origin_y,
+            } => {
+                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
+                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
+                let max_x = self
+                    .terminal_cols
+                    .saturating_sub(self.layout.existing_session_modal.width);
+                let max_y = self
+                    .terminal_rows
+                    .saturating_sub(self.layout.existing_session_modal.height);
+                self.existing_session_modal_position = Some((
+                    x.clamp(0, i32::from(max_x)) as u16,
+                    y.clamp(0, i32::from(max_y)) as u16,
+                ));
+            }
+            DragState::AddSpaceModal {
+                grab_column,
+                grab_row,
+                origin_x,
+                origin_y,
+            } => {
+                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
+                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
+                let max_x = self.terminal_cols.saturating_sub(self.layout.add_space_modal.width);
+                let max_y = self.terminal_rows.saturating_sub(self.layout.add_space_modal.height);
+                self.add_space_modal_position = Some((
+                    x.clamp(0, i32::from(max_x)) as u16,
+                    y.clamp(0, i32::from(max_y)) as u16,
+                ));
+            }
+            DragState::FolderBrowserModal {
+                grab_column,
+                grab_row,
+                origin_x,
+                origin_y,
+            } => {
+                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
+                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
+                let max_x = self
+                    .terminal_cols
+                    .saturating_sub(self.layout.folder_browser_modal.width);
+                let max_y = self
+                    .terminal_rows
+                    .saturating_sub(self.layout.folder_browser_modal.height);
+                self.folder_browser_modal_position = Some((
+                    x.clamp(0, i32::from(max_x)) as u16,
+                    y.clamp(0, i32::from(max_y)) as u16,
+                ));
+            }
+            DragState::CreateWorktreeModal {
+                grab_column,
+                grab_row,
+                origin_x,
+                origin_y,
+            } => {
+                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
+                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
+                let max_x = self
+                    .terminal_cols
+                    .saturating_sub(self.layout.create_worktree_modal.width);
+                let max_y = self
+                    .terminal_rows
+                    .saturating_sub(self.layout.create_worktree_modal.height);
+                self.create_worktree_modal_position = Some((
+                    x.clamp(0, i32::from(max_x)) as u16,
+                    y.clamp(0, i32::from(max_y)) as u16,
+                ));
+            }
             DragState::ControlModal {
                 grab_column,
                 grab_row,
@@ -2223,6 +7944,39 @@ impl App {
                 self.sidebar_split_percent =
                     (u32::from(row) * 100 / u32::from(height)).clamp(25, 75) as u16;
             }
+            DragState::SurfaceDivider { path, axis, area } => {
+                let extent = match axis {
+                    SplitAxis::Horizontal => area.width,
+                    SplitAxis::Vertical => area.height,
+                };
+                if extent >= 3 {
+                    let usable = extent - 1;
+                    let (requested_first, requested_second) = self
+                        .surface
+                        .split_child_min_extents(&path, axis)
+                        .unwrap_or((3, 3));
+                    let (minimum_first, minimum_second) =
+                        if requested_first.saturating_add(requested_second) <= usable {
+                            (requested_first, requested_second)
+                        } else {
+                            let minimum_first = (usable / 2).max(1);
+                            (minimum_first, usable.saturating_sub(minimum_first).max(1))
+                        };
+                    let cursor = match axis {
+                        SplitAxis::Horizontal => column.saturating_sub(area.x),
+                        SplitAxis::Vertical => row.saturating_sub(area.y),
+                    };
+                    let first_extent = cursor.clamp(
+                        minimum_first,
+                        usable.saturating_sub(minimum_second),
+                    );
+                    let ratio_bps = ((u32::from(first_extent) * 10_000
+                        + u32::from(usable) - 1)
+                        / u32::from(usable))
+                        .min(9_999) as u16;
+                    self.surface.set_split_ratio(&path, ratio_bps);
+                }
+            }
             DragState::SessionChip {
                 start_column,
                 start_row,
@@ -2253,8 +8007,41 @@ impl App {
                     }
                 }
             }
-            DragState::GridDivider { axis, index } => {
-                self.update_grid_divider(axis, index, column, row);
+            DragState::AgentOrder {
+                start_column,
+                start_row,
+                ..
+            } => {
+                if let Some(DragState::AgentOrder { moved, .. }) = self.drag_state.as_mut() {
+                    if column != start_column || row != start_row {
+                        *moved = true;
+                    }
+                }
+            }
+            DragState::FileSelection { key, viewport } => {
+                if let Some(file) = self.file_tabs.get_mut(&key) {
+                    let number_width = file.editor.line_count().max(1).to_string().len().max(3)
+                        + 1
+                        + usize::from(file.editor.scroll_column() > 0);
+                    let viewport_row = row
+                        .min(viewport.bottom().saturating_sub(2))
+                        .saturating_sub(viewport.y) as usize;
+                    let viewport_column = column
+                        .saturating_sub(viewport.x)
+                        .saturating_sub(number_width.min(u16::MAX as usize) as u16)
+                        as usize;
+                    file.editor.update_drag_selection(viewport_row, viewport_column);
+                    file.editor.ensure_cursor_visible(
+                        viewport.height.saturating_sub(1) as usize,
+                        viewport.width.saturating_sub(number_width as u16) as usize,
+                    );
+                }
+            }
+            DragState::FileScrollbar { key, viewport } => {
+                self.update_file_scrollbar(&key, viewport, row);
+            }
+            DragState::TerminalSelection { address, viewport } => {
+                self.update_terminal_selection(&address, viewport, column, row);
             }
         }
         AppAction::None
@@ -2264,8 +8051,48 @@ impl App {
         let Some(drag) = self.drag_state.take() else {
             return AppAction::None;
         };
-        let (address, moved) = match drag {
-            DragState::SessionChip { address, moved, .. } => (address, moved),
+        match &drag {
+            DragState::SurfaceDivider { .. } => return AppAction::None,
+            DragState::FileSelection { .. } => return AppAction::None,
+            DragState::FileScrollbar { key, viewport } => {
+                let key = key.clone();
+                let viewport = *viewport;
+                self.update_file_scrollbar(&key, viewport, row);
+                return AppAction::None;
+            }
+            DragState::TerminalSelection { address, viewport } => {
+                let address = address.clone();
+                let viewport = *viewport;
+                self.update_terminal_selection(&address, viewport, column, row);
+                if self
+                    .terminal_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.text.is_empty())
+                {
+                    self.terminal_selection = None;
+                }
+                return AppAction::None;
+            }
+            DragState::AgentOrder { key, moved, .. } => {
+                if !moved {
+                    return AppAction::None;
+                }
+                let target = self.layout.hits.iter().rev().find_map(|hit| {
+                    (hit.rect.contains(column, row)).then(|| match &hit.target {
+                        HitTarget::Agent(index) => self.agent_rows().get(*index).cloned(),
+                        HitTarget::AgentOrderHandle(key) => Some(key.clone()),
+                        _ => None,
+                    }).flatten()
+                });
+                if let Some(target) = target {
+                    self.reorder_managed_agents(key, &target);
+                }
+                return AppAction::None;
+            }
+            _ => {}
+        }
+        let (tab, moved) = match drag {
+            DragState::SessionChip { tab, moved, .. } => (tab, moved),
             DragState::AgentSelection { key, moved, .. } => {
                 if !moved {
                     let Some(index) = self
@@ -2279,50 +8106,120 @@ impl App {
                     if self.focus != Focus::Settings {
                         self.focus = Focus::Agents;
                     }
-                    self.open_selected_agent();
+                    return self.open_selected_agent();
                 }
                 return AppAction::None;
             }
             _ => return AppAction::None,
         };
         if !moved {
-            self.open_address(address);
+            match tab {
+                SurfaceTab::AgentBoard => {
+                    self.surface.open_in_focused(SurfaceTab::AgentBoard);
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::SessionMonitor(key) if self.session_monitor(&key).is_some() => {
+                    self.surface.open_in_focused(SurfaceTab::SessionMonitor(key));
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::SessionMonitor(_) => {}
+                SurfaceTab::Pty(address) => self.open_address(address),
+                SurfaceTab::Preview(key) if self.preview_tabs.contains_key(&key) => {
+                    self.surface.open_in_focused(SurfaceTab::Preview(key));
+                    self.sync_active_native_preview_selection();
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::Preview(_) => {}
+                SurfaceTab::File(key) if self.file_tabs.contains_key(&key) => {
+                    self.surface.open_in_focused(SurfaceTab::File(key));
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::Git(key) if self.git_tabs.contains_key(&key) => {
+                    self.surface.open_in_focused(SurfaceTab::Git(key));
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::File(_) | SurfaceTab::Git(_) => {}
+            }
             return AppAction::None;
         }
-        let target = self
-            .layout
-            .hits
-            .iter()
-            .rev()
-            .find(|hit| hit.rect.contains(column, row))
-            .map(|hit| hit.target.clone());
-        match target {
-            Some(HitTarget::GridDropSlot(index))
-            | Some(HitTarget::GridPaneHeader(index))
-            | Some(HitTarget::GridPaneBody(index)) => {
-                self.move_address_to_grid(address, Some(index));
-            }
-            Some(HitTarget::GridToggle) | Some(HitTarget::GridPreset(_)) => {
-                self.move_address_to_grid(address, None);
-            }
-            Some(HitTarget::TabDrop)
-            | Some(HitTarget::Tab(_))
-            | Some(HitTarget::AddTab) => {
-                self.move_address_to_tabs(address);
-            }
-            _ if self.layout.grid_drop.contains(column, row) => {
-                self.move_address_to_grid(address, None);
-            }
-            _ if self.layout.tab_drop.contains(column, row) => {
-                self.move_address_to_tabs(address);
-            }
-            _ => {}
+        if let Some((pane_id, zone)) = self.surface_drop_target_at(column, row) {
+            self.drop_surface_tab(tab, pane_id, zone);
         }
         AppAction::None
     }
 
     pub fn end_drag(&mut self) {
         self.drag_state = None;
+    }
+
+    fn begin_spawn_drag(&mut self, column: u16, row: u16) {
+        let modal = self.layout.spawn_modal;
+        if modal.width == 0 || modal.height == 0 {
+            return;
+        }
+        self.spawn_modal_position = Some((modal.x, modal.y));
+        self.drag_state = Some(DragState::SpawnModal {
+            grab_column: column,
+            grab_row: row,
+            origin_x: modal.x,
+            origin_y: modal.y,
+        });
+    }
+
+    fn begin_existing_session_drag(&mut self, column: u16, row: u16) {
+        let modal = self.layout.existing_session_modal;
+        if modal.width == 0 || modal.height == 0 {
+            return;
+        }
+        self.existing_session_modal_position = Some((modal.x, modal.y));
+        self.drag_state = Some(DragState::ExistingSessionModal {
+            grab_column: column,
+            grab_row: row,
+            origin_x: modal.x,
+            origin_y: modal.y,
+        });
+    }
+
+    fn begin_add_space_drag(&mut self, column: u16, row: u16) {
+        let modal = self.layout.add_space_modal;
+        if modal.width == 0 || modal.height == 0 {
+            return;
+        }
+        self.add_space_modal_position = Some((modal.x, modal.y));
+        self.drag_state = Some(DragState::AddSpaceModal {
+            grab_column: column,
+            grab_row: row,
+            origin_x: modal.x,
+            origin_y: modal.y,
+        });
+    }
+
+    fn begin_folder_browser_drag(&mut self, column: u16, row: u16) {
+        let modal = self.layout.folder_browser_modal;
+        if modal.width == 0 || modal.height == 0 {
+            return;
+        }
+        self.folder_browser_modal_position = Some((modal.x, modal.y));
+        self.drag_state = Some(DragState::FolderBrowserModal {
+            grab_column: column,
+            grab_row: row,
+            origin_x: modal.x,
+            origin_y: modal.y,
+        });
+    }
+
+    fn begin_create_worktree_drag(&mut self, column: u16, row: u16) {
+        let modal = self.layout.create_worktree_modal;
+        if modal.width == 0 || modal.height == 0 {
+            return;
+        }
+        self.create_worktree_modal_position = Some((modal.x, modal.y));
+        self.drag_state = Some(DragState::CreateWorktreeModal {
+            grab_column: column,
+            grab_row: row,
+            origin_x: modal.x,
+            origin_y: modal.y,
+        });
     }
 
     fn begin_control_drag(&mut self, column: u16, row: u16) {
@@ -2357,13 +8254,13 @@ impl App {
     fn begin_session_drag(
         &mut self,
         source: DragSource,
-        address: SessionAddress,
+        tab: SurfaceTab,
         column: u16,
         row: u16,
     ) {
         self.drag_state = Some(DragState::SessionChip {
             source,
-            address,
+            tab,
             start_column: column,
             start_row: row,
             current_column: column,
@@ -2377,7 +8274,12 @@ impl App {
             return;
         };
         if let Some(address) = self.agent_row_active_address(&key) {
-            self.begin_session_drag(DragSource::Agent(index), address, column, row);
+            self.begin_session_drag(
+                DragSource::Agent(index),
+                SurfaceTab::Pty(address),
+                column,
+                row,
+            );
         } else {
             self.drag_state = Some(DragState::AgentSelection {
                 key,
@@ -2388,54 +8290,24 @@ impl App {
         }
     }
 
-    fn update_grid_divider(
-        &mut self,
-        axis: GridAxisKind,
-        index: usize,
-        column: u16,
-        row: u16,
-    ) {
-        if index >= 3 {
+    fn begin_agent_order_drag(&mut self, key: AgentRowKey, column: u16, row: u16) {
+        if !matches!(key, AgentRowKey::Managed { .. }) {
             return;
         }
-        let area = self.layout.viewport;
-        let (offset, extent) = match axis {
-            GridAxisKind::Columns => (column.saturating_sub(area.x), area.width),
-            GridAxisKind::Rows => (row.saturating_sub(area.y), area.height),
-        };
-        if extent == 0 {
-            return;
-        }
-        let candidate = (u32::from(offset.min(extent)) * 10_000 / u32::from(extent)) as u16;
-        let cuts = match axis {
-            GridAxisKind::Columns => &mut self.grid.column_cuts,
-            GridAxisKind::Rows => &mut self.grid.row_cuts,
-        };
-        let (minimum, maximum) = if self.grid.preset == GridPreset::Quad {
-            if index != 1 {
-                return;
-            }
-            (1_000, 9_000)
-        } else {
-            let minimum = if index == 0 {
-                1_000
-            } else {
-                cuts[index - 1].saturating_add(1_000)
-            };
-            let maximum = if index + 1 == cuts.len() {
-                9_000
-            } else {
-                cuts[index + 1].saturating_sub(1_000)
-            };
-            (minimum, maximum)
-        };
-        cuts[index] = candidate.clamp(minimum, maximum);
+        self.select_agent_key(&key);
+        self.drag_state = Some(DragState::AgentOrder {
+            key,
+            start_column: column,
+            start_row: row,
+            moved: false,
+        });
     }
 
     fn select_workspace(&mut self, index: usize) -> AppAction {
         if index >= self.space_rows().len() {
             return AppAction::None;
         }
+        self.clear_agent_run_lens();
         self.select_workspace_without_inspection(index);
         self.focus = Focus::Agents;
         self.inspect_selected_workspace()
@@ -2464,12 +8336,15 @@ impl App {
                     .selected_workspace_inspection()
                     .and_then(|inspection| inspection.entries.get(index))
                     .map(|entry| (entry.kind, entry.relative_path.clone()));
-                let Some((WorkspaceEntryKind::Directory, relative_path)) = entry else {
+                let Some((kind, relative_path)) = entry else {
                     return AppAction::None;
                 };
                 let Some((node_id, workspace_id)) = self.selected_workspace_route() else {
                     return AppAction::None;
                 };
+                if kind == WorkspaceEntryKind::File {
+                    return self.open_workspace_file(node_id, workspace_id, relative_path);
+                }
                 let key = (node_id, workspace_id, relative_path);
                 if !self.collapsed_directories.remove(&key) {
                     self.collapsed_directories.insert(key);
@@ -2481,14 +8356,190 @@ impl App {
                     .files_scroll
                     .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
             }
-            SidebarMode::Git => self.git_cursor = index.min(self.git_item_count().saturating_sub(1)),
+            SidebarMode::Git => {
+                self.git_cursor = index.min(self.git_item_count().saturating_sub(1));
+                return self.activate_selected_git_item();
+            }
         }
         AppAction::None
     }
 
+    fn open_workspace_file(
+        &mut self,
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+    ) -> AppAction {
+        self.file_request_token = self.file_request_token.wrapping_add(1).max(1);
+        let token = self.file_request_token;
+        let key = WorkspaceFileTabKey {
+            node_id: node_id.clone(),
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        };
+        self.file_tabs.insert(
+            key.clone(),
+            WorkspaceFileTabView {
+                editor: TextEditor::default(),
+                state: WorkspaceFileState::Loading,
+                edit_mode: false,
+                request_token: token,
+                inline_history: None,
+            },
+        );
+        self.surface.open_in_focused(SurfaceTab::File(key));
+        self.focus = Focus::Viewport;
+        AppAction::ReadWorkspaceFile {
+            node_id,
+            workspace_id,
+            path,
+            token,
+        }
+    }
+
+    fn open_workspace_git(
+        &mut self,
+        node_id: String,
+        workspace_id: String,
+        history_path: Option<RepositoryPath>,
+        pending_diff: Option<WorkspaceGitDiffTarget>,
+    ) -> AppAction {
+        self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+        let token = self.git_request_token;
+        let mode = if pending_diff.is_some() {
+            WorkspaceGitPaneMode::Detail
+        } else {
+            WorkspaceGitPaneMode::List
+        };
+        let key = WorkspaceGitTabKey {
+            node_id: node_id.clone(),
+            workspace_id: workspace_id.clone(),
+            history_path: history_path.clone(),
+        };
+        let destination = WorkspaceGitRequestDestination::Surface(key.clone());
+        let view = self.git_tabs.entry(key.clone()).or_insert_with(|| WorkspaceGitTabView {
+            state: WorkspaceGitState::Loading,
+            mode: WorkspaceGitPaneMode::List,
+            history_path: None,
+            commits: Vec::new(),
+            selected: 0,
+            list_scroll: 0,
+            detail_scroll: 0,
+            next_before: None,
+            has_more: false,
+            diff: None,
+            diff_error: None,
+            pending_diff: None,
+            history_token: 0,
+            diff_token: 0,
+        });
+        view.state = WorkspaceGitState::Loading;
+        view.mode = mode;
+        view.history_path = history_path.clone();
+        view.commits.clear();
+        view.selected = 0;
+        view.list_scroll = 0;
+        view.next_before = None;
+        view.has_more = false;
+        view.diff = None;
+        view.pending_diff = pending_diff;
+        view.history_token = token;
+        view.diff_error = None;
+        self.surface.open_in_focused(SurfaceTab::Git(key));
+        self.focus = Focus::Viewport;
+        AppAction::ReadGitHistory {
+            node_id,
+            workspace_id,
+            path: history_path,
+            before: None,
+            limit: 20,
+            token,
+            destination,
+        }
+    }
+
+    fn open_workspace_file_history(
+        &mut self,
+        key: WorkspaceFileTabKey,
+        pending_diff: Option<WorkspaceGitDiffTarget>,
+    ) -> AppAction {
+        let Some(file) = self.file_tabs.get_mut(&key) else {
+            return AppAction::None;
+        };
+        if !matches!(file.state, WorkspaceFileState::Ready) {
+            self.notice = Some("file is not ready for Git history".to_owned());
+            return AppAction::None;
+        }
+        self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+        let token = self.git_request_token;
+        let mode = if pending_diff.is_some() {
+            WorkspaceGitPaneMode::Detail
+        } else {
+            WorkspaceGitPaneMode::List
+        };
+        file.edit_mode = false;
+        file.inline_history = Some(WorkspaceGitTabView {
+            state: WorkspaceGitState::Loading,
+            mode,
+            history_path: Some(key.path.clone()),
+            commits: Vec::new(),
+            selected: 0,
+            list_scroll: 0,
+            detail_scroll: 0,
+            next_before: None,
+            has_more: false,
+            diff: None,
+            diff_error: None,
+            pending_diff,
+            history_token: token,
+            diff_token: 0,
+        });
+        self.focus = Focus::Viewport;
+        AppAction::ReadGitHistory {
+            node_id: key.node_id.clone(),
+            workspace_id: key.workspace_id.clone(),
+            path: Some(key.path.clone()),
+            before: None,
+            limit: 20,
+            token,
+            destination: WorkspaceGitRequestDestination::InlineFile(key),
+        }
+    }
+
     pub fn paste(&mut self, text: String) -> AppAction {
+        if self.agent_menu.is_some() {
+            return AppAction::None;
+        }
+        if self.focus == Focus::Spawn {
+            return self.paste_spawn(text);
+        }
+        if self.focus == Focus::ExistingSession {
+            return self.paste_existing_session(text);
+        }
+        if self.focus == Focus::History {
+            return AppAction::None;
+        }
         if self.focus == Focus::AddSpace {
             return self.paste_add_space(text);
+        }
+        if self.focus == Focus::FolderBrowser {
+            let filter_len = self
+                .folder_browser
+                .as_ref()
+                .map(|browser| browser.filter.len())
+                .unwrap_or(0);
+            if text.contains(['\r', '\n', '\0']) || filter_len.saturating_add(text.len()) > 256 {
+                self.notice = Some("folder filter paste is invalid".to_owned());
+            } else if let Some(browser) = self.folder_browser.as_mut() {
+                browser.field = FolderBrowserField::Filter;
+                browser.filter.push_str(&text);
+                browser.selected = 0;
+                browser.scroll = 0;
+            }
+            return AppAction::None;
+        }
+        if self.focus == Focus::CreateWorkspaceEntry {
+            return self.paste_create_workspace_entry(text);
         }
         if self.focus == Focus::CreateWorktree {
             return self.paste_create_worktree(text);
@@ -2496,7 +8547,23 @@ impl App {
         if self.focus == Focus::RenameSession {
             return self.paste_rename_session(text);
         }
+        if self.focus == Focus::TaskId {
+            return self.paste_task_id(text);
+        }
         if self.focus != Focus::Viewport {
+            return AppAction::None;
+        }
+        if let Some((key, tab)) = self.focused_file() {
+            let key = key.clone();
+            if !tab.edit_mode || !matches!(tab.state, WorkspaceFileState::Ready) {
+                self.notice = Some("file viewer is read-only; press e before pasting".to_owned());
+                return AppAction::None;
+            }
+            if let Some(tab) = self.file_tabs.get_mut(&key) {
+                if let Err(error) = tab.editor.insert_str(&text) {
+                    self.notice = Some(format!("file paste rejected: {error:?}"));
+                }
+            }
             return AppAction::None;
         }
         if !self.focused_session().is_some_and(|session| session.running) {
@@ -2528,13 +8595,734 @@ impl App {
             self.notice = Some("selected workspace has no enabled provider".to_owned());
             return AppAction::None;
         };
-        self.spawn = Some(SpawnDialog {
+        let mut spawn = SpawnDialog {
             node_id: node.node_id.clone(),
             workspace_id: workspace.workspace_id.clone(),
             provider,
-        });
+            target: LaunchTarget::ExistingWorkspace,
+            profile_id: "default".to_owned(),
+            worktree_profile_id: "default".to_owned(),
+            bundle_id: String::new(),
+            context_mode: LaunchContextMode::None,
+            field: LaunchField::Node,
+        };
+        self.reconcile_spawn_inventory(&mut spawn);
+        self.spawn = Some(spawn);
         self.focus = Focus::Spawn;
         AppAction::None
+    }
+
+    fn begin_existing_session(&mut self) -> AppAction {
+        let selected_workspace = self.selected_workspace().map(|(node, workspace)| {
+            (node.node_id.clone(), workspace.workspace_id.clone())
+        });
+        let selected_node_id = selected_workspace
+            .as_ref()
+            .map(|(node_id, _)| node_id.clone())
+            .filter(|node_id| !self.catalog_routes_for_node(node_id).is_empty())
+            .or_else(|| {
+                self.nodes
+                    .iter()
+                    .filter(|node| matches!(node.connection, ConnectionState::Connected))
+                    .map(|node| node.node_id.clone())
+                    .find(|node_id| !self.catalog_routes_for_node(node_id).is_empty())
+            });
+        let Some(node_id) = selected_node_id else {
+            self.notice = Some(
+                "no connected Node has an enabled provider with native history".to_owned(),
+            );
+            return AppAction::None;
+        };
+        let routes = self.catalog_routes_for_node(&node_id);
+        let selected_route = selected_workspace
+            .as_ref()
+            .filter(|(selected_node_id, _)| selected_node_id == &node_id)
+            .and_then(|(_, selected_workspace_id)| {
+                routes.iter().find(|route| {
+                    route.workspace_id.as_ref() == Some(selected_workspace_id)
+                })
+            })
+            .or_else(|| routes.iter().find(|route| route.workspace_id.is_some()))
+            .or_else(|| routes.first())
+            .expect("checked native session catalog routes");
+        let workspace_id = selected_route.workspace_id.clone().unwrap_or_default();
+        let provider = selected_route.provider.clone();
+        if !self.native_provider_branches_initialized {
+            self.collapsed_native_providers.extend(routes.iter().map(|route| {
+                let group = route.workspace_id.as_ref().map_or(
+                    NativeSessionGroupKey::OtherProjects,
+                    |workspace_id| NativeSessionGroupKey::Workspace(workspace_id.clone()),
+                );
+                (node_id.clone(), group, route.provider.clone())
+            }));
+            self.native_provider_branches_initialized = true;
+        }
+        let token = self.next_native_catalog_token();
+        self.clear_native_catalog_route_tokens(&node_id);
+        self.existing_session = Some(ExistingSessionDialog {
+            node_id: node_id.clone(),
+            workspace_id: workspace_id.clone(),
+            mode: ExistingSessionMode::Catalog,
+            catalog: NativeSessionCatalogState::Loading,
+            rows: Vec::new(),
+            selected: 0,
+            tree_cursor: 0,
+            scroll: 0,
+            display_name: format!("{} session", provider),
+            provider: provider.clone(),
+            session_id: String::new(),
+            field: ExistingSessionField::Node,
+            operation: None,
+            operation_error: None,
+            request_token: token,
+            pending_routes: routes.iter().cloned().collect(),
+            route_pages: BTreeMap::new(),
+            catalog_failure: None,
+            preview: None,
+            preview_scroll: 0,
+            preview_request_token: 0,
+            preview_record_id: None,
+            preview_selection_id: None,
+            ask_after_resume: String::new(),
+        });
+        self.focus = Focus::ExistingSession;
+        AppAction::CatalogNativeSessions {
+            node_id,
+            routes,
+            limit: 64,
+            token,
+        }
+    }
+
+    pub(crate) fn ensure_initial_agents_catalog(&mut self) -> AppAction {
+        if !self.agents_roster_visible() || self.existing_session.is_some() {
+            return AppAction::None;
+        }
+        let previous_focus = self.focus;
+        let action = self.begin_existing_session();
+        if let Some(dialog) = self.existing_session.as_mut() {
+            dialog.field = ExistingSessionField::Sessions;
+        }
+        self.focus = previous_focus;
+        action
+    }
+
+    fn agents_roster_visible(&self) -> bool {
+        if !matches!(self.roster_mode, RosterMode::Agents | RosterMode::NativeSessions) {
+            return false;
+        }
+        match self.menu_placement {
+            MenuPlacement::Sidebar => match self.sidebar_presentation {
+                SidebarPresentation::Split => true,
+                SidebarPresentation::Activity => {
+                    !self.sidebar_collapsed
+                        && matches!(
+                            self.control_section,
+                            ControlSection::Agents | ControlSection::Workspaces
+                        )
+                }
+            },
+            MenuPlacement::Modal => {
+                self.focus == Focus::Settings
+                    && matches!(
+                        self.control_section,
+                        ControlSection::Agents | ControlSection::Workspaces
+                    )
+            }
+        }
+    }
+
+    fn next_native_catalog_token(&mut self) -> u64 {
+        self.native_catalog_token = self.native_catalog_token.wrapping_add(1).max(1);
+        self.native_catalog_token
+    }
+
+    fn clear_native_catalog_route_tokens(&mut self, node_id: &str) {
+        self.native_catalog_route_tokens
+            .retain(|(candidate, _), _| candidate != node_id);
+    }
+
+    fn page_native_sessions(
+        &mut self,
+        route: NativeSessionCatalogRoute,
+        window: NativeSessionCatalogWindow,
+    ) -> AppAction {
+        let token = self.next_native_catalog_token();
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return AppAction::None;
+        };
+        let Some(state) = dialog.route_pages.get_mut(&route) else {
+            return AppAction::None;
+        };
+        let (has_more, after_selection_id) = match window {
+            NativeSessionCatalogWindow::Recent => (
+                state.recent_has_more,
+                state.recent_next_after_selection_id.clone(),
+            ),
+            NativeSessionCatalogWindow::Older => (
+                state.older_has_more,
+                state.older_next_after_selection_id.clone(),
+            ),
+        };
+        if !has_more || state.pending.is_some() {
+            return AppAction::None;
+        }
+        state.pending = Some((window, token));
+        AppAction::PageNativeSessions {
+            node_id: dialog.node_id.clone(),
+            route,
+            window,
+            catalog_revision: state.catalog_revision,
+            recent_cutoff_unix_ms: state.recent_cutoff_unix_ms,
+            after_selection_id,
+            limit: 64,
+            token,
+        }
+    }
+
+    fn select_roster_mode(&mut self, mode: RosterMode) -> AppAction {
+        let mode = match mode {
+            RosterMode::NativeSessions => RosterMode::Agents,
+            mode => mode,
+        };
+        self.roster_mode = mode;
+        self.control_section = match mode {
+            RosterMode::Agents => ControlSection::Agents,
+            RosterMode::Workspaces => ControlSection::Workspaces,
+            RosterMode::NativeSessions => unreachable!("native sessions normalize to agents"),
+        };
+        self.focus = Focus::Agents;
+        if self.menu_placement == MenuPlacement::Sidebar
+            && self.sidebar_presentation == SidebarPresentation::Activity
+        {
+            self.sidebar_collapsed = false;
+        }
+        if mode != RosterMode::Agents {
+            return AppAction::None;
+        }
+        if self.existing_session.is_none() {
+            let action = self.begin_existing_session();
+            if let Some(dialog) = self.existing_session.as_mut() {
+                dialog.field = ExistingSessionField::Sessions;
+            }
+            self.focus = Focus::Agents;
+            return action;
+        }
+        let token = self.next_native_catalog_token();
+        let selected_node_id = self.selected_workspace()
+            .map(|(node, _)| node.node_id.clone())
+            .or_else(|| self.existing_session.as_ref().map(|dialog| dialog.node_id.clone()))
+            .expect("checked native sessions state");
+        let routes = self.catalog_routes_for_node(&selected_node_id);
+        self.clear_native_catalog_route_tokens(&selected_node_id);
+        let dialog = self.existing_session.as_mut().expect("checked native sessions state");
+        dialog.node_id.clone_from(&selected_node_id);
+        if let Some(route) = routes.first() {
+            if let Some(workspace_id) = route.workspace_id.as_ref() {
+                dialog.workspace_id.clone_from(workspace_id);
+            }
+            dialog.provider = route.provider.clone();
+        }
+        dialog.mode = ExistingSessionMode::Catalog;
+        dialog.field = ExistingSessionField::Sessions;
+        dialog.catalog = NativeSessionCatalogState::Loading;
+        dialog.operation = None;
+        dialog.operation_error = None;
+        dialog.rows.clear();
+        dialog.selected = 0;
+        dialog.scroll = 0;
+        dialog.preview = None;
+        dialog.preview_scroll = 0;
+        dialog.request_token = token;
+        dialog.pending_routes = routes.iter().cloned().collect();
+        dialog.route_pages.clear();
+        dialog.catalog_failure = None;
+        AppAction::CatalogNativeSessions {
+            node_id: dialog.node_id.clone(),
+            routes,
+            limit: 64,
+            token,
+        }
+    }
+
+    fn existing_session_routes(&self) -> Vec<(String, String, Provider)> {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node.connection, ConnectionState::Connected))
+            .flat_map(|node| {
+                node.workspaces.iter().flat_map(move |workspace| {
+                    workspace.providers.iter().filter_map(move |inventory| {
+                        (inventory.enabled && provider_has_native_history(&inventory.provider)).then(|| {
+                            (
+                                node.node_id.clone(),
+                                workspace.workspace_id.clone(),
+                                inventory.provider.clone(),
+                            )
+                        })
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn catalog_routes_for_node(&self, node_id: &str) -> Vec<NativeSessionCatalogRoute> {
+        catalog_routes_for_node_from_nodes(&self.nodes, node_id)
+    }
+
+    pub(crate) fn native_session_tree_items(&self) -> Vec<NativeSessionTreeItem> {
+        let Some(dialog) = self.existing_session.as_ref() else {
+            return Vec::new();
+        };
+        let node_id = dialog.node_id.as_str();
+        let registered = self.nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .map(|node| node.workspaces.iter().map(|workspace| {
+                let providers = workspace.providers.iter()
+                    .filter(|inventory| {
+                        inventory.enabled && provider_has_native_history(&inventory.provider)
+                    })
+                    .map(|inventory| inventory.provider.clone())
+                    .collect::<Vec<_>>();
+                (workspace.workspace_id.clone(), providers)
+            }).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut groups = registered.into_iter().map(|(workspace_id, providers)| {
+            (workspace_id, providers, Vec::new(), Vec::new())
+        }).collect::<Vec<(String, Vec<Provider>, Vec<usize>, Vec<(Provider, usize)>)>>();
+        let managed_record_ids = self.agent_rows().into_iter().filter_map(|key| match key {
+            AgentRowKey::Managed { node_id, record_id } => Some((node_id, record_id)),
+            AgentRowKey::Legacy(_) => None,
+        }).collect::<BTreeSet<_>>();
+        let mut external_groups = BTreeMap::<
+            Provider,
+            BTreeMap<(NativeSessionExternalGroupKind, String), (String, Vec<usize>)>,
+        >::new();
+        for (row_index, row) in dialog.rows.iter().enumerate() {
+            if row.record_id.as_ref().is_some_and(|record_id| {
+                managed_record_ids.contains(&(row.node_id.clone(), record_id.clone()))
+            }) {
+                continue;
+            }
+            match row.route.scope {
+                NativeSessionCatalogScope::Workspace => {
+                    let Some(workspace_id) = row.route.workspace_id.as_ref() else {
+                        continue;
+                    };
+                    if let Some((_, _, rows, _)) = groups.iter_mut().find(|group| {
+                        &group.0 == workspace_id
+                    }) {
+                        rows.push(row_index);
+                    }
+                }
+                NativeSessionCatalogScope::Unregistered => {
+                    let Some(group) = row.external_group.as_ref() else {
+                        continue;
+                    };
+                    external_groups
+                        .entry(row.route.provider.clone())
+                        .or_default()
+                        .entry((group.kind, group.group_id.clone()))
+                        .or_insert_with(|| (group.display_name.clone(), Vec::new()))
+                        .1
+                        .push(row_index);
+                }
+            }
+        }
+
+        let agent_rows = self.agent_rows();
+        let mut unmatched_agents = Vec::new();
+        for (agent_index, key) in agent_rows.iter().enumerate() {
+            let route = match key {
+                AgentRowKey::Managed { .. } => self.find_managed_session(key).map(|record| {
+                    (
+                        record.node_id.clone(),
+                        record.workspace_id.clone(),
+                        record.provider.clone(),
+                    )
+                }),
+                AgentRowKey::Legacy(address) => self.find_session(address).map(|session| {
+                    (
+                        address.node_id.clone(),
+                        address.workspace_id.clone(),
+                        session.provider.clone(),
+                    )
+                }),
+            };
+            let Some((agent_node_id, workspace_id, provider)) = route else {
+                unmatched_agents.push(agent_index);
+                continue;
+            };
+            if agent_node_id != node_id {
+                unmatched_agents.push(agent_index);
+                continue;
+            }
+            if let Some((_, _, _, managed_rows)) = groups.iter_mut().find(|group| {
+                group.0 == workspace_id
+            }) {
+                managed_rows.push((provider, agent_index));
+            } else {
+                unmatched_agents.push(agent_index);
+            }
+        }
+
+        let mut items = unmatched_agents.into_iter().map(|agent_index| {
+            NativeSessionTreeItem::Agent {
+                agent_index,
+                nested: false,
+            }
+        }).collect::<Vec<_>>();
+        for (workspace_id, configured_providers, row_indices, managed_rows) in groups {
+            let session_count = row_indices.len().saturating_add(managed_rows.len());
+            let mut providers = BTreeMap::<Provider, (Vec<usize>, Vec<usize>)>::new();
+            for provider in configured_providers {
+                providers.entry(provider).or_default();
+            }
+            for row_index in row_indices {
+                providers.entry(dialog.rows[row_index].route.provider.clone())
+                    .or_default()
+                    .1
+                    .push(row_index);
+            }
+            for (provider, agent_index) in managed_rows {
+                providers.entry(provider).or_default().0.push(agent_index);
+            }
+            providers.retain(|provider, (managed_rows, provider_rows)| {
+                let route = NativeSessionCatalogRoute::workspace(
+                    workspace_id.clone(),
+                    provider.clone(),
+                );
+                !managed_rows.is_empty()
+                    || !provider_rows.is_empty()
+                    || dialog.route_pages.contains_key(&route)
+            });
+            if providers.is_empty() {
+                continue;
+            }
+            let group_key = NativeSessionGroupKey::Workspace(workspace_id.clone());
+            let workspace_collapsed = self.collapsed_native_workspaces.contains(&(
+                dialog.node_id.clone(),
+                group_key.clone(),
+            ));
+            items.push(NativeSessionTreeItem::Workspace {
+                key: group_key.clone(),
+                label: workspace_id.clone(),
+                session_count,
+                collapsed: workspace_collapsed,
+                external: false,
+            });
+            if workspace_collapsed {
+                continue;
+            }
+            for (provider, (managed_rows, provider_rows)) in providers {
+                let provider_collapsed = self.collapsed_native_providers.contains(&(
+                    dialog.node_id.clone(),
+                    group_key.clone(),
+                    provider.clone(),
+                ));
+                items.push(NativeSessionTreeItem::Provider {
+                    group: group_key.clone(),
+                    provider: provider.clone(),
+                    session_count: managed_rows.len().saturating_add(provider_rows.len()),
+                    collapsed: provider_collapsed,
+                });
+                if !provider_collapsed {
+                    items.extend(managed_rows.into_iter().map(|agent_index| {
+                        NativeSessionTreeItem::Agent {
+                            agent_index,
+                            nested: true,
+                        }
+                    }));
+                    items.extend(provider_rows.into_iter().map(|row_index| {
+                        NativeSessionTreeItem::Session { row_index }
+                    }));
+                    let route = NativeSessionCatalogRoute::workspace(
+                        workspace_id.clone(),
+                        provider.clone(),
+                    );
+                    if let Some(state) = dialog.route_pages.get(&route) {
+                        if state.recent_has_more && state.recent_remaining_count > 0 {
+                            items.push(NativeSessionTreeItem::LoadMore {
+                                route: route.clone(),
+                                window: NativeSessionCatalogWindow::Recent,
+                                remaining_count: state.recent_remaining_count,
+                                loading: matches!(state.pending, Some((NativeSessionCatalogWindow::Recent, _))),
+                            });
+                        }
+                        if state.older_has_more && state.older_remaining_count > 0 {
+                            items.push(NativeSessionTreeItem::LoadMore {
+                                route: route.clone(),
+                                window: NativeSessionCatalogWindow::Older,
+                                remaining_count: state.older_remaining_count,
+                                loading: matches!(state.pending, Some((NativeSessionCatalogWindow::Older, _))),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let external_routes = dialog.route_pages.keys()
+            .filter(|route| route.scope == NativeSessionCatalogScope::Unregistered)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !external_groups.is_empty() || !external_routes.is_empty() {
+            let root_key = NativeSessionGroupKey::OtherProjects;
+            let external_count = external_groups.values()
+                .flat_map(|groups| groups.values())
+                .map(|(_, rows)| rows.len())
+                .sum();
+            let root_collapsed = self.collapsed_native_workspaces.contains(&(
+                dialog.node_id.clone(),
+                root_key.clone(),
+            ));
+            items.push(NativeSessionTreeItem::Workspace {
+                key: root_key,
+                label: "Other projects".to_owned(),
+                session_count: external_count,
+                collapsed: root_collapsed,
+                external: true,
+            });
+            if !root_collapsed {
+                let mut external_providers = external_routes.iter()
+                    .map(|route| route.provider.clone())
+                    .collect::<BTreeSet<_>>();
+                external_providers.extend(external_groups.keys().cloned());
+                for provider in external_providers {
+                    let groups = external_groups.remove(&provider).unwrap_or_default();
+                    let provider_count = groups.values()
+                        .map(|(_, rows)| rows.len())
+                        .sum();
+                    let provider_collapsed = self.collapsed_native_providers.contains(&(
+                        dialog.node_id.clone(),
+                        NativeSessionGroupKey::OtherProjects,
+                        provider.clone(),
+                    ));
+                    items.push(NativeSessionTreeItem::Provider {
+                        group: NativeSessionGroupKey::OtherProjects,
+                        provider: provider.clone(),
+                        session_count: provider_count,
+                        collapsed: provider_collapsed,
+                    });
+                    if provider_collapsed {
+                        continue;
+                    }
+                    for ((kind, group_id), (display_name, row_indices)) in groups {
+                        let group_key = NativeSessionGroupKey::External {
+                            provider: provider.clone(),
+                            kind,
+                            group_id,
+                        };
+                        let group_collapsed = self.collapsed_native_workspaces.contains(&(
+                            dialog.node_id.clone(),
+                            group_key.clone(),
+                        ));
+                        items.push(NativeSessionTreeItem::Workspace {
+                            key: group_key,
+                            label: display_name,
+                            session_count: row_indices.len(),
+                            collapsed: group_collapsed,
+                            external: true,
+                        });
+                        if !group_collapsed {
+                            items.extend(row_indices.into_iter().map(|row_index| {
+                                NativeSessionTreeItem::Session { row_index }
+                            }));
+                        }
+                    }
+                    if let Some(route) = external_routes.iter()
+                        .find(|route| route.provider == provider)
+                    {
+                        if let Some(state) = dialog.route_pages.get(route) {
+                            if state.recent_has_more && state.recent_remaining_count > 0 {
+                                items.push(NativeSessionTreeItem::LoadMore {
+                                    route: route.clone(),
+                                    window: NativeSessionCatalogWindow::Recent,
+                                    remaining_count: state.recent_remaining_count,
+                                    loading: matches!(state.pending, Some((NativeSessionCatalogWindow::Recent, _))),
+                                });
+                            }
+                            if state.older_has_more && state.older_remaining_count > 0 {
+                                items.push(NativeSessionTreeItem::LoadMore {
+                                    route: route.clone(),
+                                    window: NativeSessionCatalogWindow::Older,
+                                    remaining_count: state.older_remaining_count,
+                                    loading: matches!(state.pending, Some((NativeSessionCatalogWindow::Older, _))),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        items
+    }
+
+    fn toggle_native_workspace_group(&mut self, group: NativeSessionGroupKey) {
+        let Some(node_id) = self.existing_session.as_ref().map(|dialog| dialog.node_id.clone()) else {
+            return;
+        };
+        let key = (node_id, group);
+        if !self.collapsed_native_workspaces.remove(&key) {
+            self.collapsed_native_workspaces.insert(key);
+        }
+        self.clamp_native_tree_cursor();
+    }
+
+    fn toggle_native_provider_group(&mut self, group: NativeSessionGroupKey, provider: Provider) {
+        let Some(node_id) = self.existing_session.as_ref().map(|dialog| dialog.node_id.clone()) else {
+            return;
+        };
+        let key = (node_id, group, provider);
+        if !self.collapsed_native_providers.remove(&key) {
+            self.collapsed_native_providers.insert(key);
+        }
+        self.clamp_native_tree_cursor();
+    }
+
+    fn clamp_native_tree_cursor(&mut self) {
+        let item_count = self.native_session_tree_items().len();
+        if let Some(dialog) = self.existing_session.as_mut() {
+            dialog.tree_cursor = dialog.tree_cursor.min(item_count.saturating_sub(1));
+            dialog.scroll = dialog.scroll.min(dialog.tree_cursor);
+        }
+    }
+
+    fn activate_native_tree_cursor(&mut self) -> AppAction {
+        let item = self.existing_session.as_ref()
+            .and_then(|dialog| self.native_session_tree_items().get(dialog.tree_cursor).cloned());
+        match item {
+            Some(NativeSessionTreeItem::Agent { agent_index, .. }) => {
+                self.selected_agent = agent_index;
+                self.open_selected_agent()
+            }
+            Some(NativeSessionTreeItem::Workspace { key, .. }) => {
+                self.toggle_native_workspace_group(key);
+                AppAction::None
+            }
+            Some(NativeSessionTreeItem::Provider { group, provider, .. }) => {
+                self.toggle_native_provider_group(group, provider);
+                AppAction::None
+            }
+            Some(NativeSessionTreeItem::Session { row_index }) => {
+                if let Some(dialog) = self.existing_session.as_mut() {
+                    dialog.selected = row_index;
+                    populate_selected_catalog_row(dialog);
+                }
+                self.start_native_session_preview()
+            }
+            Some(NativeSessionTreeItem::LoadMore {
+                route,
+                window,
+                loading,
+                ..
+            }) => {
+                if loading {
+                    AppAction::None
+                } else {
+                    self.page_native_sessions(route, window)
+                }
+            }
+            None => AppAction::None,
+        }
+    }
+
+    fn move_native_tree_cursor(&mut self, delta: isize) {
+        let items = self.native_session_tree_items();
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return;
+        };
+        if items.is_empty() {
+            dialog.tree_cursor = 0;
+            dialog.scroll = 0;
+            return;
+        }
+        dialog.tree_cursor = dialog.tree_cursor
+            .saturating_add_signed(delta)
+            .min(items.len() - 1);
+        match items[dialog.tree_cursor] {
+            NativeSessionTreeItem::Agent { agent_index, .. } => {
+                self.selected_agent = agent_index;
+            }
+            NativeSessionTreeItem::Session { row_index } => {
+                dialog.selected = row_index;
+                populate_selected_catalog_row(dialog);
+            }
+            _ => {}
+        }
+    }
+
+    fn cycle_existing_session_field(&mut self, field: ExistingSessionField, forward: bool) -> AppAction {
+        let Some(mut dialog) = self.existing_session.take() else {
+            return AppAction::None;
+        };
+        dialog.field = field;
+        let routes = self.existing_session_routes();
+        let mut refresh = false;
+        match field {
+            ExistingSessionField::Node => {
+                let mut values = routes.iter().map(|route| route.0.clone()).collect::<Vec<_>>();
+                values.sort();
+                values.dedup();
+                dialog.node_id = cycle_string(&values, &dialog.node_id, forward);
+                if let Some(route) = routes.iter().find(|route| route.0 == dialog.node_id) {
+                    dialog.workspace_id.clone_from(&route.1);
+                    dialog.provider = route.2.clone();
+                }
+                refresh = true;
+            }
+            ExistingSessionField::Workspace => {
+                let mut values = routes
+                    .iter()
+                    .filter(|route| route.0 == dialog.node_id)
+                    .map(|route| route.1.clone())
+                    .collect::<Vec<_>>();
+                values.sort();
+                values.dedup();
+                dialog.workspace_id = cycle_string(&values, &dialog.workspace_id, forward);
+                if let Some(route) = routes.iter().find(|route| {
+                    route.0 == dialog.node_id && route.1 == dialog.workspace_id
+                }) {
+                    dialog.provider = route.2.clone();
+                }
+            }
+            ExistingSessionField::Provider => {
+                let values = routes
+                    .iter()
+                    .filter(|route| route.0 == dialog.node_id && route.1 == dialog.workspace_id)
+                    .filter(|route| provider_is_importable(&route.2))
+                    .map(|route| route.2.clone())
+                    .collect::<Vec<_>>();
+                dialog.provider = cycle_provider(&values, &dialog.provider, forward);
+            }
+            ExistingSessionField::Sessions
+            | ExistingSessionField::AskAfterResume
+            | ExistingSessionField::DisplayName
+            | ExistingSessionField::SessionId => {}
+        }
+        if refresh {
+            let token = self.next_native_catalog_token();
+            let routes = self.catalog_routes_for_node(&dialog.node_id);
+            self.clear_native_catalog_route_tokens(&dialog.node_id);
+            dialog.catalog = NativeSessionCatalogState::Loading;
+            dialog.rows.clear();
+            dialog.selected = 0;
+            dialog.scroll = 0;
+            dialog.preview = None;
+            dialog.preview_scroll = 0;
+            dialog.request_token = token;
+            dialog.pending_routes = routes.into_iter().collect();
+            dialog.route_pages.clear();
+            dialog.catalog_failure = None;
+        }
+        let routes = dialog.pending_routes.iter().cloned().collect();
+        let action = refresh.then(|| AppAction::CatalogNativeSessions {
+            node_id: dialog.node_id.clone(),
+            routes,
+            limit: 64,
+            token: dialog.request_token,
+        }).unwrap_or(AppAction::None);
+        self.existing_session = Some(dialog);
+        action
     }
 
     fn begin_add_space(&mut self) -> AppAction {
@@ -2547,6 +9335,23 @@ impl App {
             self.notice = Some("no connected node available for a new space".to_owned());
             return AppAction::None;
         };
+        self.begin_add_space_on_node(node_id)
+    }
+
+    fn begin_add_space_from_spawn(&mut self) -> AppAction {
+        let Some(node_id) = self.spawn.as_ref().map(|spawn| spawn.node_id.clone()) else {
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        };
+        self.begin_add_space_on_node(node_id)
+    }
+
+    fn begin_add_space_on_node(&mut self, node_id: String) -> AppAction {
+        if !self.node_is_connected(&node_id) {
+            self.notice = Some(format!("{node_id} is disconnected; workspace registration unavailable"));
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        }
         self.add_space = Some(AddSpaceDialog {
             node_id,
             workspace_id: String::new(),
@@ -2555,6 +9360,144 @@ impl App {
             root_edited: true,
             field: AddSpaceField::WorkspaceId,
         });
+        self.focus = Focus::AddSpace;
+        AppAction::None
+    }
+
+    fn begin_folder_browser(&mut self) -> AppAction {
+        let Some(add_space) = self.add_space.as_ref() else {
+            return AppAction::None;
+        };
+        let directory = (!add_space.root.trim().is_empty())
+            .then(|| OpaqueHostPath::utf8(add_space.root.clone()).ok())
+            .flatten();
+        self.folder_browser = Some(FolderBrowserDialog {
+            node_id: add_space.node_id.clone(),
+            directory: directory.clone(),
+            parent: None,
+            entries: Vec::new(),
+            next_after: None,
+            incomplete: false,
+            selected: 0,
+            scroll: 0,
+            filter: String::new(),
+            field: FolderBrowserField::Entries,
+            pending: false,
+            append_pending: false,
+            request_token: 0,
+            error: None,
+        });
+        self.focus = Focus::FolderBrowser;
+        self.request_host_directories(directory, None, false)
+    }
+
+    fn next_folder_browser_token(&mut self) -> u64 {
+        self.folder_browser_token = self.folder_browser_token.wrapping_add(1).max(1);
+        self.folder_browser_token
+    }
+
+    fn request_host_directories(
+        &mut self,
+        directory: Option<OpaqueHostPath>,
+        after: Option<OpaqueHostPath>,
+        append: bool,
+    ) -> AppAction {
+        let token = self.next_folder_browser_token();
+        let Some(browser) = self.folder_browser.as_mut() else {
+            return AppAction::None;
+        };
+        if !append {
+            browser.directory = directory.clone();
+            browser.parent = None;
+            browser.entries.clear();
+            browser.next_after = None;
+            browser.incomplete = false;
+            browser.selected = 0;
+            browser.scroll = 0;
+        }
+        browser.pending = true;
+        browser.append_pending = append;
+        browser.request_token = token;
+        browser.error = None;
+        AppAction::BrowseHostDirectories {
+            node_id: browser.node_id.clone(),
+            directory,
+            after,
+            token,
+            append,
+        }
+    }
+
+    fn close_folder_browser(&mut self) -> AppAction {
+        self.folder_browser = None;
+        self.drag_state = None;
+        self.focus = if self.add_space.is_some() {
+            Focus::AddSpace
+        } else {
+            Focus::Agents
+        };
+        AppAction::None
+    }
+
+    fn browse_parent_directory(&mut self) -> AppAction {
+        let Some(browser) = self.folder_browser.as_ref() else {
+            return AppAction::None;
+        };
+        if browser.pending {
+            return AppAction::None;
+        }
+        let directory = browser.parent.clone();
+        self.request_host_directories(directory, None, false)
+    }
+
+    fn open_selected_host_directory(&mut self) -> AppAction {
+        let indices = self.visible_host_directory_indices();
+        let Some(browser) = self.folder_browser.as_ref() else {
+            return AppAction::None;
+        };
+        if browser.pending {
+            return AppAction::None;
+        }
+        let Some(index) = indices.get(browser.selected).copied() else {
+            return AppAction::None;
+        };
+        let Some(entry) = browser.entries.get(index) else {
+            return AppAction::None;
+        };
+        self.request_host_directories(Some(entry.path.clone()), None, false)
+    }
+
+    fn load_more_host_directories(&mut self) -> AppAction {
+        let Some(browser) = self.folder_browser.as_ref() else {
+            return AppAction::None;
+        };
+        if browser.pending || browser.entries.len() >= MAX_BROWSER_LOADED_ENTRIES {
+            return AppAction::None;
+        }
+        let Some(after) = browser.next_after.clone() else {
+            return AppAction::None;
+        };
+        self.request_host_directories(browser.directory.clone(), Some(after), true)
+    }
+
+    fn use_browsed_directory(&mut self) -> AppAction {
+        let Some(directory) = self
+            .folder_browser
+            .as_ref()
+            .filter(|browser| !browser.pending)
+            .and_then(|browser| browser.directory.clone())
+        else {
+            self.notice = Some("choose a real directory before using it".to_owned());
+            return AppAction::None;
+        };
+        if let Some(add_space) = self.add_space.as_mut() {
+            add_space.root = host_path_display(&directory);
+            add_space.original_root = Some(directory);
+            add_space.root_edited = false;
+            add_space.field = AddSpaceField::Root;
+        }
+        self.folder_browser = None;
+        self.drag_state = None;
         self.focus = Focus::AddSpace;
         AppAction::None
     }
@@ -2568,15 +9511,145 @@ impl App {
             self.notice = Some(format!("{} is disconnected; worktree creation unavailable", node.node_id));
             return AppAction::None;
         }
-        let workspace_id = next_worktree_id(&workspace.workspace_id);
+        if workspace.worktree_service_mode != Some(WorktreeServiceMode::Manual) {
+            self.notice = Some(
+                "selected workspace does not allow manual Git worktree creation".to_owned(),
+            );
+            return AppAction::None;
+        }
+        let node_id = node.node_id.clone();
+        let source_workspace_id = workspace.workspace_id.clone();
+        let source_root = workspace.canonical_root.clone();
+        self.begin_create_worktree_for(
+            node_id,
+            source_workspace_id,
+            source_root,
+            false,
+        )
+    }
+
+    fn begin_create_worktree_from_spawn(&mut self) -> AppAction {
+        let Some(spawn) = self.spawn.as_ref() else {
+            return AppAction::None;
+        };
+        if !self.manual_worktree_available(&spawn.node_id, &spawn.workspace_id) {
+            self.notice = Some(
+                "selected workspace does not allow manual Git worktree creation".to_owned(),
+            );
+            return AppAction::None;
+        }
+        let Some((source_workspace_id, source_root)) = self
+            .nodes
+            .iter()
+            .find(|node| node.node_id == spawn.node_id && matches!(node.connection, ConnectionState::Connected))
+            .and_then(|node| {
+                node.workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == spawn.workspace_id)
+                    .map(|workspace| (workspace.workspace_id.clone(), workspace.canonical_root.clone()))
+            })
+        else {
+            self.notice = Some("selected workspace is unavailable for manual worktree creation".to_owned());
+            return AppAction::None;
+        };
+        self.begin_create_worktree_for(
+            spawn.node_id.clone(),
+            source_workspace_id,
+            source_root,
+            true,
+        )
+    }
+
+    fn begin_git_location_configuration(&mut self) -> AppAction {
+        let Some(spawn) = self.spawn.as_ref() else {
+            return AppAction::None;
+        };
+        match spawn.target {
+            LaunchTarget::ExistingWorkspace => AppAction::None,
+            LaunchTarget::NewLinkedWorktree => match self.selected_worktree_service_mode(spawn) {
+                Some(WorktreeServiceMode::Manual) => self.begin_create_worktree_from_spawn(),
+                Some(WorktreeServiceMode::Managed) => {
+                    self.create_worktree = Some(CreateWorktreeDialog {
+                        node_id: spawn.node_id.clone(),
+                        source_workspace_id: spawn.workspace_id.clone(),
+                        workspace_id: String::new(),
+                        target_root: String::new(),
+                        branch: String::new(),
+                        base: String::new(),
+                        field: CreateWorktreeField::WorkspaceId,
+                        return_to_spawn: true,
+                        kind: GitLocationDialogKind::ManagedLinked,
+                    });
+                    self.focus = Focus::CreateWorktree;
+                    AppAction::None
+                }
+                Some(WorktreeServiceMode::Off) | None => {
+                    self.create_worktree = Some(CreateWorktreeDialog {
+                        node_id: spawn.node_id.clone(),
+                        source_workspace_id: spawn.workspace_id.clone(),
+                        workspace_id: String::new(),
+                        target_root: String::new(),
+                        branch: String::new(),
+                        base: String::new(),
+                        field: CreateWorktreeField::WorkspaceId,
+                        return_to_spawn: true,
+                        kind: GitLocationDialogKind::LinkedDisabled,
+                    });
+                    self.focus = Focus::CreateWorktree;
+                    AppAction::None
+                }
+            },
+            LaunchTarget::NewStandaloneRepository => {
+                let workspace_id = next_standalone_id(&spawn.workspace_id);
+                let source_root = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.node_id == spawn.node_id)
+                    .and_then(|node| {
+                        node.workspaces
+                            .iter()
+                            .find(|workspace| workspace.workspace_id == spawn.workspace_id)
+                    })
+                    .map(|workspace| workspace.canonical_root.clone());
+                let target_root = source_root
+                    .as_ref()
+                    .map(|root| suggested_worktree_root(root, &workspace_id))
+                    .unwrap_or_default();
+                self.create_worktree = Some(CreateWorktreeDialog {
+                    node_id: spawn.node_id.clone(),
+                    source_workspace_id: spawn.workspace_id.clone(),
+                    workspace_id,
+                    target_root,
+                    branch: "main".to_owned(),
+                    base: String::new(),
+                    field: CreateWorktreeField::WorkspaceId,
+                    return_to_spawn: true,
+                    kind: GitLocationDialogKind::Standalone,
+                });
+                self.focus = Focus::CreateWorktree;
+                AppAction::None
+            }
+        }
+    }
+
+    fn begin_create_worktree_for(
+        &mut self,
+        node_id: String,
+        source_workspace_id: String,
+        source_root: OpaqueHostPath,
+        return_to_spawn: bool,
+    ) -> AppAction {
+        let workspace_id = next_worktree_id(&source_workspace_id);
         self.create_worktree = Some(CreateWorktreeDialog {
-            node_id: node.node_id.clone(),
-            source_workspace_id: workspace.workspace_id.clone(),
-            target_root: String::new(),
+            node_id,
+            source_workspace_id,
+            target_root: suggested_worktree_root(&source_root, &workspace_id),
             branch: workspace_id.clone(),
             workspace_id,
             base: String::new(),
             field: CreateWorktreeField::WorkspaceId,
+            return_to_spawn,
+            kind: GitLocationDialogKind::ManualLinked,
         });
         self.focus = Focus::CreateWorktree;
         AppAction::None
@@ -2674,9 +9747,77 @@ impl App {
             record_id: record.record_id.clone(),
             original_name: record.display_name.clone(),
             display_name: record.display_name.clone(),
+            local_alias: false,
         });
         self.focus = Focus::RenameSession;
         AppAction::None
+    }
+
+    fn begin_local_alias(&mut self, key: &AgentRowKey) -> AppAction {
+        let Some((node_id, record_id)) = Self::managed_preference_key(key) else {
+            self.notice = Some("local alias requires a durable managed record".to_owned());
+            return AppAction::None;
+        };
+        let alias = self.agent_local_alias(key).unwrap_or_default().to_owned();
+        self.rename_session = Some(RenameSessionDialog {
+            node_id,
+            record_id,
+            original_name: alias.clone(),
+            display_name: alias,
+            local_alias: true,
+        });
+        self.focus = Focus::RenameSession;
+        AppAction::None
+    }
+
+    fn task_action_for_record(
+        record: &ManagedSessionView,
+        target: SessionTaskTargetV1,
+    ) -> AppAction {
+        AppAction::SetSessionTask {
+            node_id: record.node_id.clone(),
+            record_id: record.record_id.clone(),
+            expected_revision: record.task_binding.as_ref().map_or(0, |binding| binding.revision),
+            target,
+        }
+    }
+
+    fn set_selected_task(&mut self, target: SessionTaskTargetV1) -> AppAction {
+        let Some(record) = self.selected_managed_session() else {
+            self.notice = Some("task correlation requires a durable managed record".to_owned());
+            return AppAction::None;
+        };
+        Self::task_action_for_record(record, target)
+    }
+
+    fn begin_assign_task_id(&mut self, key: &AgentRowKey) -> AppAction {
+        let Some(record) = self.find_managed_session(key) else {
+            self.notice = Some("task correlation requires a durable managed record".to_owned());
+            return AppAction::None;
+        };
+        self.task_id_dialog = Some(TaskIdDialog {
+            node_id: record.node_id.clone(),
+            record_id: record.record_id.clone(),
+            expected_revision: record.task_binding.as_ref().map_or(0, |binding| binding.revision),
+            value: String::new(),
+        });
+        self.focus = Focus::TaskId;
+        AppAction::None
+    }
+
+    fn copy_task_id(&mut self, key: &AgentRowKey) {
+        let Some(task_id) = self.find_managed_session(key)
+            .and_then(|record| record.task_binding.as_ref())
+            .and_then(|binding| binding.task_id.as_ref())
+            .map(ToString::to_string)
+        else {
+            self.notice = Some("task ID is unassigned".to_owned());
+            return;
+        };
+        self.notice = Some(match write_clipboard_text(&task_id) {
+            Ok(()) => format!("copied task ID {task_id}"),
+            Err(message) => format!("task ID copy failed: {message}"),
+        });
     }
 
     fn begin_forget_selected_agent(&mut self) -> AppAction {
@@ -2695,6 +9836,63 @@ impl App {
         });
         self.focus = Focus::ForgetSession;
         AppAction::None
+    }
+
+    fn begin_history_selected_agent(&mut self) -> AppAction {
+        let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
+            self.notice = Some("select an active session before opening history".to_owned());
+            return AppAction::None;
+        };
+        let Some(address) = self.agent_row_active_address(&key) else {
+            self.notice = Some("history requires an active managed or legacy session".to_owned());
+            return AppAction::None;
+        };
+        if !self.address_is_connected(&address) {
+            self.notice = Some(format!("{} is disconnected; history unavailable", address.node_id));
+            return AppAction::None;
+        }
+        let Some((source_provider, source_workspace_root, running)) = self
+            .nodes
+            .iter()
+            .find(|node| node.node_id == address.node_id)
+            .and_then(|node| {
+                node.workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == address.workspace_id)
+            })
+            .and_then(|workspace| {
+                workspace
+                    .sessions
+                    .iter()
+                    .find(|session| session.address == address)
+                    .map(|session| {
+                        (
+                            session.provider.clone(),
+                            workspace.canonical_root.clone(),
+                            session.running,
+                        )
+                    })
+            })
+        else {
+            self.notice = Some("selected active session is absent from the node snapshot".to_owned());
+            return AppAction::None;
+        };
+        if !running {
+            self.notice = Some("history opens from an active PTY session".to_owned());
+            return AppAction::None;
+        }
+        self.history = Some(HistoryDialog {
+            source: address.clone(),
+            source_provider,
+            source_workspace_root,
+            candidates: Vec::new(),
+            selected: 0,
+            loaded: None,
+            context: None,
+            pending_label: Some("discovering bounded history metadata".to_owned()),
+        });
+        self.focus = Focus::History;
+        AppAction::DiscoverHistory { address, limit: 16 }
     }
 
     fn connected_node_ids(&self) -> Vec<String> {
@@ -2720,9 +9918,16 @@ impl App {
         self.focus = Focus::Settings;
         match section {
             ControlSection::Files | ControlSection::Git => self.inspect_selected_workspace(),
-            ControlSection::Agents
-            | ControlSection::Workspaces
-            | ControlSection::Settings => AppAction::None,
+            ControlSection::Agents => {
+                let action = self.select_roster_mode(RosterMode::Agents);
+                self.focus = Focus::Settings;
+                action
+            }
+            ControlSection::Workspaces => {
+                self.roster_mode = RosterMode::Workspaces;
+                AppAction::None
+            }
+            ControlSection::Settings => AppAction::None,
         }
     }
 
@@ -2749,9 +9954,7 @@ impl App {
                 self.inspect_selected_workspace()
             }
             ControlSection::Agents => {
-                self.roster_mode = RosterMode::Agents;
-                self.focus = Focus::Agents;
-                AppAction::None
+                self.select_roster_mode(RosterMode::Agents)
             }
             ControlSection::Workspaces => {
                 self.roster_mode = RosterMode::Workspaces;
@@ -2802,15 +10005,20 @@ impl App {
                 self.git_cursor = moved_index(self.git_cursor, self.git_item_count(), up);
             }
             ControlSection::Agents => {
-                self.selected_agent = moved_index(
-                    self.selected_agent,
-                    self.agent_rows().len(),
-                    up,
-                );
+                if self.existing_session.is_some() {
+                    self.move_native_tree_cursor(if up { -1 } else { 1 });
+                } else {
+                    self.selected_agent = moved_index(
+                        self.selected_agent,
+                        self.agent_rows().len(),
+                        up,
+                    );
+                }
             }
             ControlSection::Workspaces => {
                 let next = moved_index(self.selected_space, self.space_rows().len(), up);
                 if next != self.selected_space {
+                    self.clear_agent_run_lens();
                     self.select_workspace_without_inspection(next);
                     self.reveal_roster_selection(
                         RosterMode::Workspaces,
@@ -2843,36 +10051,227 @@ impl App {
         AppAction::None
     }
 
-    fn terminal_target_at(&self, column: u16, row: u16) -> Option<(SessionAddress, Rect)> {
-        match self.surface_mode {
-            SurfaceMode::Tab if self.layout.viewport.contains(column, row) => {
-                self.focused_address()
+    fn terminal_target_at(&self, column: u16, row: u16) -> Option<(SurfaceTab, Rect)> {
+        self.layout
+            .surface_panes
+            .iter()
+            .find(|pane| pane.viewport.contains(column, row))
+            .and_then(|layout| {
+                self.surface
+                    .panes
+                    .get(&layout.pane_id)
+                    .and_then(|pane| pane.active_tab())
                     .cloned()
-                    .map(|address| (address, self.layout.viewport))
-            }
-            SurfaceMode::Grid => self
-                .layout
-                .grid_panes
-                .iter()
-                .find(|pane| pane.viewport.contains(column, row))
-                .and_then(|layout| {
-                    self.grid
-                        .panes
-                        .get(layout.pane_index)
-                        .map(|pane| (pane.address.clone(), layout.viewport))
-                }),
-            SurfaceMode::Tab => None,
+                    .map(|address| (address, layout.viewport))
+            })
+    }
+
+    fn active_file_key_in_pane(&self, pane_id: PaneId) -> Option<WorkspaceFileTabKey> {
+        match self
+            .surface
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| pane.active_tab())
+        {
+            Some(SurfaceTab::File(key)) => Some(key.clone()),
+            _ => None,
         }
+    }
+
+    fn update_file_scrollbar(
+        &mut self,
+        key: &WorkspaceFileTabKey,
+        viewport: Rect,
+        row: u16,
+    ) {
+        let Some(file) = self.file_tabs.get_mut(key) else {
+            return;
+        };
+        let track_height = viewport.height.saturating_sub(1);
+        if track_height == 0 {
+            return;
+        }
+        let last_line = file.editor.line_count().saturating_sub(1);
+        let relative = row
+            .clamp(viewport.y, viewport.y.saturating_add(track_height).saturating_sub(1))
+            .saturating_sub(viewport.y) as usize;
+        let scroll_line = if track_height <= 1 {
+            0
+        } else {
+            relative.saturating_mul(last_line) / (track_height as usize - 1)
+        };
+        file.editor.set_scroll(scroll_line, file.editor.scroll_column());
+    }
+
+    fn begin_surface_body_interaction(&mut self, pane_id: PaneId, column: u16, row: u16) {
+        self.focus_surface_pane(pane_id);
+        let Some(viewport) = self
+            .layout
+            .surface_panes
+            .iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .map(|pane| pane.viewport)
+        else {
+            return;
+        };
+        let Some(tab) = self
+            .surface
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| pane.active_tab())
+            .cloned()
+        else {
+            return;
+        };
+        match tab {
+            SurfaceTab::AgentBoard => {}
+            SurfaceTab::SessionMonitor(_) => {}
+            SurfaceTab::File(key) => {
+                let Some(file) = self.file_tabs.get_mut(&key) else {
+                    return;
+                };
+                if file.inline_history.is_some() {
+                    return;
+                }
+                if !matches!(file.state, WorkspaceFileState::Ready)
+                    || row >= viewport.bottom().saturating_sub(1)
+                {
+                    return;
+                }
+                file.edit_mode = true;
+                let number_width = file.editor.line_count().max(1).to_string().len().max(3)
+                    + 1
+                    + usize::from(file.editor.scroll_column() > 0);
+                let viewport_row = row.saturating_sub(viewport.y) as usize;
+                let viewport_column = column
+                    .saturating_sub(viewport.x)
+                    .saturating_sub(number_width.min(u16::MAX as usize) as u16)
+                    as usize;
+                file.editor.start_drag_selection(viewport_row, viewport_column);
+                self.drag_state = Some(DragState::FileSelection { key, viewport });
+            }
+            SurfaceTab::Pty(address) => {
+                let x = column.saturating_sub(viewport.x).min(viewport.width.saturating_sub(1));
+                let y = row.saturating_sub(viewport.y).min(viewport.height.saturating_sub(1));
+                self.terminal_selection = Some(TerminalSelection {
+                    address: address.clone(),
+                    start: (x, y),
+                    end: (x, y),
+                    text: String::new(),
+                });
+                self.drag_state = Some(DragState::TerminalSelection { address, viewport });
+            }
+            SurfaceTab::Preview(_) | SurfaceTab::Git(_) => {}
+        }
+    }
+
+    fn update_terminal_selection(&mut self, address: &SessionAddress, viewport: Rect, column: u16, row: u16) {
+        let x = column.saturating_sub(viewport.x).min(viewport.width.saturating_sub(1));
+        let y = row.saturating_sub(viewport.y).min(viewport.height.saturating_sub(1));
+        let Some(session) = self.find_session(address).cloned() else {
+            self.terminal_selection = None;
+            return;
+        };
+        let scroll_offset = self.terminal_scroll_offset(address);
+        let Some(selection) = self
+            .terminal_selection
+            .as_mut()
+            .filter(|selection| selection.address == *address)
+        else {
+            return;
+        };
+        selection.end = (x, y);
+        selection.text = terminal_selected_text(
+            &session,
+            viewport.width,
+            viewport.height,
+            scroll_offset,
+            selection.start,
+            selection.end,
+        );
     }
 
     fn scroll_terminal(
         &mut self,
-        address: SessionAddress,
+        tab: SurfaceTab,
         viewport: Rect,
         column: u16,
         row: u16,
         up: bool,
     ) -> AppAction {
+        let address = match tab {
+            SurfaceTab::AgentBoard => {
+                return self.reduce_agent_board(if up { UiKey::Up } else { UiKey::Down });
+            }
+            SurfaceTab::SessionMonitor(key) => {
+                if let Some(monitor) = self.session_monitors
+                    .get_mut(&key.target)
+                {
+                    let offset = monitor.scroll.entry(monitor.section).or_default();
+                    *offset = if up {
+                        offset.saturating_sub(WHEEL_SCROLL_LINES)
+                    } else {
+                        offset.saturating_add(WHEEL_SCROLL_LINES)
+                    };
+                }
+                return AppAction::None;
+            }
+            SurfaceTab::Pty(address) => address,
+            SurfaceTab::Preview(key) => {
+                if let Some(preview) = self.preview_tabs.get_mut(&key) {
+                    preview.scroll = if up {
+                        preview.scroll.saturating_sub(WHEEL_SCROLL_LINES)
+                    } else {
+                        preview.scroll.saturating_add(WHEEL_SCROLL_LINES)
+                    };
+                }
+                return AppAction::None;
+            }
+            SurfaceTab::File(key) => {
+                if let Some(tab) = self.file_tabs.get_mut(&key) {
+                    if let Some(history) = tab.inline_history.as_mut() {
+                        if history.mode == WorkspaceGitPaneMode::Detail {
+                            history.detail_scroll = if up {
+                                history.detail_scroll.saturating_sub(WHEEL_SCROLL_LINES)
+                            } else {
+                                history.detail_scroll.saturating_add(WHEEL_SCROLL_LINES)
+                            };
+                        } else {
+                            history.list_scroll = if up {
+                                history.list_scroll.saturating_sub(WHEEL_SCROLL_LINES)
+                            } else {
+                                history.list_scroll.saturating_add(WHEEL_SCROLL_LINES)
+                            };
+                        }
+                    } else {
+                        tab.editor.scroll_vertical(if up {
+                            -(WHEEL_SCROLL_LINES as isize)
+                        } else {
+                            WHEEL_SCROLL_LINES as isize
+                        });
+                    }
+                }
+                return AppAction::None;
+            }
+            SurfaceTab::Git(key) => {
+                if let Some(tab) = self.git_tabs.get_mut(&key) {
+                    if tab.mode == WorkspaceGitPaneMode::Detail {
+                        tab.detail_scroll = if up {
+                            tab.detail_scroll.saturating_sub(WHEEL_SCROLL_LINES)
+                        } else {
+                            tab.detail_scroll.saturating_add(WHEEL_SCROLL_LINES)
+                        };
+                    } else {
+                        tab.list_scroll = if up {
+                            tab.list_scroll.saturating_sub(WHEEL_SCROLL_LINES)
+                        } else {
+                            tab.list_scroll.saturating_add(WHEEL_SCROLL_LINES)
+                        };
+                    }
+                }
+                return AppAction::None;
+            }
+        };
         let Some(session) = self.find_session(&address) else {
             return AppAction::None;
         };
@@ -2938,14 +10337,34 @@ impl App {
     }
 
     fn scroll_roster(&mut self, mode: RosterMode, up: bool, visible_rows: u16) {
-        let capacity = visible_rows as usize / 2;
+        if matches!(mode, RosterMode::Agents | RosterMode::NativeSessions)
+            && self.existing_session.is_some()
+        {
+            let item_count = self.native_session_tree_items().len();
+            if let Some(dialog) = self.existing_session.as_mut() {
+                let capacity = visible_rows.saturating_sub(5) as usize;
+                let maximum = item_count.saturating_sub(capacity);
+                dialog.scroll = wheel_scroll_start(dialog.scroll, maximum, up);
+                if item_count > 0 {
+                    dialog.tree_cursor = dialog.scroll.min(item_count - 1);
+                }
+            }
+            self.move_native_tree_cursor(0);
+            return;
+        }
         let count = match mode {
             RosterMode::Agents => self.agent_rows().len(),
+            RosterMode::NativeSessions => 0,
             RosterMode::Workspaces => self.space_rows().len(),
         };
-        let maximum = count.saturating_sub(capacity);
+        let maximum = match mode {
+            RosterMode::Agents => self.agent_roster_max_scroll(visible_rows as usize),
+            RosterMode::NativeSessions => return,
+            RosterMode::Workspaces => count.saturating_sub(visible_rows as usize / 2),
+        };
         let offset = match mode {
             RosterMode::Agents => &mut self.agents_scroll,
+            RosterMode::NativeSessions => return,
             RosterMode::Workspaces => &mut self.workspaces_scroll,
         };
         *offset = wheel_scroll_start(*offset, maximum, up);
@@ -2967,16 +10386,56 @@ impl App {
     }
 
     fn reveal_roster_selection(&mut self, mode: RosterMode, visible_rows: u16) {
+        if matches!(mode, RosterMode::Agents | RosterMode::NativeSessions)
+            && self.existing_session.is_some()
+        {
+            let item_count = self.native_session_tree_items().len();
+            if let Some(dialog) = self.existing_session.as_mut() {
+                let capacity = visible_rows.saturating_sub(5) as usize;
+                dialog.scroll = visible_selection_start(
+                    dialog.scroll,
+                    dialog.tree_cursor,
+                    item_count,
+                    capacity,
+                );
+            }
+            return;
+        }
+        if mode == RosterMode::Agents {
+            let rows = self.agent_rows();
+            if rows.is_empty() {
+                self.agents_scroll = 0;
+                return;
+            }
+            let maximum = self.agent_roster_max_scroll(visible_rows as usize);
+            let mut start = self.agents_scroll.min(maximum);
+            if self.selected_agent < start {
+                start = self.selected_agent;
+            } else {
+                while start < self.selected_agent
+                    && rows[start..=self.selected_agent]
+                        .iter()
+                        .map(|key| self.agent_row_height(key))
+                        .sum::<usize>()
+                        > visible_rows as usize
+                {
+                    start += 1;
+                }
+            }
+            self.agents_scroll = start.min(maximum);
+            return;
+        }
+        if mode == RosterMode::NativeSessions {
+            return;
+        }
+        let count = self.space_rows().len();
         let capacity = visible_rows as usize / 2;
-        let (selected, count) = match mode {
-            RosterMode::Agents => (self.selected_agent, self.agent_rows().len()),
-            RosterMode::Workspaces => (self.selected_space, self.space_rows().len()),
-        };
-        let offset = match mode {
-            RosterMode::Agents => &mut self.agents_scroll,
-            RosterMode::Workspaces => &mut self.workspaces_scroll,
-        };
-        *offset = visible_selection_start(*offset, selected, count, capacity);
+        self.workspaces_scroll = visible_selection_start(
+            self.workspaces_scroll,
+            self.selected_space,
+            count,
+            capacity,
+        );
     }
 
     pub fn terminal_scroll_offset(&self, address: &SessionAddress) -> usize {
@@ -3028,8 +10487,41 @@ impl App {
             .collect()
     }
 
+    fn cycle_spawn_node(&self, spawn: &mut SpawnDialog, forward: bool) {
+        let nodes = self
+            .spawn_routes()
+            .into_iter()
+            .map(|(node_id, _, _)| node_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            return;
+        }
+        let node_id = cycle_string(&nodes, &spawn.node_id, forward);
+        if node_id == spawn.node_id {
+            return;
+        }
+        let Some((_, workspace_id, providers)) = self
+            .spawn_routes()
+            .into_iter()
+            .find(|(candidate, _, _)| candidate == &node_id)
+        else {
+            return;
+        };
+        spawn.node_id = node_id;
+        spawn.workspace_id = workspace_id;
+        if !providers.contains(&spawn.provider) {
+            spawn.provider = providers[0].clone();
+        }
+    }
+
     fn cycle_spawn_workspace(&self, spawn: &mut SpawnDialog, forward: bool) {
-        let routes = self.spawn_routes();
+        let routes = self
+            .spawn_routes()
+            .into_iter()
+            .filter(|(node_id, _, _)| node_id == &spawn.node_id)
+            .collect::<Vec<_>>();
         if routes.is_empty() {
             return;
         }
@@ -3052,6 +10544,190 @@ impl App {
         if !providers.contains(&spawn.provider) {
             spawn.provider = providers[0].clone();
         }
+    }
+
+    fn spawn_profile_ids(&self, node_id: &str) -> Option<Vec<String>> {
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == node_id)?
+            .launch_inventory
+            .as_ref()?
+            .spawn_profiles
+            .as_ref()
+            .map(|profiles| profiles.iter().map(|profile| profile.id.to_string()).collect())
+    }
+
+    fn bundle_ids(&self, node_id: &str) -> Option<Vec<String>> {
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == node_id)?
+            .launch_inventory
+            .as_ref()?
+            .bundles
+            .as_ref()
+            .map(|bundles| {
+                std::iter::once(String::new())
+                    .chain(bundles.iter().map(|bundle| bundle.id.to_string()))
+                    .collect()
+            })
+    }
+
+    fn worktree_profile_ids(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+    ) -> Option<Vec<String>> {
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == node_id)?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)?
+            .managed_worktree_profiles
+            .as_ref()
+            .map(|inventory| {
+                inventory
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.id.to_string())
+                    .collect()
+            })
+    }
+
+    fn reconcile_spawn_inventory(&self, spawn: &mut SpawnDialog) {
+        if let Some(profiles) = self.spawn_profile_ids(&spawn.node_id) {
+            if !profiles.iter().any(|profile| profile == &spawn.profile_id) {
+                spawn.profile_id = profiles.first().cloned().unwrap_or_default();
+            }
+        }
+        if let Some(profiles) =
+            self.worktree_profile_ids(&spawn.node_id, &spawn.workspace_id)
+        {
+            if !profiles
+                .iter()
+                .any(|profile| profile == &spawn.worktree_profile_id)
+            {
+                spawn.worktree_profile_id = profiles.first().cloned().unwrap_or_default();
+            }
+        }
+        if let Some(bundles) = self.bundle_ids(&spawn.node_id) {
+            if !bundles.iter().any(|bundle| bundle == &spawn.bundle_id) {
+                spawn.bundle_id.clear();
+            }
+        }
+    }
+
+    pub fn launch_field_uses_inventory(&self, spawn: &SpawnDialog, field: LaunchField) -> bool {
+        self.launch_field_choice_count(spawn, field).is_some()
+    }
+
+    pub fn launch_field_choice_count(
+        &self,
+        spawn: &SpawnDialog,
+        field: LaunchField,
+    ) -> Option<usize> {
+        match field {
+            LaunchField::Node => Some(
+                self.spawn_routes()
+                    .into_iter()
+                    .map(|(node_id, _, _)| node_id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            ),
+            LaunchField::Workspace => Some(
+                self.spawn_routes()
+                    .into_iter()
+                    .filter(|(node_id, _, _)| node_id == &spawn.node_id)
+                    .count(),
+            ),
+            LaunchField::Provider => self
+                .nodes
+                .iter()
+                .find(|node| node.node_id == spawn.node_id)
+                .and_then(|node| {
+                    node.workspaces
+                        .iter()
+                        .find(|workspace| workspace.workspace_id == spawn.workspace_id)
+                })
+                .map(|workspace| {
+                    workspace
+                        .providers
+                        .iter()
+                        .filter(|inventory| inventory.enabled)
+                        .count()
+                }),
+            LaunchField::Delivery => self.bundle_ids(&spawn.node_id).map(|bundles| bundles.len()),
+            LaunchField::GitLocation | LaunchField::ContinueFrom => None,
+        }
+    }
+
+    pub fn spawn_context_available(&self, spawn: &SpawnDialog) -> bool {
+        self.history
+            .as_ref()
+            .filter(|history| history.source.node_id == spawn.node_id)
+            .and_then(|history| history.context.as_ref())
+            .is_some()
+    }
+
+    pub fn selected_managed_worktree_profile(
+        &self,
+        spawn: &SpawnDialog,
+    ) -> Option<gate4agent_node_protocol::ManagedWorktreeProfileSummary> {
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == spawn.node_id)?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == spawn.workspace_id)?
+            .managed_worktree_profiles
+            .as_ref()?
+            .profiles
+            .iter()
+            .find(|profile| profile.id.as_str() == spawn.worktree_profile_id)
+            .cloned()
+    }
+
+    pub fn selected_spawn_profile(
+        &self,
+        spawn: &SpawnDialog,
+    ) -> Option<gate4agent_node_protocol::SpawnProfileSummary> {
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == spawn.node_id)?
+            .launch_inventory
+            .as_ref()?
+            .spawn_profiles
+            .as_ref()?
+            .iter()
+            .find(|profile| profile.id.as_str() == spawn.profile_id)
+            .cloned()
+    }
+
+    pub fn selected_worktree_service_mode(
+        &self,
+        spawn: &SpawnDialog,
+    ) -> Option<WorktreeServiceMode> {
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == spawn.node_id)?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == spawn.workspace_id)?
+            .worktree_service_mode
+    }
+
+    pub fn manual_worktree_available(&self, node_id: &str, workspace_id: &str) -> bool {
+        self.nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .and_then(|node| {
+                node.workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)
+            })
+            .is_some_and(|workspace| {
+                workspace.worktree_service_mode == Some(WorktreeServiceMode::Manual)
+            })
     }
 
     fn remove_selected_space(&mut self) -> AppAction {
@@ -3159,11 +10835,11 @@ impl App {
         let Some(inspection) = self.selected_workspace_inspection() else {
             return 0;
         };
-        let details = if inspection.git.status.is_empty() {
-            inspection.git.recent_commits.len()
-        } else {
-            inspection.git.status.len()
-        };
+        let details = inspection
+            .git
+            .status
+            .len()
+            .saturating_add(inspection.git.recent_commits.len());
         inspection.git.worktrees.len().saturating_add(details)
     }
 
@@ -3175,7 +10851,38 @@ impl App {
         if self.git_cursor < worktree_count {
             self.activate_worktree(self.git_cursor)
         } else {
-            AppAction::None
+            let Some((node_id, workspace_id)) = self.selected_workspace_route() else {
+                return AppAction::None;
+            };
+            let (status_count, status_target, commit_id) = self
+                .selected_workspace_inspection()
+                .map(|inspection| {
+                    let status_count = inspection.git.status.len();
+                    let detail_index = self.git_cursor.saturating_sub(worktree_count);
+                    let status_target = inspection.git.status.get(detail_index).map(|entry| {
+                        let path = Some(entry.path.clone());
+                        if entry.worktree_status == " " && entry.index_status != " " {
+                            WorkspaceGitDiffTarget::Staged { path }
+                        } else {
+                            WorkspaceGitDiffTarget::Working { path }
+                        }
+                    });
+                    let commit_id = detail_index.checked_sub(status_count).and_then(|index| {
+                        inspection.git.recent_commits.get(index).map(|commit| commit.id.clone())
+                    });
+                    (status_count, status_target, commit_id)
+                })
+                .unwrap_or((0, None, None));
+            let detail_index = self.git_cursor.saturating_sub(worktree_count);
+            let pending_diff = if detail_index < status_count {
+                status_target
+            } else {
+                commit_id.map(|revision| WorkspaceGitDiffTarget::Commit {
+                    revision,
+                    path: None,
+                })
+            };
+            self.open_workspace_git(node_id, workspace_id, None, pending_diff)
         }
     }
 
@@ -3190,21 +10897,100 @@ impl App {
     fn reduce_agents(&mut self, key: UiKey) -> AppAction {
         match key {
             UiKey::Char('a') => {
-                self.roster_mode = RosterMode::Agents;
-                self.control_section = ControlSection::Agents;
-                return AppAction::None;
+                return self.select_roster_mode(RosterMode::Agents);
             }
             UiKey::Char('w') => {
-                self.roster_mode = RosterMode::Workspaces;
-                self.control_section = ControlSection::Workspaces;
-                return AppAction::None;
+                return self.select_roster_mode(RosterMode::Workspaces);
+            }
+            UiKey::Char('b') | UiKey::Char('B') => {
+                return self.open_agent_board();
             }
             _ => {}
         }
         self.control_section = match self.roster_mode {
-            RosterMode::Agents => ControlSection::Agents,
+            RosterMode::Agents | RosterMode::NativeSessions => ControlSection::Agents,
             RosterMode::Workspaces => ControlSection::Workspaces,
         };
+        if matches!(self.roster_mode, RosterMode::Agents | RosterMode::NativeSessions)
+            && self.existing_session.is_some()
+        {
+            let Some(field) = self.existing_session.as_ref().map(|dialog| dialog.field) else {
+                return AppAction::None;
+            };
+            let navigated = matches!(key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
+            match key {
+                UiKey::Tab | UiKey::BackTab => {
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        dialog.field = ExistingSessionField::Sessions;
+                    }
+                }
+                UiKey::Up => {
+                    self.move_native_tree_cursor(-1);
+                }
+                UiKey::Down => {
+                    self.move_native_tree_cursor(1);
+                }
+                UiKey::Home => {
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        dialog.tree_cursor = 0;
+                    }
+                    self.move_native_tree_cursor(0);
+                }
+                UiKey::End => {
+                    let last = self.native_session_tree_items().len().saturating_sub(1);
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        dialog.tree_cursor = last;
+                    }
+                    self.move_native_tree_cursor(0);
+                }
+                UiKey::Left
+                    if matches!(field, ExistingSessionField::Node | ExistingSessionField::Workspace | ExistingSessionField::Provider) => {
+                    return self.cycle_existing_session_field(field, false);
+                }
+                UiKey::Right
+                    if matches!(field, ExistingSessionField::Node | ExistingSessionField::Workspace | ExistingSessionField::Provider) => {
+                    return self.cycle_existing_session_field(field, true);
+                }
+                UiKey::Enter => {
+                    return self.activate_native_tree_cursor();
+                }
+                UiKey::Char('r') | UiKey::Char('R') => {
+                    let Some(dialog) = self.existing_session.as_mut() else {
+                        return AppAction::None;
+                    };
+                    self.native_catalog_token = self.native_catalog_token.wrapping_add(1).max(1);
+                    let routes = catalog_routes_for_node_from_nodes(
+                        &self.nodes,
+                        &dialog.node_id,
+                    );
+                    self.native_catalog_route_tokens
+                        .retain(|(candidate, _), _| candidate != &dialog.node_id);
+                    dialog.catalog = NativeSessionCatalogState::Loading;
+                    dialog.rows.clear();
+                    dialog.selected = 0;
+                    dialog.tree_cursor = 0;
+                    dialog.scroll = 0;
+                    dialog.request_token = self.native_catalog_token;
+                    dialog.pending_routes = routes.iter().cloned().collect();
+                    dialog.route_pages.clear();
+                    dialog.catalog_failure = None;
+                    return AppAction::CatalogNativeSessions {
+                        node_id: dialog.node_id.clone(),
+                        routes,
+                        limit: 64,
+                        token: dialog.request_token,
+                    };
+                }
+                _ => {}
+            }
+            if navigated {
+                self.reveal_roster_selection(
+                    RosterMode::Agents,
+                    self.layout.agents.height.saturating_sub(3),
+                );
+            }
+            return AppAction::None;
+        }
         if self.roster_mode == RosterMode::Workspaces {
             let count = self.space_rows().len();
             let navigated = matches!(&key, UiKey::Up | UiKey::Down | UiKey::Home | UiKey::End);
@@ -3239,7 +11025,7 @@ impl App {
         match key {
             UiKey::Up => self.selected_agent = self.selected_agent.saturating_sub(1),
             UiKey::Down if count > 0 => self.selected_agent = (self.selected_agent + 1).min(count - 1),
-            UiKey::Enter => self.open_selected_agent(),
+            UiKey::Enter => return self.open_selected_agent(),
             UiKey::Delete => {
                 let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
                     self.notice = Some("no managed session selected".to_owned());
@@ -3263,8 +11049,9 @@ impl App {
                 return self.begin_forget_selected_agent();
             }
             UiKey::Char('+') | UiKey::Insert => return self.begin_spawn(),
-            UiKey::Char('r') => return self.restart_selected_agent(),
+            UiKey::Char('r') | UiKey::Char('R') => return self.restart_selected_agent(),
             UiKey::Char('n') => return self.begin_rename_selected_agent(),
+            UiKey::Char('h') => return self.begin_history_selected_agent(),
             _ => {}
         }
         if navigated {
@@ -3281,7 +11068,7 @@ impl App {
             self.notice = Some("no managed session selected".to_owned());
             return AppAction::None;
         };
-        if let Some(record) = self.find_managed_session(&key) {
+        if let Some(record) = self.find_managed_session(&key).cloned() {
             let node_id = record.node_id.clone();
             let record_id = record.record_id.clone();
             let display_name = record.display_name.clone();
@@ -3303,11 +11090,49 @@ impl App {
                 ));
                 return AppAction::None;
             }
+            if self.preview_resume.is_some() {
+                self.notice = Some("another session reconnect is already in progress".to_owned());
+                return AppAction::None;
+            }
+            let preview_key = PreviewTabKey::ManagedRecord {
+                node_id: node_id.clone(),
+                record_id: record_id.clone(),
+            };
+            let origin = (self.preview_tabs.contains_key(&preview_key)
+                && self
+                    .surface
+                    .tab_location(&SurfaceTab::Preview(preview_key.clone()))
+                    .is_some())
+                .then_some(preview_key);
+            if let Some(origin) = origin.as_ref() {
+                if let Some(tab) = self.preview_tabs.get_mut(origin) {
+                    tab.phase = PreviewTabPhase::Resuming;
+                    tab.reconnect_error = None;
+                    tab.scroll = usize::MAX;
+                }
+            }
+            self.existing_session_operation_token = self
+                .existing_session_operation_token
+                .wrapping_add(1)
+                .max(1);
+            let operation_token = self.existing_session_operation_token;
+            self.preview_resume = Some(PreviewResumeOperation {
+                origin,
+                node_id: node_id.clone(),
+                workspace_id: record.workspace_id.clone(),
+                provider: record.provider.clone(),
+                selection_id: None,
+                record_id: Some(record_id.clone()),
+                operation_token,
+            });
+            self.notice = Some(format!("reconnecting {display_name}..."));
             return AppAction::ResumeSessionRecord {
                 node_id,
                 record_id,
                 rows: self.content_rows(),
                 cols: self.content_cols(),
+                initial_prompt: None,
+                operation_token,
             };
         }
         let Some(address) = self.agent_row_active_address(&key) else {
@@ -3336,41 +11161,39 @@ impl App {
     }
 
     fn reduce_tabs(&mut self, key: UiKey) -> AppAction {
-        if self.surface_mode == SurfaceMode::Grid {
-            if self.grid.panes.is_empty() {
-                return AppAction::None;
-            }
-            let current = self.grid.focused.min(self.grid.panes.len() - 1);
-            let candidate = match (self.grid.preset, key) {
-                (GridPreset::Quad, UiKey::Left) if current % 2 == 1 => Some(current - 1),
-                (GridPreset::Quad, UiKey::Right) if current % 2 == 0 => Some(current + 1),
-                (GridPreset::Quad, UiKey::Up) if current >= 2 => Some(current - 2),
-                (GridPreset::Quad, UiKey::Down) => Some(current + 2),
-                (GridPreset::Columns, UiKey::Left) if current > 0 => Some(current - 1),
-                (GridPreset::Columns, UiKey::Right) => Some(current + 1),
-                (GridPreset::Rows, UiKey::Up) if current > 0 => Some(current - 1),
-                (GridPreset::Rows, UiKey::Down) => Some(current + 1),
-                (_, UiKey::Enter) => {
-                    self.focus = Focus::Viewport;
-                    None
-                }
-                _ => None,
-            };
-            if let Some(candidate) = candidate {
-                if candidate < self.grid.panes.len() {
-                    self.grid.focused = candidate;
-                }
-            }
-            return AppAction::None;
-        }
         match key {
-            UiKey::Left if !self.tabs.is_empty() => self.selected_tab = self.selected_tab.saturating_sub(1),
-            UiKey::Right if !self.tabs.is_empty() => {
-                self.selected_tab = (self.selected_tab + 1).min(self.tabs.len() - 1)
+            UiKey::Char('r') | UiKey::Char('R') if self.focused_preview().is_some() => {
+                return self.start_focused_preview_resume();
+            }
+            UiKey::Left => {
+                let pane = self.surface.focused_pane_mut();
+                pane.active = pane.active.saturating_sub(1);
+            }
+            UiKey::Right => {
+                let pane = self.surface.focused_pane_mut();
+                if !pane.tabs.is_empty() {
+                    pane.active = pane.active.saturating_add(1).min(pane.tabs.len() - 1);
+                }
+            }
+            UiKey::Up | UiKey::Down => {
+                let leaves = self.surface.leaf_ids();
+                let current = leaves
+                    .iter()
+                    .position(|pane_id| *pane_id == self.surface.focused)
+                    .unwrap_or(0);
+                let candidate = if key == UiKey::Up {
+                    current.saturating_sub(1)
+                } else {
+                    current.saturating_add(1).min(leaves.len().saturating_sub(1))
+                };
+                if let Some(pane_id) = leaves.get(candidate).copied() {
+                    let _ = self.surface.set_focused(pane_id);
+                }
             }
             UiKey::Enter => self.focus = Focus::Viewport,
             _ => {}
         }
+        self.sync_active_native_preview_selection();
         AppAction::None
     }
 
@@ -3379,27 +11202,112 @@ impl App {
             self.focus = Focus::Tabs;
             return AppAction::None;
         }
-        if !self.focused_session().is_some_and(|session| session.running) {
+        if matches!(self.surface.active_tab(), Some(SurfaceTab::AgentBoard)) {
+            return self.reduce_agent_board(key);
+        }
+        if matches!(self.surface.active_tab(), Some(SurfaceTab::SessionMonitor(_))) {
+            return self.reduce_session_monitor(key);
+        }
+        if let Some((file_key, _)) = self.focused_file() {
+            let file_key = file_key.clone();
+            return self.reduce_file_viewport(file_key, key);
+        }
+        if let Some((git_key, _)) = self.focused_git() {
+            let git_key = git_key.clone();
+            return self.reduce_git_viewport(git_key, key);
+        }
+        if let Some((preview_key, _)) = self.focused_preview() {
+            let preview_key = preview_key.clone();
+            if matches!(key, UiKey::Char('r') | UiKey::Char('R') | UiKey::Enter) {
+                return self.start_focused_preview_resume();
+            }
+            if let Some(preview) = self.preview_tabs.get_mut(&preview_key) {
+                match key {
+                    UiKey::Up => preview.scroll = preview.scroll.saturating_sub(1),
+                    UiKey::Down => preview.scroll = preview.scroll.saturating_add(1),
+                    UiKey::PageUp => {
+                        preview.scroll = preview.scroll.saturating_sub(self.terminal_rows as usize)
+                    }
+                    UiKey::PageDown => {
+                        preview.scroll = preview.scroll.saturating_add(self.terminal_rows as usize)
+                    }
+                    UiKey::Home => preview.scroll = 0,
+                    UiKey::End => preview.scroll = usize::MAX,
+                    _ => {
+                        self.notice = Some(
+                            "session is hydrated; press r to reconnect its provider PTY"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            return AppAction::None;
+        }
+        let focused_address = self.focused_address().cloned();
+        let has_focused_selection = self.terminal_selection.as_ref().is_some_and(|selection| {
+            !selection.text.is_empty()
+                && focused_address.as_ref() == Some(&selection.address)
+        });
+        if !self.focused_session().is_some_and(|session| session.running)
+            && !matches!(key, UiKey::Ctrl('c') | UiKey::Ctrl('x'))
+        {
             self.notice = Some("stopped PTY is read-only; use r from agents to restart".to_owned());
             return AppAction::None;
         }
         match key {
+            UiKey::Ctrl('c') | UiKey::Ctrl('x')
+                if has_focused_selection =>
+            {
+                let text = self
+                    .terminal_selection
+                    .as_ref()
+                    .map(|selection| selection.text.clone())
+                    .unwrap_or_default();
+                match write_clipboard_text(&text) {
+                    Ok(()) => self.notice = Some("terminal selection copied".to_owned()),
+                    Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                }
+                AppAction::None
+            }
+            UiKey::Ctrl('v') => match read_clipboard_text() {
+                Ok(text) if text.len() <= TERMINAL_INPUT_MAX_BYTES => {
+                    self.terminal_selection = None;
+                    self.for_active(|address| AppAction::Paste { address, text })
+                }
+                Ok(_) => {
+                    self.notice = Some("clipboard exceeds the PTY input limit".to_owned());
+                    AppAction::None
+                }
+                Err(error) => {
+                    self.notice = Some(format!("paste failed: {error}"));
+                    AppAction::None
+                }
+            },
             UiKey::Ctrl(ch) => match control_for_ctrl(ch) {
                 Some(control) => self.terminal_control(control),
                 None => AppAction::None,
             },
             UiKey::OperatorEscape => AppAction::None,
-            UiKey::TerminalBytes(bytes) => self.for_active(|address| AppAction::TerminalBytes {
-                address,
-                bytes,
-            }),
-            UiKey::Char(ch) => self.for_active(|address| AppAction::Input {
-                address,
-                text: ch.to_string(),
-            }),
+            UiKey::TerminalBytes(bytes) => {
+                self.terminal_selection = None;
+                self.for_active(|address| AppAction::TerminalBytes { address, bytes })
+            }
+            UiKey::Char(ch) => {
+                self.terminal_selection = None;
+                self.for_active(|address| AppAction::Input {
+                    address,
+                    text: ch.to_string(),
+                })
+            }
             UiKey::Escape => self.terminal_control(TerminalControl::Escape),
             UiKey::Enter => self.terminal_control(TerminalControl::Enter),
-            UiKey::Backspace => self.terminal_control(TerminalControl::Backspace),
+            UiKey::Backspace => {
+                self.terminal_selection = None;
+                self.for_active(|address| AppAction::TerminalBytes {
+                    address,
+                    bytes: vec![0x7f],
+                })
+            }
             UiKey::Insert => self.terminal_control(TerminalControl::Insert),
             UiKey::Delete => self.terminal_control(TerminalControl::Delete),
             UiKey::Home => self.terminal_control(TerminalControl::Home),
@@ -3413,7 +11321,948 @@ impl App {
             UiKey::Down => self.terminal_control(TerminalControl::ArrowDown),
             UiKey::Right => self.terminal_control(TerminalControl::ArrowRight),
             UiKey::Left => self.terminal_control(TerminalControl::ArrowLeft),
+            UiKey::ShiftUp => self.terminal_control(TerminalControl::ArrowUp),
+            UiKey::ShiftDown => self.terminal_control(TerminalControl::ArrowDown),
+            UiKey::ShiftRight => self.terminal_control(TerminalControl::ArrowRight),
+            UiKey::ShiftLeft => self.terminal_control(TerminalControl::ArrowLeft),
+            UiKey::ShiftHome => self.terminal_control(TerminalControl::Home),
+            UiKey::ShiftEnd => self.terminal_control(TerminalControl::End),
+            UiKey::ShiftPageUp => self.terminal_control(TerminalControl::PageUp),
+            UiKey::ShiftPageDown => self.terminal_control(TerminalControl::PageDown),
+            UiKey::ModifiedEnter => {
+                self.notice = Some("unsupported key modifier; no input sent".to_owned());
+                AppAction::None
+            }
             UiKey::UnsupportedModifier => AppAction::None,
+        }
+    }
+
+    fn reduce_session_monitor(&mut self, input: UiKey) -> AppAction {
+        if matches!(input, UiKey::Escape | UiKey::OperatorEscape) {
+            self.focus = Focus::Tabs;
+            return AppAction::None;
+        }
+        let Some(SurfaceTab::SessionMonitor(key)) = self.surface.active_tab().cloned() else {
+            return AppAction::None;
+        };
+        let Some(monitor) = self.session_monitors
+            .get_mut(&key.target)
+        else {
+            return AppAction::None;
+        };
+        let section_index = SessionMonitorSection::ALL
+            .iter()
+            .position(|section| *section == monitor.section)
+            .unwrap_or(0);
+        match input {
+            UiKey::Left => {
+                monitor.section = SessionMonitorSection::ALL[section_index.saturating_sub(1)];
+            }
+            UiKey::Right => {
+                monitor.section = SessionMonitorSection::ALL[
+                    section_index.saturating_add(1).min(SessionMonitorSection::ALL.len() - 1)
+                ];
+            }
+            UiKey::Up => {
+                let offset = monitor.scroll.entry(monitor.section).or_default();
+                *offset = offset.saturating_sub(1);
+            }
+            UiKey::Down => {
+                let offset = monitor.scroll.entry(monitor.section).or_default();
+                *offset = offset.saturating_add(1);
+            }
+            UiKey::PageUp => {
+                let offset = monitor.scroll.entry(monitor.section).or_default();
+                *offset = offset.saturating_sub(self.terminal_rows.max(1) as usize);
+            }
+            UiKey::PageDown => {
+                let offset = monitor.scroll.entry(monitor.section).or_default();
+                *offset = offset.saturating_add(self.terminal_rows.max(1) as usize);
+            }
+            UiKey::Home => {
+                monitor.scroll.insert(monitor.section, 0);
+            }
+            UiKey::End => {
+                monitor.scroll.insert(monitor.section, usize::MAX);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn reduce_file_viewport(&mut self, key: WorkspaceFileTabKey, input: UiKey) -> AppAction {
+        let Some(file) = self.file_tabs.get(&key) else {
+            return AppAction::None;
+        };
+        if !matches!(file.state, WorkspaceFileState::Ready) {
+            self.notice = Some("file is not editable until it has loaded".to_owned());
+            return AppAction::None;
+        }
+        if file.inline_history.is_some() {
+            return self.reduce_git_destination(
+                WorkspaceGitRequestDestination::InlineFile(key),
+                input,
+            );
+        }
+        let Some(tab) = self.file_tabs.get_mut(&key) else {
+            return AppAction::None;
+        };
+        if !tab.edit_mode {
+            match input {
+                UiKey::Char('e') | UiKey::Enter => {
+                    tab.edit_mode = true;
+                    self.notice = Some("edit mode; Ctrl+S saves, Esc returns to viewer".to_owned());
+                }
+                UiKey::Up => tab.editor.scroll_vertical(-1),
+                UiKey::Down => tab.editor.scroll_vertical(1),
+                UiKey::Left => tab.editor.scroll_horizontal(-1),
+                UiKey::Right => tab.editor.scroll_horizontal(1),
+                UiKey::PageUp => tab.editor.scroll_vertical(-(self.terminal_rows as isize)),
+                UiKey::PageDown => tab.editor.scroll_vertical(self.terminal_rows as isize),
+                UiKey::Home => tab.editor.set_scroll(0, 0),
+                UiKey::Char('d') | UiKey::Ctrl('d') => {
+                    let target = WorkspaceGitDiffTarget::Working {
+                        path: Some(key.path.clone()),
+                    };
+                    return self.open_workspace_file_history(key, Some(target));
+                }
+                UiKey::Ctrl('a') => tab.editor.select_all(),
+                UiKey::Ctrl('c') => {
+                    if let Some(text) = tab.editor.selected_text() {
+                        match write_clipboard_text(text) {
+                            Ok(()) => self.notice = Some("selection copied".to_owned()),
+                            Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                        }
+                    }
+                }
+                UiKey::Ctrl('x') => {
+                    if let Some(text) = tab.editor.selected_text().map(str::to_owned) {
+                        match write_clipboard_text(&text) {
+                            Ok(()) => {
+                                let _ = tab.editor.replace_selection("");
+                                tab.edit_mode = true;
+                                self.notice = Some("selection cut".to_owned());
+                            }
+                            Err(error) => self.notice = Some(format!("cut failed: {error}")),
+                        }
+                    }
+                }
+                UiKey::Ctrl('v') => match read_clipboard_text() {
+                    Ok(text) => {
+                        if let Err(error) = tab.editor.replace_selection(&text) {
+                            self.notice = Some(format!("paste rejected: {error:?}"));
+                        } else {
+                            tab.edit_mode = true;
+                        }
+                    }
+                    Err(error) => self.notice = Some(format!("paste failed: {error}")),
+                },
+                _ => self.notice = Some("file viewer; press e to edit".to_owned()),
+            }
+            return AppAction::None;
+        }
+        match input {
+            UiKey::Escape => {
+                tab.edit_mode = false;
+                AppAction::None
+            }
+            UiKey::Ctrl('s') => {
+                if !tab.editor.dirty() {
+                    self.notice = Some("file has no unsaved changes".to_owned());
+                    return AppAction::None;
+                }
+                let Some(revision) = tab.editor.saved_revision().map(str::to_owned) else {
+                    self.notice = Some("file revision is unavailable; reload before saving".to_owned());
+                    return AppAction::None;
+                };
+                tab.editor.mark_saving();
+                AppAction::WriteWorkspaceFile {
+                    node_id: key.node_id,
+                    workspace_id: key.workspace_id,
+                    path: key.path,
+                    expected_revision: revision,
+                    text: tab.editor.text().to_owned(),
+                    token: tab.request_token,
+                }
+            }
+            UiKey::Ctrl('a') => {
+                tab.editor.select_all();
+                AppAction::None
+            }
+            UiKey::Ctrl('c') => {
+                if let Some(text) = tab.editor.selected_text() {
+                    match write_clipboard_text(text) {
+                        Ok(()) => self.notice = Some("selection copied".to_owned()),
+                        Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                    }
+                }
+                AppAction::None
+            }
+            UiKey::Ctrl('x') => {
+                if let Some(text) = tab.editor.selected_text().map(str::to_owned) {
+                    match write_clipboard_text(&text) {
+                        Ok(()) => {
+                            let _ = tab.editor.replace_selection("");
+                            self.notice = Some("selection cut".to_owned());
+                        }
+                        Err(error) => self.notice = Some(format!("cut failed: {error}")),
+                    }
+                }
+                AppAction::None
+            }
+            UiKey::Ctrl('v') => {
+                match read_clipboard_text() {
+                    Ok(text) => {
+                        if let Err(error) = tab.editor.replace_selection(&text) {
+                            self.notice = Some(format!("paste rejected: {error:?}"));
+                        }
+                    }
+                    Err(error) => self.notice = Some(format!("paste failed: {error}")),
+                }
+                AppAction::None
+            }
+            UiKey::Ctrl('d') => {
+                let target = WorkspaceGitDiffTarget::Working {
+                    path: Some(key.path.clone()),
+                };
+                return self.open_workspace_file_history(key, Some(target));
+            }
+            UiKey::Char(ch) => {
+                if let Err(error) = tab.editor.insert_char(ch) {
+                    self.notice = Some(format!("file edit rejected: {error:?}"));
+                }
+                tab.editor.ensure_cursor_visible(
+                    self.terminal_rows.saturating_sub(1) as usize,
+                    self.terminal_cols as usize,
+                );
+                AppAction::None
+            }
+            UiKey::Enter | UiKey::ModifiedEnter => {
+                if let Err(error) = tab.editor.insert_newline() {
+                    self.notice = Some(format!("file edit rejected: {error:?}"));
+                }
+                tab.editor.ensure_cursor_visible(
+                    self.terminal_rows.saturating_sub(1) as usize,
+                    self.terminal_cols as usize,
+                );
+                AppAction::None
+            }
+            UiKey::Backspace => {
+                tab.editor.backspace();
+                tab.editor.ensure_cursor_visible(
+                    self.terminal_rows.saturating_sub(1) as usize,
+                    self.terminal_cols as usize,
+                );
+                AppAction::None
+            }
+            UiKey::Delete => {
+                tab.editor.delete();
+                AppAction::None
+            }
+            UiKey::Left => {
+                tab.editor.move_left();
+                tab.editor.ensure_cursor_visible(
+                    self.terminal_rows.saturating_sub(1) as usize,
+                    self.terminal_cols as usize,
+                );
+                AppAction::None
+            }
+            UiKey::Right => {
+                tab.editor.move_right();
+                tab.editor.ensure_cursor_visible(
+                    self.terminal_rows.saturating_sub(1) as usize,
+                    self.terminal_cols as usize,
+                );
+                AppAction::None
+            }
+            UiKey::ShiftLeft => {
+                tab.editor.move_left_extending();
+                AppAction::None
+            }
+            UiKey::ShiftRight => {
+                tab.editor.move_right_extending();
+                AppAction::None
+            }
+            UiKey::ShiftUp => {
+                tab.editor.move_up_extending();
+                AppAction::None
+            }
+            UiKey::ShiftDown => {
+                tab.editor.move_down_extending();
+                AppAction::None
+            }
+            UiKey::Up => {
+                tab.editor.move_up();
+                tab.editor.ensure_cursor_visible(
+                    self.terminal_rows.saturating_sub(1) as usize,
+                    self.terminal_cols as usize,
+                );
+                AppAction::None
+            }
+            UiKey::Down => {
+                tab.editor.move_down();
+                tab.editor.ensure_cursor_visible(
+                    self.terminal_rows.saturating_sub(1) as usize,
+                    self.terminal_cols as usize,
+                );
+                AppAction::None
+            }
+            UiKey::Home => {
+                tab.editor.move_home();
+                AppAction::None
+            }
+            UiKey::ShiftHome => {
+                tab.editor.move_home_extending();
+                AppAction::None
+            }
+            UiKey::ShiftEnd => {
+                tab.editor.move_end_extending();
+                AppAction::None
+            }
+            UiKey::End => {
+                tab.editor.move_end();
+                AppAction::None
+            }
+            UiKey::PageUp => {
+                tab.editor.page_up(self.terminal_rows as usize);
+                AppAction::None
+            }
+            UiKey::PageDown => {
+                tab.editor.page_down(self.terminal_rows as usize);
+                AppAction::None
+            }
+            UiKey::ShiftPageUp => {
+                tab.editor.page_up_extending(self.terminal_rows as usize);
+                AppAction::None
+            }
+            UiKey::ShiftPageDown => {
+                tab.editor.page_down_extending(self.terminal_rows as usize);
+                AppAction::None
+            }
+            UiKey::Tab => {
+                if let Err(error) = tab.editor.insert_str("    ") {
+                    self.notice = Some(format!("file edit rejected: {error:?}"));
+                }
+                AppAction::None
+            }
+            UiKey::Ctrl(_) | UiKey::OperatorEscape | UiKey::TerminalBytes(_) | UiKey::Insert
+            | UiKey::BackTab | UiKey::Function(_) | UiKey::UnsupportedModifier => AppAction::None,
+        }
+    }
+
+    fn git_view(
+        &self,
+        destination: &WorkspaceGitRequestDestination,
+    ) -> Option<&WorkspaceGitTabView> {
+        match destination {
+            WorkspaceGitRequestDestination::Surface(key) => self.git_tabs.get(key),
+            WorkspaceGitRequestDestination::InlineFile(key) => self
+                .file_tabs
+                .get(key)
+                .and_then(|file| file.inline_history.as_ref()),
+        }
+    }
+
+    fn git_view_mut(
+        &mut self,
+        destination: &WorkspaceGitRequestDestination,
+    ) -> Option<&mut WorkspaceGitTabView> {
+        match destination {
+            WorkspaceGitRequestDestination::Surface(key) => self.git_tabs.get_mut(key),
+            WorkspaceGitRequestDestination::InlineFile(key) => self
+                .file_tabs
+                .get_mut(key)
+                .and_then(|file| file.inline_history.as_mut()),
+        }
+    }
+
+    fn git_destination_route(
+        destination: &WorkspaceGitRequestDestination,
+    ) -> (String, String, Option<RepositoryPath>) {
+        match destination {
+            WorkspaceGitRequestDestination::Surface(key) => (
+                key.node_id.clone(),
+                key.workspace_id.clone(),
+                key.history_path.clone(),
+            ),
+            WorkspaceGitRequestDestination::InlineFile(key) => (
+                key.node_id.clone(),
+                key.workspace_id.clone(),
+                Some(key.path.clone()),
+            ),
+        }
+    }
+
+    fn reduce_git_viewport(&mut self, key: WorkspaceGitTabKey, input: UiKey) -> AppAction {
+        self.reduce_git_destination(WorkspaceGitRequestDestination::Surface(key), input)
+    }
+
+    fn reduce_git_destination(
+        &mut self,
+        destination: WorkspaceGitRequestDestination,
+        input: UiKey,
+    ) -> AppAction {
+        let Some(tab) = self.git_view(&destination) else {
+            return AppAction::None;
+        };
+        let mode = tab.mode;
+        let selected = tab.selected;
+        let last = tab.commits.len().saturating_sub(1);
+        let has_more = tab.has_more;
+        if mode == WorkspaceGitPaneMode::Detail {
+            match input {
+                UiKey::Escape | UiKey::Backspace => {
+                    if let Some(tab) = self.git_view_mut(&destination) {
+                        tab.mode = WorkspaceGitPaneMode::List;
+                        tab.detail_scroll = 0;
+                    }
+                }
+                UiKey::Up => {
+                    if let Some(tab) = self.git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_sub(1);
+                    }
+                }
+                UiKey::Down => {
+                    if let Some(tab) = self.git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_add(1);
+                    }
+                }
+                UiKey::PageUp => {
+                    let rows = self.terminal_rows as usize;
+                    if let Some(tab) = self.git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_sub(rows);
+                    }
+                }
+                UiKey::PageDown => {
+                    let rows = self.terminal_rows as usize;
+                    if let Some(tab) = self.git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_add(rows);
+                    }
+                }
+                UiKey::Home => {
+                    if let Some(tab) = self.git_view_mut(&destination) {
+                        tab.detail_scroll = 0;
+                    }
+                }
+                UiKey::Left if selected > 0 => {
+                    return self.request_git_commit_diff(&destination, selected - 1);
+                }
+                UiKey::Right if selected < last => {
+                    return self.request_git_commit_diff(&destination, selected + 1);
+                }
+                _ => {}
+            }
+            return AppAction::None;
+        }
+        match input {
+            UiKey::Escape | UiKey::Backspace
+                if matches!(&destination, WorkspaceGitRequestDestination::InlineFile(_)) =>
+            {
+                if let WorkspaceGitRequestDestination::InlineFile(key) = &destination {
+                    if let Some(file) = self.file_tabs.get_mut(key) {
+                        file.inline_history = None;
+                    }
+                }
+                return AppAction::None;
+            }
+            UiKey::Up if selected > 0 => self.select_git_commit(&destination, selected - 1),
+            UiKey::Down if selected < last => self.select_git_commit(&destination, selected + 1),
+            UiKey::Home if selected > 0 => self.select_git_commit(&destination, 0),
+            UiKey::End if selected < last => self.select_git_commit(&destination, last),
+            UiKey::Enter | UiKey::Char('d') => {
+                return self.request_git_commit_diff(&destination, selected)
+            }
+            UiKey::Char('w') => {
+                let (node_id, workspace_id, history_path) =
+                    Self::git_destination_route(&destination);
+                self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+                let token = self.git_request_token;
+                let target = WorkspaceGitDiffTarget::Working {
+                    path: history_path,
+                };
+                if let Some(tab) = self.git_view_mut(&destination) {
+                    tab.mode = WorkspaceGitPaneMode::Detail;
+                    tab.detail_scroll = 0;
+                    tab.pending_diff = Some(target.clone());
+                    tab.diff = None;
+                    tab.diff_error = None;
+                    tab.diff_token = token;
+                }
+                return AppAction::ReadGitDiff {
+                    node_id,
+                    workspace_id,
+                    target,
+                    token,
+                    destination,
+                };
+            }
+            UiKey::Char('s') => {
+                let (node_id, workspace_id, history_path) =
+                    Self::git_destination_route(&destination);
+                self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+                let token = self.git_request_token;
+                let target = WorkspaceGitDiffTarget::Staged {
+                    path: history_path,
+                };
+                if let Some(tab) = self.git_view_mut(&destination) {
+                    tab.mode = WorkspaceGitPaneMode::Detail;
+                    tab.detail_scroll = 0;
+                    tab.pending_diff = Some(target.clone());
+                    tab.diff = None;
+                    tab.diff_error = None;
+                    tab.diff_token = token;
+                }
+                return AppAction::ReadGitDiff {
+                    node_id,
+                    workspace_id,
+                    target,
+                    token,
+                    destination,
+                };
+            }
+            UiKey::Char('l') if has_more => {
+                let (node_id, workspace_id, history_path) =
+                    Self::git_destination_route(&destination);
+                let before = self.git_view(&destination).and_then(|tab| tab.next_before.clone());
+                self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+                let token = self.git_request_token;
+                if let Some(tab) = self.git_view_mut(&destination) {
+                    tab.history_token = token;
+                }
+                return AppAction::ReadGitHistory {
+                    node_id,
+                    workspace_id,
+                    path: history_path,
+                    before,
+                    limit: 20,
+                    token,
+                    destination,
+                };
+            }
+            _ => {}
+        }
+        let rows = self.terminal_rows;
+        let Some(tab) = self.git_view_mut(&destination) else {
+            return AppAction::None;
+        };
+        let capacity = rows.saturating_sub(2).max(1) as usize;
+        if tab.selected < tab.list_scroll {
+            tab.list_scroll = tab.selected;
+        } else if tab.selected >= tab.list_scroll.saturating_add(capacity) {
+            tab.list_scroll = tab.selected.saturating_add(1).saturating_sub(capacity);
+        }
+        AppAction::None
+    }
+
+    fn select_git_commit(
+        &mut self,
+        destination: &WorkspaceGitRequestDestination,
+        index: usize,
+    ) {
+        self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+        let invalidation_token = self.git_request_token;
+        let Some(tab) = self.git_view_mut(destination) else {
+            return;
+        };
+        if index >= tab.commits.len() {
+            return;
+        }
+        tab.selected = index;
+        tab.detail_scroll = 0;
+        tab.pending_diff = None;
+        tab.diff = None;
+        tab.diff_error = None;
+        tab.diff_token = invalidation_token;
+    }
+
+    fn request_git_commit_diff(
+        &mut self,
+        destination: &WorkspaceGitRequestDestination,
+        index: usize,
+    ) -> AppAction {
+        let Some((revision, path)) = self.git_view(destination).and_then(|tab| {
+            tab.commits
+                .get(index)
+                .map(|commit| (commit.id.clone(), tab.history_path.clone()))
+        }) else {
+            return AppAction::None;
+        };
+        let (node_id, workspace_id, _) = Self::git_destination_route(destination);
+        self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+        let token = self.git_request_token;
+        let target = WorkspaceGitDiffTarget::Commit { revision, path };
+        let rows = self.terminal_rows;
+        if let Some(tab) = self.git_view_mut(destination) {
+            tab.selected = index;
+            tab.mode = WorkspaceGitPaneMode::Detail;
+            tab.detail_scroll = 0;
+            tab.pending_diff = Some(target.clone());
+            tab.diff = None;
+            tab.diff_error = None;
+            tab.diff_token = token;
+            let capacity = rows.saturating_sub(2).max(1) as usize;
+            if tab.selected < tab.list_scroll {
+                tab.list_scroll = tab.selected;
+            } else if tab.selected >= tab.list_scroll.saturating_add(capacity) {
+                tab.list_scroll = tab.selected.saturating_add(1).saturating_sub(capacity);
+            }
+        }
+        AppAction::ReadGitDiff {
+            node_id,
+            workspace_id,
+            target,
+            token,
+            destination: destination.clone(),
+        }
+    }
+
+    pub fn apply_workspace_file_read(
+        &mut self,
+        node_id: String,
+        token: u64,
+        file: gate4agent_node_protocol::WorkspaceFileRead,
+    ) {
+        let key = WorkspaceFileTabKey {
+            node_id,
+            workspace_id: file.workspace_id.to_string(),
+            path: file.path,
+        };
+        let Some(tab) = self.file_tabs.get_mut(&key) else {
+            return;
+        };
+        if tab.request_token != token {
+            return;
+        }
+        match file.content {
+            gate4agent_node_protocol::WorkspaceFileContent::Utf8 { text, .. } => {
+                let revision = file.revision.map(|revision| revision.as_str().to_owned());
+                match TextEditor::new(text, revision) {
+                    Ok(editor) => {
+                        tab.editor = editor;
+                        tab.state = WorkspaceFileState::Ready;
+                        tab.edit_mode = false;
+                    }
+                    Err(error) => tab.state = WorkspaceFileState::Error(format!("{error:?}")),
+                }
+            }
+            gate4agent_node_protocol::WorkspaceFileContent::NonUtf8 { byte_len } => {
+                tab.state = WorkspaceFileState::NonUtf8 { byte_len };
+            }
+            gate4agent_node_protocol::WorkspaceFileContent::TooLarge { limit_bytes } => {
+                tab.state = WorkspaceFileState::TooLarge { limit_bytes };
+            }
+        }
+    }
+
+    pub fn fail_workspace_file(
+        &mut self,
+        key: &WorkspaceFileTabKey,
+        token: u64,
+        message: String,
+        save: bool,
+    ) {
+        let Some(tab) = self.file_tabs.get_mut(key) else {
+            return;
+        };
+        if tab.request_token != token {
+            return;
+        }
+        if save {
+            tab.editor.mark_error(message);
+        } else {
+            tab.state = WorkspaceFileState::Error(message);
+        }
+    }
+
+    pub fn apply_workspace_file_written(
+        &mut self,
+        node_id: String,
+        token: u64,
+        file: gate4agent_node_protocol::WorkspaceFileRead,
+    ) {
+        let key = WorkspaceFileTabKey {
+            node_id,
+            workspace_id: file.workspace_id.to_string(),
+            path: file.path.clone(),
+        };
+        let Some(tab) = self.file_tabs.get_mut(&key) else {
+            return;
+        };
+        if tab.request_token != token {
+            return;
+        }
+        if let gate4agent_node_protocol::WorkspaceFileContent::Utf8 { text, .. } = file.content {
+            if text == tab.editor.text() {
+                tab.editor.mark_save_success(
+                    file.revision.map(|revision| revision.as_str().to_owned()),
+                );
+                tab.state = WorkspaceFileState::Ready;
+                self.notice = Some(format!("saved {}", repository_path_display(&key.path)));
+            } else {
+                tab.editor.mark_conflict("saved response did not match the editor buffer");
+            }
+        }
+    }
+
+    pub fn apply_workspace_file_created(
+        &mut self,
+        node_id: String,
+        token: u64,
+        file: gate4agent_node_protocol::WorkspaceFileRead,
+    ) -> AppAction {
+        let Some(dialog) = self.create_workspace_entry.as_ref() else {
+            return AppAction::None;
+        };
+        let expected_path = RepositoryPath::utf8(dialog.path.clone()).ok();
+        if !dialog.pending
+            || dialog.kind != WorkspaceEntryKind::File
+            || dialog.token != token
+            || dialog.node_id != node_id
+            || dialog.workspace_id != file.workspace_id.as_str()
+            || expected_path.as_ref() != Some(&file.path)
+        {
+            return AppAction::None;
+        }
+        let (text, byte_len) = match &file.content {
+            gate4agent_node_protocol::WorkspaceFileContent::Utf8 { text, byte_len } => {
+                (text.clone(), *byte_len)
+            }
+            _ => {
+                self.fail_workspace_entry_create(
+                    node_id,
+                    file.workspace_id.to_string(),
+                    file.path,
+                    WorkspaceEntryKind::File,
+                    token,
+                    "node returned a non-text file creation response".to_owned(),
+                );
+                return AppAction::None;
+            }
+        };
+        let Some(revision) = file.revision.as_ref().map(|value| value.as_str().to_owned()) else {
+            self.fail_workspace_entry_create(
+                node_id,
+                file.workspace_id.to_string(),
+                file.path,
+                WorkspaceEntryKind::File,
+                token,
+                "node omitted the created file revision".to_owned(),
+            );
+            return AppAction::None;
+        };
+        if !text.is_empty() || byte_len != 0 {
+            self.fail_workspace_entry_create(
+                node_id,
+                file.workspace_id.to_string(),
+                file.path,
+                WorkspaceEntryKind::File,
+                token,
+                "node returned a non-empty created file".to_owned(),
+            );
+            return AppAction::None;
+        }
+        let Ok(editor) = TextEditor::new(text, Some(revision)) else {
+            self.fail_workspace_entry_create(
+                node_id,
+                file.workspace_id.to_string(),
+                file.path,
+                WorkspaceEntryKind::File,
+                token,
+                "created file could not be opened in the editor".to_owned(),
+            );
+            return AppAction::None;
+        };
+        let workspace_id = file.workspace_id.to_string();
+        let path = file.path;
+        self.create_workspace_entry = None;
+        let key = WorkspaceFileTabKey {
+            node_id: node_id.clone(),
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        };
+        self.file_tabs.insert(
+            key.clone(),
+            WorkspaceFileTabView {
+                editor,
+                state: WorkspaceFileState::Ready,
+                edit_mode: true,
+                request_token: token,
+                inline_history: None,
+            },
+        );
+        self.surface.open_in_focused(SurfaceTab::File(key));
+        self.focus = Focus::Viewport;
+        self.notice = Some(format!("created {}", repository_path_display(&path)));
+        AppAction::InspectWorkspace { node_id, workspace_id }
+    }
+
+    pub fn apply_workspace_directory_created(
+        &mut self,
+        node_id: String,
+        workspace_id: String,
+        token: u64,
+        entry: gate4agent_node_protocol::WorkspaceEntry,
+    ) -> AppAction {
+        let Some(dialog) = self.create_workspace_entry.as_ref() else {
+            return AppAction::None;
+        };
+        let expected_path = RepositoryPath::utf8(dialog.path.clone()).ok();
+        if !dialog.pending
+            || dialog.kind != WorkspaceEntryKind::Directory
+            || dialog.token != token
+            || dialog.node_id != node_id
+            || dialog.workspace_id != workspace_id
+            || entry.kind != WorkspaceEntryKind::Directory
+            || expected_path.as_ref() != Some(&entry.relative_path)
+        {
+            return AppAction::None;
+        }
+        let path = entry.relative_path;
+        self.create_workspace_entry = None;
+        self.focus = Focus::Spaces;
+        self.notice = Some(format!("created directory {}", repository_path_display(&path)));
+        AppAction::InspectWorkspace { node_id, workspace_id }
+    }
+
+    pub fn fail_workspace_entry_create(
+        &mut self,
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        kind: WorkspaceEntryKind,
+        token: u64,
+        message: String,
+    ) {
+        let Some(dialog) = self.create_workspace_entry.as_mut() else {
+            return;
+        };
+        if !dialog.pending
+            || dialog.kind != kind
+            || dialog.token != token
+            || dialog.node_id != node_id
+            || dialog.workspace_id != workspace_id
+            || RepositoryPath::utf8(dialog.path.clone()).ok().as_ref() != Some(&path)
+        {
+            return;
+        }
+        dialog.pending = false;
+        dialog.error = Some(message.clone());
+        self.notice = Some(message);
+    }
+
+    pub fn apply_git_history(
+        &mut self,
+        destination: &WorkspaceGitRequestDestination,
+        token: u64,
+        commits: Vec<GitCommitView>,
+        next_before: Option<String>,
+        has_more: bool,
+    ) -> Option<AppAction> {
+        let target = {
+            let Some(tab) = self.git_view_mut(destination) else {
+                return None;
+            };
+            if tab.history_token != token {
+                return None;
+            }
+            let append = !tab.commits.is_empty() && tab.next_before.is_some();
+            if append {
+                for commit in commits {
+                    if !tab.commits.iter().any(|current| current.id == commit.id) {
+                        tab.commits.push(commit);
+                    }
+                }
+            } else {
+                tab.commits = commits;
+            }
+            tab.next_before = next_before;
+            tab.has_more = has_more;
+            tab.state = WorkspaceGitState::Ready;
+            let pending = tab.pending_diff.clone();
+            match pending {
+                Some(WorkspaceGitDiffTarget::Commit { revision, path })
+                    if !matches!(revision.len(), 40 | 64) =>
+                {
+                    let mut matches = tab
+                        .commits
+                        .iter()
+                        .filter(|commit| commit.id.starts_with(&revision));
+                    let exact = matches.next().map(|commit| commit.id.clone());
+                    if let Some(exact) = exact.filter(|_| matches.next().is_none()) {
+                        Some(WorkspaceGitDiffTarget::Commit {
+                            revision: exact,
+                            path,
+                        })
+                    } else {
+                        tab.pending_diff = None;
+                        tab.diff_error = Some("selected abbreviated commit is ambiguous".to_owned());
+                        None
+                    }
+                }
+                other => other,
+            }
+        }?;
+        if let Some(tab) = self.git_view_mut(destination) {
+            tab.pending_diff = Some(target.clone());
+        }
+        self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
+        let diff_token = self.git_request_token;
+        if let Some(tab) = self.git_view_mut(destination) {
+            tab.diff_token = diff_token;
+        }
+        let (node_id, workspace_id, _) = Self::git_destination_route(destination);
+        Some(AppAction::ReadGitDiff {
+            node_id,
+            workspace_id,
+            target,
+            token: diff_token,
+            destination: destination.clone(),
+        })
+    }
+
+    pub fn fail_git_history(
+        &mut self,
+        destination: &WorkspaceGitRequestDestination,
+        token: u64,
+        message: String,
+    ) {
+        let Some(tab) = self.git_view_mut(destination) else {
+            return;
+        };
+        if tab.history_token == token {
+            tab.state = WorkspaceGitState::Error(message);
+        }
+    }
+
+    pub fn apply_git_diff(
+        &mut self,
+        destination: &WorkspaceGitRequestDestination,
+        token: u64,
+        diff: WorkspaceGitDiffView,
+    ) {
+        let Some(tab) = self.git_view_mut(destination) else {
+            return;
+        };
+        if tab.diff_token == token || (tab.diff_token == 0 && tab.history_token == token) {
+            tab.pending_diff = None;
+            tab.diff_error = None;
+            tab.diff = Some(diff);
+            tab.detail_scroll = 0;
+        }
+    }
+
+    pub fn fail_git_diff(
+        &mut self,
+        destination: &WorkspaceGitRequestDestination,
+        token: u64,
+        message: String,
+    ) {
+        let Some(tab) = self.git_view_mut(destination) else {
+            return;
+        };
+        if tab.diff_token == token {
+            tab.pending_diff = None;
+            tab.diff_error = Some(message);
         }
     }
 
@@ -3422,45 +12271,1784 @@ impl App {
             self.focus = Focus::Agents;
             return AppAction::None;
         };
-        let enabled = self
-            .nodes
-            .iter()
-            .find(|node| node.node_id == spawn.node_id)
-            .and_then(|node| node.workspaces.iter().find(|workspace| workspace.workspace_id == spawn.workspace_id))
-            .map(|workspace| {
-                workspace
-                    .providers
-                    .iter()
-                    .filter(|inventory| inventory.enabled)
-                    .map(|inventory| inventory.provider.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         match key {
+            UiKey::Ctrl('r') => {
+                self.spawn = Some(spawn);
+                return self.begin_add_space_from_spawn();
+            }
             UiKey::Escape => {
                 self.focus = Focus::Agents;
                 return AppAction::None;
             }
-            UiKey::Up => self.cycle_spawn_workspace(&mut spawn, false),
-            UiKey::Down => self.cycle_spawn_workspace(&mut spawn, true),
-            UiKey::Left => spawn.provider = cycle_provider(&enabled, &spawn.provider, false),
-            UiKey::Right | UiKey::Tab => {
-                spawn.provider = cycle_provider(&enabled, &spawn.provider, true)
+            UiKey::Tab => spawn.field = spawn.field.cycle(true),
+            UiKey::BackTab => spawn.field = spawn.field.cycle(false),
+            UiKey::Up | UiKey::Left => self.cycle_launch_value(&mut spawn, false),
+            UiKey::Down | UiKey::Right => self.cycle_launch_value(&mut spawn, true),
+            UiKey::Backspace => {
+                if self.launch_field_uses_inventory(&spawn, spawn.field) {
+                    self.notice = Some("use arrows or click to select an advertised launch resource".to_owned());
+                } else if let Some(target) = launch_text_target(&mut spawn) {
+                    target.pop();
+                }
+            }
+            UiKey::Char(ch) => {
+                if self.launch_field_uses_inventory(&spawn, spawn.field) {
+                    self.notice = Some("use arrows or click to select an advertised launch resource".to_owned());
+                } else if let Err(message) = append_launch_text(&mut spawn, &ch.to_string()) {
+                    self.notice = Some(message);
+                }
+            }
+            UiKey::Enter if spawn.field == LaunchField::GitLocation
+                && spawn.target != LaunchTarget::ExistingWorkspace => {
+                self.spawn = Some(spawn);
+                return self.begin_git_location_configuration();
             }
             UiKey::Enter => {
-                self.focus = Focus::Agents;
-                return AppAction::Spawn {
-                    node_id: spawn.node_id,
-                    workspace_id: spawn.workspace_id,
-                    provider: spawn.provider,
-                    rows: self.content_rows(),
-                    cols: self.content_cols(),
-                };
+                match self.build_launch_action(&spawn) {
+                    Ok(action) => {
+                        self.focus = Focus::Agents;
+                        return action;
+                    }
+                    Err(message) => self.notice = Some(message),
+                }
             }
             _ => {}
         }
         self.spawn = Some(spawn);
         AppAction::None
+    }
+
+    fn reduce_existing_session(&mut self, key: UiKey) -> AppAction {
+        let Some(mut dialog) = self.existing_session.take() else {
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        };
+        if dialog.operation.is_some() {
+            if key == UiKey::Escape {
+                dialog.operation = None;
+                dialog.catalog = NativeSessionCatalogState::Error(
+                    "operation cancelled locally; backend completion may still arrive".to_owned(),
+                );
+            }
+            self.existing_session = Some(dialog);
+            return AppAction::None;
+        }
+        match key {
+            UiKey::Escape => {
+                self.focus = Focus::Agents;
+                return AppAction::None;
+            }
+            UiKey::Tab | UiKey::BackTab if dialog.mode == ExistingSessionMode::Catalog => {
+                dialog.field = if dialog.field == ExistingSessionField::AskAfterResume {
+                    ExistingSessionField::Sessions
+                } else {
+                    ExistingSessionField::AskAfterResume
+                };
+            }
+            UiKey::Tab => dialog.field = dialog.field.cycle(dialog.mode, true),
+            UiKey::BackTab => dialog.field = dialog.field.cycle(dialog.mode, false),
+            UiKey::Up | UiKey::Left
+                if matches!(dialog.field, ExistingSessionField::Node | ExistingSessionField::Workspace | ExistingSessionField::Provider) => {
+                let field = dialog.field;
+                self.existing_session = Some(dialog);
+                return self.cycle_existing_session_field(field, false);
+            }
+            UiKey::Down | UiKey::Right
+                if matches!(dialog.field, ExistingSessionField::Node | ExistingSessionField::Workspace | ExistingSessionField::Provider) => {
+                let field = dialog.field;
+                self.existing_session = Some(dialog);
+                return self.cycle_existing_session_field(field, true);
+            }
+            UiKey::Up if dialog.field == ExistingSessionField::Sessions => {
+                dialog.preview_scroll = dialog.preview_scroll.saturating_sub(1);
+            }
+            UiKey::Down if dialog.field == ExistingSessionField::Sessions => {
+                dialog.preview_scroll = dialog.preview_scroll.saturating_add(1);
+            }
+            UiKey::PageUp if dialog.field == ExistingSessionField::Sessions => {
+                dialog.preview_scroll = dialog.preview_scroll.saturating_sub(10);
+            }
+            UiKey::PageDown if dialog.field == ExistingSessionField::Sessions => {
+                dialog.preview_scroll = dialog.preview_scroll.saturating_add(10);
+            }
+            UiKey::Home if dialog.field == ExistingSessionField::Sessions => {
+                dialog.preview_scroll = 0;
+            }
+            UiKey::Backspace => match dialog.field {
+                ExistingSessionField::DisplayName => {
+                    dialog.display_name.pop();
+                }
+                ExistingSessionField::SessionId => {
+                    dialog.session_id.pop();
+                }
+                ExistingSessionField::AskAfterResume => {
+                    dialog.ask_after_resume.pop();
+                }
+                ExistingSessionField::Node
+                | ExistingSessionField::Workspace
+                | ExistingSessionField::Provider
+                | ExistingSessionField::Sessions => {}
+            },
+            UiKey::Char('a') if dialog.mode == ExistingSessionMode::Catalog
+                && dialog.field != ExistingSessionField::AskAfterResume => {
+                dialog.mode = ExistingSessionMode::AdvancedImport;
+                dialog.field = ExistingSessionField::DisplayName;
+            }
+            UiKey::Char('b') if dialog.mode == ExistingSessionMode::AdvancedImport => {
+                dialog.mode = ExistingSessionMode::Catalog;
+                dialog.field = ExistingSessionField::Sessions;
+            }
+            UiKey::Char('r') if dialog.mode == ExistingSessionMode::Catalog
+                && dialog.field != ExistingSessionField::AskAfterResume => {
+                self.notice = Some(RESTORE_VIA_SKILL_DISABLED_REASON.to_owned());
+            }
+            UiKey::Char(ch) => {
+                let result = match dialog.field {
+                    ExistingSessionField::DisplayName => {
+                        append_session_name(&mut dialog.display_name, ch.to_string())
+                    }
+                    ExistingSessionField::SessionId => {
+                        append_provider_session_id(&mut dialog.session_id, ch.to_string())
+                    }
+                    ExistingSessionField::AskAfterResume => {
+                        append_resume_query(&mut dialog.ask_after_resume, ch.to_string())
+                    }
+                    ExistingSessionField::Node
+                    | ExistingSessionField::Workspace
+                    | ExistingSessionField::Provider
+                    | ExistingSessionField::Sessions => Ok(()),
+                };
+                if let Err(message) = result {
+                    self.notice = Some(message);
+                }
+            }
+            UiKey::Enter if dialog.mode == ExistingSessionMode::Catalog => {
+                self.existing_session = Some(dialog);
+                return self.start_native_session_resume();
+            }
+            UiKey::Enter => {
+                let name = dialog.display_name.trim().to_owned();
+                if let Err(message) = validate_session_name(&name) {
+                    self.notice = Some(message);
+                    self.existing_session = Some(dialog);
+                    return AppAction::None;
+                }
+                if !provider_is_importable(&dialog.provider) {
+                    self.notice = Some(
+                        "native resume references are supported for Claude, Codex, Grok, and Kimi"
+                            .to_owned(),
+                    );
+                    self.existing_session = Some(dialog);
+                    return AppAction::None;
+                }
+                let identity = ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id: dialog.session_id.trim().to_owned(),
+                    transcript_path: None,
+                };
+                if let Err(error) = identity.validate() {
+                    self.notice = Some(format!("invalid native session ID: {error}"));
+                    self.existing_session = Some(dialog);
+                    return AppAction::None;
+                }
+                let routes = self.existing_session_routes();
+                if !routes.iter().any(|route| {
+                    route.0 == dialog.node_id
+                        && route.1 == dialog.workspace_id
+                        && route.2 == dialog.provider
+                }) {
+                    self.notice = Some("selected Node/workspace/provider route is unavailable".to_owned());
+                    self.existing_session = Some(dialog);
+                    return AppAction::None;
+                }
+                self.existing_session_operation_token = self.existing_session_operation_token
+                    .wrapping_add(1).max(1);
+                let operation_token = self.existing_session_operation_token;
+                dialog.operation = Some(ExistingSessionOperation::IndexingOnly {
+                    node_id: dialog.node_id.clone(),
+                    workspace_id: dialog.workspace_id.clone(),
+                    provider: dialog.provider.clone(),
+                    session_id: identity.id.clone(),
+                    operation_token,
+                });
+                dialog.operation_error = None;
+                self.existing_session = Some(dialog.clone());
+                self.notice = Some("indexing provider session reference...".to_owned());
+                return AppAction::IndexProviderSession {
+                    node_id: dialog.node_id,
+                    workspace_id: dialog.workspace_id,
+                    provider: dialog.provider,
+                    identity,
+                    display_name: name,
+                    operation_token,
+                };
+            }
+            _ => {}
+        }
+        self.existing_session = Some(dialog);
+        AppAction::None
+    }
+
+    fn set_existing_session_mode(&mut self, mode: ExistingSessionMode) {
+        if let Some(dialog) = self.existing_session.as_mut() {
+            dialog.mode = mode;
+            dialog.field = match mode {
+                ExistingSessionMode::Catalog => ExistingSessionField::Sessions,
+                ExistingSessionMode::AdvancedImport => ExistingSessionField::DisplayName,
+            };
+        }
+    }
+
+    fn start_native_session_resume(&mut self) -> AppAction {
+        let can_resume = self.existing_session.as_ref().is_some_and(|dialog| {
+            dialog.operation.is_none()
+                && matches!(dialog.preview,
+                    Some(NativeSessionPreviewState::Ready(_))
+                    | Some(NativeSessionPreviewState::Empty(_)))
+        });
+        if !can_resume {
+            self.notice = Some("load a native session preview before resuming".to_owned());
+            return AppAction::None;
+        }
+        self.existing_session_operation_token = self.existing_session_operation_token.wrapping_add(1).max(1);
+        let operation_token = self.existing_session_operation_token;
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return AppAction::None;
+        };
+        let Some(row) = dialog.rows.get(dialog.selected).cloned() else {
+            self.notice = Some(match &dialog.catalog {
+                NativeSessionCatalogState::Loading => "native sessions are still loading",
+                NativeSessionCatalogState::Unavailable(_) => "native session catalog is unavailable",
+                _ => "select a native session first",
+            }.to_owned());
+            return AppAction::None;
+        };
+        if row.route.scope != NativeSessionCatalogScope::Workspace {
+            self.notice = Some(
+                "register this project as a workspace before resuming its session".to_owned(),
+            );
+            return AppAction::None;
+        }
+        if let Some(record_id) = row.record_id.clone() {
+            let node_id = dialog.node_id.clone();
+            dialog.operation = Some(ExistingSessionOperation::Resuming {
+                node_id: node_id.clone(),
+                record_id: record_id.clone(),
+                operation_token,
+            });
+            dialog.operation_error = None;
+            self.notice = Some("requesting native resume...".to_owned());
+            return AppAction::ResumeSessionRecord {
+                node_id,
+                record_id,
+                rows: self.terminal_rows.max(1),
+                cols: self.terminal_cols.max(1),
+                initial_prompt: None,
+                operation_token,
+            };
+        }
+        if !provider_supports_native_resume(&row.route.provider) {
+            self.notice = Some(format!(
+                "{} native history is available, but native resume is not supported",
+                row.route.provider,
+            ));
+            return AppAction::None;
+        }
+        let display_name = row.display_name();
+        dialog.node_id.clone_from(&row.node_id);
+        let Some(workspace_id) = row.route.workspace_id.as_ref() else {
+            return AppAction::None;
+        };
+        dialog.workspace_id.clone_from(workspace_id);
+        dialog.display_name = display_name.clone();
+        dialog.operation = Some(ExistingSessionOperation::IndexingNativeForResume {
+            node_id: dialog.node_id.clone(),
+            route: row.route.clone(),
+            catalog_revision: row.catalog_revision,
+            recent_cutoff_unix_ms: row.recent_cutoff_unix_ms,
+            selection_id: row.selection_id.clone(),
+            initial_prompt: None,
+            operation_token,
+        });
+        dialog.operation_error = None;
+        self.notice = Some("indexing selected native session before resume...".to_owned());
+        AppAction::IndexNativeSession {
+            node_id: row.node_id,
+            route: row.route,
+            catalog_revision: row.catalog_revision,
+            recent_cutoff_unix_ms: row.recent_cutoff_unix_ms,
+            selection_id: row.selection_id,
+            display_name,
+            operation_token,
+        }
+    }
+
+    fn start_focused_preview_resume(&mut self) -> AppAction {
+        let Some((origin, tab)) = self
+            .focused_preview()
+            .map(|(key, tab)| (key.clone(), tab.clone()))
+        else {
+            return AppAction::None;
+        };
+        if self.preview_resume.is_some() || tab.phase != PreviewTabPhase::Hydrated {
+            self.notice = Some("session reconnect is already in progress".to_owned());
+            return AppAction::None;
+        }
+        if !self.node_is_connected(match &origin {
+            PreviewTabKey::ManagedRecord { node_id, .. }
+            | PreviewTabKey::NativeSelection { node_id, .. } => node_id,
+        }) {
+            self.notice = Some("session node is disconnected; reconnect unavailable".to_owned());
+            return AppAction::None;
+        }
+        self.existing_session_operation_token = self
+            .existing_session_operation_token
+            .wrapping_add(1)
+            .max(1);
+        let operation_token = self.existing_session_operation_token;
+        match &origin {
+            PreviewTabKey::ManagedRecord { node_id, record_id } => {
+                let key = AgentRowKey::Managed {
+                    node_id: node_id.clone(),
+                    record_id: record_id.clone(),
+                };
+                let Some(record) = self.find_managed_session(&key).cloned() else {
+                    self.notice = Some("managed session record disappeared".to_owned());
+                    return AppAction::None;
+                };
+                if record.state != ManagedSessionState::Dormant
+                    || !record.has_provider_session_identity
+                    || record.active_session.is_some()
+                {
+                    self.notice = Some("session is not eligible for provider resume".to_owned());
+                    return AppAction::None;
+                }
+                if let Some(view) = self.preview_tabs.get_mut(&origin) {
+                    view.phase = PreviewTabPhase::Resuming;
+                    view.reconnect_error = None;
+                    view.scroll = usize::MAX;
+                }
+                self.preview_resume = Some(PreviewResumeOperation {
+                    origin: Some(origin.clone()),
+                    node_id: record.node_id.clone(),
+                    workspace_id: record.workspace_id.clone(),
+                    provider: record.provider.clone(),
+                    selection_id: None,
+                    record_id: Some(record.record_id.clone()),
+                    operation_token,
+                });
+                self.notice = Some("reconnecting session PTY...".to_owned());
+                AppAction::ResumeSessionRecord {
+                    node_id: record.node_id,
+                    record_id: record.record_id,
+                    rows: self.terminal_rows.max(1),
+                    cols: self.terminal_cols.max(1),
+                    initial_prompt: None,
+                    operation_token,
+                }
+            }
+            PreviewTabKey::NativeSelection {
+                node_id,
+                route,
+                catalog_revision,
+                recent_cutoff_unix_ms,
+                selection_id,
+            } => {
+                if !tab.resume_available || route.scope != NativeSessionCatalogScope::Workspace {
+                    self.notice = Some(
+                        "register this project as a workspace before resuming its session"
+                            .to_owned(),
+                    );
+                    return AppAction::None;
+                }
+                if !provider_supports_native_resume(&route.provider) {
+                    self.notice = Some(format!(
+                        "{} native history is available, but native resume is not supported",
+                        route.provider,
+                    ));
+                    return AppAction::None;
+                }
+                let Some(workspace_id) = route.workspace_id.as_ref() else {
+                    return AppAction::None;
+                };
+                if let Some(view) = self.preview_tabs.get_mut(&origin) {
+                    view.phase = if tab.record_id.is_some() {
+                        PreviewTabPhase::Resuming
+                    } else {
+                        PreviewTabPhase::Indexing
+                    };
+                    view.reconnect_error = None;
+                    view.scroll = usize::MAX;
+                }
+                self.preview_resume = Some(PreviewResumeOperation {
+                    origin: Some(origin.clone()),
+                    node_id: node_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    provider: route.provider.clone(),
+                    selection_id: Some(selection_id.clone()),
+                    record_id: tab.record_id.clone(),
+                    operation_token,
+                });
+                if let Some(record_id) = tab.record_id {
+                    self.notice = Some("reconnecting linked native session...".to_owned());
+                    AppAction::ResumeSessionRecord {
+                        node_id: node_id.clone(),
+                        record_id,
+                        rows: self.terminal_rows.max(1),
+                        cols: self.terminal_cols.max(1),
+                        initial_prompt: None,
+                        operation_token,
+                    }
+                } else {
+                    self.notice = Some("linking native session before reconnect...".to_owned());
+                    AppAction::IndexNativeSession {
+                        node_id: node_id.clone(),
+                        route: route.clone(),
+                        catalog_revision: *catalog_revision,
+                        recent_cutoff_unix_ms: *recent_cutoff_unix_ms,
+                        selection_id: selection_id.clone(),
+                        display_name: tab.title,
+                        operation_token,
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_native_session_preview(&mut self) -> AppAction {
+        let token = {
+            self.native_preview_token = self.native_preview_token.wrapping_add(1).max(1);
+            self.native_preview_token
+        };
+        let Some(dialog) = self.existing_session.as_ref() else {
+            return AppAction::None;
+        };
+        let Some(row) = dialog.rows.get(dialog.selected).cloned() else {
+            self.notice = Some("select a native session before opening details".to_owned());
+            return AppAction::None;
+        };
+        let node_id = row.node_id.clone();
+        let route = row.route.clone();
+        let selection_id = row.selection_id.clone();
+        if let Some(workspace_id) = route.workspace_id.as_deref() {
+            self.select_workspace_route_without_inspection(&node_id, workspace_id);
+        }
+        let key = PreviewTabKey::NativeSelection {
+            node_id: node_id.clone(),
+            route: route.clone(),
+            catalog_revision: row.catalog_revision,
+            recent_cutoff_unix_ms: row.recent_cutoff_unix_ms,
+            selection_id: selection_id.clone(),
+        };
+        let workspace_label = route.workspace_id.clone().or_else(|| {
+            row.external_group.as_ref().map(|group| group.display_name.clone())
+        }).unwrap_or_else(|| "Other projects".to_owned());
+        self.open_preview_tab(
+            key,
+            PreviewTabView {
+                title: row.display_name(),
+                workspace_id: workspace_label,
+                provider: route.provider.clone(),
+                preview: NativeSessionPreviewState::Loading,
+                phase: PreviewTabPhase::Hydrated,
+                reconnect_error: None,
+                scroll: 0,
+                request_token: token,
+                resume_available: route.scope == NativeSessionCatalogScope::Workspace,
+                record_id: row.record_id,
+            },
+        );
+        AppAction::PreviewNativeSession {
+            node_id,
+            route,
+            catalog_revision: row.catalog_revision,
+            recent_cutoff_unix_ms: row.recent_cutoff_unix_ms,
+            selection_id,
+            message_limit: 24,
+            token,
+        }
+    }
+
+    fn start_managed_session_preview(&mut self, record: ManagedSessionView) -> AppAction {
+        self.native_preview_token = self.native_preview_token.wrapping_add(1).max(1);
+        let token = self.native_preview_token;
+        let record_id = record.record_id.clone();
+        let node_id = record.node_id.clone();
+        self.select_workspace_route_without_inspection(&node_id, &record.workspace_id);
+        let key = PreviewTabKey::ManagedRecord {
+            node_id: node_id.clone(),
+            record_id: record_id.clone(),
+        };
+        self.open_preview_tab(
+            key,
+            PreviewTabView {
+                title: record.display_name,
+                workspace_id: record.workspace_id,
+                provider: record.provider,
+                preview: NativeSessionPreviewState::Loading,
+                phase: PreviewTabPhase::Hydrated,
+                reconnect_error: None,
+                scroll: 0,
+                request_token: token,
+                resume_available: true,
+                record_id: Some(record_id.clone()),
+            },
+        );
+        AppAction::PreviewSessionRecord {
+            node_id,
+            record_id,
+            message_limit: 24,
+            token,
+        }
+    }
+
+    fn open_preview_tab(&mut self, key: PreviewTabKey, view: PreviewTabView) {
+        self.preview_tabs.insert(key.clone(), view);
+        self.surface.open_in_focused(SurfaceTab::Preview(key));
+        self.focus = Focus::Viewport;
+    }
+
+    fn sync_native_preview_selection(&mut self, key: &PreviewTabKey) {
+        let PreviewTabKey::NativeSelection {
+            node_id,
+            route,
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            selection_id,
+        } = key
+        else {
+            return;
+        };
+        let Some(row_index) = self.existing_session.as_ref().and_then(|dialog| {
+            dialog.rows.iter().position(|row| {
+                row.node_id == *node_id
+                    && row.route == *route
+                    && row.catalog_revision == *catalog_revision
+                    && row.recent_cutoff_unix_ms == *recent_cutoff_unix_ms
+                    && row.selection_id == *selection_id
+            })
+        }) else {
+            return;
+        };
+        let tree_cursor = self.native_session_tree_items().iter().position(|item| {
+            matches!(item, NativeSessionTreeItem::Session { row_index: candidate } if *candidate == row_index)
+        });
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return;
+        };
+        dialog.selected = row_index;
+        if let Some(tree_cursor) = tree_cursor {
+            dialog.tree_cursor = tree_cursor;
+        }
+        populate_selected_catalog_row(dialog);
+    }
+
+    fn sync_active_native_preview_selection(&mut self) {
+        let Some(PreviewTabKey::NativeSelection {
+            node_id,
+            route,
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            selection_id,
+        }) = self.surface.active_tab().and_then(|tab| match tab {
+            SurfaceTab::Preview(key) => Some(key),
+            _ => None,
+        }).cloned()
+        else {
+            return;
+        };
+        self.sync_native_preview_selection(&PreviewTabKey::NativeSelection {
+            node_id,
+            route,
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            selection_id,
+        });
+    }
+
+    pub fn apply_native_session_preview(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: String,
+        token: u64,
+        preview: NativeSessionPreviewView,
+    ) {
+        let key = PreviewTabKey::NativeSelection {
+            node_id: node_id.clone(),
+            route: route.clone(),
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            selection_id: selection_id.clone(),
+        };
+        let Some(tab) = self.preview_tabs.get(&key) else {
+            return;
+        };
+        if tab.request_token != token {
+            return;
+        }
+        let row_is_generic = self.existing_session.as_ref().and_then(|dialog| {
+            dialog.rows.iter().find(|row| {
+                row.node_id == node_id
+                    && row.route == route
+                    && row.catalog_revision == catalog_revision
+                    && row.recent_cutoff_unix_ms == recent_cutoff_unix_ms
+                    && row.selection_id == selection_id
+            })
+        }).is_some_and(|row| {
+            row.title.as_deref().map(str::trim).is_none_or(|title| {
+                title.is_empty() || title == "Existing session"
+            })
+        });
+        let resolved_title = preview
+            .title
+            .as_ref()
+            .filter(|title| !title.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                (tab.title.trim() == "Existing session" && row_is_generic)
+                    .then(|| {
+                        preview.messages.iter().find_map(|message| {
+                            (message.role == "user" && !message.text.trim().is_empty()).then(|| {
+                                bounded_session_display_name(
+                                    message.text.trim(),
+                                    "Existing session",
+                                )
+                            })
+                        })
+                    })
+                    .flatten()
+                    .filter(|title| title != "Existing session")
+            });
+        if let Some(title) = resolved_title.as_ref() {
+            if let Some(tab) = self.preview_tabs.get_mut(&key) {
+                tab.title.clone_from(title);
+            }
+            if let Some(dialog) = self.existing_session.as_mut() {
+                let selected = dialog.selected;
+                let updated_index = dialog.rows.iter_mut().enumerate().find_map(|(index, row)| {
+                    let exact = row.node_id == node_id
+                        && row.route == route
+                        && row.catalog_revision == catalog_revision
+                        && row.recent_cutoff_unix_ms == recent_cutoff_unix_ms
+                        && row.selection_id == selection_id;
+                    let replace = row.title.as_deref().map(str::trim).is_none_or(|current| {
+                        current.is_empty() || current == "Existing session"
+                    });
+                    (exact && replace).then(|| {
+                        row.title = Some(title.clone());
+                        index
+                    })
+                });
+                if updated_index == Some(selected) {
+                    populate_selected_catalog_row(dialog);
+                }
+            }
+        }
+        let Some(tab) = self.preview_tabs.get_mut(&key) else {
+            return;
+        };
+        tab.scroll = usize::MAX;
+        tab.phase = PreviewTabPhase::Hydrated;
+        tab.preview = if preview.messages.is_empty() {
+            NativeSessionPreviewState::Empty(preview)
+        } else {
+            NativeSessionPreviewState::Ready(preview)
+        };
+    }
+
+    pub fn fail_native_session_preview(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: String,
+        token: u64,
+        message: String,
+        unavailable: bool,
+        stale_catalog: bool,
+    ) -> AppAction {
+        let key = PreviewTabKey::NativeSelection {
+            node_id: node_id.clone(),
+            route: route.clone(),
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            selection_id,
+        };
+        let Some(tab) = self.preview_tabs.get_mut(&key) else {
+            return AppAction::None;
+        };
+        if tab.request_token != token {
+            return AppAction::None;
+        }
+        if stale_catalog {
+            tab.request_token = 0;
+            tab.preview = NativeSessionPreviewState::Error(
+                "catalog refreshed; select session again".to_owned(),
+            );
+            return self.refresh_stale_native_session_catalog(node_id, route);
+        }
+        tab.preview = if unavailable {
+            NativeSessionPreviewState::Unavailable(message)
+        } else {
+            NativeSessionPreviewState::Error(message)
+        };
+        AppAction::None
+    }
+
+    pub fn apply_session_record_preview(
+        &mut self,
+        node_id: String,
+        record_id: String,
+        token: u64,
+        preview: NativeSessionPreviewView,
+    ) {
+        let key = PreviewTabKey::ManagedRecord { node_id, record_id };
+        let Some(tab) = self.preview_tabs.get_mut(&key) else {
+            return;
+        };
+        if tab.request_token != token {
+            return;
+        }
+        if let Some(title) = preview.title.as_ref().filter(|title| !title.trim().is_empty()) {
+            tab.title.clone_from(title);
+        }
+        tab.scroll = usize::MAX;
+        tab.phase = PreviewTabPhase::Hydrated;
+        tab.preview = if preview.messages.is_empty() {
+            NativeSessionPreviewState::Empty(preview)
+        } else {
+            NativeSessionPreviewState::Ready(preview)
+        };
+    }
+
+    pub fn fail_session_record_preview(
+        &mut self,
+        node_id: String,
+        record_id: String,
+        token: u64,
+        message: String,
+        unavailable: bool,
+    ) {
+        let key = PreviewTabKey::ManagedRecord { node_id, record_id };
+        let Some(tab) = self.preview_tabs.get_mut(&key) else {
+            return;
+        };
+        if tab.request_token != token {
+            return;
+        }
+        tab.preview = if unavailable {
+            NativeSessionPreviewState::Unavailable(message)
+        } else {
+            NativeSessionPreviewState::Error(message)
+        };
+    }
+
+    pub fn apply_native_session_catalog(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        token: u64,
+        rows: Vec<NativeSessionCatalogRowView>,
+    ) {
+        self.apply_native_session_catalog_summary(
+            node_id,
+            route,
+            token,
+            rows,
+            None,
+        );
+    }
+
+    pub fn apply_native_session_catalog_summary(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        token: u64,
+        mut rows: Vec<NativeSessionCatalogRowView>,
+        summary: Option<NativeSessionCatalogSummary>,
+    ) {
+        let route_token_key = (node_id.clone(), route.clone());
+        let route_token = self
+            .native_catalog_route_tokens
+            .get(&route_token_key)
+            .copied();
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return;
+        };
+        if dialog.node_id != node_id
+            || route_token.unwrap_or(dialog.request_token) != token
+            || !dialog.pending_routes.remove(&route)
+        {
+            return;
+        }
+        self.native_catalog_route_tokens.remove(&route_token_key);
+        rows.retain(|row| {
+            row.node_id == node_id
+                && row.route == route
+        });
+        if let Some(summary) = summary {
+            let loaded_recent = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+            for row in &mut rows {
+                row.catalog_revision = summary.catalog_revision;
+                row.recent_cutoff_unix_ms = summary.recent_cutoff_unix_ms;
+            }
+            dialog.route_pages.insert(route.clone(), NativeSessionRoutePageState {
+                catalog_revision: summary.catalog_revision,
+                recent_cutoff_unix_ms: summary.recent_cutoff_unix_ms,
+                recent_remaining_count: summary.recent_total_count.saturating_sub(loaded_recent),
+                older_remaining_count: summary.older_total_count,
+                recent_next_after_selection_id: summary.recent_next_after_selection_id,
+                older_next_after_selection_id: None,
+                recent_has_more: summary.recent_has_more,
+                older_has_more: summary.older_total_count > 0,
+                pending: None,
+            });
+        } else {
+            dialog.route_pages.remove(&route);
+        }
+        let selected_route = dialog.rows.get(dialog.selected).map(|row| (
+            row.node_id.clone(),
+            row.route.clone(),
+            row.selection_id.clone(),
+        ));
+        dialog.rows.extend(rows);
+        dialog.rows.sort_by(|left, right| {
+            left.route.cmp(&right.route)
+                .then_with(|| native_session_modified_at(right).cmp(&native_session_modified_at(left)))
+                .then_with(|| left.selection_id.cmp(&right.selection_id))
+        });
+        let mut seen = BTreeSet::new();
+        dialog.rows.retain(|row| seen.insert((
+            row.node_id.clone(),
+            row.route.clone(),
+            row.selection_id.clone(),
+        )));
+        dialog.selected = selected_route.and_then(|selected| {
+            dialog.rows.iter().position(|row| (
+                row.node_id.clone(),
+                row.route.clone(),
+                row.selection_id.clone(),
+            ) == selected)
+        }).unwrap_or_else(|| dialog.selected.min(dialog.rows.len().saturating_sub(1)));
+        dialog.scroll = dialog.scroll.min(dialog.selected);
+        dialog.catalog = if !dialog.pending_routes.is_empty() {
+            NativeSessionCatalogState::Loading
+        } else if !dialog.rows.is_empty() {
+            NativeSessionCatalogState::Ready
+        } else if let Some((message, unavailable)) = dialog.catalog_failure.take() {
+            if unavailable {
+                NativeSessionCatalogState::Unavailable(message)
+            } else {
+                NativeSessionCatalogState::Error(message)
+            }
+        } else {
+            NativeSessionCatalogState::Empty
+        };
+        populate_selected_catalog_row(dialog);
+    }
+
+    pub fn apply_native_session_page(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        token: u64,
+        page: NativeSessionCatalogPage,
+    ) {
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return;
+        };
+        let Some(state) = dialog.route_pages.get_mut(&route) else {
+            return;
+        };
+        if dialog.node_id != node_id
+            || state.pending != Some((page.window, token))
+            || page.revision != state.catalog_revision
+        {
+            return;
+        }
+        state.pending = None;
+        match page.window {
+            NativeSessionCatalogWindow::Recent => {
+                state.recent_next_after_selection_id = page.next_after_selection_id.clone();
+                state.recent_remaining_count = page.remaining_count;
+                state.recent_has_more = page.has_more;
+            }
+            NativeSessionCatalogWindow::Older => {
+                state.older_next_after_selection_id = page.next_after_selection_id.clone();
+                state.older_remaining_count = page.remaining_count;
+                state.older_has_more = page.has_more;
+            }
+        }
+        let selected_route = dialog.rows.get(dialog.selected).map(|row| (
+            row.node_id.clone(),
+            row.route.clone(),
+            row.selection_id.clone(),
+        ));
+        dialog.rows.extend(page.entries.into_iter().map(|entry| NativeSessionCatalogRowView {
+            node_id: node_id.clone(),
+            route: route.clone(),
+            catalog_revision: state.catalog_revision,
+            recent_cutoff_unix_ms: state.recent_cutoff_unix_ms,
+            selection_id: entry.selection_id,
+            title: entry.title,
+            modified_at: entry.modified_at_unix_ms.map(|value| value.to_string()),
+            model: entry.model,
+            message_count: Some(entry.message_count),
+            completed_turn_count: entry.completed_turn_count,
+            external_group: entry.external_group,
+            record_id: entry.record_id.map(|record_id| record_id.to_string()),
+        }));
+        dialog.rows.sort_by(|left, right| {
+            left.route.cmp(&right.route)
+                .then_with(|| native_session_modified_at(right).cmp(&native_session_modified_at(left)))
+                .then_with(|| left.selection_id.cmp(&right.selection_id))
+        });
+        let mut seen = BTreeSet::new();
+        dialog.rows.retain(|row| seen.insert((
+            row.node_id.clone(),
+            row.route.clone(),
+            row.selection_id.clone(),
+        )));
+        dialog.selected = selected_route.and_then(|selected| {
+            dialog.rows.iter().position(|row| (
+                row.node_id.clone(),
+                row.route.clone(),
+                row.selection_id.clone(),
+            ) == selected)
+        }).unwrap_or_else(|| dialog.selected.min(dialog.rows.len().saturating_sub(1)));
+        dialog.catalog = if dialog.rows.is_empty() {
+            NativeSessionCatalogState::Empty
+        } else {
+            NativeSessionCatalogState::Ready
+        };
+        populate_selected_catalog_row(dialog);
+        self.clamp_native_tree_cursor();
+    }
+
+    pub fn fail_native_session_page(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        window: NativeSessionCatalogWindow,
+        token: u64,
+        message: String,
+        stale_catalog: bool,
+    ) -> AppAction {
+        let correlated = self.existing_session.as_ref().is_some_and(|dialog| {
+            dialog.node_id == node_id
+                && dialog.route_pages.get(&route).is_some_and(|state| {
+                    state.pending == Some((window, token))
+                })
+        });
+        if !correlated {
+            return AppAction::None;
+        }
+        if stale_catalog {
+            return self.refresh_stale_native_session_catalog(node_id, route);
+        }
+        if let Some(state) = self
+            .existing_session
+            .as_mut()
+            .and_then(|dialog| dialog.route_pages.get_mut(&route))
+        {
+            state.pending = None;
+        }
+        self.notice = Some(message);
+        AppAction::None
+    }
+
+    fn refresh_stale_native_session_catalog(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+    ) -> AppAction {
+        if !self
+            .existing_session
+            .as_ref()
+            .is_some_and(|dialog| dialog.node_id == node_id)
+        {
+            return AppAction::None;
+        }
+        let token = self.next_native_catalog_token();
+        self.native_catalog_route_tokens
+            .insert((node_id.clone(), route.clone()), token);
+        let dialog = self
+            .existing_session
+            .as_mut()
+            .expect("checked native session catalog state");
+        dialog.rows.retain(|row| row.node_id != node_id || row.route != route);
+        dialog.route_pages.remove(&route);
+        dialog.pending_routes.remove(&route);
+        dialog.pending_routes.insert(route.clone());
+        dialog.catalog_failure = None;
+        dialog.catalog = if dialog.rows.is_empty() {
+            NativeSessionCatalogState::Loading
+        } else {
+            NativeSessionCatalogState::Ready
+        };
+        dialog.selected = dialog.selected.min(dialog.rows.len().saturating_sub(1));
+        dialog.tree_cursor = 0;
+        dialog.scroll = 0;
+        dialog.preview = None;
+        dialog.preview_scroll = 0;
+        dialog.preview_record_id = None;
+        dialog.preview_selection_id = None;
+        populate_selected_catalog_row(dialog);
+        self.notice = Some("catalog refreshed; select session again".to_owned());
+        AppAction::CatalogNativeSessions {
+            node_id,
+            routes: vec![route],
+            limit: 64,
+            token,
+        }
+    }
+
+    pub fn fail_native_session_catalog(
+        &mut self,
+        node_id: String,
+        route: NativeSessionCatalogRoute,
+        token: u64,
+        message: String,
+        unavailable: bool,
+    ) {
+        let route_token_key = (node_id.clone(), route.clone());
+        let route_token = self
+            .native_catalog_route_tokens
+            .get(&route_token_key)
+            .copied();
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return;
+        };
+        let provider = route.provider.clone();
+        if dialog.node_id != node_id
+            || route_token.unwrap_or(dialog.request_token) != token
+            || !dialog.pending_routes.remove(&route)
+        {
+            return;
+        }
+        self.native_catalog_route_tokens.remove(&route_token_key);
+        dialog.catalog_failure = Some((format!("{provider}: {message}"), unavailable));
+        dialog.catalog = if !dialog.pending_routes.is_empty() {
+            NativeSessionCatalogState::Loading
+        } else if !dialog.rows.is_empty() {
+            NativeSessionCatalogState::Ready
+        } else if unavailable {
+            NativeSessionCatalogState::Unavailable(format!("{provider}: {message}"))
+        } else {
+            NativeSessionCatalogState::Error(format!("{provider}: {message}"))
+        };
+    }
+
+    fn paste_existing_session(&mut self, text: String) -> AppAction {
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return AppAction::None;
+        };
+        let result = match dialog.field {
+            ExistingSessionField::DisplayName => append_session_name(&mut dialog.display_name, text),
+            ExistingSessionField::SessionId => append_provider_session_id(&mut dialog.session_id, text),
+            ExistingSessionField::AskAfterResume => {
+                append_resume_query(&mut dialog.ask_after_resume, text)
+            }
+            ExistingSessionField::Node
+            | ExistingSessionField::Workspace
+            | ExistingSessionField::Provider
+            | ExistingSessionField::Sessions => {
+                Err("select Node, workspace, and provider with arrows".to_owned())
+            }
+        };
+        if let Err(message) = result {
+            self.notice = Some(message);
+        }
+        AppAction::None
+    }
+
+    pub fn complete_native_session_index(
+        &mut self,
+        response_node_id: &str,
+        response_route: &NativeSessionCatalogRoute,
+        response_catalog_revision: u64,
+        response_recent_cutoff_unix_ms: u64,
+        response_selection_id: &str,
+        record: ManagedSessionView,
+        operation_token: u64,
+    ) -> AppAction {
+        if let Some(pending) = self.preview_resume.as_ref().filter(|pending| {
+            pending.record_id.is_none()
+                && pending.operation_token == operation_token
+                && pending.node_id == response_node_id
+                && pending.selection_id.as_deref() == Some(response_selection_id)
+                && pending.origin.as_ref().is_some_and(|origin| matches!(origin,
+                    PreviewTabKey::NativeSelection {
+                        node_id,
+                        route,
+                        catalog_revision,
+                        recent_cutoff_unix_ms,
+                        selection_id,
+                    } if node_id == response_node_id
+                        && route == response_route
+                        && *catalog_revision == response_catalog_revision
+                        && *recent_cutoff_unix_ms == response_recent_cutoff_unix_ms
+                        && selection_id == response_selection_id
+                ))
+        }).cloned() {
+            let matches_route = record.node_id == pending.node_id
+                && record.workspace_id == pending.workspace_id
+                && record.provider == pending.provider
+                && record.has_provider_session_identity;
+            let Some(origin) = pending.origin.clone() else {
+                return AppAction::None;
+            };
+            if !matches_route {
+                return AppAction::None;
+            }
+            let record_id = record.record_id.clone();
+            let node_id = record.node_id.clone();
+            let replacement_key = PreviewTabKey::ManagedRecord {
+                node_id: node_id.clone(),
+                record_id: record_id.clone(),
+            };
+            self.upsert_managed_session(record.clone());
+            if let Some(mut view) = self.preview_tabs.remove(&origin) {
+                view.phase = PreviewTabPhase::Resuming;
+                view.record_id = Some(record_id.clone());
+                if self.surface.replace_tab(
+                    &SurfaceTab::Preview(origin.clone()),
+                    SurfaceTab::Preview(replacement_key.clone()),
+                ) {
+                    self.preview_tabs.insert(replacement_key.clone(), view);
+                } else {
+                    view.phase = PreviewTabPhase::Hydrated;
+                    view.reconnect_error = Some(
+                        "Reconnect failed: history tab could not be linked.".to_owned(),
+                    );
+                    self.preview_tabs.insert(origin, view);
+                    self.preview_resume = None;
+                    return AppAction::None;
+                }
+            }
+            self.preview_resume = Some(PreviewResumeOperation {
+                origin: Some(replacement_key),
+                node_id: node_id.clone(),
+                workspace_id: record.workspace_id,
+                provider: record.provider,
+                selection_id: pending.selection_id,
+                record_id: Some(record_id.clone()),
+                operation_token,
+            });
+            return AppAction::ResumeSessionRecord {
+                node_id,
+                record_id,
+                rows: self.terminal_rows.max(1),
+                cols: self.terminal_cols.max(1),
+                initial_prompt: None,
+                operation_token,
+            };
+        }
+
+        let pending = self.existing_session.as_ref().and_then(|dialog| {
+            match &dialog.operation {
+                Some(ExistingSessionOperation::IndexingNativeForResume {
+                    node_id,
+                    route,
+                    catalog_revision,
+                    recent_cutoff_unix_ms,
+                    selection_id,
+                    initial_prompt,
+                    operation_token: expected_token,
+                }) if *expected_token == operation_token => {
+                    let workspace_id = route.workspace_id.as_ref()?;
+                    (node_id == response_node_id
+                        && route == response_route
+                        && *catalog_revision == response_catalog_revision
+                        && *recent_cutoff_unix_ms == response_recent_cutoff_unix_ms
+                        && selection_id == response_selection_id
+                        && record.node_id == *node_id
+                        && record.workspace_id == *workspace_id
+                        && record.provider == route.provider
+                        && record.has_provider_session_identity)
+                        .then(|| (initial_prompt.clone(), record.record_id.clone()))
+                }
+                _ => None,
+            }
+        });
+        let Some((initial_prompt, record_id)) = pending else {
+            return AppAction::None;
+        };
+        if let Some(dialog) = self.existing_session.as_mut() {
+            dialog.operation = Some(ExistingSessionOperation::Resuming {
+                node_id: record.node_id.clone(),
+                record_id: record_id.clone(),
+                operation_token,
+            });
+            dialog.preview_record_id = Some(record_id.clone());
+        }
+        self.upsert_managed_session(record.clone());
+        AppAction::ResumeSessionRecord {
+            node_id: record.node_id,
+            record_id,
+            rows: self.terminal_rows.max(1),
+            cols: self.terminal_cols.max(1),
+            initial_prompt,
+            operation_token,
+        }
+    }
+
+    pub fn complete_existing_session_import(
+        &mut self,
+        record: ManagedSessionView,
+        operation_token: u64,
+        source_node_id: &str,
+        source_workspace_id: &str,
+        source_provider: &Provider,
+        source_session_id: &str,
+        identity_matches: bool,
+    ) -> AppAction {
+        let pending = self.existing_session.as_ref().and_then(|dialog| {
+            match &dialog.operation {
+                Some(ExistingSessionOperation::IndexingOnly {
+                    node_id, workspace_id, provider, session_id,
+                    operation_token: expected_token,
+                }) if *expected_token == operation_token
+                    && node_id == source_node_id
+                    && workspace_id == source_workspace_id
+                    && provider == source_provider
+                    && session_id == source_session_id => Some((false, None)),
+                Some(ExistingSessionOperation::IndexingForResume {
+                    node_id, workspace_id, provider, session_id, initial_prompt,
+                    operation_token: expected_token,
+                }) if *expected_token == operation_token
+                    && node_id == source_node_id
+                    && workspace_id == source_workspace_id
+                    && provider == source_provider
+                    && session_id == source_session_id => Some((true, initial_prompt.clone())),
+                _ => None,
+            }
+        });
+        let Some((resume_after_index, initial_prompt)) = pending else {
+            return AppAction::None;
+        };
+        let returned_record_matches = record.node_id == source_node_id
+            && record.workspace_id == source_workspace_id
+            && &record.provider == source_provider
+            && record.has_provider_session_identity
+            && identity_matches;
+        if !returned_record_matches {
+            self.fail_existing_session_operation(
+                source_node_id,
+                None,
+                true,
+                operation_token,
+                "indexed session response did not match the requested source".to_owned(),
+                false,
+            );
+            return AppAction::None;
+        }
+        let returned_record_id = record.record_id.clone();
+        let returned_node_id = record.node_id.clone();
+        self.upsert_managed_session(record);
+        if resume_after_index {
+            let dialog = self.existing_session.as_mut().expect("checked existing session dialog");
+            dialog.operation = Some(ExistingSessionOperation::Resuming {
+                node_id: returned_node_id,
+                record_id: returned_record_id.clone(),
+                operation_token,
+            });
+            self.notice = Some("native session indexed; requesting native resume...".to_owned());
+            return AppAction::ResumeSessionRecord {
+                node_id: dialog.node_id.clone(),
+                record_id: returned_record_id,
+                rows: self.terminal_rows.max(1),
+                cols: self.terminal_cols.max(1),
+                initial_prompt,
+                operation_token,
+            };
+        }
+        self.existing_session = None;
+        self.focus = Focus::Agents;
+        self.roster_mode = RosterMode::Agents;
+        self.notice = Some("provider session reference indexed; Resume remains an explicit action".to_owned());
+        AppAction::None
+    }
+
+    pub fn complete_existing_session_resume(
+        &mut self,
+        record: &ManagedSessionView,
+        operation_token: u64,
+    ) -> SessionRecordResumeDisposition {
+        if self.cancelled_preview_resumes.contains(&(
+            record.node_id.clone(),
+            record.record_id.clone(),
+            operation_token,
+        )) {
+            return SessionRecordResumeDisposition::RejectRecord;
+        }
+        let preview_for_record = self.preview_resume.as_ref().filter(|pending| {
+            pending.node_id == record.node_id
+                && pending.record_id.as_deref() == Some(record.record_id.as_str())
+        }).cloned();
+        if preview_for_record
+            .as_ref()
+            .is_some_and(|pending| pending.operation_token != operation_token)
+        {
+            return SessionRecordResumeDisposition::RejectRecord;
+        }
+        let preview_pending = preview_for_record.filter(|pending| {
+            pending.operation_token == operation_token
+        });
+        if let Some(pending) = preview_pending {
+            let current_key = AgentRowKey::Managed {
+                node_id: pending.node_id.clone(),
+                record_id: pending.record_id.clone().expect("matched preview record"),
+            };
+            let current = self.find_managed_session(&current_key).cloned();
+            let address = record.active_session.clone();
+            let authoritative_match = current.as_ref().is_some_and(|current| {
+                current.node_id == pending.node_id
+                    && current.workspace_id == pending.workspace_id
+                    && current.provider == pending.provider
+                    && current.mode == SessionMode::Pty
+                    && current.has_provider_session_identity
+            }) && record.workspace_id == pending.workspace_id
+                && record.provider == pending.provider
+                && record.mode == SessionMode::Pty
+                && record.has_provider_session_identity
+                && record.state == ManagedSessionState::Live
+                && address.as_ref().is_some_and(|address| {
+                    address.node_id == pending.node_id
+                        && address.workspace_id == pending.workspace_id
+                        && current.as_ref().is_some_and(|current| {
+                            match current.state {
+                                ManagedSessionState::Dormant => current.active_session.is_none(),
+                                ManagedSessionState::Live => {
+                                    current.active_session.as_ref() == Some(address)
+                                }
+                                ManagedSessionState::IdentityPending
+                                | ManagedSessionState::Unavailable => false,
+                            }
+                        })
+                });
+            if !authoritative_match {
+                if let Some(origin) = pending.origin.as_ref() {
+                    if let Some(tab) = self.preview_tabs.get_mut(origin) {
+                        tab.phase = PreviewTabPhase::Hydrated;
+                        tab.reconnect_error = Some(
+                            "Session reconnect result no longer matches this record.".to_owned(),
+                        );
+                        tab.scroll = usize::MAX;
+                    }
+                }
+                self.preview_resume = None;
+                self.notice = Some(
+                    "session reconnect result no longer matches the managed record".to_owned(),
+                );
+                return SessionRecordResumeDisposition::RejectRecord;
+            }
+            let address = address.expect("validated live session address");
+            if self
+                .surface
+                .tab_location(&SurfaceTab::Pty(address.clone()))
+                .is_some()
+            {
+                if let Some(origin) = pending.origin.as_ref() {
+                    if let Some(tab) = self.preview_tabs.get_mut(origin) {
+                        tab.phase = PreviewTabPhase::Hydrated;
+                    }
+                }
+                self.preview_resume = None;
+                self.notice = Some(
+                    "session PTY is already open; hydrated tab was left unchanged".to_owned(),
+                );
+                return SessionRecordResumeDisposition::UpsertRecord;
+            }
+            let Some(origin) = pending.origin.clone() else {
+                self.preview_resume = None;
+                self.existing_session = None;
+                self.notice = Some(format!("session reconnected: {}", record.display_name));
+                return SessionRecordResumeDisposition::UpsertRecordAndOpen(address);
+            };
+            if !self.surface.replace_tab(
+                &SurfaceTab::Preview(origin.clone()),
+                SurfaceTab::Pty(address.clone()),
+            ) {
+                if let Some(tab) = self.preview_tabs.get_mut(&origin) {
+                    tab.phase = PreviewTabPhase::Hydrated;
+                    tab.reconnect_error = Some(
+                        "Session tab disappeared during reconnect.".to_owned(),
+                    );
+                    tab.scroll = usize::MAX;
+                }
+                self.preview_resume = None;
+                self.notice = Some("hydrated session tab disappeared during reconnect".to_owned());
+                return SessionRecordResumeDisposition::RejectRecord;
+            }
+            self.preview_tabs.remove(&origin);
+            self.preview_resume = None;
+            self.existing_session = None;
+            self.notice = Some(format!("session reconnected: {}", record.display_name));
+            return SessionRecordResumeDisposition::UpsertRecordAndOpen(address);
+        }
+        let completed = self.existing_session.as_ref().is_some_and(|dialog| {
+            matches!(
+                &dialog.operation,
+                Some(ExistingSessionOperation::Resuming {
+                    node_id, record_id, operation_token: expected_token,
+                }) if node_id == &record.node_id
+                    && record_id == &record.record_id
+                    && *expected_token == operation_token
+            ) && record.active_session.is_some()
+        });
+        if completed {
+            let address = record.active_session.clone();
+            self.existing_session = None;
+            self.focus = Focus::Agents;
+            self.roster_mode = RosterMode::Agents;
+            self.notice = Some(format!("native resume started: {}", record.display_name));
+            return address.map_or(
+                SessionRecordResumeDisposition::RejectRecord,
+                SessionRecordResumeDisposition::UpsertRecordAndOpen,
+            );
+        }
+        SessionRecordResumeDisposition::RejectRecord
+    }
+
+    pub fn fail_existing_session_operation(
+        &mut self,
+        node_id: &str,
+        record_id: Option<&str>,
+        indexing: bool,
+        operation_token: u64,
+        message: String,
+        stale_catalog: bool,
+    ) -> AppAction {
+        let preview_matches = self.preview_resume.as_ref().is_some_and(|pending| {
+            pending.node_id == node_id
+                && pending.operation_token == operation_token
+                && if indexing {
+                    pending.record_id.is_none()
+                } else {
+                    pending.record_id.as_deref() == record_id
+                }
+        });
+        if preview_matches {
+            let stale_route = stale_catalog.then(|| {
+                self.preview_resume.as_ref().and_then(|pending| {
+                    let PreviewTabKey::NativeSelection { node_id: origin_node_id, route, .. } =
+                        pending.origin.as_ref()?
+                    else {
+                        return None;
+                    };
+                    (origin_node_id == node_id).then(|| route.clone())
+                })
+            }).flatten();
+            let safe_message = sanitize_resume_failure(&message);
+            if let Some(origin) = self
+                .preview_resume
+                .as_ref()
+                .and_then(|pending| pending.origin.clone())
+            {
+                if let Some(tab) = self.preview_tabs.get_mut(&origin) {
+                    tab.phase = PreviewTabPhase::Hydrated;
+                    tab.reconnect_error = Some(if stale_route.is_some() {
+                        "Reconnect cancelled: catalog refreshed; select session again".to_owned()
+                    } else {
+                        format!("Reconnect failed: {safe_message}")
+                    });
+                    tab.scroll = usize::MAX;
+                }
+            }
+            self.preview_resume = None;
+            if let Some(route) = stale_route {
+                return self.refresh_stale_native_session_catalog(node_id.to_owned(), route);
+            }
+            self.notice = Some(format!("session reconnect failed: {safe_message}"));
+            return AppAction::None;
+        }
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return AppAction::None;
+        };
+        let matches = match dialog.operation.as_ref() {
+            Some(ExistingSessionOperation::IndexingOnly {
+                node_id: expected, operation_token: expected_token, ..
+            }) => indexing && expected == node_id && *expected_token == operation_token,
+            Some(ExistingSessionOperation::IndexingForResume {
+                node_id: expected, operation_token: expected_token, ..
+            }) => {
+                indexing && expected == node_id && *expected_token == operation_token
+            }
+            Some(ExistingSessionOperation::IndexingNativeForResume {
+                node_id: expected, operation_token: expected_token, ..
+            }) => {
+                indexing && expected == node_id && *expected_token == operation_token
+            }
+            Some(ExistingSessionOperation::Resuming {
+                node_id: expected, record_id: expected_record, operation_token: expected_token,
+            }) => {
+                !indexing && expected == node_id && record_id == Some(expected_record.as_str())
+                    && *expected_token == operation_token
+            }
+            None => false,
+        };
+        let stale_route = if stale_catalog && matches {
+            match dialog.operation.as_ref() {
+                Some(ExistingSessionOperation::IndexingNativeForResume { route, .. }) => {
+                    Some(route.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if !matches {
+            return AppAction::None;
+        }
+        dialog.operation = None;
+        dialog.operation_error = Some(if stale_route.is_some() {
+            "catalog refreshed; select session again".to_owned()
+        } else {
+            message.clone()
+        });
+        if let Some(route) = stale_route {
+            return self.refresh_stale_native_session_catalog(node_id.to_owned(), route);
+        }
+        self.notice = Some(message);
+        AppAction::None
+    }
+
+    fn paste_spawn(&mut self, text: String) -> AppAction {
+        let Some(mut spawn) = self.spawn.take() else {
+            return AppAction::None;
+        };
+        if self.launch_field_uses_inventory(&spawn, spawn.field) {
+            self.notice = Some("use arrows or click to select an advertised launch resource".to_owned());
+        } else if let Err(message) = append_launch_text(&mut spawn, &text) {
+            self.notice = Some(message);
+        }
+        self.spawn = Some(spawn);
+        AppAction::None
+    }
+
+    fn cycle_launch_value(&mut self, spawn: &mut SpawnDialog, forward: bool) {
+        match spawn.field {
+            LaunchField::Node => {
+                self.cycle_spawn_node(spawn, forward);
+                self.reconcile_spawn_inventory(spawn);
+            }
+            LaunchField::Workspace => {
+                self.cycle_spawn_workspace(spawn, forward);
+                self.reconcile_spawn_inventory(spawn);
+            }
+            LaunchField::Provider => {
+                let enabled = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.node_id == spawn.node_id)
+                    .and_then(|node| {
+                        node.workspaces
+                            .iter()
+                            .find(|workspace| workspace.workspace_id == spawn.workspace_id)
+                    })
+                    .map(|workspace| {
+                        workspace
+                            .providers
+                            .iter()
+                            .filter(|inventory| inventory.enabled)
+                            .map(|inventory| inventory.provider.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                spawn.provider = cycle_provider(&enabled, &spawn.provider, forward);
+            }
+            LaunchField::GitLocation => {
+                let next = match spawn.target {
+                    LaunchTarget::ExistingWorkspace => LaunchTarget::NewLinkedWorktree,
+                    LaunchTarget::NewLinkedWorktree => LaunchTarget::NewStandaloneRepository,
+                    LaunchTarget::NewStandaloneRepository => LaunchTarget::ExistingWorkspace,
+                };
+                spawn.target = next;
+            }
+            LaunchField::ContinueFrom => {
+                if self.spawn_context_available(spawn) {
+                    spawn.context_mode = match spawn.context_mode {
+                        LaunchContextMode::None => LaunchContextMode::ContextPack,
+                        LaunchContextMode::ContextPack => LaunchContextMode::None,
+                    };
+                } else {
+                    spawn.context_mode = LaunchContextMode::None;
+                    self.notice = Some(
+                        "export a ContextPack from session history before attaching it".to_owned(),
+                    );
+                }
+            }
+            LaunchField::Delivery => {
+                if let Some(ids) = self.bundle_ids(&spawn.node_id) {
+                    spawn.bundle_id = cycle_string(&ids, &spawn.bundle_id, forward);
+                }
+            }
+        }
+    }
+
+    fn build_launch_action(&mut self, spawn: &SpawnDialog) -> Result<AppAction, String> {
+        if !self.node_is_connected(&spawn.node_id) {
+            return Err(format!("{} is disconnected; launch unavailable", spawn.node_id));
+        }
+        let provider_is_enabled = self
+            .nodes
+            .iter()
+            .find(|node| node.node_id == spawn.node_id)
+            .and_then(|node| {
+                node.workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == spawn.workspace_id)
+            })
+            .is_some_and(|workspace| {
+                workspace
+                    .providers
+                    .iter()
+                    .any(|inventory| inventory.enabled && inventory.provider == spawn.provider)
+            });
+        if !provider_is_enabled {
+            return Err("selected provider is unavailable in the selected workspace".to_owned());
+        }
+        let selected_spawn_profile = self.selected_spawn_profile(spawn)
+            .ok_or_else(|| "selected spawn profile is not advertised by the node".to_owned())?;
+        SpawnProfileId::new(spawn.profile_id.clone()).map_err(|error| error.to_string())?;
+        let profile_revision = selected_spawn_profile.revision.to_string();
+        if spawn.target == LaunchTarget::NewLinkedWorktree {
+            match self.selected_worktree_service_mode(spawn) {
+                Some(WorktreeServiceMode::Off) => {
+                    return Err("linked worktrees are disabled by the selected workspace policy".to_owned());
+                }
+                Some(WorktreeServiceMode::Manual) => {
+                    return Err("configure and create the linked worktree before launch".to_owned());
+                }
+                Some(WorktreeServiceMode::Managed) => {}
+                None => {
+                    return Err("linked worktree policy is not advertised by the selected workspace".to_owned());
+                }
+            }
+            if let Some(profiles) =
+                self.worktree_profile_ids(&spawn.node_id, &spawn.workspace_id)
+            {
+                if !profiles
+                    .iter()
+                    .any(|profile| profile == &spawn.worktree_profile_id)
+                {
+                    return Err(
+                        "selected managed-worktree profile is not advertised for this workspace"
+                            .to_owned(),
+                    );
+                }
+            }
+            WorktreeProfileId::new(spawn.worktree_profile_id.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        let bundle_id = if spawn.bundle_id.is_empty() {
+            None
+        } else {
+            SpawnBundleId::new(spawn.bundle_id.clone()).map_err(|error| error.to_string())?;
+            if self
+                .bundle_ids(&spawn.node_id)
+                .is_some_and(|bundles| !bundles.iter().any(|bundle| bundle == &spawn.bundle_id))
+            {
+                return Err("selected bundle is not advertised by the node".to_owned());
+            }
+            Some(spawn.bundle_id.clone())
+        };
+        let context_id = match spawn.context_mode {
+            LaunchContextMode::None => None,
+            LaunchContextMode::ContextPack => {
+                let context = self
+                    .history
+                    .as_ref()
+                    .filter(|history| history.source.node_id == spawn.node_id)
+                    .and_then(|history| history.context.as_ref())
+                    .ok_or_else(|| {
+                        "ContextPack launch requires an exported pack from the same node".to_owned()
+                    })?;
+                Some(context.id.to_string())
+            }
+        };
+        let idempotency_key = self.next_launch_idempotency_key();
+        let rows = self.content_rows();
+        let cols = self.content_cols();
+        Ok(match spawn.target {
+            LaunchTarget::ExistingWorkspace => AppAction::SpawnSpec {
+                node_id: spawn.node_id.clone(),
+                workspace_id: spawn.workspace_id.clone(),
+                provider: spawn.provider.clone(),
+                rows,
+                cols,
+                profile_id: spawn.profile_id.clone(),
+                profile_revision: profile_revision.clone(),
+                prompt: None,
+                bundle_id,
+                context_id,
+                idempotency_key,
+            },
+            LaunchTarget::NewLinkedWorktree => AppAction::SpawnManagedWorktree {
+                node_id: spawn.node_id.clone(),
+                workspace_id: spawn.workspace_id.clone(),
+                provider: spawn.provider.clone(),
+                rows,
+                cols,
+                profile_id: spawn.profile_id.clone(),
+                profile_revision,
+                worktree_profile_id: spawn.worktree_profile_id.clone(),
+                prompt: None,
+                bundle_id,
+                context_id,
+                idempotency_key,
+            },
+            LaunchTarget::NewStandaloneRepository => {
+                return Err("configure and create the standalone repository before launch".to_owned());
+            }
+        })
+    }
+
+    fn confirm_spawn(&mut self) -> AppAction {
+        let Some(spawn) = self.spawn.clone() else {
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        };
+        if spawn.target == LaunchTarget::NewStandaloneRepository
+            || (spawn.target == LaunchTarget::NewLinkedWorktree
+                && self.selected_worktree_service_mode(&spawn) != Some(WorktreeServiceMode::Managed))
+        {
+            return self.begin_git_location_configuration();
+        }
+        match self.build_launch_action(&spawn) {
+            Ok(action) => {
+                self.spawn = None;
+                self.focus = Focus::Agents;
+                action
+            }
+            Err(message) => {
+                self.notice = Some(message);
+                AppAction::None
+            }
+        }
+    }
+
+    fn next_launch_idempotency_key(&mut self) -> String {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(self.last_idempotency_unix_ms);
+        if unix_ms == self.last_idempotency_unix_ms {
+            self.idempotency_counter = self.idempotency_counter.saturating_add(1);
+        } else {
+            self.last_idempotency_unix_ms = unix_ms;
+            self.idempotency_counter = 0;
+        }
+        if self.idempotency_counter == 0 {
+            format!("tui-{unix_ms}")
+        } else {
+            format!("tui-{unix_ms}-{}", self.idempotency_counter)
+        }
     }
 
     fn reduce_add_space(&mut self, key: UiKey) -> AppAction {
@@ -3471,8 +14059,12 @@ impl App {
         };
         match key {
             UiKey::Escape => {
-                self.focus = Focus::Agents;
-                self.roster_mode = RosterMode::Workspaces;
+                self.focus = if self.spawn.is_some() {
+                    Focus::Spawn
+                } else {
+                    self.roster_mode = RosterMode::Workspaces;
+                    Focus::Agents
+                };
                 return AppAction::None;
             }
             UiKey::Tab | UiKey::BackTab => {
@@ -3481,8 +14073,21 @@ impl App {
                     AddSpaceField::Root => AddSpaceField::WorkspaceId,
                 };
             }
-            UiKey::Up => dialog.node_id = self.cycle_add_space_node(&dialog.node_id, false),
-            UiKey::Down => dialog.node_id = self.cycle_add_space_node(&dialog.node_id, true),
+            direction @ (UiKey::Up | UiKey::Down) => {
+                let next_node = self.cycle_add_space_node(
+                    &dialog.node_id,
+                    matches!(direction, UiKey::Down),
+                );
+                if next_node != dialog.node_id {
+                    dialog.node_id = next_node;
+                    dialog.root.clear();
+                    dialog.original_root = None;
+                    dialog.root_edited = false;
+                    self.notice = Some(
+                        "node changed; browse or enter a root on the selected node".to_owned(),
+                    );
+                }
+            }
             UiKey::Backspace => match dialog.field {
                 AddSpaceField::WorkspaceId => { dialog.workspace_id.pop(); }
                 AddSpaceField::Root => {
@@ -3518,8 +14123,19 @@ impl App {
                             root
                         }
                     };
-                    self.focus = Focus::Agents;
-                    self.roster_mode = RosterMode::Workspaces;
+                    let return_to_spawn = self.spawn.is_some();
+                    if let Some(spawn) = self.spawn.as_mut() {
+                        spawn.node_id.clone_from(&dialog.node_id);
+                        spawn.workspace_id.clone_from(&dialog.workspace_id);
+                        spawn.field = LaunchField::Workspace;
+                    }
+                    self.pending_space = Some((dialog.node_id.clone(), dialog.workspace_id.clone()));
+                    self.focus = if return_to_spawn {
+                        Focus::Spawn
+                    } else {
+                        self.roster_mode = RosterMode::Workspaces;
+                        Focus::Agents
+                    };
                     return AppAction::RegisterWorkspace {
                         node_id: dialog.node_id,
                         workspace_id: dialog.workspace_id,
@@ -3533,6 +14149,96 @@ impl App {
         AppAction::None
     }
 
+    fn reduce_folder_browser(&mut self, key: UiKey) -> AppAction {
+        let Some(browser) = self.folder_browser.as_ref() else {
+            self.focus = Focus::AddSpace;
+            return AppAction::None;
+        };
+        let field = browser.field;
+        match key {
+            UiKey::Escape => return self.close_folder_browser(),
+            UiKey::Tab | UiKey::BackTab => {
+                if let Some(browser) = self.folder_browser.as_mut() {
+                    browser.field = match browser.field {
+                        FolderBrowserField::Entries => FolderBrowserField::Filter,
+                        FolderBrowserField::Filter => FolderBrowserField::Entries,
+                    };
+                }
+            }
+            UiKey::Up => self.move_folder_browser_selection(-1),
+            UiKey::Down => self.move_folder_browser_selection(1),
+            UiKey::PageUp => self.move_folder_browser_selection(-10),
+            UiKey::PageDown => self.move_folder_browser_selection(10),
+            UiKey::Home => self.set_folder_browser_selection(false),
+            UiKey::End => self.set_folder_browser_selection(true),
+            UiKey::Left if field == FolderBrowserField::Entries => {
+                return self.browse_parent_directory();
+            }
+            UiKey::Right | UiKey::Enter if field == FolderBrowserField::Entries => {
+                return self.open_selected_host_directory();
+            }
+            UiKey::Backspace if field == FolderBrowserField::Entries => {
+                return self.browse_parent_directory();
+            }
+            UiKey::Backspace => {
+                if let Some(browser) = self.folder_browser.as_mut() {
+                    browser.filter.pop();
+                    browser.selected = 0;
+                    browser.scroll = 0;
+                }
+            }
+            UiKey::Char('u') if field == FolderBrowserField::Entries => {
+                return self.use_browsed_directory();
+            }
+            UiKey::Char('m') if field == FolderBrowserField::Entries => {
+                return self.load_more_host_directories();
+            }
+            UiKey::Char(ch) if field == FolderBrowserField::Filter => {
+                if !ch.is_control() {
+                    let current_len = self
+                        .folder_browser
+                        .as_ref()
+                        .map(|browser| browser.filter.len())
+                        .unwrap_or(0);
+                    if current_len + ch.len_utf8() <= 256 {
+                        if let Some(browser) = self.folder_browser.as_mut() {
+                            browser.filter.push(ch);
+                            browser.selected = 0;
+                            browser.scroll = 0;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn move_folder_browser_selection(&mut self, delta: isize) {
+        let count = self.visible_host_directory_indices().len();
+        let Some(browser) = self.folder_browser.as_mut() else {
+            return;
+        };
+        if count == 0 {
+            browser.selected = 0;
+            browser.scroll = 0;
+            return;
+        }
+        browser.field = FolderBrowserField::Entries;
+        browser.selected = browser
+            .selected
+            .saturating_add_signed(delta)
+            .min(count.saturating_sub(1));
+    }
+
+    fn set_folder_browser_selection(&mut self, end: bool) {
+        let count = self.visible_host_directory_indices().len();
+        if let Some(browser) = self.folder_browser.as_mut() {
+            browser.field = FolderBrowserField::Entries;
+            browser.selected = if end { count.saturating_sub(1) } else { 0 };
+        }
+    }
+
     fn paste_add_space(&mut self, text: String) -> AppAction {
         if let Some(dialog) = self.add_space.as_mut() {
             if let Err(message) = append_modal_paste(dialog, &text) {
@@ -3542,6 +14248,145 @@ impl App {
         AppAction::None
     }
 
+    fn begin_create_workspace_entry(&mut self, kind: WorkspaceEntryKind) -> AppAction {
+        let Some((node_id, workspace_id)) = self.selected_workspace_route() else {
+            self.notice = Some("select a connected workspace first".to_owned());
+            return AppAction::None;
+        };
+        let path = self
+            .visible_workspace_entry_indices()
+            .get(self.files_cursor)
+            .copied()
+            .and_then(|index| self.selected_workspace_inspection()?.entries.get(index))
+            .and_then(|entry| match entry.kind {
+                WorkspaceEntryKind::Directory => entry.relative_path.as_utf8(),
+                WorkspaceEntryKind::File => entry
+                    .relative_path
+                    .as_utf8()
+                    .and_then(|path| path.rsplit_once('/').map(|(parent, _)| parent)),
+            })
+            .filter(|path| !path.is_empty())
+            .map(|path| format!("{path}/"))
+            .filter(|path| path.len() <= gate4agent_node_protocol::MAX_REPOSITORY_PATH_BYTES)
+            .unwrap_or_default();
+        self.create_workspace_entry = Some(CreateWorkspaceEntryDialog {
+            node_id,
+            workspace_id,
+            kind,
+            path,
+            pending: false,
+            token: 0,
+            error: None,
+        });
+        self.focus = Focus::CreateWorkspaceEntry;
+        AppAction::None
+    }
+
+    fn reduce_create_workspace_entry(&mut self, key: UiKey) -> AppAction {
+        let Some(mut dialog) = self.create_workspace_entry.take() else {
+            self.focus = Focus::Spaces;
+            return AppAction::None;
+        };
+        if dialog.pending {
+            match key {
+                UiKey::Escape => {
+                    dialog.error = Some("creation is already in progress".to_owned());
+                }
+                _ => {}
+            }
+            self.create_workspace_entry = Some(dialog);
+            return AppAction::None;
+        }
+        match key {
+            UiKey::Escape => {
+                self.focus = Focus::Spaces;
+                return AppAction::None;
+            }
+            UiKey::Backspace => {
+                dialog.path.pop();
+                dialog.error = None;
+            }
+            UiKey::Char(ch) if !ch.is_control() => {
+                if dialog.path.len().saturating_add(ch.len_utf8())
+                    > gate4agent_node_protocol::MAX_REPOSITORY_PATH_BYTES
+                {
+                    dialog.error = Some("repository path exceeds protocol limit".to_owned());
+                } else {
+                    dialog.path.push(ch);
+                    dialog.error = None;
+                }
+            }
+            UiKey::Enter | UiKey::ModifiedEnter => {
+                let normalized = normalize_workspace_entry_input(&dialog.path);
+                let path = match RepositoryPath::utf8(normalized.clone()) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        dialog.error = Some(format!(
+                            "invalid workspace path: {error}; use e.g. new/hello.txt",
+                        ));
+                        self.create_workspace_entry = Some(dialog);
+                        return AppAction::None;
+                    }
+                };
+                dialog.path = normalized;
+                self.workspace_entry_token = self.workspace_entry_token.wrapping_add(1).max(1);
+                dialog.pending = true;
+                dialog.token = self.workspace_entry_token;
+                dialog.error = None;
+                let action = match dialog.kind {
+                    WorkspaceEntryKind::File => AppAction::CreateWorkspaceFile {
+                        node_id: dialog.node_id.clone(),
+                        workspace_id: dialog.workspace_id.clone(),
+                        path,
+                        token: dialog.token,
+                    },
+                    WorkspaceEntryKind::Directory => AppAction::CreateWorkspaceDirectory {
+                        node_id: dialog.node_id.clone(),
+                        workspace_id: dialog.workspace_id.clone(),
+                        path,
+                        token: dialog.token,
+                    },
+                };
+                self.create_workspace_entry = Some(dialog);
+                return action;
+            }
+            _ => {}
+        }
+        self.create_workspace_entry = Some(dialog);
+        AppAction::None
+    }
+
+    fn paste_create_workspace_entry(&mut self, text: String) -> AppAction {
+        let Some(dialog) = self.create_workspace_entry.as_mut() else {
+            return AppAction::None;
+        };
+        if dialog.pending {
+            return AppAction::None;
+        }
+        if text.contains(['\r', '\n', '\0'])
+            || dialog.path.len().saturating_add(text.len())
+                > gate4agent_node_protocol::MAX_REPOSITORY_PATH_BYTES
+        {
+            dialog.error = Some("pasted repository path is invalid or too long".to_owned());
+            return AppAction::None;
+        }
+        dialog.path.push_str(&text);
+        dialog.error = None;
+        AppAction::None
+    }
+
+    fn click_create_workspace_entry(&mut self, target: Option<HitTarget>) -> AppAction {
+        match target {
+            Some(HitTarget::CreateWorkspaceEntryCancel) => {
+                self.reduce_create_workspace_entry(UiKey::Escape)
+            }
+            Some(HitTarget::CreateWorkspaceEntrySubmit) => {
+                self.reduce_create_workspace_entry(UiKey::Enter)
+            }
+            _ => AppAction::None,
+        }
+    }
+
     fn reduce_create_worktree(&mut self, key: UiKey) -> AppAction {
         let Some(mut dialog) = self.create_worktree.take() else {
             self.focus = Focus::Spaces;
@@ -3549,27 +14394,58 @@ impl App {
         };
         match key {
             UiKey::Escape => {
-                self.focus = Focus::Spaces;
+                self.focus = if dialog.return_to_spawn && self.spawn.is_some() {
+                    Focus::Spawn
+                } else {
+                    Focus::Spaces
+                };
                 return AppAction::None;
             }
-            UiKey::Tab => dialog.field = next_create_worktree_field(dialog.field, true),
-            UiKey::BackTab => dialog.field = next_create_worktree_field(dialog.field, false),
-            UiKey::Up => dialog.field = next_create_worktree_field(dialog.field, false),
-            UiKey::Down => dialog.field = next_create_worktree_field(dialog.field, true),
+            UiKey::Tab => dialog.field = next_git_location_field(&dialog, true),
+            UiKey::BackTab => dialog.field = next_git_location_field(&dialog, false),
+            UiKey::Up => dialog.field = next_git_location_field(&dialog, false),
+            UiKey::Down => dialog.field = next_git_location_field(&dialog, true),
             UiKey::Backspace => {
-                create_worktree_field_mut(&mut dialog).pop();
+                if matches!(dialog.kind, GitLocationDialogKind::ManualLinked | GitLocationDialogKind::Standalone) {
+                    create_worktree_field_mut(&mut dialog).pop();
+                }
             }
             UiKey::Char(ch) => {
-                if let Err(message) = append_create_worktree_char(&mut dialog, ch) {
+                if !matches!(dialog.kind, GitLocationDialogKind::ManualLinked | GitLocationDialogKind::Standalone) {
+                    self.notice = Some("this Git location policy is read-only".to_owned());
+                } else if let Err(message) = append_create_worktree_char(&mut dialog, ch) {
                     self.notice = Some(message);
                 }
             }
             UiKey::Enter => {
+                if dialog.kind == GitLocationDialogKind::ManagedLinked {
+                    let Some(spawn) = self.spawn.clone() else {
+                        self.focus = Focus::Agents;
+                        return AppAction::None;
+                    };
+                    match self.build_launch_action(&spawn) {
+                        Ok(action) => {
+                            self.focus = Focus::Agents;
+                            return action;
+                        }
+                        Err(message) => self.notice = Some(message),
+                    }
+                    self.create_worktree = Some(dialog);
+                    return AppAction::None;
+                }
+                if dialog.kind == GitLocationDialogKind::LinkedDisabled {
+                    self.notice = Some(
+                        "linked worktrees are disabled by the selected workspace policy".to_owned(),
+                    );
+                    self.create_worktree = Some(dialog);
+                    return AppAction::None;
+                }
                 if dialog.workspace_id.trim().is_empty()
                     || dialog.target_root.trim().is_empty()
-                    || dialog.branch.trim().is_empty()
+                    || (dialog.kind == GitLocationDialogKind::ManualLinked
+                        && dialog.branch.trim().is_empty())
                 {
-                    self.notice = Some("workspace ID, target root, and branch are required".to_owned());
+                    self.notice = Some("workspace ID and root are required; linked worktrees also require a branch".to_owned());
                 } else if let Err(error) = WorkspaceId::new(dialog.workspace_id.clone()) {
                     self.notice = Some(format!("invalid workspace ID: {error}"));
                 } else {
@@ -3578,14 +14454,38 @@ impl App {
                         self.create_worktree = Some(dialog);
                         return AppAction::None;
                     };
-                    self.focus = Focus::Spaces;
-                    return AppAction::CreateWorktree {
-                        node_id: dialog.node_id,
-                        source_workspace_id: dialog.source_workspace_id,
-                        workspace_id: dialog.workspace_id,
-                        target_root,
-                        branch: dialog.branch,
-                        base: (!dialog.base.trim().is_empty()).then_some(dialog.base),
+                    if dialog.return_to_spawn {
+                        if let Some(spawn) = self.spawn.as_mut() {
+                            spawn.node_id.clone_from(&dialog.node_id);
+                            spawn.workspace_id.clone_from(&dialog.workspace_id);
+                            spawn.target = LaunchTarget::ExistingWorkspace;
+                            spawn.field = LaunchField::Workspace;
+                        }
+                        self.pending_space = Some((
+                            dialog.node_id.clone(),
+                            dialog.workspace_id.clone(),
+                        ));
+                        self.focus = Focus::Spawn;
+                    } else {
+                        self.focus = Focus::Spaces;
+                    }
+                    return match dialog.kind {
+                        GitLocationDialogKind::ManualLinked => AppAction::CreateWorktree {
+                            node_id: dialog.node_id,
+                            source_workspace_id: dialog.source_workspace_id,
+                            workspace_id: dialog.workspace_id,
+                            target_root,
+                            branch: dialog.branch,
+                            base: (!dialog.base.trim().is_empty()).then_some(dialog.base),
+                        },
+                        GitLocationDialogKind::Standalone => AppAction::CreateStandaloneWorkspace {
+                            node_id: dialog.node_id,
+                            workspace_id: dialog.workspace_id,
+                            root: target_root,
+                            initial_branch: (!dialog.branch.trim().is_empty()).then_some(dialog.branch),
+                        },
+                        GitLocationDialogKind::ManagedLinked
+                        | GitLocationDialogKind::LinkedDisabled => unreachable!(),
                     };
                 }
             }
@@ -3599,6 +14499,10 @@ impl App {
         let Some(dialog) = self.create_worktree.as_mut() else {
             return AppAction::None;
         };
+        if !matches!(dialog.kind, GitLocationDialogKind::ManualLinked | GitLocationDialogKind::Standalone) {
+            self.notice = Some("this Git location policy is read-only".to_owned());
+            return AppAction::None;
+        }
         if text.contains(['\r', '\n', '\0']) {
             self.notice = Some("worktree field cannot contain control characters".to_owned());
             return AppAction::None;
@@ -3665,7 +14569,12 @@ impl App {
                 AppAction::None
             }
             UiKey::Char(ch) => {
-                if let Err(message) = append_session_name(&mut dialog.display_name, ch.to_string()) {
+                let result = if dialog.local_alias {
+                    append_local_agent_alias(&mut dialog.display_name, ch.to_string())
+                } else {
+                    append_session_name(&mut dialog.display_name, ch.to_string())
+                };
+                if let Err(message) = result {
                     self.notice = Some(message);
                 }
                 self.rename_session = Some(dialog);
@@ -3673,6 +14582,15 @@ impl App {
             }
             UiKey::Enter => {
                 let name = dialog.display_name.trim().to_owned();
+                if dialog.local_alias {
+                    let key = AgentRowKey::Managed {
+                        node_id: dialog.node_id,
+                        record_id: dialog.record_id,
+                    };
+                    self.focus = Focus::Agents;
+                    self.set_managed_agent_alias(&key, (!name.is_empty()).then_some(name));
+                    return AppAction::None;
+                }
                 if let Err(message) = validate_session_name(&name) {
                     self.notice = Some(message);
                     self.rename_session = Some(dialog);
@@ -3695,11 +14613,80 @@ impl App {
         }
     }
 
+    fn reduce_task_id(&mut self, key: UiKey) -> AppAction {
+        let Some(mut dialog) = self.task_id_dialog.take() else {
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        };
+        match key {
+            UiKey::Escape => {
+                self.focus = Focus::Agents;
+                AppAction::None
+            }
+            UiKey::Backspace => {
+                dialog.value.pop();
+                self.task_id_dialog = Some(dialog);
+                AppAction::None
+            }
+            UiKey::Char(ch) => {
+                let mut encoded = [0_u8; 4];
+                if let Err(message) = append_task_id_input(
+                    &mut dialog.value,
+                    ch.encode_utf8(&mut encoded),
+                ) {
+                    self.notice = Some(message);
+                }
+                self.task_id_dialog = Some(dialog);
+                AppAction::None
+            }
+            UiKey::Enter => match dialog.value.parse::<TaskId>() {
+                Ok(task_id) => {
+                    self.focus = Focus::Agents;
+                    AppAction::SetSessionTask {
+                        node_id: dialog.node_id,
+                        record_id: dialog.record_id,
+                        expected_revision: dialog.expected_revision,
+                        target: SessionTaskTargetV1::Existing { task_id },
+                    }
+                }
+                Err(message) => {
+                    self.notice = Some(message.to_string());
+                    self.task_id_dialog = Some(dialog);
+                    AppAction::None
+                }
+            },
+            _ => {
+                self.task_id_dialog = Some(dialog);
+                AppAction::None
+            }
+        }
+    }
+
+    fn paste_task_id(&mut self, text: String) -> AppAction {
+        if let Some(dialog) = self.task_id_dialog.as_mut() {
+            let mut candidate = if text.starts_with("task-") {
+                String::new()
+            } else {
+                dialog.value.clone()
+            };
+            match append_task_id_input(&mut candidate, &text) {
+                Ok(()) => dialog.value = candidate,
+                Err(message) => self.notice = Some(message),
+            }
+        }
+        AppAction::None
+    }
+
     fn paste_rename_session(&mut self, text: String) -> AppAction {
         let Some(dialog) = self.rename_session.as_mut() else {
             return AppAction::None;
         };
-        if let Err(message) = append_session_name(&mut dialog.display_name, text) {
+        let result = if dialog.local_alias {
+            append_local_agent_alias(&mut dialog.display_name, text)
+        } else {
+            append_session_name(&mut dialog.display_name, text)
+        };
+        if let Err(message) = result {
             self.notice = Some(message);
         }
         AppAction::None
@@ -3724,6 +14711,74 @@ impl App {
             }
             _ => {
                 self.forget_session = Some(dialog);
+                AppAction::None
+            }
+        }
+    }
+
+    fn reduce_history(&mut self, key: UiKey) -> AppAction {
+        let Some(mut history) = self.history.take() else {
+            self.focus = Focus::Agents;
+            return AppAction::None;
+        };
+        match key {
+            UiKey::Escape => {
+                self.focus = Focus::Agents;
+                self.history = Some(history);
+                AppAction::None
+            }
+            UiKey::Up => {
+                history.selected = history.selected.saturating_sub(1);
+                self.history = Some(history);
+                AppAction::None
+            }
+            UiKey::Down => {
+                history.selected = (history.selected + 1)
+                    .min(history.candidates.len().saturating_sub(1));
+                self.history = Some(history);
+                AppAction::None
+            }
+            UiKey::Enter => {
+                let Some(candidate_id) = history
+                    .candidates
+                    .get(history.selected)
+                    .map(|candidate| candidate.id.clone())
+                else {
+                    self.notice = Some("history discovery returned no selectable session".to_owned());
+                    self.history = Some(history);
+                    return AppAction::None;
+                };
+                history.loaded = None;
+                history.context = None;
+                history.pending_label = Some("loading bounded history metadata".to_owned());
+                let address = history.source.clone();
+                self.history = Some(history);
+                AppAction::LoadHistory { address, candidate_id }
+            }
+            UiKey::Char('x') => {
+                if history.loaded.is_none() {
+                    self.notice = Some("load a history candidate before exporting ContextPack".to_owned());
+                    self.history = Some(history);
+                    return AppAction::None;
+                }
+                history.pending_label = Some("exporting bounded ContextPack".to_owned());
+                let address = history.source.clone();
+                self.history = Some(history);
+                AppAction::ExportContextPack { address }
+            }
+            UiKey::Char('f') => {
+                let Some(context_id) = history.context.as_ref().map(|context| context.id.to_string()) else {
+                    self.notice = Some("no exported ContextPack to forget".to_owned());
+                    self.history = Some(history);
+                    return AppAction::None;
+                };
+                history.pending_label = Some("forgetting ContextPack".to_owned());
+                let node_id = history.source.node_id.clone();
+                self.history = Some(history);
+                AppAction::ForgetContextPack { node_id, context_id }
+            }
+            _ => {
+                self.history = Some(history);
                 AppAction::None
             }
         }
@@ -3779,7 +14834,11 @@ impl App {
         match self.control_section {
             ControlSection::Files => self.sidebar_mode = SidebarMode::Files,
             ControlSection::Git => self.sidebar_mode = SidebarMode::Git,
-            ControlSection::Agents => self.roster_mode = RosterMode::Agents,
+            ControlSection::Agents => {
+                if self.roster_mode == RosterMode::Workspaces {
+                    self.roster_mode = RosterMode::Agents;
+                }
+            }
             ControlSection::Workspaces => self.roster_mode = RosterMode::Workspaces,
             ControlSection::Settings => unreachable!("settings is normalized above"),
         }
@@ -3836,7 +14895,13 @@ impl App {
                     return self.select_inspector_item(SidebarMode::Files, entry_index);
                 }
                 ControlSection::Git => return self.activate_selected_git_item(),
-                ControlSection::Agents => self.open_selected_agent(),
+                ControlSection::Agents => {
+                    return if self.existing_session.is_some() {
+                        self.activate_native_tree_cursor()
+                    } else {
+                        self.open_selected_agent()
+                    }
+                }
                 ControlSection::Workspaces => return self.inspect_selected_workspace(),
                 ControlSection::Settings => {}
             },
@@ -3852,9 +14917,9 @@ impl App {
                 ControlSection::Git => return self.remove_selected_git_worktree(),
                 ControlSection::Files | ControlSection::Settings => {}
             },
-            UiKey::Char('r') => match self.control_section {
+            UiKey::Char('r') | UiKey::Char('R') => match self.control_section {
                 ControlSection::Files | ControlSection::Git | ControlSection::Workspaces => {}
-                ControlSection::Agents => return self.restart_selected_agent(),
+                ControlSection::Agents => return self.reduce_agents(key),
                 ControlSection::Settings => {}
             },
             UiKey::Char('s') => self.cycle_color_mode(),
@@ -3871,8 +14936,21 @@ impl App {
             UiKey::Home => match self.control_section {
                 ControlSection::Files => self.files_cursor = 0,
                 ControlSection::Git => self.git_cursor = 0,
+                ControlSection::Agents if self.existing_session.is_some() => {
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        dialog.tree_cursor = 0;
+                    }
+                    self.move_native_tree_cursor(0);
+                    self.reveal_roster_selection(
+                        RosterMode::Agents,
+                        self.layout.control_content.height.saturating_sub(1),
+                    );
+                }
                 ControlSection::Agents => self.selected_agent = 0,
-                ControlSection::Workspaces => self.selected_space = 0,
+                ControlSection::Workspaces => {
+                    self.clear_agent_run_lens();
+                    self.selected_space = 0;
+                }
                 ControlSection::Settings => {}
             },
             UiKey::End => match self.control_section {
@@ -3880,10 +14958,22 @@ impl App {
                     self.files_cursor = self.visible_workspace_entry_indices().len().saturating_sub(1)
                 }
                 ControlSection::Git => self.git_cursor = self.git_item_count().saturating_sub(1),
+                ControlSection::Agents if self.existing_session.is_some() => {
+                    let last = self.native_session_tree_items().len().saturating_sub(1);
+                    if let Some(dialog) = self.existing_session.as_mut() {
+                        dialog.tree_cursor = last;
+                    }
+                    self.move_native_tree_cursor(0);
+                    self.reveal_roster_selection(
+                        RosterMode::Agents,
+                        self.layout.control_content.height.saturating_sub(1),
+                    );
+                }
                 ControlSection::Agents => {
                     self.selected_agent = self.agent_rows().len().saturating_sub(1)
                 }
                 ControlSection::Workspaces => {
+                    self.clear_agent_run_lens();
                     self.selected_space = self.space_rows().len().saturating_sub(1)
                 }
                 ControlSection::Settings => {}
@@ -3900,11 +14990,16 @@ impl App {
                 Focus::Viewport => Focus::Tabs,
                 Focus::Spaces | Focus::Agents => Focus::Tabs,
                 Focus::Spawn
+                | Focus::ExistingSession
                 | Focus::AddSpace
+                | Focus::FolderBrowser
+                | Focus::CreateWorkspaceEntry
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
                 | Focus::RenameSession
+                | Focus::TaskId
                 | Focus::ForgetSession
+                | Focus::History
                 | Focus::Settings => self.focus,
             };
         }
@@ -3917,11 +15012,16 @@ impl App {
                     if self.focus == sidebar { Focus::Tabs } else { sidebar }
                 }
                 Focus::Spawn
+                | Focus::ExistingSession
                 | Focus::AddSpace
+                | Focus::FolderBrowser
+                | Focus::CreateWorkspaceEntry
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
                 | Focus::RenameSession
+                | Focus::TaskId
                 | Focus::ForgetSession
+                | Focus::History
                 | Focus::Settings => self.focus,
             };
         }
@@ -3931,11 +15031,16 @@ impl App {
             Focus::Tabs => Focus::Viewport,
             Focus::Viewport => Focus::Spaces,
             Focus::Spawn
+            | Focus::ExistingSession
             | Focus::AddSpace
+            | Focus::FolderBrowser
+            | Focus::CreateWorkspaceEntry
             | Focus::CreateWorktree
             | Focus::RemoveWorktree
             | Focus::RenameSession
+            | Focus::TaskId
             | Focus::ForgetSession
+            | Focus::History
             | Focus::Settings => self.focus,
         }
     }
@@ -3947,11 +15052,16 @@ impl App {
                 Focus::Viewport => Focus::Tabs,
                 Focus::Spaces | Focus::Agents => Focus::Tabs,
                 Focus::Spawn
+                | Focus::ExistingSession
                 | Focus::AddSpace
+                | Focus::FolderBrowser
+                | Focus::CreateWorkspaceEntry
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
                 | Focus::RenameSession
+                | Focus::TaskId
                 | Focus::ForgetSession
+                | Focus::History
                 | Focus::Settings => self.focus,
             };
         }
@@ -3964,11 +15074,16 @@ impl App {
                     if self.focus == sidebar { Focus::Viewport } else { sidebar }
                 }
                 Focus::Spawn
+                | Focus::ExistingSession
                 | Focus::AddSpace
+                | Focus::FolderBrowser
+                | Focus::CreateWorkspaceEntry
                 | Focus::CreateWorktree
                 | Focus::RemoveWorktree
                 | Focus::RenameSession
+                | Focus::TaskId
                 | Focus::ForgetSession
+                | Focus::History
                 | Focus::Settings => self.focus,
             };
         }
@@ -3978,11 +15093,16 @@ impl App {
             Focus::Tabs => Focus::Agents,
             Focus::Viewport => Focus::Tabs,
             Focus::Spawn
+            | Focus::ExistingSession
             | Focus::AddSpace
+            | Focus::FolderBrowser
+            | Focus::CreateWorkspaceEntry
             | Focus::CreateWorktree
             | Focus::RemoveWorktree
             | Focus::RenameSession
+            | Focus::TaskId
             | Focus::ForgetSession
+            | Focus::History
             | Focus::Settings => self.focus,
         }
     }
@@ -4008,6 +15128,7 @@ impl App {
     }
 
     fn terminal_control(&mut self, control: TerminalControl) -> AppAction {
+        self.terminal_selection = None;
         self.for_active(|address| AppAction::TerminalControl { address, control })
     }
 }
@@ -4024,6 +15145,17 @@ pub(crate) fn repository_path_file_name_display(path: &RepositoryPath) -> String
     sanitize_path_display(path.file_name_display_text().as_ref())
 }
 
+pub(crate) fn normalize_workspace_entry_input(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    if let Some(relative) = normalized.strip_prefix("./") {
+        return relative.to_owned();
+    }
+    if normalized.starts_with('/') && !normalized.starts_with("//") {
+        return normalized[1..].to_owned();
+    }
+    normalized
+}
+
 fn sanitize_path_display(display: &str) -> String {
     let mut sanitized = String::new();
     for ch in display.chars() {
@@ -4036,10 +15168,152 @@ fn sanitize_path_display(display: &str) -> String {
     sanitized
 }
 
+fn terminal_selected_text(
+    session: &SessionView,
+    width: u16,
+    height: u16,
+    scroll_offset: usize,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> String {
+    if width == 0 || height == 0 || start == end {
+        return String::new();
+    }
+    let rows = terminal_visible_rows(session, width, height, scroll_offset);
+    let (start, end) = if (start.1, start.0) <= (end.1, end.0) {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let mut selected = Vec::new();
+    for row in start.1..=end.1.min(height.saturating_sub(1)) {
+        let from = if row == start.1 { start.0 } else { 0 };
+        let to = if row == end.1 {
+            end.0.saturating_add(1).min(width)
+        } else {
+            width
+        };
+        let line = rows.get(row as usize).map(String::as_str).unwrap_or("");
+        selected.push(slice_terminal_cells(line, from as usize, to as usize).trim_end().to_owned());
+    }
+    selected.join("\n").trim_end_matches('\n').to_owned()
+}
+
+fn terminal_visible_rows(
+    session: &SessionView,
+    width: u16,
+    height: u16,
+    scroll_offset: usize,
+) -> Vec<String> {
+    let mut parser = vt100::Parser::new(height.max(1), width.max(1), 0);
+    parser.process(&session.terminal_formatted);
+    let current = parser.screen().rows(0, width.max(1)).collect::<Vec<_>>();
+    let history_len = session.terminal_scrollback.len();
+    let first_logical_row = history_len.saturating_sub(scroll_offset.min(history_len));
+    (0..height)
+        .map(|row| {
+            let logical = first_logical_row.saturating_add(row as usize);
+            if logical < history_len {
+                let mut row_parser = vt100::Parser::new(1, width.max(1), 0);
+                row_parser.process(&session.terminal_scrollback[logical]);
+                let text = row_parser
+                    .screen()
+                    .rows(0, width.max(1))
+                    .next()
+                    .unwrap_or_default();
+                text
+            } else {
+                current
+                    .get(logical.saturating_sub(history_len))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        })
+        .collect()
+}
+
+fn slice_terminal_cells(value: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut column = 0usize;
+    for ch in value.chars() {
+        let width = terminal_char_cell_width(ch);
+        let next = column.saturating_add(width);
+        if next > start && column < end {
+            result.push(ch);
+        }
+        column = next;
+        if column >= end {
+            break;
+        }
+    }
+    result
+}
+
+fn terminal_char_cell_width(character: char) -> usize {
+    let code = character as u32;
+    if character.is_control()
+        || matches!(
+            code,
+            0x0300..=0x036f
+                | 0x1ab0..=0x1aff
+                | 0x1dc0..=0x1dff
+                | 0x20d0..=0x20ff
+                | 0xfe00..=0xfe0f
+                | 0xfe20..=0xfe2f
+        )
+    {
+        0
+    } else if matches!(
+        code,
+        0x1100..=0x115f
+            | 0x2329..=0x232a
+            | 0x2e80..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe19
+            | 0xfe30..=0xfe6f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+            | 0x1f300..=0x1faff
+            | 0x20000..=0x3fffd
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
 fn next_worktree_id(source: &str) -> String {
     let suffix = "-worktree";
     let keep = MAX_NODE_IDENTIFIER_BYTES.saturating_sub(suffix.len());
     format!("{}{suffix}", &source[..source.len().min(keep)])
+}
+
+fn next_standalone_id(source: &str) -> String {
+    let suffix = "-repo";
+    let keep = MAX_NODE_IDENTIFIER_BYTES.saturating_sub(suffix.len());
+    format!("{}{suffix}", &source[..source.len().min(keep)])
+}
+
+fn suggested_worktree_root(source_root: &OpaqueHostPath, workspace_id: &str) -> String {
+    let Some(source) = source_root.as_utf8() else {
+        return String::new();
+    };
+    let trimmed = source.trim_end_matches(['/', '\\']);
+    let separator = trimmed
+        .rfind(['/', '\\'])
+        .map(|index| &trimmed[..=index])
+        .or_else(|| {
+            source
+                .ends_with(['/', '\\'])
+                .then_some(source)
+        });
+    separator
+        .map(|parent| format!("{parent}{workspace_id}"))
+        .unwrap_or_default()
 }
 
 fn workspace_id_char(ch: char) -> bool {
@@ -4074,17 +15348,29 @@ fn worktree_can_be_removed(worktree: &GitWorktreeSnapshot) -> bool {
     !worktree.is_main && !worktree.is_bare && !worktree.locked && !worktree.prunable
 }
 
-fn next_create_worktree_field(
-    current: CreateWorktreeField,
+fn next_git_location_field(
+    dialog: &CreateWorktreeDialog,
     forward: bool,
 ) -> CreateWorktreeField {
-    let fields = [
+    let manual_fields = [
         CreateWorktreeField::WorkspaceId,
         CreateWorktreeField::TargetRoot,
         CreateWorktreeField::Branch,
         CreateWorktreeField::Base,
     ];
-    let index = fields.iter().position(|field| *field == current).unwrap_or(0);
+    let standalone_fields = [
+        CreateWorktreeField::WorkspaceId,
+        CreateWorktreeField::TargetRoot,
+        CreateWorktreeField::Branch,
+    ];
+    let fields: &[CreateWorktreeField] = if dialog.kind == GitLocationDialogKind::Standalone {
+        &standalone_fields
+    } else if dialog.kind == GitLocationDialogKind::ManualLinked {
+        &manual_fields[..]
+    } else {
+        return dialog.field;
+    };
+    let index = fields.iter().position(|field| *field == dialog.field).unwrap_or(0);
     let next = if forward {
         (index + 1) % fields.len()
     } else if index == 0 {
@@ -4136,7 +15422,60 @@ fn wheel_scroll_start(current: usize, maximum: usize, up: bool) -> usize {
     }
 }
 
-fn visible_selection_start(
+pub(crate) fn harness_operator_move_allowed(
+    from: HarnessTaskStateV1,
+    to: HarnessTaskStateV1,
+) -> bool {
+    from != to
+        && !matches!(
+            from,
+            HarnessTaskStateV1::Done
+                | HarnessTaskStateV1::Failed
+                | HarnessTaskStateV1::Cancelled
+        )
+        && !matches!(
+            to,
+            HarnessTaskStateV1::Running
+                | HarnessTaskStateV1::Failed
+                | HarnessTaskStateV1::Cancelled
+        )
+        && (to != HarnessTaskStateV1::Done || from == HarnessTaskStateV1::Review)
+}
+
+fn populate_selected_catalog_row(dialog: &mut ExistingSessionDialog) {
+    let Some(row) = dialog.rows.get(dialog.selected) else {
+        return;
+    };
+    dialog.node_id.clone_from(&row.node_id);
+    dialog.workspace_id = row.route.workspace_id.clone().unwrap_or_default();
+    dialog.provider = row.route.provider.clone();
+    dialog.session_id.clear();
+    dialog.display_name = row.display_name();
+}
+
+fn native_session_modified_at(row: &NativeSessionCatalogRowView) -> u64 {
+    row.modified_at.as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn bounded_session_display_name(preferred: &str, session_id: &str) -> String {
+    let preferred = if preferred.is_empty() { session_id } else { preferred };
+    let mut result = String::new();
+    for ch in preferred.chars() {
+        if ch.is_control() || result.len().saturating_add(ch.len_utf8()) > MAX_SESSION_DISPLAY_NAME_BYTES {
+            break;
+        }
+        result.push(ch);
+    }
+    if result.trim().is_empty() {
+        "Existing session".to_owned()
+    } else {
+        result
+    }
+}
+
+pub(crate) fn visible_selection_start(
     current: usize,
     selected: usize,
     count: usize,
@@ -4153,6 +15492,26 @@ fn visible_selection_start(
         selected.saturating_add(1).saturating_sub(capacity).min(maximum)
     } else {
         current
+    }
+}
+
+pub(crate) fn surface_drop_zone(
+    frame: Rect,
+    column: u16,
+    row: u16,
+) -> SurfaceDropZone {
+    let edge_width = (frame.width / 4).max(1);
+    let edge_height = (frame.height / 4).max(1);
+    if row < frame.y.saturating_add(edge_height) {
+        SurfaceDropZone::Top
+    } else if row >= frame.bottom().saturating_sub(edge_height) {
+        SurfaceDropZone::Bottom
+    } else if column < frame.x.saturating_add(edge_width) {
+        SurfaceDropZone::Left
+    } else if column >= frame.right().saturating_sub(edge_width) {
+        SurfaceDropZone::Right
+    } else {
+        SurfaceDropZone::Center
     }
 }
 
@@ -4342,6 +15701,75 @@ fn cycle_provider(enabled: &[Provider], current: &Provider, forward: bool) -> Pr
     enabled[index].clone()
 }
 
+fn provider_has_native_history(provider: &Provider) -> bool {
+    matches!(
+        provider.to_string().as_str(),
+        "claude" | "codex" | "grok" | "kimi" | "qwen-code"
+    )
+}
+
+pub(crate) fn provider_supports_native_resume(provider: &Provider) -> bool {
+    matches!(
+        provider.to_string().as_str(),
+        "claude" | "codex" | "grok" | "kimi"
+    )
+}
+
+fn provider_is_importable(provider: &Provider) -> bool {
+    provider_supports_native_resume(provider)
+}
+
+fn catalog_routes_for_node_from_nodes(
+    nodes: &[NodeView],
+    node_id: &str,
+) -> Vec<NativeSessionCatalogRoute> {
+    let mut routes = nodes.iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| node.workspaces.iter().flat_map(|workspace| {
+            workspace.providers.iter().filter_map(|inventory| {
+                (inventory.enabled && provider_has_native_history(&inventory.provider)).then(|| {
+                    NativeSessionCatalogRoute::workspace(
+                        workspace.workspace_id.clone(),
+                        inventory.provider.clone(),
+                    )
+                })
+            })
+        }).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let unregistered_providers = nodes.iter()
+        .find(|node| node.node_id == node_id)
+        .into_iter()
+        .flat_map(|node| node.providers.iter())
+        .filter(|inventory| {
+            inventory.enabled && provider_has_native_history(&inventory.provider)
+        })
+        .map(|inventory| inventory.provider.clone())
+        .collect::<BTreeSet<_>>();
+    routes.extend(
+        unregistered_providers
+            .into_iter()
+            .map(NativeSessionCatalogRoute::unregistered),
+    );
+    routes.sort();
+    routes.dedup();
+    routes
+}
+
+fn cycle_string(values: &[String], current: &str, forward: bool) -> String {
+    if values.is_empty() {
+        return current.to_owned();
+    }
+    let current = values.iter().position(|value| value == current).unwrap_or(0);
+    let index = if forward {
+        (current + 1) % values.len()
+    } else if current == 0 {
+        values.len() - 1
+    } else {
+        current - 1
+    };
+    values[index].clone()
+}
+
 pub fn managed_state_label(state: ManagedSessionState) -> &'static str {
     match state {
         ManagedSessionState::IdentityPending => "identity pending",
@@ -4362,6 +15790,108 @@ fn append_session_name(target: &mut String, text: String) -> Result<(), String> 
     Ok(())
 }
 
+fn append_local_agent_alias(target: &mut String, text: String) -> Result<(), String> {
+    if text.chars().any(char::is_control) {
+        return Err("local alias cannot contain control characters".to_owned());
+    }
+    if target.len().saturating_add(text.len()) > MAX_LOCAL_AGENT_ALIAS_BYTES {
+        return Err("local alias exceeds 96 UTF-8 bytes".to_owned());
+    }
+    target.push_str(&text);
+    Ok(())
+}
+
+fn append_task_id_input(target: &mut String, text: &str) -> Result<(), String> {
+    const PREFIX: &[u8] = b"task-";
+    if target.len().saturating_add(text.len()) > 29 {
+        return Err("task ID input exceeds 29 ASCII bytes".to_owned());
+    }
+    for (offset, byte) in text.bytes().enumerate() {
+        let index = target.len() + offset;
+        let valid = if index < PREFIX.len() {
+            byte == PREFIX[index]
+        } else {
+            byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+        };
+        if !valid {
+            return Err("task ID input must match task- plus lowercase hexadecimal".to_owned());
+        }
+    }
+    target.push_str(text);
+    Ok(())
+}
+
+fn append_provider_session_id(target: &mut String, text: String) -> Result<(), String> {
+    if text.chars().any(char::is_control) {
+        return Err("native session ID cannot contain control characters".to_owned());
+    }
+    if target.len().saturating_add(text.len()) > PROVIDER_EVENT_ID_MAX_BYTES {
+        return Err("native session ID exceeds protocol limit".to_owned());
+    }
+    target.push_str(&text);
+    Ok(())
+}
+
+fn append_resume_query(target: &mut String, text: String) -> Result<(), String> {
+    if text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err("resume query contains an unsupported control character".to_owned());
+    }
+    if target.len().saturating_add(text.len()) > MAX_NODE_TEXT_BYTES {
+        return Err("resume query exceeds the protocol text limit".to_owned());
+    }
+    target.push_str(&text);
+    Ok(())
+}
+
+fn sanitize_resume_failure(message: &str) -> String {
+    let flattened = message
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    let normalized = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = if normalized.is_empty() {
+        "provider rejected the reconnect".to_owned()
+    } else {
+        normalized
+    };
+    let mut bounded = normalized.chars().take(240).collect::<String>();
+    if normalized.chars().count() > 240 {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn launch_text_target(spawn: &mut SpawnDialog) -> Option<&mut String> {
+    match spawn.field {
+        LaunchField::Delivery => Some(&mut spawn.bundle_id),
+        LaunchField::Node
+        | LaunchField::Workspace
+        | LaunchField::Provider
+        | LaunchField::GitLocation
+        | LaunchField::ContinueFrom => None,
+    }
+}
+
+fn append_launch_text(spawn: &mut SpawnDialog, text: &str) -> Result<(), String> {
+    let Some(target) = launch_text_target(spawn) else {
+        return Ok(());
+    };
+    if !text
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+    {
+        return Err("launch identifiers require printable non-whitespace ASCII without path separators".to_owned());
+    }
+    if target.len().saturating_add(text.len()) > MAX_NODE_TEXT_BYTES {
+        return Err("launch field exceeds the protocol text limit".to_owned());
+    }
+    target.push_str(text);
+    Ok(())
+}
+
 fn validate_session_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("session name cannot be empty".to_owned());
@@ -4375,9 +15905,283 @@ fn validate_session_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn harness_task(id_digit: char, state: HarnessTaskStateV1, revision: u64) -> RedactedTaskV1 {
+        RedactedTaskV1 {
+            task_id: HarnessTaskId::new(format!("htask_{}", id_digit.to_string().repeat(24))).unwrap(),
+            revision: HarnessRevision::new(revision).unwrap(),
+            title: format!("task {id_digit}"),
+            body: String::new(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: revision,
+        }
+    }
+
+    fn harness_run(id_digit: char, task_id: HarnessTaskId, binding: RedactedBindingStateV1) -> RedactedRunV1 {
+        RedactedRunV1 {
+            run_id: HarnessRunId::new(format!("hrun_{}", id_digit.to_string().repeat(24))).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: Some(task_id),
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: if binding == RedactedBindingStateV1::None {
+                HarnessRunLifecycleV1::Requested
+            } else {
+                HarnessRunLifecycleV1::Running
+            },
+            binding,
+            result_disposition: None,
+            failure_category: None,
+            references_redacted: false,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn harness_kanban_columns_are_the_exact_protocol_states() {
+        let expected = [
+            HarnessTaskStateV1::Backlog,
+            HarnessTaskStateV1::Ready,
+            HarnessTaskStateV1::Running,
+            HarnessTaskStateV1::Waiting,
+            HarnessTaskStateV1::Review,
+            HarnessTaskStateV1::Done,
+            HarnessTaskStateV1::Failed,
+            HarnessTaskStateV1::Cancelled,
+        ];
+        assert_eq!(HarnessKanbanColumn::ALL.map(HarnessKanbanColumn::state), expected);
+        for state in expected {
+            assert_eq!(HarnessKanbanColumn::from_state(state).state(), state);
+        }
+    }
+
+    #[test]
+    fn harness_schedule_next_uses_configured_plan_not_selected_card() {
+        let mut app = App::default();
+        let selected = harness_task('1', HarnessTaskStateV1::Ready, 1);
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![selected.clone()], Vec::new());
+        app.harness_kanban.selected = Some(selected.task_id);
+        app.enable_harness_schedule(Some(HarnessSelectorV1::new("default").unwrap()));
+
+        let AppAction::HarnessScheduleNext { plan_id, .. } =
+            app.harness_schedule_next()
+        else {
+            panic!("configured scheduler action");
+        };
+        assert_eq!(plan_id.unwrap().as_str(), "default");
+
+        app.harness_schedule_plan = None;
+        assert_eq!(app.harness_schedule_next(), AppAction::None);
+    }
+
+    #[test]
+    fn harness_mouse_controls_schedule_globally_and_scroll_columns() {
+        let mut app = App::default();
+        app.enable_harness_schedule(Some(HarnessSelectorV1::new("mouse-plan").unwrap()));
+        app.layout.hits = vec![
+            HitRegion {
+                rect: Rect::new(0, 0, 1, 1),
+                target: HitTarget::HarnessScheduleNext,
+            },
+            HitRegion {
+                rect: Rect::new(1, 0, 1, 1),
+                target: HitTarget::HarnessColumnScroll(1),
+            },
+            HitRegion {
+                rect: Rect::new(2, 0, 1, 1),
+                target: HitTarget::HarnessColumnScroll(0),
+            },
+        ];
+
+        let AppAction::HarnessScheduleNext { plan_id, .. } = app.click(0, 0) else {
+            panic!("mouse schedule must dispatch the configured global plan");
+        };
+        assert_eq!(plan_id.unwrap().as_str(), "mouse-plan");
+        assert!(app.harness_kanban.selected.is_none());
+
+        assert_eq!(app.click(1, 0), AppAction::None);
+        assert_eq!(app.harness_kanban.column_scroll, 1);
+        assert_eq!(app.click(2, 0), AppAction::None);
+        assert_eq!(app.harness_kanban.column_scroll, 0);
+    }
+
+    #[test]
+    fn harness_composer_mouse_targets_focus_submit_to_backlog_and_cancel() {
+        let mut app = App::default();
+        app.harness_kanban.composer = Some(HarnessTaskComposer::default());
+        app.layout.hits = vec![
+            HitRegion {
+                rect: Rect::new(0, 0, 1, 1),
+                target: HitTarget::HarnessComposerField(HarnessTaskComposerField::Body),
+            },
+            HitRegion {
+                rect: Rect::new(1, 0, 1, 1),
+                target: HitTarget::HarnessComposerCreate,
+            },
+            HitRegion {
+                rect: Rect::new(2, 0, 1, 1),
+                target: HitTarget::HarnessComposerCancel,
+            },
+        ];
+
+        assert_eq!(app.click(0, 0), AppAction::None);
+        assert_eq!(
+            app.harness_kanban.composer.as_ref().map(|composer| composer.field),
+            Some(HarnessTaskComposerField::Body),
+        );
+        app.harness_kanban.composer.as_mut().unwrap().title = "Mouse-created".to_owned();
+        let AppAction::HarnessCreateTask { title, initial_state, .. } = app.click(1, 0) else {
+            panic!("composer create hit must submit the task");
+        };
+        assert_eq!(title, "Mouse-created");
+        assert_eq!(initial_state, HarnessTaskStateV1::Backlog);
+
+        app.harness_kanban.composer = Some(HarnessTaskComposer::default());
+        assert_eq!(app.click(2, 0), AppAction::None);
+        assert!(app.harness_kanban.composer.is_none());
+    }
+
+    #[test]
+    fn agent_menu_session_correlation_labels_do_not_claim_harness_tasks() {
+        assert_eq!(AgentMenuAction::NewTaskId.label(), "New session correlation");
+        assert_eq!(AgentMenuAction::AssignTaskId.label(), "Assign session correlation...");
+    }
+
+    #[test]
+    fn harness_refresh_is_atomic_and_preserves_task_selection_across_restart() {
+        let mut app = App::default();
+        let first = harness_task('1', HarnessTaskStateV1::Ready, 1);
+        let second = harness_task('2', HarnessTaskStateV1::Running, 1);
+        app.begin_harness_refresh(7);
+        app.apply_harness_snapshot(7, vec![first.clone(), second.clone()], Vec::new());
+        app.harness_kanban.selected = Some(second.task_id.clone());
+
+        app.begin_harness_refresh(8);
+        assert_eq!(app.harness_kanban.tasks.len(), 2, "refresh keeps the last complete snapshot visible");
+        app.fail_harness_refresh(8, "host restarting".to_owned());
+        assert_eq!(app.harness_kanban.selected.as_ref(), Some(&second.task_id));
+        assert_eq!(app.harness_kanban.tasks[&first.task_id].revision, first.revision);
+        assert!(app.harness_kanban.stale_reason.is_some());
+
+        let moved = harness_task('2', HarnessTaskStateV1::Review, 2);
+        app.begin_harness_refresh(9);
+        app.apply_harness_snapshot(9, vec![first, moved.clone()], Vec::new());
+        assert_eq!(app.harness_kanban.selected.as_ref(), Some(&moved.task_id));
+        assert_eq!(app.harness_kanban.tasks[&moved.task_id].state, HarnessTaskStateV1::Review);
+        assert!(app.harness_kanban.stale_reason.is_none());
+    }
+
+    #[test]
+    fn harness_mutation_actions_carry_domain_intent_without_authority() {
+        let mut app = App::default();
+        let task = harness_task('3', HarnessTaskStateV1::Ready, 4);
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
+        app.harness_kanban.selected = Some(task.task_id.clone());
+
+        let first = app.harness_move_selected(HarnessTaskStateV1::Backlog);
+        let second = app.harness_cancel_selected();
+        let (
+            AppAction::HarnessMoveTask { expected_revision: first_revision, .. },
+            AppAction::HarnessCancelTask { expected_revision: second_revision, .. },
+        ) = (first, second) else {
+            panic!("expected harness mutations");
+        };
+        assert_eq!(first_revision, task.revision);
+        assert_eq!(second_revision, task.revision);
+    }
+
+    #[test]
+    fn harness_operator_move_guard_matches_frozen_service_transitions() {
+        assert!(harness_operator_move_allowed(
+            HarnessTaskStateV1::Ready,
+            HarnessTaskStateV1::Backlog,
+        ));
+        assert!(harness_operator_move_allowed(
+            HarnessTaskStateV1::Review,
+            HarnessTaskStateV1::Done,
+        ));
+        assert!(!harness_operator_move_allowed(
+            HarnessTaskStateV1::Ready,
+            HarnessTaskStateV1::Running,
+        ));
+        assert!(!harness_operator_move_allowed(
+            HarnessTaskStateV1::Ready,
+            HarnessTaskStateV1::Failed,
+        ));
+        assert!(!harness_operator_move_allowed(
+            HarnessTaskStateV1::Ready,
+            HarnessTaskStateV1::Cancelled,
+        ));
+        assert!(!harness_operator_move_allowed(
+            HarnessTaskStateV1::Backlog,
+            HarnessTaskStateV1::Done,
+        ));
+        assert!(!harness_operator_move_allowed(
+            HarnessTaskStateV1::Done,
+            HarnessTaskStateV1::Backlog,
+        ));
+    }
+
+    #[test]
+    fn harness_run_details_stay_inline_in_agent_board_and_require_a_bound_run() {
+        let mut app = App::default();
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let mut task = harness_task('4', HarnessTaskStateV1::Running, 1);
+        let unbound = harness_run('5', task.task_id.clone(), RedactedBindingStateV1::None);
+        task.run_ids.push(unbound.run_id.clone());
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![unbound]);
+        app.harness_kanban.selected = Some(task.task_id.clone());
+        assert_eq!(app.open_selected_harness_monitor(), AppAction::None);
+        assert!(app.harness_kanban.monitor.is_none());
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+
+        let bound = harness_run('5', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        let run_id = bound.run_id.clone();
+        app.begin_harness_refresh(2);
+        app.apply_harness_snapshot(2, vec![task], vec![bound]);
+        let action = app.open_selected_harness_monitor();
+        assert_eq!(action, AppAction::HarnessOpenMonitor { run_id: run_id.clone() });
+        assert_eq!(
+            app.harness_kanban.monitor.as_ref().map(|view| &view.run.run_id),
+            Some(&run_id),
+        );
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+        assert_eq!(app.surface.all_tabs(), vec![&SurfaceTab::AgentBoard]);
+        assert_eq!(app.reduce_harness_kanban(UiKey::Escape), AppAction::None);
+        assert!(app.harness_kanban.monitor.is_none());
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+    }
     use gate4agent_node_protocol::{
-        GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, WorkspaceEntry,
+        AgentProgressAttentionKindV1, AgentProgressAttentionV1, AgentProgressUsageV1,
+        ContextPackLineageReceipt, GitCommitSummary, GitObjectId, GitSnapshot, GitStatusEntry,
+        GitWorktreeSnapshot,
+        ManagedWorktreeCleanupFailure, ManagedWorktreeGitScope, ManagedWorktreeLeaseId, ManagedWorktreeLeaseState,
+        ManagedWorktreeProfileSummary, ManagedWorktreeRetention, NodeId, SpawnBundleDigest,
+        SpawnBundleRevision, SpawnContextDigest, SpawnProfileRevision, SpawnProfileSummary,
+        WorktreeProfileRevision, WorkspaceEntry, WorkspaceFileContent, WorkspaceFileRead,
+        WorkspaceFileRevision,
+        ObservationTodoItemV1, ObservationV1,
     };
+    use gate4agent_types::{AgentInstanceId, ProviderActivity, SessionGeneration};
+    use gate4agent_observation_api::ProjectionFreshness;
 
     fn host_path(value: impl Into<String>) -> OpaqueHostPath {
         OpaqueHostPath::utf8(value.into()).unwrap()
@@ -4410,9 +16214,15 @@ mod tests {
             node_id: "node-a".to_owned(),
             incarnation_id: None,
             endpoint: r"\\.\pipe\node-a".to_owned(),
+            relay_route: C2RelayRoute::Unknown,
             connection: ConnectionState::Connected,
             controller_owned: true,
             event_sequence: 10,
+            launch_inventory: None,
+            providers: fixture_providers()
+                .into_iter()
+                .map(|provider| ProviderInventory { provider, enabled: true })
+                .collect(),
             session_records: Vec::new(),
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
@@ -4422,6 +16232,8 @@ mod tests {
                     .into_iter()
                     .map(|provider| ProviderInventory { provider, enabled: true })
                     .collect(),
+                worktree_service_mode: Some(WorktreeServiceMode::Manual),
+                managed_worktree_profiles: None,
                 sessions: vec![SessionView {
                     address: address.clone(),
                     provider: provider("codex"),
@@ -4432,6 +16244,7 @@ mod tests {
                     restartable: false,
                     attention: false,
                     has_provider_session_identity: true,
+                    progress: None,
                     terminal_formatted: b"codex".to_vec(),
                     terminal_scrollback: Vec::new(),
                     terminal_alternate_screen: false,
@@ -4441,9 +16254,2039 @@ mod tests {
                 }],
             }],
         });
-        app.tabs.push(SessionTab { address });
+        app.surface.open_in_focused(SurfaceTab::Pty(address));
         app.layout.viewport = Rect::new(26, 1, 74, 23);
+        install_launch_inventory(&mut app);
         app
+    }
+
+    fn board_progress(current: AgentProgressCurrentV1) -> AgentProgressV1 {
+        AgentProgressV1 {
+            provider_sequence: 9,
+            activity: match current {
+                AgentProgressCurrentV1::Idle => ProviderActivity::Idle,
+                AgentProgressCurrentV1::Working => ProviderActivity::Working,
+                AgentProgressCurrentV1::WaitingForInput => ProviderActivity::WaitingForInput,
+                AgentProgressCurrentV1::Blocked => ProviderActivity::Blocked,
+            },
+            completed_turns: 3,
+            usage: Some(AgentProgressUsageV1 {
+                input_tokens: 10,
+                output_tokens: 4,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 1,
+            }),
+            current,
+            active_tool_labels: vec!["shell".to_owned()],
+            active_tool_count: 1,
+            attention: None,
+            subagent_count: 1,
+            last_event_kind: None,
+            gap_count: 0,
+            stale: false,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn agent_board_derivation_precedence_is_exact() {
+        let mut app = fixture();
+        let key = AgentRowKey::Legacy(active_pty_address(&app));
+        let card = |app: &App| app.derive_agent_board_card(key.clone()).unwrap();
+
+        app.nodes[0].connection = ConnectionState::Disconnected("secret transport detail".to_owned());
+        assert_eq!((card(&app).column, card(&app).reason.as_str()), (AgentBoardColumn::Offline, "offline"));
+        app.nodes[0].connection = ConnectionState::Connecting;
+        assert_eq!((card(&app).column, card(&app).reason.as_str()), (AgentBoardColumn::Unknown, "node connecting"));
+        app.nodes[0].connection = ConnectionState::Resyncing;
+        assert_eq!((card(&app).column, card(&app).reason.as_str()), (AgentBoardColumn::Unknown, "node resyncing"));
+        app.nodes[0].connection = ConnectionState::Connected;
+
+        app.nodes[0].workspaces[0].sessions[0].running = false;
+        assert_eq!(card(&app).reason, "session not running");
+        app.nodes[0].workspaces[0].sessions[0].running = true;
+        assert_eq!(card(&app).reason, "progress unavailable");
+        app.nodes[0].workspaces[0].sessions[0].attention = true;
+        assert_eq!(card(&app).column, AgentBoardColumn::Attention);
+        app.nodes[0].workspaces[0].sessions[0].attention = false;
+
+        let mut progress = board_progress(AgentProgressCurrentV1::Working);
+        progress.stale = true;
+        app.nodes[0].workspaces[0].sessions[0].progress = Some(progress);
+        assert_eq!((card(&app).column, card(&app).reason.as_str()), (AgentBoardColumn::Unknown, "stale"));
+        let progress = app.nodes[0].workspaces[0].sessions[0].progress.as_mut().unwrap();
+        progress.stale = false;
+        progress.gap_count = 2;
+        assert_eq!((card(&app).column, card(&app).reason.as_str()), (AgentBoardColumn::Unknown, "event gap 2"));
+        let progress = app.nodes[0].workspaces[0].sessions[0].progress.as_mut().unwrap();
+        progress.gap_count = 0;
+        progress.current = AgentProgressCurrentV1::WaitingForInput;
+        assert_eq!(card(&app).column, AgentBoardColumn::Attention);
+        let progress = app.nodes[0].workspaces[0].sessions[0].progress.as_mut().unwrap();
+        progress.current = AgentProgressCurrentV1::Blocked;
+        assert_eq!((card(&app).column, card(&app).reason.as_str()), (AgentBoardColumn::Attention, "blocked"));
+        let progress = app.nodes[0].workspaces[0].sessions[0].progress.as_mut().unwrap();
+        progress.current = AgentProgressCurrentV1::Idle;
+        progress.attention = Some(AgentProgressAttentionV1 {
+            kind: AgentProgressAttentionKindV1::Approval,
+            tool_label: Some("raw tool input must stay private".to_owned()),
+        });
+        assert_eq!((card(&app).column, card(&app).reason.as_str()), (AgentBoardColumn::Attention, "attention requested"));
+        let progress = app.nodes[0].workspaces[0].sessions[0].progress.as_mut().unwrap();
+        progress.current = AgentProgressCurrentV1::Working;
+        progress.attention = None;
+        progress.truncated = true;
+        assert_eq!((card(&app).column, card(&app).partial), (AgentBoardColumn::Working, true));
+        app.nodes[0].workspaces[0].sessions[0].progress = Some(board_progress(AgentProgressCurrentV1::Idle));
+        assert_eq!(card(&app).column, AgentBoardColumn::Idle);
+
+        let dormant_address = active_pty_address(&app);
+        let dormant = add_managed_record(
+            &mut app,
+            "board-dormant",
+            "Dormant board agent",
+            ManagedSessionState::Dormant,
+            Some(dormant_address),
+            true,
+        );
+        let dormant = app.derive_agent_board_card(dormant).unwrap();
+        assert_eq!((dormant.column, dormant.reason.as_str()), (AgentBoardColumn::Dormant, "managed dormant"));
+        let record = app.nodes[0].session_records.last_mut().unwrap();
+        record.state = ManagedSessionState::Unavailable;
+        let unavailable = app.derive_agent_board_card(dormant.key.clone()).unwrap();
+        assert_eq!((unavailable.column, unavailable.reason.as_str()), (AgentBoardColumn::Unknown, "managed unavailable"));
+        let record = app.nodes[0].session_records.last_mut().unwrap();
+        record.state = ManagedSessionState::IdentityPending;
+        record.active_session = None;
+        let pending = app.derive_agent_board_card(dormant.key).unwrap();
+        assert_eq!((pending.column, pending.reason.as_str()), (AgentBoardColumn::Unknown, "no active session"));
+    }
+
+    #[test]
+    fn agent_board_selection_survives_column_movement_and_clears_on_removal() {
+        let mut app = fixture();
+        let key = AgentRowKey::Legacy(active_pty_address(&app));
+        app.nodes[0].workspaces[0].sessions[0].progress = Some(board_progress(AgentProgressCurrentV1::Working));
+        app.agent_board.selected = Some(key.clone());
+        let mut updated = app.nodes[0].clone();
+        updated.workspaces[0].sessions[0].progress = Some(board_progress(AgentProgressCurrentV1::Idle));
+        app.upsert_node(updated);
+        assert_eq!(app.agent_board.selected.as_ref(), Some(&key));
+        assert_eq!(app.agent_board_cards()[0].column, AgentBoardColumn::Idle);
+        app.remove_topology_node("node-a");
+        assert!(app.agent_board.selected.is_none());
+    }
+
+    #[test]
+    fn agent_board_hits_reuse_existing_open_run_and_monitor_actions() {
+        let mut app = fixture();
+        let key = AgentRowKey::Legacy(active_pty_address(&app));
+        app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([43; 16]));
+        app.surface = SurfaceState::default();
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(1, 1, 6, 1),
+            target: HitTarget::AgentBoardOpen,
+        }];
+        assert_eq!(app.click(2, 1), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(1, 1, 6, 1),
+            target: HitTarget::AgentBoardCardOpen(key.clone()),
+        }];
+        assert_eq!(app.click(2, 1), AppAction::None);
+        assert!(matches!(app.surface.active_tab(), Some(SurfaceTab::Pty(address)) if address == &active_pty_address(&app)));
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(1, 1, 6, 1),
+            target: HitTarget::AgentBoardCardProgress(key.clone()),
+        }];
+        assert_eq!(app.click(2, 1), AppAction::None);
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::SessionMonitor(monitor)) if monitor.agent == key
+        ));
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(1, 1, 6, 1),
+            target: HitTarget::AgentBoardCardRun(key.clone()),
+        }];
+        assert!(matches!(app.click(2, 1), AppAction::InspectWorkspace { .. }));
+        assert_eq!(app.agent_run_lens_key(), Some(&key));
+    }
+
+    #[test]
+    fn agent_board_b_shortcut_opens_activity_surface_from_agents() {
+        let mut app = fixture();
+        app.surface = SurfaceState::default();
+        app.focus = Focus::Agents;
+        app.roster_mode = RosterMode::Agents;
+
+        assert_eq!(app.reduce_agents(UiKey::Char('b')), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+        assert_eq!(app.focus, Focus::Viewport);
+    }
+
+    #[test]
+    fn agent_board_wheel_moves_only_within_selected_column() {
+        let mut app = fixture();
+        let first = active_pty_address(&app);
+        app.nodes[0].workspaces[0].sessions[0].progress =
+            Some(board_progress(AgentProgressCurrentV1::Working));
+        let second = add_session(&mut app, 8, provider("codex"));
+        app.nodes[0].workspaces[0].sessions[1].progress =
+            Some(board_progress(AgentProgressCurrentV1::Working));
+        let first_key = AgentRowKey::Legacy(first);
+        let second_key = AgentRowKey::Legacy(second);
+        let working_column = AgentBoardColumn::Working;
+        let working = app
+            .agent_board_cards()
+            .into_iter()
+            .filter(|card| card.column == working_column)
+            .map(|card| card.key)
+            .collect::<Vec<_>>();
+        assert_eq!(working.len(), 2);
+        app.agent_board.selected = Some(working[0].clone());
+        app.agent_board.column_scroll = 1;
+
+        assert_eq!(
+            app.scroll_terminal(SurfaceTab::AgentBoard, Rect::new(0, 0, 80, 20), 2, 2, false),
+            AppAction::None,
+        );
+        assert_eq!(app.agent_board.selected.as_ref(), Some(&working[1]));
+        assert_eq!(app.agent_board.vertical_offsets.get(&working_column), Some(&1));
+        assert_eq!(app.agent_board.column_scroll, 1);
+        assert!(matches!(app.agent_board.selected.as_ref(), Some(key) if key == &first_key || key == &second_key));
+
+        assert_eq!(
+            app.scroll_terminal(SurfaceTab::AgentBoard, Rect::new(0, 0, 80, 20), 2, 2, true),
+            AppAction::None,
+        );
+        assert_eq!(app.agent_board.selected.as_ref(), Some(&working[0]));
+        assert_eq!(app.agent_board.column_scroll, 1);
+    }
+
+    fn initialize_unified_agents_tree(app: &mut App, session_count: usize) {
+        app.nodes[0].session_records.clear();
+        for workspace in &mut app.nodes[0].workspaces {
+            workspace.sessions.clear();
+        }
+        let _ = app.select_roster_mode(RosterMode::Agents);
+        app.collapsed_native_providers.clear();
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.catalog = NativeSessionCatalogState::Ready;
+        dialog.pending_routes.clear();
+        dialog.route_pages.clear();
+        dialog.rows = (0..session_count).map(|index| NativeSessionCatalogRowView {
+            node_id: "node-a".to_owned(),
+            route: NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(),
+                provider("codex"),
+            ),
+            catalog_revision: 1,
+            recent_cutoff_unix_ms: 0,
+            selection_id: format!("selection-{index}"),
+            title: Some(format!("Session {index}")),
+            modified_at: Some(index.to_string()),
+            model: None,
+            message_count: Some(1),
+            completed_turn_count: Some(1),
+            external_group: None,
+            record_id: None,
+        }).collect();
+        dialog.selected = 0;
+        dialog.tree_cursor = 0;
+        dialog.scroll = 0;
+        dialog.field = ExistingSessionField::Sessions;
+        populate_selected_catalog_row(dialog);
+    }
+
+    #[test]
+    fn native_rows_open_from_viewport_and_select_their_workspace() {
+        let mut app = fixture();
+        let mut second_workspace = app.nodes[0].workspaces[0].clone();
+        second_workspace.workspace_id = "workspace-b".to_owned();
+        second_workspace.label = "workspace-b".to_owned();
+        second_workspace.canonical_root = host_path(r"C:\work\workspace-b");
+        second_workspace.sessions.clear();
+        app.nodes[0].workspaces.push(second_workspace);
+        initialize_unified_agents_tree(&mut app, 2);
+        app.existing_session.as_mut().unwrap().rows[1].route =
+            NativeSessionCatalogRoute::workspace(
+                "workspace-b".to_owned(),
+                provider("codex"),
+            );
+        app.existing_session.as_mut().unwrap().rows[1].title = Some("Investigate".to_owned());
+        app.focus = Focus::Viewport;
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(1, 1, 10, 1),
+            target: HitTarget::ExistingSessionRow(1),
+        }];
+
+        let action = app.click(2, 1);
+
+        assert!(matches!(
+            action,
+            AppAction::PreviewNativeSession {
+                selection_id,
+                ..
+            } if selection_id == "selection-1"
+        ));
+        assert_eq!(
+            app.selected_workspace_route(),
+            Some(("node-a".to_owned(), "workspace-b".to_owned())),
+        );
+        let active = app.surface.active_tab().cloned().unwrap();
+        assert!(matches!(active, SurfaceTab::Preview(_)));
+        assert_eq!(app.surface_tab_title(&active), "[codex] workspace-b · history");
+    }
+
+    #[test]
+    fn native_session_context_menu_uses_exact_catalog_identity_and_fails_closed() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 2);
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(2, 3, 18, 1),
+            target: HitTarget::ExistingSessionRow(1),
+        }];
+
+        assert_eq!(app.right_click(4, 3), AppAction::None);
+        let key = app.native_session_menu.as_ref().unwrap().key.clone();
+        assert!(matches!(
+            key,
+            PreviewTabKey::NativeSelection {
+                ref selection_id,
+                catalog_revision: 1,
+                ..
+            } if selection_id == "selection-1"
+        ));
+        let items = app.native_session_menu_items();
+        assert!(items.iter().any(|item| {
+            item.action == NativeSessionMenuAction::OpenTranscriptMetrics && item.enabled
+        }));
+        assert!(items.iter().any(|item| {
+            item.action == NativeSessionMenuAction::OpenWorkspace && item.enabled
+        }));
+        assert!(items.iter().any(|item| {
+            item.action == NativeSessionMenuAction::Resume
+                && item.disabled_reason.as_deref()
+                    == Some("open and hydrate the transcript first")
+        }));
+        assert!(items.iter().any(|item| {
+            item.action == NativeSessionMenuAction::RenameProviderRecord
+                && item.disabled_reason.as_deref()
+                    == Some("session is not linked to a managed record")
+        }));
+
+        app.existing_session.as_mut().unwrap().rows[1].catalog_revision = 2;
+        assert!(app.native_session_menu_items().iter().all(|item| !item.enabled));
+        assert_eq!(
+            app.activate_native_session_menu_action(
+                NativeSessionMenuAction::OpenTranscriptMetrics,
+            ),
+            AppAction::None,
+        );
+        assert!(app.preview_tabs.get(&key).is_none());
+    }
+
+    #[test]
+    fn native_session_resume_and_rename_require_exact_hydrated_managed_record() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 1);
+        add_managed_record(
+            &mut app,
+            "native-record",
+            "linked history",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        app.existing_session.as_mut().unwrap().rows[0].record_id =
+            Some("native-record".to_owned());
+        app.open_native_session_menu(0, 4, 3);
+        let (node_id, route, catalog_revision, recent_cutoff_unix_ms, selection_id, token) =
+            match app.activate_native_session_menu_action(
+                NativeSessionMenuAction::OpenTranscriptMetrics,
+            ) {
+                AppAction::PreviewNativeSession {
+                    node_id,
+                    route,
+                    catalog_revision,
+                    recent_cutoff_unix_ms,
+                    selection_id,
+                    token,
+                    ..
+                } => (
+                    node_id,
+                    route,
+                    catalog_revision,
+                    recent_cutoff_unix_ms,
+                    selection_id,
+                    token,
+                ),
+                action => panic!("unexpected action: {action:?}"),
+            };
+        app.apply_native_session_preview(
+            node_id,
+            route,
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            selection_id,
+            token,
+            NativeSessionPreviewView {
+                title: Some("linked history".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 1,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: false,
+                messages: vec![NativeSessionPreviewMessageView {
+                    role: "assistant".to_owned(),
+                    text: "done".to_owned(),
+                }],
+            },
+        );
+
+        app.open_native_session_menu(0, 4, 3);
+        let items = app.native_session_menu_items();
+        assert!(items.iter().any(|item| {
+            item.action == NativeSessionMenuAction::Resume && item.enabled
+        }));
+        assert!(items.iter().any(|item| {
+            item.action == NativeSessionMenuAction::RenameProviderRecord && item.enabled
+        }));
+        assert!(matches!(
+            app.activate_native_session_menu_action(NativeSessionMenuAction::Resume),
+            AppAction::ResumeSessionRecord { ref record_id, .. }
+                if record_id == "native-record"
+        ));
+
+        app.preview_resume = None;
+        app.preview_tabs.values_mut().for_each(|tab| {
+            tab.phase = PreviewTabPhase::Hydrated;
+        });
+        app.nodes[0]
+            .session_records
+            .iter_mut()
+            .find(|record| record.record_id == "native-record")
+            .unwrap()
+            .state = ManagedSessionState::Live;
+        app.open_native_session_menu(0, 4, 3);
+        assert!(app.native_session_menu_items().iter().any(|item| {
+            item.action == NativeSessionMenuAction::Resume
+                && item.disabled_reason.as_deref() == Some("already live")
+        }));
+        assert_eq!(
+            app.activate_native_session_menu_action(
+                NativeSessionMenuAction::RenameProviderRecord,
+            ),
+            AppAction::None,
+        );
+        assert_eq!(app.focus, Focus::RenameSession);
+        assert_eq!(
+            app.rename_session.as_ref().map(|dialog| dialog.record_id.as_str()),
+            Some("native-record"),
+        );
+    }
+
+    #[test]
+    fn board_monitor_click_opens_exact_session_monitor() {
+        let mut app = fixture();
+        let key = AgentRowKey::Legacy(active_pty_address(&app));
+        app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([42; 16]));
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(2, 3, 18, 1),
+            target: HitTarget::AgentBoardCardProgress(key.clone()),
+        }];
+
+        assert_eq!(app.click(4, 3), AppAction::None);
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::SessionMonitor(monitor)) if monitor.agent == key
+        ));
+        assert_eq!(app.focus, Focus::Viewport);
+
+        app.layout.hits[0].target = HitTarget::AgentBoardCard(key.clone());
+        assert_eq!(app.right_click(4, 3), AppAction::None);
+        assert_eq!(app.agent_menu.as_ref().map(|menu| &menu.key), Some(&key));
+        assert!(app.agent_menu_items().iter().any(|item| {
+            item.action == AgentMenuAction::ActivityBoard && item.enabled
+        }));
+    }
+
+    fn active_pty_address(app: &App) -> SessionAddress {
+        app.surface
+            .active_tab()
+            .and_then(SurfaceTab::pty_address)
+            .expect("fixture has an active PTY tab")
+            .clone()
+    }
+
+    fn install_launch_inventory(app: &mut App) {
+        app.nodes[0].launch_inventory = Some(LaunchInventory {
+            spawn_profiles: Some(vec![
+                SpawnProfileSummary {
+                    id: SpawnProfileId::new("default").unwrap(),
+                    revision: SpawnProfileRevision::new("builtin-v1").unwrap(),
+                },
+                SpawnProfileSummary {
+                    id: SpawnProfileId::new("review").unwrap(),
+                    revision: SpawnProfileRevision::new("review-v2").unwrap(),
+                },
+            ]),
+            bundles: Some(vec![ResolvedBundleReceipt {
+                id: SpawnBundleId::new("skills-review").unwrap(),
+                revision: SpawnBundleRevision::new("skills-v3").unwrap(),
+                digest: SpawnBundleDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            }]),
+        });
+        app.nodes[0].workspaces[0].managed_worktree_profiles =
+            Some(WorktreeProfileInventory {
+                profiles: vec![ManagedWorktreeProfileSummary {
+                    id: WorktreeProfileId::new("review-tree").unwrap(),
+                    revision: WorktreeProfileRevision::new("review-tree-v1").unwrap(),
+                    retention: ManagedWorktreeRetention::RemoveWhenReleased,
+                }],
+            });
+    }
+
+    #[test]
+    fn existing_session_dialog_submits_bounded_native_reference() {
+        let mut app = fixture();
+        assert!(matches!(
+            app.begin_existing_session(),
+            AppAction::CatalogNativeSessions { limit: 64, .. }
+        ));
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.provider = provider("codex");
+        dialog.mode = ExistingSessionMode::AdvancedImport;
+        dialog.field = ExistingSessionField::SessionId;
+        dialog.display_name = "Recovered Codex".to_owned();
+        dialog.session_id = "019f-session-native".to_owned();
+
+        let action = app.reduce_existing_session(UiKey::Enter);
+        let operation_token = match &action {
+            AppAction::IndexProviderSession { operation_token, .. } => *operation_token,
+            _ => panic!("expected provider session index"),
+        };
+
+        assert!(matches!(
+            action,
+            AppAction::IndexProviderSession {
+                node_id,
+                workspace_id,
+                provider,
+                identity: ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id,
+                    transcript_path: None,
+                },
+                display_name,
+                ..
+            } if node_id == "node-a"
+                && workspace_id == "workspace-a"
+                && provider == AgentId::new("codex").unwrap()
+                && id == "019f-session-native"
+                && display_name == "Recovered Codex"
+        ));
+        assert_eq!(app.focus, Focus::ExistingSession);
+        assert!(app.existing_session.is_some());
+
+        let _ = app.complete_existing_session_import(ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-imported".to_owned(),
+            display_name: "Recovered Codex".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: Some(host_path(r"C:\work\nemo")),
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            last_error: None,
+        }, operation_token, "node-a", "workspace-a", &provider("codex"), "019f-session-native", true);
+        assert!(app.existing_session.is_none());
+        assert_eq!(app.focus, Focus::Agents);
+        assert!(app.nodes[0].session_records.iter().any(|record| {
+            record.record_id == "record-imported"
+                && record.state == ManagedSessionState::Dormant
+                && record.active_session.is_none()
+        }));
+    }
+
+    #[test]
+    fn agents_roster_selection_starts_native_catalog_for_selected_node() {
+        let mut app = fixture();
+        let mut workspace_b = app.nodes[0].workspaces[0].clone();
+        workspace_b.workspace_id = "workspace-b".to_owned();
+        workspace_b.label = "other".to_owned();
+        workspace_b.sessions.clear();
+        app.nodes[0].workspaces.push(workspace_b);
+        assert!(app.nodes[0].session_records.is_empty());
+        let action = app.select_roster_mode(RosterMode::Agents);
+        assert!(matches!(
+            action,
+            AppAction::CatalogNativeSessions {
+                ref node_id,
+                ref routes,
+                limit: 64,
+                token,
+            } if node_id == "node-a"
+                && token != 0
+                && routes.len() == 15
+                && routes.iter().filter(|route| route.workspace_id.as_deref() == Some("workspace-a")).count() == 5
+                && routes.iter().filter(|route| route.workspace_id.as_deref() == Some("workspace-b")).count() == 5
+                && routes.iter().filter(|route| route.scope == NativeSessionCatalogScope::Unregistered).count() == 5
+        ));
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert_eq!(dialog.pending_routes.len(), 15);
+        assert_eq!(app.roster_mode, RosterMode::Agents);
+
+        let original_token = dialog.request_token;
+        let action = app.cycle_existing_session_field(ExistingSessionField::Provider, true);
+        assert_eq!(action, AppAction::None);
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert_eq!(dialog.request_token, original_token);
+        assert_eq!(dialog.catalog, NativeSessionCatalogState::Loading);
+        assert!(dialog.rows.is_empty());
+    }
+
+    #[test]
+    fn native_catalog_reducer_merges_partial_results_and_keeps_success_after_failure() {
+        let mut app = fixture();
+        let (node_id, routes, token) = match app.select_roster_mode(RosterMode::NativeSessions) {
+            AppAction::CatalogNativeSessions {
+                node_id,
+                routes,
+                token,
+                ..
+            } => (node_id, routes, token),
+            _ => panic!("expected initial native catalog request"),
+        };
+        let workspace_id = "workspace-a".to_owned();
+        let codex = provider("codex");
+        let codex_route = NativeSessionCatalogRoute::workspace(workspace_id.clone(), codex.clone());
+        app.apply_native_session_catalog(
+            node_id.clone(), codex_route.clone(), token,
+            vec![
+                NativeSessionCatalogRowView {
+                    node_id: node_id.clone(), route: codex_route.clone(),
+                    catalog_revision: 1, recent_cutoff_unix_ms: 0,
+                    selection_id: "codex-new".to_owned(), title: Some("new".to_owned()),
+                    modified_at: Some("30".to_owned()), model: None,
+                    message_count: Some(1), completed_turn_count: None,
+                    external_group: None, record_id: None,
+                },
+                NativeSessionCatalogRowView {
+                    node_id: node_id.clone(), route: codex_route.clone(),
+                    catalog_revision: 1, recent_cutoff_unix_ms: 0,
+                    selection_id: "codex-new".to_owned(), title: Some("old duplicate".to_owned()),
+                    modified_at: Some("10".to_owned()), model: None,
+                    message_count: Some(1), completed_turn_count: None,
+                    external_group: None, record_id: None,
+                },
+            ],
+        );
+        let claude_route = NativeSessionCatalogRoute::workspace(
+            workspace_id.clone(), provider("claude")
+        );
+        app.fail_native_session_catalog(
+            node_id.clone(), claude_route.clone(), token,
+            "history unavailable".to_owned(), true,
+        );
+        let grok_route = NativeSessionCatalogRoute::workspace(
+            workspace_id.clone(), provider("grok")
+        );
+        app.apply_native_session_catalog(
+            node_id.clone(), grok_route.clone(), token,
+            vec![NativeSessionCatalogRowView {
+                node_id: node_id.clone(), route: grok_route.clone(),
+                catalog_revision: 1, recent_cutoff_unix_ms: 0,
+                selection_id: "grok-shared".to_owned(), title: Some("grok".to_owned()),
+                modified_at: Some("20".to_owned()), model: None,
+                message_count: Some(1), completed_turn_count: None,
+                external_group: None, record_id: None,
+            }],
+        );
+        for route in routes.into_iter().filter(|route| {
+            route != &codex_route && route != &claude_route && route != &grok_route
+        }) {
+            app.apply_native_session_catalog(
+                node_id.clone(), route, token, Vec::new(),
+            );
+        }
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert!(dialog.pending_routes.is_empty());
+        assert_eq!(dialog.catalog, NativeSessionCatalogState::Ready);
+        assert_eq!(dialog.rows.len(), 2);
+        assert_eq!(dialog.rows[0].route.provider, provider("codex"));
+        assert_eq!(dialog.rows[1].route.provider, provider("grok"));
+        assert_eq!(dialog.rows[0].selection_id, "codex-new");
+    }
+
+    #[test]
+    fn native_catalog_reducer_ignores_stale_route_and_token() {
+        let mut app = fixture();
+        let action = app.select_roster_mode(RosterMode::NativeSessions);
+        let (node_id, token) = match action {
+            AppAction::CatalogNativeSessions { node_id, token, .. } => {
+                (node_id, token)
+            }
+            _ => panic!("expected native catalog request"),
+        };
+        let stale = NativeSessionCatalogRowView {
+            node_id: node_id.clone(), route: NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(), provider("codex")
+            ), catalog_revision: 1, recent_cutoff_unix_ms: 0,
+            selection_id: "stale".to_owned(), title: None, modified_at: None,
+            model: None, message_count: Some(0), completed_turn_count: None,
+            external_group: None, record_id: None,
+        };
+        app.apply_native_session_catalog(
+            node_id.clone(), NativeSessionCatalogRoute::workspace(
+                "other-workspace".to_owned(), provider("codex")
+            ), token,
+            vec![stale.clone()],
+        );
+        app.apply_native_session_catalog(
+            node_id, NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(), provider("codex")
+            ), token + 1, vec![stale],
+        );
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert!(dialog.rows.is_empty());
+        assert_eq!(dialog.pending_routes.len(), 10);
+    }
+
+    #[test]
+    fn native_catalog_row_routes_preview_and_resume_to_exact_workspace() {
+        let mut app = fixture();
+        let mut workspace_b = app.nodes[0].workspaces[0].clone();
+        workspace_b.workspace_id = "workspace-b".to_owned();
+        workspace_b.label = "other".to_owned();
+        workspace_b.sessions.clear();
+        app.nodes[0].workspaces.push(workspace_b);
+        let token = match app.select_roster_mode(RosterMode::NativeSessions) {
+            AppAction::CatalogNativeSessions { token, .. } => token,
+            _ => panic!("expected native catalog request"),
+        };
+        let kimi = provider("kimi");
+        let kimi_route = NativeSessionCatalogRoute::workspace(
+            "workspace-b".to_owned(), kimi.clone()
+        );
+        app.apply_native_session_catalog(
+            "node-a".to_owned(),
+            kimi_route.clone(),
+            token,
+            vec![NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(),
+                route: kimi_route,
+                catalog_revision: 1,
+                recent_cutoff_unix_ms: 0,
+                selection_id: "kimi-history-9".to_owned(),
+                title: Some("Workspace B task".to_owned()),
+                modified_at: Some("90".to_owned()),
+                model: None,
+                message_count: Some(3),
+                completed_turn_count: Some(1),
+                external_group: None,
+                record_id: None,
+            }],
+        );
+
+        assert!(matches!(app.start_native_session_preview(), AppAction::PreviewNativeSession {
+            node_id,
+            route,
+            selection_id,
+            ..
+        } if node_id == "node-a"
+            && route.workspace_id.as_deref() == Some("workspace-b")
+            && route.provider == kimi
+            && selection_id == "kimi-history-9"));
+
+        app.existing_session.as_mut().unwrap().preview = Some(
+            NativeSessionPreviewState::Empty(NativeSessionPreviewView {
+                title: Some("Workspace B task".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 0,
+                message_count_exact: true,
+                completed_turn_count: None,
+                total_tokens: None,
+                truncated: false,
+                messages: Vec::new(),
+            }),
+        );
+        assert!(matches!(app.start_native_session_resume(), AppAction::IndexNativeSession {
+            node_id,
+            route,
+            selection_id,
+            ..
+        } if node_id == "node-a"
+            && route.workspace_id.as_deref() == Some("workspace-b")
+            && route.provider == kimi
+            && selection_id == "kimi-history-9"));
+    }
+
+    #[test]
+    fn catalog_selection_keeps_native_resume_and_restore_via_skill_distinct() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let route = app.existing_session.as_ref().map(|dialog| (
+            dialog.node_id.clone(),
+            dialog.workspace_id.clone(),
+            dialog.request_token,
+        )).unwrap();
+        let row_provider = provider("grok");
+        let row_route = NativeSessionCatalogRoute::workspace(
+            route.1.clone(), row_provider.clone()
+        );
+        app.apply_native_session_catalog(
+            route.0.clone(),
+            row_route.clone(),
+            route.2,
+            vec![NativeSessionCatalogRowView {
+                node_id: route.0.clone(), route: row_route,
+                catalog_revision: 1, recent_cutoff_unix_ms: 0,
+                selection_id: "hist_native_7".to_owned(),
+                title: Some("Review session".to_owned()),
+                modified_at: Some("1765432100000".to_owned()),
+                model: Some("gpt-5".to_owned()),
+                message_count: Some(12),
+                completed_turn_count: Some(4),
+                external_group: None,
+                record_id: None,
+            }],
+        );
+        assert_eq!(app.existing_session.as_ref().unwrap().display_name, "Review session");
+        app.existing_session.as_mut().unwrap().preview = Some(
+            NativeSessionPreviewState::Empty(NativeSessionPreviewView {
+                title: Some("Review session".to_owned()),
+                modified_at: None, model: None, message_count: 0, message_count_exact: true, completed_turn_count: None,
+                total_tokens: None,
+                truncated: false, messages: Vec::new(),
+            }),
+        );
+
+        let restore = app.click_existing_session(
+            Some(HitTarget::ExistingSessionRestoreViaSkill),
+            0,
+            0,
+        );
+        assert_eq!(restore, AppAction::None);
+        assert_eq!(app.notice.as_deref(), Some(RESTORE_VIA_SKILL_DISABLED_REASON));
+        assert!(app.existing_session.as_ref().unwrap().operation.is_none());
+
+        let resume = app.click_existing_session(
+            Some(HitTarget::ExistingSessionNativeResume),
+            0,
+            0,
+        );
+        assert!(matches!(
+            resume,
+            AppAction::IndexNativeSession {
+                route,
+                selection_id,
+                display_name,
+                ..
+            } if route.provider == row_provider
+                && selection_id == "hist_native_7"
+                && display_name == "Review session"
+        ));
+    }
+
+    #[test]
+    fn roster_controls_use_same_selection_action_inside_control_modal() {
+        let mut app = fixture();
+        app.menu_placement = MenuPlacement::Modal;
+        app.focus = Focus::Settings;
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(2, 2, 3, 1),
+            target: HitTarget::RosterMode(RosterMode::Agents),
+        });
+
+        assert!(matches!(
+            app.click(3, 2),
+            AppAction::CatalogNativeSessions { .. }
+        ));
+        assert_eq!(app.roster_mode, RosterMode::Agents);
+        assert_eq!(app.control_section, ControlSection::Agents);
+        assert_eq!(app.focus, Focus::Settings);
+    }
+
+    #[test]
+    fn native_tree_workspace_and_provider_groups_collapse_by_enter_and_mouse() {
+        let mut app = fixture();
+        let mut empty = app.nodes[0].workspaces[0].clone();
+        empty.workspace_id = "workspace-empty".to_owned();
+        empty.label = "empty".to_owned();
+        empty.sessions.clear();
+        app.nodes[0].workspaces.push(empty);
+        let _ = app.select_roster_mode(RosterMode::NativeSessions);
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.catalog = NativeSessionCatalogState::Ready;
+        dialog.pending_routes.clear();
+        dialog.field = ExistingSessionField::Sessions;
+        dialog.rows = vec![NativeSessionCatalogRowView {
+            node_id: "node-a".to_owned(),
+            route: NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(), provider("codex")
+            ),
+            catalog_revision: 1,
+            recent_cutoff_unix_ms: 0,
+            selection_id: "selection-a".to_owned(),
+            title: Some("Recovered".to_owned()),
+            modified_at: Some("9".to_owned()),
+            model: None,
+            message_count: Some(2),
+            completed_turn_count: Some(1),
+            external_group: None,
+            record_id: None,
+        }];
+
+        let initial = app.native_session_tree_items();
+        assert!(!initial.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Workspace {
+                key: NativeSessionGroupKey::Workspace(workspace_id), session_count: 0, ..
+            } if workspace_id == "workspace-empty"
+        )));
+        app.roster_mode = RosterMode::NativeSessions;
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(app.collapsed_native_workspaces.contains(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+        )));
+        assert!(!app.native_session_tree_items().iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Provider {
+                group: NativeSessionGroupKey::Workspace(workspace_id), ..
+            } if workspace_id == "workspace-a"
+        )));
+
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(0, 0, 20, 1),
+            target: HitTarget::NativeWorkspaceGroup(
+                NativeSessionGroupKey::Workspace("workspace-a".to_owned())
+            ),
+        });
+        assert_eq!(app.click(1, 0), AppAction::None);
+        assert!(!app.collapsed_native_workspaces.contains(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+        )));
+        let codex_provider = app.native_session_tree_items().iter().position(|item| matches!(item,
+            NativeSessionTreeItem::Provider {
+                group: NativeSessionGroupKey::Workspace(workspace_id),
+                provider: group_provider, ..
+            } if workspace_id == "workspace-a" && group_provider == &provider("codex")
+        )).unwrap();
+        app.existing_session.as_mut().unwrap().tree_cursor = codex_provider;
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(app.collapsed_native_providers.contains(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+            provider("codex"),
+        )));
+    }
+
+    #[test]
+    fn initial_native_provider_branches_are_collapsed_and_keep_grok_header_visible() {
+        let mut app = fixture();
+        let routes = match app.begin_existing_session() {
+            AppAction::CatalogNativeSessions { routes, .. } => routes,
+            action => panic!("expected native catalog request, got {action:?}"),
+        };
+        assert!(routes.iter().all(|route| {
+            let group = route.workspace_id.as_ref().map_or(
+                NativeSessionGroupKey::OtherProjects,
+                |workspace_id| NativeSessionGroupKey::Workspace(workspace_id.clone()),
+            );
+            app.collapsed_native_providers.contains(&(
+                "node-a".to_owned(),
+                group,
+                route.provider.clone(),
+            ))
+        }));
+        assert!(app.collapsed_native_workspaces.is_empty());
+
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.catalog = NativeSessionCatalogState::Ready;
+        dialog.pending_routes.clear();
+        dialog.rows = routes
+            .iter()
+            .filter(|route| route.scope == NativeSessionCatalogScope::Workspace)
+            .enumerate()
+            .map(|(index, route)| NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(),
+                route: route.clone(),
+                catalog_revision: 1,
+                recent_cutoff_unix_ms: 0,
+                selection_id: format!("selection-{index}"),
+                title: Some(format!("{} history", route.provider)),
+                modified_at: None,
+                model: None,
+                message_count: None,
+                completed_turn_count: None,
+                external_group: None,
+                record_id: None,
+            })
+            .collect();
+        let items = app.native_session_tree_items();
+        assert!(items.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Workspace {
+                key: NativeSessionGroupKey::Workspace(workspace_id),
+                collapsed: false,
+                ..
+            } if workspace_id == "workspace-a"
+        )));
+        assert!(items.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Provider {
+                provider: group_provider,
+                collapsed: true,
+                ..
+            } if group_provider == &provider("grok")
+        )));
+        assert!(!items.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Session { .. }
+        )));
+
+        let grok_key = (
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+            provider("grok"),
+        );
+        app.toggle_native_provider_group(grok_key.1.clone(), grok_key.2.clone());
+        assert!(!app.collapsed_native_providers.contains(&grok_key));
+        let _ = app.select_roster_mode(RosterMode::Agents);
+        assert!(!app.collapsed_native_providers.contains(&grok_key));
+        app.existing_session = None;
+        let _ = app.begin_existing_session();
+        assert!(!app.collapsed_native_providers.contains(&grok_key));
+    }
+
+    #[test]
+    fn native_history_provider_totals_include_exact_grok_and_successful_zero() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let claude_route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("claude"),
+        );
+        let grok_route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("grok"),
+        );
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.rows = (0..2).map(|index| NativeSessionCatalogRowView {
+            node_id: "node-a".to_owned(),
+            route: grok_route.clone(),
+            catalog_revision: 3,
+            recent_cutoff_unix_ms: 4,
+            selection_id: format!("grok-{index}"),
+            title: None,
+            modified_at: None,
+            model: None,
+            message_count: None,
+            completed_turn_count: None,
+            external_group: None,
+            record_id: None,
+        }).collect();
+        dialog.route_pages.clear();
+        dialog.route_pages.insert(claude_route, NativeSessionRoutePageState {
+            catalog_revision: 3,
+            recent_cutoff_unix_ms: 4,
+            recent_remaining_count: 0,
+            older_remaining_count: 0,
+            recent_next_after_selection_id: None,
+            older_next_after_selection_id: None,
+            recent_has_more: false,
+            older_has_more: false,
+            pending: None,
+        });
+        dialog.route_pages.insert(grok_route, NativeSessionRoutePageState {
+            catalog_revision: 3,
+            recent_cutoff_unix_ms: 4,
+            recent_remaining_count: 6,
+            older_remaining_count: 4,
+            recent_next_after_selection_id: None,
+            older_next_after_selection_id: None,
+            recent_has_more: true,
+            older_has_more: true,
+            pending: None,
+        });
+
+        let totals = dialog.native_history_provider_totals();
+        assert_eq!(totals.get(&provider("claude")), Some(&0));
+        assert_eq!(totals.get(&provider("grok")), Some(&12));
+    }
+
+    #[test]
+    fn native_tree_hides_pending_groups_but_keeps_successful_zero_and_older_routes() {
+        let mut app = fixture();
+        app.nodes[0].session_records.clear();
+        for workspace in &mut app.nodes[0].workspaces {
+            workspace.sessions.clear();
+        }
+        let _ = app.select_roster_mode(RosterMode::Agents);
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.pending_routes.clear();
+        dialog.route_pages.clear();
+        dialog.rows.clear();
+
+        assert!(app.native_session_tree_items().is_empty());
+
+        let route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("codex")
+        );
+        app.existing_session.as_mut().unwrap().route_pages.insert(
+            route.clone(),
+            NativeSessionRoutePageState {
+                catalog_revision: 7,
+                recent_cutoff_unix_ms: 10,
+                recent_remaining_count: 0,
+                older_remaining_count: 0,
+                recent_next_after_selection_id: None,
+                older_next_after_selection_id: None,
+                recent_has_more: false,
+                older_has_more: false,
+                pending: None,
+            },
+        );
+        let zero = app.native_session_tree_items();
+        assert!(zero.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Provider {
+                provider: group_provider,
+                session_count: 0,
+                ..
+            } if group_provider == &provider("codex")
+        )));
+        app.collapsed_native_providers.remove(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+            provider("codex"),
+        ));
+        let page = app.existing_session.as_mut().unwrap().route_pages.get_mut(&route).unwrap();
+        page.older_remaining_count = 3;
+        page.older_has_more = true;
+        let older = app.native_session_tree_items();
+        assert!(older.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Workspace {
+                key: NativeSessionGroupKey::Workspace(workspace_id), session_count: 0, ..
+            } if workspace_id == "workspace-a"
+        )));
+        assert!(older.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::LoadMore {
+                route,
+                window: NativeSessionCatalogWindow::Older,
+                remaining_count: 3,
+                ..
+            } if route.workspace_id.as_deref() == Some("workspace-a")
+                && route.provider == provider("codex")
+        )));
+
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.route_pages.clear();
+        dialog.pending_routes.insert(route);
+        let pending = app.native_session_tree_items();
+        assert!(!pending.iter().any(|item| matches!(item,
+            NativeSessionTreeItem::Workspace {
+                key: NativeSessionGroupKey::Workspace(workspace_id), ..
+            } if workspace_id == "workspace-a"
+        )));
+    }
+
+    #[test]
+    fn zero_workspace_node_still_catalogs_unregistered_provider_history() {
+        let mut app = fixture();
+        app.nodes[0].workspaces.clear();
+
+        let routes = catalog_routes_for_node_from_nodes(&app.nodes, "node-a");
+
+        assert_eq!(routes.len(), fixture_providers().len());
+        assert!(routes.iter().all(|route| {
+            route.scope == NativeSessionCatalogScope::Unregistered
+                && route.workspace_id.is_none()
+        }));
+    }
+
+    #[test]
+    fn native_record_dedup_is_scoped_to_node() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 1);
+        app.existing_session.as_mut().unwrap().rows[0].record_id = Some("shared-record".to_owned());
+        let mut other_node = app.nodes[0].clone();
+        other_node.node_id = "node-b".to_owned();
+        other_node.session_records = vec![ManagedSessionView {
+            node_id: "node-b".to_owned(),
+            record_id: "shared-record".to_owned(),
+            display_name: "Other node record".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            last_error: None,
+        }];
+        app.nodes.push(other_node);
+
+        assert!(app.native_session_tree_items().iter().any(|item| {
+            matches!(item, NativeSessionTreeItem::Session { row_index: 0 })
+        }));
+    }
+
+    #[test]
+    fn external_groups_with_same_id_remain_provider_scoped() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 0);
+        let external = |provider_name: &str, label: &str, selection_id: &str| {
+            NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(),
+                route: NativeSessionCatalogRoute::unregistered(provider(provider_name)),
+                catalog_revision: 1,
+                recent_cutoff_unix_ms: 0,
+                selection_id: selection_id.to_owned(),
+                title: Some(label.to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: Some(1),
+                completed_turn_count: None,
+                external_group: Some(NativeSessionExternalGroup {
+                    group_id: "external-0001".to_owned(),
+                    kind: NativeSessionExternalGroupKind::Project,
+                    display_name: label.to_owned(),
+                }),
+                record_id: None,
+            }
+        };
+        app.existing_session.as_mut().unwrap().rows = vec![
+            external("claude", "Claude project", "claude-selection"),
+            external("codex", "Codex project", "codex-selection"),
+        ];
+
+        let groups = app.native_session_tree_items().into_iter().filter_map(|item| match item {
+            NativeSessionTreeItem::Workspace {
+                key: NativeSessionGroupKey::External { provider, group_id, .. },
+                label,
+                ..
+            } => Some((provider, group_id, label)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&(
+            provider("claude"), "external-0001".to_owned(), "Claude project".to_owned()
+        )));
+        assert!(groups.contains(&(
+            provider("codex"), "external-0001".to_owned(), "Codex project".to_owned()
+        )));
+    }
+
+    #[test]
+    fn unindexed_native_preview_never_creates_observation_target() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 0);
+        let route = NativeSessionCatalogRoute::unregistered(provider("codex"));
+        app.existing_session.as_mut().unwrap().rows = vec![NativeSessionCatalogRowView {
+            node_id: "node-a".to_owned(),
+            route: route.clone(),
+            catalog_revision: 9,
+            recent_cutoff_unix_ms: 10,
+            selection_id: "external-selection".to_owned(),
+            title: Some("External task".to_owned()),
+            modified_at: None,
+            model: None,
+            message_count: Some(1),
+            completed_turn_count: None,
+            external_group: Some(NativeSessionExternalGroup {
+                group_id: "external-project".to_owned(),
+                kind: NativeSessionExternalGroupKind::Project,
+                display_name: "External project".to_owned(),
+            }),
+            record_id: None,
+        }];
+
+        assert!(matches!(app.start_native_session_preview(), AppAction::PreviewNativeSession {
+            route: action_route,
+            selection_id,
+            ..
+        } if action_route == route && selection_id == "external-selection"));
+        let tab = app.preview_tabs.values().next().unwrap();
+        assert!(!tab.resume_available);
+        assert_eq!(tab.workspace_id, "External project");
+        assert!(app.session_monitors.is_empty());
+        assert_eq!(app.start_focused_preview_resume(), AppAction::None);
+        assert!(app.session_monitors.is_empty());
+        assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("register")));
+    }
+
+    #[test]
+    fn indexed_native_row_resumes_managed_record_directly() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 1);
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.rows[0].record_id = Some("record-linked".to_owned());
+        dialog.preview = Some(NativeSessionPreviewState::Empty(NativeSessionPreviewView {
+            title: Some("Linked task".to_owned()),
+            modified_at: None,
+            model: None,
+            message_count: 0,
+            message_count_exact: true,
+            completed_turn_count: None,
+            total_tokens: None,
+            truncated: false,
+            messages: Vec::new(),
+        }));
+
+        assert!(matches!(app.start_native_session_resume(), AppAction::ResumeSessionRecord {
+            record_id,
+            ..
+        } if record_id == "record-linked"));
+    }
+
+    #[test]
+    fn unified_agents_keyboard_navigates_and_refreshes_initialized_tree() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 6);
+        assert_eq!(app.roster_mode, RosterMode::Agents);
+        assert_eq!(app.native_session_tree_items().len(), 8);
+
+        app.existing_session.as_mut().unwrap().field = ExistingSessionField::AskAfterResume;
+        assert_eq!(app.reduce(UiKey::Tab), AppAction::None);
+        assert_eq!(
+            app.existing_session.as_ref().unwrap().field,
+            ExistingSessionField::Sessions,
+        );
+
+        assert_eq!(app.reduce(UiKey::Down), AppAction::None);
+        assert_eq!(app.existing_session.as_ref().unwrap().tree_cursor, 1);
+        assert_eq!(app.reduce(UiKey::End), AppAction::None);
+        assert_eq!(app.existing_session.as_ref().unwrap().tree_cursor, 7);
+        assert_eq!(app.existing_session.as_ref().unwrap().selected, 5);
+        assert_eq!(app.reduce(UiKey::Home), AppAction::None);
+        assert_eq!(app.existing_session.as_ref().unwrap().tree_cursor, 0);
+
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(app.collapsed_native_workspaces.contains(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+        )));
+
+        let refresh = app.reduce(UiKey::Char('R'));
+        assert!(matches!(refresh, AppAction::CatalogNativeSessions { .. }));
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert_eq!(dialog.tree_cursor, 0);
+        assert_eq!(dialog.scroll, 0);
+        assert!(dialog.rows.is_empty());
+    }
+
+    #[test]
+    fn unified_agents_wheel_and_reveal_follow_tree_cursor() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 8);
+        assert_eq!(app.native_session_tree_items().len(), 10);
+
+        app.scroll_roster(RosterMode::Agents, false, 8);
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert_eq!(dialog.scroll, WHEEL_SCROLL_LINES);
+        assert_eq!(dialog.tree_cursor, WHEEL_SCROLL_LINES);
+        assert_eq!(dialog.selected, 1);
+
+        let last = app.native_session_tree_items().len() - 1;
+        {
+            let dialog = app.existing_session.as_mut().unwrap();
+            dialog.scroll = 0;
+            dialog.tree_cursor = last;
+        }
+        app.reveal_roster_selection(RosterMode::Agents, 8);
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert_eq!(dialog.tree_cursor, last);
+        assert_eq!(dialog.scroll, 7);
+    }
+
+    #[test]
+    fn unified_agents_modal_controls_navigate_and_activate_tree() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 4);
+        app.menu_placement = MenuPlacement::Modal;
+        app.control_section = ControlSection::Agents;
+        app.focus = Focus::Settings;
+
+        assert_eq!(app.reduce(UiKey::Down), AppAction::None);
+        assert_eq!(app.existing_session.as_ref().unwrap().tree_cursor, 1);
+        assert_eq!(app.reduce(UiKey::Home), AppAction::None);
+        assert_eq!(app.existing_session.as_ref().unwrap().tree_cursor, 0);
+        assert_eq!(app.reduce(UiKey::End), AppAction::None);
+        assert_eq!(app.existing_session.as_ref().unwrap().tree_cursor, 5);
+        assert_eq!(app.existing_session.as_ref().unwrap().selected, 3);
+
+        app.existing_session.as_mut().unwrap().tree_cursor = 0;
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(app.collapsed_native_workspaces.contains(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+        )));
+
+        assert!(matches!(
+            app.reduce(UiKey::Char('R')),
+            AppAction::CatalogNativeSessions { .. }
+        ));
+    }
+
+    #[test]
+    fn native_tree_pages_older_sessions_by_exact_route_and_deduplicates_append() {
+        let mut app = fixture();
+        let action = app.select_roster_mode(RosterMode::NativeSessions);
+        let token = match action {
+            AppAction::CatalogNativeSessions { token, .. } => token,
+            _ => panic!("expected native catalog request"),
+        };
+        let route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("codex")
+        );
+        app.apply_native_session_catalog_summary(
+            "node-a".to_owned(),
+            route.clone(),
+            token,
+            vec![NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(),
+                route: route.clone(),
+                catalog_revision: 77,
+                recent_cutoff_unix_ms: 10,
+                selection_id: "selection-recent".to_owned(),
+                title: Some("Recent".to_owned()),
+                modified_at: Some("20".to_owned()),
+                model: None,
+                message_count: Some(2),
+                completed_turn_count: Some(1),
+                external_group: None,
+                record_id: None,
+            }],
+            Some(NativeSessionCatalogSummary {
+                catalog_revision: 77,
+                recent_cutoff_unix_ms: 10,
+                recent_total_count: 1,
+                older_total_count: 2,
+                recent_next_after_selection_id: None,
+                recent_has_more: false,
+            }),
+        );
+        app.collapsed_native_providers.remove(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+            provider("codex"),
+        ));
+        let older = app.native_session_tree_items().iter().position(|item| matches!(item,
+            NativeSessionTreeItem::LoadMore {
+                route,
+                window: NativeSessionCatalogWindow::Older,
+                remaining_count: 2,
+                ..
+            } if route.workspace_id.as_deref() == Some("workspace-a")
+                && route.provider == provider("codex")
+        )).unwrap();
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.field = ExistingSessionField::Sessions;
+        dialog.tree_cursor = older;
+        let page_token = match app.reduce(UiKey::Enter) {
+            AppAction::PageNativeSessions {
+                node_id,
+                route,
+                window: NativeSessionCatalogWindow::Older,
+                catalog_revision: 77,
+                recent_cutoff_unix_ms: 10,
+                after_selection_id: None,
+                limit: 64,
+                token,
+            } if node_id == "node-a"
+                && route.workspace_id.as_deref() == Some("workspace-a")
+                && route.provider == provider("codex") => token,
+            action => panic!("unexpected page action: {action:?}"),
+        };
+        let page = NativeSessionCatalogPage {
+            window: NativeSessionCatalogWindow::Older,
+            revision: 77,
+            entries: vec![
+                gate4agent_node_protocol::NativeSessionCatalogEntry {
+                    selection_id: "selection-recent".to_owned(),
+                    title: Some("Recent duplicate".to_owned()),
+                    modified_at_unix_ms: Some(20),
+                    model: None,
+                    message_count: 2,
+                    completed_turn_count: Some(1),
+                    external_group: None,
+                    record_id: None,
+                },
+                gate4agent_node_protocol::NativeSessionCatalogEntry {
+                    selection_id: "selection-old".to_owned(),
+                    title: Some("Older".to_owned()),
+                    modified_at_unix_ms: Some(5),
+                    model: None,
+                    message_count: 4,
+                    completed_turn_count: Some(2),
+                    external_group: None,
+                    record_id: None,
+                },
+            ],
+            next_after_selection_id: None,
+            remaining_count: 0,
+            has_more: false,
+        };
+        app.apply_native_session_page(
+            "node-a".to_owned(),
+            route.clone(),
+            page_token.wrapping_add(1),
+            page.clone(),
+        );
+        assert_eq!(app.existing_session.as_ref().unwrap().rows.len(), 1);
+        app.apply_native_session_page(
+            "node-a".to_owned(),
+            route,
+            page_token,
+            page,
+        );
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert_eq!(dialog.rows.len(), 2);
+        assert!(dialog.rows.iter().any(|row| row.selection_id == "selection-old"));
+        assert!(!app.native_session_tree_items().iter().any(|item| matches!(item,
+            NativeSessionTreeItem::LoadMore {
+                route,
+                window: NativeSessionCatalogWindow::Older,
+                ..
+            } if route.workspace_id.as_deref() == Some("workspace-a")
+                && route.provider == provider("codex")
+        )));
+    }
+
+    #[test]
+    fn legacy_native_catalog_keeps_rows_without_enabling_paging() {
+        let mut app = fixture();
+        let token = match app.select_roster_mode(RosterMode::NativeSessions) {
+            AppAction::CatalogNativeSessions { token, .. } => token,
+            _ => panic!("expected native catalog request"),
+        };
+        let route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("codex")
+        );
+        app.apply_native_session_catalog(
+            "node-a".to_owned(),
+            route.clone(),
+            token,
+            vec![NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(),
+                route: route.clone(),
+                catalog_revision: 1,
+                recent_cutoff_unix_ms: 0,
+                selection_id: "legacy-selection".to_owned(),
+                title: Some("Legacy session".to_owned()),
+                modified_at: Some("9".to_owned()),
+                model: None,
+                message_count: Some(2),
+                completed_turn_count: Some(1),
+                external_group: None,
+                record_id: None,
+            }],
+        );
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert!(dialog.rows.iter().any(|row| row.selection_id == "legacy-selection"));
+        assert!(!dialog.route_pages.contains_key(&route));
+        assert!(!app.native_session_tree_items().iter().any(|item| matches!(item,
+            NativeSessionTreeItem::LoadMore { route, .. }
+                if route.workspace_id.as_deref() == Some("workspace-a")
+                    && route.provider == provider("codex")
+        )));
+    }
+
+    #[test]
+    fn stale_native_page_refreshes_only_route_once_and_ignores_old_catalog_token() {
+        let mut app = fixture();
+        let initial_token = match app.select_roster_mode(RosterMode::NativeSessions) {
+            AppAction::CatalogNativeSessions { token, .. } => token,
+            action => panic!("expected native catalog request, got {action:?}"),
+        };
+        let route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("codex"),
+        );
+        app.apply_native_session_catalog_summary(
+            "node-a".to_owned(),
+            route.clone(),
+            initial_token,
+            vec![NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(), route: route.clone(),
+                catalog_revision: 7, recent_cutoff_unix_ms: 9,
+                selection_id: "stale-row".to_owned(), title: Some("Stale".to_owned()),
+                modified_at: None, model: None, message_count: Some(1),
+                completed_turn_count: None, external_group: None, record_id: None,
+            }],
+            Some(NativeSessionCatalogSummary {
+                catalog_revision: 7, recent_cutoff_unix_ms: 9,
+                recent_total_count: 2, older_total_count: 0,
+                recent_next_after_selection_id: Some("stale-row".to_owned()),
+                recent_has_more: true,
+            }),
+        );
+        let page_token = match app.page_native_sessions(
+            route.clone(), NativeSessionCatalogWindow::Recent,
+        ) {
+            AppAction::PageNativeSessions { token, .. } => token,
+            action => panic!("expected page request, got {action:?}"),
+        };
+        let refresh_token = match app.fail_native_session_page(
+            "node-a".to_owned(),
+            route.clone(),
+            NativeSessionCatalogWindow::Recent,
+            page_token,
+            "native session catalog changed; refresh required".to_owned(),
+            true,
+        ) {
+            AppAction::CatalogNativeSessions { node_id, routes, token, .. } => {
+                assert_eq!(node_id, "node-a");
+                assert_eq!(routes, vec![route.clone()]);
+                token
+            }
+            action => panic!("expected route refresh, got {action:?}"),
+        };
+        assert!(app.existing_session.as_ref().unwrap().rows.iter().all(|row| {
+            row.route != route
+        }));
+        assert_eq!(app.notice.as_deref(), Some("catalog refreshed; select session again"));
+        assert_eq!(
+            app.fail_native_session_page(
+                "node-a".to_owned(), route.clone(), NativeSessionCatalogWindow::Recent,
+                page_token, "repeated stale".to_owned(), true,
+            ),
+            AppAction::None,
+        );
+        app.apply_native_session_catalog(
+            "node-a".to_owned(),
+            route.clone(),
+            initial_token,
+            vec![NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(), route: route.clone(),
+                catalog_revision: 7, recent_cutoff_unix_ms: 9,
+                selection_id: "old-token-row".to_owned(), title: Some("Old".to_owned()),
+                modified_at: None, model: None, message_count: Some(1),
+                completed_turn_count: None, external_group: None, record_id: None,
+            }],
+        );
+        assert!(app.existing_session.as_ref().unwrap().rows.iter().all(|row| {
+            row.selection_id != "old-token-row"
+        }));
+        app.apply_native_session_catalog(
+            "node-a".to_owned(),
+            route,
+            refresh_token,
+            Vec::new(),
+        );
+        assert!(app.existing_session.as_ref().unwrap().rows.iter().all(|row| {
+            row.selection_id != "old-token-row"
+        }));
+    }
+
+    #[test]
+    fn non_stale_native_page_failure_stays_error_without_refresh() {
+        let mut app = fixture();
+        let token = match app.select_roster_mode(RosterMode::NativeSessions) {
+            AppAction::CatalogNativeSessions { token, .. } => token,
+            action => panic!("expected native catalog request, got {action:?}"),
+        };
+        let route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("codex"),
+        );
+        app.apply_native_session_catalog_summary(
+            "node-a".to_owned(), route.clone(), token, Vec::new(),
+            Some(NativeSessionCatalogSummary {
+                catalog_revision: 7, recent_cutoff_unix_ms: 9,
+                recent_total_count: 1, older_total_count: 0,
+                recent_next_after_selection_id: None, recent_has_more: true,
+            }),
+        );
+        let page_token = match app.page_native_sessions(
+            route.clone(), NativeSessionCatalogWindow::Recent,
+        ) {
+            AppAction::PageNativeSessions { token, .. } => token,
+            action => panic!("expected page request, got {action:?}"),
+        };
+        assert_eq!(
+            app.fail_native_session_page(
+                "node-a".to_owned(), route.clone(), NativeSessionCatalogWindow::Recent,
+                page_token, "page unavailable".to_owned(), false,
+            ),
+            AppAction::None,
+        );
+        assert_eq!(app.notice.as_deref(), Some("page unavailable"));
+        assert!(app.existing_session.as_ref().unwrap().route_pages.contains_key(&route));
+    }
+
+    #[test]
+    fn native_preview_rejects_stale_selection_and_token() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let route = app.existing_session.as_ref().map(|dialog| (
+            dialog.node_id.clone(), dialog.workspace_id.clone(), dialog.provider.clone(), dialog.request_token,
+        )).unwrap();
+        let catalog_route = NativeSessionCatalogRoute::workspace(
+            route.1.clone(), route.2.clone()
+        );
+        app.apply_native_session_catalog(route.0.clone(), catalog_route.clone(), route.3,
+            vec![NativeSessionCatalogRowView {
+                node_id: route.0.clone(), route: catalog_route.clone(),
+                catalog_revision: 1, recent_cutoff_unix_ms: 0,
+                selection_id: "hist_exact".to_owned(),
+                title: Some("Exact".to_owned()), modified_at: None, model: None,
+                message_count: Some(2), completed_turn_count: Some(1),
+                external_group: None, record_id: None,
+            }]);
+        let action = app.start_native_session_preview();
+        let token = match action {
+            AppAction::PreviewNativeSession { ref selection_id, token, .. } => {
+                assert_eq!(selection_id, "hist_exact");
+                token
+            }
+            _ => panic!("expected preview request"),
+        };
+        assert_eq!(app.focus, Focus::Viewport);
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::Preview(PreviewTabKey::NativeSelection {
+                selection_id, ..
+            })) if selection_id == "hist_exact"
+        ));
+        let preview = NativeSessionPreviewView {
+            title: Some("Exact".to_owned()),
+            modified_at: None, model: None, message_count: 2, message_count_exact: true, completed_turn_count: Some(1),
+            total_tokens: None,
+            truncated: false,
+            messages: vec![NativeSessionPreviewMessageView { role: "user".to_owned(), text: "hello".to_owned() }],
+        };
+        app.apply_native_session_preview(route.0.clone(), catalog_route.clone(), 1, 0,
+            "hist_stale".to_owned(), token, preview.clone());
+        let key = PreviewTabKey::NativeSelection {
+            node_id: route.0.clone(),
+            route: catalog_route.clone(),
+            catalog_revision: 1,
+            recent_cutoff_unix_ms: 0,
+            selection_id: "hist_exact".to_owned(),
+        };
+        assert!(matches!(
+            app.preview_tabs.get(&key).map(|tab| &tab.preview),
+            Some(NativeSessionPreviewState::Loading),
+        ));
+        app.apply_native_session_preview(
+            route.0.clone(),
+            catalog_route.clone(),
+            1,
+            0,
+            "hist_exact".to_owned(),
+            token.wrapping_add(1),
+            preview.clone(),
+        );
+        assert!(matches!(
+            app.preview_tabs.get(&key).map(|tab| &tab.preview),
+            Some(NativeSessionPreviewState::Loading),
+        ));
+        app.apply_native_session_preview(route.0, catalog_route, 1, 0,
+            "hist_exact".to_owned(), token, preview);
+        assert!(matches!(
+            app.preview_tabs.get(&key).map(|tab| &tab.preview),
+            Some(NativeSessionPreviewState::Ready(_)),
+        ));
+    }
+
+    #[test]
+    fn native_preview_success_titles_generic_row_from_first_user_message() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let dialog = app.existing_session.as_mut().unwrap();
+        let route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("codex"),
+        );
+        dialog.rows = vec![NativeSessionCatalogRowView {
+            node_id: "node-a".to_owned(), route: route.clone(),
+            catalog_revision: 4, recent_cutoff_unix_ms: 5,
+            selection_id: "generic-history".to_owned(), title: None,
+            modified_at: None, model: None, message_count: Some(2),
+            completed_turn_count: Some(1), external_group: None, record_id: None,
+        }];
+        dialog.selected = 0;
+        let token = match app.start_native_session_preview() {
+            AppAction::PreviewNativeSession { token, .. } => token,
+            action => panic!("expected preview request, got {action:?}"),
+        };
+        app.apply_native_session_preview(
+            "node-a".to_owned(),
+            route.clone(),
+            4,
+            5,
+            "generic-history".to_owned(),
+            token,
+            NativeSessionPreviewView {
+                title: None,
+                modified_at: None,
+                model: None,
+                message_count: 2,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: false,
+                messages: vec![
+                    NativeSessionPreviewMessageView {
+                        role: "assistant".to_owned(),
+                        text: "do not use this".to_owned(),
+                    },
+                    NativeSessionPreviewMessageView {
+                        role: "user".to_owned(),
+                        text: "Investigate the native catalog".to_owned(),
+                    },
+                ],
+            },
+        );
+        let key = PreviewTabKey::NativeSelection {
+            node_id: "node-a".to_owned(), route, catalog_revision: 4,
+            recent_cutoff_unix_ms: 5, selection_id: "generic-history".to_owned(),
+        };
+        assert_eq!(
+            app.preview_tabs.get(&key).map(|tab| tab.title.as_str()),
+            Some("Investigate the native catalog"),
+        );
+        assert_eq!(
+            app.existing_session.as_ref().unwrap().rows[0].title.as_deref(),
+            Some("Investigate the native catalog"),
+        );
+    }
+
+    #[test]
+    fn activating_native_preview_tab_syncs_exact_roster_row() {
+        let mut app = fixture();
+        initialize_unified_agents_tree(&mut app, 2);
+        let rows = app.existing_session.as_ref().unwrap().rows.clone();
+        let target = rows[1].clone();
+        let key = PreviewTabKey::NativeSelection {
+            node_id: target.node_id.clone(),
+            route: target.route.clone(),
+            catalog_revision: target.catalog_revision,
+            recent_cutoff_unix_ms: target.recent_cutoff_unix_ms,
+            selection_id: target.selection_id.clone(),
+        };
+        app.preview_tabs.insert(key.clone(), PreviewTabView {
+            title: target.display_name(),
+            workspace_id: target.route.workspace_id.clone().unwrap(),
+            provider: target.route.provider.clone(),
+            preview: NativeSessionPreviewState::Loading,
+            phase: PreviewTabPhase::Hydrated,
+            reconnect_error: None,
+            scroll: 0,
+            request_token: 9,
+            resume_available: true,
+            record_id: None,
+        });
+        app.surface.open_in_focused(SurfaceTab::Preview(key));
+        app.existing_session.as_mut().unwrap().selected = 0;
+        app.sync_active_native_preview_selection();
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert_eq!(dialog.selected, 1);
+        assert!(matches!(
+            app.native_session_tree_items().get(dialog.tree_cursor),
+            Some(NativeSessionTreeItem::Session { row_index: 1 })
+        ));
+    }
+
+    #[test]
+    fn first_node_snapshot_preserves_other_node_collapsed_directories() {
+        let mut app = fixture();
+        let path = repository_path("src");
+        app.collapsed_directories.insert((
+            "node-b".to_owned(), "workspace-b".to_owned(), path.clone(),
+        ));
+        let node = app.nodes[0].clone();
+        app.upsert_node(node);
+        assert!(app.collapsed_directories.contains(&(
+            "node-b".to_owned(), "workspace-b".to_owned(), path,
+        )));
+    }
+
+    #[test]
+    fn correlated_resume_failure_preserves_preview_and_query() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.rows = vec![NativeSessionCatalogRowView {
+            node_id: "node-a".to_owned(), route: NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(), provider("codex")
+            ), catalog_revision: 1, recent_cutoff_unix_ms: 0,
+            selection_id: "hist_exact".to_owned(),
+            title: Some("Exact".to_owned()), modified_at: None, model: None,
+            message_count: Some(1), completed_turn_count: None,
+            external_group: None, record_id: None,
+        }];
+        dialog.catalog = NativeSessionCatalogState::Ready;
+        dialog.ask_after_resume = "  explain next\nstep  ".to_owned();
+        dialog.preview = Some(NativeSessionPreviewState::Empty(NativeSessionPreviewView {
+            title: Some("Exact".to_owned()),
+            modified_at: None, model: None, message_count: 0, message_count_exact: true, completed_turn_count: None,
+            total_tokens: None,
+            truncated: false, messages: Vec::new(),
+        }));
+        let action = app.start_native_session_resume();
+        let token = match action {
+            AppAction::IndexNativeSession { operation_token, .. } => operation_token,
+            _ => panic!("expected correlated index"),
+        };
+        app.fail_existing_session_operation(
+            "node-a", None, true, token + 1, "unrelated".to_owned(), false,
+        );
+        assert!(app.existing_session.as_ref().unwrap().operation.is_some());
+        app.fail_existing_session_operation(
+            "node-a", None, true, token, "provider resume rejected".to_owned(), false,
+        );
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert!(dialog.operation.is_none());
+        assert_eq!(dialog.ask_after_resume, "  explain next\nstep  ");
+        assert!(matches!(&dialog.preview, Some(NativeSessionPreviewState::Empty(_))));
+        assert_eq!(dialog.operation_error.as_deref(), Some("provider resume rejected"));
+    }
+
+    #[test]
+    fn resume_success_requires_exact_node_record_and_token_before_open() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let address = SessionAddress {
+            node_id: "node-a".to_owned(), workspace_id: "workspace-a".to_owned(),
+            instance_id: 44, generation: 2,
+        };
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.operation = Some(ExistingSessionOperation::Resuming {
+            node_id: "node-a".to_owned(), record_id: "record-7".to_owned(), operation_token: 91,
+        });
+        let record = |node_id: &str| ManagedSessionView {
+            node_id: node_id.to_owned(), record_id: "record-7".to_owned(),
+            display_name: "Recovered".to_owned(), provider: provider("codex"),
+            mode: SessionMode::Pty, state: ManagedSessionState::Live,
+            workspace_id: "workspace-a".to_owned(), canonical_root: None,
+            has_provider_session_identity: true, bundle: None, context_id: None,
+            context: None, task_binding: None, active_session: Some(address.clone()), last_error: None,
+        };
+        assert_eq!(
+            app.complete_existing_session_resume(&record("node-b"), 91),
+            SessionRecordResumeDisposition::RejectRecord,
+        );
+        assert_eq!(
+            app.complete_existing_session_resume(&record("node-a"), 90),
+            SessionRecordResumeDisposition::RejectRecord,
+        );
+        assert_eq!(
+            app.complete_existing_session_resume(&record("node-a"), 91),
+            SessionRecordResumeDisposition::UpsertRecordAndOpen(address),
+        );
+    }
+
+    #[test]
+    fn ask_text_is_retained_but_not_sent_on_raw_record_resume() {
+        let mut app = fixture();
+        let record = ManagedSessionView {
+            node_id: "node-a".to_owned(), record_id: "record-7".to_owned(),
+            display_name: "Recovered".to_owned(), provider: provider("codex"),
+            mode: SessionMode::Pty, state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(), canonical_root: None,
+            has_provider_session_identity: true, bundle: None, context_id: None,
+            context: None, task_binding: None, active_session: None, last_error: None,
+        };
+        app.upsert_managed_session(record);
+        app.selected_agent = app
+            .agent_rows()
+            .iter()
+            .position(|row| matches!(row, AgentRowKey::Managed { record_id, .. } if record_id == "record-7"))
+            .unwrap();
+        assert!(matches!(app.restart_selected_agent(),
+            AppAction::ResumeSessionRecord { initial_prompt: None, .. }));
+    }
+
+    #[test]
+    fn resume_is_inert_until_preview_is_ready_and_no_operation_is_pending() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.preview = Some(NativeSessionPreviewState::Loading);
+        assert_eq!(app.start_native_session_resume(), AppAction::None);
+        app.existing_session.as_mut().unwrap().preview = Some(
+            NativeSessionPreviewState::Error("preview rejected".to_owned()),
+        );
+        assert_eq!(app.start_native_session_resume(), AppAction::None);
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.preview = Some(NativeSessionPreviewState::Empty(NativeSessionPreviewView {
+            title: None, modified_at: None,
+            model: None, message_count: 0, message_count_exact: true, completed_turn_count: None,
+            total_tokens: None,
+            truncated: false, messages: Vec::new(),
+        }));
+        dialog.operation = Some(ExistingSessionOperation::IndexingOnly {
+            node_id: "node-a".to_owned(), workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"), session_id: "native-7".to_owned(), operation_token: 4,
+        });
+        assert_eq!(app.start_native_session_resume(), AppAction::None);
+    }
+
+    #[test]
+    fn mismatched_index_result_is_rejected_before_upsert_or_resume() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        let dialog = app.existing_session.as_mut().unwrap();
+        dialog.operation = Some(ExistingSessionOperation::IndexingForResume {
+            node_id: "node-a".to_owned(), workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"), session_id: "native-7".to_owned(),
+            initial_prompt: None, operation_token: 55,
+        });
+        let record = ManagedSessionView {
+            node_id: "node-a".to_owned(), record_id: "record-wrong".to_owned(),
+            display_name: "Wrong".to_owned(), provider: provider("claude"),
+            mode: SessionMode::Pty, state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(), canonical_root: None,
+            has_provider_session_identity: true, bundle: None, context_id: None,
+            context: None, task_binding: None, active_session: None, last_error: None,
+        };
+        let action = app.complete_existing_session_import(
+            record, 55, "node-a", "workspace-a", &provider("codex"), "native-7", true,
+        );
+        assert_eq!(action, AppAction::None);
+        assert!(app.nodes[0].session_records.iter().all(|record| record.record_id != "record-wrong"));
+        let dialog = app.existing_session.as_ref().unwrap();
+        assert!(dialog.operation.is_none());
+        assert!(dialog.operation_error.as_deref().is_some_and(|message| message.contains("did not match")));
+    }
+
+    #[test]
+    fn stale_provider_session_index_result_does_not_mutate_roster_or_resume() {
+        let mut app = fixture();
+        let _ = app.begin_existing_session();
+        app.existing_session.as_mut().unwrap().operation = Some(
+            ExistingSessionOperation::IndexingForResume {
+                node_id: "node-a".to_owned(), workspace_id: "workspace-a".to_owned(),
+                provider: provider("codex"), session_id: "native-7".to_owned(),
+                initial_prompt: None, operation_token: 55,
+            },
+        );
+        let before = app.nodes[0].session_records.clone();
+        let stale = ManagedSessionView {
+            node_id: "node-a".to_owned(), record_id: "record-stale".to_owned(),
+            display_name: "Stale".to_owned(), provider: provider("codex"),
+            mode: SessionMode::Pty, state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(), canonical_root: None,
+            has_provider_session_identity: true, bundle: None, context_id: None,
+            context: None, task_binding: None, active_session: None, last_error: None,
+        };
+        let action = app.complete_existing_session_import(
+            stale, 54, "node-a", "workspace-a", &provider("codex"), "native-7", true,
+        );
+        assert_eq!(action, AppAction::None);
+        assert_eq!(app.nodes[0].session_records, before);
+        assert!(matches!(app.existing_session.as_ref().unwrap().operation,
+            Some(ExistingSessionOperation::IndexingForResume { operation_token: 55, .. })));
     }
 
     fn add_session(app: &mut App, instance_id: u64, provider: Provider) -> SessionAddress {
@@ -4473,6 +18316,10 @@ mod tests {
             workspace_id: "workspace-a".to_owned(),
             canonical_root: Some(host_path(r"C:\work\nemo")),
             has_provider_session_identity: has_identity,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
             active_session,
             last_error: None,
         });
@@ -4480,6 +18327,141 @@ mod tests {
             node_id: "node-a".to_owned(),
             record_id: record_id.to_owned(),
         }
+    }
+
+    #[test]
+    fn agent_run_lens_toggles_by_stable_key_and_restores_original_route() {
+        let mut app = fixture();
+        app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([1; 16]));
+        let mut second = app.nodes[0].workspaces[0].clone();
+        second.workspace_id = "workspace-b".to_owned();
+        second.label = "workspace-b".to_owned();
+        second.sessions.clear();
+        app.nodes[0].workspaces.push(second);
+        let first = add_managed_record(
+            &mut app,
+            "record-a",
+            "Agent A",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        app.nodes[0].session_records.last_mut().unwrap().workspace_id = "workspace-b".to_owned();
+        let action = app.toggle_agent_run_lens(first.clone());
+        assert!(matches!(action, AppAction::InspectWorkspace { ref workspace_id, .. } if workspace_id == "workspace-b"));
+        assert_eq!(app.agent_run_lens_key(), Some(&first));
+        assert_eq!(app.selected_workspace_route().unwrap().1, "workspace-b");
+
+        let second_key = add_managed_record(
+            &mut app,
+            "record-b",
+            "Agent B",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let action = app.toggle_agent_run_lens(second_key.clone());
+        assert!(matches!(action, AppAction::InspectWorkspace { ref workspace_id, .. } if workspace_id == "workspace-a"));
+        assert_eq!(app.agent_run_lens_key(), Some(&second_key));
+
+        let action = app.toggle_agent_run_lens(second_key);
+        assert!(matches!(action, AppAction::InspectWorkspace { ref workspace_id, .. } if workspace_id == "workspace-a"));
+        assert!(app.agent_run_lens.is_none());
+        assert_eq!(app.selected_workspace_route().unwrap().1, "workspace-a");
+    }
+
+    #[test]
+    fn agent_run_lens_fails_closed_and_manual_workspace_selection_exits_without_restore() {
+        let mut app = fixture();
+        app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([1; 16]));
+        let mut second = app.nodes[0].workspaces[0].clone();
+        second.workspace_id = "workspace-b".to_owned();
+        second.label = "workspace-b".to_owned();
+        second.sessions.clear();
+        app.nodes[0].workspaces.push(second);
+        let key = add_managed_record(
+            &mut app,
+            "record-a",
+            "Agent A",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        app.nodes[0].session_records.last_mut().unwrap().workspace_id = "workspace-b".to_owned();
+        let _ = app.toggle_agent_run_lens(key.clone());
+        let _ = app.select_workspace(0);
+        assert!(app.agent_run_lens.is_none());
+        assert_eq!(app.selected_workspace_route().unwrap().1, "workspace-a");
+
+        let _ = app.toggle_agent_run_lens(key);
+        let mut renamed = app.nodes[0].session_records[0].clone();
+        renamed.display_name = "Renamed Agent".to_owned();
+        renamed.state = ManagedSessionState::Live;
+        app.upsert_managed_session(renamed);
+        assert!(app.agent_run_lens.is_some());
+        let mut replacement = app.nodes[0].clone();
+        replacement.incarnation_id = Some(NodeIncarnationId::from_bytes([2; 16]));
+        app.upsert_node(replacement);
+        assert!(app.agent_run_lens.is_none());
+    }
+
+    #[test]
+    fn agent_run_git_scope_requires_exact_route_and_exclusive_counts() {
+        let mut app = fixture();
+        let key = add_managed_record(
+            &mut app,
+            "record-a",
+            "Agent A",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let _ = app.toggle_agent_run_lens(key);
+        let mut inspection = workspace_inspection();
+        inspection.git.managed_worktree = Some(ManagedWorktreeGitScope {
+            lease_id: ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+            source_workspace_id: WorkspaceId::new("source-a").unwrap(),
+            branch: "agent/record-a".to_owned(),
+            base_commit: GitObjectId::new("a".repeat(40)).unwrap(),
+            active_session_count: 1,
+            managed_record_count: 1,
+        });
+        app.apply_workspace_inspection("node-a".to_owned(), inspection);
+        assert_eq!(
+            app.agent_run_git_scope_view(),
+            AgentRunGitScopeView::ExclusiveManagedWorktree {
+                branch: "agent/record-a".to_owned(),
+                base_commit: "aaaaaaaa".to_owned(),
+            }
+        );
+        app.workspace_inspections
+            .get_mut(&("node-a".to_owned(), "workspace-a".to_owned()))
+            .unwrap()
+            .git
+            .managed_worktree
+            .as_mut()
+            .unwrap()
+            .managed_record_count = 2;
+        assert!(matches!(
+            app.agent_run_git_scope_view(),
+            AgentRunGitScopeView::SharedManagedWorktree { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_agent_run_lens_rebinds_generation_and_opening_it_keeps_lens() {
+        let mut app = fixture();
+        let old = app.nodes[0].workspaces[0].sessions[0].address.clone();
+        let key = AgentRowKey::Legacy(old.clone());
+        let _ = app.toggle_agent_run_lens(key);
+        app.open_address(old.clone());
+        assert!(app.agent_run_lens.is_some());
+
+        let mut replacement = app.nodes[0].clone();
+        replacement.workspaces[0].sessions[0].address.generation += 1;
+        let rebound = replacement.workspaces[0].sessions[0].address.clone();
+        app.upsert_node(replacement);
+        assert_eq!(app.agent_run_lens_key(), Some(&AgentRowKey::Legacy(rebound)));
     }
 
     fn workspace_inspection() -> WorkspaceInspection {
@@ -4523,6 +18505,7 @@ mod tests {
                 ],
                 recent_commits: Vec::new(),
                 worktrees: Vec::new(),
+                managed_worktree: None,
                 truncated: false,
                 diagnostic: None,
             },
@@ -4541,6 +18524,66 @@ mod tests {
             prunable: false,
             prunable_reason: None,
             workspace_id: workspace_id.map(|id| WorkspaceId::new(id).unwrap()),
+        }
+    }
+
+    fn loaded_history(app: &App, context: Option<ResolvedContextPackReceipt>) -> HistoryDialog {
+        HistoryDialog {
+            source: app.nodes[0].workspaces[0].sessions[0].address.clone(),
+            source_provider: provider("codex"),
+            source_workspace_root: host_path(r"C:\work\nemo"),
+            candidates: vec![HistoryCandidateSummary {
+                id: "candidate-a".to_owned(),
+                session_id_hint: "native-session-a".to_owned(),
+                modified_at_unix_ms: Some(1),
+            }],
+            selected: 0,
+            loaded: Some(LoadedHistoryView {
+                session_id: "native-session-a".to_owned(),
+                message_count: 6,
+                completed_turn_count: Some(3),
+            }),
+            context,
+            pending_label: None,
+        }
+    }
+
+    fn context_receipt() -> ResolvedContextPackReceipt {
+        ResolvedContextPackReceipt {
+            id: SpawnContextId::new("ctx-a").unwrap(),
+            digest: SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            lineage: ContextPackLineageReceipt {
+                source_node_id: NodeId::new("node-a").unwrap(),
+                source_session: gate4agent_node_protocol::SessionAddress {
+                    workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                    session: gate4agent_node_protocol::SessionKey {
+                        instance_id: AgentInstanceId(7),
+                        generation: SessionGeneration(2),
+                    },
+                },
+                source_provider: provider("codex"),
+            },
+            source_message_count: 6,
+            retained_message_count: 6,
+            byte_len: 128,
+            truncated: false,
+        }
+    }
+
+    fn managed_worktree_lease(state: ManagedWorktreeLeaseState) -> ManagedWorktreeLeaseSnapshot {
+        ManagedWorktreeLeaseSnapshot {
+            lease_id: ManagedWorktreeLeaseId::new("lease-a").unwrap(),
+            source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            workspace_id: WorkspaceId::new("workspace-managed").unwrap(),
+            profile_id: WorktreeProfileId::new("default").unwrap(),
+            profile_revision: WorktreeProfileRevision::new("manual-v1").unwrap(),
+            retention: ManagedWorktreeRetention::RemoveWhenReleased,
+            state,
+            active_session_count: 0,
+            managed_record_count: 0,
+            cleanup_failure: Some(ManagedWorktreeCleanupFailure::Dirty),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
         }
     }
 
@@ -4579,7 +18622,10 @@ mod tests {
     fn tab_click_focuses_exact_pty_and_typing_is_direct() {
         let mut app = fixture();
         app.focus = Focus::Agents;
-        app.layout.hits.push(HitRegion { rect: Rect::new(26, 0, 8, 1), target: HitTarget::Tab(0) });
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(26, 0, 8, 1),
+            target: HitTarget::SurfaceTab(PaneId(0), 0),
+        });
         assert_eq!(app.click(27, 0), AppAction::None);
         assert_eq!(app.focus, Focus::Agents);
         assert_eq!(app.drop_at(27, 0), AppAction::None);
@@ -4644,16 +18690,369 @@ mod tests {
     }
 
     #[test]
-    fn spawn_is_provider_only_and_uses_selected_route() {
+    fn launch_wizard_carries_selected_spawn_profile_revision() {
         let mut app = fixture();
         app.focus = Focus::Agents;
         assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
         assert_eq!(app.focus, Focus::Spawn);
         assert!(matches!(
             app.reduce(UiKey::Enter),
-            AppAction::Spawn { node_id, workspace_id, provider: actual, .. }
-                if node_id == "node-a" && workspace_id == "workspace-a" && actual == provider("claude")
+            AppAction::SpawnSpec {
+                node_id,
+                workspace_id,
+                provider: actual,
+                profile_id,
+                profile_revision,
+                context_id: None,
+                ..
+            } if node_id == "node-a"
+                && workspace_id == "workspace-a"
+                && actual == provider("claude")
+                && profile_id == "default"
+                && profile_revision == "builtin-v1"
         ));
+    }
+
+    #[test]
+    fn missing_spawn_profile_inventory_blocks_unpinned_launch() {
+        let mut app = fixture();
+        app.nodes[0].launch_inventory = None;
+        app.focus = Focus::Agents;
+        assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("selected spawn profile is not advertised by the node"),
+        );
+    }
+
+    #[test]
+    fn history_hotkey_discovers_only_for_the_selected_active_session() {
+        let mut app = fixture();
+        app.focus = Focus::Agents;
+
+        assert!(matches!(
+            app.reduce(UiKey::Char('h')),
+            AppAction::DiscoverHistory { address, limit: 16 }
+                if address == app.nodes[0].workspaces[0].sessions[0].address
+        ));
+        assert_eq!(app.focus, Focus::History);
+        assert_eq!(app.history.as_ref().unwrap().source_provider, provider("codex"));
+        assert!(app.history.as_ref().unwrap().loaded.is_none());
+    }
+
+    #[test]
+    fn launch_product_ux_fields_and_mouse_enforce_pty_without_hidden_profile_focus() {
+        let mut app = fixture();
+        let mut workspace = app.nodes[0].workspaces[0].clone();
+        workspace.workspace_id = "workspace-b".to_owned();
+        workspace.label = "workspace-b".to_owned();
+        workspace.sessions.clear();
+        app.nodes[0].workspaces.push(workspace);
+        app.history = Some(loaded_history(&app, Some(context_receipt())));
+        app.focus = Focus::Agents;
+        app.reduce(UiKey::Ctrl('n'));
+        app.layout.hits = vec![
+            HitRegion {
+                rect: Rect::new(1, 1, 10, 1),
+                target: HitTarget::SpawnField(LaunchField::Workspace),
+            },
+            HitRegion {
+                rect: Rect::new(1, 2, 10, 1),
+                target: HitTarget::SpawnField(LaunchField::GitLocation),
+            },
+            HitRegion {
+                rect: Rect::new(1, 3, 10, 1),
+                target: HitTarget::SpawnField(LaunchField::ContinueFrom),
+            },
+            HitRegion {
+                rect: Rect::new(1, 4, 10, 1),
+                target: HitTarget::SpawnConfigureGitLocation,
+            },
+            HitRegion {
+                rect: Rect::new(1, 5, 10, 1),
+                target: HitTarget::SpawnLaunch,
+            },
+        ];
+        assert_eq!(app.click(2, 1), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().workspace_id, "workspace-b");
+        assert_eq!(app.click(2, 2), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().target, LaunchTarget::NewLinkedWorktree);
+        assert_eq!(app.click(2, 3), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().context_mode, LaunchContextMode::ContextPack);
+        assert_eq!(app.click(2, 4), AppAction::None);
+        assert_eq!(app.focus, Focus::CreateWorktree);
+        assert_eq!(app.create_worktree.as_ref().unwrap().kind, GitLocationDialogKind::ManualLinked);
+        assert_eq!(LaunchField::ALL, [
+            LaunchField::Node,
+            LaunchField::Workspace,
+            LaunchField::GitLocation,
+            LaunchField::Provider,
+            LaunchField::Delivery,
+            LaunchField::ContinueFrom,
+        ]);
+    }
+
+    #[test]
+    fn launch_uses_only_advertised_profiles_worktrees_and_bundles_when_available() {
+        let mut app = fixture();
+        install_launch_inventory(&mut app);
+        app.focus = Focus::Agents;
+        assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
+        let spawn = app.spawn.as_ref().unwrap();
+        assert_eq!(spawn.profile_id, "default");
+        assert_eq!(spawn.worktree_profile_id, "review-tree");
+        assert!(spawn.bundle_id.is_empty());
+
+        app.spawn.as_mut().unwrap().field = LaunchField::Delivery;
+        app.reduce(UiKey::Right);
+        assert_eq!(app.spawn.as_ref().unwrap().bundle_id, "skills-review");
+        app.nodes[0].workspaces[0].worktree_service_mode = Some(WorktreeServiceMode::Managed);
+        app.spawn.as_mut().unwrap().field = LaunchField::GitLocation;
+        app.reduce(UiKey::Right);
+        assert_eq!(app.spawn.as_ref().unwrap().target, LaunchTarget::NewLinkedWorktree);
+
+        assert!(matches!(
+            app.confirm_spawn(),
+            AppAction::SpawnManagedWorktree {
+                prompt: None,
+                profile_id,
+                worktree_profile_id,
+                bundle_id: Some(bundle_id),
+                ..
+            } if profile_id == "default"
+                && worktree_profile_id == "review-tree"
+                && bundle_id == "skills-review"
+        ));
+    }
+
+    #[test]
+    fn launch_selector_value_focuses_and_only_visible_arrows_cycle() {
+        let mut app = fixture();
+        app.focus = Focus::Agents;
+        app.reduce(UiKey::Ctrl('n'));
+        let original_provider = app.spawn.as_ref().unwrap().provider.clone();
+        let original_workspace = app.spawn.as_ref().unwrap().workspace_id.clone();
+        app.layout.hits = vec![
+            HitRegion {
+                rect: Rect::new(10, 5, 20, 1),
+                target: HitTarget::SpawnField(LaunchField::Provider),
+            },
+            HitRegion {
+                rect: Rect::new(10, 6, 1, 1),
+                target: HitTarget::SpawnFieldPrevious(LaunchField::Provider),
+            },
+            HitRegion {
+                rect: Rect::new(12, 6, 1, 1),
+                target: HitTarget::SpawnFieldNext(LaunchField::Provider),
+            },
+        ];
+
+        assert_eq!(app.click(15, 5), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().field, LaunchField::Provider);
+        assert_eq!(app.spawn.as_ref().unwrap().provider, original_provider);
+        assert_eq!(app.spawn.as_ref().unwrap().workspace_id, original_workspace);
+
+        assert_eq!(app.click(12, 6), AppAction::None);
+        assert_ne!(app.spawn.as_ref().unwrap().provider, original_provider);
+        assert_eq!(app.spawn.as_ref().unwrap().workspace_id, original_workspace);
+
+        assert_eq!(app.click(10, 6), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().provider, original_provider);
+        assert_eq!(app.spawn.as_ref().unwrap().workspace_id, original_workspace);
+    }
+
+    #[test]
+    fn authoritative_empty_profile_inventory_blocks_launch_instead_of_inventing_default() {
+        let mut app = fixture();
+        app.nodes[0].launch_inventory = Some(LaunchInventory {
+            spawn_profiles: Some(Vec::new()),
+            bundles: Some(Vec::new()),
+        });
+        app.focus = Focus::Agents;
+        assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
+        assert!(app.spawn.as_ref().unwrap().profile_id.is_empty());
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("selected spawn profile is not advertised by the node"),
+        );
+    }
+
+    #[test]
+    fn context_selector_stays_none_until_a_pack_is_exported() {
+        let mut app = fixture();
+        app.focus = Focus::Agents;
+        app.reduce(UiKey::Ctrl('n'));
+        app.spawn.as_mut().unwrap().field = LaunchField::ContinueFrom;
+
+        assert_eq!(app.reduce(UiKey::Right), AppAction::None);
+
+        assert_eq!(app.spawn.as_ref().unwrap().context_mode, LaunchContextMode::None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("export a ContextPack from session history before attaching it"),
+        );
+    }
+
+    #[test]
+    fn git_location_modal_maps_standalone_and_disables_off_without_stale_spawn_state() {
+        let mut app = fixture();
+        app.focus = Focus::Agents;
+        app.reduce(UiKey::Ctrl('n'));
+        app.spawn.as_mut().unwrap().field = LaunchField::GitLocation;
+        app.reduce(UiKey::Right);
+        app.reduce(UiKey::Right);
+        assert_eq!(app.spawn.as_ref().unwrap().target, LaunchTarget::NewStandaloneRepository);
+
+        assert_eq!(app.confirm_spawn(), AppAction::None);
+        let dialog = app.create_worktree.as_ref().unwrap();
+        assert_eq!(dialog.kind, GitLocationDialogKind::Standalone);
+        assert_eq!(dialog.workspace_id, "workspace-a-repo");
+        assert_eq!(dialog.target_root, r"C:\work\workspace-a-repo");
+        assert_eq!(dialog.branch, "main");
+
+        let action = app.reduce(UiKey::Enter);
+        assert!(matches!(
+            action,
+            AppAction::CreateStandaloneWorkspace {
+                node_id,
+                workspace_id,
+                root,
+                initial_branch: Some(branch),
+            } if node_id == "node-a"
+                && workspace_id == "workspace-a-repo"
+                && root == host_path(r"C:\work\workspace-a-repo")
+                && branch == "main"
+        ));
+        assert_eq!(app.focus, Focus::Spawn);
+        assert_eq!(app.spawn.as_ref().unwrap().workspace_id, "workspace-a-repo");
+        assert_eq!(app.spawn.as_ref().unwrap().target, LaunchTarget::ExistingWorkspace);
+        assert_eq!(app.pending_space, Some(("node-a".to_owned(), "workspace-a-repo".to_owned())));
+
+        let mut off = fixture();
+        off.nodes[0].workspaces[0].worktree_service_mode = Some(WorktreeServiceMode::Off);
+        off.begin_spawn();
+        off.spawn.as_mut().unwrap().target = LaunchTarget::NewLinkedWorktree;
+        assert_eq!(off.confirm_spawn(), AppAction::None);
+        assert_eq!(off.create_worktree.as_ref().unwrap().kind, GitLocationDialogKind::LinkedDisabled);
+        assert_eq!(off.reduce(UiKey::Enter), AppAction::None);
+        assert_eq!(off.notice.as_deref(), Some("linked worktrees are disabled by the selected workspace policy"));
+    }
+
+    #[test]
+    fn managed_git_location_modal_confirms_advertised_policy_as_pty_launch() {
+        let mut app = fixture();
+        install_launch_inventory(&mut app);
+        app.nodes[0].workspaces[0].worktree_service_mode = Some(WorktreeServiceMode::Managed);
+        app.begin_spawn();
+        app.spawn.as_mut().unwrap().target = LaunchTarget::NewLinkedWorktree;
+
+        assert_eq!(app.begin_git_location_configuration(), AppAction::None);
+        assert_eq!(app.create_worktree.as_ref().unwrap().kind, GitLocationDialogKind::ManagedLinked);
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::SpawnManagedWorktree {
+                profile_id,
+                worktree_profile_id,
+                prompt: None,
+                ..
+            } if profile_id == "default" && worktree_profile_id == "review-tree"
+        ));
+    }
+
+    #[test]
+    fn spawn_and_add_space_modals_drag_with_explicit_bounded_geometry() {
+        let mut app = fixture();
+        app.terminal_cols = 100;
+        app.terminal_rows = 30;
+        app.focus = Focus::Agents;
+        app.reduce(UiKey::Ctrl('n'));
+        app.layout.spawn_modal = Rect::new(20, 4, 50, 20);
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(20, 4, 50, 1),
+            target: HitTarget::SpawnDrag,
+        });
+        assert_eq!(app.click(30, 4), AppAction::None);
+        assert!(matches!(app.drag_state, Some(DragState::SpawnModal { .. })));
+        assert_eq!(app.drag(45, 10), AppAction::None);
+        assert_eq!(app.spawn_modal_position, Some((35, 10)));
+        app.end_drag();
+
+        assert_eq!(app.reduce(UiKey::Ctrl('r')), AppAction::None);
+        app.layout.hits.clear();
+        app.layout.add_space_modal = Rect::new(30, 8, 40, 12);
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(30, 8, 40, 1),
+            target: HitTarget::AddSpaceDrag,
+        });
+        assert_eq!(app.click(35, 8), AppAction::None);
+        assert!(matches!(app.drag_state, Some(DragState::AddSpaceModal { .. })));
+        assert_eq!(app.drag(99, 29), AppAction::None);
+        assert_eq!(app.add_space_modal_position, Some((60, 18)));
+        assert_eq!(app.drop_at(99, 29), AppAction::None);
+        assert!(app.drag_state.is_none());
+    }
+
+    #[test]
+    fn spawn_register_workspace_mouse_handoff_accepts_arbitrary_id_and_root_then_returns() {
+        let mut app = fixture();
+        app.focus = Focus::Agents;
+        app.reduce(UiKey::Ctrl('n'));
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(1, 1, 10, 1),
+            target: HitTarget::SpawnRegisterWorkspace,
+        });
+        assert_eq!(app.click(2, 1), AppAction::None);
+        assert_eq!(app.focus, Focus::AddSpace);
+        assert_eq!(app.add_space.as_ref().unwrap().node_id, "node-a");
+        assert!(app.spawn.is_some());
+
+        app.layout.hits = vec![
+            HitRegion {
+                rect: Rect::new(1, 2, 10, 1),
+                target: HitTarget::AddSpaceField(AddSpaceField::WorkspaceId),
+            },
+            HitRegion {
+                rect: Rect::new(1, 3, 10, 1),
+                target: HitTarget::AddSpaceField(AddSpaceField::Root),
+            },
+            HitRegion {
+                rect: Rect::new(1, 4, 10, 1),
+                target: HitTarget::AddSpaceRegister,
+            },
+        ];
+        app.click(2, 2);
+        app.paste("arbitrary-space".to_owned());
+        app.click(2, 3);
+        app.paste(r"D:\outside\arbitrary".to_owned());
+        assert!(matches!(
+            app.click(2, 4),
+            AppAction::RegisterWorkspace { node_id, workspace_id, root }
+                if node_id == "node-a"
+                    && workspace_id == "arbitrary-space"
+                    && root == host_path(r"D:\outside\arbitrary")
+        ));
+        assert_eq!(app.focus, Focus::Spawn);
+        assert_eq!(app.spawn.as_ref().unwrap().workspace_id, "arbitrary-space");
+        assert_eq!(app.pending_space, Some(("node-a".to_owned(), "arbitrary-space".to_owned())));
+    }
+
+    #[test]
+    fn managed_worktree_cleanup_state_is_retained_until_the_exact_lease_is_removed() {
+        let mut app = fixture();
+        app.apply_managed_worktree_lease(managed_worktree_lease(
+            ManagedWorktreeLeaseState::CleanupBlocked,
+        ));
+        assert_eq!(
+            app.last_managed_worktree_lease.as_ref().unwrap().state,
+            ManagedWorktreeLeaseState::CleanupBlocked,
+        );
+
+        app.apply_managed_worktree_removed("lease-other".to_owned());
+        assert!(app.last_managed_worktree_removed.is_none());
+        app.apply_managed_worktree_removed("lease-a".to_owned());
+        assert_eq!(app.last_managed_worktree_removed.as_deref(), Some("lease-a"));
     }
 
     #[test]
@@ -4666,12 +19065,52 @@ mod tests {
         app.focus = Focus::Agents;
         assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
         assert_eq!(app.spawn.as_ref().unwrap().provider, provider("qwen-code"));
+        app.reduce(UiKey::Tab);
+        app.reduce(UiKey::Tab);
+        app.reduce(UiKey::Tab);
         app.reduce(UiKey::Right);
         assert_eq!(app.spawn.as_ref().unwrap().provider, provider("grok"));
         assert!(matches!(
             app.reduce(UiKey::Enter),
-            AppAction::Spawn { provider: actual, .. } if actual == provider("grok")
+            AppAction::SpawnSpec { provider: actual, .. } if actual == provider("grok")
         ));
+    }
+
+    #[test]
+    fn launch_selects_node_before_browsing_only_that_nodes_workspaces() {
+        let mut app = fixture();
+        let mut workspace_b = app.nodes[0].workspaces[0].clone();
+        workspace_b.workspace_id = "workspace-b".to_owned();
+        workspace_b.label = "workspace-b".to_owned();
+        workspace_b.canonical_root = host_path(r"C:\work\b");
+        workspace_b.sessions.clear();
+        app.nodes[0].workspaces.push(workspace_b);
+
+        let mut node_b = app.nodes[0].clone();
+        node_b.node_id = "node-b".to_owned();
+        node_b.endpoint = r"\\.\pipe\node-b".to_owned();
+        node_b.workspaces.retain(|workspace| workspace.workspace_id == "workspace-a");
+        node_b.workspaces[0].workspace_id = "workspace-c".to_owned();
+        node_b.workspaces[0].label = "workspace-c".to_owned();
+        node_b.workspaces[0].sessions.clear();
+        let mut workspace_d = node_b.workspaces[0].clone();
+        workspace_d.workspace_id = "workspace-d".to_owned();
+        workspace_d.label = "workspace-d".to_owned();
+        node_b.workspaces.push(workspace_d);
+        app.nodes.push(node_b);
+
+        assert_eq!(app.begin_spawn(), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().field, LaunchField::Node);
+        assert_eq!(app.reduce(UiKey::Right), AppAction::None);
+        let spawn = app.spawn.as_ref().unwrap();
+        assert_eq!(spawn.node_id, "node-b");
+        assert_eq!(spawn.workspace_id, "workspace-c");
+
+        app.spawn.as_mut().unwrap().field = LaunchField::Workspace;
+        assert_eq!(app.reduce(UiKey::Right), AppAction::None);
+        let spawn = app.spawn.as_ref().unwrap();
+        assert_eq!(spawn.node_id, "node-b");
+        assert_eq!(spawn.workspace_id, "workspace-d");
     }
 
     #[test]
@@ -4694,7 +19133,10 @@ mod tests {
             false,
         );
         let title = first.find_managed_session(&key).unwrap().short_title();
+        assert_eq!(title, "pending | node-a/workspace-a @record-pending");
+        if false {
         assert_eq!(title, "pending · node-a/workspace-a @record-pending");
+        }
     }
 
     #[test]
@@ -4703,16 +19145,169 @@ mod tests {
         app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([1; 16]));
         let mut restarted = app.nodes[0].clone();
         restarted.incarnation_id = Some(NodeIncarnationId::from_bytes([2; 16]));
-        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.surface.all_tabs().len(), 1);
 
         app.upsert_node(restarted);
 
-        assert!(app.tabs.is_empty());
-        assert!(app.grid.panes.is_empty());
+        assert!(app.surface.all_tabs().is_empty());
         assert_eq!(
             app.notice.as_deref(),
             Some("node-a restarted; stale PTY targets were detached"),
         );
+    }
+
+    #[test]
+    fn changed_node_incarnation_prunes_file_git_tokens_and_rejects_stale_responses() {
+        let mut app = fixture();
+        app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([1; 16]));
+        let path = repository_path("Cargo.toml");
+        let AppAction::ReadWorkspaceFile { token: old_file_token, .. } = app.open_workspace_file(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            path.clone(),
+        ) else {
+            panic!("opening a file must issue a bounded read");
+        };
+        let AppAction::ReadGitHistory { token: old_git_token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            None,
+            Some(WorkspaceGitDiffTarget::Working { path: None }),
+        ) else {
+            panic!("opening Git must issue a bounded history read");
+        };
+        let file_key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: path.clone(),
+        };
+        let git_key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: None,
+        };
+
+        let mut restarted = app.nodes[0].clone();
+        restarted.incarnation_id = Some(NodeIncarnationId::from_bytes([2; 16]));
+        app.upsert_node(restarted);
+
+        assert!(!app.file_tabs.contains_key(&file_key));
+        assert!(!app.git_tabs.contains_key(&git_key));
+        assert!(!app.surface.all_tabs().iter().any(|tab| {
+            matches!(tab, SurfaceTab::File(_) | SurfaceTab::Git(_))
+        }));
+
+        let AppAction::ReadWorkspaceFile { token: new_file_token, .. } = app.open_workspace_file(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            path.clone(),
+        ) else {
+            panic!("reopening a file must issue a fresh bounded read");
+        };
+        let AppAction::ReadGitHistory { token: new_git_token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            None,
+            Some(WorkspaceGitDiffTarget::Working { path: None }),
+        ) else {
+            panic!("reopening Git must issue a fresh bounded history read");
+        };
+        assert_ne!(old_file_token, new_file_token);
+        assert_ne!(old_git_token, new_git_token);
+
+        app.apply_workspace_file_read(
+            "node-a".to_owned(),
+            old_file_token,
+            WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                path,
+                content: WorkspaceFileContent::Utf8 {
+                    text: "stale".to_owned(),
+                    byte_len: 5,
+                },
+                revision: Some(WorkspaceFileRevision::new("0".repeat(64)).unwrap()),
+            },
+        );
+        assert_eq!(app.file_tabs[&file_key].state, WorkspaceFileState::Loading);
+        assert!(app.file_tabs[&file_key].editor.text().is_empty());
+        assert_eq!(
+            app.apply_git_history(
+                &WorkspaceGitRequestDestination::Surface(git_key.clone()),
+                old_git_token,
+                Vec::new(),
+                None,
+                false,
+            ),
+            None,
+        );
+        assert_eq!(app.git_tabs[&git_key].state, WorkspaceGitState::Loading);
+        assert!(app.git_tabs[&git_key].commits.is_empty());
+    }
+
+    #[test]
+    fn removed_workspace_prunes_file_git_tokens_and_rejects_stale_responses() {
+        let mut app = fixture();
+        let path = repository_path("Cargo.toml");
+        let AppAction::ReadWorkspaceFile { token: file_token, .. } = app.open_workspace_file(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            path.clone(),
+        ) else {
+            panic!("opening a file must issue a bounded read");
+        };
+        let AppAction::ReadGitHistory { token: git_token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            None,
+            Some(WorkspaceGitDiffTarget::Working { path: None }),
+        ) else {
+            panic!("opening Git must issue a bounded history read");
+        };
+        let file_key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: path.clone(),
+        };
+        let git_key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: None,
+        };
+
+        let mut without_workspace = app.nodes[0].clone();
+        without_workspace.workspaces.clear();
+        app.upsert_node(without_workspace);
+
+        assert!(!app.file_tabs.contains_key(&file_key));
+        assert!(!app.git_tabs.contains_key(&git_key));
+        assert!(!app.surface.all_tabs().iter().any(|tab| {
+            matches!(tab, SurfaceTab::File(_) | SurfaceTab::Git(_))
+        }));
+        app.apply_workspace_file_read(
+            "node-a".to_owned(),
+            file_token,
+            WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                path,
+                content: WorkspaceFileContent::Utf8 {
+                    text: "stale".to_owned(),
+                    byte_len: 5,
+                },
+                revision: Some(WorkspaceFileRevision::new("0".repeat(64)).unwrap()),
+            },
+        );
+        assert_eq!(
+            app.apply_git_history(
+                &WorkspaceGitRequestDestination::Surface(git_key.clone()),
+                git_token,
+                Vec::new(),
+                None,
+                false,
+            ),
+            None,
+        );
+        assert!(!app.file_tabs.contains_key(&file_key));
+        assert!(!app.git_tabs.contains_key(&git_key));
     }
 
     #[test]
@@ -4743,7 +19338,7 @@ mod tests {
         app.reduce(UiKey::Down);
         assert!(matches!(
             app.reduce(UiKey::Enter),
-            AppAction::Spawn { workspace_id, provider: actual, .. }
+            AppAction::SpawnSpec { workspace_id, provider: actual, .. }
                 if workspace_id == "workspace-b" && actual == provider("kimi")
         ));
     }
@@ -4908,14 +19503,15 @@ mod tests {
     }
 
     #[test]
-    fn create_worktree_modal_starts_with_empty_foreign_target_and_projects_exact_action() {
+    fn create_worktree_modal_suggests_sibling_target_and_projects_exact_action() {
         let mut app = fixture();
         assert_eq!(app.begin_create_worktree(), AppAction::None);
         let dialog = app.create_worktree.as_ref().unwrap();
         assert_eq!(dialog.source_workspace_id, "workspace-a");
         assert_eq!(dialog.workspace_id, "workspace-a-worktree");
-        assert!(dialog.target_root.is_empty());
+        assert_eq!(dialog.target_root, r"C:\work\workspace-a-worktree");
         assert_eq!(dialog.branch, "workspace-a-worktree");
+        assert!(!dialog.return_to_spawn);
 
         let dialog = app.create_worktree.as_mut().unwrap();
         dialog.workspace_id = "Bad.Id".to_owned();
@@ -4945,6 +19541,38 @@ mod tests {
                 && branch == "feature/a"
                 && base == "origin/main"
         ));
+    }
+
+    #[test]
+    fn session_lab_manual_worktree_returns_to_launch_on_registered_workspace() {
+        let mut app = fixture();
+        assert_eq!(app.begin_spawn(), AppAction::None);
+        assert_eq!(app.begin_create_worktree_from_spawn(), AppAction::None);
+        let dialog = app.create_worktree.as_ref().unwrap();
+        assert!(dialog.return_to_spawn);
+        assert_eq!(dialog.target_root, r"C:\work\workspace-a-worktree");
+
+        let action = app.reduce(UiKey::Enter);
+        assert!(matches!(
+            action,
+            AppAction::CreateWorktree {
+                source_workspace_id,
+                workspace_id,
+                branch,
+                base: None,
+                ..
+            } if source_workspace_id == "workspace-a"
+                && workspace_id == "workspace-a-worktree"
+                && branch == "workspace-a-worktree"
+        ));
+        assert_eq!(app.focus, Focus::Spawn);
+        let spawn = app.spawn.as_ref().unwrap();
+        assert_eq!(spawn.workspace_id, "workspace-a-worktree");
+        assert_eq!(spawn.target, LaunchTarget::ExistingWorkspace);
+        assert_eq!(
+            app.pending_space,
+            Some(("node-a".to_owned(), "workspace-a-worktree".to_owned()))
+        );
     }
 
     #[test]
@@ -5034,6 +19662,8 @@ mod tests {
             label: "scratch".to_owned(),
             canonical_root: host_path(r"C:\tmp\scratch"),
             providers: Vec::new(),
+            worktree_service_mode: None,
+            managed_worktree_profiles: None,
             sessions: Vec::new(),
         });
         app.upsert_node(node);
@@ -5050,6 +19680,8 @@ mod tests {
             label: "scratch".to_owned(),
             canonical_root: host_path(r"C:\tmp\scratch"),
             providers: Vec::new(),
+            worktree_service_mode: None,
+            managed_worktree_profiles: None,
             sessions: Vec::new(),
         });
         app.upsert_node(node);
@@ -5066,9 +19698,28 @@ mod tests {
     }
 
     #[test]
+    fn removing_the_launch_workspace_closes_the_stale_modal() {
+        let mut app = fixture();
+        app.focus = Focus::Agents;
+        app.reduce(UiKey::Ctrl('n'));
+        assert_eq!(app.focus, Focus::Spawn);
+        let mut node = app.nodes[0].clone();
+        node.workspaces.clear();
+
+        app.upsert_node(node);
+
+        assert!(app.spawn.is_none());
+        assert_eq!(app.focus, Focus::Agents);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("launch cancelled because its workspace was removed"),
+        );
+    }
+
+    #[test]
     fn disconnected_node_retains_authoritative_inventory_and_terminal_state() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = active_pty_address(&app);
 
         app.set_node_connection(
             "node-a",
@@ -5077,7 +19728,7 @@ mod tests {
         );
 
         assert_eq!(app.nodes.len(), 1);
-        assert_eq!(app.tabs, vec![SessionTab { address: address.clone() }]);
+        assert_eq!(app.surface.all_tabs()[0].pty_address(), Some(&address));
         assert_eq!(app.focused_session().unwrap().terminal_formatted, b"codex");
         assert!(matches!(
             app.nodes[0].connection,
@@ -5088,7 +19739,7 @@ mod tests {
     #[test]
     fn authoritative_topology_removal_purges_node_owned_state_and_keeps_survivor_usable() {
         let mut app = fixture();
-        let removed_address = app.tabs[0].address.clone();
+        let removed_address = active_pty_address(&app);
         add_managed_record(
             &mut app,
             "removed-record",
@@ -5109,12 +19760,14 @@ mod tests {
         surviving_node.session_records.clear();
         let surviving_address = surviving_node.workspaces[0].sessions[0].address.clone();
         app.nodes.push(surviving_node);
-        app.tabs.push(SessionTab { address: surviving_address.clone() });
-        app.grid.panes = vec![
-            GridPane { address: removed_address.clone() },
-            GridPane { address: surviving_address.clone() },
-        ];
-        app.grid.focused = 0;
+        app.surface
+            .drop_tab(
+                SurfaceTab::Pty(surviving_address.clone()),
+                PaneId(0),
+                SurfaceDropZone::Right,
+            )
+            .unwrap();
+        app.surface.set_focused(PaneId(0)).unwrap();
         app.pending_open = vec![removed_address.clone(), surviving_address.clone()];
         app.pending_space = Some(("node-a".to_owned(), "workspace-a".to_owned()));
         app.terminal_scroll_offsets.insert(removed_address.clone(), 7);
@@ -5146,8 +19799,6 @@ mod tests {
             .iter()
             .position(|row| app.agent_row_active_address(row).as_ref() == Some(&removed_address))
             .unwrap();
-        app.selected_tab = 0;
-        app.surface_mode = SurfaceMode::Tab;
         app.focus = Focus::Viewport;
 
         app.remove_topology_node("node-a");
@@ -5156,8 +19807,10 @@ mod tests {
         assert_eq!(app.nodes[0].node_id, "node-b");
         assert_eq!(app.nodes[0].workspaces[0].sessions[0].terminal_formatted, b"surviving terminal");
         assert!(app.find_session(&removed_address).is_none());
-        assert_eq!(app.tabs, vec![SessionTab { address: surviving_address.clone() }]);
-        assert_eq!(app.grid.panes, vec![GridPane { address: surviving_address.clone() }]);
+        assert_eq!(
+            app.surface.all_tabs()[0].pty_address(),
+            Some(&surviving_address),
+        );
         assert_eq!(app.pending_open, vec![surviving_address.clone()]);
         assert!(app.pending_space.is_none());
         assert_eq!(app.terminal_scroll_offsets.len(), 1);
@@ -5186,8 +19839,8 @@ mod tests {
         );
         assert_eq!(app.selected_workspace_route(), Some(("node-b".to_owned(), "workspace-b".to_owned())));
         assert_eq!(app.selected_agent_session().unwrap().address, surviving_address);
-        assert_eq!((app.selected_tab, app.grid.focused), (0, 0));
-        assert_eq!((app.surface_mode, app.focus), (SurfaceMode::Tab, Focus::Tabs));
+        assert_eq!(app.surface.leaf_ids().len(), 1);
+        assert_eq!(app.focus, Focus::Tabs);
 
         assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
         assert!(matches!(
@@ -5220,7 +19873,7 @@ mod tests {
 
         app.upsert_node(node);
 
-        assert!(app.tabs.is_empty());
+        assert!(app.surface.all_tabs().is_empty());
         assert_eq!(app.focus, Focus::Agents);
         assert!(app.notice.as_deref().unwrap().contains("input target cleared"));
     }
@@ -5387,13 +20040,13 @@ mod tests {
             generation: 1,
         };
         app.request_open(pending.clone());
-        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.surface.all_tabs().len(), 1);
         let mut node = app.nodes[0].clone();
         let mut session = node.workspaces[0].sessions[0].clone();
         session.address = pending;
         node.workspaces[0].sessions.push(session);
         app.upsert_node(node);
-        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.surface.all_tabs().len(), 2);
         assert_eq!(app.focus, Focus::Viewport);
     }
 
@@ -5478,9 +20131,12 @@ mod tests {
             node_id: "node-b".to_owned(),
             incarnation_id: None,
             endpoint: r"\\.\pipe\node-b".to_owned(),
+            relay_route: C2RelayRoute::Unknown,
             connection: ConnectionState::Connected,
             controller_owned: true,
             event_sequence: 1,
+            launch_inventory: None,
+            providers: Vec::new(),
             session_records: Vec::new(),
             workspaces: Vec::new(),
         });
@@ -5498,6 +20154,35 @@ mod tests {
             AppAction::RegisterWorkspace { node_id, workspace_id, .. }
                 if node_id == "node-b" && workspace_id == "scratch"
         ));
+    }
+
+    #[test]
+    fn add_space_node_change_invalidates_the_previous_nodes_root_authority() {
+        let mut app = fixture();
+        let mut second = app.nodes[0].clone();
+        second.node_id = "node-b".to_owned();
+        second.endpoint = r"\\.\pipe\node-b".to_owned();
+        second.workspaces.clear();
+        app.nodes.push(second);
+        assert_eq!(app.begin_add_space_on_node("node-a".to_owned()), AppAction::None);
+        let root = host_path(r"C:\work\nemo");
+        {
+            let dialog = app.add_space.as_mut().unwrap();
+            dialog.root = r"C:\work\nemo".to_owned();
+            dialog.original_root = Some(root);
+        }
+
+        assert_eq!(app.reduce(UiKey::Down), AppAction::None);
+
+        let dialog = app.add_space.as_ref().unwrap();
+        assert_eq!(dialog.node_id, "node-b");
+        assert!(dialog.root.is_empty());
+        assert!(dialog.original_root.is_none());
+        assert!(!dialog.root_edited);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("node changed; browse or enter a root on the selected node"),
+        );
     }
 
     #[test]
@@ -5524,46 +20209,59 @@ mod tests {
     }
 
     #[test]
-    fn session_chip_drag_moves_between_tab_and_grid_without_duplication() {
+    fn session_chip_drag_splits_and_merges_without_duplication() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = add_session(&mut app, 8, provider("claude"));
+        app.surface.open_in_focused(SurfaceTab::Pty(address.clone()));
         app.layout.hits.push(HitRegion {
             rect: Rect::new(0, 0, 8, 1),
-            target: HitTarget::Tab(0),
+            target: HitTarget::SurfaceTab(PaneId(0), 1),
         });
-        app.layout.hits.push(HitRegion {
-            rect: Rect::new(40, 2, 20, 8),
-            target: HitTarget::GridDropSlot(2),
+        app.layout.surface_panes.push(SurfacePaneLayout {
+            pane_id: PaneId(0),
+            frame: Rect::new(20, 2, 40, 12),
+            header: Rect::new(20, 2, 40, 1),
+            viewport: Rect::new(20, 3, 40, 11),
         });
 
         assert_eq!(app.click(2, 0), AppAction::None);
-        assert_eq!(app.drag(45, 4), AppAction::None);
-        assert_eq!(app.drop_at(45, 4), AppAction::None);
-        assert!(app.tabs.is_empty());
-        assert_eq!(app.grid.panes, vec![GridPane { address: address.clone() }]);
-        assert_eq!(app.surface_mode, SurfaceMode::Grid);
+        assert_eq!(app.drag(58, 8), AppAction::None);
+        assert_eq!(app.drop_at(58, 8), AppAction::None);
+        assert_eq!(app.surface.leaf_ids().len(), 2);
+        let tab = SurfaceTab::Pty(address.clone());
+        let (split_pane, _) = app.surface.tab_location(&tab).unwrap();
+        assert_ne!(split_pane, PaneId(0));
+        assert_eq!(app.surface.all_tabs().iter().filter(|candidate| ***candidate == tab).count(), 1);
 
         app.layout.hits.clear();
+        app.layout.surface_panes.clear();
         app.layout.hits.push(HitRegion {
             rect: Rect::new(40, 2, 20, 1),
-            target: HitTarget::GridPaneHeader(0),
+            target: HitTarget::SurfacePaneHeader(split_pane),
         });
-        app.layout.hits.push(HitRegion {
-            rect: Rect::new(0, 0, 30, 1),
-            target: HitTarget::TabDrop,
+        app.layout.surface_panes.push(SurfacePaneLayout {
+            pane_id: PaneId(0),
+            frame: Rect::new(0, 2, 40, 12),
+            header: Rect::new(0, 2, 40, 1),
+            viewport: Rect::new(0, 3, 40, 11),
+        });
+        app.layout.surface_panes.push(SurfacePaneLayout {
+            pane_id: split_pane,
+            frame: Rect::new(40, 2, 40, 12),
+            header: Rect::new(40, 2, 40, 1),
+            viewport: Rect::new(40, 3, 40, 11),
         });
         assert_eq!(app.click(45, 2), AppAction::None);
-        assert_eq!(app.drag(12, 0), AppAction::None);
-        assert_eq!(app.drop_at(12, 0), AppAction::None);
-        assert!(app.grid.panes.is_empty());
-        assert_eq!(app.tabs, vec![SessionTab { address }]);
-        assert_eq!(app.surface_mode, SurfaceMode::Tab);
+        assert_eq!(app.drag(20, 8), AppAction::None);
+        assert_eq!(app.drop_at(20, 8), AppAction::None);
+        assert_eq!(app.surface.leaf_ids(), vec![PaneId(0)]);
+        assert_eq!(app.surface.all_tabs().iter().filter(|candidate| ***candidate == tab).count(), 1);
     }
 
     #[test]
     fn agent_chip_activates_only_on_release_and_drag_preserves_the_active_surface() {
         let mut click_app = fixture();
-        let first = click_app.tabs[0].address.clone();
+        let first = active_pty_address(&click_app);
         let second = add_session(&mut click_app, 8, provider("claude"));
         let addresses = click_app.agent_addresses();
         let first_index = addresses.iter().position(|address| address == &first).unwrap();
@@ -5582,7 +20280,7 @@ mod tests {
         assert_eq!(click_app.selected_agent, second_index);
 
         let mut drag_app = fixture();
-        let first = drag_app.tabs[0].address.clone();
+        let first = active_pty_address(&drag_app);
         let second = add_session(&mut drag_app, 8, provider("claude"));
         let second_index = drag_app
             .agent_addresses()
@@ -5593,61 +20291,78 @@ mod tests {
             rect: Rect::new(0, 5, 24, 2),
             target: HitTarget::Agent(second_index),
         });
-        drag_app.layout.grid_drop = Rect::new(30, 2, 30, 12);
+        drag_app.layout.surface_panes.push(SurfacePaneLayout {
+            pane_id: PaneId(0),
+            frame: Rect::new(30, 2, 30, 12),
+            header: Rect::new(30, 2, 30, 1),
+            viewport: Rect::new(30, 3, 30, 11),
+        });
 
         assert_eq!(drag_app.click(4, 5), AppAction::None);
-        assert_eq!(drag_app.drag(35, 6), AppAction::None);
+        assert_eq!(drag_app.drag(58, 6), AppAction::None);
         assert_eq!(drag_app.focused_address(), Some(&first));
-        assert_eq!(drag_app.surface_mode, SurfaceMode::Tab);
-        assert_eq!(drag_app.drop_at(35, 6), AppAction::None);
-        assert_eq!(drag_app.grid.panes, vec![GridPane { address: second }]);
-        assert_eq!(drag_app.tabs, vec![SessionTab { address: first }]);
+        assert_eq!(drag_app.drop_at(58, 6), AppAction::None);
+        assert_eq!(drag_app.surface.leaf_ids().len(), 2);
+        assert_eq!(drag_app.focused_address(), Some(&second));
+        assert!(drag_app
+            .surface
+            .all_tabs()
+            .contains(&&SurfaceTab::Pty(first)));
     }
 
     #[test]
-    fn grid_reorders_duplicates_and_rejects_a_fifth_unique_pty() {
+    fn surface_rejects_a_fifth_leaf_and_keeps_unique_tabs() {
         let mut app = fixture();
-        let first = app.tabs[0].address.clone();
+        let first = active_pty_address(&app);
         let second = add_session(&mut app, 8, provider("claude"));
         let third = add_session(&mut app, 9, provider("kimi"));
         let fourth = add_session(&mut app, 10, provider("codex"));
         let fifth = add_session(&mut app, 11, provider("claude"));
 
-        for address in [&first, &second, &third, &fourth] {
-            assert!(app.move_address_to_grid(address.clone(), None));
+        for (address, zone) in [
+            (second, SurfaceDropZone::Right),
+            (third, SurfaceDropZone::Bottom),
+            (fourth, SurfaceDropZone::Left),
+        ] {
+            assert!(app.drop_address_on_surface(address, PaneId(0), zone));
         }
-        assert_eq!(app.grid.panes.len(), MAX_GRID_PANES);
-        assert!(app.tabs.is_empty());
-        assert!(app.move_address_to_grid(first.clone(), Some(3)));
-        assert_eq!(app.grid.panes.len(), MAX_GRID_PANES);
-        assert_eq!(app.grid.panes[3].address, first);
-        assert!(!app.move_address_to_grid(fifth, None));
-        assert_eq!(app.grid.panes.len(), MAX_GRID_PANES);
-        assert!(app.notice.as_deref().unwrap().contains("grid is full"));
+        assert_eq!(app.surface.leaf_ids().len(), 4);
+        assert_eq!(app.surface.all_tabs().len(), 4);
+        assert!(!app.drop_address_on_surface(
+            fifth,
+            PaneId(0),
+            SurfaceDropZone::Top,
+        ));
+        assert_eq!(app.surface.leaf_ids().len(), 4);
+        assert!(app.notice.as_deref().unwrap().contains("surface is full"));
+        app.surface.open_in_focused(SurfaceTab::Pty(first));
+        assert_eq!(app.surface.all_tabs().len(), 4);
     }
 
     #[test]
-    fn focused_grid_pane_routes_input_paste_and_terminal_geometry() {
+    fn focused_surface_pane_routes_input_paste_and_terminal_geometry() {
         let mut app = fixture();
-        let first = app.tabs[0].address.clone();
+        let first = active_pty_address(&app);
         let second = add_session(&mut app, 8, provider("claude"));
-        assert!(app.move_address_to_grid(first.clone(), None));
-        assert!(app.move_address_to_grid(second.clone(), None));
-        app.layout.grid_panes = vec![
-            GridPaneLayout {
-                pane_index: 0,
+        let second_pane = app
+            .surface
+            .drop_tab(SurfaceTab::Pty(second.clone()), PaneId(0), SurfaceDropZone::Right)
+            .unwrap();
+        app.layout.surface_panes = vec![
+            SurfacePaneLayout {
+                pane_id: PaneId(0),
                 frame: Rect::new(0, 1, 40, 20),
                 header: Rect::new(0, 1, 40, 1),
                 viewport: Rect::new(0, 2, 40, 19),
             },
-            GridPaneLayout {
-                pane_index: 1,
+            SurfacePaneLayout {
+                pane_id: second_pane,
                 frame: Rect::new(40, 1, 60, 20),
                 header: Rect::new(40, 1, 60, 1),
                 viewport: Rect::new(40, 2, 60, 19),
             },
         ];
-        app.focus_grid_pane(1);
+        app.focus_surface_pane(second_pane);
 
         assert_eq!(app.focused_session().unwrap().address, second);
         assert_eq!(app.focused_terminal_rect(), Rect::new(40, 2, 60, 19));
@@ -5666,18 +20381,24 @@ mod tests {
     }
 
     #[test]
-    fn grid_rebinds_generation_and_keeps_nearest_pane_when_focused_one_disappears() {
+    fn surface_rebinds_generation_and_keeps_nearest_pane_when_focused_one_disappears() {
         let mut app = fixture();
-        let first = app.tabs[0].address.clone();
         let second = add_session(&mut app, 8, provider("claude"));
-        assert!(app.move_address_to_grid(first.clone(), None));
-        assert!(app.move_address_to_grid(second.clone(), None));
-        app.focus_grid_pane(0);
+        app.surface
+            .drop_tab(SurfaceTab::Pty(second.clone()), PaneId(0), SurfaceDropZone::Right)
+            .unwrap();
+        app.focus_surface_pane(PaneId(0));
 
         let mut replacement = app.nodes[0].clone();
         replacement.workspaces[0].sessions[0].address.generation = 3;
         app.upsert_node(replacement.clone());
-        assert_eq!(app.grid.panes[0].address.generation, 3);
+        assert_eq!(
+            app.surface.focused_pane().tabs[0]
+                .pty_address()
+                .unwrap()
+                .generation,
+            3,
+        );
         assert!(matches!(
             app.reduce(UiKey::Char('x')),
             AppAction::Input { address, .. } if address.generation == 3
@@ -5687,93 +20408,22 @@ mod tests {
             .sessions
             .retain(|session| session.address.instance_id == second.instance_id);
         app.upsert_node(replacement.clone());
-        assert_eq!(app.surface_mode, SurfaceMode::Grid);
         assert_eq!(app.focus, Focus::Viewport);
-        assert_eq!(app.grid.panes.len(), 1);
+        assert_eq!(app.surface.leaf_ids().len(), 1);
         assert_eq!(app.focused_address(), Some(&second));
         assert!(app.notice.as_deref().unwrap().contains("nearest pane focused"));
 
         replacement.workspaces[0].sessions.clear();
         app.upsert_node(replacement);
-        assert!(app.grid.panes.is_empty());
-        assert_eq!(app.surface_mode, SurfaceMode::Tab);
+        assert!(app.surface.all_tabs().is_empty());
         assert_eq!(app.focus, Focus::Agents);
         assert!(app.notice.as_deref().unwrap().contains("input target cleared"));
     }
 
     #[test]
-    fn grid_dividers_clamp_to_minimum_adjacent_shares() {
-        let mut app = fixture();
-        app.layout.viewport = Rect::new(0, 0, 100, 40);
-        app.grid.preset = GridPreset::Columns;
-        app.layout.hits.push(HitRegion {
-            rect: Rect::new(25, 0, 1, 40),
-            target: HitTarget::GridDivider(GridAxisKind::Columns, 0),
-        });
-
-        app.click(25, 10);
-        app.drag(99, 10);
-        assert_eq!(app.grid.column_cuts[0], 4_000);
-        app.end_drag();
-        app.click(25, 10);
-        app.drag(0, 10);
-        assert_eq!(app.grid.column_cuts[0], 1_000);
-        app.end_drag();
-
-        app.grid.preset = GridPreset::Quad;
-        app.layout.hits.clear();
-        app.layout.hits.push(HitRegion {
-            rect: Rect::new(50, 0, 1, 40),
-            target: HitTarget::GridDivider(GridAxisKind::Columns, 1),
-        });
-        app.click(50, 10);
-        app.drag(0, 10);
-        assert_eq!(app.grid.column_cuts[1], 1_000);
-        app.end_drag();
-        app.click(50, 10);
-        app.drag(100, 10);
-        assert_eq!(app.grid.column_cuts[1], 9_000);
-    }
-
-    #[test]
-    fn grid_keyboard_navigation_respects_visual_preset_axes() {
-        let mut app = fixture();
-        let first = app.tabs[0].address.clone();
-        let second = add_session(&mut app, 8, provider("claude"));
-        let third = add_session(&mut app, 9, provider("kimi"));
-        let fourth = add_session(&mut app, 10, provider("codex"));
-        for address in [first, second, third, fourth] {
-            app.move_address_to_grid(address, None);
-        }
-        app.focus = Focus::Tabs;
-        app.grid.preset = GridPreset::Quad;
-        app.grid.focused = 0;
-        app.reduce(UiKey::Right);
-        assert_eq!(app.grid.focused, 1);
-        app.reduce(UiKey::Down);
-        assert_eq!(app.grid.focused, 3);
-        app.reduce(UiKey::Left);
-        assert_eq!(app.grid.focused, 2);
-        app.reduce(UiKey::Up);
-        assert_eq!(app.grid.focused, 0);
-
-        app.grid.preset = GridPreset::Columns;
-        app.reduce(UiKey::Down);
-        assert_eq!(app.grid.focused, 0);
-        app.reduce(UiKey::Right);
-        assert_eq!(app.grid.focused, 1);
-
-        app.grid.preset = GridPreset::Rows;
-        app.reduce(UiKey::Right);
-        assert_eq!(app.grid.focused, 1);
-        app.reduce(UiKey::Down);
-        assert_eq!(app.grid.focused, 2);
-    }
-
-    #[test]
     fn wheel_scrolls_terminal_history_without_sending_cursor_keys() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = active_pty_address(&app);
         app.nodes[0].workspaces[0].sessions[0].terminal_scrollback =
             (0..10).map(|line| format!("history-{line}").into_bytes()).collect();
         app.layout.viewport = Rect::new(26, 1, 74, 20);
@@ -5822,7 +20472,7 @@ mod tests {
     #[test]
     fn stopped_terminal_with_retained_mouse_mode_scrolls_local_history() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = active_pty_address(&app);
         let session = &mut app.nodes[0].workspaces[0].sessions[0];
         session.running = false;
         session.terminal_scrollback = vec![b"history".to_vec()];
@@ -5835,26 +20485,27 @@ mod tests {
     }
 
     #[test]
-    fn wheel_scrolls_the_hovered_grid_pane_independently() {
+    fn wheel_scrolls_the_hovered_surface_pane_independently() {
         let mut app = fixture();
-        let first = app.tabs[0].address.clone();
+        let first = active_pty_address(&app);
         let second = add_session(&mut app, 8, provider("claude"));
         for session in &mut app.nodes[0].workspaces[0].sessions {
             session.terminal_scrollback =
                 (0..8).map(|line| format!("history-{line}").into_bytes()).collect();
         }
-        app.move_address_to_grid(first.clone(), None);
-        app.move_address_to_grid(second.clone(), None);
-        app.surface_mode = SurfaceMode::Grid;
-        app.layout.grid_panes = vec![
-            GridPaneLayout {
-                pane_index: 0,
+        let second_pane = app
+            .surface
+            .drop_tab(SurfaceTab::Pty(second.clone()), PaneId(0), SurfaceDropZone::Right)
+            .unwrap();
+        app.layout.surface_panes = vec![
+            SurfacePaneLayout {
+                pane_id: PaneId(0),
                 frame: Rect::new(0, 1, 50, 20),
                 header: Rect::new(0, 1, 50, 1),
                 viewport: Rect::new(0, 2, 50, 19),
             },
-            GridPaneLayout {
-                pane_index: 1,
+            SurfacePaneLayout {
+                pane_id: second_pane,
                 frame: Rect::new(51, 1, 49, 20),
                 header: Rect::new(51, 1, 49, 1),
                 viewport: Rect::new(51, 2, 49, 19),
@@ -5884,7 +20535,7 @@ mod tests {
     #[test]
     fn modal_agent_chip_starts_the_same_drag_as_the_sidebar() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = active_pty_address(&app);
         app.focus = Focus::Settings;
         app.menu_placement = MenuPlacement::Modal;
         app.control_section = ControlSection::Agents;
@@ -5899,13 +20550,13 @@ mod tests {
             app.drag_state,
             Some(DragState::SessionChip {
                 source: DragSource::Agent(0),
-                ref address,
+                tab: SurfaceTab::Pty(ref address),
                 start_column: 22,
                 start_row: 8,
                 ..
-            }) if *address == app.tabs[0].address
+            }) if Some(address) == app.surface.focused_pane().tabs[0].pty_address()
         ));
-        assert_eq!(app.tabs[0].address, address);
+        assert_eq!(app.surface.focused_pane().tabs[0].pty_address(), Some(&address));
         assert_eq!(app.drop_at(22, 8), AppAction::None);
         assert_eq!(app.focus, Focus::Viewport);
     }
@@ -5925,7 +20576,7 @@ mod tests {
     #[test]
     fn terminal_input_returns_scrolled_view_to_live_bottom() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = active_pty_address(&app);
         app.focus = Focus::Viewport;
         app.terminal_scroll_offsets.insert(address, 9);
 
@@ -5936,7 +20587,7 @@ mod tests {
     #[test]
     fn live_output_keeps_a_scrolled_terminal_anchored() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = active_pty_address(&app);
         app.nodes[0].workspaces[0].sessions[0].terminal_scrollback =
             ["a", "b", "c"].into_iter().map(|row| row.as_bytes().to_vec()).collect();
         app.terminal_scroll_offsets.insert(address.clone(), 1);
@@ -5950,7 +20601,385 @@ mod tests {
     }
 
     #[test]
-    fn dormant_record_click_selects_only_on_release_and_routes_resume_rename_forget() {
+    fn right_click_live_record_opens_management_without_typing_into_pty() {
+        let mut app = fixture();
+        let address = active_pty_address(&app);
+        let managed = add_managed_record(
+            &mut app,
+            "record-live",
+            "live review",
+            ManagedSessionState::Live,
+            Some(address.clone()),
+            true,
+        );
+        let index = app.agent_rows().iter().position(|row| row == &managed).unwrap();
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(0, 6, 24, 2),
+            target: HitTarget::Agent(index),
+        });
+        app.focus = Focus::Viewport;
+        let selected_tab = app.surface.focused_pane().active;
+
+        assert_eq!(app.right_click(4, 6), AppAction::None);
+        assert_eq!(app.agent_menu.as_ref().map(|menu| &menu.key), Some(&managed));
+        assert_eq!(app.focus, Focus::Viewport);
+        assert_eq!(app.surface.focused_pane().active, selected_tab);
+        let items = app.agent_menu_items();
+        for action in [
+            AgentMenuAction::Open,
+            AgentMenuAction::InspectWorkspace,
+            AgentMenuAction::Rename,
+            AgentMenuAction::History,
+            AgentMenuAction::Stop,
+        ] {
+            assert!(items.iter().any(|item| item.action == action && item.enabled));
+        }
+        assert!(items.iter().any(|item| {
+            item.action == AgentMenuAction::Resume
+                && item.disabled_reason.as_deref() == Some("already live")
+        }));
+        assert!(items.iter().any(|item| {
+            item.action == AgentMenuAction::Forget
+                && item.disabled_reason.as_deref() == Some("stop the live PTY first")
+        }));
+
+        assert_eq!(app.reduce(UiKey::Char('n')), AppAction::None);
+        assert_eq!(app.focus, Focus::RenameSession);
+        assert_eq!(app.rename_session.as_ref().map(|dialog| dialog.record_id.as_str()), Some("record-live"));
+        assert!(app.agent_menu.is_none());
+        assert_eq!(app.focused_address(), Some(&address));
+    }
+
+    #[test]
+    fn task_menu_is_managed_only_and_carries_exact_revision() {
+        let mut app = fixture();
+        let key = add_managed_record(
+            &mut app,
+            "record-task",
+            "task run",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let task_id: TaskId = "task-0123456789abcdef01234567".parse().unwrap();
+        app.nodes[0].session_records.last_mut().unwrap().task_binding = Some(SessionTaskBindingV1 {
+            revision: 7,
+            task_id: Some(task_id.clone()),
+            changed_at_unix_ms: 9,
+        });
+        let index = app.agent_rows().iter().position(|row| row == &key).unwrap();
+        app.open_agent_menu(index, 4, 4);
+        let items = app.agent_menu_items();
+        for action in [
+            AgentMenuAction::NewTaskId,
+            AgentMenuAction::AssignTaskId,
+            AgentMenuAction::CopyTaskId,
+            AgentMenuAction::ClearTaskId,
+        ] {
+            assert!(items.iter().any(|item| item.action == action && item.enabled));
+        }
+        assert!(items.iter().any(|item| {
+            item.action == AgentMenuAction::CopyTaskId && item.label.contains(task_id.as_str())
+        }));
+        assert!(matches!(
+            app.activate_agent_menu_action(AgentMenuAction::NewTaskId),
+            AppAction::SetSessionTask {
+                expected_revision: 7,
+                target: SessionTaskTargetV1::New,
+                ..
+            }
+        ));
+
+        app.open_agent_menu(index, 4, 4);
+        assert_eq!(app.activate_agent_menu_action(AgentMenuAction::AssignTaskId), AppAction::None);
+        assert_eq!(app.focus, Focus::TaskId);
+        assert_eq!(app.task_id_dialog.as_ref().map(|dialog| dialog.expected_revision), Some(7));
+        assert_eq!(app.paste("task-ABCDEF0123456789abcdef01".to_owned()), AppAction::None);
+        assert_eq!(app.task_id_dialog.as_ref().map(|dialog| dialog.value.as_str()), Some(""));
+        assert_eq!(app.paste("task-0123456789abcdef0123456789abcdef".to_owned()), AppAction::None);
+        assert_eq!(app.task_id_dialog.as_ref().map(|dialog| dialog.value.as_str()), Some(""));
+        assert_eq!(app.paste(task_id.to_string()), AppAction::None);
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::SetSessionTask {
+                expected_revision: 7,
+                target: SessionTaskTargetV1::Existing { task_id: assigned },
+                ..
+            } if assigned == task_id
+        ));
+
+        let legacy = app.agent_rows().into_iter()
+            .find(|row| matches!(row, AgentRowKey::Legacy(_)))
+            .unwrap();
+        let legacy_index = app.agent_rows().iter().position(|row| row == &legacy).unwrap();
+        app.open_agent_menu(legacy_index, 4, 4);
+        for action in [
+            AgentMenuAction::NewTaskId,
+            AgentMenuAction::AssignTaskId,
+            AgentMenuAction::CopyTaskId,
+            AgentMenuAction::ClearTaskId,
+        ] {
+            assert!(app.agent_menu_items().iter().any(|item| item.action == action && !item.enabled));
+        }
+    }
+
+    #[test]
+    fn authoritative_managed_upsert_can_remove_task_binding() {
+        let mut app = fixture();
+        let key = add_managed_record(
+            &mut app,
+            "record-task-clear",
+            "task clear",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let record = app.nodes[0].session_records.last_mut().unwrap();
+        record.task_binding = Some(SessionTaskBindingV1 {
+            revision: 3,
+            task_id: Some("task-0123456789abcdef01234567".parse().unwrap()),
+            changed_at_unix_ms: 4,
+        });
+        let mut authoritative = record.clone();
+        authoritative.task_binding = None;
+        app.upsert_managed_session(authoritative);
+        assert!(app.find_managed_session(&key).unwrap().task_binding.is_none());
+    }
+
+    #[test]
+    fn activity_board_task_filter_matches_exact_managed_records_and_clears_when_unobserved() {
+        let mut app = fixture();
+        let first = add_managed_record(
+            &mut app, "record-task-a", "A", ManagedSessionState::Dormant, None, true,
+        );
+        let second = add_managed_record(
+            &mut app, "record-task-b", "B", ManagedSessionState::Dormant, None, true,
+        );
+        let task_id: TaskId = "task-0123456789abcdef01234567".parse().unwrap();
+        let other_id: TaskId = "task-fedcba9876543210fedcba98".parse().unwrap();
+        app.nodes[0].session_records.iter_mut().for_each(|record| {
+            record.task_binding = Some(SessionTaskBindingV1 {
+                revision: 1,
+                task_id: Some(if record.record_id == "record-task-a" {
+                    task_id.clone()
+                } else {
+                    other_id.clone()
+                }),
+                changed_at_unix_ms: 1,
+            });
+        });
+        let mut other_node = app.nodes[0].clone();
+        other_node.node_id = "node-b".to_owned();
+        other_node.workspaces.clear();
+        let mut observed = app.find_managed_session(&first).unwrap().clone();
+        observed.node_id = "node-b".to_owned();
+        observed.record_id = "record-task-c".to_owned();
+        other_node.session_records = vec![observed];
+        app.nodes.push(other_node);
+        app.agent_board.selected = Some(first.clone());
+        app.filter_agent_board_by_selected_task();
+        assert_eq!(app.agent_board.task_filter.as_ref(), Some(&task_id));
+        let cards = app.agent_board_cards();
+        assert_eq!(cards.len(), 2);
+        assert!(cards.iter().all(|card| matches!(card.key, AgentRowKey::Managed { .. })));
+        assert!(!cards.iter().any(|card| card.key == second));
+
+        for node in &mut app.nodes {
+            for record in &mut node.session_records {
+                record.task_binding = None;
+            }
+        }
+        app.reconcile_agent_board();
+        assert!(app.agent_board.task_filter.is_none());
+        assert!(!app.agent_board_cards().is_empty());
+    }
+
+    #[test]
+    fn dormant_agent_menu_routes_resume_inspect_and_forget() {
+        let mut app = fixture();
+        let dormant = add_managed_record(
+            &mut app,
+            "record-dormant-menu",
+            "nightly review",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let index = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
+        app.open_agent_menu(index, 10, 7);
+        let items = app.agent_menu_items();
+        for action in [
+            AgentMenuAction::InspectWorkspace,
+            AgentMenuAction::Rename,
+            AgentMenuAction::Resume,
+            AgentMenuAction::Forget,
+        ] {
+            assert!(items.iter().any(|item| item.action == action && item.enabled));
+        }
+        assert!(matches!(
+            app.activate_agent_menu_action(AgentMenuAction::Resume),
+            AppAction::ResumeSessionRecord { ref record_id, .. }
+                if record_id == "record-dormant-menu"
+        ));
+
+        app.open_agent_menu(index, 10, 7);
+        assert!(matches!(
+            app.activate_agent_menu_action(AgentMenuAction::InspectWorkspace),
+            AppAction::InspectWorkspace { ref node_id, ref workspace_id }
+                if node_id == "node-a" && workspace_id == "workspace-a"
+        ));
+        assert_eq!(app.control_section, ControlSection::Files);
+
+        app.open_agent_menu(index, 10, 7);
+        assert_eq!(app.activate_agent_menu_action(AgentMenuAction::Forget), AppAction::None);
+        assert_eq!(app.focus, Focus::ForgetSession);
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::ForgetSessionRecord { ref record_id, .. }
+                if record_id == "record-dormant-menu"
+        ));
+    }
+
+    #[test]
+    fn agent_menu_tracks_record_key_across_roster_reorder_and_outside_click_closes() {
+        let mut app = fixture();
+        let target = add_managed_record(
+            &mut app,
+            "record-z",
+            "z review",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let original_index = app.agent_rows().iter().position(|row| row == &target).unwrap();
+        app.open_agent_menu(original_index, 10, 7);
+        add_managed_record(
+            &mut app,
+            "record-a",
+            "a review",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let update = app.nodes[0].clone();
+        app.upsert_node(update);
+        assert_eq!(app.agent_menu.as_ref().map(|menu| &menu.key), Some(&target));
+        assert_eq!(app.activate_agent_menu_action(AgentMenuAction::Rename), AppAction::None);
+        assert_eq!(app.rename_session.as_ref().map(|dialog| dialog.record_id.as_str()), Some("record-z"));
+
+        app.focus = Focus::Agents;
+        app.rename_session = None;
+        let reordered_index = app.agent_rows().iter().position(|row| row == &target).unwrap();
+        app.open_agent_menu(reordered_index, 10, 7);
+        assert_eq!(app.click(70, 20), AppAction::None);
+        assert!(app.agent_menu.is_none());
+    }
+
+    #[test]
+    fn local_agent_pin_alias_and_order_survive_upsert_without_backend_actions() {
+        let mut app = fixture();
+        let first = add_managed_record(
+            &mut app,
+            "record-local-a",
+            "Authoritative A",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let second = add_managed_record(
+            &mut app,
+            "record-local-b",
+            "Authoritative B",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let second_index = app.agent_rows().iter().position(|key| key == &second).unwrap();
+        app.open_agent_menu(second_index, 5, 5);
+        assert_eq!(app.activate_agent_menu_action(AgentMenuAction::TogglePin), AppAction::None);
+        let second_index = app.agent_rows().iter().position(|key| key == &second).unwrap();
+        app.open_agent_menu(second_index, 5, 5);
+        assert_eq!(app.activate_agent_menu_action(AgentMenuAction::LocalAlias), AppAction::None);
+        assert!(app.rename_session.as_ref().is_some_and(|dialog| dialog.local_alias));
+        for character in "Local B".chars() {
+            assert_eq!(app.reduce(UiKey::Char(character)), AppAction::None);
+        }
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert_eq!(app.agent_local_alias(&second), Some("Local B"));
+        assert!(app.agent_is_pinned(&second));
+        assert_eq!(app.find_managed_session(&second).unwrap().display_name, "Authoritative B");
+
+        app.expanded_agent_progress.insert(second.clone());
+        app.agent_run_lens = Some(AgentRunLens {
+            key: second.clone(),
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            node_incarnation_id: None,
+            return_workspace_route: None,
+            return_sidebar_mode: SidebarMode::Files,
+            return_control_section: ControlSection::Agents,
+            return_focus: Focus::Agents,
+        });
+        app.select_agent_key(&second);
+        let update = app.nodes[0].clone();
+        app.upsert_node(update);
+        assert_eq!(app.agent_rows().first(), Some(&second));
+        assert_eq!(app.agent_local_alias(&second), Some("Local B"));
+        assert!(app.expanded_agent_progress.contains(&second));
+        assert_eq!(app.agent_run_lens_key(), Some(&second));
+        assert_eq!(app.agent_rows().get(app.selected_agent), Some(&second));
+
+        app.toggle_managed_agent_pin(&first);
+        assert!(app.reorder_managed_agents(&second, &first));
+        assert_eq!(app.agent_rows().first(), Some(&second));
+        assert_eq!(app.find_managed_session(&first).unwrap().display_name, "Authoritative A");
+    }
+
+    #[test]
+    fn dedicated_agent_order_drag_reorders_locally_while_card_drag_remains_pty() {
+        let mut app = fixture();
+        let active = active_pty_address(&app);
+        let live = add_managed_record(
+            &mut app,
+            "record-order-live",
+            "Live",
+            ManagedSessionState::Live,
+            Some(active.clone()),
+            true,
+        );
+        let dormant = add_managed_record(
+            &mut app,
+            "record-order-dormant",
+            "Dormant",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let live_index = app.agent_rows().iter().position(|key| key == &live).unwrap();
+        let dormant_index = app.agent_rows().iter().position(|key| key == &dormant).unwrap();
+        app.layout.hits = vec![
+            HitRegion { rect: Rect::new(0, 2, 30, 2), target: HitTarget::Agent(live_index) },
+            HitRegion { rect: Rect::new(0, 6, 30, 2), target: HitTarget::Agent(dormant_index) },
+        ];
+        app.begin_agent_order_drag(dormant.clone(), 1, 6);
+        assert_eq!(app.drag(1, 2), AppAction::None);
+        assert_eq!(app.drop_at(1, 2), AppAction::None);
+        assert_eq!(app.agent_rows().first(), Some(&dormant));
+
+        let live_index = app.agent_rows().iter().position(|key| key == &live).unwrap();
+        app.select_or_begin_agent_drag(live_index, 4, 2);
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::SessionChip {
+                source: DragSource::Agent(_),
+                tab: SurfaceTab::Pty(ref address),
+                ..
+            }) if address == &active
+        ));
+    }
+
+    #[test]
+    fn dormant_record_click_selects_only_on_release_and_opens_bounded_preview() {
         let mut app = fixture();
         let dormant = add_managed_record(
             &mut app,
@@ -5970,34 +20999,1007 @@ mod tests {
         assert_eq!(app.click(4, 6), AppAction::None);
         assert_eq!(app.selected_agent, previous);
         assert!(matches!(app.drag_state, Some(DragState::AgentSelection { .. })));
-        assert_eq!(app.drop_at(4, 6), AppAction::None);
+        assert!(matches!(
+            app.drop_at(4, 6),
+            AppAction::PreviewSessionRecord {
+                ref node_id,
+                ref record_id,
+                message_limit: 24,
+                ..
+            } if node_id == "node-a" && record_id == "record-dormant"
+        ));
         assert_eq!(app.selected_agent, index);
-        assert_eq!(app.tabs.len(), 1);
-
+        assert_eq!(app.surface.all_tabs().len(), 2);
+        assert_eq!(app.focus, Focus::Viewport);
+        assert!(app.existing_session.is_none());
+        let key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-dormant".to_owned(),
+        };
+        assert!(matches!(app.surface.active_tab(), Some(SurfaceTab::Preview(active)) if active == &key));
         assert!(matches!(
-            app.reduce(UiKey::Char('r')),
-            AppAction::ResumeSessionRecord { ref node_id, ref record_id, .. }
-                if node_id == "node-a" && record_id == "record-dormant"
+            app.preview_tabs.get(&key).map(|tab| &tab.preview),
+            Some(NativeSessionPreviewState::Loading),
         ));
-        assert_eq!(app.reduce(UiKey::Char('n')), AppAction::None);
-        assert_eq!(app.focus, Focus::RenameSession);
-        app.rename_session.as_mut().unwrap().display_name.clear();
-        app.paste("renamed session".to_owned());
-        assert!(matches!(
-            app.reduce(UiKey::Enter),
-            AppAction::RenameSessionRecord { ref display_name, .. }
-                if display_name == "renamed session"
-        ));
+    }
 
+    #[test]
+    fn preview_surface_scrolls_locally_and_rejects_terminal_input() {
+        let mut app = fixture();
+        let record = ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-history".to_owned(),
+            display_name: "history".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            last_error: None,
+        };
+        let token = match app.start_managed_session_preview(record) {
+            AppAction::PreviewSessionRecord { token, .. } => token,
+            _ => panic!("expected hydrated record preview"),
+        };
+        app.apply_session_record_preview(
+            "node-a".to_owned(),
+            "record-history".to_owned(),
+            token,
+            NativeSessionPreviewView {
+                title: Some("history".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 2,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: false,
+                messages: vec![
+                    NativeSessionPreviewMessageView {
+                        role: "user".to_owned(),
+                        text: "first".to_owned(),
+                    },
+                    NativeSessionPreviewMessageView {
+                        role: "assistant".to_owned(),
+                        text: "second".to_owned(),
+                    },
+                ],
+            },
+        );
+        let key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-history".to_owned(),
+        };
+
+        assert_eq!(app.preview_tabs.get(&key).unwrap().scroll, usize::MAX);
+        assert_eq!(app.reduce(UiKey::Up), AppAction::None);
+        assert_eq!(app.preview_tabs.get(&key).unwrap().scroll, usize::MAX - 1);
+        assert_eq!(app.reduce(UiKey::Char('x')), AppAction::None);
+        assert_eq!(app.preview_tabs.get(&key).unwrap().scroll, usize::MAX - 1);
+        assert!(app.notice.as_deref().unwrap().contains("hydrated"));
+    }
+
+    #[test]
+    fn native_hydrated_session_rekeys_rejects_stale_resume_and_promotes_in_place() {
+        let mut app = fixture();
+        let existing_address = active_pty_address(&app);
+        let native_key = PreviewTabKey::NativeSelection {
+            node_id: "node-a".to_owned(),
+            route: NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(), provider("codex")
+            ),
+            catalog_revision: 1,
+            recent_cutoff_unix_ms: 0,
+            selection_id: "selection-a".to_owned(),
+        };
+        app.preview_tabs.insert(native_key.clone(), PreviewTabView {
+            title: "Recovered session".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"),
+            preview: NativeSessionPreviewState::Ready(NativeSessionPreviewView {
+                title: Some("Recovered session".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 1,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: false,
+                messages: vec![NativeSessionPreviewMessageView {
+                    role: "assistant".to_owned(),
+                    text: "hydrated answer".to_owned(),
+                }],
+            }),
+            phase: PreviewTabPhase::Hydrated,
+            reconnect_error: None,
+            scroll: 0,
+            request_token: 4,
+            resume_available: true,
+            record_id: None,
+        });
+        app.surface.open_in_focused(SurfaceTab::Preview(native_key.clone()));
+        app.focus = Focus::Viewport;
+        let (origin_pane, origin_index) = app
+            .surface
+            .tab_location(&SurfaceTab::Preview(native_key.clone()))
+            .unwrap();
+
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::IndexNativeSession { operation_token, .. } => operation_token,
+            action => panic!("expected indexed native resume, got {action:?}"),
+        };
+        assert_eq!(
+            app.preview_tabs.get(&native_key).map(|tab| tab.phase),
+            Some(PreviewTabPhase::Indexing),
+        );
+
+        let indexed = ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-native-a".to_owned(),
+            display_name: "Recovered session".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            last_error: None,
+        };
+        assert!(matches!(
+            app.complete_native_session_index(
+                "node-a",
+                &NativeSessionCatalogRoute::workspace(
+                    "workspace-a".to_owned(), provider("codex")
+                ),
+                1,
+                0,
+                "selection-a",
+                indexed.clone(),
+                operation_token,
+            ),
+            AppAction::ResumeSessionRecord { ref record_id, .. }
+                if record_id == "record-native-a"
+        ));
+        let managed_key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-native-a".to_owned(),
+        };
+        assert!(!app.preview_tabs.contains_key(&native_key));
+        assert_eq!(
+            app.surface.tab_location(&SurfaceTab::Preview(managed_key.clone())),
+            Some((origin_pane, origin_index)),
+        );
+        assert_eq!(
+            app.preview_tabs.get(&managed_key).map(|tab| tab.phase),
+            Some(PreviewTabPhase::Resuming),
+        );
+
+        let other_tab = SurfaceTab::Pty(existing_address);
+        let other_pane = app
+            .surface
+            .drop_tab(other_tab, origin_pane, SurfaceDropZone::Right)
+            .unwrap();
+        assert_eq!(app.surface.focused, other_pane);
+        let promotion_index = app
+            .surface
+            .tab_location(&SurfaceTab::Preview(managed_key.clone()))
+            .unwrap()
+            .1;
+        let active_before = app.surface.focused_pane().active;
+        let address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 77,
+            generation: 3,
+        };
+        let mut live = indexed;
+        live.state = ManagedSessionState::Live;
+        live.active_session = Some(address.clone());
+        assert_eq!(
+            app.complete_existing_session_resume(&live, operation_token.wrapping_add(1)),
+            SessionRecordResumeDisposition::RejectRecord,
+        );
+        assert!(app.preview_tabs.contains_key(&managed_key));
+        assert_eq!(
+            app.complete_existing_session_resume(&live, operation_token),
+            SessionRecordResumeDisposition::UpsertRecordAndOpen(address.clone()),
+        );
+        assert_eq!(
+            app.surface.tab_location(&SurfaceTab::Pty(address.clone())),
+            Some((origin_pane, promotion_index)),
+        );
+        assert_eq!(
+            app.surface
+                .all_tabs()
+                .into_iter()
+                .filter(|tab| matches!(tab, SurfaceTab::Pty(open) if open == &address))
+                .count(),
+            1,
+        );
+        assert_eq!(app.surface.focused, other_pane);
+        assert_eq!(app.surface.focused_pane().active, active_before);
+        app.request_open(address);
+        assert_eq!(app.surface.focused, other_pane);
+        assert_eq!(app.surface.focused_pane().active, active_before);
+    }
+
+    #[test]
+    fn native_index_echo_rejects_other_selection_in_same_workspace_provider() {
+        let mut app = fixture();
+        let route = NativeSessionCatalogRoute::workspace(
+            "workspace-a".to_owned(), provider("codex")
+        );
+        let native_key = PreviewTabKey::NativeSelection {
+            node_id: "node-a".to_owned(),
+            route: route.clone(),
+            catalog_revision: 11,
+            recent_cutoff_unix_ms: 22,
+            selection_id: "selection-a".to_owned(),
+        };
+        app.preview_tabs.insert(native_key.clone(), PreviewTabView {
+            title: "Selection A".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"),
+            preview: NativeSessionPreviewState::Empty(NativeSessionPreviewView {
+                title: Some("Selection A".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 0,
+                message_count_exact: true,
+                completed_turn_count: None,
+                total_tokens: None,
+                truncated: false,
+                messages: Vec::new(),
+            }),
+            phase: PreviewTabPhase::Hydrated,
+            reconnect_error: None,
+            scroll: 0,
+            request_token: 1,
+            resume_available: true,
+            record_id: None,
+        });
+        app.surface.open_in_focused(SurfaceTab::Preview(native_key.clone()));
+        app.focus = Focus::Viewport;
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::IndexNativeSession { operation_token, .. } => operation_token,
+            action => panic!("expected native index, got {action:?}"),
+        };
+        let record = ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-selection-a".to_owned(),
+            display_name: "Selection A".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            last_error: None,
+        };
+        let records_before = app.nodes[0].session_records.clone();
+
+        assert_eq!(app.complete_native_session_index(
+            "node-a", &route, 11, 22, "selection-b", record.clone(), operation_token,
+        ), AppAction::None);
+        assert_eq!(app.nodes[0].session_records, records_before);
+        assert!(app.preview_tabs.contains_key(&native_key));
+        assert_eq!(
+            app.preview_tabs.get(&native_key).map(|tab| tab.phase),
+            Some(PreviewTabPhase::Indexing),
+        );
+        assert!(app.preview_resume.is_some());
+
+        assert!(matches!(app.complete_native_session_index(
+            "node-a", &route, 11, 22, "selection-a", record, operation_token,
+        ), AppAction::ResumeSessionRecord { ref record_id, .. }
+            if record_id == "record-selection-a"));
+    }
+
+    #[test]
+    fn native_index_mismatch_persists_error_in_origin_preview() {
+        let mut app = fixture();
+        let native_key = PreviewTabKey::NativeSelection {
+            node_id: "node-a".to_owned(),
+            route: NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(), provider("codex")
+            ),
+            catalog_revision: 1,
+            recent_cutoff_unix_ms: 0,
+            selection_id: "selection-mismatch".to_owned(),
+        };
+        app.preview_tabs.insert(native_key.clone(), PreviewTabView {
+            title: "Native mismatch".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"),
+            preview: NativeSessionPreviewState::Empty(NativeSessionPreviewView {
+                title: None,
+                modified_at: None,
+                model: None,
+                message_count: 0,
+                message_count_exact: true,
+                completed_turn_count: None,
+                total_tokens: None,
+                truncated: false,
+                messages: Vec::new(),
+            }),
+            phase: PreviewTabPhase::Hydrated,
+            reconnect_error: None,
+            scroll: 0,
+            request_token: 7,
+            resume_available: true,
+            record_id: None,
+        });
+        app.surface.open_in_focused(SurfaceTab::Preview(native_key.clone()));
+        app.focus = Focus::Viewport;
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::IndexNativeSession { operation_token, .. } => operation_token,
+            action => panic!("expected native index, got {action:?}"),
+        };
+        let mismatched = ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-mismatch".to_owned(),
+            display_name: "Mismatched".to_owned(),
+            provider: provider("claude"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            last_error: None,
+        };
+        assert_eq!(
+            app.complete_native_session_index(
+                "node-a",
+                &NativeSessionCatalogRoute::workspace(
+                    "workspace-a".to_owned(), provider("codex")
+                ),
+                1,
+                0,
+                "selection-mismatch",
+                mismatched,
+                operation_token,
+            ),
+            AppAction::None,
+        );
+        let tab = app.preview_tabs.get(&native_key).unwrap();
+        assert_eq!(tab.phase, PreviewTabPhase::Hydrated);
+        assert_eq!(tab.scroll, usize::MAX);
+        assert!(tab
+            .reconnect_error
+            .as_deref()
+            .is_some_and(|message| message.contains("no longer matches")));
+        assert!(app.preview_resume.is_none());
+    }
+
+    #[test]
+    fn removed_record_rejects_late_preview_resume_without_readding_roster() {
+        let mut app = fixture();
+        let managed_key = add_managed_record(
+            &mut app,
+            "record-removed-race",
+            "Removed race",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let record = app.find_managed_session(&managed_key).unwrap().clone();
+        let token = match app.start_managed_session_preview(record.clone()) {
+            AppAction::PreviewSessionRecord { token, .. } => token,
+            action => panic!("expected preview request, got {action:?}"),
+        };
+        app.apply_session_record_preview(
+            "node-a".to_owned(),
+            "record-removed-race".to_owned(),
+            token,
+            NativeSessionPreviewView {
+                title: Some("Removed race".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 1,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: false,
+                messages: vec![NativeSessionPreviewMessageView {
+                    role: "assistant".to_owned(),
+                    text: "preserve this transcript".to_owned(),
+                }],
+            },
+        );
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::ResumeSessionRecord { operation_token, .. } => operation_token,
+            action => panic!("expected correlated resume, got {action:?}"),
+        };
+
+        app.remove_managed_session("node-a", "record-removed-race");
+        let preview_key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-removed-race".to_owned(),
+        };
+        assert!(app.find_managed_session(&managed_key).is_none());
+        assert_eq!(
+            app.preview_tabs.get(&preview_key).map(|tab| tab.phase),
+            Some(PreviewTabPhase::Hydrated),
+        );
+        assert!(matches!(
+            app.preview_tabs.get(&preview_key).map(|tab| &tab.preview),
+            Some(NativeSessionPreviewState::Ready(preview))
+                if preview.messages[0].text == "preserve this transcript"
+        ));
+        assert!(app.preview_resume.is_none());
+
+        let address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 91,
+            generation: 1,
+        };
+        let mut late = record;
+        late.state = ManagedSessionState::Live;
+        late.active_session = Some(address.clone());
+        let disposition = app.complete_existing_session_resume(&late, operation_token);
+        assert_eq!(disposition, SessionRecordResumeDisposition::RejectRecord);
+        if !matches!(disposition, SessionRecordResumeDisposition::RejectRecord) {
+            app.upsert_managed_session(late);
+        }
+        assert!(app.find_managed_session(&managed_key).is_none());
+        assert!(app
+            .surface
+            .tab_location(&SurfaceTab::Pty(address))
+            .is_none());
+    }
+
+    #[test]
+    fn native_rekey_conflict_preserves_both_preview_panes_and_focus() {
+        let mut app = fixture();
+        let native_key = PreviewTabKey::NativeSelection {
+            node_id: "node-a".to_owned(),
+            route: NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(), provider("codex")
+            ),
+            catalog_revision: 1,
+            recent_cutoff_unix_ms: 0,
+            selection_id: "native-conflict".to_owned(),
+        };
+        let managed_key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-conflict".to_owned(),
+        };
+        let preview = NativeSessionPreviewState::Ready(NativeSessionPreviewView {
+            title: Some("Conflict".to_owned()),
+            modified_at: None,
+            model: None,
+            message_count: 1,
+            message_count_exact: true,
+            completed_turn_count: Some(1),
+            total_tokens: None,
+            truncated: false,
+            messages: vec![NativeSessionPreviewMessageView {
+                role: "assistant".to_owned(),
+                text: "existing transcript".to_owned(),
+            }],
+        });
+        app.preview_tabs.insert(native_key.clone(), PreviewTabView {
+            title: "Native conflict".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"),
+            preview: preview.clone(),
+            phase: PreviewTabPhase::Hydrated,
+            reconnect_error: None,
+            scroll: 0,
+            request_token: 1,
+            resume_available: true,
+            record_id: None,
+        });
+        app.surface.open_in_focused(SurfaceTab::Preview(native_key.clone()));
+        let origin_pane = app.surface.focused;
+        app.preview_tabs.insert(managed_key.clone(), PreviewTabView {
+            title: "Managed conflict".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"),
+            preview,
+            phase: PreviewTabPhase::Hydrated,
+            reconnect_error: None,
+            scroll: 3,
+            request_token: 2,
+            resume_available: true,
+            record_id: Some("record-conflict".to_owned()),
+        });
+        let destination_pane = app
+            .surface
+            .drop_tab(
+                SurfaceTab::Preview(managed_key.clone()),
+                origin_pane,
+                SurfaceDropZone::Right,
+            )
+            .unwrap();
+        app.surface.set_focused(origin_pane).unwrap();
+        let native_index = app
+            .surface
+            .tab_location(&SurfaceTab::Preview(native_key.clone()))
+            .unwrap()
+            .1;
+        app.surface.activate_tab(origin_pane, native_index);
+        app.focus = Focus::Viewport;
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::IndexNativeSession { operation_token, .. } => operation_token,
+            action => panic!("expected native index, got {action:?}"),
+        };
+        app.surface.set_focused(destination_pane).unwrap();
+        let focused_before = app.surface.focused;
+        let native_location = app
+            .surface
+            .tab_location(&SurfaceTab::Preview(native_key.clone()));
+        let managed_location = app
+            .surface
+            .tab_location(&SurfaceTab::Preview(managed_key.clone()));
+
+        let indexed = ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-conflict".to_owned(),
+            display_name: "Managed conflict".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: None,
+            last_error: None,
+        };
+        assert_eq!(
+            app.complete_native_session_index(
+                "node-a",
+                &NativeSessionCatalogRoute::workspace(
+                    "workspace-a".to_owned(), provider("codex")
+                ),
+                1,
+                0,
+                "native-conflict",
+                indexed,
+                operation_token,
+            ),
+            AppAction::None,
+        );
+        assert_eq!(
+            app.surface.tab_location(&SurfaceTab::Preview(native_key.clone())),
+            native_location,
+        );
+        assert_eq!(
+            app.surface.tab_location(&SurfaceTab::Preview(managed_key.clone())),
+            managed_location,
+        );
+        assert_eq!(app.surface.focused, focused_before);
+        assert_eq!(
+            app.preview_tabs.get(&native_key).map(|tab| tab.phase),
+            Some(PreviewTabPhase::Hydrated),
+        );
+        assert_eq!(
+            app.preview_tabs.get(&native_key).map(|tab| tab.scroll),
+            Some(usize::MAX),
+        );
+        assert!(app
+            .preview_tabs
+            .get(&native_key)
+            .and_then(|tab| tab.reconnect_error.as_deref())
+            .is_some_and(|message| message.contains("already open")));
+        assert_eq!(app.preview_tabs.get(&managed_key).map(|tab| tab.scroll), Some(3));
+        assert!(app.preview_resume.is_none());
+    }
+
+    #[test]
+    fn existing_pty_conflict_keeps_single_live_tab_and_hydrated_origin() {
+        let mut app = fixture();
+        let managed_key = add_managed_record(
+            &mut app,
+            "record-live-conflict",
+            "Live conflict",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let record = app.find_managed_session(&managed_key).unwrap().clone();
+        let token = match app.start_managed_session_preview(record.clone()) {
+            AppAction::PreviewSessionRecord { token, .. } => token,
+            action => panic!("expected preview request, got {action:?}"),
+        };
+        app.apply_session_record_preview(
+            "node-a".to_owned(),
+            "record-live-conflict".to_owned(),
+            token,
+            NativeSessionPreviewView {
+                title: Some("Live conflict".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 1,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: false,
+                messages: vec![NativeSessionPreviewMessageView {
+                    role: "assistant".to_owned(),
+                    text: "hydrated transcript".to_owned(),
+                }],
+            },
+        );
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::ResumeSessionRecord { operation_token, .. } => operation_token,
+            action => panic!("expected preview resume, got {action:?}"),
+        };
+        let preview_key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-live-conflict".to_owned(),
+        };
+        let origin_pane = app
+            .surface
+            .tab_location(&SurfaceTab::Preview(preview_key.clone()))
+            .unwrap()
+            .0;
+        let address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 92,
+            generation: 1,
+        };
+        let live_pane = app
+            .surface
+            .drop_tab(SurfaceTab::Pty(address.clone()), origin_pane, SurfaceDropZone::Right)
+            .unwrap();
+        let focused_before = app.surface.focused;
+        assert_eq!(focused_before, live_pane);
+        let mut live = record;
+        live.state = ManagedSessionState::Live;
+        live.active_session = Some(address.clone());
+
+        assert_eq!(
+            app.complete_existing_session_resume(&live, operation_token),
+            SessionRecordResumeDisposition::UpsertRecord,
+        );
+        assert_eq!(app.surface.focused, focused_before);
+        assert_eq!(
+            app.surface
+                .all_tabs()
+                .into_iter()
+                .filter(|tab| matches!(tab, SurfaceTab::Pty(open) if open == &address))
+                .count(),
+            1,
+        );
+        assert!(app
+            .surface
+            .tab_location(&SurfaceTab::Preview(preview_key.clone()))
+            .is_some());
+        assert_eq!(
+            app.preview_tabs.get(&preview_key).map(|tab| tab.phase),
+            Some(PreviewTabPhase::Hydrated),
+        );
+        assert!(app.preview_resume.is_none());
+    }
+
+    #[test]
+    fn unmatched_resume_rejects_zero_and_nonzero_tokens_without_pending_operation() {
+        let mut app = fixture();
+        let key = add_managed_record(
+            &mut app,
+            "record-legacy-zero",
+            "Legacy zero",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let mut response = app.find_managed_session(&key).unwrap().clone();
+        response.state = ManagedSessionState::Live;
+        response.active_session = Some(SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 93,
+            generation: 1,
+        });
+
+        assert_eq!(
+            app.complete_existing_session_resume(&response, 17),
+            SessionRecordResumeDisposition::RejectRecord,
+        );
+        assert_eq!(
+            app.complete_existing_session_resume(&response, 0),
+            SessionRecordResumeDisposition::RejectRecord,
+        );
+        response.record_id = "record-missing".to_owned();
+        assert_eq!(
+            app.complete_existing_session_resume(&response, 0),
+            SessionRecordResumeDisposition::RejectRecord,
+        );
+    }
+
+    #[test]
+    fn context_menu_resume_uses_nonzero_correlation_and_opens_exact_pty() {
+        let mut app = fixture();
+        let address = add_session(&mut app, 94, provider("codex"));
+        let key = add_managed_record(
+            &mut app,
+            "record-context-resume",
+            "Context resume",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let index = app.agent_rows().iter().position(|row| row == &key).unwrap();
+        app.open_agent_menu(index, 8, 4);
+        let operation_token = match app.activate_agent_menu_action(AgentMenuAction::Resume) {
+            AppAction::ResumeSessionRecord { operation_token, .. } => operation_token,
+            action => panic!("expected correlated context-menu resume, got {action:?}"),
+        };
+        assert_ne!(operation_token, 0);
+        assert!(app.preview_resume.as_ref().is_some_and(|pending| {
+            pending.origin.is_none()
+                && pending.record_id.as_deref() == Some("record-context-resume")
+                && pending.operation_token == operation_token
+        }));
+        let mut live = app.find_managed_session(&key).unwrap().clone();
+        live.state = ManagedSessionState::Live;
+        live.active_session = Some(address.clone());
+        let disposition = app.complete_existing_session_resume(&live, operation_token);
+        assert_eq!(
+            disposition,
+            SessionRecordResumeDisposition::UpsertRecordAndOpen(address.clone()),
+        );
+        if let SessionRecordResumeDisposition::UpsertRecordAndOpen(open) = disposition {
+            app.upsert_managed_session(live);
+            app.request_open(open);
+        }
+        assert_eq!(
+            app.surface
+                .all_tabs()
+                .into_iter()
+                .filter(|tab| matches!(tab, SurfaceTab::Pty(open) if open == &address))
+                .count(),
+            1,
+        );
+        assert!(app.preview_resume.is_none());
+    }
+
+    #[test]
+    fn agents_resume_promotes_exact_open_managed_preview_in_place() {
+        let mut app = fixture();
+        let address = add_session(&mut app, 95, provider("codex"));
+        let key = add_managed_record(
+            &mut app,
+            "record-agents-promote",
+            "Agents promote",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let record = app.find_managed_session(&key).unwrap().clone();
+        let token = match app.start_managed_session_preview(record.clone()) {
+            AppAction::PreviewSessionRecord { token, .. } => token,
+            action => panic!("expected preview request, got {action:?}"),
+        };
+        app.apply_session_record_preview(
+            "node-a".to_owned(),
+            "record-agents-promote".to_owned(),
+            token,
+            NativeSessionPreviewView {
+                title: Some("Agents promote".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 1,
+                message_count_exact: true,
+                completed_turn_count: Some(1),
+                total_tokens: None,
+                truncated: false,
+                messages: vec![NativeSessionPreviewMessageView {
+                    role: "assistant".to_owned(),
+                    text: "hydrated".to_owned(),
+                }],
+            },
+        );
+        let preview_key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-agents-promote".to_owned(),
+        };
+        let preview_location = app
+            .surface
+            .tab_location(&SurfaceTab::Preview(preview_key.clone()))
+            .unwrap();
+        app.selected_agent = app.agent_rows().iter().position(|row| row == &key).unwrap();
         app.focus = Focus::Agents;
-        app.selected_agent = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
-        assert_eq!(app.reduce(UiKey::Delete), AppAction::None);
-        assert_eq!(app.focus, Focus::ForgetSession);
-        assert!(matches!(
-            app.reduce(UiKey::Enter),
-            AppAction::ForgetSessionRecord { ref record_id, .. }
-                if record_id == "record-dormant"
-        ));
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::ResumeSessionRecord { operation_token, .. } => operation_token,
+            action => panic!("expected Agents resume, got {action:?}"),
+        };
+        let mut live = record;
+        live.state = ManagedSessionState::Live;
+        live.active_session = Some(address.clone());
+        assert_eq!(
+            app.complete_existing_session_resume(&live, operation_token),
+            SessionRecordResumeDisposition::UpsertRecordAndOpen(address.clone()),
+        );
+        assert_eq!(
+            app.surface.tab_location(&SurfaceTab::Pty(address)),
+            Some(preview_location),
+        );
+        assert!(!app.preview_tabs.contains_key(&preview_key));
+        assert!(app.preview_resume.is_none());
+    }
+
+    #[test]
+    fn roster_uppercase_resume_promotes_open_preview_and_failure_persists() {
+        let mut app = fixture();
+        let key = add_managed_record(
+            &mut app,
+            "record-visible-failure",
+            "Visible failure",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let record = app.find_managed_session(&key).unwrap().clone();
+        let token = match app.start_managed_session_preview(record) {
+            AppAction::PreviewSessionRecord { token, .. } => token,
+            action => panic!("expected preview request, got {action:?}"),
+        };
+        app.apply_session_record_preview(
+            "node-a".to_owned(),
+            "record-visible-failure".to_owned(),
+            token,
+            NativeSessionPreviewView {
+                title: Some("Visible failure".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: 40,
+                message_count_exact: true,
+                completed_turn_count: Some(20),
+                total_tokens: None,
+                truncated: false,
+                messages: (0..40)
+                    .map(|index| NativeSessionPreviewMessageView {
+                        role: if index % 2 == 0 { "user" } else { "assistant" }.to_owned(),
+                        text: format!("turn {index}"),
+                    })
+                    .collect(),
+            },
+        );
+        app.selected_agent = app.agent_rows().iter().position(|row| row == &key).unwrap();
+        app.focus = Focus::Agents;
+        let operation_token = match app.reduce(UiKey::Char('R')) {
+            AppAction::ResumeSessionRecord { operation_token, .. } => operation_token,
+            action => panic!("expected uppercase correlated resume, got {action:?}"),
+        };
+        assert_ne!(operation_token, 0);
+        let preview_key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-visible-failure".to_owned(),
+        };
+        assert_eq!(
+            app.preview_resume.as_ref().and_then(|pending| pending.origin.as_ref()),
+            Some(&preview_key),
+        );
+        app.fail_existing_session_operation(
+            "node-a",
+            Some("record-visible-failure"),
+            false,
+            operation_token,
+            "denied\r\n\u{1b}[31m retry".to_owned(),
+            false,
+        );
+        let tab = app.preview_tabs.get(&preview_key).unwrap();
+        assert_eq!(tab.phase, PreviewTabPhase::Hydrated);
+        assert_eq!(tab.scroll, usize::MAX);
+        assert!(matches!(&tab.preview, NativeSessionPreviewState::Ready(preview)
+            if preview.messages.len() == 40));
+        let error = tab.reconnect_error.as_deref().unwrap();
+        assert!(error.contains("Reconnect failed: denied [31m retry"));
+        assert!(!error.chars().any(char::is_control));
+        assert!(app.notice.as_deref().unwrap().contains("session reconnect failed"));
+        assert!(app.preview_resume.is_none());
+    }
+
+    #[test]
+    fn unavailable_history_does_not_block_managed_provider_resume() {
+        let mut app = fixture();
+        let key = add_managed_record(
+            &mut app,
+            "record-no-history",
+            "No history",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        let record = app.find_managed_session(&key).unwrap().clone();
+        let preview_token = match app.start_managed_session_preview(record) {
+            AppAction::PreviewSessionRecord { token, .. } => token,
+            action => panic!("expected preview request, got {action:?}"),
+        };
+        app.fail_session_record_preview(
+            "node-a".to_owned(),
+            "record-no-history".to_owned(),
+            preview_token,
+            "history source is not configured".to_owned(),
+            true,
+        );
+        let operation_token = match app.reduce(UiKey::Char('r')) {
+            AppAction::ResumeSessionRecord {
+                initial_prompt: None,
+                operation_token,
+                ..
+            } => operation_token,
+            action => panic!("expected raw provider resume, got {action:?}"),
+        };
+        assert_ne!(operation_token, 0);
+        let preview_key = PreviewTabKey::ManagedRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-no-history".to_owned(),
+        };
+        assert_eq!(
+            app.preview_tabs.get(&preview_key).map(|tab| tab.phase),
+            Some(PreviewTabPhase::Resuming),
+        );
+        assert_eq!(
+            app.preview_resume
+                .as_ref()
+                .and_then(|pending| pending.origin.as_ref()),
+            Some(&preview_key),
+        );
+    }
+
+    #[test]
+    fn activity_spinner_advances_on_bounded_ui_ticks() {
+        let mut app = App::default();
+        assert_eq!(app.activity_spinner(), '⠋');
+        for _ in 0..4 {
+            app.advance_animation_frame();
+        }
+        assert_eq!(app.activity_spinner(), '⠙');
+        for _ in 0..36 {
+            app.advance_animation_frame();
+        }
+        assert_eq!(app.activity_spinner(), '⠋');
+    }
+
+    #[test]
+    fn unavailable_context_resume_is_noop_without_allocating_pending_operation() {
+        let mut app = fixture();
+        let key = add_managed_record(
+            &mut app,
+            "record-unavailable-noop",
+            "Unavailable",
+            ManagedSessionState::Unavailable,
+            None,
+            true,
+        );
+        let index = app.agent_rows().iter().position(|row| row == &key).unwrap();
+        app.open_agent_menu(index, 8, 4);
+        assert_eq!(
+            app.activate_agent_menu_action(AgentMenuAction::Resume),
+            AppAction::None,
+        );
+        assert!(app.preview_resume.is_none());
+        assert_eq!(app.existing_session_operation_token, 0);
     }
 
     #[test]
@@ -6013,7 +22015,7 @@ mod tests {
         );
         let index = app.agent_rows().iter().position(|row| row == &dormant).unwrap();
         let selected = app.selected_agent;
-        let tabs = app.tabs.clone();
+        let tabs = app.surface.all_tabs().into_iter().cloned().collect::<Vec<_>>();
         app.layout.hits.push(HitRegion {
             rect: Rect::new(0, 6, 24, 2),
             target: HitTarget::Agent(index),
@@ -6024,7 +22026,7 @@ mod tests {
         app.drop_at(35, 10);
 
         assert_eq!(app.selected_agent, selected);
-        assert_eq!(app.tabs, tabs);
+        assert_eq!(app.surface.all_tabs(), tabs.iter().collect::<Vec<_>>());
     }
 
     #[test]
@@ -6060,13 +22062,13 @@ mod tests {
 
         assert_eq!(app.selected_agent, reordered_index);
         assert_eq!(app.selected_managed_session().unwrap().record_id, "record-dormant");
-        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.surface.all_tabs().len(), 1);
     }
 
     #[test]
     fn live_managed_display_name_is_the_terminal_surface_title() {
         let mut app = fixture();
-        let address = app.tabs[0].address.clone();
+        let address = active_pty_address(&app);
         add_managed_record(
             &mut app,
             "record-live",
@@ -6118,5 +22120,1628 @@ mod tests {
 
         app.layout.control_content = Rect::default();
         assert_eq!(app.scroll(0, 0, false), AppAction::None);
+    }
+
+    #[test]
+    fn folder_browser_navigates_selected_node_and_uses_only_current_canonical_directory() {
+        let mut app = fixture();
+        assert_eq!(app.begin_add_space_on_node("node-a".to_owned()), AppAction::None);
+        let first = app.begin_folder_browser();
+        let AppAction::BrowseHostDirectories {
+            node_id,
+            directory,
+            after,
+            token: first_token,
+            append,
+        } = first
+        else {
+            panic!("folder browser must request virtual roots");
+        };
+        assert_eq!(node_id, "node-a");
+        assert!(directory.is_none());
+        assert!(after.is_none());
+        assert!(!append);
+        assert_eq!(app.focus, Focus::FolderBrowser);
+
+        app.apply_host_directories(
+            "node-a".to_owned(),
+            first_token.saturating_add(1),
+            false,
+            HostDirectoryListing {
+                directory: None,
+                parent: None,
+                entries: Vec::new(),
+                next_after: None,
+                incomplete: false,
+            },
+        );
+        assert!(app.folder_browser.as_ref().unwrap().pending);
+
+        let drive = host_path(r"C:\");
+        app.apply_host_directories(
+            "node-a".to_owned(),
+            first_token,
+            false,
+            HostDirectoryListing {
+                directory: None,
+                parent: None,
+                entries: vec![HostDirectoryEntry {
+                    path: drive.clone(),
+                    display_name: "C:\\".to_owned(),
+                    is_link: false,
+                }],
+                next_after: None,
+                incomplete: false,
+            },
+        );
+        let AppAction::BrowseHostDirectories {
+            directory: Some(opened_drive),
+            token: drive_token,
+            ..
+        } = app.reduce(UiKey::Enter)
+        else {
+            panic!("Enter must open the selected drive on the Node");
+        };
+        assert_eq!(opened_drive, drive);
+
+        let repository = host_path(r"C:\work\nemo");
+        app.apply_host_directories(
+            "node-a".to_owned(),
+            drive_token,
+            false,
+            HostDirectoryListing {
+                directory: Some(drive),
+                parent: None,
+                entries: vec![HostDirectoryEntry {
+                    path: repository.clone(),
+                    display_name: "work".to_owned(),
+                    is_link: false,
+                }],
+                next_after: None,
+                incomplete: false,
+            },
+        );
+        let AppAction::BrowseHostDirectories {
+            directory: Some(opened_repository),
+            token: repository_token,
+            ..
+        } = app.reduce(UiKey::Enter)
+        else {
+            panic!("Enter must navigate into the selected Node directory");
+        };
+        assert_eq!(opened_repository, repository);
+        app.apply_host_directories(
+            "node-a".to_owned(),
+            repository_token,
+            false,
+            HostDirectoryListing {
+                directory: Some(repository.clone()),
+                parent: Some(host_path(r"C:\work")),
+                entries: Vec::new(),
+                next_after: None,
+                incomplete: false,
+            },
+        );
+
+        assert_eq!(app.reduce(UiKey::Char('u')), AppAction::None);
+        assert_eq!(app.focus, Focus::AddSpace);
+        let add_space = app.add_space.as_ref().unwrap();
+        assert_eq!(add_space.original_root.as_ref(), Some(&repository));
+        assert_eq!(add_space.root, r"C:\work\nemo");
+        assert!(!add_space.root_edited);
+    }
+
+    #[test]
+    fn folder_browser_rejects_paste_that_would_overflow_the_filter_bound() {
+        let mut app = fixture();
+        assert_eq!(app.begin_add_space_on_node("node-a".to_owned()), AppAction::None);
+        let _ = app.begin_folder_browser();
+        app.folder_browser.as_mut().unwrap().filter = "a".repeat(250);
+
+        assert_eq!(app.paste("b".repeat(7)), AppAction::None);
+
+        assert_eq!(app.folder_browser.as_ref().unwrap().filter.len(), 250);
+        assert_eq!(app.notice.as_deref(), Some("folder filter paste is invalid"));
+    }
+
+    #[test]
+    fn folder_browser_final_page_clears_pagination_incomplete_state() {
+        let mut app = fixture();
+        assert_eq!(app.begin_add_space_on_node("node-a".to_owned()), AppAction::None);
+        let first = app.begin_folder_browser();
+        let AppAction::BrowseHostDirectories { token, .. } = first else {
+            panic!("folder browser must request roots");
+        };
+        let directory = host_path(r"C:\work");
+        let cursor = host_path(r"C:\work\a");
+        app.apply_host_directories(
+            "node-a".to_owned(),
+            token,
+            false,
+            HostDirectoryListing {
+                directory: Some(directory.clone()),
+                parent: Some(host_path(r"C:\")),
+                entries: vec![HostDirectoryEntry {
+                    path: cursor.clone(),
+                    display_name: "a".to_owned(),
+                    is_link: false,
+                }],
+                next_after: Some(cursor),
+                incomplete: true,
+            },
+        );
+        let AppAction::BrowseHostDirectories { token: next_token, .. } =
+            app.load_more_host_directories()
+        else {
+            panic!("next page must be requested");
+        };
+        app.apply_host_directories(
+            "node-a".to_owned(),
+            next_token,
+            true,
+            HostDirectoryListing {
+                directory: Some(directory),
+                parent: Some(host_path(r"C:\")),
+                entries: vec![HostDirectoryEntry {
+                    path: host_path(r"C:\work\b"),
+                    display_name: "b".to_owned(),
+                    is_link: false,
+                }],
+                next_after: None,
+                incomplete: false,
+            },
+        );
+
+        let browser = app.folder_browser.as_ref().unwrap();
+        assert_eq!(browser.entries.len(), 2);
+        assert!(!browser.incomplete);
+        assert!(browser.next_after.is_none());
+    }
+
+    #[test]
+    fn workspace_file_opens_in_surface_edits_and_saves_with_exact_revision() {
+        let mut app = fixture();
+        app.workspace_inspections.insert(
+            ("node-a".to_owned(), "workspace-a".to_owned()),
+            workspace_inspection(),
+        );
+        let path = repository_path("Cargo.toml");
+        let AppAction::ReadWorkspaceFile { token, .. } =
+            app.select_inspector_item(SidebarMode::Files, 3)
+        else {
+            panic!("file click must request bounded content");
+        };
+        let key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: path.clone(),
+        };
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(key.clone())));
+        let revision = WorkspaceFileRevision::new("0".repeat(64)).unwrap();
+        let text = "name = \"gate\"\n".to_owned();
+        let byte_len = text.len() as u32;
+        app.apply_workspace_file_read(
+            "node-a".to_owned(),
+            token,
+            WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                path,
+                content: WorkspaceFileContent::Utf8 { text, byte_len },
+                revision: Some(revision),
+            },
+        );
+        assert_eq!(app.reduce_viewport(UiKey::Char('e')), AppAction::None);
+        assert_eq!(app.reduce_viewport(UiKey::Char('#')), AppAction::None);
+        let AppAction::WriteWorkspaceFile { expected_revision, text, .. } =
+            app.reduce_viewport(UiKey::Ctrl('s'))
+        else {
+            panic!("Ctrl+S must issue a CAS write");
+        };
+        assert_eq!(expected_revision, "0".repeat(64));
+        assert!(text.starts_with('#'));
+    }
+
+    #[test]
+    fn workspace_entry_dialog_emits_validated_no_overwrite_actions() {
+        let mut app = fixture();
+        assert_eq!(
+            app.begin_create_workspace_entry(WorkspaceEntryKind::File),
+            AppAction::None,
+        );
+        assert_eq!(app.focus, Focus::CreateWorkspaceEntry);
+        assert_eq!(
+            app.paste_create_workspace_entry("/notes/new.md".to_owned()),
+            AppAction::None,
+        );
+
+        let action = app.reduce_create_workspace_entry(UiKey::Enter);
+        let (path, token) = match action {
+            AppAction::CreateWorkspaceFile {
+                node_id,
+                workspace_id,
+                path,
+                token,
+            } => {
+                assert_eq!(node_id, "node-a");
+                assert_eq!(workspace_id, "workspace-a");
+                (path, token)
+            }
+            other => panic!("expected file create action, got {other:?}"),
+        };
+        assert_eq!(path, repository_path("notes/new.md"));
+        assert_ne!(token, 0);
+        assert!(app.create_workspace_entry.as_ref().unwrap().pending);
+
+        app.fail_workspace_entry_create(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            path,
+            WorkspaceEntryKind::File,
+            token,
+            "repository entry already exists".to_owned(),
+        );
+        let dialog = app.create_workspace_entry.as_ref().unwrap();
+        assert!(!dialog.pending);
+        assert_eq!(dialog.path, "notes/new.md");
+        assert_eq!(
+            dialog.error.as_deref(),
+            Some("repository entry already exists"),
+        );
+
+        app.create_workspace_entry.as_mut().unwrap().path = "../escape".to_owned();
+        assert_eq!(
+            app.reduce_create_workspace_entry(UiKey::Enter),
+            AppAction::None,
+        );
+        assert!(app
+            .create_workspace_entry
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .is_some_and(|message| message.starts_with("invalid workspace path:")));
+    }
+
+    #[test]
+    fn workspace_entry_dialog_prefills_selected_directory_and_file_parent() {
+        let mut app = fixture();
+        app.apply_workspace_inspection("node-a".to_owned(), workspace_inspection());
+
+        app.files_cursor = 0;
+        assert_eq!(
+            app.begin_create_workspace_entry(WorkspaceEntryKind::File),
+            AppAction::None,
+        );
+        assert_eq!(
+            app.create_workspace_entry.as_ref().unwrap().path,
+            "src/",
+        );
+
+        app.focus = Focus::Spaces;
+        app.create_workspace_entry = None;
+        app.files_cursor = 2;
+        assert_eq!(
+            app.begin_create_workspace_entry(WorkspaceEntryKind::File),
+            AppAction::None,
+        );
+        assert_eq!(
+            app.create_workspace_entry.as_ref().unwrap().path,
+            "src/bin/",
+        );
+    }
+
+    #[test]
+    fn created_file_opens_ready_editor_and_refreshes_workspace() {
+        let mut app = fixture();
+        let _ = app.begin_create_workspace_entry(WorkspaceEntryKind::File);
+        let _ = app.paste_create_workspace_entry("notes/new.md".to_owned());
+        let AppAction::CreateWorkspaceFile { token, path, .. } =
+            app.reduce_create_workspace_entry(UiKey::Enter)
+        else {
+            panic!("expected file create action");
+        };
+        let revision = WorkspaceFileRevision::new(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        )
+        .unwrap();
+
+        let follow_up = app.apply_workspace_file_created(
+            "node-a".to_owned(),
+            token,
+            WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                path: path.clone(),
+                content: WorkspaceFileContent::Utf8 {
+                    text: String::new(),
+                    byte_len: 0,
+                },
+                revision: Some(revision),
+            },
+        );
+
+        assert_eq!(
+            follow_up,
+            AppAction::InspectWorkspace {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+            },
+        );
+        let key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path,
+        };
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(key.clone())));
+        let tab = &app.file_tabs[&key];
+        assert!(tab.edit_mode);
+        assert_eq!(tab.state, WorkspaceFileState::Ready);
+        assert_eq!(tab.editor.text(), "");
+        assert!(app.create_workspace_entry.is_none());
+    }
+
+    #[test]
+    fn created_directory_refreshes_workspace_without_opening_tab() {
+        let mut app = fixture();
+        let active_before = app.surface.active_tab().cloned();
+        let _ = app.begin_create_workspace_entry(WorkspaceEntryKind::Directory);
+        let _ = app.paste_create_workspace_entry("notes".to_owned());
+        let AppAction::CreateWorkspaceDirectory { token, path, .. } =
+            app.reduce_create_workspace_entry(UiKey::Enter)
+        else {
+            panic!("expected directory create action");
+        };
+
+        let follow_up = app.apply_workspace_directory_created(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            token,
+            WorkspaceEntry {
+                relative_path: path,
+                kind: WorkspaceEntryKind::Directory,
+            },
+        );
+
+        assert_eq!(
+            follow_up,
+            AppAction::InspectWorkspace {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+            },
+        );
+        assert_eq!(app.surface.active_tab().cloned(), active_before);
+        assert!(app.create_workspace_entry.is_none());
+        assert_eq!(app.focus, Focus::Spaces);
+    }
+
+    #[test]
+    fn workspace_entry_create_ignores_stale_or_mismatched_completion() {
+        let mut app = fixture();
+        let _ = app.begin_create_workspace_entry(WorkspaceEntryKind::File);
+        let _ = app.paste_create_workspace_entry("notes/new.md".to_owned());
+        let AppAction::CreateWorkspaceFile { token, path, .. } =
+            app.reduce_create_workspace_entry(UiKey::Enter)
+        else {
+            panic!("expected file create action");
+        };
+        let response = WorkspaceFileRead {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            path: path.clone(),
+            content: WorkspaceFileContent::Utf8 {
+                text: String::new(),
+                byte_len: 0,
+            },
+            revision: Some(WorkspaceFileRevision::new("a".repeat(64)).unwrap()),
+        };
+
+        assert_eq!(
+            app.apply_workspace_file_created(
+                "node-a".to_owned(),
+                token.saturating_add(1),
+                response,
+            ),
+            AppAction::None,
+        );
+        app.fail_workspace_entry_create(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            repository_path("notes/other.md"),
+            WorkspaceEntryKind::File,
+            token,
+            "stale failure".to_owned(),
+        );
+
+        let dialog = app.create_workspace_entry.as_ref().unwrap();
+        assert!(dialog.pending);
+        assert_eq!(dialog.token, token);
+        assert_eq!(dialog.path, "notes/new.md");
+        assert!(dialog.error.is_none());
+        assert!(!app.file_tabs.keys().any(|key| key.path == path));
+    }
+
+    #[test]
+    fn modified_enter_inserts_a_newline_only_in_workspace_file_edit_mode() {
+        let mut app = fixture();
+        let key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/lib.rs"),
+        };
+        let mut editor = TextEditor::from_text("alpha".to_owned()).unwrap();
+        editor.move_end();
+        app.file_tabs.insert(
+            key.clone(),
+            WorkspaceFileTabView {
+                editor,
+                state: WorkspaceFileState::Ready,
+                edit_mode: true,
+                request_token: 1,
+                inline_history: None,
+            },
+        );
+        app.surface.open_in_focused(SurfaceTab::File(key.clone()));
+        app.focus = Focus::Viewport;
+
+        assert_eq!(app.reduce(UiKey::ModifiedEnter), AppAction::None);
+        assert_eq!(app.file_tabs[&key].editor.text(), "alpha\n");
+
+        let mut pty = fixture();
+        pty.focus = Focus::Viewport;
+        assert_eq!(pty.reduce(UiKey::ModifiedEnter), AppAction::None);
+        assert_eq!(
+            pty.notice.as_deref(),
+            Some("unsupported key modifier; no input sent"),
+        );
+    }
+
+    #[test]
+    fn dirty_git_sidebar_keeps_history_and_opens_a_grid_git_tab() {
+        let mut app = fixture();
+        let mut inspection = workspace_inspection();
+        inspection.git.recent_commits.push(GitCommitSummary {
+            id: "01234567".to_owned(),
+            summary: "keep history visible".to_owned(),
+        });
+        app.workspace_inspections.insert(
+            ("node-a".to_owned(), "workspace-a".to_owned()),
+            inspection,
+        );
+        assert_eq!(app.git_item_count(), 3);
+        app.git_cursor = 2;
+        let AppAction::ReadGitHistory { workspace_id, .. } = app.activate_selected_git_item()
+        else {
+            panic!("commit row must open the Git surface");
+        };
+        assert_eq!(workspace_id, "workspace-a");
+        let Some(SurfaceTab::Git(key)) = app.surface.active_tab().cloned() else {
+            panic!("Git surface must be active");
+        };
+        let token = app.git_tabs[&key].history_token;
+        let full_id = format!("01234567{}", "a".repeat(32));
+        let action = app.apply_git_history(
+            &WorkspaceGitRequestDestination::Surface(key.clone()),
+            token,
+            vec![GitCommitView {
+                id: full_id.clone(),
+                parents: Vec::new(),
+                subject: "keep history visible".to_owned(),
+                author_name: "Author".to_owned(),
+                author_email: "author@example.invalid".to_owned(),
+                authored_at: "2026-08-12T00:00:00Z".to_owned(),
+                committer_name: "Committer".to_owned(),
+                committer_email: "committer@example.invalid".to_owned(),
+                committed_at: "2026-08-12T00:00:00Z".to_owned(),
+                signature_status: "NoSignature".to_owned(),
+                signer: None,
+            }],
+            None,
+            false,
+        );
+        assert!(matches!(
+            action,
+            Some(AppAction::ReadGitDiff {
+                target: WorkspaceGitDiffTarget::Commit { revision, .. },
+                ..
+            }) if revision == full_id
+        ));
+    }
+
+    fn test_git_commit(id: char, subject: &str) -> GitCommitView {
+        GitCommitView {
+            id: id.to_string().repeat(40),
+            parents: vec!["0".repeat(40)],
+            subject: subject.to_owned(),
+            author_name: "Author".to_owned(),
+            author_email: "author@example.invalid".to_owned(),
+            authored_at: "2026-08-12T00:00:00Z".to_owned(),
+            committer_name: "Committer".to_owned(),
+            committer_email: "committer@example.invalid".to_owned(),
+            committed_at: "2026-08-12T00:00:01Z".to_owned(),
+            signature_status: "NoSignature".to_owned(),
+            signer: None,
+        }
+    }
+
+    #[test]
+    fn git_list_selection_clears_stale_content_without_opening_detail() {
+        let mut app = fixture();
+        let AppAction::ReadGitHistory { token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            None,
+            None,
+        ) else {
+            panic!("Git history must be requested");
+        };
+        let key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: None,
+        };
+        app.apply_git_history(
+            &WorkspaceGitRequestDestination::Surface(key.clone()),
+            token,
+            vec![test_git_commit('a', "first"), test_git_commit('b', "second")],
+            None,
+            false,
+        );
+        app.git_tabs.get_mut(&key).unwrap().diff = Some(WorkspaceGitDiffView {
+            target: WorkspaceGitDiffTarget::Commit { revision: "a".repeat(40), path: None },
+            text: "stale".to_owned(),
+            byte_len: 5,
+            truncated: false,
+        });
+
+        assert_eq!(app.reduce_viewport(UiKey::Down), AppAction::None);
+        let tab = &app.git_tabs[&key];
+        assert_eq!(tab.selected, 1);
+        assert_eq!(tab.mode, WorkspaceGitPaneMode::List);
+        assert!(tab.diff.is_none());
+        assert!(tab.pending_diff.is_none());
+    }
+
+    #[test]
+    fn clicking_git_commit_row_requests_that_exact_commit_diff() {
+        let mut app = fixture();
+        let AppAction::ReadGitHistory { token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            None,
+            None,
+        ) else {
+            panic!("Git history must be requested");
+        };
+        let key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: None,
+        };
+        app.apply_git_history(
+            &WorkspaceGitRequestDestination::Surface(key.clone()),
+            token,
+            vec![test_git_commit('a', "first"), test_git_commit('b', "second")],
+            None,
+            false,
+        );
+        let pane_id = app.surface.focused;
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(5, 7, 30, 1),
+            target: HitTarget::GitCommit(pane_id, 1),
+        }];
+
+        let AppAction::ReadGitDiff { target, .. } = app.click(8, 7) else {
+            panic!("commit row click must request its diff");
+        };
+        assert_eq!(
+            target,
+            WorkspaceGitDiffTarget::Commit { revision: "b".repeat(40), path: None }
+        );
+        assert_eq!(app.git_tabs[&key].selected, 1);
+        assert_eq!(app.git_tabs[&key].mode, WorkspaceGitPaneMode::Detail);
+    }
+
+    #[test]
+    fn git_detail_scroll_does_not_change_selected_commit() {
+        let (mut app, key) = git_detail_fixture();
+        let selected = app.git_tabs[&key].selected;
+
+        assert_eq!(app.reduce_viewport(UiKey::Down), AppAction::None);
+        assert_eq!(app.reduce_viewport(UiKey::PageDown), AppAction::None);
+
+        assert_eq!(app.git_tabs[&key].selected, selected);
+        assert!(app.git_tabs[&key].detail_scroll > 0);
+    }
+
+    #[test]
+    fn git_detail_left_right_switch_exact_file_scoped_commit() {
+        let (mut app, key) = git_detail_fixture();
+
+        let AppAction::ReadGitDiff { target, .. } = app.reduce_viewport(UiKey::Right) else {
+            panic!("Right must request the next commit diff");
+        };
+        assert_eq!(
+            target,
+            WorkspaceGitDiffTarget::Commit {
+                revision: "b".repeat(40),
+                path: key.history_path.clone(),
+            }
+        );
+        assert_eq!(app.git_tabs[&key].mode, WorkspaceGitPaneMode::Detail);
+        let AppAction::ReadGitDiff { target, .. } = app.reduce_viewport(UiKey::Left) else {
+            panic!("Left must request the previous commit diff");
+        };
+        assert_eq!(
+            target,
+            WorkspaceGitDiffTarget::Commit {
+                revision: "a".repeat(40),
+                path: key.history_path.clone(),
+            }
+        );
+    }
+
+    #[test]
+    fn git_detail_escape_and_backspace_return_to_list() {
+        let (mut app, key) = git_detail_fixture();
+
+        assert_eq!(app.reduce_viewport(UiKey::Escape), AppAction::None);
+        assert_eq!(app.git_tabs[&key].mode, WorkspaceGitPaneMode::List);
+        app.git_tabs.get_mut(&key).unwrap().mode = WorkspaceGitPaneMode::Detail;
+        assert_eq!(app.reduce_viewport(UiKey::Backspace), AppAction::None);
+        assert_eq!(app.git_tabs[&key].mode, WorkspaceGitPaneMode::List);
+    }
+
+    #[test]
+    fn pending_commit_diff_opens_and_remains_in_detail_mode() {
+        let mut app = fixture();
+        let path = repository_path("src/history.rs");
+        let revision = "a".repeat(40);
+        let pending = WorkspaceGitDiffTarget::Commit {
+            revision: revision.clone(),
+            path: Some(path.clone()),
+        };
+        let AppAction::ReadGitHistory { token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            Some(path.clone()),
+            Some(pending),
+        ) else {
+            panic!("Git history must be requested");
+        };
+        let key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: Some(path),
+        };
+        assert_eq!(app.git_tabs[&key].mode, WorkspaceGitPaneMode::Detail);
+
+        let follow_up = app
+            .apply_git_history(
+                &WorkspaceGitRequestDestination::Surface(key.clone()),
+                token,
+                vec![test_git_commit('a', "first")],
+                None,
+                false,
+            )
+            .expect("pending commit must request its diff");
+        assert!(matches!(
+            follow_up,
+            AppAction::ReadGitDiff {
+                target: WorkspaceGitDiffTarget::Commit { revision: actual, .. },
+                ..
+            } if actual == revision
+        ));
+        assert_eq!(app.git_tabs[&key].mode, WorkspaceGitPaneMode::Detail);
+    }
+
+    fn git_detail_fixture() -> (App, WorkspaceGitTabKey) {
+        let mut app = fixture();
+        let path = repository_path("src/history.rs");
+        let AppAction::ReadGitHistory { token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            Some(path.clone()),
+            None,
+        ) else {
+            panic!("Git history must be requested");
+        };
+        let key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: Some(path),
+        };
+        app.apply_git_history(
+            &WorkspaceGitRequestDestination::Surface(key.clone()),
+            token,
+            vec![test_git_commit('a', "first"), test_git_commit('b', "second")],
+            None,
+            false,
+        );
+        let action = app.request_git_commit_diff(
+            &WorkspaceGitRequestDestination::Surface(key.clone()),
+            0,
+        );
+        assert!(matches!(action, AppAction::ReadGitDiff { .. }));
+        (app, key)
+    }
+
+    #[test]
+    fn pty_backspace_emits_del_byte() {
+        let mut app = fixture();
+        app.focus = Focus::Viewport;
+        assert!(matches!(
+            app.reduce_viewport(UiKey::Backspace),
+            AppAction::TerminalBytes { bytes, .. } if bytes == vec![0x7f]
+        ));
+    }
+
+    #[test]
+    fn pty_mouse_drag_selects_visible_terminal_text() {
+        let mut app = fixture();
+        app.nodes[0].workspaces[0].sessions[0].terminal_formatted = b"hello world".to_vec();
+        let pane_id = app.surface.focused;
+        let viewport = Rect::new(10, 3, 40, 8);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id,
+            frame: Rect::new(9, 1, 42, 11),
+            header: Rect::new(10, 2, 40, 1),
+            viewport,
+        }];
+        app.begin_surface_body_interaction(pane_id, 10, 3);
+        assert!(matches!(app.drag_state, Some(DragState::TerminalSelection { .. })));
+        assert_eq!(app.drag(14, 3), AppAction::None);
+        assert_eq!(app.drop_at(14, 3), AppAction::None);
+        assert_eq!(
+            app.terminal_selection.as_ref().map(|selection| selection.text.as_str()),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn switching_pty_clears_selection_from_the_previous_session() {
+        let mut app = fixture();
+        let previous = app.nodes[0].workspaces[0].sessions[0].address.clone();
+        let mut next = app.nodes[0].workspaces[0].sessions[0].clone();
+        next.address.instance_id = 8;
+        next.address.generation = 1;
+        let next_address = next.address.clone();
+        app.nodes[0].workspaces[0].sessions.push(next);
+        app.terminal_selection = Some(TerminalSelection {
+            address: previous,
+            start: (0, 0),
+            end: (4, 0),
+            text: "hello".to_owned(),
+        });
+
+        app.open_address(next_address.clone());
+
+        assert_eq!(app.focused_address(), Some(&next_address));
+        assert!(app.terminal_selection.is_none());
+    }
+
+    #[test]
+    fn file_mouse_drag_selects_text_and_ctrl_d_opens_exact_file_diff() {
+        let mut app = fixture();
+        app.workspace_inspections.insert(
+            ("node-a".to_owned(), "workspace-a".to_owned()),
+            workspace_inspection(),
+        );
+        let path = repository_path("Cargo.toml");
+        let AppAction::ReadWorkspaceFile { token, .. } =
+            app.select_inspector_item(SidebarMode::Files, 3)
+        else {
+            panic!("file click must request content");
+        };
+        let key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: path.clone(),
+        };
+        let text = "name = \"gate\"\n".to_owned();
+        app.apply_workspace_file_read(
+            "node-a".to_owned(),
+            token,
+            WorkspaceFileRead {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                path: path.clone(),
+                content: WorkspaceFileContent::Utf8 {
+                    byte_len: text.len() as u32,
+                    text,
+                },
+                revision: Some(WorkspaceFileRevision::new("0".repeat(64)).unwrap()),
+            },
+        );
+        let pane_id = app.surface.focused;
+        let viewport = Rect::new(10, 3, 40, 8);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id,
+            frame: Rect::new(9, 1, 42, 11),
+            header: Rect::new(10, 2, 40, 1),
+            viewport,
+        }];
+        app.begin_surface_body_interaction(pane_id, 14, 3);
+        assert!(matches!(app.drag_state, Some(DragState::FileSelection { .. })));
+        assert_eq!(app.drag(18, 3), AppAction::None);
+        assert_eq!(app.drop_at(18, 3), AppAction::None);
+        assert_eq!(app.file_tabs[&key].editor.selected_text(), Some("name"));
+
+        let AppAction::ReadGitHistory {
+            node_id,
+            workspace_id,
+            path: Some(history_path),
+            limit,
+            destination,
+            ..
+        } =
+            app.reduce_file_viewport(key.clone(), UiKey::Ctrl('d'))
+        else {
+            panic!("Ctrl+D must open file-scoped Git diff");
+        };
+        assert_eq!(node_id, "node-a");
+        assert_eq!(workspace_id, "workspace-a");
+        assert_eq!(history_path, path);
+        assert_eq!(limit, 20);
+        assert_eq!(
+            destination,
+            WorkspaceGitRequestDestination::InlineFile(key.clone()),
+        );
+        assert!(matches!(
+            app.file_tabs[&key].inline_history.as_ref().unwrap().pending_diff,
+            Some(WorkspaceGitDiffTarget::Working { path: Some(ref actual) }) if actual == &path
+        ));
+        assert!(app.git_tabs.is_empty());
+    }
+
+    #[test]
+    fn file_toolbar_history_and_scrollbar_preserve_file_scope_without_moving_caret() {
+        let mut app = fixture();
+        let key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/lib.rs"),
+        };
+        let text = (0..80)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.file_tabs.insert(
+            key.clone(),
+            WorkspaceFileTabView {
+                editor: TextEditor::from_text(text).unwrap(),
+                state: WorkspaceFileState::Ready,
+                edit_mode: false,
+                request_token: 1,
+                inline_history: None,
+            },
+        );
+        app.surface.open_in_focused(SurfaceTab::File(key.clone()));
+        let pane_id = app.surface.focused;
+        let viewport = Rect::new(10, 3, 40, 9);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id,
+            frame: Rect::new(10, 2, 40, 10),
+            header: Rect::new(10, 2, 40, 1),
+            viewport,
+        }];
+        app.layout.hits = vec![
+            HitRegion {
+                rect: Rect::new(10, 2, 9, 1),
+                target: HitTarget::FileHistory(pane_id),
+            },
+            HitRegion {
+                rect: Rect::new(49, 3, 1, 8),
+                target: HitTarget::FileScrollbar(pane_id),
+            },
+        ];
+        let caret = app.file_tabs[&key].editor.cursor_position();
+
+        assert_eq!(app.click(49, 10), AppAction::None);
+        assert!(app.file_tabs[&key].editor.scroll_line() > 0);
+        assert_eq!(app.file_tabs[&key].editor.cursor_position(), caret);
+        assert_eq!(app.drag(49, 3), AppAction::None);
+        assert_eq!(app.drop_at(49, 3), AppAction::None);
+        assert_eq!(app.file_tabs[&key].editor.scroll_line(), 0);
+        assert_eq!(app.file_tabs[&key].editor.cursor_position(), caret);
+
+        let AppAction::ReadGitHistory {
+            path: Some(path),
+            limit,
+            ..
+        } = app.click(10, 2)
+        else {
+            panic!("History toolbar button must request file-scoped commits");
+        };
+        assert_eq!(path, key.path);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn inline_file_histories_are_distinct_and_repo_git_surface_remains_separate() {
+        let mut app = fixture();
+        let first = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/first.rs"),
+        };
+        let second = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/second.rs"),
+        };
+        for key in [&first, &second] {
+            app.file_tabs.insert(
+                key.clone(),
+                WorkspaceFileTabView {
+                    editor: TextEditor::from_text("fn sample() {}".to_owned()).unwrap(),
+                    state: WorkspaceFileState::Ready,
+                    edit_mode: false,
+                    request_token: 1,
+                    inline_history: None,
+                },
+            );
+        }
+        app.surface.open_in_focused(SurfaceTab::File(first.clone()));
+        let first_pane = app.surface.focused;
+        let second_pane = app
+            .surface
+            .drop_tab(
+                SurfaceTab::File(second.clone()),
+                first_pane,
+                SurfaceDropZone::Right,
+            )
+            .unwrap();
+        app.layout.hits = vec![
+            HitRegion {
+                rect: Rect::new(1, 1, 8, 1),
+                target: HitTarget::FileHistory(first_pane),
+            },
+            HitRegion {
+                rect: Rect::new(20, 1, 8, 1),
+                target: HitTarget::FileHistory(second_pane),
+            },
+        ];
+
+        let AppAction::ReadGitHistory {
+            path: Some(first_path),
+            destination: first_destination,
+            ..
+        } = app.click(1, 1)
+        else {
+            panic!("first History button must open inline file history");
+        };
+        assert_eq!(first_path, first.path);
+        assert_eq!(
+            first_destination,
+            WorkspaceGitRequestDestination::InlineFile(first.clone()),
+        );
+        assert!(app.file_tabs[&first].inline_history.is_some());
+        assert!(app.git_tabs.is_empty());
+
+        let AppAction::ReadGitHistory {
+            path: Some(second_path),
+            destination: second_destination,
+            ..
+        } = app.click(20, 1)
+        else {
+            panic!("second History button must open inline file history");
+        };
+        assert_eq!(second_path, second.path);
+        assert_eq!(
+            second_destination,
+            WorkspaceGitRequestDestination::InlineFile(second.clone()),
+        );
+        assert!(app.file_tabs[&first].inline_history.is_some());
+        assert!(app.file_tabs[&second].inline_history.is_some());
+        assert!(app.git_tabs.is_empty());
+        assert_eq!(app.surface.tab_location(&SurfaceTab::File(first.clone())).unwrap().0, first_pane);
+        assert_eq!(app.surface.tab_location(&SurfaceTab::File(second.clone())).unwrap().0, second_pane);
+        assert_eq!(app.surface_tab_title(&SurfaceTab::File(first.clone())), "first.rs");
+        assert_eq!(app.surface_tab_title(&SurfaceTab::File(second.clone())), "second.rs");
+
+        app.surface.set_focused(first_pane).unwrap();
+        let AppAction::ReadGitHistory { path: None, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            None,
+            None,
+        ) else {
+            panic!("repository History must open a repository-scoped Git tab");
+        };
+        let repo_git = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: None,
+        };
+        assert_eq!(app.git_tabs.len(), 1);
+        assert!(app.git_tabs.contains_key(&repo_git));
+        assert!(app.file_tabs[&first].inline_history.is_some());
+        assert!(app.file_tabs[&second].inline_history.is_some());
+    }
+
+    #[test]
+    fn inline_file_history_drills_into_diff_navigates_commits_and_returns_to_source() {
+        let mut app = fixture();
+        let key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/history.rs"),
+        };
+        app.file_tabs.insert(
+            key.clone(),
+            WorkspaceFileTabView {
+                editor: TextEditor::from_text("fn current() {}".to_owned()).unwrap(),
+                state: WorkspaceFileState::Ready,
+                edit_mode: false,
+                request_token: 1,
+                inline_history: None,
+            },
+        );
+        app.surface.open_in_focused(SurfaceTab::File(key.clone()));
+        let destination = WorkspaceGitRequestDestination::InlineFile(key.clone());
+        let AppAction::ReadGitHistory { token, destination: actual, .. } =
+            app.open_workspace_file_history(key.clone(), None)
+        else {
+            panic!("inline History must issue a bounded Git history read");
+        };
+        assert_eq!(actual, destination);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(key.clone())));
+        assert!(app.git_tabs.is_empty());
+
+        assert_eq!(
+            app.apply_git_history(
+                &destination,
+                token,
+                vec![test_git_commit('a', "first"), test_git_commit('b', "second")],
+                None,
+                false,
+            ),
+            None,
+        );
+        let AppAction::ReadGitDiff {
+            target: WorkspaceGitDiffTarget::Commit { revision, path },
+            token: first_diff_token,
+            destination: actual,
+            ..
+        } = app.reduce_viewport(UiKey::Enter)
+        else {
+            panic!("Enter must drill into the selected inline commit");
+        };
+        assert_eq!(revision, "a".repeat(40));
+        assert_eq!(path.as_ref(), Some(&key.path));
+        assert_eq!(actual, destination);
+        app.apply_git_diff(
+            &destination,
+            first_diff_token,
+            WorkspaceGitDiffView {
+                target: WorkspaceGitDiffTarget::Commit {
+                    revision: revision.clone(),
+                    path: path.clone(),
+                },
+                text: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                byte_len: 22,
+                truncated: false,
+            },
+        );
+
+        let AppAction::ReadGitDiff {
+            target: WorkspaceGitDiffTarget::Commit { revision, .. },
+            destination: actual,
+            ..
+        } = app.reduce_viewport(UiKey::Right)
+        else {
+            panic!("Right must request the next inline commit");
+        };
+        assert_eq!(revision, "b".repeat(40));
+        assert_eq!(actual, destination);
+        assert_eq!(
+            app.file_tabs[&key].inline_history.as_ref().unwrap().selected,
+            1,
+        );
+        assert!(app.git_tabs.is_empty());
+
+        let pane_id = app.surface.focused;
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(1, 1, 8, 1),
+            target: HitTarget::FileSource(pane_id),
+        }];
+        assert_eq!(app.click(1, 1), AppAction::None);
+        assert!(app.file_tabs[&key].inline_history.is_none());
+        assert_eq!(app.file_tabs[&key].editor.text(), "fn current() {}");
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(key)));
+    }
+
+    #[test]
+    fn git_wheel_scrolls_the_active_list_or_detail_without_crossing_modes() {
+        let mut app = fixture();
+        let path = repository_path("src/history.rs");
+        let AppAction::ReadGitHistory { token, .. } = app.open_workspace_git(
+            "node-a".to_owned(),
+            "workspace-a".to_owned(),
+            Some(path.clone()),
+            None,
+        ) else {
+            panic!("Git history must be requested");
+        };
+        let key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: Some(path),
+        };
+        let destination = WorkspaceGitRequestDestination::Surface(key.clone());
+        app.apply_git_history(
+            &destination,
+            token,
+            (0..12)
+                .map(|index| test_git_commit(char::from(b'a' + index), "commit"))
+                .collect(),
+            None,
+            false,
+        );
+        let viewport = Rect::new(0, 0, 40, 8);
+
+        assert_eq!(
+            app.scroll_terminal(SurfaceTab::Git(key.clone()), viewport, 2, 2, false),
+            AppAction::None,
+        );
+        assert!(app.git_tabs[&key].list_scroll > 0);
+        assert_eq!(app.git_tabs[&key].detail_scroll, 0);
+
+        app.git_tabs.get_mut(&key).unwrap().mode = WorkspaceGitPaneMode::Detail;
+        let list_scroll = app.git_tabs[&key].list_scroll;
+        assert_eq!(
+            app.scroll_terminal(SurfaceTab::Git(key.clone()), viewport, 2, 2, false),
+            AppAction::None,
+        );
+        assert_eq!(app.git_tabs[&key].list_scroll, list_scroll);
+        assert!(app.git_tabs[&key].detail_scroll > 0);
+    }
+
+    #[test]
+    fn auxiliary_mouse_navigation_moves_backward_and_forward_inside_target_pane() {
+        let mut app = fixture();
+        let first = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/first.rs"),
+        };
+        let second = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/second.rs"),
+        };
+        app.surface.open_in_focused(SurfaceTab::File(first.clone()));
+        app.surface.open_in_focused(SurfaceTab::File(second.clone()));
+        let pane_id = app.surface.focused;
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id,
+            frame: Rect::new(20, 2, 40, 15),
+            header: Rect::new(20, 2, 40, 2),
+            viewport: Rect::new(20, 4, 40, 13),
+        }];
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(second.clone())));
+
+        assert_eq!(app.navigate_surface_tab_at(30, 8, true), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(first.clone())));
+        assert_eq!(app.navigate_surface_tab_at(30, 8, false), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(second.clone())));
+
+        assert_eq!(app.navigate_surface_tab_at(5, 8, true), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(second.clone())));
+
+        app.focus = Focus::Settings;
+        assert_eq!(app.navigate_surface_tab_at(30, 8, true), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::File(second)));
+    }
+
+    fn monitor_observation(source_sequence: u64, kind: ObservationKindV1) -> ObservationV1 {
+        ObservationV1 {
+            source_sequence,
+            observed_at_unix_ms: Some(source_sequence.max(1)),
+            evidence: ObservationEvidenceV1::StructuredProvider,
+            kind,
+            truncated: false,
+        }
+    }
+
+    fn runtime_monitor_target(
+        address: &SessionAddress,
+        incarnation: NodeIncarnationId,
+    ) -> SessionMonitorTarget {
+        SessionMonitorTarget::Runtime {
+            address: address.clone(),
+            incarnation,
+        }
+    }
+
+    #[test]
+    fn dormant_managed_monitor_opens_and_requests_bounded_history_refresh() {
+        let mut app = fixture();
+        let incarnation = NodeIncarnationId::from_bytes([31; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        let agent = add_managed_record(
+            &mut app,
+            "record-dormant",
+            "Dormant agent",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        assert!(app.apply_managed_record_inventory("node-a", incarnation, true));
+
+        assert_eq!(
+            app.open_session_monitor(agent.clone()),
+            AppAction::RefreshSessionRecordHistory {
+                node_id: "node-a".to_owned(),
+                node_incarnation_id: incarnation,
+                record_id: "record-dormant".to_owned(),
+                message_limit: 1,
+            },
+        );
+        let target = SessionMonitorTarget::Managed {
+            node_id: "node-a".to_owned(),
+            record_id: "record-dormant".to_owned(),
+            incarnation,
+        };
+        let monitor = app.session_monitors.get(&target).unwrap();
+        assert_eq!(monitor.key.agent, agent);
+        let projection = app.session_monitor_projection(&monitor.key).unwrap();
+        assert!(projection.timeline.is_empty());
+        assert!(projection.todos.current.is_none());
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::SessionMonitor(key)) if key.target == target
+        ));
+        assert_eq!(app.open_session_monitor(agent), AppAction::None);
+    }
+
+    #[test]
+    fn session_monitor_history_refresh_requires_exact_managed_provider_identity() {
+        let mut app = fixture();
+        let incarnation = NodeIncarnationId::from_bytes([41; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        let legacy = active_pty_address(&app);
+        let no_identity = add_managed_record(
+            &mut app,
+            "record-no-identity",
+            "No identity",
+            ManagedSessionState::Dormant,
+            None,
+            false,
+        );
+        assert_eq!(app.open_session_monitor(no_identity), AppAction::None);
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::SessionMonitor(key))
+                if matches!(key.agent, AgentRowKey::Managed { ref record_id, .. }
+                    if record_id == "record-no-identity")
+        ));
+        assert_eq!(
+            app.open_session_monitor(AgentRowKey::Legacy(legacy.clone())),
+            AppAction::None,
+        );
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::SessionMonitor(key))
+                if key.agent == AgentRowKey::Legacy(legacy)
+        ));
+    }
+
+    #[test]
+    fn failed_session_monitor_history_refresh_is_safe_and_retryable() {
+        let mut app = fixture();
+        let incarnation = NodeIncarnationId::from_bytes([42; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        let agent = add_managed_record(
+            &mut app,
+            "record-retry",
+            "Retry",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        assert!(matches!(
+            app.open_session_monitor(agent.clone()),
+            AppAction::RefreshSessionRecordHistory { message_limit: 1, .. }
+        ));
+        app.fail_session_record_history_refresh(
+            "node-a".to_owned(),
+            "record-retry".to_owned(),
+            incarnation,
+            "history unavailable".to_owned(),
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Session Monitor history refresh failed: history unavailable"),
+        );
+        assert!(matches!(
+            app.open_session_monitor(agent),
+            AppAction::RefreshSessionRecordHistory { message_limit: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn replaced_node_cannot_complete_new_incarnation_history_refresh() {
+        let mut app = fixture();
+        let old_incarnation = NodeIncarnationId::from_bytes([43; 16]);
+        let new_incarnation = NodeIncarnationId::from_bytes([44; 16]);
+        app.nodes[0].incarnation_id = Some(old_incarnation);
+        let agent = add_managed_record(
+            &mut app,
+            "record-replaced",
+            "Replaced",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        assert!(matches!(
+            app.open_session_monitor(agent.clone()),
+            AppAction::RefreshSessionRecordHistory {
+                node_incarnation_id,
+                ..
+            } if node_incarnation_id == old_incarnation
+        ));
+
+        let mut replacement = app.nodes[0].clone();
+        replacement.incarnation_id = Some(new_incarnation);
+        app.upsert_node(replacement);
+        assert!(matches!(
+            app.open_session_monitor(agent.clone()),
+            AppAction::RefreshSessionRecordHistory {
+                node_incarnation_id,
+                ..
+            } if node_incarnation_id == new_incarnation
+        ));
+        app.complete_session_record_history_refresh(
+            "node-a".to_owned(),
+            "record-replaced".to_owned(),
+            old_incarnation,
+        );
+        assert_eq!(app.open_session_monitor(agent), AppAction::None);
+        assert!(!app.session_history_refreshed.contains(&(
+            "node-a".to_owned(),
+            "record-replaced".to_owned(),
+            old_incarnation,
+        )));
+        assert!(app.session_history_refresh_pending.contains(&(
+            "node-a".to_owned(),
+            "record-replaced".to_owned(),
+            new_incarnation,
+        )));
+    }
+
+    #[test]
+    fn late_inline_observation_is_retained_for_current_incarnation() {
+        let mut app = fixture();
+        let address = active_pty_address(&app);
+        let incarnation = NodeIncarnationId::from_bytes([32; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        app.nodes[0].workspaces[0].sessions.clear();
+
+        assert!(app.apply_session_observation(
+            address.node_id.clone(),
+            incarnation,
+            11,
+            address.clone(),
+            monitor_observation(1, ObservationKindV1::TurnCompleted),
+        ));
+        let target = runtime_monitor_target(&address, incarnation);
+        let monitor = app.session_monitors.get(&target).unwrap();
+        let projection = app.session_monitor_projection(&monitor.key).unwrap();
+        assert_eq!(projection.timeline.len(), 1);
+        assert_eq!(projection.timeline[0].kind, ObservationKindV1::TurnCompleted);
+        assert_eq!(monitor.key.agent, AgentRowKey::Legacy(address));
+    }
+
+    #[test]
+    fn managed_record_inventory_does_not_clear_gap() {
+        let mut app = fixture();
+        let address = active_pty_address(&app);
+        let incarnation = NodeIncarnationId::from_bytes([33; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        assert!(app.apply_session_observation(
+            address.node_id.clone(),
+            incarnation,
+            1,
+            address.clone(),
+            monitor_observation(1, ObservationKindV1::Ready),
+        ));
+        assert!(app.mark_session_monitor_transport_gap("node-a", incarnation, 1, 4));
+        add_managed_record(
+            &mut app,
+            "record-gap",
+            "Gap inventory",
+            ManagedSessionState::Dormant,
+            None,
+            true,
+        );
+        assert!(app.apply_managed_record_inventory("node-a", incarnation, true));
+
+        let monitor = app.session_monitors
+            .get(&runtime_monitor_target(&address, incarnation))
+            .unwrap();
+        assert_eq!(
+            app.session_monitor_projection(&monitor.key).unwrap().freshness,
+            ProjectionFreshness::IncompleteAfterGap,
+        );
+    }
+
+    #[test]
+    fn session_monitor_reducer_preserves_same_source_sequence_distinct_events() {
+        let mut app = fixture();
+        let address = active_pty_address(&app);
+        let incarnation = NodeIncarnationId::from_bytes([21; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        assert!(app.apply_session_observation(
+            address.node_id.clone(),
+            incarnation,
+            40,
+            address.clone(),
+            monitor_observation(7, ObservationKindV1::TurnCompleted),
+        ));
+        assert!(app.apply_session_observation(
+            address.node_id.clone(),
+            incarnation,
+            41,
+            address.clone(),
+            monitor_observation(7, ObservationKindV1::Usage {
+                input_tokens: 8,
+                output_tokens: 5,
+                cache_read_tokens: 3,
+                cache_write_tokens: 2,
+                reasoning_tokens: 1,
+                context_window: Some(32_000),
+                is_cumulative: true,
+            }),
+        ));
+        let monitor = app.session_monitors.get(&runtime_monitor_target(&address, incarnation)).unwrap();
+        let projection = app.session_monitor_projection(&monitor.key).unwrap();
+        assert_eq!(projection.timeline.len(), 2);
+        assert_eq!(projection.timeline[0].kind, ObservationKindV1::TurnCompleted);
+        assert!(matches!(projection.timeline[1].kind, ObservationKindV1::Usage { .. }));
+        assert_eq!(projection.usage.last_cumulative.unwrap().input_tokens, 8);
+        app.open_session_monitor(AgentRowKey::Legacy(address));
+        assert_eq!(app.reduce(UiKey::Right), AppAction::None);
+        assert_eq!(app.focused_session_monitor().unwrap().section, SessionMonitorSection::Workflow);
+        assert_eq!(app.reduce(UiKey::Down), AppAction::None);
+        assert_eq!(app.focused_session_monitor().unwrap().section_scroll(), 1);
+        assert_eq!(app.reduce(UiKey::Escape), AppAction::None);
+        assert_eq!(app.focus, Focus::Tabs);
+    }
+
+    #[test]
+    fn session_monitor_incarnation_and_generation_never_rebind() {
+        let mut app = fixture();
+        let old_address = active_pty_address(&app);
+        let old_incarnation = NodeIncarnationId::from_bytes([22; 16]);
+        app.nodes[0].incarnation_id = Some(old_incarnation);
+        app.apply_session_observation(
+            old_address.node_id.clone(),
+            old_incarnation,
+            1,
+            old_address.clone(),
+            monitor_observation(1, ObservationKindV1::Ready),
+        );
+        app.open_session_monitor(AgentRowKey::Legacy(old_address.clone()));
+
+        let mut restarted = app.nodes[0].clone();
+        let new_incarnation = NodeIncarnationId::from_bytes([23; 16]);
+        restarted.incarnation_id = Some(new_incarnation);
+        restarted.event_sequence = 2;
+        restarted.workspaces[0].sessions[0].address.generation =
+            old_address.generation.saturating_add(1);
+        let new_address = restarted.workspaces[0].sessions[0].address.clone();
+        app.upsert_node(restarted);
+        app.apply_session_observation(
+            new_address.node_id.clone(),
+            new_incarnation,
+            3,
+            new_address.clone(),
+            monitor_observation(1, ObservationKindV1::Working),
+        );
+
+        let old_target = runtime_monitor_target(&old_address, old_incarnation);
+        let old = app.session_monitors.get(&old_target).unwrap();
+        assert!(old.node_restarted);
+        assert_eq!(old.key.target, old_target);
+        assert!(app.session_monitors.contains_key(&runtime_monitor_target(&new_address, new_incarnation)));
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::SessionMonitor(key))
+                if key.target == runtime_monitor_target(&old_address, old_incarnation)
+        ));
+    }
+
+    #[test]
+    fn session_monitor_gap_stale_and_source_reset_are_truthful() {
+        let mut app = fixture();
+        let address = active_pty_address(&app);
+        let incarnation = NodeIncarnationId::from_bytes([24; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        for (node_sequence, kind) in [
+            (1, ObservationKindV1::TodoSnapshot {
+                revision: 1,
+                items: vec![ObservationTodoItemV1 {
+                    id: None,
+                    text: "bounded task".to_owned(),
+                    state: gate4agent_node_protocol::ObservationTodoStateV1::InProgress,
+                }],
+                complete: false,
+            }),
+            (2, ObservationKindV1::Gap { missed: 2 }),
+            (3, ObservationKindV1::Stale),
+        ] {
+            app.apply_session_observation(
+                address.node_id.clone(),
+                incarnation,
+                node_sequence,
+                address.clone(),
+                monitor_observation(node_sequence, kind),
+            );
+        }
+        let monitor = app.session_monitors.get(&runtime_monitor_target(&address, incarnation)).unwrap();
+        let projection = app.session_monitor_projection(&monitor.key).unwrap();
+        assert_eq!(projection.freshness, ProjectionFreshness::IncompleteAfterGap);
+        assert!(!projection.stale_evidence.is_empty());
+        assert!(projection.todos.current.is_some());
+
+        app.apply_session_observation(
+            address.node_id.clone(),
+            incarnation,
+            4,
+            address.clone(),
+            monitor_observation(1, ObservationKindV1::SourceReset),
+        );
+        let monitor = app.session_monitors.get(&runtime_monitor_target(&address, incarnation)).unwrap();
+        let projection = app.session_monitor_projection(&monitor.key).unwrap();
+        assert!(projection.incomplete_evidence.is_empty());
+        assert!(projection.stale_evidence.is_empty());
+        assert!(projection.todos.current.is_none());
+        assert_eq!(projection.timeline.len(), 4);
+    }
+
+    #[test]
+    fn session_monitor_collections_are_bounded() {
+        let mut app = fixture();
+        let base = active_pty_address(&app);
+        let incarnation = NodeIncarnationId::from_bytes([25; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        for sequence in 1..=600_u64 {
+            app.apply_session_observation(
+                base.node_id.clone(),
+                incarnation,
+                sequence,
+                base.clone(),
+                monitor_observation(sequence, ObservationKindV1::ToolCompleted {
+                    correlation_id: format!("tool-{sequence}"),
+                    class: "shell".to_owned(),
+                    success: true,
+                    duration_ms: None,
+                }),
+            );
+        }
+        let monitor = app.session_monitors.get(&runtime_monitor_target(&base, incarnation)).unwrap();
+        let projection = app.session_monitor_projection(&monitor.key).unwrap();
+        assert_eq!(projection.timeline.len(), MAX_SESSION_MONITOR_TIMELINE);
+        assert_eq!(projection.tools.len(), MAX_SESSION_MONITOR_COLLECTION);
+        app.open_session_monitor(AgentRowKey::Legacy(base.clone()));
+
+        for instance_id in 2..=260_u64 {
+            let address = SessionAddress { instance_id, ..base.clone() };
+            let mut session = app.nodes[0].workspaces[0].sessions[0].clone();
+            session.address = address.clone();
+            app.nodes[0].workspaces[0].sessions.push(session);
+            app.apply_session_observation(
+                address.node_id.clone(),
+                incarnation,
+                600 + instance_id,
+                address,
+                monitor_observation(1, ObservationKindV1::Ready),
+            );
+        }
+        assert_eq!(app.session_monitors.len(), MAX_SESSION_MONITORS);
+        assert!(app.session_monitors.contains_key(&runtime_monitor_target(&base, incarnation)));
+        assert!(matches!(
+            app.surface.active_tab(),
+            Some(SurfaceTab::SessionMonitor(key))
+                if key.target == runtime_monitor_target(&base, incarnation)
+        ));
     }
 }

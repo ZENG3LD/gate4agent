@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const DEFAULT_SPAWN_PROFILE_ID: &str = "default";
-pub const MAX_SPAWN_PROFILES: usize = 64;
+pub use crate::protocol::MAX_SPAWN_PROFILES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnProfileRegistry {

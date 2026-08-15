@@ -13,6 +13,7 @@ mod hook_session;
 mod managed_hook;
 mod one_shot;
 mod pty_identity;
+mod qwen_dual_output;
 mod resume;
 mod session_options;
 
@@ -46,15 +47,21 @@ pub use managed_hook::{
     MANAGED_HOOK_TIMEOUT_MILLISECONDS, MANAGED_HOOK_TIMEOUT_SECONDS,
 };
 pub use one_shot::{
-    one_shot_spec, one_shot_specs, resolve_one_shot_plan, OneShotAdapterError, OneShotAdapterSpec,
-    OneShotModelSource, OneShotModelSpec, OneShotPlan, OneShotPromptDelivery, OneShotThinkingLevel,
-    CLAUDE_CODE_INLINE_REVISION, CODEX_CLI_INLINE_REVISION, KIMI_CODE_INLINE_REVISION,
-    ONE_SHOT_OUTPUT_MAX_BYTES, ONE_SHOT_REVISION, ONE_SHOT_THINKING_OPTION_ID,
-    ONE_SHOT_TIMEOUT_SECONDS, QWEN_CODE_INLINE_REVISION,
+    one_shot_spec, one_shot_specs, resolve_one_shot_plan,
+    resolve_one_shot_plan_with_persistence, OneShotAdapterError, OneShotAdapterSpec,
+    OneShotModelSource, OneShotModelSpec, OneShotPlan, OneShotPromptDelivery,
+    OneShotSessionPersistence, OneShotThinkingLevel, CLAUDE_CODE_INLINE_REVISION,
+    CODEX_CLI_INLINE_REVISION, KIMI_CODE_INLINE_REVISION, ONE_SHOT_OUTPUT_MAX_BYTES,
+    ONE_SHOT_REVISION, ONE_SHOT_THINKING_OPTION_ID, ONE_SHOT_TIMEOUT_SECONDS,
+    QWEN_CODE_INLINE_REVISION,
 };
 pub use pty_identity::{
     CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor,
     KIMI_PTY_SESSION_ID_MAX_BYTES,
+};
+pub use qwen_dual_output::{
+    QwenDualOutputLine, QwenDualOutputParser, QWEN_DUAL_OUTPUT_MAX_LINE_BYTES,
+    QWEN_DUAL_OUTPUT_REVISION,
 };
 pub use resume::{
     build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,
@@ -295,6 +302,12 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     for id in ["claude-code", "codex", "gemini", "opencode", "kimi"] {
         descriptors.push(descriptor(AdapterFamily::Pipe, id));
     }
+    descriptors.push(descriptor_with_revision_and_verification(
+        AdapterFamily::Pipe,
+        "qwen-code",
+        QWEN_DUAL_OUTPUT_REVISION,
+        AdapterVerification::Reference,
+    ));
     for id in [
         "claude",
         "codex",
@@ -489,6 +502,9 @@ mod tests {
         let qwen = AdapterId::new("qwen-code").unwrap();
         assert!(registry.get(AdapterFamily::Hook, &qwen).is_none());
         assert!(registry.get(AdapterFamily::History, &qwen).is_some());
+        let sidecar = registry.get(AdapterFamily::Pipe, &qwen).unwrap();
+        assert_eq!(sidecar.binding.revision, QWEN_DUAL_OUTPUT_REVISION);
+        assert_eq!(sidecar.binding.verification, AdapterVerification::Reference);
     }
 
     #[test]

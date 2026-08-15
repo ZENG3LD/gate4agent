@@ -56,7 +56,14 @@ fn orca_roots_cover_pinned_native_sources_without_exposing_paths_in_debug() {
     let fixture = FixtureDir::new("roots");
     let roots = orca_home_roots(fixture.path()).unwrap();
 
-    assert_eq!(roots.len(), 20);
+    assert_eq!(roots.len(), 21);
+    assert_eq!(
+        roots
+            .iter()
+            .filter(|root| root.adapter_id().as_str() == "claude-code")
+            .count(),
+        2
+    );
     assert_eq!(
         roots
             .iter()
@@ -64,6 +71,14 @@ fn orca_roots_cover_pinned_native_sources_without_exposing_paths_in_debug() {
             .count(),
         2
     );
+    assert!(roots.iter().any(|root| {
+        root.adapter_id().as_str() == "grok"
+            && root.layout() == HistorySourceLayout::SummaryJsonWithSiblingNdjson
+    }));
+    assert!(roots.iter().any(|root| {
+        root.adapter_id().as_str() == "qwen-code"
+            && root.layout() == HistorySourceLayout::SingleNdjson
+    }));
     assert!(format!("{:?}", roots[0]).contains("[REDACTED]"));
     assert!(!format!("{:?}", roots[0]).contains(&fixture.path().display().to_string()));
 }
@@ -263,6 +278,201 @@ fn kimi_load_uses_index_cwd_and_primary_agent_wire() {
     assert_eq!(parsed.cwd.as_deref(), Some("/repo/kimi"));
     assert_eq!(parsed.model.as_deref(), Some("kimi-k2"));
     assert_eq!(parsed.messages.len(), 2);
+}
+
+#[test]
+fn kimi_locator_index_uses_central_session_index_without_loading_wire() {
+    let fixture = FixtureDir::new("kimi-locator");
+    let sessions = fixture.path().join("sessions");
+    let session = sessions.join("wd_repo_hash").join("session_kimi_locator");
+    write(
+        &session.join("state.json"),
+        r#"{"title":"Kimi locator","agents":{"agent-primary":{"type":"main","parentAgentId":null}}}"#,
+    );
+    write(
+        &fixture.path().join("session_index.jsonl"),
+        r#"{"sessionId":"session_kimi_locator","workDir":"/repo/kimi-locator"}"#,
+    );
+    let mut authority = NativeHistoryAuthority::new(
+        NativeHistoryConfig::new(vec![root(
+            "kimi",
+            HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson,
+            &sessions,
+        )])
+        .unwrap(),
+    );
+
+    let locators = authority
+        .discover_locator_index(&request("kimi", 1))
+        .unwrap();
+
+    assert_eq!(locators.len(), 1);
+    assert_eq!(locators[0].session_id(), "session_kimi_locator");
+    assert_eq!(locators[0].cwd(), Some("/repo/kimi-locator"));
+    assert_eq!(locators[0].title(), Some("Kimi locator"));
+}
+
+#[test]
+fn locator_index_retains_session_without_cwd_and_keeps_source_path_private() {
+    let fixture = FixtureDir::new("locator-no-cwd");
+    let history = fixture.path().join("history");
+    let source = history.join("no-cwd.jsonl");
+    write(
+        &source,
+        concat!(
+            r#"{"type":"user","sessionId":"no-cwd","message":{"content":"question"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":"answer"}}"#,
+        ),
+    );
+    let mut authority = NativeHistoryAuthority::new(
+        NativeHistoryConfig::new(vec![root(
+            "claude-code",
+            HistorySourceLayout::SingleNdjson,
+            &history,
+        )])
+        .unwrap(),
+    );
+
+    let locators = authority
+        .discover_locator_index(&request("claude", 1))
+        .unwrap();
+
+    assert_eq!(locators.len(), 1);
+    assert_eq!(locators[0].session_id(), "no-cwd");
+    assert_eq!(locators[0].cwd(), None);
+    assert!(!format!("{:?}", locators[0]).contains(&source.display().to_string()));
+}
+
+#[test]
+fn claude_preview_uses_bounded_head_and_tail_with_exact_locator_identity() {
+    let fixture = FixtureDir::new("claude-preview-tail");
+    let history = fixture.path().join("history");
+    let oversized_first_prompt = format!(
+        "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}},\"sessionId\":\"claude-tail\",\"cwd\":\"/repo/tail\"}}",
+        "x".repeat(600_000),
+    );
+    let transcript = format!(
+        "{}\n{}\n{}",
+        oversized_first_prompt,
+        r#"{"type":"user","message":{"content":"last question"}}"#,
+        r#"{"type":"assistant","message":{"content":"last answer"}}"#,
+    );
+    write(&history.join("claude-tail.jsonl"), &transcript);
+    let mut authority = NativeHistoryAuthority::new(
+        NativeHistoryConfig::new(vec![root(
+            "claude-code",
+            HistorySourceLayout::SingleNdjson,
+            &history,
+        )])
+        .unwrap(),
+    );
+    let discovery = request("claude", 1);
+    let locator = authority
+        .discover_locator_index(&discovery)
+        .unwrap()
+        .remove(0);
+    let load = HistoryLoadRequest::new(&discovery, locator.candidate().clone()).unwrap();
+
+    let preview = authority.load_preview_session(&load).unwrap();
+    assert!(preview.source_truncated());
+    let preview = preview.session();
+
+    assert_eq!(preview.session_id, "claude-tail");
+    assert_eq!(preview.cwd.as_deref(), Some("/repo/tail"));
+    assert_eq!(preview.messages.len(), 2);
+    assert_eq!(preview.messages.last().unwrap().text, "last answer");
+}
+
+#[test]
+fn kimi_preview_uses_bounded_wire_tail_and_indexed_cwd() {
+    let fixture = FixtureDir::new("kimi-preview-tail");
+    let sessions = fixture.path().join("sessions");
+    let session = sessions.join("wd_repo_hash").join("session_kimi_tail");
+    write(
+        &session.join("state.json"),
+        r#"{"title":"Kimi tail","agents":{"main":{"type":"main","parentAgentId":null}}}"#,
+    );
+    write(
+        &fixture.path().join("session_index.jsonl"),
+        r#"{"sessionId":"session_kimi_tail","workDir":"/repo/kimi-tail"}"#,
+    );
+    let oversized = serde_json::json!({
+        "type": "context.append_message",
+        "message": {
+            "role": "user",
+            "origin": { "kind": "user" },
+            "content": "x".repeat(600_000),
+        },
+    });
+    write(
+        &session.join("agents").join("main").join("wire.jsonl"),
+        &format!(
+            "{oversized}\n{}\n{}\n{}",
+            r#"{"type":"context.append_message","message":{"role":"user","origin":{"kind":"user"},"content":"last question"}}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"last answer"}}}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"step.end"}}"#,
+        ),
+    );
+    let mut authority = NativeHistoryAuthority::new(
+        NativeHistoryConfig::new(vec![root(
+            "kimi",
+            HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson,
+            &sessions,
+        )])
+        .unwrap(),
+    );
+    let discovery = request("kimi", 1);
+    let locator = authority
+        .discover_locator_index(&discovery)
+        .unwrap()
+        .remove(0);
+    let load = HistoryLoadRequest::new(&discovery, locator.candidate().clone()).unwrap();
+
+    let preview = authority.load_preview_session(&load).unwrap();
+    assert!(preview.source_truncated());
+    let preview = preview.session();
+    assert_eq!(preview.session_id, "session_kimi_tail");
+    assert_eq!(preview.cwd.as_deref(), Some("/repo/kimi-tail"));
+    assert_eq!(preview.messages.len(), 2);
+    assert_eq!(preview.messages.last().unwrap().text, "last answer");
+}
+
+#[test]
+fn locator_scan_reports_internal_overflow_without_poisoning_public_page() {
+    let fixture = FixtureDir::new("locator-overflow");
+    let history = fixture.path().join("history");
+    for index in 0..2 {
+        write(
+            &history.join(format!("session-{index}.jsonl")),
+            &format!(
+                "{{\"type\":\"user\",\"sessionId\":\"session-{index}\",\"cwd\":\"/repo\",\"message\":{{\"content\":\"question\"}}}}"
+            ),
+        );
+    }
+    let limits = NativeHistoryLimits {
+        max_candidates: 1,
+        ..NativeHistoryLimits::default()
+    };
+    let mut authority = NativeHistoryAuthority::new(
+        NativeHistoryConfig::with_limits(
+            vec![root(
+                "claude-code",
+                HistorySourceLayout::SingleNdjson,
+                &history,
+            )],
+            limits,
+        )
+        .unwrap(),
+    );
+    let discovery = request("claude", 1);
+
+    assert_eq!(discover_history(&mut authority, &discovery).unwrap().len(), 1);
+    assert!(authority.take_discovery_issues().is_empty());
+    assert_eq!(authority.discover_locator_index(&discovery).unwrap().len(), 1);
+    assert!(authority.take_discovery_issues().iter().any(|issue| {
+        issue.kind == NativeHistoryDiscoveryIssueKind::CandidateLimitReached
+    }));
 }
 
 #[test]

@@ -923,7 +923,12 @@ impl Gate4AgentEngine {
             );
             return;
         }
-        if let ControlObservation::ProviderGap { source, missed } = &envelope.observation {
+        if let ControlObservation::ProviderGap {
+            source,
+            source_sequence,
+            missed,
+        } = &envelope.observation
+        {
             if current.provider.sequence == u64::MAX {
                 self.counter_error = Some(ControlError::ProviderSequenceExhausted {
                     instance_id,
@@ -931,13 +936,38 @@ impl Gate4AgentEngine {
                 });
                 return;
             }
+            let current_source_sequence = provider_source_sequence(&current.provider, source);
+            let expected_source_sequence = current_source_sequence.checked_add(*missed);
+            if *source_sequence == 0
+                || *missed == 0
+                || expected_source_sequence != Some(*source_sequence)
+            {
+                if expected_source_sequence.is_none() {
+                    self.counter_error = Some(ControlError::ProviderSourceSequenceExhausted {
+                        instance_id,
+                        generation,
+                        provider_source: source.clone(),
+                    });
+                } else {
+                    self.emit_ignored(
+                        instance_id,
+                        generation,
+                        ObservationIgnoredReason::StaleProviderEvent,
+                    );
+                }
+                return;
+            }
             let missed = *missed;
             let state = self
                 .sessions
                 .get_mut(&instance_id)
                 .expect("validated session");
-            let canonical_sequence =
-                reduce_provider_gap(&mut state.snapshot.provider, source, missed);
+            let canonical_sequence = reduce_provider_gap(
+                &mut state.snapshot.provider,
+                source,
+                *source_sequence,
+                missed,
+            );
             self.bump_revision();
             self.emit_event(
                 None,
@@ -946,6 +976,7 @@ impl Gate4AgentEngine {
                 ControlEventKind::ProviderGap {
                     sequence: canonical_sequence,
                     source: source.clone(),
+                    source_sequence: *source_sequence,
                     missed,
                 },
             );
@@ -1929,9 +1960,19 @@ impl Gate4AgentEngine {
             .map_err(|error| ControlError::InvalidProviderRuntimePolicy { error })?;
         require_runtime_capability(
             runtime_policy,
-            ProviderRuntimeCapability::ProviderSessionIdentity,
+            ProviderRuntimeCapability::RawPtyLifecycle,
         )?;
-        require_runtime_capability(runtime_policy, ProviderRuntimeCapability::SemanticResume)?;
+        let has_initial_prompt = request.initial_prompt.is_some();
+        if has_initial_prompt {
+            require_runtime_capability(
+                runtime_policy,
+                ProviderRuntimeCapability::ProviderSessionIdentity,
+            )?;
+            require_runtime_capability(
+                runtime_policy,
+                ProviderRuntimeCapability::SemanticResume,
+            )?;
+        }
         request.initial_prompt = request
             .initial_prompt
             .as_deref()
@@ -2175,7 +2216,7 @@ impl Gate4AgentEngine {
                     .expect("validated session")
                     .snapshot
                     .provider;
-                reduce_provider_gap(snapshot, &source, missed)
+                reduce_provider_gap(snapshot, &source, source_sequence - 1, missed)
             };
             self.bump_revision();
             self.emit_event(
@@ -2185,6 +2226,7 @@ impl Gate4AgentEngine {
                 ControlEventKind::ProviderGap {
                     sequence: canonical_sequence,
                     source: source.clone(),
+                    source_sequence: source_sequence - 1,
                     missed,
                 },
             );
@@ -2412,13 +2454,24 @@ impl Gate4AgentEngine {
     }
 
     fn observation_has_provider_headroom(&self, envelope: &ObservationEnvelope) -> bool {
-        !matches!(
-            envelope.observation,
-            ControlObservation::ProviderEvent { .. } | ControlObservation::ProviderGap { .. }
-        ) || self
-            .sessions
-            .get(&envelope.instance_id)
-            .is_none_or(|state| state.snapshot.provider.sequence < u64::MAX)
+        let Some(state) = self.sessions.get(&envelope.instance_id) else {
+            return true;
+        };
+        if state.snapshot.provider.sequence == u64::MAX {
+            return !matches!(
+                envelope.observation,
+                ControlObservation::ProviderEvent { .. }
+                    | ControlObservation::ProviderGap { .. }
+            );
+        }
+        match &envelope.observation {
+            ControlObservation::ProviderGap { source, missed, .. } => {
+                provider_source_sequence(&state.snapshot.provider, source)
+                    .checked_add(*missed)
+                    .is_some()
+            }
+            _ => true,
+        }
     }
 
     fn retire_exhausted_counter(&mut self, error: &ControlError) {
@@ -2614,9 +2667,13 @@ fn denied_observation_capability(
             }
         }
         ControlObservation::ProviderGap { .. } => ProviderRuntimeCapability::SemanticReadiness,
+        // Resume authority observations are correlated to an exact pending
+        // operation and are not provider telemetry. Command admission already
+        // requires the semantic resume contract when a prompt is injected;
+        // a prompt-free provider-native PTY resume is intentionally raw.
         ControlObservation::ResumeAuthorized { .. }
         | ControlObservation::ResumeDenied { .. }
-        | ControlObservation::ResumeFailed { .. } => ProviderRuntimeCapability::SemanticResume,
+        | ControlObservation::ResumeFailed { .. } => return None,
         _ => return None,
     };
     (!runtime_policy.admits(capability)).then_some(capability)
@@ -2947,6 +3004,29 @@ fn reduce_provider_event(
             interaction_transitions.push(ProviderInteractionTransition::Requested(interaction));
             snapshot.lead_activity = ProviderActivity::WaitingForInput;
         }
+        ProviderEvent::InteractionResolved {
+            request_id,
+            outcome,
+        } => {
+            let resolved = resolve_provider_reported_interactions(
+                snapshot,
+                source,
+                request_id,
+                *outcome,
+            );
+            if !resolved.is_empty() {
+                snapshot.lead_activity = if snapshot
+                    .interactions
+                    .iter()
+                    .any(interaction_is_unresolved)
+                {
+                    ProviderActivity::WaitingForInput
+                } else {
+                    ProviderActivity::Working
+                };
+            }
+            interaction_transitions.extend(resolved);
+        }
         ProviderEvent::RateLimited { .. } | ProviderEvent::Error { .. } => {
             snapshot.lead_activity = ProviderActivity::Blocked;
         }
@@ -3003,7 +3083,9 @@ fn reduce_provider_event(
                 subagent.source != *source || subagent.provider_agent_id != *agent_id
             });
         }
-        ProviderEvent::Text { .. } | ProviderEvent::Thinking { .. } => {}
+        ProviderEvent::Text { .. }
+        | ProviderEvent::Thinking { .. }
+        | ProviderEvent::ContextWindowUsage { .. } => {}
     }
     refresh_provider_activity(snapshot);
     provider_source_cursor_mut(snapshot, source).sequence = source_sequence;
@@ -3108,6 +3190,25 @@ fn resolve_provider_request_interactions(
             interaction.source == *source
                 && interaction.provider_request_id.as_deref() == Some(provider_request_id)
                 && interaction.agent_id.as_deref() == agent_id
+                && interaction_is_unresolved(interaction)
+        })
+        .map(|interaction| (interaction.id, outcome))
+        .collect();
+    resolve_interaction_ids(snapshot, matching)
+}
+
+fn resolve_provider_reported_interactions(
+    snapshot: &mut ProviderSnapshot,
+    source: &ProviderSource,
+    provider_request_id: &str,
+    outcome: ProviderInteractionOutcome,
+) -> Vec<ProviderInteractionTransition> {
+    let matching = snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.source == *source
+                && interaction.provider_request_id.as_deref() == Some(provider_request_id)
                 && interaction_is_unresolved(interaction)
         })
         .map(|interaction| (interaction.id, outcome))
@@ -3234,9 +3335,11 @@ fn resolve_interaction_ids(
 fn reduce_provider_gap(
     snapshot: &mut ProviderSnapshot,
     source: &ProviderSource,
+    source_sequence: u64,
     missed: u64,
 ) -> u64 {
     let cursor = provider_source_cursor_mut(snapshot, source);
+    cursor.sequence = source_sequence;
     cursor.gap_count = cursor.gap_count.saturating_add(missed);
     cursor.stale = true;
     snapshot.gap_count = snapshot.gap_count.saturating_add(missed);
@@ -3541,9 +3644,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_policy_requires_resume_identity_and_resume_capability() {
+    fn raw_pty_policy_admits_prompt_free_native_resume_only() {
         let mut engine = Gate4AgentEngine::new();
         engine.apply_command(register(1)).unwrap();
+        engine.drain_events();
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "provider-session".to_owned(),
+            transcript_path: None,
+        };
         let request = ResumeLaunchRequest {
             working_directory: ".".to_owned(),
             terminal_size: TerminalSize {
@@ -3552,28 +3661,73 @@ mod tests {
             },
             initial_prompt: None,
         };
-        assert_eq!(
-            engine.apply_command(CommandEnvelope {
+        engine
+            .apply_command(CommandEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
                     target: ResumeTarget::ProviderSession {
-                        identity: ProviderSessionIdentity {
-                            key: ProviderSessionKey::SessionId,
-                            id: "provider-session".to_owned(),
-                            transcript_path: None,
-                        },
+                        identity: identity.clone(),
                     },
                     runtime_policy: ProviderRuntimePolicy::raw_pty(),
                     request,
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        assert!(matches!(
+            &authorize.effect,
+            ControlEffect::AuthorizeResume {
+                target: ResumeAuthorityTarget::ProviderSession { identity: requested },
+                ..
+            } if requested == &identity
+        ));
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: identity.clone(),
+            },
+        });
+        assert!(matches!(
+            engine.drain_effects().pop().unwrap().effect,
+            ControlEffect::SpawnResume {
+                provider_session,
+                runtime_policy,
+                request: ResumeLaunchRequest { initial_prompt: None, .. },
+                ..
+            } if provider_session == identity
+                && runtime_policy == ProviderRuntimePolicy::raw_pty()
+        ));
+
+        let mut prompted = Gate4AgentEngine::new();
+        prompted.apply_command(register(1)).unwrap();
+        assert_eq!(
+            prompted.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(2),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    target: ResumeTarget::ProviderSession { identity },
+                    runtime_policy: ProviderRuntimePolicy::raw_pty(),
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: Some("continue".to_owned()),
+                    },
                 },
             }),
             Err(ControlError::ProviderRuntimePolicyDenied {
                 capability: ProviderRuntimeCapability::ProviderSessionIdentity,
             })
         );
-        assert!(engine.drain_effects().is_empty());
+        assert!(prompted.drain_effects().is_empty());
     }
 
     fn resolving_interaction(
@@ -3838,7 +3992,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_events_reduce_usage_and_reject_stale_sequence() {
+    fn direct_provider_gap_advances_source_cursor_and_accepts_next_event() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -3866,7 +4020,19 @@ mod tests {
             generation: spawn.generation,
             observation: ControlObservation::ProviderGap {
                 source: provider_source(),
+                source_sequence: 3,
                 missed: 2,
+            },
+        });
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 4,
+                event: ProviderEvent::WorkingObserved,
             },
         });
         engine.apply_observation(ObservationEnvelope {
@@ -3893,8 +4059,18 @@ mod tests {
         assert_eq!(provider.usage.input_tokens, 3);
         assert_eq!(provider.usage.output_tokens, 5);
         assert_eq!(provider.gap_count, 2);
-        assert!(provider.stale);
-        assert!(engine.drain_events().iter().any(|event| matches!(
+        assert!(!provider.stale);
+        assert_eq!(provider.sources[0].sequence, 4);
+        let events = engine.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ProviderGap {
+                source_sequence: 3,
+                missed: 2,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
             event.event,
             ControlEventKind::ObservationIgnored {
                 reason: ObservationIgnoredReason::StaleProviderEvent
@@ -4038,6 +4214,171 @@ mod tests {
                 interaction_id: ProviderInteractionId(1),
                 outcome: ProviderInteractionOutcome::Answered,
             }
+        )));
+    }
+
+    #[test]
+    fn provider_reported_interaction_resolution_is_exact_and_immediate() {
+        for outcome in [
+            ProviderInteractionOutcome::Approved,
+            ProviderInteractionOutcome::Denied,
+        ] {
+            let (mut engine, spawn) = running_engine();
+            let source = provider_source();
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: source.clone(),
+                    sequence: 1,
+                    event: ProviderEvent::InteractionRequested {
+                        request_id: Some("approval-1".to_owned()),
+                        interaction_kind: ProviderInteractionKind::Approval,
+                        tool_name: "shell".to_owned(),
+                        prompt: String::new(),
+                        agent_id: None,
+                    },
+                },
+            });
+            engine.drain_events();
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source,
+                    sequence: 2,
+                    event: ProviderEvent::InteractionResolved {
+                        request_id: "approval-1".to_owned(),
+                        outcome,
+                    },
+                },
+            });
+
+            assert_eq!(
+                engine.snapshot().sessions[0].provider.interactions[0].status,
+                ProviderInteractionStatus::Resolved { outcome }
+            );
+            assert_eq!(
+                engine.snapshot().sessions[0].provider.lead_activity,
+                ProviderActivity::Working
+            );
+            assert_eq!(
+                engine
+                    .drain_events()
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event,
+                        ControlEventKind::InteractionResolved {
+                            interaction_id: ProviderInteractionId(1),
+                            outcome: observed,
+                        } if observed == outcome
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn provider_reported_resolution_is_fail_closed_for_orphan_duplicate_and_lifecycle() {
+        let (mut engine, spawn) = running_engine();
+        let source = provider_source();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: source.clone(),
+                sequence: 1,
+                event: ProviderEvent::InteractionResolved {
+                    request_id: "orphan".to_owned(),
+                    outcome: ProviderInteractionOutcome::Approved,
+                },
+            },
+        });
+        assert!(engine.snapshot().sessions[0].provider.interactions.is_empty());
+        assert!(!engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::InteractionResolved { .. }
+        )));
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: source.clone(),
+                sequence: 2,
+                event: ProviderEvent::InteractionRequested {
+                    request_id: Some("approval-2".to_owned()),
+                    interaction_kind: ProviderInteractionKind::Approval,
+                    tool_name: "shell".to_owned(),
+                    prompt: String::new(),
+                    agent_id: None,
+                },
+            },
+        });
+        engine.drain_events();
+        for sequence in [3, 4] {
+            engine.apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: spawn.instance_id,
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderEvent {
+                    source: source.clone(),
+                    sequence,
+                    event: ProviderEvent::InteractionResolved {
+                        request_id: "approval-2".to_owned(),
+                        outcome: ProviderInteractionOutcome::Denied,
+                    },
+                },
+            });
+        }
+        let events = engine.drain_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    ControlEventKind::InteractionResolved {
+                        interaction_id: ProviderInteractionId(2),
+                        outcome: ProviderInteractionOutcome::Denied,
+                    }
+                ))
+                .count(),
+            1
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: spawn.instance_id,
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source,
+                sequence: 5,
+                event: ProviderEvent::TurnCompleted {
+                    usage: TokenUsage::default(),
+                    is_cumulative: false,
+                },
+            },
+        });
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.interactions[0].status,
+            ProviderInteractionStatus::Resolved {
+                outcome: ProviderInteractionOutcome::Denied,
+            }
+        );
+        assert!(!engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::InteractionResolved { .. }
         )));
     }
 
@@ -5041,7 +5382,7 @@ mod tests {
     }
 
     #[test]
-    fn external_ingress_merges_sources_with_canonical_sequence_and_automatic_gap() {
+    fn ingest_provider_jump_emits_exact_gap_and_accepts_next_sequence() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -5106,12 +5447,13 @@ mod tests {
             event.event,
             ControlEventKind::ProviderGap {
                 sequence: 4,
+                source_sequence: 2,
                 missed: 1,
                 ..
             }
         )));
 
-        let stale = engine
+        engine
             .apply_command(CommandEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(32),
@@ -5119,7 +5461,28 @@ mod tests {
                     instance_id: spawn.instance_id,
                     generation: spawn.generation,
                     source: hook_source(),
-                    source_sequence: 3,
+                    source_sequence: 4,
+                    events: vec![ProviderEvent::WorkingObserved],
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            provider_source_sequence(
+                &engine.snapshot().sessions[0].provider,
+                &hook_source(),
+            ),
+            4,
+        );
+
+        let stale = engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(33),
+                command: ControlCommand::IngestProvider {
+                    instance_id: spawn.instance_id,
+                    generation: spawn.generation,
+                    source: hook_source(),
+                    source_sequence: 4,
                     events: vec![ProviderEvent::Ready],
                 },
             })
@@ -5901,6 +6264,7 @@ mod tests {
                 generation: spawn.generation,
                 observation: ControlObservation::ProviderGap {
                     source: provider_source(),
+                    source_sequence: 1,
                     missed: 1,
                 },
             })
@@ -5955,6 +6319,70 @@ mod tests {
             }
         );
         assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn direct_provider_gap_source_sequence_overflow_is_typed_and_atomic() {
+        let (mut engine, spawn) = running_engine();
+        let source = provider_source();
+        engine
+            .session_mut(instance())
+            .provider
+            .sources
+            .push(ProviderSourceCursor {
+                source: source.clone(),
+                sequence: u64::MAX,
+                gap_count: 0,
+                stale: false,
+            });
+        let before = engine.clone();
+        let error = engine
+            .try_apply_observation(ObservationEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: None,
+                instance_id: instance(),
+                generation: spawn.generation,
+                observation: ControlObservation::ProviderGap {
+                    source: source.clone(),
+                    source_sequence: u64::MAX,
+                    missed: 1,
+                },
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ControlError::ProviderSourceSequenceExhausted {
+                instance_id: instance(),
+                generation: spawn.generation,
+                provider_source: source,
+            },
+        );
+        assert_eq!(engine, before);
+    }
+
+    #[test]
+    fn direct_provider_gap_rejects_non_exact_source_sequence() {
+        let (mut engine, spawn) = running_engine();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderGap {
+                source: provider_source(),
+                source_sequence: 2,
+                missed: 1,
+            },
+        });
+        let provider = &engine.snapshot().sessions[0].provider;
+        assert_eq!(provider.gap_count, 0);
+        assert!(provider.sources.is_empty());
+        assert!(engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::StaleProviderEvent,
+            }
+        )));
     }
 
     #[test]
@@ -6280,6 +6708,7 @@ mod tests {
                     cwd: Some("/repo".to_owned()),
                     model: Some("model".to_owned()),
                     message_count: 1,
+                    completed_turn_count: None,
                     total_tokens: 7,
                     messages: vec![HistoryMessageRecord {
                         role: HistoryMessageRole::User,
@@ -7024,6 +7453,7 @@ mod tests {
                     cwd: None,
                     model: None,
                     message_count: 0,
+                    completed_turn_count: None,
                     total_tokens: 0,
                     messages: Vec::new(),
                 },

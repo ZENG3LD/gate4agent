@@ -4,22 +4,40 @@ use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, validate_provider_contract_manifest,
     write_json_frame_limited, CapabilityId,
     ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
-    FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure,
+    FrameError, HarnessMcpLocalReplyV1, HarnessMcpLocalRequestV1, HarnessMcpLocalToken,
+    HarnessReadHostErrorV1, HarnessReadRequestV1, HarnessReadResponseV1,
+    NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure,
     NodeFailureCode, NodeHello, NodeId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope,
     WorkspaceSnapshot,
     ServerChallenge, ServerFrame,
+    MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES, MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     NODE_AUTH_NONCE_BYTES,
+    CAPABILITY_HOST_DIRECTORY_BROWSE_V1,
+    NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+    NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
+    NODE_OBSERVATION_EVENTS_CAPABILITY,
+    NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+    NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+    NODE_HARNESS_MCP_READ_PROXY_CAPABILITY,
+    NODE_NATIVE_SESSION_CATALOG_CAPABILITY, NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
+    NODE_NATIVE_SESSION_INDEX_CAPABILITY, NODE_NATIVE_SESSION_PREVIEW_CAPABILITY,
+    NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_OPAQUE_UNIX_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
+    NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
+    NODE_SESSION_TASK_CORRELATION_CAPABILITY,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+    NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
     NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
-    NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    NODE_GIT_READ_CAPABILITY, NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    NODE_WORKSPACE_FILE_WRITE_CAPABILITY,
+    NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION,
 };
@@ -36,10 +54,10 @@ use crate::auth_proof;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 #[cfg(feature = "fixture")]
 use tokio::io::AsyncWriteExt;
@@ -54,6 +72,106 @@ const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 const SERVER_FRAME_QUEUE_CAPACITY: usize = 1;
 const PENDING_EVENTS_MAX: usize = 1_024;
 const PENDING_EVENT_WIRE_BYTES_MAX: usize = 16 * 1024 * 1024;
+const LOCAL_SESSION_HARNESS_MCP_DEADLINE: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+pub struct LocalSessionHarnessMcpClient {
+    endpoint: PathBuf,
+    token: HarnessMcpLocalToken,
+}
+
+impl LocalSessionHarnessMcpClient {
+    pub fn new(
+        endpoint: impl AsRef<Path>,
+        token: HarnessMcpLocalToken,
+    ) -> Result<Self, LocalSessionHarnessMcpError> {
+        let endpoint = endpoint.as_ref();
+        if endpoint.as_os_str().is_empty() {
+            return Err(LocalSessionHarnessMcpError::Unavailable);
+        }
+        Ok(Self { endpoint: endpoint.to_path_buf(), token })
+    }
+
+    pub fn send(
+        &self,
+        request: HarnessReadRequestV1,
+    ) -> Result<HarnessReadResponseV1, LocalSessionHarnessMcpError> {
+        request.validate().map_err(|_| LocalSessionHarnessMcpError::InvalidRequest)?;
+        let envelope = HarnessMcpLocalRequestV1 {
+            version: 1,
+            token: self.token.clone(),
+            request,
+        };
+        envelope.validate().map_err(|_| LocalSessionHarnessMcpError::InvalidRequest)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| LocalSessionHarnessMcpError::Unavailable)?;
+        runtime.block_on(async {
+            timeout(LOCAL_SESSION_HARNESS_MCP_DEADLINE, async {
+                let mut stream = connect_local_stream(&self.endpoint)
+                    .await
+                    .map_err(map_harness_mcp_io_error)?;
+                write_json_frame_limited(
+                    &mut stream,
+                    &envelope,
+                    MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES,
+                ).await.map_err(map_harness_mcp_frame_error)?;
+                use tokio::io::AsyncWriteExt as _;
+                stream.shutdown().await.map_err(map_harness_mcp_io_error)?;
+                let reply: HarnessMcpLocalReplyV1 = read_json_frame_limited_body_timeout(
+                    &mut stream,
+                    MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES,
+                    LOCAL_SESSION_HARNESS_MCP_DEADLINE,
+                ).await.map_err(map_harness_mcp_frame_error)?;
+                reply.validate().map_err(|_| LocalSessionHarnessMcpError::InvalidResponse)?;
+                match reply {
+                    HarnessMcpLocalReplyV1::Ok { response } => Ok(response),
+                    HarnessMcpLocalReplyV1::Error {
+                        error: HarnessReadHostErrorV1::Unauthorized,
+                    } => Err(LocalSessionHarnessMcpError::Unauthorized),
+                    HarnessMcpLocalReplyV1::Error { error } => {
+                        Err(LocalSessionHarnessMcpError::Host(error))
+                    }
+                }
+            }).await.map_err(|_| LocalSessionHarnessMcpError::Deadline)?
+        })
+    }
+}
+
+fn map_harness_mcp_io_error(error: io::Error) -> LocalSessionHarnessMcpError {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => LocalSessionHarnessMcpError::Unauthorized,
+        io::ErrorKind::TimedOut => LocalSessionHarnessMcpError::Deadline,
+        _ => LocalSessionHarnessMcpError::Unavailable,
+    }
+}
+
+fn map_harness_mcp_frame_error(error: FrameError) -> LocalSessionHarnessMcpError {
+    match error {
+        FrameError::PrefixTimedOut | FrameError::BodyTimedOut { .. } => {
+            LocalSessionHarnessMcpError::Deadline
+        }
+        _ => LocalSessionHarnessMcpError::InvalidResponse,
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum LocalSessionHarnessMcpError {
+    #[error("local session harness MCP request was unauthorized")]
+    Unauthorized,
+    #[error("local session harness MCP endpoint is unavailable")]
+    Unavailable,
+    #[error("local session harness MCP request is invalid")]
+    InvalidRequest,
+    #[error("local session harness MCP response is invalid")]
+    InvalidResponse,
+    #[error("local session harness MCP deadline exceeded")]
+    Deadline,
+    #[error("local session harness MCP host rejected the request: {0:?}")]
+    Host(HarnessReadHostErrorV1),
+}
 
 trait NodeClientStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -302,6 +420,10 @@ impl LocalNodeClient {
             &hello,
             &negotiated_capabilities,
         )?;
+        ensure_node_snapshot_agent_progress_capability(
+            &hello.snapshot,
+            &negotiated_capabilities,
+        )?;
         if &hello.snapshot.node_id != expected_node_id {
             return Err(NodeClientError::Protocol(format!(
                 "node identity mismatch: expected '{}', received '{}'",
@@ -356,11 +478,22 @@ impl LocalNodeClient {
     }
 
     async fn recv_received(&mut self) -> Result<ReceivedServerFrame, NodeClientError> {
+        self.recv_received_for_request(None).await
+    }
+
+    async fn recv_received_for_request(
+        &mut self,
+        expected_request: Option<&NodeRequest>,
+    ) -> Result<ReceivedServerFrame, NodeClientError> {
         let received = self.frame_rx.recv().await.ok_or_else(|| {
             NodeClientError::Protocol("node frame reader closed".to_owned())
         })??;
         let frame = &received.frame;
-        ensure_server_frame_required_capability(frame, &self.negotiated_capabilities)?;
+        ensure_server_frame_required_capability_for_request(
+            frame,
+            &self.negotiated_capabilities,
+            expected_request,
+        )?;
         ensure_server_frame_terminal_capability(
             frame,
             self.terminal_frame_events_enabled,
@@ -375,11 +508,20 @@ impl LocalNodeClient {
     }
 
     pub async fn request(&mut self, request: NodeRequest) -> Result<NodeResponse, NodeClientError> {
+        let expected_request = request.clone();
         let request_id = self.send(request).await?;
         loop {
-            let received = self.recv_received().await?;
+            let received = self
+                .recv_received_for_request(Some(&expected_request))
+                .await?;
             match received.frame {
                 ServerFrame::Reply(reply) if reply.request_id == request_id => {
+                    validate_provider_session_index_response(&expected_request, &reply.result)?;
+                    validate_native_session_response(&expected_request, &reply.result)?;
+                    validate_workspace_content_response(&expected_request, &reply.result)?;
+                    validate_session_task_response(&expected_request, &reply.result)?;
+                    validate_delivery_response(&expected_request, &reply.result)?;
+                    validate_harness_mcp_response(&expected_request, &reply.result)?;
                     return reply.result.map_err(NodeClientError::Node);
                 }
                 ServerFrame::Reply(reply) => {
@@ -532,9 +674,25 @@ fn reserve_request_id(
     open_provider_ids_enabled: bool,
     negotiated_capabilities: &[CapabilityId],
 ) -> Result<u64, NodeClientError> {
+    let now_unix_ms = current_unix_ms()?;
+    if !request.harness_mcp_contract_is_valid_at(now_unix_ms) {
+        return Err(NodeClientError::Protocol(
+            "invalid harness MCP proxy request".to_owned(),
+        ));
+    }
     if !request.history_context_pack_contract_is_valid() {
         return Err(NodeClientError::Protocol(
             "invalid history context pack request".to_owned(),
+        ));
+    }
+    if !request.native_session_catalog_contract_is_valid() {
+        return Err(NodeClientError::Protocol(
+            "invalid native session catalog request".to_owned(),
+        ));
+    }
+    if !request.native_session_preview_contract_is_valid() {
+        return Err(NodeClientError::Protocol(
+            "invalid native session preview request".to_owned(),
         ));
     }
     ensure_node_request_required_capability(request, negotiated_capabilities)?;
@@ -549,6 +707,414 @@ fn reserve_request_id(
         .checked_add(1)
         .ok_or(NodeClientError::RequestIdExhausted)?;
     Ok(request_id)
+}
+
+fn current_unix_ms() -> Result<u64, NodeClientError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| NodeClientError::Protocol("system clock precedes Unix epoch".to_owned()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| NodeClientError::Protocol("system clock exceeds protocol range".to_owned()))
+}
+
+fn validate_provider_session_index_response(
+    expected: &NodeRequest,
+    response: &Result<NodeResponse, NodeFailure>,
+) -> Result<(), NodeClientError> {
+    let matches = match (expected, response) {
+        (
+            NodeRequest::IndexProviderSession {
+                workspace_id,
+                provider,
+                identity,
+                ..
+            },
+            Ok(NodeResponse::ProviderSessionIndexed { record }),
+        ) => {
+            &record.workspace_id == workspace_id
+                && &record.provider == provider
+                && record.provider_session.as_ref() == Some(identity)
+        }
+        (NodeRequest::IndexProviderSession { .. }, Err(_)) => true,
+        (NodeRequest::IndexProviderSession { .. }, Ok(_)) => false,
+        (_, Ok(NodeResponse::ProviderSessionIndexed { .. })) => false,
+        _ => true,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(NodeClientError::Protocol(
+            "node provider session index response does not match the request".to_owned(),
+        ))
+    }
+}
+
+fn validate_native_session_response(
+    expected: &NodeRequest,
+    response: &Result<NodeResponse, NodeFailure>,
+) -> Result<(), NodeClientError> {
+    let matches = match (expected, response) {
+        (
+            NodeRequest::CatalogNativeSessions { route, .. },
+            Ok(response @ NodeResponse::NativeSessionsCataloged {
+                route: echoed_route,
+                ..
+            }),
+        ) => echoed_route == route && response.native_session_catalog_contract_is_valid(),
+        (
+            NodeRequest::PageNativeSessions {
+                route,
+                window,
+                catalog_revision,
+                ..
+            },
+            Ok(response @ NodeResponse::NativeSessionsPaged {
+                route: echoed_route,
+                page,
+            }),
+        ) => {
+            echoed_route == route
+                && page.window == *window
+                && page.revision == *catalog_revision
+                && response.native_session_catalog_contract_is_valid()
+        }
+        (
+            NodeRequest::PreviewNativeSession { selection, .. },
+            Ok(response @ NodeResponse::NativeSessionPreviewed {
+                selection: echoed_selection,
+                ..
+            }),
+        ) => {
+            echoed_selection == selection
+                && response.native_session_preview_contract_is_valid()
+        }
+        (
+            NodeRequest::IndexNativeSession { selection, .. },
+            Ok(response @ NodeResponse::NativeSessionIndexed {
+                selection: echoed_selection,
+                record,
+            }),
+        ) => {
+            echoed_selection == selection
+                && selection.route.scope
+                == gate4agent_node_protocol::NativeSessionCatalogScope::Workspace
+                && selection.route.workspace_id.as_ref() == Some(&record.workspace_id)
+                && selection.route.provider == record.provider
+                && response.native_session_index_contract_is_valid()
+        }
+        (
+            NodeRequest::CatalogNativeSessions { .. }
+            | NodeRequest::PageNativeSessions { .. }
+            | NodeRequest::PreviewNativeSession { .. }
+            | NodeRequest::IndexNativeSession { .. },
+            Err(_),
+        ) => true,
+        (
+            NodeRequest::CatalogNativeSessions { .. }
+            | NodeRequest::PageNativeSessions { .. }
+            | NodeRequest::PreviewNativeSession { .. }
+            | NodeRequest::IndexNativeSession { .. },
+            Ok(_),
+        ) => false,
+        (
+            _,
+            Ok(
+                NodeResponse::NativeSessionsCataloged { .. }
+                | NodeResponse::NativeSessionsPaged { .. }
+                | NodeResponse::NativeSessionPreviewed { .. }
+                | NodeResponse::NativeSessionIndexed { .. },
+            ),
+        ) => false,
+        _ => true,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(NodeClientError::Protocol(
+            "node native session response does not match the request".to_owned(),
+        ))
+    }
+}
+
+fn validate_workspace_content_response(
+    expected: &NodeRequest,
+    response: &Result<NodeResponse, NodeFailure>,
+) -> Result<(), NodeClientError> {
+    let matches = match (expected, response) {
+        (
+            NodeRequest::ReadWorkspaceFile { workspace_id, path },
+            Ok(NodeResponse::WorkspaceFileRead { file }),
+        ) => &file.workspace_id == workspace_id && &file.path == path,
+        (
+            NodeRequest::WriteWorkspaceFile { workspace_id, path, text, .. },
+            Ok(NodeResponse::WorkspaceFileWritten { file }),
+        ) => {
+            &file.workspace_id == workspace_id
+                && &file.path == path
+                && matches!(
+                    &file.content,
+                    gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+                        text: written,
+                        byte_len,
+                    } if written == text
+                        && u32::try_from(text.len()).ok() == Some(*byte_len)
+                )
+        }
+        (
+            NodeRequest::CreateWorkspaceFile { workspace_id, path },
+            Ok(NodeResponse::WorkspaceFileCreated { file }),
+        ) => {
+            &file.workspace_id == workspace_id
+                && &file.path == path
+                && file.revision.is_some()
+                && matches!(
+                    &file.content,
+                    gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+                        text,
+                        byte_len: 0,
+                    } if text.is_empty()
+                )
+        }
+        (
+            NodeRequest::CreateWorkspaceDirectory { workspace_id, path },
+            Ok(NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id: actual_workspace_id,
+                entry,
+            }),
+        ) => {
+            actual_workspace_id == workspace_id
+                && &entry.relative_path == path
+                && entry.kind == gate4agent_node_protocol::WorkspaceEntryKind::Directory
+        }
+        (
+            NodeRequest::ReadGitHistory { workspace_id, .. },
+            Ok(NodeResponse::GitHistoryRead { workspace_id: actual, .. }),
+        ) => actual == workspace_id,
+        (
+            NodeRequest::ReadGitDiff { workspace_id, request },
+            Ok(NodeResponse::GitDiffRead { workspace_id: actual, diff }),
+        ) => actual == workspace_id && diff.mode == request.mode && diff.path == request.path,
+        (
+            NodeRequest::ReadWorkspaceFile { .. }
+            | NodeRequest::WriteWorkspaceFile { .. }
+            | NodeRequest::CreateWorkspaceFile { .. }
+            | NodeRequest::CreateWorkspaceDirectory { .. }
+            | NodeRequest::ReadGitHistory { .. }
+            | NodeRequest::ReadGitDiff { .. },
+            Err(_),
+        ) => true,
+        (
+            NodeRequest::ReadWorkspaceFile { .. }
+            | NodeRequest::WriteWorkspaceFile { .. }
+            | NodeRequest::CreateWorkspaceFile { .. }
+            | NodeRequest::CreateWorkspaceDirectory { .. }
+            | NodeRequest::ReadGitHistory { .. }
+            | NodeRequest::ReadGitDiff { .. },
+            Ok(_),
+        ) => false,
+        (
+            _,
+            Ok(
+                NodeResponse::WorkspaceFileRead { .. }
+                | NodeResponse::WorkspaceFileWritten { .. }
+                | NodeResponse::WorkspaceFileCreated { .. }
+                | NodeResponse::WorkspaceDirectoryCreated { .. }
+                | NodeResponse::GitHistoryRead { .. }
+                | NodeResponse::GitDiffRead { .. },
+            ),
+        ) => false,
+        _ => true,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(NodeClientError::Protocol(
+            "node workspace content response does not match the request".to_owned(),
+        ))
+    }
+}
+
+fn validate_session_task_response(
+    expected: &NodeRequest,
+    response: &Result<NodeResponse, NodeFailure>,
+) -> Result<(), NodeClientError> {
+    let matches = match (expected, response) {
+        (
+            NodeRequest::SetSessionTask {
+                record_id,
+                expected_revision,
+                target,
+            },
+            Ok(NodeResponse::SessionRecordUpdated { record }),
+        ) => session_task_record_matches(record, record_id, *expected_revision, target),
+        (NodeRequest::SetSessionTask { .. }, Err(_)) => true,
+        (NodeRequest::SetSessionTask { .. }, Ok(_)) => false,
+        _ => true,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(NodeClientError::Protocol(
+            "node session task response does not match the request".to_owned(),
+        ))
+    }
+}
+
+fn validate_delivery_response(
+    expected: &NodeRequest,
+    response: &Result<NodeResponse, NodeFailure>,
+) -> Result<(), NodeClientError> {
+    let matches = match (expected, response) {
+        (
+            NodeRequest::BeginDeliveryStage { manifest },
+            Ok(NodeResponse::DeliveryStageBegun {
+                manifest_digest, ..
+            }),
+        ) => manifest_digest == &manifest.manifest_digest,
+        (
+            NodeRequest::PutDeliveryBlobChunk {
+                stage_id,
+                blob_digest,
+                offset,
+                chunk_hex,
+            },
+            Ok(NodeResponse::DeliveryBlobChunkAccepted {
+                stage_id: actual_stage_id,
+                blob_digest: actual_blob_digest,
+                next_offset,
+            }),
+        ) => {
+            actual_stage_id == stage_id
+                && actual_blob_digest == blob_digest
+                && offset
+                    .checked_add(chunk_hex.raw_len() as u64)
+                    .is_some_and(|expected_offset| expected_offset == *next_offset)
+        }
+        (
+            NodeRequest::CommitDeliveryStage { .. },
+            Ok(NodeResponse::DeliveryCommitted { .. }),
+        ) => true,
+        (
+            NodeRequest::AbortDeliveryStage { stage_id },
+            Ok(NodeResponse::DeliveryStageAborted {
+                stage_id: actual_stage_id,
+            }),
+        ) => actual_stage_id == stage_id,
+        (
+            NodeRequest::BeginDeliveryStage { .. }
+            | NodeRequest::PutDeliveryBlobChunk { .. }
+            | NodeRequest::CommitDeliveryStage { .. }
+            | NodeRequest::AbortDeliveryStage { .. },
+            Err(_),
+        ) => true,
+        (
+            NodeRequest::BeginDeliveryStage { .. }
+            | NodeRequest::PutDeliveryBlobChunk { .. }
+            | NodeRequest::CommitDeliveryStage { .. }
+            | NodeRequest::AbortDeliveryStage { .. },
+            Ok(_),
+        ) => false,
+        (
+            _,
+            Ok(
+                NodeResponse::DeliveryStageBegun { .. }
+                | NodeResponse::DeliveryBlobChunkAccepted { .. }
+                | NodeResponse::DeliveryCommitted { .. }
+                | NodeResponse::DeliveryStageAborted { .. },
+            ),
+        ) => false,
+        _ => true,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(NodeClientError::Protocol(
+            "node delivery response does not match the request".to_owned(),
+        ))
+    }
+}
+
+fn validate_harness_mcp_response(
+    expected: &NodeRequest,
+    response: &Result<NodeResponse, NodeFailure>,
+) -> Result<(), NodeClientError> {
+    use NodeRequest as Request;
+    use NodeResponse as Response;
+    let matches = match (expected, response) {
+        (Request::ArmHarnessMcpReservation { reservation_id, activation_digest, expires_at_unix_ms, .. },
+            Ok(Response::Armed { reservation_id: echoed_id, activation_digest: echoed_digest, expires_at_unix_ms: echoed_expiry })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && expires_at_unix_ms == echoed_expiry,
+        (Request::SpawnSpecWithHarnessMcp { reservation_id, activation_digest, .. },
+            Ok(Response::Spawned { reservation_id: echoed_id, activation_digest: echoed_digest, receipt })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && receipt.harness_mcp_proxy.as_ref().is_some_and(|proxy| {
+                    &proxy.reservation_id == reservation_id
+                        && &proxy.activation_digest == activation_digest
+                }),
+        (Request::ActivateHarnessMcpReservation { reservation_id, activation_digest, record_id, session },
+            Ok(Response::Activated { reservation_id: echoed_id, activation_digest: echoed_digest, record_id: echoed_record, session: echoed_session })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && record_id == echoed_record && session == echoed_session,
+        (Request::AbortHarnessMcpReservation { reservation_id, activation_digest },
+            Ok(Response::Aborted { reservation_id: echoed_id, activation_digest: echoed_digest })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest,
+        (Request::PutHarnessMcpReplyChunk { reservation_id, activation_digest, record_id, session, call_id, offset, final_chunk, chunk_hex },
+            Ok(Response::ReplyChunkAccepted { reservation_id: echoed_id, activation_digest: echoed_digest, record_id: echoed_record, session: echoed_session, call_id: echoed_call, next_offset, completed })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && record_id == echoed_record && session == echoed_session && call_id == echoed_call
+                && offset.checked_add(u32::try_from(chunk_hex.raw_len()).unwrap_or(u32::MAX))
+                    == Some(*next_offset)
+                && completed == final_chunk,
+        (Request::RejectHarnessMcpCall { reservation_id, activation_digest, record_id, session, call_id, .. },
+            Ok(Response::CallRejected { reservation_id: echoed_id, activation_digest: echoed_digest, record_id: echoed_record, session: echoed_session, call_id: echoed_call })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && record_id == echoed_record && session == echoed_session && call_id == echoed_call,
+        (request, Err(_)) if request.required_capability()
+            == Some(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY) => true,
+        (request, Ok(_)) if request.required_capability()
+            == Some(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY) => false,
+        (_, Ok(response)) if response.requires_harness_mcp_proxy_capability() => false,
+        _ => true,
+    };
+    if matches { Ok(()) } else {
+        Err(NodeClientError::Protocol(
+            "node harness MCP proxy response does not match the request".to_owned(),
+        ))
+    }
+}
+
+fn session_task_record_matches(
+    record: &gate4agent_node_protocol::ManagedSessionRecord,
+    record_id: &gate4agent_node_protocol::SessionRecordId,
+    expected_revision: u64,
+    target: &gate4agent_node_protocol::SessionTaskTargetV1,
+) -> bool {
+    if &record.record_id != record_id { return false; }
+    let next_revision = expected_revision.checked_add(1);
+    match target {
+        gate4agent_node_protocol::SessionTaskTargetV1::New => record
+            .task_binding
+            .as_ref()
+            .is_some_and(|binding| {
+                Some(binding.revision) == next_revision && binding.task_id.is_some()
+            }),
+        gate4agent_node_protocol::SessionTaskTargetV1::Existing { task_id } => record
+            .task_binding
+            .as_ref()
+            .is_some_and(|binding| {
+                (binding.revision == expected_revision
+                    || Some(binding.revision) == next_revision)
+                    && binding.task_id.as_ref() == Some(task_id)
+            }),
+        gate4agent_node_protocol::SessionTaskTargetV1::Clear => match &record.task_binding {
+            None => expected_revision == 0,
+            Some(binding) => binding.task_id.is_none()
+                && (binding.revision == expected_revision
+                    || Some(binding.revision) == next_revision),
+        },
+    }
 }
 
 fn ensure_node_request_required_capability(
@@ -568,6 +1134,16 @@ fn ensure_node_request_required_capability(
     {
         return Err(NodeClientError::UnsupportedCapability(
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY.to_owned(),
+        ));
+    }
+    if request.requires_spawn_profile_revision_capability()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_SPAWN_PROFILE_REVISION_CAPABILITY.to_owned(),
         ));
     }
     if request.requires_worktree_selection_capability()
@@ -612,20 +1188,146 @@ fn ensure_node_request_required_capability(
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_server_frame_required_capability(
     frame: &ServerFrame,
     negotiated_capabilities: &[CapabilityId],
 ) -> Result<(), NodeClientError> {
+    ensure_server_frame_required_capability_for_request(
+        frame,
+        negotiated_capabilities,
+        None,
+    )
+}
+
+fn ensure_server_frame_required_capability_for_request(
+    frame: &ServerFrame,
+    negotiated_capabilities: &[CapabilityId],
+    expected_request: Option<&NodeRequest>,
+) -> Result<(), NodeClientError> {
+    if matches!(frame, ServerFrame::Event(event)
+        if !event.event.harness_mcp_contract_is_valid_at(current_unix_ms()?))
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent an invalid harness MCP read call".to_owned(),
+        ));
+    }
+    if matches!(frame, ServerFrame::Reply(reply)
+        if reply.result.as_ref().is_ok_and(|response| {
+            !response.native_session_catalog_contract_is_valid()
+        }))
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent an invalid native session catalog response".to_owned(),
+        ));
+    }
+    if matches!(frame, ServerFrame::Reply(reply)
+        if reply.result.as_ref().is_ok_and(|response| {
+            response.requires_native_session_preview_capability()
+                && !response.native_session_preview_contract_is_valid()
+        }))
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent an invalid native session preview response".to_owned(),
+        ));
+    }
+    if matches!(frame, ServerFrame::Reply(reply)
+        if reply.result.as_ref().is_ok_and(|response| {
+            response.requires_native_session_index_capability()
+                && !response.native_session_index_contract_is_valid()
+        }))
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent an invalid native session index response".to_owned(),
+        ));
+    }
     let required = match frame {
         ServerFrame::Reply(reply) => match reply.result.as_ref() {
+            Ok(NodeResponse::DeliveryStageBegun { .. })
+            | Ok(NodeResponse::DeliveryBlobChunkAccepted { .. })
+            | Ok(NodeResponse::DeliveryCommitted { .. })
+            | Ok(NodeResponse::DeliveryStageAborted { .. }) => {
+                Some(NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY)
+            }
+            Err(NodeFailure {
+                code:
+                    NodeFailureCode::DeliveryManifestInvalid
+                    | NodeFailureCode::UnknownDeliveryStage
+                    | NodeFailureCode::DeliveryStageConflict
+                    | NodeFailureCode::DeliveryBlobUnexpected
+                    | NodeFailureCode::DeliveryChunkOutOfOrder
+                    | NodeFailureCode::DeliveryBlobDigestMismatch
+                    | NodeFailureCode::DeliveryBundleDigestMismatch
+                    | NodeFailureCode::DeliveryStageIncomplete
+                    | NodeFailureCode::DeliveryStageStorageFailed,
+                ..
+            }) => Some(NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY),
+            Ok(response) if response.requires_harness_mcp_proxy_capability() => {
+                Some(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY)
+            }
+            Err(NodeFailure { code, .. }) if matches!(code,
+                NodeFailureCode::HarnessMcpUnavailable
+                    | NodeFailureCode::ReservationNotFound
+                    | NodeFailureCode::ReservationConflict
+                    | NodeFailureCode::ReservationExpired
+                    | NodeFailureCode::BindingMismatch
+                    | NodeFailureCode::NotActivated
+                    | NodeFailureCode::CallNotFound
+                    | NodeFailureCode::ChunkOutOfOrder
+                    | NodeFailureCode::ResponseTooLarge) => {
+                Some(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY)
+            }
             Ok(NodeResponse::WorkspaceFileRead { .. }) => {
                 Some(NODE_WORKSPACE_FILE_READ_CAPABILITY)
+            }
+            Ok(NodeResponse::WorkspaceFileWritten { .. }) => {
+                Some(NODE_WORKSPACE_FILE_WRITE_CAPABILITY)
+            }
+            Ok(NodeResponse::WorkspaceFileCreated { .. })
+            | Ok(NodeResponse::WorkspaceDirectoryCreated { .. }) => {
+                Some(NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY)
+            }
+            Ok(NodeResponse::GitHistoryRead { .. }) | Ok(NodeResponse::GitDiffRead { .. }) => {
+                Some(NODE_GIT_READ_CAPABILITY)
+            }
+            Ok(NodeResponse::HostDirectoriesBrowsed { .. }) => {
+                Some(CAPABILITY_HOST_DIRECTORY_BROWSE_V1)
+            }
+            Ok(NodeResponse::StandaloneWorkspaceCreated { .. }) => {
+                Some(NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY)
+            }
+            Ok(NodeResponse::ProviderSessionIndexed { .. }) => {
+                Some(NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY)
+            }
+            Ok(NodeResponse::NativeSessionIndexed { .. }) => {
+                Some(NODE_NATIVE_SESSION_INDEX_CAPABILITY)
+            }
+            Ok(NodeResponse::NativeSessionsCataloged { .. }) => {
+                Some(NODE_NATIVE_SESSION_CATALOG_CAPABILITY)
+            }
+            Ok(NodeResponse::NativeSessionsPaged { .. }) => {
+                Some(NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY)
+            }
+            Err(NodeFailure {
+                code: NodeFailureCode::StaleNativeSessionCatalog,
+                ..
+            }) => Some(NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY),
+            Ok(NodeResponse::NativeSessionPreviewed { .. })
+            | Ok(NodeResponse::SessionRecordPreviewed { .. }) => {
+                Some(NODE_NATIVE_SESSION_PREVIEW_CAPABILITY)
+            }
+            Ok(NodeResponse::SessionRecordUpdated { .. })
+                if matches!(expected_request, Some(NodeRequest::SetSessionTask { .. })) => {
+                Some(NODE_SESSION_TASK_CORRELATION_CAPABILITY)
             }
             Ok(response) if response.requires_spawn_spec_defaults_overrides_capability() => {
                 Some(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY)
             }
             _ => None,
         },
+        ServerFrame::Event(event) if event.event.requires_harness_mcp_proxy_capability() => {
+            Some(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY)
+        }
         _ => None,
     };
     if let Some(required) = required {
@@ -635,6 +1337,18 @@ fn ensure_server_frame_required_capability(
         {
             return Err(NodeClientError::UnsupportedCapability(required.to_owned()));
         }
+    }
+    if matches!(frame, ServerFrame::Reply(reply)
+        if reply.result.as_ref().is_ok_and(|response|
+            response.requires_spawn_profile_revision_capability()))
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::UnsupportedCapability(
+            NODE_SPAWN_PROFILE_REVISION_CAPABILITY.to_owned(),
+        ));
     }
     let contains_managed_worktree = server_frame_contains_managed_worktree(frame);
     if contains_managed_worktree
@@ -740,6 +1454,91 @@ fn ensure_server_frame_required_capability(
                 .to_owned(),
         ));
     }
+    let contains_session_task_binding = match frame {
+        ServerFrame::Hello(hello) => hello
+            .snapshot
+            .session_records
+            .iter()
+            .any(|record| record.task_binding.is_some()),
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|response| {
+            match response {
+                NodeResponse::Snapshot { snapshot, .. } => snapshot
+                    .session_records
+                    .iter()
+                    .any(|record| record.task_binding.is_some()),
+                NodeResponse::Resync { snapshot, events, .. } => snapshot
+                    .session_records
+                    .iter()
+                    .any(|record| record.task_binding.is_some())
+                    || events.iter().any(|event| matches!(&event.event,
+                        NodeEvent::SessionRecordUpserted { record }
+                            if record.task_binding.is_some())),
+                NodeResponse::SessionRecordUpdated { record }
+                | NodeResponse::ProviderSessionIndexed { record }
+                | NodeResponse::NativeSessionIndexed { record, .. }
+                | NodeResponse::SessionRecordResumed { record, .. } => {
+                    record.task_binding.is_some()
+                }
+                _ => false,
+            }
+        }),
+        ServerFrame::Event(event) => matches!(&event.event,
+            NodeEvent::SessionRecordUpserted { record } if record.task_binding.is_some()),
+        ServerFrame::Challenge(_) => false,
+    };
+    if contains_session_task_binding
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_SESSION_TASK_CORRELATION_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent session task correlation metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    if server_frame_contains_agent_progress(frame)
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent agent progress metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    if server_frame_contains_observation(frame)
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_OBSERVATION_EVENTS_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent observation events without negotiating the capability".to_owned(),
+        ));
+    }
+    if server_frame_contains_managed_observation(frame)
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent managed observation targets without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    if server_frame_contains_observation_workflow_detail(frame)
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent observation workflow detail without negotiating the capability".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -749,9 +1548,86 @@ fn has_capability(capabilities: &[CapabilityId], required: &str) -> bool {
         .any(|capability| capability.as_str() == required)
 }
 
+fn ensure_node_snapshot_agent_progress_capability(
+    snapshot: &NodeSnapshot,
+    negotiated_capabilities: &[CapabilityId],
+) -> Result<(), NodeClientError> {
+    if !snapshot.agent_progress.is_empty()
+        && !has_capability(
+            negotiated_capabilities,
+            NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+        )
+    {
+        return Err(NodeClientError::Protocol(
+            "node sent agent progress metadata without negotiating the capability"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn server_frame_contains_agent_progress(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Hello(hello) => !hello.snapshot.agent_progress.is_empty(),
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|response| {
+            match response {
+                NodeResponse::Snapshot { snapshot, .. }
+                | NodeResponse::Resync { snapshot, .. } => !snapshot.agent_progress.is_empty(),
+                _ => false,
+            }
+        }),
+        ServerFrame::Challenge(_) | ServerFrame::Event(_) => false,
+    }
+}
+
+fn server_frame_contains_observation(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|response| {
+            matches!(response, NodeResponse::Resync { events, .. }
+                if events.iter().any(|event| {
+                    event.event.requires_observation_events_capability()
+                }))
+        }),
+        ServerFrame::Event(event) => event.event.requires_observation_events_capability(),
+        ServerFrame::Challenge(_) | ServerFrame::Hello(_) => false,
+    }
+}
+
+fn server_frame_contains_managed_observation(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|response| {
+            matches!(response, NodeResponse::Resync { events, .. }
+                if events.iter().any(|event| {
+                    event
+                        .event
+                        .requires_observation_managed_target_capability()
+                }))
+        }),
+        ServerFrame::Event(event) => event
+            .event
+            .requires_observation_managed_target_capability(),
+        ServerFrame::Challenge(_) | ServerFrame::Hello(_) => false,
+    }
+}
+
+fn server_frame_contains_observation_workflow_detail(frame: &ServerFrame) -> bool {
+    match frame {
+        ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|response| {
+            matches!(response, NodeResponse::Resync { events, .. }
+                if events.iter().any(|event| {
+                    event.event.requires_observation_workflow_detail_capability()
+                }))
+        }),
+        ServerFrame::Event(event) => event
+            .event
+            .requires_observation_workflow_detail_capability(),
+        ServerFrame::Challenge(_) | ServerFrame::Hello(_) => false,
+    }
+}
+
 fn server_frame_contains_managed_worktree(frame: &ServerFrame) -> bool {
     match frame {
-        ServerFrame::Hello(hello) => !hello.snapshot.managed_worktrees.is_empty(),
+        ServerFrame::Hello(hello) => node_snapshot_contains_managed_worktree(&hello.snapshot),
         ServerFrame::Reply(reply) => reply
             .result
             .as_ref()
@@ -764,12 +1640,17 @@ fn server_frame_contains_managed_worktree(frame: &ServerFrame) -> bool {
 
 fn node_response_contains_managed_worktree(response: &NodeResponse) -> bool {
     match response {
-        NodeResponse::Snapshot { snapshot, .. } => !snapshot.managed_worktrees.is_empty(),
+        NodeResponse::Snapshot { snapshot, .. } => node_snapshot_contains_managed_worktree(snapshot),
         NodeResponse::Resync { snapshot, events, .. } => {
-            !snapshot.managed_worktrees.is_empty()
+            node_snapshot_contains_managed_worktree(snapshot)
                 || events
                     .iter()
                     .any(|event| node_event_is_managed_worktree(&event.event))
+        }
+        NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::StandaloneWorkspaceCreated { workspace }
+        | NodeResponse::WorktreeCreated { workspace, .. } => {
+            workspace_contains_managed_worktree_metadata(workspace)
         }
         NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. } => true,
@@ -778,11 +1659,27 @@ fn node_response_contains_managed_worktree(response: &NodeResponse) -> bool {
 }
 
 fn node_event_is_managed_worktree(event: &NodeEvent) -> bool {
-    matches!(
-        event,
+    match event {
+        NodeEvent::WorkspaceAdded { workspace } => {
+            workspace_contains_managed_worktree_metadata(workspace)
+        }
         NodeEvent::ManagedWorktreeUpserted { .. }
-            | NodeEvent::ManagedWorktreeRemoved { .. }
-    )
+        | NodeEvent::ManagedWorktreeRemoved { .. } => true,
+        _ => false,
+    }
+}
+
+fn workspace_contains_managed_worktree_metadata(workspace: &WorkspaceSnapshot) -> bool {
+    workspace.worktree_service_mode.is_some()
+        || workspace.managed_worktree_profiles.is_some()
+}
+
+fn node_snapshot_contains_managed_worktree(snapshot: &NodeSnapshot) -> bool {
+    !snapshot.managed_worktrees.is_empty()
+        || snapshot
+            .workspaces
+            .iter()
+            .any(workspace_contains_managed_worktree_metadata)
 }
 
 fn ensure_server_frame_terminal_capability(
@@ -928,7 +1825,23 @@ fn ensure_node_request_provider_capability(
         NodeRequest::Spawn { provider, .. } => {
             ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
         }
+        NodeRequest::IndexProviderSession { provider, .. } => {
+            ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
+        }
+        NodeRequest::CatalogNativeSessions { route, .. }
+        | NodeRequest::PageNativeSessions { route, .. } => {
+            ensure_outbound_provider_id_capability(&route.provider, open_provider_ids_enabled)?;
+        }
+        NodeRequest::PreviewNativeSession { selection, .. }
+        | NodeRequest::IndexNativeSession { selection, .. } => {
+            ensure_outbound_provider_id_capability(
+                &selection.route.provider,
+                open_provider_ids_enabled,
+            )?;
+        }
         NodeRequest::SpawnSpec { spec }
+        | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
         | NodeRequest::SpawnManagedWorktree {
             request: gate4agent_node_protocol::ManagedWorktreeSpawnRequest {
                 spawn_spec: spec,
@@ -950,19 +1863,36 @@ fn ensure_node_request_provider_capability(
         }
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::SetSessionTask { .. }
         | NodeRequest::ResumeSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
         | NodeRequest::ExportContextPack { .. }
@@ -1043,15 +1973,37 @@ fn ensure_repository_path_capability(
 
 fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
     match request {
-        NodeRequest::RegisterWorkspace { root, .. } => root.as_unix_bytes().is_some(),
+        NodeRequest::RegisterWorkspace { root, .. }
+        | NodeRequest::CreateStandaloneWorkspace { root, .. } => {
+            root.as_unix_bytes().is_some()
+        }
+        NodeRequest::BrowseHostDirectories { directory, after } => {
+            directory.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+                || after.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+        }
         NodeRequest::CreateWorktree { target_root, .. }
         | NodeRequest::RemoveWorktree { target_root, .. } => {
             target_root.as_unix_bytes().is_some()
         }
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
@@ -1061,8 +2013,15 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::SetSessionTask { .. }
+        | NodeRequest::IndexProviderSession { .. }
+        | NodeRequest::IndexNativeSession { .. }
         | NodeRequest::ResumeSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
         | NodeRequest::ExportContextPack { .. }
@@ -1103,14 +2062,18 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
                 })
         }
         NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::ProviderSessionIndexed { record }
+        | NodeResponse::NativeSessionIndexed { record, .. }
         | NodeResponse::SessionRecordResumed { record, .. } => {
             managed_session_record_contains_open_provider_id(record)
         }
         NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::StandaloneWorkspaceCreated { workspace }
         | NodeResponse::WorktreeCreated { workspace, .. } => {
             workspace_contains_open_provider_id(workspace)
         }
-        NodeResponse::SpawnSpecAccepted { receipt } => {
+        NodeResponse::SpawnSpecAccepted { receipt }
+        | NodeResponse::Spawned { receipt, .. } => {
             resolved_spawn_receipt_contains_open_provider_id(receipt)
         }
         NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
@@ -1119,12 +2082,35 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
         NodeResponse::ContextPackExported { context } => {
             context_pack_contains_open_provider_id(context)
         }
-        NodeResponse::WorkspaceInspected { .. }
+        NodeResponse::NativeSessionsCataloged { route, .. }
+        | NodeResponse::NativeSessionsPaged { route, .. } => {
+            !provider_id_is_legacy(&route.provider)
+        }
+        NodeResponse::NativeSessionPreviewed { selection, .. } => {
+            !provider_id_is_legacy(&selection.route.provider)
+        }
+        NodeResponse::Armed { .. }
+        | NodeResponse::Activated { .. }
+        | NodeResponse::Aborted { .. }
+        | NodeResponse::ReplyChunkAccepted { .. }
+        | NodeResponse::CallRejected { .. }
+        | NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::DeliveryStageBegun { .. }
+        | NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | NodeResponse::DeliveryCommitted { .. }
+        | NodeResponse::DeliveryStageAborted { .. }
+        | NodeResponse::HostDirectoriesBrowsed { .. }
         | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::WorkspaceFileWritten { .. }
+        | NodeResponse::WorkspaceFileCreated { .. }
+        | NodeResponse::WorkspaceDirectoryCreated { .. }
+        | NodeResponse::GitHistoryRead { .. }
+        | NodeResponse::GitDiffRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackForgotten { .. }
@@ -1183,7 +2169,10 @@ fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
         NodeEvent::SessionRecordUpserted { record } => {
             managed_session_record_contains_open_provider_id(record)
         }
-        NodeEvent::Control { .. }
+        NodeEvent::HarnessMcpReadCall { .. }
+        | NodeEvent::Control { .. }
+        | NodeEvent::Observation { .. }
+        | NodeEvent::ManagedObservation { .. }
         | NodeEvent::TerminalFrame { .. }
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }
@@ -1196,13 +2185,33 @@ fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
 
 fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
     match request {
-        NodeRequest::ReadWorkspaceFile { path, .. } => path.as_unix_bytes().is_some(),
+        NodeRequest::ReadWorkspaceFile { path, .. }
+        | NodeRequest::WriteWorkspaceFile { path, .. }
+        | NodeRequest::CreateWorkspaceFile { path, .. }
+        | NodeRequest::CreateWorkspaceDirectory { path, .. } => path.as_unix_bytes().is_some(),
+        NodeRequest::ReadGitDiff { request, .. } => request
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_unix_bytes().is_some()),
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
+        | NodeRequest::ReadGitHistory { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
@@ -1212,8 +2221,15 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::SetSessionTask { .. }
+        | NodeRequest::IndexProviderSession { .. }
+        | NodeRequest::IndexNativeSession { .. }
         | NodeRequest::ResumeSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
         | NodeRequest::ExportContextPack { .. }
@@ -1263,22 +2279,50 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
                     })
             })
         }
-        NodeResponse::WorkspaceFileRead { file } => file.path.as_unix_bytes().is_some(),
+        NodeResponse::WorkspaceFileRead { file }
+        | NodeResponse::WorkspaceFileWritten { file }
+        | NodeResponse::WorkspaceFileCreated { file } => file.path.as_unix_bytes().is_some(),
+        NodeResponse::WorkspaceDirectoryCreated { entry, .. } => {
+            entry.relative_path.as_unix_bytes().is_some()
+        }
+        NodeResponse::GitDiffRead { diff, .. } => diff
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_unix_bytes().is_some()),
         NodeResponse::Snapshot { .. }
         | NodeResponse::Resync { .. }
+        | NodeResponse::Armed { .. }
+        | NodeResponse::Spawned { .. }
+        | NodeResponse::Activated { .. }
+        | NodeResponse::Aborted { .. }
+        | NodeResponse::ReplyChunkAccepted { .. }
+        | NodeResponse::CallRejected { .. }
+        | NodeResponse::DeliveryStageBegun { .. }
+        | NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | NodeResponse::DeliveryCommitted { .. }
+        | NodeResponse::DeliveryStageAborted { .. }
+        | NodeResponse::HostDirectoriesBrowsed { .. }
+        | NodeResponse::GitHistoryRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordUpdated { .. }
+        | NodeResponse::ProviderSessionIndexed { .. }
+        | NodeResponse::NativeSessionIndexed { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::NativeSessionsCataloged { .. }
+        | NodeResponse::NativeSessionsPaged { .. }
+        | NodeResponse::NativeSessionPreviewed { .. }
+        | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::StandaloneWorkspaceCreated { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeCreated { .. }
         | NodeResponse::WorktreeRemoved { .. }
@@ -1301,12 +2345,26 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         NodeResponse::WorkspaceInspected { inspection } => inspection.git.worktrees
             .iter()
             .any(|worktree| worktree.path.as_unix_bytes().is_some()),
-        NodeResponse::WorkspaceFileRead { .. } => false,
+        NodeResponse::HostDirectoriesBrowsed { listing } => {
+            listing.directory.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+                || listing.parent.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+                || listing.entries.iter().any(|entry| entry.path.as_unix_bytes().is_some())
+                || listing.next_after.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+        }
+        NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::WorkspaceFileWritten { .. }
+        | NodeResponse::WorkspaceFileCreated { .. }
+        | NodeResponse::WorkspaceDirectoryCreated { .. }
+        | NodeResponse::GitHistoryRead { .. }
+        | NodeResponse::GitDiffRead { .. } => false,
         NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::ProviderSessionIndexed { record }
+        | NodeResponse::NativeSessionIndexed { record, .. }
         | NodeResponse::SessionRecordResumed { record, .. } => {
             record.canonical_root.as_unix_bytes().is_some()
         }
-        NodeResponse::WorkspaceRegistered { workspace } => {
+        NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::StandaloneWorkspaceCreated { workspace } => {
             workspace.canonical_root.as_unix_bytes().is_some()
         }
         NodeResponse::WorktreeCreated { worktree, workspace } => {
@@ -1316,12 +2374,26 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         NodeResponse::WorktreeRemoved { target_root, .. } => {
             target_root.as_unix_bytes().is_some()
         }
-        NodeResponse::Controller { .. }
+        NodeResponse::Armed { .. }
+        | NodeResponse::Spawned { .. }
+        | NodeResponse::Activated { .. }
+        | NodeResponse::Aborted { .. }
+        | NodeResponse::ReplyChunkAccepted { .. }
+        | NodeResponse::CallRejected { .. }
+        | NodeResponse::Controller { .. }
+        | NodeResponse::DeliveryStageBegun { .. }
+        | NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | NodeResponse::DeliveryCommitted { .. }
+        | NodeResponse::DeliveryStageAborted { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
         | NodeResponse::SessionRecordForgotten { .. }
+        | NodeResponse::NativeSessionsCataloged { .. }
+        | NodeResponse::NativeSessionsPaged { .. }
+        | NodeResponse::NativeSessionPreviewed { .. }
+        | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackExported { .. }
@@ -1348,7 +2420,10 @@ fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
         NodeEvent::SessionRecordUpserted { record } => {
             record.canonical_root.as_unix_bytes().is_some()
         }
-        NodeEvent::Control { .. }
+        NodeEvent::HarnessMcpReadCall { .. }
+        | NodeEvent::Control { .. }
+        | NodeEvent::Observation { .. }
+        | NodeEvent::ManagedObservation { .. }
         | NodeEvent::TerminalFrame { .. }
         | NodeEvent::ControllerChanged { .. }
         | NodeEvent::WorkspaceRemoved { .. }
@@ -1535,19 +2610,21 @@ pub enum NodeClientError {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        AdapterContractRevision, AdapterFamily, AdapterId, AgentId, ArchitectureId,
+        AdapterContractRevision, AdapterFamily, AdapterId, AgentId, AgentProgressCurrentV1,
+        AgentProgressV1, ArchitectureId,
         ContextPackLineageReceipt,
         GitSnapshot, GitStatusEntry, GitWorktreeSnapshot, HostDescriptor, LocalTransportKind,
         ManagedSessionRecord, ManagedSessionState, NodeCompatibilitySupport, OpaqueHostPath,
         ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
         ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
         ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest,
-        OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+        HostDirectoryEntry, HostDirectoryListing, OperatingSystemId, PathEncoding,
+        PathSemantics, PathStyle,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         ProviderRuntimeStatus, ProviderRuntimeStatuses, RepositoryPath, ResponseEnvelope,
         ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedEnvironmentProfileReceipt,
         ResolvedSpawnReceipt,
-        SessionAddress, SessionKey,
+        SessionAddress, SessionAgentProgress, SessionKey,
         SessionMode, SessionRecordId,
         SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision, SpawnDeadlineMs,
         SpawnContextDigest, SpawnContextId,
@@ -1555,10 +2632,54 @@ mod tests {
         SpawnEnvironmentProfileId, SpawnEnvironmentProfileRevision, SpawnProfileId,
         SpawnProfileRevision, SpawnPromptMetadata, SpawnRequiredCapabilities,
         SpawnResolutionProvenance, SpawnSpec, SpawnTarget, WorkspaceEntry,
-        WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceId,
+        WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead, WorkspaceFileRevision,
+        WorkspaceId,
         WorkspaceInspection, WorkspaceSnapshot,
-        WorktreeProfileId, WorktreeProfileRevision,
+        WorktreeProfileId, WorktreeProfileRevision, WorktreeServiceMode,
+        ObservationEvidenceV1, ObservationKindV1, ObservationV1,
     };
+
+    #[test]
+    fn harness_mcp_wire_capability_and_exact_response_correlation() {
+        let reservation_id = gate4agent_node_protocol::HarnessMcpReservationId::new(
+            format!("hmcpres_{}", "a".repeat(24)),
+        ).unwrap();
+        let activation_digest = gate4agent_node_protocol::HarnessMcpActivationDigest::new(
+            format!("sha256:{}", "b".repeat(64)),
+        ).unwrap();
+        let request = NodeRequest::AbortHarnessMcpReservation {
+            reservation_id: reservation_id.clone(),
+            activation_digest: activation_digest.clone(),
+        };
+        assert!(matches!(
+            ensure_node_request_required_capability(&request, &[]),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_HARNESS_MCP_READ_PROXY_CAPABILITY
+        ));
+        let capability = CapabilityId::new(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY).unwrap();
+        assert!(ensure_node_request_required_capability(
+            &request,
+            std::slice::from_ref(&capability),
+        ).is_ok());
+        let exact = Ok(NodeResponse::Aborted {
+            reservation_id: reservation_id.clone(),
+            activation_digest: activation_digest.clone(),
+        });
+        assert!(validate_harness_mcp_response(&request, &exact).is_ok());
+        let mismatch = Ok(NodeResponse::Aborted {
+            reservation_id: gate4agent_node_protocol::HarnessMcpReservationId::new(
+                format!("hmcpres_{}", "c".repeat(24)),
+            ).unwrap(),
+            activation_digest,
+        });
+        assert!(validate_harness_mcp_response(&request, &mismatch).is_err());
+        let frame = ServerFrame::Reply(ResponseEnvelope {
+            request_id: 1,
+            result: exact,
+        });
+        assert!(ensure_server_frame_required_capability(&frame, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(&frame, &[capability]).is_ok());
+    }
     use gate4agent_types::{
         AgentInstanceId, CapabilitySnapshot, ForegroundSnapshot, HistorySnapshot,
         ProviderSnapshot, ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
@@ -1620,6 +2741,8 @@ mod tests {
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             canonical_root,
             sessions: Vec::new(),
+            worktree_service_mode: None,
+            managed_worktree_profiles: None,
         }
     }
 
@@ -1660,10 +2783,84 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn session_task_capability_and_idempotent_response_correlation_are_fail_closed() {
+        let task_id = gate4agent_node_protocol::TaskId::from_nonce([7; 12]);
+        let request = NodeRequest::SetSessionTask {
+            record_id: SessionRecordId::new("session-a").unwrap(),
+            expected_revision: 7,
+            target: gate4agent_node_protocol::SessionTaskTargetV1::Existing {
+                task_id: task_id.clone(),
+            },
+        };
+        assert!(ensure_node_request_required_capability(&request, &[]).is_err());
+        let capability = CapabilityId::new(NODE_SESSION_TASK_CORRELATION_CAPABILITY).unwrap();
+        assert!(ensure_node_request_required_capability(
+            &request,
+            std::slice::from_ref(&capability),
+        ).is_ok());
+
+        let mut record = session_record_with_path(utf8_path());
+        record.task_binding = Some(gate4agent_node_protocol::SessionTaskBindingV1 {
+            revision: 7,
+            task_id: Some(task_id.clone()),
+            changed_at_unix_ms: 2,
+        });
+        assert!(validate_session_task_response(
+            &request,
+            &Ok(NodeResponse::SessionRecordUpdated { record: record.clone() }),
+        ).is_ok());
+        record.task_binding.as_mut().unwrap().revision = 8;
+        assert!(validate_session_task_response(
+            &request,
+            &Ok(NodeResponse::SessionRecordUpdated { record: record.clone() }),
+        ).is_ok());
+        record.task_binding.as_mut().unwrap().revision = 9;
+        assert!(validate_session_task_response(
+            &request,
+            &Ok(NodeResponse::SessionRecordUpdated { record: record.clone() }),
+        ).is_err());
+
+        let clear = NodeRequest::SetSessionTask {
+            record_id: SessionRecordId::new("session-a").unwrap(),
+            expected_revision: 0,
+            target: gate4agent_node_protocol::SessionTaskTargetV1::Clear,
+        };
+        record.task_binding = None;
+        assert!(validate_session_task_response(
+            &clear,
+            &Ok(NodeResponse::SessionRecordUpdated { record: record.clone() }),
+        ).is_ok());
+
+        let new = NodeRequest::SetSessionTask {
+            record_id: SessionRecordId::new("session-a").unwrap(),
+            expected_revision: 7,
+            target: gate4agent_node_protocol::SessionTaskTargetV1::New,
+        };
+        record.task_binding = Some(gate4agent_node_protocol::SessionTaskBindingV1 {
+            revision: 7,
+            task_id: Some(task_id),
+            changed_at_unix_ms: 2,
+        });
+        assert!(validate_session_task_response(
+            &new,
+            &Ok(NodeResponse::SessionRecordUpdated { record: record.clone() }),
+        ).is_err());
+        record.task_binding.as_mut().unwrap().revision = 8;
+        let frame = response_frame(NodeResponse::SessionRecordUpdated { record: record.clone() });
+        assert!(ensure_server_frame_required_capability(&frame, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(&frame, &[capability]).is_ok());
+        assert!(validate_session_task_response(
+            &new,
+            &Ok(NodeResponse::SessionRecordUpdated { record }),
+        ).is_ok());
     }
 
     fn worktree_with_path(path: OpaqueHostPath) -> GitWorktreeSnapshot {
@@ -1689,6 +2886,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         }
     }
 
@@ -1703,6 +2902,146 @@ mod tests {
             snapshot,
             compatibility: None,
         }
+    }
+
+    #[test]
+    fn agent_progress_requires_negotiated_capability_on_hello_snapshot_and_reply() {
+        let mut snapshot = empty_snapshot();
+        snapshot.agent_progress.push(SessionAgentProgress {
+            address: SessionAddress {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(2),
+                },
+            },
+            progress: AgentProgressV1 {
+                provider_sequence: 3,
+                activity: gate4agent_types::ProviderActivity::Idle,
+                completed_turns: 0,
+                usage: None,
+                current: AgentProgressCurrentV1::Idle,
+                active_tool_labels: Vec::new(),
+                active_tool_count: 0,
+                attention: None,
+                subagent_count: 0,
+                last_event_kind: None,
+                gap_count: 0,
+                stale: false,
+                truncated: false,
+            },
+        });
+        let capabilities = Vec::new();
+        assert!(matches!(
+            ensure_node_snapshot_agent_progress_capability(&snapshot, &capabilities),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("without negotiating the capability")
+        ));
+        let frame = response_frame(NodeResponse::Snapshot {
+            event_sequence: 0,
+            controller: None,
+            snapshot: snapshot.clone(),
+        });
+        assert!(matches!(
+            ensure_server_frame_required_capability(&frame, &capabilities),
+            Err(NodeClientError::Protocol(message))
+                if message.contains("without negotiating the capability")
+        ));
+        let negotiated = vec![
+            CapabilityId::new(NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY).unwrap(),
+        ];
+        assert!(ensure_node_snapshot_agent_progress_capability(
+            &snapshot,
+            &negotiated,
+        )
+        .is_ok());
+        assert!(ensure_server_frame_required_capability(&frame, &negotiated).is_ok());
+    }
+
+    #[test]
+    fn observation_events_require_negotiated_capabilities() {
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(2),
+            },
+        };
+        let frame = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 4,
+            event: NodeEvent::Observation {
+                address: address.clone(),
+                observation: ObservationV1 {
+                    source_sequence: 3,
+                    observed_at_unix_ms: Some(2),
+                    evidence: ObservationEvidenceV1::StructuredProvider,
+                    kind: ObservationKindV1::Working,
+                    truncated: false,
+                },
+            },
+        });
+        let base = CapabilityId::new(NODE_OBSERVATION_EVENTS_CAPABILITY).unwrap();
+        let detail = CapabilityId::new(NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY).unwrap();
+        assert!(ensure_server_frame_required_capability(&frame, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &frame,
+            std::slice::from_ref(&base),
+        )
+        .is_ok());
+
+        let detailed = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 5,
+            event: NodeEvent::Observation {
+                address,
+                observation: ObservationV1 {
+                    source_sequence: 4,
+                    observed_at_unix_ms: Some(3),
+                    evidence: ObservationEvidenceV1::StructuredProvider,
+                    kind: ObservationKindV1::Error {
+                        detail: "provider-error".to_owned(),
+                    },
+                    truncated: false,
+                },
+            },
+        });
+        assert!(ensure_server_frame_required_capability(
+            &detailed,
+            std::slice::from_ref(&base),
+        )
+        .is_err());
+        assert!(ensure_server_frame_required_capability(&detailed, &[base, detail]).is_ok());
+    }
+
+    #[test]
+    fn managed_observation_requires_managed_target_capability() {
+        let frame = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 4,
+            event: NodeEvent::ManagedObservation {
+                record_id: gate4agent_node_protocol::SessionRecordId::new("record-a").unwrap(),
+                observation: ObservationV1 {
+                    source_sequence: 3,
+                    observed_at_unix_ms: Some(2),
+                    evidence: ObservationEvidenceV1::StructuredProvider,
+                    kind: ObservationKindV1::Working,
+                    truncated: false,
+                },
+            },
+        });
+        let base = CapabilityId::new(NODE_OBSERVATION_EVENTS_CAPABILITY).unwrap();
+        let managed =
+            CapabilityId::new(NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY).unwrap();
+        assert!(ensure_server_frame_required_capability(&frame, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &frame,
+            std::slice::from_ref(&base),
+        )
+        .is_err());
+        assert!(ensure_server_frame_required_capability(
+            &frame,
+            std::slice::from_ref(&managed),
+        )
+        .is_err());
+        assert!(ensure_server_frame_required_capability(&frame, &[base, managed]).is_ok());
     }
 
     fn response_frame(response: NodeResponse) -> ServerFrame {
@@ -1723,6 +3062,8 @@ mod tests {
                     worktree_id: None,
                 },
                 profile_id: SpawnProfileId::new("default").unwrap(),
+                expected_profile_revision:
+                    SpawnProfileRevision::new("default.r1").unwrap(),
                 overrides,
                 deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
                 idempotency_key: SpawnIdempotencyKey::new("request-a").unwrap(),
@@ -1775,6 +3116,7 @@ mod tests {
                 context_id: SpawnFieldProvenance::Profile,
                 environment_profile_id: SpawnFieldProvenance::Profile,
             },
+            harness_mcp_proxy: None,
         }
     }
 
@@ -1799,6 +3141,159 @@ mod tests {
             byte_len: 128,
             truncated: true,
         }
+    }
+
+    #[test]
+    fn native_session_response_correlation_is_fail_closed() {
+        let route = gate4agent_node_protocol::NativeSessionCatalogRoute::workspace(
+            WorkspaceId::new("workspace-a").unwrap(),
+            agent("codex"),
+        );
+        let selection = gate4agent_node_protocol::NativeSessionSelection {
+            route: route.clone(),
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 70,
+            selection_id: "selection-7".to_owned(),
+        };
+
+        let catalog = NodeRequest::CatalogNativeSessions {
+            route: route.clone(),
+            limit: 10,
+        };
+        assert!(validate_native_session_response(
+            &catalog,
+            &Ok(NodeResponse::NativeSessionsCataloged {
+                route: route.clone(),
+                entries: Vec::new(),
+                summary: None,
+            }),
+        )
+        .is_ok());
+        let wrong_route = gate4agent_node_protocol::NativeSessionCatalogRoute::workspace(
+            WorkspaceId::new("workspace-b").unwrap(),
+            agent("codex"),
+        );
+        assert!(validate_native_session_response(
+            &catalog,
+            &Ok(NodeResponse::NativeSessionsCataloged {
+                route: wrong_route,
+                entries: Vec::new(),
+                summary: None,
+            }),
+        )
+        .is_err());
+
+        let page = NodeRequest::PageNativeSessions {
+            route: route.clone(),
+            window: gate4agent_node_protocol::NativeSessionCatalogWindow::Recent,
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 70,
+            after_selection_id: None,
+            limit: 10,
+        };
+        assert!(validate_native_session_response(
+            &page,
+            &Ok(NodeResponse::NativeSessionsPaged {
+                route: route.clone(),
+                page: gate4agent_node_protocol::NativeSessionCatalogPage {
+                    window: gate4agent_node_protocol::NativeSessionCatalogWindow::Recent,
+                    revision: 8,
+                    entries: Vec::new(),
+                    next_after_selection_id: None,
+                    remaining_count: 0,
+                    has_more: false,
+                },
+            }),
+        )
+        .is_err());
+
+        let preview = NodeRequest::PreviewNativeSession {
+            selection: selection.clone(),
+            message_limit: 10,
+        };
+        let mut wrong_selection = selection.clone();
+        wrong_selection.catalog_revision = 8;
+        assert!(validate_native_session_response(
+            &preview,
+            &Ok(NodeResponse::NativeSessionPreviewed {
+                selection: wrong_selection,
+                preview: gate4agent_node_protocol::SessionRecordPreview {
+                    title: None,
+                    modified_at_unix_ms: None,
+                    model: None,
+                    message_count: 0,
+                    message_count_exact: true,
+                    completed_turn_count: None,
+                    total_tokens: None,
+                    truncated: false,
+                    messages: Vec::new(),
+                },
+            }),
+        )
+        .is_err());
+
+        let index = NodeRequest::IndexNativeSession {
+            selection: selection.clone(),
+            display_name: "Indexed".to_owned(),
+        };
+        let mut record = session_record_with_path(utf8_path());
+        record.provider = agent("codex");
+        assert!(validate_native_session_response(
+            &index,
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: selection.clone(),
+                record: record.clone(),
+            }),
+        )
+        .is_ok());
+        assert!(validate_native_session_response(
+            &index,
+            &Ok(NodeResponse::ProviderSessionIndexed {
+                record: record.clone(),
+            }),
+        )
+        .is_err());
+        let mut wrong_selection = selection.clone();
+        wrong_selection.catalog_revision = 8;
+        assert!(validate_native_session_response(
+            &index,
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: wrong_selection,
+                record: record.clone(),
+            }),
+        )
+        .is_err());
+        let mut wrong_record = record.clone();
+        wrong_record.provider = agent("claude");
+        assert!(validate_native_session_response(
+            &index,
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: selection.clone(),
+                record: wrong_record,
+            }),
+        )
+        .is_err());
+
+        let external_index = NodeRequest::IndexNativeSession {
+            selection: gate4agent_node_protocol::NativeSessionSelection {
+                route: gate4agent_node_protocol::NativeSessionCatalogRoute::unregistered(
+                    agent("codex"),
+                ),
+                ..selection
+            },
+            display_name: "External".to_owned(),
+        };
+        assert!(validate_native_session_response(
+            &external_index,
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: match &external_index {
+                    NodeRequest::IndexNativeSession { selection, .. } => selection.clone(),
+                    _ => unreachable!(),
+                },
+                record,
+            }),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2537,12 +4032,302 @@ mod tests {
                     text: "hello".to_owned(),
                     byte_len: 5,
                 },
+                revision: None,
             },
         });
         assert!(ensure_server_frame_required_capability(&frame, &[]).is_err());
         let capabilities = vec![
             CapabilityId::new(NODE_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
         ];
+        assert!(ensure_server_frame_required_capability(&frame, &capabilities).is_ok());
+    }
+
+    #[test]
+    fn workspace_entry_create_is_capability_gated_and_response_correlated_fail_closed() {
+        let workspace_id = WorkspaceId::new("workspace-a").unwrap();
+        let file_path = utf8_repository_path("src/new.rs");
+        let file_request = NodeRequest::CreateWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: file_path.clone(),
+        };
+        let mut next_request_id = 73;
+        let error = reserve_request_id(
+            &mut next_request_id,
+            &file_request,
+            false,
+            false,
+            false,
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeClientError::UnsupportedCapability(capability)
+                if capability == NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY
+        ));
+        assert_eq!(next_request_id, 73);
+
+        let capabilities = vec![
+            CapabilityId::new(NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY).unwrap(),
+        ];
+        assert_eq!(
+            reserve_request_id(
+                &mut next_request_id,
+                &file_request,
+                false,
+                false,
+                false,
+                &capabilities,
+            )
+            .unwrap(),
+            73,
+        );
+
+        let file = WorkspaceFileRead {
+            workspace_id: workspace_id.clone(),
+            path: file_path.clone(),
+            content: WorkspaceFileContent::Utf8 {
+                text: String::new(),
+                byte_len: 0,
+            },
+            revision: Some(WorkspaceFileRevision::new(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+            ).unwrap()),
+        };
+        let file_frame = response_frame(NodeResponse::WorkspaceFileCreated {
+            file: file.clone(),
+        });
+        assert!(ensure_server_frame_required_capability(&file_frame, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(&file_frame, &capabilities).is_ok());
+        assert!(validate_workspace_content_response(
+            &file_request,
+            &Ok(NodeResponse::WorkspaceFileCreated { file: file.clone() }),
+        ).is_ok());
+
+        let mut wrong_content = file;
+        wrong_content.content = WorkspaceFileContent::Utf8 {
+            text: "not-empty".to_owned(),
+            byte_len: 9,
+        };
+        assert!(validate_workspace_content_response(
+            &file_request,
+            &Ok(NodeResponse::WorkspaceFileCreated { file: wrong_content }),
+        ).is_err());
+
+        let directory_path = utf8_repository_path("src/new");
+        let directory_request = NodeRequest::CreateWorkspaceDirectory {
+            workspace_id: workspace_id.clone(),
+            path: directory_path.clone(),
+        };
+        let directory_response = NodeResponse::WorkspaceDirectoryCreated {
+            workspace_id,
+            entry: WorkspaceEntry {
+                relative_path: directory_path,
+                kind: WorkspaceEntryKind::Directory,
+            },
+        };
+        assert!(validate_workspace_content_response(
+            &directory_request,
+            &Ok(directory_response),
+        ).is_ok());
+        let tagged_directory_request = NodeRequest::CreateWorkspaceDirectory {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            path: tagged_repository_path(b"src/\xff"),
+        };
+        assert!(ensure_node_request_path_capability(
+            &tagged_directory_request,
+            false,
+            false,
+        ).is_err());
+        assert!(ensure_node_request_path_capability(
+            &tagged_directory_request,
+            false,
+            true,
+        ).is_ok());
+        let tagged_directory_frame = response_frame(
+            NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                entry: WorkspaceEntry {
+                    relative_path: tagged_repository_path(b"src/\xff"),
+                    kind: WorkspaceEntryKind::Directory,
+                },
+            },
+        );
+        assert!(ensure_server_frame_path_capability(
+            &tagged_directory_frame,
+            false,
+            false,
+        ).is_err());
+        assert!(ensure_server_frame_path_capability(
+            &tagged_directory_frame,
+            false,
+            true,
+        ).is_ok());
+        assert!(validate_workspace_content_response(
+            &directory_request,
+            &Ok(NodeResponse::WorkspaceFileCreated {
+                file: WorkspaceFileRead {
+                    workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                    path: utf8_repository_path("src/new"),
+                    content: WorkspaceFileContent::Utf8 {
+                        text: String::new(),
+                        byte_len: 0,
+                    },
+                    revision: None,
+                },
+            }),
+        ).is_err());
+    }
+
+    #[test]
+    fn ordinary_startup_snapshot_is_not_rejected_as_native_session_preview() {
+        let frame = response_frame(NodeResponse::Snapshot {
+            event_sequence: 0,
+            controller: None,
+            snapshot: empty_snapshot(),
+        });
+
+        assert!(ensure_server_frame_required_capability(&frame, &[]).is_ok());
+    }
+
+    #[test]
+    fn host_directory_browse_requires_capability_and_preserves_opaque_paths() {
+        let unix = OpaqueHostPath::unix_bytes(b"/srv/\xff".to_vec()).unwrap();
+        let request = NodeRequest::BrowseHostDirectories {
+            directory: None,
+            after: Some(unix.clone()),
+        };
+        assert!(ensure_node_request_required_capability(&request, &[]).is_err());
+        assert!(node_request_contains_opaque_unix_path(&request));
+        let capability = CapabilityId::new(CAPABILITY_HOST_DIRECTORY_BROWSE_V1).unwrap();
+        assert!(ensure_node_request_required_capability(
+            &request,
+            &[capability.clone()],
+        ).is_ok());
+
+        let frame = response_frame(NodeResponse::HostDirectoriesBrowsed {
+            listing: HostDirectoryListing {
+                directory: Some(unix.clone()),
+                parent: None,
+                entries: vec![HostDirectoryEntry {
+                    path: unix,
+                    display_name: "opaque".to_owned(),
+                    is_link: false,
+                }],
+                next_after: None,
+                incomplete: false,
+            },
+        });
+        assert!(ensure_server_frame_required_capability(&frame, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(&frame, &[capability]).is_ok());
+        assert!(server_frame_contains_opaque_unix_path(&frame));
+    }
+
+    #[test]
+    fn standalone_workspace_lifecycle_is_exactly_capability_and_path_gated() {
+        let root = OpaqueHostPath::unix_bytes(b"/srv/standalone".to_vec()).unwrap();
+        let request = NodeRequest::CreateStandaloneWorkspace {
+            workspace_id: WorkspaceId::new("standalone").unwrap(),
+            root: root.clone(),
+            initial_branch: Some("main".to_owned()),
+        };
+        let capability = CapabilityId::new(
+            NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
+        ).unwrap();
+
+        assert!(matches!(
+            ensure_node_request_required_capability(&request, &[]),
+            Err(NodeClientError::UnsupportedCapability(required))
+                if required == NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY
+        ));
+        assert!(ensure_node_request_required_capability(
+            &request,
+            std::slice::from_ref(&capability),
+        ).is_ok());
+        assert!(node_request_contains_opaque_unix_path(&request));
+
+        let frame = response_frame(NodeResponse::StandaloneWorkspaceCreated {
+            workspace: workspace_with_path(root),
+        });
+        assert!(matches!(
+            ensure_server_frame_required_capability(&frame, &[]),
+            Err(NodeClientError::UnsupportedCapability(required))
+                if required == NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY
+        ));
+        assert!(ensure_server_frame_required_capability(&frame, &[capability]).is_ok());
+        assert!(server_frame_contains_opaque_unix_path(&frame));
+    }
+
+    #[test]
+    fn spawn_profile_revision_capability_is_advertised_and_gates_all_spawn_spec_paths() {
+        let offer = client_compatibility_offer().unwrap();
+        let profile_revision =
+            CapabilityId::new(NODE_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap();
+        assert!(offer.capabilities.contains(&profile_revision));
+
+        let NodeRequest::SpawnSpec { spec } = spawn_spec_request() else {
+            unreachable!("spawn spec helper changed variant");
+        };
+        let reservation_id = gate4agent_node_protocol::HarnessMcpReservationId::new(
+            format!("hmcpres_{}", "a".repeat(24)),
+        ).unwrap();
+        let activation_digest = gate4agent_node_protocol::HarnessMcpActivationDigest::new(
+            format!("sha256:{}", "b".repeat(64)),
+        ).unwrap();
+        let requests = [
+            NodeRequest::SpawnSpec { spec: spec.clone() },
+            NodeRequest::SpawnManagedWorktree {
+                request: ManagedWorktreeSpawnRequest {
+                    spawn_spec: spec.clone(),
+                    worktree_profile_id: WorktreeProfileId::new("review").unwrap(),
+                },
+            },
+            NodeRequest::ArmHarnessMcpReservation {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                spawn_spec: spec.clone(),
+                expires_at_unix_ms: 10_000,
+            },
+            NodeRequest::SpawnSpecWithHarnessMcp {
+                reservation_id,
+                activation_digest,
+                spec,
+                deadline_unix_ms: 10_000,
+            },
+        ];
+        let mut capabilities = vec![
+            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
+            CapabilityId::new(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
+            CapabilityId::new(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY).unwrap(),
+        ];
+        for request in &requests {
+            assert!(matches!(
+                ensure_node_request_required_capability(request, &capabilities),
+                Err(NodeClientError::UnsupportedCapability(capability))
+                    if capability == NODE_SPAWN_PROFILE_REVISION_CAPABILITY
+            ));
+        }
+        capabilities.push(profile_revision.clone());
+        for request in &requests {
+            let result = ensure_node_request_required_capability(request, &capabilities);
+            assert!(!matches!(
+                result,
+                Err(NodeClientError::UnsupportedCapability(capability))
+                    if capability == NODE_SPAWN_PROFILE_REVISION_CAPABILITY
+            ));
+        }
+
+        let frame = response_frame(NodeResponse::SpawnSpecAccepted {
+            receipt: spawn_spec_receipt(),
+        });
+        capabilities.retain(|capability| capability != &profile_revision);
+        assert!(matches!(
+            ensure_server_frame_required_capability(&frame, &capabilities),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_SPAWN_PROFILE_REVISION_CAPABILITY
+        ));
+        capabilities.push(profile_revision);
         assert!(ensure_server_frame_required_capability(&frame, &capabilities).is_ok());
     }
 
@@ -2910,6 +4695,7 @@ mod tests {
                 session,
                 session_id: "provider-session-a".to_owned(),
                 message_count: 4,
+                completed_turn_count: None,
             },
             NodeResponse::ContextPackExported {
                 context: context_pack_receipt(),
@@ -3158,6 +4944,66 @@ mod tests {
     }
 
     #[test]
+    fn worktree_service_mode_metadata_requires_managed_worktree_capabilities() {
+        let managed = CapabilityId::new(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap();
+        let worktree = CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
+        let mut workspace = workspace_with_path(utf8_path());
+        workspace.worktree_service_mode = Some(WorktreeServiceMode::Manual);
+        let reply = response_frame(NodeResponse::WorkspaceRegistered {
+            workspace: workspace.clone(),
+        });
+
+        assert!(ensure_server_frame_required_capability(&reply, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &reply,
+            std::slice::from_ref(&managed),
+        )
+        .is_err());
+        assert!(ensure_server_frame_required_capability(
+            &reply,
+            std::slice::from_ref(&worktree),
+        )
+        .is_err());
+        assert!(ensure_server_frame_required_capability(
+            &reply,
+            &[managed.clone(), worktree.clone()],
+        )
+        .is_ok());
+
+        let event = ServerFrame::Event(NodeEventEnvelope {
+            sequence: 5,
+            event: NodeEvent::WorkspaceAdded { workspace },
+        });
+        assert!(ensure_server_frame_required_capability(&event, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &event,
+            &[managed.clone(), worktree.clone()],
+        )
+        .is_ok());
+
+        let mut snapshot = empty_snapshot();
+        let mut profile_only = workspace_with_path(utf8_path());
+        profile_only.managed_worktree_profiles = Some(
+            gate4agent_node_protocol::WorktreeProfileInventory {
+                profiles: Vec::new(),
+            },
+        );
+        snapshot.workspaces.push(profile_only);
+        let hello = ServerFrame::Hello(hello_with_snapshot(snapshot));
+        assert!(ensure_server_frame_required_capability(&hello, &[]).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &hello,
+            &[managed.clone(), worktree.clone()],
+        )
+        .is_ok());
+
+        let legacy = response_frame(NodeResponse::WorkspaceRegistered {
+            workspace: workspace_with_path(utf8_path()),
+        });
+        assert!(ensure_server_frame_required_capability(&legacy, &[]).is_ok());
+    }
+
+    #[test]
     fn malicious_legacy_hello_with_unix_path_is_rejected_before_exposure() {
         let mut snapshot = empty_snapshot();
         snapshot.workspaces.push(workspace_with_path(unix_path()));
@@ -3246,6 +5092,7 @@ mod tests {
                 status: Vec::new(),
                 recent_commits: Vec::new(),
                 worktrees: vec![worktree_with_path(unix_path())],
+                managed_worktree: None,
                 truncated: false,
                 diagnostic: None,
             },
@@ -3258,6 +5105,7 @@ mod tests {
             },
             NodeResponse::Resync {
                 event_sequence: 1,
+                oldest_available_sequence: 1,
                 snapshot: empty_snapshot(),
                 events: vec![NodeEventEnvelope {
                     sequence: 1,
@@ -3327,6 +5175,7 @@ mod tests {
                     status: Vec::new(),
                     recent_commits: Vec::new(),
                     worktrees: Vec::new(),
+                    managed_worktree: None,
                     truncated: false,
                     diagnostic: None,
                 },
@@ -3346,6 +5195,7 @@ mod tests {
                     }],
                     recent_commits: Vec::new(),
                     worktrees: Vec::new(),
+                    managed_worktree: None,
                     truncated: false,
                     diagnostic: None,
                 },
@@ -3365,6 +5215,7 @@ mod tests {
                     }],
                     recent_commits: Vec::new(),
                     worktrees: Vec::new(),
+                    managed_worktree: None,
                     truncated: false,
                     diagnostic: None,
                 },
@@ -3382,6 +5233,7 @@ mod tests {
                 workspace_id: WorkspaceId::new("workspace-a").unwrap(),
                 path: tagged_repository_path(b"src/\xff"),
                 content: WorkspaceFileContent::NonUtf8 { byte_len: 3 },
+                revision: None,
             },
         });
         assert!(ensure_server_frame_path_capability(&file_frame, false, false).is_err());
@@ -3408,6 +5260,7 @@ mod tests {
                 }],
                 recent_commits: Vec::new(),
                 worktrees: Vec::new(),
+                managed_worktree: None,
                 truncated: false,
                 diagnostic: None,
             },
@@ -3415,6 +5268,75 @@ mod tests {
         let frame = response_frame(NodeResponse::WorkspaceInspected { inspection });
 
         assert!(ensure_server_frame_path_capability(&frame, false, false).is_ok());
+    }
+
+    #[test]
+    fn delivery_wire_capability_and_exact_reply_validation() {
+        use gate4agent_node_protocol::{
+            DeliveryBlobChunkHexV1, DeliveryBlobDigestV1, DeliveryManifestDigestV2,
+            DeliveryStageId,
+        };
+
+        let stage_id = DeliveryStageId::new(format!(
+            "delivery-stage-{}",
+            "1".repeat(32),
+        ))
+        .unwrap();
+        let digest = DeliveryBlobDigestV1::new(format!("sha256:{}", "a".repeat(64)))
+            .unwrap();
+        let request = NodeRequest::PutDeliveryBlobChunk {
+            stage_id: stage_id.clone(),
+            blob_digest: digest.clone(),
+            offset: 7,
+            chunk_hex: DeliveryBlobChunkHexV1::new("00ff").unwrap(),
+        };
+        let mut next_request_id = 1;
+        assert!(matches!(
+            reserve_request_id(&mut next_request_id, &request, false, false, false, &[]),
+            Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY
+        ));
+        let capability = CapabilityId::new(
+            NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
+        )
+        .unwrap();
+        assert!(reserve_request_id(
+            &mut next_request_id,
+            &request,
+            false,
+            false,
+            false,
+            std::slice::from_ref(&capability),
+        )
+        .is_ok());
+
+        let exact = Ok(NodeResponse::DeliveryBlobChunkAccepted {
+            stage_id: stage_id.clone(),
+            blob_digest: digest.clone(),
+            next_offset: 9,
+        });
+        assert!(validate_delivery_response(&request, &exact).is_ok());
+        let wrong_offset = Ok(NodeResponse::DeliveryBlobChunkAccepted {
+            stage_id: stage_id.clone(),
+            blob_digest: digest.clone(),
+            next_offset: 8,
+        });
+        assert!(validate_delivery_response(&request, &wrong_offset).is_err());
+        let unexpected = Ok(NodeResponse::DeliveryStageBegun {
+            stage_id,
+            manifest_digest: DeliveryManifestDigestV2::new(format!(
+                "sha256:{}",
+                "b".repeat(64),
+            ))
+            .unwrap(),
+            missing_blobs: vec![digest],
+        });
+        assert!(validate_delivery_response(&request, &unexpected).is_err());
+        assert!(ensure_server_frame_required_capability(
+            &response_frame(unexpected.unwrap()),
+            &[],
+        )
+        .is_err());
     }
 
 }

@@ -1,5 +1,7 @@
 use crate::protocol::{
+    DeliveryBlobDigestV1, DeliveryBundleManifestV2, DeliveryManifestDigestV2,
     ResolvedBundleReceipt, SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision,
+    MAX_LAUNCH_BUNDLES,
 };
 use ring::digest::{Context, SHA256};
 use serde_json::Value;
@@ -10,7 +12,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-pub const MAX_BUNDLE_CATALOG_ENTRIES: usize = 128;
+pub const MAX_BUNDLE_CATALOG_ENTRIES: usize = MAX_LAUNCH_BUNDLES;
 pub const MAX_BUNDLE_FILES: usize = 128;
 pub const MAX_BUNDLE_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_BUNDLE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
@@ -57,6 +59,7 @@ pub struct NodeBundle {
     revision: SpawnBundleRevision,
     digest: SpawnBundleDigest,
     files: Vec<NodeBundleFile>,
+    delivery_manifest: Option<DeliveryBundleManifestV2>,
 }
 
 impl fmt::Debug for NodeBundle {
@@ -67,6 +70,13 @@ impl fmt::Debug for NodeBundle {
             .field("revision", &self.revision)
             .field("digest", &self.digest)
             .field("files", &self.files)
+            .field(
+                "delivery_manifest_digest",
+                &self
+                    .delivery_manifest
+                    .as_ref()
+                    .map(|manifest| &manifest.manifest_digest),
+            )
             .finish()
     }
 }
@@ -99,6 +109,57 @@ impl NodeBundle {
             revision,
             digest: actual_digest,
             files: scanner.files,
+            delivery_manifest: None,
+        })
+    }
+
+    pub(crate) fn from_delivery(
+        manifest: DeliveryBundleManifestV2,
+        blobs: &BTreeMap<DeliveryBlobDigestV1, Vec<u8>>,
+    ) -> Result<Self, NodeBundleError> {
+        manifest
+            .validate()
+            .map_err(|_| NodeBundleError::InvalidDeliveryManifest)?;
+        let actual_manifest_digest = digest_delivery_manifest(&manifest);
+        if actual_manifest_digest != manifest.manifest_digest {
+            return Err(NodeBundleError::DeliveryManifestDigestMismatch);
+        }
+
+        let mut files = Vec::with_capacity(manifest.components.len());
+        for component in &manifest.components {
+            let bytes = blobs
+                .get(&component.blob.digest)
+                .ok_or(NodeBundleError::DeliveryBlobMissing)?;
+            if bytes.len() as u64 != component.blob.byte_len {
+                return Err(NodeBundleError::DeliveryBlobLengthMismatch);
+            }
+            if digest_delivery_blob(bytes) != component.blob.digest {
+                return Err(NodeBundleError::DeliveryBlobDigestMismatch);
+            }
+            if has_executable_shape(component.relative_path.as_str(), bytes) {
+                return Err(NodeBundleError::ExecutableFile {
+                    path: component.relative_path.as_str().to_owned(),
+                });
+            }
+            files.push(NodeBundleFile {
+                path: component.relative_path.as_str().to_owned(),
+                bytes: bytes.clone(),
+            });
+        }
+        let actual_bundle_digest = digest_files(&files);
+        if actual_bundle_digest != manifest.bundle_digest {
+            return Err(NodeBundleError::DigestMismatch {
+                expected: manifest.bundle_digest.clone(),
+                actual: actual_bundle_digest,
+            });
+        }
+
+        Ok(Self {
+            id: manifest.bundle_id.clone(),
+            revision: manifest.revision.clone(),
+            digest: manifest.bundle_digest.clone(),
+            files,
+            delivery_manifest: Some(manifest),
         })
     }
 
@@ -116,6 +177,31 @@ impl NodeBundle {
 
     pub fn files(&self) -> &[NodeBundleFile] {
         &self.files
+    }
+
+    pub(crate) fn delivery_manifest(&self) -> Option<&DeliveryBundleManifestV2> {
+        self.delivery_manifest.as_ref()
+    }
+
+    pub(crate) fn validate_skill_bundle_contract(&self) -> Result<(), NodeBundleError> {
+        let directories = self
+            .files
+            .iter()
+            .filter_map(|file| Path::new(&file.path).parent())
+            .flat_map(|parent| {
+                let mut current = PathBuf::new();
+                parent
+                    .components()
+                    .filter_map(move |component| match component {
+                        Component::Normal(name) => {
+                            current.push(name);
+                            Some(current.to_string_lossy().replace('\\', "/"))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        validate_bundle_contract(&self.files, &directories)
     }
 
     pub fn receipt(&self) -> ResolvedBundleReceipt {
@@ -167,6 +253,27 @@ impl BundleCatalog {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &NodeBundle> {
         self.bundles.values()
+    }
+
+    pub(crate) fn insert_idempotent(
+        &mut self,
+        bundle: NodeBundle,
+    ) -> Result<bool, BundleCatalogError> {
+        if let Some(existing) = self.bundles.get(bundle.id()) {
+            if existing == &bundle {
+                return Ok(false);
+            }
+            return Err(BundleCatalogError::Conflict {
+                id: bundle.id().clone(),
+            });
+        }
+        if self.bundles.len() == MAX_BUNDLE_CATALOG_ENTRIES {
+            return Err(BundleCatalogError::TooMany {
+                max: MAX_BUNDLE_CATALOG_ENTRIES,
+            });
+        }
+        self.bundles.insert(bundle.id().clone(), bundle);
+        Ok(true)
     }
 }
 
@@ -236,6 +343,8 @@ pub enum BundleCatalogError {
     TooMany { max: usize },
     #[error("bundle catalog contains duplicate bundle {id}")]
     Duplicate { id: SpawnBundleId },
+    #[error("bundle catalog contains conflicting content for bundle {id}")]
+    Conflict { id: SpawnBundleId },
 }
 
 #[derive(Debug, Error)]
@@ -287,6 +396,16 @@ pub enum NodeBundleError {
         expected: SpawnBundleDigest,
         actual: SpawnBundleDigest,
     },
+    #[error("delivery manifest is invalid")]
+    InvalidDeliveryManifest,
+    #[error("delivery manifest digest mismatch")]
+    DeliveryManifestDigestMismatch,
+    #[error("delivery blob is missing")]
+    DeliveryBlobMissing,
+    #[error("delivery blob length mismatch")]
+    DeliveryBlobLengthMismatch,
+    #[error("delivery blob digest mismatch")]
+    DeliveryBlobDigestMismatch,
     #[error("bundle filesystem operation failed at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -1248,6 +1367,10 @@ fn is_executable(metadata: &fs::Metadata, path: &str, bytes: &[u8]) -> bool {
     if unix_executable(metadata) {
         return true;
     }
+    has_executable_shape(path, bytes)
+}
+
+fn has_executable_shape(path: &str, bytes: &[u8]) -> bool {
     let extension = path.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
     if extension.as_deref().is_some_and(|extension| {
         matches!(
@@ -1297,6 +1420,32 @@ fn digest_files(files: &[NodeBundleFile]) -> SpawnBundleDigest {
         write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
     }
     SpawnBundleDigest::new(value).expect("SHA-256 formatting is valid")
+}
+
+pub(crate) fn digest_delivery_blob(bytes: &[u8]) -> DeliveryBlobDigestV1 {
+    let actual = ring::digest::digest(&SHA256, bytes);
+    DeliveryBlobDigestV1::new(format!("sha256:{}", hex_digest(actual.as_ref())))
+        .expect("SHA-256 formatting is valid")
+}
+
+pub(crate) fn digest_delivery_manifest(
+    manifest: &DeliveryBundleManifestV2,
+) -> DeliveryManifestDigestV2 {
+    let actual = ring::digest::digest(
+        &SHA256,
+        &manifest.canonical_manifest_digest_material(),
+    );
+    DeliveryManifestDigestV2::new(format!("sha256:{}", hex_digest(actual.as_ref())))
+        .expect("SHA-256 formatting is valid")
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    value
 }
 
 #[cfg(test)]

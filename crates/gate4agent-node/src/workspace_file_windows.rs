@@ -1,21 +1,29 @@
 use std::ffi::{c_void, OsStr, OsString};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::protocol::{RepositoryPath, MAX_WORKSPACE_FILE_BYTES};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW, ReplaceFileW,
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
     FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, REPLACEFILE_WRITE_THROUGH, VOLUME_NAME_DOS,
 };
+use ring::digest::{digest, SHA256};
+
+pub(crate) const WORKSPACE_ENTRY_CREATE_PENDING: u8 = 0;
+pub(crate) const WORKSPACE_ENTRY_CREATE_COMMITTING: u8 = 1;
+pub(crate) const WORKSPACE_ENTRY_CREATE_CANCELED: u8 = 2;
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const FILE_OPEN: u32 = 1;
+const FILE_CREATE: u32 = 2;
+const FILE_WRITE_DATA_ACCESS: u32 = 0x0000_0002;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
@@ -26,6 +34,7 @@ const STATUS_NO_SUCH_FILE: i32 = 0xC000_000Fu32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_OBJECT_NAME_INVALID: i32 = 0xC000_0033u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003Au32 as i32;
 const STATUS_SHARING_VIOLATION: i32 = 0xC000_0043u32 as i32;
 const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
@@ -46,7 +55,228 @@ pub(crate) enum WorkspaceFileReadErrorKind {
     NotRegularFile,
     ReparsePoint,
     AccessDenied,
+    RevisionConflict,
+    AlreadyExists,
+    ParentNotFound,
+    ParentNotDirectory,
+    Canceled,
     Io,
+}
+
+pub(crate) fn create_workspace_file(
+    canonical_root: &Path,
+    repository_path: &RepositoryPath,
+    commit_state: &AtomicU8,
+) -> Result<String, WorkspaceFileReadError> {
+    let repository_path = repository_path.as_utf8().ok_or_else(|| {
+        WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::InvalidPath)
+    })?;
+    let components = validate_repository_path(repository_path)?;
+    let (parent, name) = open_create_parent(canonical_root, &components)?;
+    begin_create_commit(commit_state)?;
+    let handle = create_relative(&parent, name, false)?;
+    let raw = handle.into_raw_handle();
+    let file = unsafe { std::fs::File::from_raw_handle(raw) };
+    file.sync_all()
+        .map_err(|error| WorkspaceFileReadError::from_io(&error))?;
+    Ok(sha256_hex(&[]))
+}
+
+pub(crate) fn create_workspace_directory(
+    canonical_root: &Path,
+    repository_path: &RepositoryPath,
+    commit_state: &AtomicU8,
+) -> Result<(), WorkspaceFileReadError> {
+    let repository_path = repository_path.as_utf8().ok_or_else(|| {
+        WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::InvalidPath)
+    })?;
+    let components = validate_repository_path(repository_path)?;
+    let (parent, name) = open_create_parent(canonical_root, &components)?;
+    begin_create_commit(commit_state)?;
+    let _directory = create_relative(&parent, name, true)?;
+    Ok(())
+}
+
+fn begin_create_commit(commit_state: &AtomicU8) -> Result<(), WorkspaceFileReadError> {
+    commit_state
+        .compare_exchange(
+            WORKSPACE_ENTRY_CREATE_PENDING,
+            WORKSPACE_ENTRY_CREATE_COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::Canceled))
+}
+
+fn open_create_parent<'a>(
+    canonical_root: &Path,
+    components: &'a [&OsStr],
+) -> Result<(OwnedHandle, &'a OsStr), WorkspaceFileReadError> {
+    let mut parent = open_verified_root(canonical_root)?;
+    for component in &components[..components.len() - 1] {
+        parent = open_relative(&parent, component, true).map_err(parent_create_error)?;
+    }
+    Ok((parent, components[components.len() - 1]))
+}
+
+fn parent_create_error(error: WorkspaceFileReadError) -> WorkspaceFileReadError {
+    match error.kind() {
+        WorkspaceFileReadErrorKind::NotFound => {
+            WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::ParentNotFound)
+        }
+        WorkspaceFileReadErrorKind::NotRegularFile => {
+            WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::ParentNotDirectory)
+        }
+        _ => error,
+    }
+}
+
+fn create_relative(
+    parent: &OwnedHandle,
+    name: &OsStr,
+    directory: bool,
+) -> Result<OwnedHandle, WorkspaceFileReadError> {
+    let mut name = simple_name_wide(name)?;
+    let byte_length = name
+        .len()
+        .checked_mul(2)
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::InvalidPath))?;
+    let mut unicode = UnicodeString {
+        length: byte_length,
+        maximum_length: byte_length,
+        buffer: name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: parent.0,
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = IoStatusBlock { status: 0, information: 0 };
+    let mut handle = std::ptr::null_mut();
+    let desired_access = if directory {
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+    } else {
+        FILE_WRITE_DATA_ACCESS | FILE_READ_ATTRIBUTES
+    };
+    let type_option = if directory { FILE_DIRECTORY_FILE } else { FILE_NON_DIRECTORY_FILE };
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            desired_access | SYNCHRONIZE_ACCESS,
+            &mut attributes,
+            &mut io_status,
+            std::ptr::null_mut(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            type_option | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_OPTION,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 {
+        return Err(WorkspaceFileReadError::new(match nt_status_kind(status) {
+            WorkspaceFileReadErrorKind::NotFound => WorkspaceFileReadErrorKind::ParentNotFound,
+            kind => kind,
+        }));
+    }
+    let handle = OwnedHandle(handle);
+    ensure_handle_type(&handle, directory)?;
+    Ok(handle)
+}
+
+pub(crate) fn write_workspace_file(
+    canonical_root: &Path,
+    repository_path: &RepositoryPath,
+    expected_revision: &str,
+    text: &str,
+) -> Result<String, WorkspaceFileReadError> {
+    if text.len() > MAX_WORKSPACE_FILE_BYTES {
+        return Err(WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::InvalidPath));
+    }
+    let repository_path = repository_path.as_utf8().ok_or_else(|| {
+        WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::InvalidPath)
+    })?;
+    let components = validate_repository_path(repository_path)?;
+    let root = open_verified_root(canonical_root)?;
+    let mut parent = root;
+    for component in &components[..components.len() - 1] {
+        parent = open_relative(&parent, component, true)?;
+    }
+    let name = components[components.len() - 1];
+    let original = open_relative(&parent, name, false)?;
+    let original_path = final_path_for_handle(&original)?;
+    let current = read_bounded(original)?;
+    let WorkspaceFileBytes::Utf8(current) = current else {
+        return Err(WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::NotRegularFile));
+    };
+    if sha256_hex(current.as_bytes()) != expected_revision {
+        return Err(WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::RevisionConflict));
+    }
+
+    let parent_path = final_path_for_handle(&parent)?;
+    let temp_name = format!(".gate4agent-save-{}-{}", std::process::id(), next_temp_id());
+    let temp_path = parent_path.join(temp_name);
+    let result = (|| {
+        let mut temp = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| WorkspaceFileReadError::from_io(&error))?;
+        temp.write_all(text.as_bytes())
+            .and_then(|_| temp.sync_all())
+            .map_err(|error| WorkspaceFileReadError::from_io(&error))?;
+        drop(temp);
+
+        let current = open_relative(&parent, name, false)?;
+        if normalized_windows_path(&final_path_for_handle(&current)?)
+            != normalized_windows_path(&original_path)
+        {
+            return Err(WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::RevisionConflict));
+        }
+        let WorkspaceFileBytes::Utf8(current) = read_bounded(current)? else {
+            return Err(WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::RevisionConflict));
+        };
+        if sha256_hex(current.as_bytes()) != expected_revision {
+            return Err(WorkspaceFileReadError::new(WorkspaceFileReadErrorKind::RevisionConflict));
+        }
+
+        let target_wide = wide_nul(&original_path)?;
+        let temp_wide = wide_nul(&temp_path)?;
+        let replaced = unsafe {
+            ReplaceFileW(
+                target_wide.as_ptr(),
+                temp_wide.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if replaced == 0 {
+            return Err(WorkspaceFileReadError::from_io(&io::Error::last_os_error()));
+        }
+        Ok(sha256_hex(text.as_bytes()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    digest(&SHA256, bytes).as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn next_temp_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug)]
@@ -217,7 +447,7 @@ fn read_bounded(handle: OwnedHandle) -> Result<WorkspaceFileBytes, WorkspaceFile
     let raw = handle.into_raw_handle();
     let mut file = unsafe { std::fs::File::from_raw_handle(raw) };
     let mut bytes = Vec::with_capacity(MAX_WORKSPACE_FILE_BYTES.min(16 * 1_024));
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take((MAX_WORKSPACE_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| WorkspaceFileReadError::from_io(&error))?;
@@ -345,6 +575,7 @@ fn nt_status_kind(status: i32) -> WorkspaceFileReadErrorKind {
             WorkspaceFileReadErrorKind::AccessDenied
         }
         STATUS_OBJECT_NAME_INVALID => WorkspaceFileReadErrorKind::InvalidPath,
+        STATUS_OBJECT_NAME_COLLISION => WorkspaceFileReadErrorKind::AlreadyExists,
         STATUS_FILE_IS_A_DIRECTORY | STATUS_NOT_A_DIRECTORY => {
             WorkspaceFileReadErrorKind::NotRegularFile
         }
@@ -410,5 +641,99 @@ impl Drop for OwnedHandle {
                 let _ = CloseHandle(self.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let root = std::env::temp_dir().join(format!(
+                "gate4agent-workspace-entry-create-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(std::fs::canonicalize(root).unwrap())
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn path(value: &str) -> RepositoryPath {
+        RepositoryPath::utf8(value.to_owned()).unwrap()
+    }
+
+    #[test]
+    fn workspace_entry_create_is_handle_relative_and_no_overwrite() {
+        let root = TestRoot::new();
+        std::fs::create_dir(root.0.join("src")).unwrap();
+
+        let revision = create_workspace_file(
+            &root.0,
+            &path("src/new.rs"),
+            &AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING),
+        )
+        .unwrap();
+        assert_eq!(revision, sha256_hex(&[]));
+        assert_eq!(std::fs::read(root.0.join("src/new.rs")).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            create_workspace_file(
+                &root.0,
+                &path("src/new.rs"),
+                &AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING),
+            )
+            .unwrap_err()
+            .kind(),
+            WorkspaceFileReadErrorKind::AlreadyExists,
+        );
+
+        create_workspace_directory(
+            &root.0,
+            &path("src/new-dir"),
+            &AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING),
+        )
+        .unwrap();
+        assert!(root.0.join("src/new-dir").is_dir());
+        assert_eq!(
+            create_workspace_directory(
+                &root.0,
+                &path("src/new-dir"),
+                &AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING),
+            )
+            .unwrap_err()
+            .kind(),
+            WorkspaceFileReadErrorKind::AlreadyExists,
+        );
+        assert_eq!(
+            create_workspace_file(
+                &root.0,
+                &path("missing/new.rs"),
+                &AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING),
+            )
+            .unwrap_err()
+            .kind(),
+            WorkspaceFileReadErrorKind::ParentNotFound,
+        );
+        assert_eq!(
+            create_workspace_file(
+                &root.0,
+                &path("src/new.rs/child"),
+                &AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING),
+            )
+            .unwrap_err()
+            .kind(),
+            WorkspaceFileReadErrorKind::ParentNotDirectory,
+        );
     }
 }

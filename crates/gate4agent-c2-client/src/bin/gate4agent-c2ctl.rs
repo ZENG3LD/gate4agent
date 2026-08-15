@@ -535,9 +535,14 @@ mod tests {
                     "fixture-root".to_owned(),
                 ).unwrap(),
                 sessions: vec![session],
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
             }],
             session_records: Vec::new(),
+            agent_progress: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            observation_support: None,
         }
     }
 

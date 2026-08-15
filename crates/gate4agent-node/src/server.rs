@@ -8,14 +8,25 @@ use crate::git_worktree::{
     run_git_read_bounded, GitCommandOutput, GitWorktreeError, GitWorktreeErrorKind,
     NativeGitWorktreeSnapshot,
 };
+use crate::host_directory_browser::{
+    browse_host_directories, HostDirectoryBrowseError, HostDirectoryBrowseErrorKind,
+};
 use crate::environment_profiles::{
     EnvironmentProfileBinding, NodeEnvironmentProfile, MAX_NODE_ENVIRONMENT_PROFILES,
 };
 use crate::bundle_catalog::{BundleCatalog, NodeBundle};
+use self::bundle_delivery::{DeliveryStore, DeliveryStoreError};
 use crate::bundle_provider::{
     bundle_launch_arguments, validate_bundle_binding, BundleProviderLayout,
 };
-use crate::context_pack::{ContextPackCatalog, NodeContextPack};
+use crate::context_pack::{
+    ContextPackCatalog, ContextPackRepository, ContextPackRepositoryFileSource,
+    ContextPackSelectedFileSkipReason, NodeContextPack, CONTEXT_PACK_SELECTED_FILES,
+};
+use crate::harness_mcp_proxy::{
+    HarnessMcpProxyError, HarnessMcpProxyRegistry, PreparedHarnessMcpSpawn,
+    ReviewedHarnessMcpProgram,
+};
 use crate::session_environment::{
     MaterializationId, MaterializationOwner, MaterializationOwnershipRecord,
     MaterializationState, NodeSecretResolver, NodeSessionMaterializationProfile,
@@ -30,13 +41,23 @@ use crate::session_registry::{
 };
 #[cfg(unix)]
 use crate::workspace_file_unix::{
-    read_workspace_file as read_workspace_file_from_disk, WorkspaceFileBytes,
+    create_workspace_directory as create_workspace_directory_on_disk,
+    create_workspace_file as create_workspace_file_on_disk,
+    read_workspace_file as read_workspace_file_from_disk,
+    write_workspace_file as write_workspace_file_to_disk, WorkspaceFileBytes,
     WorkspaceFileReadError, WorkspaceFileReadErrorKind,
+    WORKSPACE_ENTRY_CREATE_CANCELED, WORKSPACE_ENTRY_CREATE_COMMITTING,
+    WORKSPACE_ENTRY_CREATE_PENDING,
 };
 #[cfg(windows)]
 use crate::workspace_file_windows::{
-    read_workspace_file as read_workspace_file_from_disk, WorkspaceFileBytes,
+    create_workspace_directory as create_workspace_directory_on_disk,
+    create_workspace_file as create_workspace_file_on_disk,
+    read_workspace_file as read_workspace_file_from_disk,
+    write_workspace_file as write_workspace_file_to_disk, WorkspaceFileBytes,
     WorkspaceFileReadError, WorkspaceFileReadErrorKind,
+    WORKSPACE_ENTRY_CREATE_CANCELED, WORKSPACE_ENTRY_CREATE_COMMITTING,
+    WORKSPACE_ENTRY_CREATE_PENDING,
 };
 use crate::platform;
 use crate::provider_runtime::{
@@ -44,53 +65,95 @@ use crate::provider_runtime::{
     ProviderRuntimeRequirement,
 };
 use crate::spawn_spec::SpawnProfileRegistry;
+use crate::standalone_workspace::{
+    prepare_standalone_workspace, StandaloneWorkspaceError, StandaloneWorkspaceErrorKind,
+};
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
     provider_id_is_legacy, AdapterContractRevision, CapabilityId, ClientFrame, ClientRole,
-    ControllerState,
-    FrameError, GitCommitSummary, GitSnapshot, GitStatusEntry,
-    GitWorktreeSnapshot, NodeCompatibilitySupport, NodeEvent,
+    ControllerState, DeliveryBlobChunkHexV1, DeliveryBlobDigestV1,
+    DeliveryBundleManifestV2, DeliveryCommitReceiptV1, DeliveryStageId,
+    AgentProgressAttentionKindV1, AgentProgressAttentionV1, AgentProgressCurrentV1,
+    AgentProgressEventKindV1, AgentProgressUsageV1, AgentProgressV1, FrameError,
+    GitCommitDetails, GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage,
+    GitObjectId, GitCommitSummary, GitSignatureStatus, GitSnapshot, GitStatusEntry,
+    GitWorktreeSnapshot, HarnessMcpActivationDigest, HarnessMcpReservationId,
+    HostDirectoryListing,
+    NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
     NegotiatedNodeCompatibility, NodeRequest, NodeResponse, NodeSnapshot, OpaqueHostPath,
     ProtocolRange,
     ProviderAdapterContractSupport,
     ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
     ProviderRuntimeStatuses, ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt,
-    ContextPackLineageReceipt, ResolvedContextPackReceipt, ResolvedSpawnReceipt,
+    ContextPackLineageReceipt, ResolvedContextPackReceipt,
+    ResolvedHarnessMcpProxyReceiptV1, ResolvedSpawnReceipt,
     ResolvedSpawnSpec, ResponseEnvelope,
-    ServerChallenge, ServerFrame, SessionAddress, SessionKey, SessionMode, ManagedSessionRecord,
+    ServerChallenge, ServerFrame, SessionAddress, SessionAgentProgress, SessionKey, SessionMode,
+    ManagedSessionRecord,
     ManagedSessionState, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
     ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
     ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest, SessionRecordId,
+    NativeSessionCatalogRoute, NativeSessionSelection, SessionTaskBindingV1,
+    SessionTaskTargetV1, TaskId,
+    ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
+    ObservationKindV1, ObservationSourceFamilyV1, ObservationV1,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
-    SpawnRequiredCapabilities, SpawnSpec,
-    WorkspaceFileContent,
+    SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
+    WorkspaceFileContent, WorkspaceFileRevision,
     WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
+    WorktreeServiceMode,
+    LaunchInventory, ManagedWorktreeProfileSummary, SpawnProfileSummary,
+    WorktreeProfileInventory, MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE,
     DEFAULT_CONTROLLER_LEASE_MS,
     MAX_CONTROLLER_LEASE_MS, MIN_CONTROLLER_LEASE_MS, NODE_COMPATIBILITY_METADATA_CAPABILITY,
+    CAPABILITY_HOST_DIRECTORY_BROWSE_V1,
     NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, NODE_REPOSITORY_PATH_CAPABILITY,
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
+    NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
     NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY, NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+    NODE_NATIVE_SESSION_CATALOG_CAPABILITY, NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
+    NODE_NATIVE_SESSION_INDEX_CAPABILITY, NODE_NATIVE_SESSION_PREVIEW_CAPABILITY,
+    NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+    NODE_OBSERVATION_EVENTS_CAPABILITY,
+    NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+    NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
+    NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
+    NODE_HARNESS_MCP_READ_PROXY_CAPABILITY,
+    NODE_SESSION_TASK_CORRELATION_CAPABILITY,
+    NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
-    NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY, NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
-    NODE_WORKSPACE_FILE_READ_CAPABILITY, NODE_WORKTREE_SELECTION_CAPABILITY,
+    NODE_SPAWN_PROFILE_REVISION_CAPABILITY, NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+    NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    NODE_GIT_READ_CAPABILITY, NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    NODE_WORKSPACE_FILE_WRITE_CAPABILITY, NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
+    NODE_WORKTREE_SELECTION_CAPABILITY,
     NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
-    MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES, MAX_REPOSITORY_PATH_BYTES,
-    MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V8,
+    MAX_AGENT_PROGRESS_ACTIVE_TOOL_LABELS, MAX_AGENT_PROGRESS_ENTRY_BYTES,
+    MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES,
+    MAX_REPOSITORY_PATH_BYTES,
+    MAX_GIT_DIFF_BYTES, MAX_GIT_HISTORY_COMMITS, MAX_WORKSPACE_FILE_BYTES,
+    MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V9,
     SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
     SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
     SPAWN_RUNTIME_STRUCTURED_PROMPT,
 };
+use ring::digest::{digest, SHA256};
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
 use gate4agent_runtime_native::{
-    HookIngressConfig, NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay,
+    HookIngressConfig, NativeHarnessMcpLaunchOverlay, NativeInstanceLaunchOverlay,
+    NativeLaunchEnvironmentOverlay,
     NativeHistoryConfig, NativeLaunchProfileControl, NativeRuntime, NativeRuntimeConfig,
+    NativeSessionCatalogAuthority, NativeSessionCatalogError, NativeSessionPreviewError,
+    ScopedNativeSessionCatalogEntry,
 };
+#[cfg(test)]
+use gate4agent_runtime_native::{HistorySourceLayout, NativeHistoryRoot};
 use gate4agent_node_wire::{
     auth_proof, negotiated_auth_proof, proofs_match, random_incarnation_id, random_nonce,
     AuthDirection, LocalServerStream, OwnerOnlyLocalListener,
@@ -100,15 +163,21 @@ use gate4agent_types::{
     validate_candidate_id, ControlCommand, ControlEvent, ControlEventKind,
     HistoryCandidateSummary, HistoryOperation, HistoryQuery, HistorySessionRecord, InputAction,
     PromptFraming, PromptPayload, ResumeLaunchRequest,
-    ProviderRuntimeCapability, ProviderRuntimePolicy, ResumeTarget, SessionGeneration, StartRequest,
+    ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus,
+    ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
+    ProviderSnapshot,
+    ResumeTarget,
+    SessionGeneration, StartRequest,
     TerminalControl, TerminalText,
     SessionStatus, TerminalFrame, TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
     WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "fixture")]
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -117,6 +186,9 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 mod http_api;
+
+#[path = "bundle_delivery.rs"]
+mod bundle_delivery;
 
 #[cfg(windows)]
 pub use crate::platform::DEFAULT_NODE_ENDPOINT;
@@ -140,12 +212,16 @@ const READINESS_SETTLE_HEADROOM_MS: u64 = 2_000;
 const MANAGED_RESUME_SETTLE_TIMEOUT_MS: u64 = 30_000;
 const WORKSPACE_INSPECTION_MAX_CONCURRENCY: usize = 4;
 const WORKSPACE_FILE_READ_TIMEOUT_MS: u64 = 2_000;
+const HOST_DIRECTORY_BROWSE_TIMEOUT_MS: u64 = 2_000;
+const NATIVE_SESSION_CATALOG_TIMEOUT_MS: u64 = 30_000;
 const WORKSPACE_TREE_MAX_DEPTH: usize = 6;
 const WORKSPACE_TREE_MAX_ENTRIES: usize = 512;
 const GIT_STATUS_MAX_ENTRIES: usize = 128;
 const GIT_COMMIT_MAX_ENTRIES: usize = 12;
 const GIT_OUTPUT_MAX_BYTES: usize = 64 * 1_024;
 const GIT_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
+const WORKSPACE_FILE_WRITE_TIMEOUT_MS: u64 = 5_000;
+const WORKSPACE_ENTRY_CREATE_TIMEOUT_MS: u64 = 5_000;
 const GIT_COMMAND_TIMEOUT_MS: u64 = 1_500;
 const WORKSPACE_UNAVAILABLE_ERROR: &str = "workspace-unavailable";
 const PROVIDER_SESSION_SCOPE_CONFLICT_ERROR: &str = "provider-session-scope-conflict";
@@ -164,6 +240,712 @@ const DURABLE_STATE_PATH_SEMANTICS_UNSUPPORTED_ERROR: &str =
 
 fn opaque_windows_path(value: String) -> OpaqueHostPath {
     OpaqueHostPath::utf8(value).expect("validated Windows node path must remain wire-safe")
+}
+
+fn agent_progress_from_provider_snapshot(
+    address: SessionAddress,
+    provider: &ProviderSnapshot,
+) -> Option<SessionAgentProgress> {
+    let mut truncated = false;
+    let active_tool_count = bounded_progress_count(provider.active_tools.len(), &mut truncated);
+    let mut active_tool_labels = Vec::with_capacity(
+        provider
+            .active_tools
+            .len()
+            .min(MAX_AGENT_PROGRESS_ACTIVE_TOOL_LABELS),
+    );
+    for tool in &provider.active_tools {
+        if active_tool_labels.len() == MAX_AGENT_PROGRESS_ACTIVE_TOOL_LABELS {
+            truncated = true;
+            break;
+        }
+        if let Some(label) = sanitize_progress_tool_label(&tool.name, &mut truncated) {
+            active_tool_labels.push(label);
+        }
+    }
+    let attention = provider
+        .interactions
+        .iter()
+        .find(|interaction| {
+            matches!(
+                interaction.status,
+                ProviderInteractionStatus::Pending | ProviderInteractionStatus::Resolving { .. }
+            )
+        })
+        .map(|interaction| AgentProgressAttentionV1 {
+            kind: match interaction.interaction_kind {
+                ProviderInteractionKind::Approval => AgentProgressAttentionKindV1::Approval,
+                ProviderInteractionKind::Question => AgentProgressAttentionKindV1::Question,
+            },
+            tool_label: sanitize_progress_tool_label(&interaction.tool_name, &mut truncated),
+        });
+    let subagent_count = bounded_progress_count(provider.subagents.len(), &mut truncated);
+    let usage = (provider.completed_turns > 0
+        || provider.usage.input_tokens > 0
+        || provider.usage.output_tokens > 0
+        || provider.usage.cache_read_tokens > 0
+        || provider.usage.cache_write_tokens > 0
+        || provider.usage.reasoning_tokens > 0)
+        .then_some(AgentProgressUsageV1 {
+            input_tokens: provider.usage.input_tokens,
+            output_tokens: provider.usage.output_tokens,
+            cache_read_tokens: provider.usage.cache_read_tokens,
+            cache_write_tokens: provider.usage.cache_write_tokens,
+            reasoning_tokens: provider.usage.reasoning_tokens,
+        });
+    let progress = AgentProgressV1 {
+        provider_sequence: provider.sequence,
+        activity: provider.activity,
+        completed_turns: provider.completed_turns,
+        usage,
+        current: AgentProgressCurrentV1::from(provider.activity),
+        active_tool_labels,
+        active_tool_count,
+        attention,
+        subagent_count,
+        last_event_kind: provider.last_event.as_ref().and_then(agent_progress_event_kind),
+        gap_count: provider.gap_count,
+        stale: provider.stale,
+        truncated,
+    };
+    let entry = SessionAgentProgress { address, progress };
+    serde_json::to_vec(&entry)
+        .ok()
+        .filter(|encoded| encoded.len() <= MAX_AGENT_PROGRESS_ENTRY_BYTES)
+        .map(|_| entry)
+}
+
+fn bounded_progress_count(count: usize, truncated: &mut bool) -> u32 {
+    match u32::try_from(count) {
+        Ok(count) => count,
+        Err(_) => {
+            *truncated = true;
+            u32::MAX
+        }
+    }
+}
+
+fn sanitize_progress_tool_label(value: &str, truncated: &mut bool) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        *truncated = true;
+        return None;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    let class = if ["read", "view", "open", "get"].iter().any(|term| normalized.contains(term)) {
+        "Read"
+    } else if ["write", "create", "save"].iter().any(|term| normalized.contains(term)) {
+        "Write"
+    } else if ["edit", "patch", "replace"].iter().any(|term| normalized.contains(term)) {
+        "Edit"
+    } else if ["shell", "bash", "powershell", "terminal", "exec", "command"]
+        .iter()
+        .any(|term| normalized.contains(term))
+    {
+        "Shell"
+    } else if ["search", "find", "grep", "query"].iter().any(|term| normalized.contains(term)) {
+        "Search"
+    } else if ["browser", "web", "http", "fetch"].iter().any(|term| normalized.contains(term)) {
+        "Browse"
+    } else if ["git", "commit", "diff"].iter().any(|term| normalized.contains(term)) {
+        "Git"
+    } else if ["ask", "question", "approval", "input"].iter().any(|term| normalized.contains(term)) {
+        "Ask"
+    } else if ["task", "agent", "spawn"].iter().any(|term| normalized.contains(term)) {
+        "Task"
+    } else {
+        "Tool"
+    };
+    if trimmed != class {
+        *truncated = true;
+    }
+    Some(class.to_owned())
+}
+
+fn agent_progress_event_kind(event: &ProviderEvent) -> Option<AgentProgressEventKindV1> {
+    if matches!(event, ProviderEvent::ContextWindowUsage { .. }) {
+        return None;
+    }
+    Some(match event {
+        ProviderEvent::SessionStarted { .. } => AgentProgressEventKindV1::SessionStarted,
+        ProviderEvent::SessionIdentityObserved { .. } => {
+            AgentProgressEventKindV1::SessionIdentityObserved
+        }
+        ProviderEvent::TurnStarted { .. } => AgentProgressEventKindV1::TurnStarted,
+        ProviderEvent::WorkingObserved => AgentProgressEventKindV1::WorkingObserved,
+        ProviderEvent::Text { .. } => AgentProgressEventKindV1::Text,
+        ProviderEvent::Thinking { .. } => AgentProgressEventKindV1::Thinking,
+        ProviderEvent::ToolStarted { .. } => AgentProgressEventKindV1::ToolStarted,
+        ProviderEvent::ToolCompleted { .. } => AgentProgressEventKindV1::ToolCompleted,
+        ProviderEvent::TurnCompleted { .. } => AgentProgressEventKindV1::TurnCompleted,
+        ProviderEvent::TurnInterrupted => AgentProgressEventKindV1::TurnInterrupted,
+        ProviderEvent::SessionEnded { .. } => AgentProgressEventKindV1::SessionEnded,
+        ProviderEvent::Error { .. } => AgentProgressEventKindV1::Error,
+        ProviderEvent::Ready => AgentProgressEventKindV1::Ready,
+        ProviderEvent::InteractionRequested { .. } => {
+            AgentProgressEventKindV1::InteractionRequested
+        }
+        ProviderEvent::InteractionResolved { .. } => AgentProgressEventKindV1::InteractionResolved,
+        ProviderEvent::SubagentStarted { .. } => AgentProgressEventKindV1::SubagentStarted,
+        ProviderEvent::SubagentStopped { .. } => AgentProgressEventKindV1::SubagentStopped,
+        ProviderEvent::RateLimited { .. } => AgentProgressEventKindV1::RateLimited,
+        ProviderEvent::ContextWindowUsage { .. } => unreachable!("handled above"),
+    })
+}
+
+fn observation_evidence(family: AdapterFamily) -> Option<ObservationEvidenceV1> {
+    match family {
+        AdapterFamily::PtySemantic => Some(ObservationEvidenceV1::PtyHint),
+        AdapterFamily::Hook | AdapterFamily::ManagedHook => {
+            Some(ObservationEvidenceV1::ManagedHook)
+        }
+        AdapterFamily::Pipe | AdapterFamily::OneShot | AdapterFamily::Acp => {
+            Some(ObservationEvidenceV1::StructuredProvider)
+        }
+        AdapterFamily::History
+        | AdapterFamily::Resume
+        | AdapterFamily::SessionOptions
+        | AdapterFamily::CapabilityProbe => None,
+    }
+}
+
+fn observation_source_capabilities(
+    source: &gate4agent_types::ProviderSource,
+) -> (ObservationSourceFamilyV1, ObservationCapabilitiesV1) {
+    let adapter = source.binding.id.as_str();
+    match source.family {
+        AdapterFamily::PtySemantic => (
+            ObservationSourceFamilyV1::PtySemantic,
+            ObservationCapabilitiesV1::default(),
+        ),
+        AdapterFamily::Pipe => (
+            ObservationSourceFamilyV1::Pipe,
+            ObservationCapabilitiesV1 {
+                tools: matches!(
+                    adapter,
+                    "claude-code" | "codex" | "gemini" | "opencode" | "kimi" | "qwen-code"
+                ),
+                attention: adapter == "qwen-code",
+                usage: matches!(
+                    adapter,
+                    "claude-code" | "codex" | "gemini" | "opencode" | "qwen-code"
+                ),
+                ..ObservationCapabilitiesV1::default()
+            },
+        ),
+        AdapterFamily::Hook => (
+            ObservationSourceFamilyV1::Hook,
+            hook_observation_capabilities(adapter),
+        ),
+        AdapterFamily::ManagedHook => (
+            ObservationSourceFamilyV1::ManagedHook,
+            hook_observation_capabilities(adapter),
+        ),
+        AdapterFamily::OneShot => (
+            ObservationSourceFamilyV1::OneShot,
+            ObservationCapabilitiesV1::default(),
+        ),
+        AdapterFamily::Acp => (
+            ObservationSourceFamilyV1::Acp,
+            ObservationCapabilitiesV1 {
+                tools: true,
+                usage: true,
+                ..ObservationCapabilitiesV1::default()
+            },
+        ),
+        AdapterFamily::History
+        | AdapterFamily::Resume
+        | AdapterFamily::SessionOptions
+        | AdapterFamily::CapabilityProbe => unreachable!("non-live source has no observation evidence"),
+    }
+}
+
+fn hook_observation_capabilities(adapter: &str) -> ObservationCapabilitiesV1 {
+    ObservationCapabilitiesV1 {
+        tools: matches!(
+            adapter,
+            "claude-code"
+                | "codex"
+                | "gemini"
+                | "pi"
+                | "omp"
+                | "antigravity"
+                | "amp"
+                | "command-code"
+                | "hermes"
+                | "devin"
+                | "grok"
+                | "kimi"
+                | "copilot"
+                | "droid"
+                | "cursor"
+        ),
+        attention: matches!(
+            adapter,
+            "claude-code"
+                | "codex"
+                | "opencode"
+                | "mimo-code"
+                | "antigravity"
+                | "hermes"
+                | "devin"
+                | "grok"
+                | "kimi"
+                | "copilot"
+                | "droid"
+        ),
+        subagents: matches!(
+            adapter,
+            "claude-code" | "grok" | "kimi" | "copilot" | "droid" | "cursor"
+        ),
+        ..ObservationCapabilitiesV1::default()
+    }
+}
+
+fn token_usage_is_observed(usage: &gate4agent_types::TokenUsage) -> bool {
+    usage.input_tokens != 0
+        || usage.output_tokens != 0
+        || usage.cache_read_tokens != 0
+        || usage.cache_write_tokens != 0
+        || usage.reasoning_tokens != 0
+        || usage.context_window.is_some()
+}
+
+fn source_capabilities_observation(
+    source: &gate4agent_types::ProviderSource,
+    source_sequence: u64,
+    evidence: ObservationEvidenceV1,
+) -> ObservationV1 {
+    let (source_family, capabilities) = observation_source_capabilities(source);
+    ObservationV1 {
+        source_sequence,
+        observed_at_unix_ms: Some(unix_time_ms()),
+        evidence,
+        kind: ObservationKindV1::SourceCapabilities {
+            source_family,
+            source_adapter: source.binding.id.as_str().to_owned(),
+            capabilities,
+        },
+        truncated: false,
+    }
+}
+
+fn history_summary_observations(
+    preview: &gate4agent_types::SessionRecordPreview,
+) -> [ObservationV1; 2] {
+    let observed_at_unix_ms = unix_time_ms().max(1);
+    let source_sequence = preview
+        .modified_at_unix_ms
+        .unwrap_or(observed_at_unix_ms)
+        .max(1);
+    [
+        ObservationV1 {
+            source_sequence,
+            observed_at_unix_ms: Some(observed_at_unix_ms),
+            evidence: ObservationEvidenceV1::HistoryProjection,
+            kind: ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::History,
+                source_adapter: "native-history".to_owned(),
+                capabilities: ObservationCapabilitiesV1 {
+                    history_summary: true,
+                    ..ObservationCapabilitiesV1::default()
+                },
+            },
+            truncated: false,
+        },
+        ObservationV1 {
+            source_sequence,
+            observed_at_unix_ms: Some(observed_at_unix_ms),
+            evidence: ObservationEvidenceV1::HistoryProjection,
+            kind: ObservationKindV1::HistorySnapshot {
+                message_count: preview.message_count,
+                message_count_exact: preview.message_count_exact,
+                completed_turn_count: preview.completed_turn_count,
+                total_tokens: preview.total_tokens,
+            },
+            // The observation intentionally carries aggregate metrics only.
+            // Omitted preview messages therefore do not make this aggregate partial.
+            truncated: false,
+        },
+    ]
+}
+
+fn observation_tool_class(name: &str) -> String {
+    let mut truncated = false;
+    sanitize_progress_tool_label(name, &mut truncated).unwrap_or_else(|| "Tool".to_owned())
+}
+
+fn opaque_subagent_correlation(
+    instance_id: AgentInstanceId,
+    generation: SessionGeneration,
+    source: &gate4agent_types::ProviderSource,
+    provider_agent_id: &str,
+) -> String {
+    let mut material = Vec::with_capacity(16 + provider_agent_id.len());
+    material.extend_from_slice(&instance_id.0.to_le_bytes());
+    material.extend_from_slice(&generation.0.to_le_bytes());
+    material.extend_from_slice(
+        &serde_json::to_vec(source).expect("validated provider source must serialize"),
+    );
+    material.extend_from_slice(provider_agent_id.as_bytes());
+    let digest = digest(&SHA256, &material);
+    let mut correlation = String::with_capacity(20);
+    correlation.push_str("sub-");
+    for byte in &digest.as_ref()[..8] {
+        use std::fmt::Write as _;
+        write!(&mut correlation, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    correlation
+}
+
+fn opaque_tool_correlation(
+    event: &ControlEvent,
+    source: &gate4agent_types::ProviderSource,
+    provider_tool_id: &str,
+) -> String {
+    let mut material = Vec::new();
+    material.extend_from_slice(&event.instance_id.0.to_le_bytes());
+    material.extend_from_slice(&event.generation.0.to_le_bytes());
+    material.extend_from_slice(
+        &serde_json::to_vec(source).expect("validated provider source must serialize"),
+    );
+    material.extend_from_slice(provider_tool_id.as_bytes());
+    opaque_correlation("tool-", &material)
+}
+
+fn opaque_interaction_correlation(event: &ControlEvent, interaction_id: u64) -> String {
+    let mut material = Vec::with_capacity(24);
+    material.extend_from_slice(b"interaction");
+    material.extend_from_slice(&event.instance_id.0.to_le_bytes());
+    material.extend_from_slice(&event.generation.0.to_le_bytes());
+    material.extend_from_slice(&interaction_id.to_le_bytes());
+    opaque_correlation("int-", &material)
+}
+
+fn opaque_correlation(prefix: &str, material: &[u8]) -> String {
+    let digest = digest(&SHA256, material);
+    let mut correlation = String::with_capacity(prefix.len() + 16);
+    correlation.push_str(prefix);
+    for byte in &digest.as_ref()[..8] {
+        use std::fmt::Write as _;
+        write!(&mut correlation, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    correlation
+}
+
+fn observation_interaction_outcome(
+    outcome: gate4agent_types::ProviderInteractionOutcome,
+) -> ObservationInteractionOutcomeV1 {
+    match outcome {
+        gate4agent_types::ProviderInteractionOutcome::Approved => {
+            ObservationInteractionOutcomeV1::Approved
+        }
+        gate4agent_types::ProviderInteractionOutcome::Answered => {
+            ObservationInteractionOutcomeV1::Answered
+        }
+        gate4agent_types::ProviderInteractionOutcome::Denied => {
+            ObservationInteractionOutcomeV1::Denied
+        }
+        gate4agent_types::ProviderInteractionOutcome::Interrupted => {
+            ObservationInteractionOutcomeV1::Interrupted
+        }
+        gate4agent_types::ProviderInteractionOutcome::TurnEnded => {
+            ObservationInteractionOutcomeV1::TurnEnded
+        }
+        gate4agent_types::ProviderInteractionOutcome::Superseded => {
+            ObservationInteractionOutcomeV1::Superseded
+        }
+    }
+}
+
+fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
+    let (source, source_sequence, provider_sequence, provider_event) = match &event.event {
+        ControlEventKind::ProviderEvent {
+            sequence,
+            source,
+            source_sequence,
+            event,
+        } => (source, *source_sequence, *sequence, event),
+        ControlEventKind::ProviderGap {
+            source,
+            source_sequence,
+            missed,
+            ..
+        } => {
+            let Some(evidence) = observation_evidence(source.family) else {
+                return Vec::new();
+            };
+            return vec![
+                source_capabilities_observation(source, *source_sequence, evidence),
+                ObservationV1 {
+                    source_sequence: *source_sequence,
+                    observed_at_unix_ms: Some(unix_time_ms()),
+                    evidence,
+                    kind: ObservationKindV1::Gap { missed: *missed },
+                    truncated: false,
+                },
+            ];
+        }
+        ControlEventKind::InteractionResolved {
+            interaction_id,
+            outcome,
+        } => {
+            return vec![ObservationV1 {
+                source_sequence: event.sequence,
+                observed_at_unix_ms: Some(unix_time_ms()),
+                evidence: ObservationEvidenceV1::NodeLifecycle,
+                kind: ObservationKindV1::InteractionResolved {
+                    correlation_id: opaque_interaction_correlation(event, interaction_id.0),
+                    outcome: observation_interaction_outcome(*outcome),
+                },
+                truncated: false,
+            }];
+        }
+        _ => return node_lifecycle_observations(event),
+    };
+    let Some(evidence) = observation_evidence(source.family) else {
+        return Vec::new();
+    };
+    let is_pty_hint = evidence == ObservationEvidenceV1::PtyHint;
+    let mut kinds = Vec::with_capacity(2);
+    match provider_event {
+        ProviderEvent::SessionStarted { .. } => kinds.push(ObservationKindV1::SessionStarted),
+        ProviderEvent::TurnStarted { .. } => kinds.push(ObservationKindV1::TurnStarted),
+        ProviderEvent::WorkingObserved => kinds.push(ObservationKindV1::Working),
+        ProviderEvent::Thinking { .. } => kinds.push(ObservationKindV1::Working),
+        ProviderEvent::ToolStarted { id, name, .. } => kinds.push(ObservationKindV1::ToolStarted {
+            correlation_id: opaque_tool_correlation(event, source, id),
+            class: observation_tool_class(name),
+        }),
+        ProviderEvent::ToolCompleted { id, is_error, duration_ms, .. } if !is_pty_hint => {
+            kinds.push(ObservationKindV1::ToolCompleted {
+                correlation_id: opaque_tool_correlation(event, source, id),
+                class: "Tool".to_owned(),
+                success: !is_error,
+                duration_ms: *duration_ms,
+            });
+        }
+        ProviderEvent::TurnCompleted { usage, is_cumulative } if !is_pty_hint => {
+            kinds.push(ObservationKindV1::TurnCompleted);
+            if token_usage_is_observed(usage) {
+                kinds.push(ObservationKindV1::Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
+                    context_window: usage.context_window,
+                    is_cumulative: *is_cumulative,
+                });
+            }
+        }
+        ProviderEvent::ContextWindowUsage { usage }
+            if evidence == ObservationEvidenceV1::StructuredProvider =>
+        {
+            kinds.push(ObservationKindV1::ContextWindowUsage {
+                uncached_input_tokens: usage.uncached_input_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                output_tokens: usage.output_tokens,
+                unattributed_tokens: usage.unattributed_tokens,
+                used_tokens: usage.used_tokens,
+                capacity_tokens: usage.capacity_tokens,
+            });
+        }
+        ProviderEvent::TurnInterrupted => kinds.push(ObservationKindV1::TurnInterrupted),
+        ProviderEvent::SessionEnded { is_error, .. } => kinds.push(ObservationKindV1::Exited {
+            success: Some(!is_error),
+        }),
+        ProviderEvent::Error { .. } => kinds.push(ObservationKindV1::Error {
+            detail: "provider-error".to_owned(),
+        }),
+        ProviderEvent::Ready => kinds.push(ObservationKindV1::Ready),
+        ProviderEvent::InteractionRequested {
+            interaction_kind,
+            tool_name,
+            ..
+        } => kinds.push(match interaction_kind {
+            ProviderInteractionKind::Approval => ObservationKindV1::ApprovalRequested {
+                correlation_id: opaque_interaction_correlation(event, provider_sequence),
+                tool_class: observation_tool_class(tool_name),
+            },
+            ProviderInteractionKind::Question => ObservationKindV1::QuestionRequested {
+                correlation_id: opaque_interaction_correlation(event, provider_sequence),
+                tool_class: observation_tool_class(tool_name),
+            },
+        }),
+        ProviderEvent::SubagentStarted { agent_id, agent_type, .. } => {
+            kinds.push(ObservationKindV1::SubagentStarted {
+                correlation_id: opaque_subagent_correlation(
+                    event.instance_id,
+                    event.generation,
+                    source,
+                    agent_id,
+                ),
+                class: agent_type
+                    .as_deref()
+                    .map(observation_tool_class)
+                    .unwrap_or_else(|| "Task".to_owned()),
+            });
+        }
+        ProviderEvent::SubagentStopped { agent_id } if !is_pty_hint => {
+            kinds.push(ObservationKindV1::SubagentCompleted {
+                correlation_id: opaque_subagent_correlation(
+                    event.instance_id,
+                    event.generation,
+                    source,
+                    agent_id,
+                ),
+                success: None,
+            });
+        }
+        ProviderEvent::RateLimited { .. } => kinds.push(ObservationKindV1::RateLimited),
+        ProviderEvent::SessionIdentityObserved { .. }
+        | ProviderEvent::Text { .. }
+        | ProviderEvent::InteractionResolved { .. }
+        | ProviderEvent::ToolCompleted { .. }
+        | ProviderEvent::TurnCompleted { .. }
+        | ProviderEvent::ContextWindowUsage { .. }
+        | ProviderEvent::SubagentStopped { .. } => {}
+    }
+    let reports_capabilities = source_sequence == 1
+        || matches!(provider_event, ProviderEvent::SessionStarted { .. });
+    let mut observations = kinds.into_iter().map(|kind| ObservationV1 {
+            source_sequence,
+            observed_at_unix_ms: Some(unix_time_ms()),
+            evidence,
+            kind,
+            truncated: false,
+        })
+        .filter(|observation| observation.validate().is_ok())
+        .collect::<Vec<_>>();
+    // The observation engine coalesces this declaration by source and excludes it
+    // from timeline rows. Emit it with the first source receipt (or an explicit
+    // session restart), while gaps carry their own declaration for repair.
+    if reports_capabilities {
+        observations.insert(0, source_capabilities_observation(source, source_sequence, evidence));
+    }
+    observations
+}
+
+fn opaque_process_correlation(
+    instance_id: AgentInstanceId,
+    generation: SessionGeneration,
+) -> String {
+    let mut material = Vec::with_capacity(24);
+    material.extend_from_slice(b"provider-session");
+    material.extend_from_slice(&instance_id.0.to_le_bytes());
+    material.extend_from_slice(&generation.0.to_le_bytes());
+    let digest = digest(&SHA256, &material);
+    let mut correlation = String::with_capacity(21);
+    correlation.push_str("proc-");
+    for byte in &digest.as_ref()[..8] {
+        use std::fmt::Write as _;
+        write!(&mut correlation, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    correlation
+}
+
+fn node_lifecycle_observations(event: &ControlEvent) -> Vec<ObservationV1> {
+    let correlation_id = opaque_process_correlation(event.instance_id, event.generation);
+    let kinds = match &event.event {
+        ControlEventKind::Running { .. } => vec![
+            ObservationKindV1::SessionStarted,
+            ObservationKindV1::OwnedProcessStarted {
+                correlation_id,
+                class: "provider-session".to_owned(),
+            },
+        ],
+        ControlEventKind::Exited { exit_code, .. } => vec![
+            ObservationKindV1::OwnedProcessExited {
+                correlation_id,
+                success: exit_code.map(|code| code == 0),
+                exit_code: *exit_code,
+            },
+            ObservationKindV1::Exited {
+                success: exit_code.map(|code| code == 0),
+            },
+        ],
+        ControlEventKind::Failed { .. } => vec![
+            ObservationKindV1::OwnedProcessExited {
+                correlation_id,
+                success: Some(false),
+                exit_code: None,
+            },
+            ObservationKindV1::Error {
+                detail: "session-failed".to_owned(),
+            },
+        ],
+        ControlEventKind::Removed => vec![ObservationKindV1::Stopped],
+        _ => return Vec::new(),
+    };
+    std::iter::once(ObservationV1 {
+        source_sequence: event.sequence,
+        observed_at_unix_ms: Some(unix_time_ms()),
+        evidence: ObservationEvidenceV1::NodeLifecycle,
+        kind: ObservationKindV1::SourceCapabilities {
+            source_family: ObservationSourceFamilyV1::NodeLifecycle,
+            source_adapter: "node".to_owned(),
+            capabilities: ObservationCapabilitiesV1 {
+                owned_processes: true,
+                ..ObservationCapabilitiesV1::default()
+            },
+        },
+        truncated: false,
+    })
+        .chain(kinds.into_iter().map(|kind| ObservationV1 {
+            source_sequence: event.sequence,
+            observed_at_unix_ms: Some(unix_time_ms()),
+            evidence: ObservationEvidenceV1::NodeLifecycle,
+            kind,
+            truncated: false,
+        }))
+        .filter(|observation| observation.validate().is_ok())
+        .collect()
+}
+
+async fn run_native_session_catalog_operation<T, E, F>(
+    catalog: Arc<Mutex<NativeSessionCatalogAuthority>>,
+    operation: &'static str,
+    execute: F,
+) -> Result<T, NodeFailure>
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce(&mut NativeSessionCatalogAuthority) -> Result<T, E> + Send + 'static,
+{
+    let task = tokio::task::spawn_blocking(move || {
+        let mut catalog = match catalog.try_lock() {
+            Ok(catalog) => catalog,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(failure(
+                    NodeFailureCode::BackendBusy,
+                    "native session catalog operation is already running",
+                ));
+            }
+        };
+        execute(&mut catalog).map_err(|error| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                &format!("{operation} failed: {error}"),
+            )
+        })
+    });
+    timeout(Duration::from_millis(NATIVE_SESSION_CATALOG_TIMEOUT_MS), task)
+        .await
+        .map_err(|_| {
+            failure(
+                NodeFailureCode::BackendBusy,
+                &format!("{operation} exceeded its bounded deadline"),
+            )
+        })?
+        .map_err(|_| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                &format!("{operation} task failed"),
+            )
+        })?
 }
 
 fn windows_path_text(path: &OpaqueHostPath) -> &str {
@@ -271,15 +1053,22 @@ impl WorkspaceConfig {
                 message,
             }
         })?;
-        if self.managed_worktree_profiles
-            .insert(profile.profile_id().clone(), profile.clone())
-            .is_some()
-        {
+        if self.managed_worktree_profiles.contains_key(profile.profile_id()) {
             return Err(NodeServerError::DuplicateManagedWorktreeProfile {
                 workspace_id: self.workspace_id,
                 profile_id: profile.profile_id().clone(),
             });
         }
+        if self.managed_worktree_profiles.len()
+            == MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE
+        {
+            return Err(NodeServerError::ManagedWorktreeProfileCapacity {
+                workspace_id: self.workspace_id,
+                max: MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE,
+            });
+        }
+        self.managed_worktree_profiles
+            .insert(profile.profile_id().clone(), profile);
         Ok(self)
     }
 }
@@ -296,19 +1085,15 @@ pub struct NodeServerConfig {
     spawn_profiles: SpawnProfileRegistry,
     session_environment: Option<NodeSessionEnvironmentConfig>,
     history: Option<NativeHistoryConfig>,
+    harness_mcp_helper: Option<ReviewedHarnessMcpProgram>,
+    #[cfg(feature = "fixture")]
+    fixture_raw_pty_runtime: bool,
 }
 
 #[derive(Clone)]
 struct NodeSessionEnvironmentConfig {
     root: PathBuf,
     resolver: Arc<dyn NodeSecretResolver>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WorktreeServiceMode {
-    Manual,
-    Managed,
-    Off,
 }
 
 impl NodeServerConfig {
@@ -378,6 +1163,9 @@ impl NodeServerConfig {
             spawn_profiles: SpawnProfileRegistry::default(),
             session_environment: None,
             history: None,
+            harness_mcp_helper: None,
+            #[cfg(feature = "fixture")]
+            fixture_raw_pty_runtime: false,
         })
     }
 
@@ -430,6 +1218,26 @@ impl NodeServerConfig {
         self.history = Some(history);
         self
     }
+
+    /// Enables the H3B read proxy with one exact operator-reviewed helper file.
+    pub fn with_harness_mcp_helper(
+        mut self,
+        helper_program: impl Into<PathBuf>,
+    ) -> Result<Self, NodeServerError> {
+        #[cfg(not(windows))]
+        {
+            let _ = helper_program;
+            return Err(NodeServerError::InvalidHarnessMcpHelper);
+        }
+        #[cfg(windows)]
+        {
+        self.harness_mcp_helper = Some(
+            ReviewedHarnessMcpProgram::review(helper_program.into())
+                .map_err(|_| NodeServerError::InvalidHarnessMcpHelper)?,
+        );
+        Ok(self)
+        }
+    }
 }
 
 pub fn default_state_path(node_id: &NodeId) -> Result<PathBuf, NodeServerError> {
@@ -439,6 +1247,13 @@ pub fn default_state_path(node_id: &NodeId) -> Result<PathBuf, NodeServerError> 
 
 pub fn default_node_endpoint() -> Result<PathBuf, NodeServerError> {
     platform::default_node_endpoint().ok_or(NodeServerError::LocalRuntimeDirectoryUnavailable)
+}
+
+fn delivery_store_root_for_state_path(state_path: &Path) -> Option<PathBuf> {
+    let parent = state_path.parent()?;
+    let mut name = state_path.file_name()?.to_os_string();
+    name.push(".delivery-store");
+    Some(parent.join(name))
 }
 
 pub struct NodeServer {
@@ -463,12 +1278,70 @@ impl NodeServer {
         Self::new_fixture_with_spec(config, spec)
     }
 
+    #[cfg(feature = "fixture")]
+    pub fn new_clean_exit_fixture(
+        config: NodeServerConfig,
+        fixture_root: PathBuf,
+        started_marker: PathBuf,
+        release_signal: PathBuf,
+    ) -> Result<Self, NodeServerError> {
+        let mut spec = gate4agent_testkit::controlled_clean_exit_agent_spec(
+            &fixture_root,
+            &started_marker,
+            &release_signal,
+        )
+        .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        spec.id = AgentId::new("claude")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        spec.display_name = "Controlled Claude clean-exit fixture".to_owned();
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    #[cfg(feature = "fixture")]
+    pub fn new_monitoring_hook_fixture(
+        config: NodeServerConfig,
+    ) -> Result<Self, NodeServerError> {
+        let mut spec = gate4agent_testkit::monitoring_hook_agent_spec();
+        spec.id = AgentId::new("claude")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let mut server = Self::new_fixture_with_spec(config, spec)?;
+        Arc::get_mut(&mut server.shared)
+            .expect("fixture Node shared state must remain uniquely owned before run")
+            .fixture_semantic_hook_policy = true;
+        Ok(server)
+    }
+
     #[cfg(all(feature = "fixture", windows))]
     pub fn new_provider_bundle_argv_fixture(
         config: NodeServerConfig,
         agent_id: AgentId,
         proof_path: PathBuf,
     ) -> Result<Self, NodeServerError> {
+        let spec = Self::provider_bundle_argv_fixture_spec(agent_id, proof_path, None)?;
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    pub fn new_provider_bundle_argv_hold_fixture(
+        config: NodeServerConfig,
+        agent_id: AgentId,
+        proof_path: PathBuf,
+        release_signal: PathBuf,
+    ) -> Result<Self, NodeServerError> {
+        let spec = Self::provider_bundle_argv_fixture_spec(
+            agent_id,
+            proof_path,
+            Some(release_signal),
+        )?;
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    fn provider_bundle_argv_fixture_spec(
+        agent_id: AgentId,
+        proof_path: PathBuf,
+        release_signal: Option<PathBuf>,
+    ) -> Result<gate4agent_types::AgentSpec, NodeServerError> {
         if !matches!(agent_id.as_str(), "claude" | "codex" | "kimi") {
             return Err(NodeServerError::Registry(
                 "provider bundle argv fixture requires Claude, Codex, or Kimi".to_owned(),
@@ -495,11 +1368,60 @@ impl NodeServer {
                     .to_owned(),
             ));
         }
+        if let Some(release_signal) = release_signal.as_ref() {
+            if !release_signal.is_absolute()
+                || !release_signal
+                    .parent()
+                    .is_some_and(|parent| parent.is_dir())
+            {
+                return Err(NodeServerError::Registry(
+                    "provider bundle argv release path requires an existing absolute parent"
+                        .to_owned(),
+                ));
+            }
+            if release_signal.exists() {
+                return Err(NodeServerError::Registry(
+                    "provider bundle argv release path must not exist".to_owned(),
+                ));
+            }
+            let proof_parent = std::fs::canonicalize(
+                proof_path
+                    .parent()
+                    .expect("validated provider bundle proof parent"),
+            )
+            .map_err(|_| {
+                NodeServerError::Registry(
+                    "provider bundle argv proof parent is unavailable".to_owned(),
+                )
+            })?;
+            let release_parent = std::fs::canonicalize(
+                release_signal
+                    .parent()
+                    .expect("validated provider bundle release parent"),
+            )
+            .map_err(|_| {
+                NodeServerError::Registry(
+                    "provider bundle argv release parent is unavailable".to_owned(),
+                )
+            })?;
+            if proof_parent != release_parent {
+                return Err(NodeServerError::Registry(
+                    "provider bundle argv release path must share the proof parent".to_owned(),
+                ));
+            }
+        }
         let proof_path = proof_path.into_os_string().into_string().map_err(|_| {
             NodeServerError::Registry(
                 "provider bundle argv proof path is not valid Unicode".to_owned(),
             )
         })?;
+        let release_signal = release_signal.map(|release_signal| {
+            release_signal.into_os_string().into_string().map_err(|_| {
+                NodeServerError::Registry(
+                    "provider bundle argv release path is not valid Unicode".to_owned(),
+                )
+            })
+        }).transpose()?;
         let script = spec
             .launch
             .fixed_args
@@ -512,11 +1434,19 @@ impl NodeServer {
         } else {
             "if ($bundleArgs.Count -eq 0) { [IO.File]::WriteAllLines($proofPath, [string[]]@()); [Console]::Out.WriteLine('F62_NO_BUNDLE_ARGV') } elseif ($bundleArgs.Count -eq 2 -and $bundleArgs[0] -ceq '--skills-dir' -and [IO.Path]::IsPathRooted($bundleArgs[1]) -and (Test-Path -LiteralPath $bundleArgs[1] -PathType Container)) { if ((Split-Path -Leaf $bundleArgs[1]) -ne 'skills') { exit 93 }; [IO.File]::WriteAllLines($proofPath, [string[]]@($bundleArgs[0], $bundleArgs[1])); [Console]::Out.WriteLine('F62_BUNDLE_ARGV_VALIDATED') } else { exit 91 }"
         };
-        spec.launch.fixed_args.push(format!(
-            "& {{ param([string]$proofPath, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) {bundle_validation}; {script} }}",
-        ));
-        spec.launch.fixed_args.push(proof_path);
-        Self::new_fixture_with_spec(config, spec)
+        if let Some(release_signal) = release_signal {
+            spec.launch.fixed_args.push(format!(
+                "& {{ param([string]$proofPath, [string]$releaseSignal, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) {bundle_validation}; $deadline = [DateTime]::UtcNow.AddSeconds(45); while (-not (Test-Path -LiteralPath $releaseSignal -PathType Leaf)) {{ if ([DateTime]::UtcNow -ge $deadline) {{ exit 96 }}; Start-Sleep -Milliseconds 20 }}; {script} }}",
+            ));
+            spec.launch.fixed_args.push(proof_path);
+            spec.launch.fixed_args.push(release_signal);
+        } else {
+            spec.launch.fixed_args.push(format!(
+                "& {{ param([string]$proofPath, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) {bundle_validation}; {script} }}",
+            ));
+            spec.launch.fixed_args.push(proof_path);
+        }
+        Ok(spec)
     }
 
     #[cfg(all(feature = "fixture", windows))]
@@ -524,6 +1454,30 @@ impl NodeServer {
         config: NodeServerConfig,
         proof_path: PathBuf,
     ) -> Result<Self, NodeServerError> {
+        let catalog = Self::context_pack_fixture_catalog(proof_path, None)?;
+        Self::new_with_registry(config, catalog)
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    pub fn new_context_only_proof_fixture(
+        config: NodeServerConfig,
+        target_provider: AgentId,
+        proof_path: PathBuf,
+    ) -> Result<Self, NodeServerError> {
+        if target_provider.as_str() != "kimi" {
+            return Err(NodeServerError::Registry(
+                "context-only proof fixture requires Kimi".to_owned(),
+            ));
+        }
+        let catalog = Self::context_pack_fixture_catalog(proof_path, Some(&target_provider))?;
+        Self::new_with_registry(config, catalog)
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    fn context_pack_fixture_catalog(
+        proof_path: PathBuf,
+        context_only_target: Option<&AgentId>,
+    ) -> Result<AgentRegistry, NodeServerError> {
         if !proof_path.is_absolute()
             || !proof_path
                 .parent()
@@ -601,12 +1555,53 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
                     "& {{ param([string]$proofPath, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) {validation}; {script} }}",
                 ));
                 spec.launch.fixed_args.push(proof_path.clone());
+            } else if context_only_target.map(AgentId::as_str) == Some(provider_id) {
+                let script = spec.launch.fixed_args.pop().ok_or_else(|| {
+                    NodeServerError::Registry("PTY fixture script is unavailable".to_owned())
+                })?;
+                let validation = r#"
+$bundleArgs = @($bundleArgs)
+if ($bundleArgs.Count -ne 0) { exit 91 }
+$contextRoot = [Environment]::GetEnvironmentVariable('GATE4AGENT_CONTEXT_ROOT', 'Process')
+$cwd = (Get-Location).ProviderPath
+if ([string]::IsNullOrEmpty($contextRoot) -or -not [IO.Path]::IsPathRooted($contextRoot) -or -not (Test-Path -LiteralPath $contextRoot -PathType Container)) { exit 92 }
+$contextPath = Join-Path $contextRoot 'context-pack.json'
+if (-not (Test-Path -LiteralPath $contextPath -PathType Leaf)) { exit 93 }
+$entries = @(Get-ChildItem -LiteralPath $contextRoot -Force)
+if ($entries.Count -ne 1 -or $entries[0] -isnot [IO.FileInfo] -or [IO.Path]::GetFullPath($entries[0].FullName) -ine [IO.Path]::GetFullPath($contextPath)) { exit 94 }
+$contextFull = [IO.Path]::GetFullPath($contextRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+$cwdFull = [IO.Path]::GetFullPath($cwd).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+$separator = [IO.Path]::DirectorySeparatorChar
+if ($contextFull.Equals($cwdFull, [StringComparison]::OrdinalIgnoreCase) -or $contextFull.StartsWith($cwdFull + $separator, [StringComparison]::OrdinalIgnoreCase) -or $cwdFull.StartsWith($contextFull + $separator, [StringComparison]::OrdinalIgnoreCase)) { exit 95 }
+try { $document = [IO.File]::ReadAllText($contextPath) | ConvertFrom-Json -ErrorAction Stop } catch { exit 96 }
+if ($document.schema -cne 'g4a-context-pack-v1' -or $null -ne $document.PSObject.Properties['cwd']) { exit 97 }
+if (@('claude', 'codex', 'grok', 'kimi', 'qwen-code') -cnotcontains [string]$document.source_provider) { exit 98 }
+$messages = @($document.retained_messages)
+if ($messages.Count -eq 0) { exit 99 }
+$hasUser = $false
+$hasAssistant = $false
+foreach ($message in $messages) {
+    if ([string]::IsNullOrWhiteSpace([string]$message.text)) { exit 100 }
+    if ([string]$message.role -ceq 'user') { $hasUser = $true }
+    elseif ([string]$message.role -ceq 'assistant') { $hasAssistant = $true }
+    else { exit 101 }
+}
+if (-not $hasUser -or -not $hasAssistant) { exit 102 }
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($contextPath)))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+[IO.File]::WriteAllLines($proofPath, [string[]]@('context-only', $contextRoot, $cwd, $contextHash, [string]$document.schema, [string]$document.source_provider, [string]$messages.Count))
+[Console]::Out.WriteLine('F7_KIMI_CONTEXT_ONLY_VALIDATED')
+"#;
+                spec.launch.fixed_args.push(format!(
+                    "& {{ param([string]$proofPath, [Parameter(ValueFromRemainingArguments=$true)][string[]]$bundleArgs) {validation}; {script} }}",
+                ));
+                spec.launch.fixed_args.push(proof_path.clone());
             }
             specs.push(spec);
         }
         let catalog = AgentRegistry::new(specs)
             .map_err(|error| NodeServerError::Registry(error.to_string()))?;
-        Self::new_with_registry(config, catalog)
+        Ok(catalog)
     }
 
     #[cfg(feature = "fixture")]
@@ -648,6 +1643,139 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             })?
             .clone();
         spec.launch.program = launcher;
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    #[cfg(feature = "fixture")]
+    pub fn new_harness_mcp_proxy_fixture(
+        config: NodeServerConfig,
+        provider_program: PathBuf,
+        fixed_args: Vec<OsString>,
+        harness_mcp_program: PathBuf,
+    ) -> Result<Self, NodeServerError> {
+        if !provider_program.is_absolute() || fixed_args.len() > 32 {
+            return Err(NodeServerError::Registry(
+                "H3B fixture requires an absolute provider and at most 32 arguments".to_owned(),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&provider_program).map_err(|_| {
+            NodeServerError::Registry("H3B fixture provider is unavailable".to_owned())
+        })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(NodeServerError::Registry(
+                "H3B fixture provider must be an exact regular file".to_owned(),
+            ));
+        }
+        let program = provider_program.into_os_string().into_string().map_err(|_| {
+            NodeServerError::Registry("H3B fixture provider path is not Unicode".to_owned())
+        })?;
+        let fixed_args = fixed_args.into_iter().map(|argument| {
+            argument.into_string().map_err(|_| NodeServerError::Registry(
+                "H3B fixture argument is not Unicode".to_owned(),
+            ))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let argument_bytes = fixed_args.iter()
+            .try_fold(0usize, |total, argument| total.checked_add(argument.len()));
+        if program.contains('\0')
+            || fixed_args.iter().any(|argument| argument.contains('\0'))
+            || !matches!(argument_bytes, Some(total) if total <= 65_536)
+        {
+            return Err(NodeServerError::Registry(
+                "H3B fixture provider or arguments are invalid".to_owned(),
+            ));
+        }
+        let mut config = config.with_harness_mcp_helper(harness_mcp_program)?;
+        let agent_id = AgentId::new("codex")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let mut spec = builtin_registry().get(&agent_id).ok_or_else(|| {
+            NodeServerError::Registry("H3B fixture provider is unavailable".to_owned())
+        })?.clone();
+        spec.display_name = "Controlled H3B MCP proxy fixture".to_owned();
+        let process_name = Path::new(&program).file_name().and_then(|name| name.to_str())
+            .ok_or_else(|| NodeServerError::Registry(
+                "H3B fixture provider basename is unavailable".to_owned(),
+            ))?.to_owned();
+        spec.detection.command = process_name.clone();
+        spec.expected_processes = vec![gate4agent_types::ProcessMatcher::Exact {
+            name: process_name,
+        }];
+        spec.launch.program = program;
+        spec.launch.fixed_args = fixed_args;
+        config.fixture_raw_pty_runtime = true;
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    #[cfg(feature = "fixture")]
+    pub fn new_qwen_dual_output_fixture(
+        mut config: NodeServerConfig,
+        launcher: String,
+        fixed_args: Vec<String>,
+    ) -> Result<Self, NodeServerError> {
+        const FIXTURE_ARGUMENTS_MAX: usize = 32;
+        const FIXTURE_ARGUMENT_BYTES_MAX: usize = 65_536;
+
+        if launcher.contains('\0') {
+            return Err(NodeServerError::Registry(
+                "Qwen dual-output fixture path contains NUL".to_owned(),
+            ));
+        }
+        let launcher_path = Path::new(&launcher);
+        if !launcher_path.is_absolute() {
+            return Err(NodeServerError::Registry(
+                "Qwen dual-output fixture path must be absolute".to_owned(),
+            ));
+        }
+        let metadata = std::fs::metadata(launcher_path).map_err(|_| {
+            NodeServerError::Registry(
+                "Qwen dual-output fixture path is unavailable".to_owned(),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(NodeServerError::Registry(
+                "Qwen dual-output fixture path must be a regular file".to_owned(),
+            ));
+        }
+        let argument_bytes = fixed_args
+            .iter()
+            .try_fold(0usize, |total, argument| total.checked_add(argument.len()));
+        if fixed_args.len() > FIXTURE_ARGUMENTS_MAX
+            || fixed_args.iter().any(|argument| argument.contains('\0'))
+            || !matches!(argument_bytes, Some(total) if total <= FIXTURE_ARGUMENT_BYTES_MAX)
+        {
+            return Err(NodeServerError::Registry(
+                "Qwen dual-output fixture arguments are invalid".to_owned(),
+            ));
+        }
+        let qwen_id = AgentId::new("qwen-code")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let mut spec = builtin_registry()
+            .get(&qwen_id)
+            .ok_or_else(|| {
+                NodeServerError::Registry(
+                    "Qwen dual-output fixture provider is unavailable".to_owned(),
+                )
+            })?
+            .clone();
+        if spec.capabilities.adapters.pty_sidecar.is_none() {
+            return Err(NodeServerError::Registry(
+                "Qwen dual-output fixture sidecar binding is unavailable".to_owned(),
+            ));
+        }
+        let mut spawn_profile = config
+            .spawn_profiles
+            .iter()
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                NodeServerError::Registry(
+                    "Qwen dual-output fixture spawn profile is unavailable".to_owned(),
+                )
+            })?;
+        spawn_profile.provider = qwen_id;
+        config.spawn_profiles = SpawnProfileRegistry::new([spawn_profile])
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        spec.launch.program = launcher;
+        spec.launch.fixed_args = fixed_args;
         Self::new_fixture_with_spec(config, spec)
     }
 
@@ -743,13 +1871,37 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             .iter()
             .map(|contract| contract.provider.clone())
             .collect();
-        let provider_runtime_monitor = Arc::new(ProviderRuntimeMonitor::new(&catalog));
-        let provider_runtime_statuses = provider_runtime_monitor.collect();
+        #[cfg(feature = "fixture")]
+        let fixture_raw_pty_runtime = config.fixture_raw_pty_runtime;
+        #[cfg(not(feature = "fixture"))]
+        let fixture_raw_pty_runtime = false;
+        let (provider_runtime_monitor, provider_runtime_statuses) = if fixture_raw_pty_runtime {
+            let statuses = ProviderRuntimeStatuses::new(catalog.iter().map(|spec| {
+                crate::protocol::ProviderRuntimeStatus::raw_passthrough(spec.id.clone(), None)
+            })).expect("fixture provider catalog remains bounded");
+            (None, statuses)
+        } else {
+            let monitor = Arc::new(ProviderRuntimeMonitor::new(&catalog));
+            let statuses = monitor.collect();
+            (Some(monitor), statuses)
+        };
         let state_path_lock =
             session_registry::StatePathLock::acquire(config.state_path.as_deref())
                 .map_err(|error| {
                     durable_state_server_error(error, DURABLE_STATE_LOCK_FAILED_ERROR)
                 })?;
+        let (delivery_store, delivered_bundles) = match config.state_path.as_ref() {
+            Some(state_path) => {
+                let delivery_root = delivery_store_root_for_state_path(state_path)
+                    .ok_or(NodeServerError::DeliveryStore)?;
+                let (store, bundles) = DeliveryStore::open(delivery_root)
+                    .map_err(|_| NodeServerError::DeliveryStore)?;
+                (Some(store), bundles)
+            }
+            None => (None, Vec::new()),
+        };
+        let delivered_catalog = BundleCatalog::new(delivered_bundles)
+            .map_err(|_| NodeServerError::DeliveryStore)?;
         let session_environment_materializer = config
             .session_environment
             .as_ref()
@@ -761,11 +1913,18 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
                 .map_err(|_| NodeServerError::SessionEnvironmentMaterializer)
             })
             .transpose()?;
+        let native_session_catalog = config.history.clone().map(|history| {
+            Arc::new(Mutex::new(NativeSessionCatalogAuthority::new(history)))
+        });
         let (handle, runtime) = match config.history.clone() {
             Some(history) => NativeRuntime::new_with_history(catalog, config.runtime, history),
             None => NativeRuntime::new(catalog, config.runtime),
         };
         let native_launch_profile_control = runtime.native_launch_profile_control();
+        let harness_mcp_registry = config
+            .harness_mcp_helper
+            .clone()
+            .map(HarnessMcpProxyRegistry::new);
         let events = handle.subscribe(CONTROL_EVENT_SUBSCRIPTION_CAPACITY);
         let incarnation_id = random_incarnation_id()
             .map_err(NodeServerError::IncarnationIdentity)?;
@@ -777,7 +1936,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         let materializations = std::mem::take(&mut loaded.materializations);
         let (workspaces, records, persistence_warning) =
             merge_durable_state(&config.workspaces, loaded)?;
-        let shared = Arc::new(NodeShared::new_with_incarnation(
+        let mut shared = NodeShared::new_with_incarnation(
             handle,
             config.access_token.clone(),
             config.node_id.clone(),
@@ -785,11 +1944,12 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             workspaces,
             enabled_providers,
             provider_runtime_statuses,
-            Some(provider_runtime_monitor),
+            provider_runtime_monitor,
             provider_contracts,
             provider_adapter_contracts,
             config.spawn_profiles.clone(),
             Some(native_launch_profile_control),
+            native_session_catalog,
             session_environment_materializer,
             config.state_path.clone(),
             records,
@@ -798,7 +1958,19 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             materializations,
             persistence_warning,
             input_settle_timeout_ms,
-        ));
+        );
+        shared.harness_mcp_registry = harness_mcp_registry.clone();
+        shared.bundle_catalog = RwLock::new(delivered_catalog);
+        shared.delivery_store = Mutex::new(delivery_store);
+        let shared = Arc::new(shared);
+        if let Some(registry) = harness_mcp_registry {
+            let weak = Arc::downgrade(&shared);
+            registry.set_event_sink(Arc::new(move |event| {
+                if let Some(shared) = weak.upgrade() {
+                    shared.publish_transient(event);
+                }
+            }));
+        }
         if shared.persistence_error().is_none() {
             shared.persist_state().map_err(|error| {
                 durable_state_server_error(error, DURABLE_STATE_COMMIT_FAILED_ERROR)
@@ -893,9 +2065,8 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             .bundle_catalog
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut bundles = catalog.iter().cloned().collect::<Vec<_>>();
-        bundles.push(bundle);
-        *catalog = BundleCatalog::new(bundles)
+        catalog
+            .insert_idempotent(bundle)
             .map_err(|error| NodeServerError::BundleCatalog(error.to_string()))?;
         Ok(())
     }
@@ -1126,6 +2297,11 @@ fn declared_adapter_bindings(
         AdapterFamily::PtySemantic,
         spec.capabilities.transports.pty_adapter.as_ref(),
     )?;
+    push_declared_binding(
+        &mut bindings,
+        AdapterFamily::Pipe,
+        spec.capabilities.adapters.pty_sidecar.as_ref(),
+    )?;
     let pipe_transport = spec.capabilities.transports.pipe.as_ref();
     let pipe_family = pipe_transport.map(|transport| match transport.protocol {
         gate4agent_types::PipeProtocol::SemanticNdjson
@@ -1321,8 +2497,11 @@ struct NodeShared {
     environment_materialization_profiles:
         RwLock<BTreeMap<SpawnEnvironmentProfileId, NodeSessionMaterializationProfile>>,
     bundle_catalog: RwLock<BundleCatalog>,
+    delivery_store: Mutex<Option<DeliveryStore>>,
     context_catalog: RwLock<ContextPackCatalog>,
     native_launch_profile_control: Option<NativeLaunchProfileControl>,
+    harness_mcp_registry: Option<HarnessMcpProxyRegistry>,
+    native_session_catalog: Option<Arc<Mutex<NativeSessionCatalogAuthority>>>,
     session_environment_materializer: Option<SessionEnvironmentMaterializer>,
     materializations: Mutex<BTreeMap<MaterializationId, MaterializationOwnershipRecord>>,
     spawn_idempotency: Mutex<SpawnIdempotencyCache>,
@@ -1347,6 +2526,21 @@ struct NodeShared {
     persistence_error: RwLock<Option<String>>,
     state_transaction: Mutex<()>,
     input_settle_timeout_ms: u64,
+    #[cfg(feature = "fixture")]
+    fixture_semantic_hook_policy: bool,
+}
+
+impl Drop for NodeShared {
+    fn drop(&mut self) {
+        if let Some(registry) = self.harness_mcp_registry.as_ref() {
+            let instances = registry.shutdown();
+            if let Some(control) = self.native_launch_profile_control.as_ref() {
+                for instance_id in instances {
+                    control.clear_native_harness_mcp_launch_overlay(instance_id);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1363,6 +2557,12 @@ struct SessionBinding {
     materialization_id: Option<MaterializationId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpawnRecordPolicy {
+    ProviderIdentityOnly,
+    Always,
+}
+
 struct NativeEnvironmentSelectionGuard {
     control: Option<NativeLaunchProfileControl>,
     instance_id: AgentInstanceId,
@@ -1371,6 +2571,22 @@ struct NativeEnvironmentSelectionGuard {
 struct NativeInstanceOverlayGuard {
     control: Option<NativeLaunchProfileControl>,
     instance_id: AgentInstanceId,
+}
+
+struct NativeHarnessMcpOverlayGuard {
+    control: NativeLaunchProfileControl,
+    instance_id: AgentInstanceId,
+}
+
+impl NativeHarnessMcpOverlayGuard {
+    fn retain(self) { std::mem::forget(self); }
+}
+
+impl Drop for NativeHarnessMcpOverlayGuard {
+    fn drop(&mut self) {
+        self.control
+            .clear_native_harness_mcp_launch_overlay(self.instance_id);
+    }
 }
 
 impl NativeInstanceOverlayGuard {
@@ -1451,6 +2667,7 @@ enum SpawnIdempotencyValue {
         request: ManagedWorktreeSpawnRequest,
         result: Result<ManagedWorktreeSpawnReceipt, NodeFailure>,
     },
+    HarnessMcp,
 }
 
 impl SpawnIdempotencyValue {
@@ -1464,6 +2681,7 @@ impl SpawnIdempotencyValue {
                 .as_ref()
                 .ok()
                 .and_then(|receipt| receipt.spawn.context.as_ref()),
+            Self::HarnessMcp => None,
         }
         .is_some_and(|receipt| &receipt.id == context_id)
     }
@@ -1477,6 +2695,7 @@ struct ControllerLease {
 
 struct NodeEventHistory {
     last_sequence: u64,
+    replay_floor_sequence: u64,
     events: VecDeque<NodeEventEnvelope>,
     record_providers: BTreeMap<SessionRecordId, AgentId>,
     removed_record_providers: BTreeMap<u64, AgentId>,
@@ -1486,6 +2705,7 @@ impl NodeEventHistory {
     fn new(record_providers: BTreeMap<SessionRecordId, AgentId>) -> Self {
         Self {
             last_sequence: 0,
+            replay_floor_sequence: 1,
             events: VecDeque::with_capacity(NODE_EVENT_HISTORY_MAX),
             record_providers,
             removed_record_providers: BTreeMap::new(),
@@ -1507,6 +2727,7 @@ impl NodeShared {
         provider_adapter_contracts: Vec<ProviderAdapterContractSupport>,
         spawn_profiles: SpawnProfileRegistry,
         native_launch_profile_control: Option<NativeLaunchProfileControl>,
+        native_session_catalog: Option<Arc<Mutex<NativeSessionCatalogAuthority>>>,
         session_environment_materializer: Option<SessionEnvironmentMaterializer>,
         state_path: Option<PathBuf>,
         records: Vec<ManagedSessionRecord>,
@@ -1543,8 +2764,7 @@ impl NodeShared {
         ).expect("durable managed worktree registry was validated while loading");
         managed_worktrees.clear_stale_session_holders(incarnation_id, unix_time_ms());
         managed_worktrees.reattach_record_holders(
-            &records.iter().map(|record| (record.record_id.clone(), record.workspace_id.clone()))
-                .collect::<Vec<_>>(),
+            &managed_worktree_record_holders(&records),
             unix_time_ms(),
         );
         Self {
@@ -1576,8 +2796,11 @@ impl NodeShared {
             environment_profiles: RwLock::new(BTreeMap::new()),
             environment_materialization_profiles: RwLock::new(BTreeMap::new()),
             bundle_catalog: RwLock::new(BundleCatalog::default()),
+            delivery_store: Mutex::new(None),
             context_catalog: RwLock::new(ContextPackCatalog::default()),
             native_launch_profile_control,
+            harness_mcp_registry: None,
+            native_session_catalog,
             session_environment_materializer,
             materializations: Mutex::new(
                 materializations
@@ -1616,6 +2839,8 @@ impl NodeShared {
             ),
             state_transaction: Mutex::new(()),
             input_settle_timeout_ms,
+            #[cfg(feature = "fixture")]
+            fixture_semantic_hook_policy: false,
         }
     }
 
@@ -1639,6 +2864,7 @@ impl NodeShared {
             Vec::new(),
             Vec::new(),
             SpawnProfileRegistry::default(),
+            None,
             None,
             None,
             None,
@@ -1712,6 +2938,32 @@ impl NodeShared {
         })
     }
 
+    fn admit_qwen_sidecar_observation_policy(
+        &self,
+        provider: &AgentId,
+        mode: SessionMode,
+        policy: ProviderRuntimePolicy,
+    ) -> ProviderRuntimePolicy {
+        let exact_qwen_sidecar = mode == SessionMode::Pty
+            && provider.as_str() == "qwen-code"
+            && self.provider_adapter_contracts.iter().any(|contract| {
+                contract.provider == *provider
+                    && contract.family == AdapterFamily::Pipe
+                    && contract.adapter_id.as_str() == "qwen-code"
+            });
+        if !exact_qwen_sidecar || policy.semantic_readiness {
+            return policy;
+        }
+        ProviderRuntimePolicy::new(
+            policy.raw_pty_lifecycle,
+            true,
+            policy.structured_prompt,
+            policy.provider_session_identity,
+            policy.semantic_resume,
+        )
+        .expect("exact Qwen sidecar observation policy is internally valid")
+    }
+
     fn resolve_environment_profile(
         &self,
         resolved: &ResolvedSpawnSpec,
@@ -1767,6 +3019,105 @@ impl NodeShared {
             bundle,
         )?;
         Ok(Some(bundle.receipt()))
+    }
+
+    fn begin_delivery_stage(
+        &self,
+        manifest: DeliveryBundleManifestV2,
+    ) -> Result<NodeResponse, NodeFailure> {
+        let mut store = self
+            .delivery_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = store.as_mut().ok_or_else(|| {
+            failure(
+                NodeFailureCode::DeliveryStageStorageFailed,
+                "node delivery store is unavailable",
+            )
+        })?;
+        let begun = store.begin(manifest).map_err(delivery_failure)?;
+        Ok(NodeResponse::DeliveryStageBegun {
+            stage_id: begun.stage_id,
+            manifest_digest: begun.manifest_digest,
+            missing_blobs: begun.missing_blobs,
+        })
+    }
+
+    fn put_delivery_blob_chunk(
+        &self,
+        stage_id: DeliveryStageId,
+        blob_digest: DeliveryBlobDigestV1,
+        offset: u64,
+        chunk_hex: DeliveryBlobChunkHexV1,
+    ) -> Result<NodeResponse, NodeFailure> {
+        let mut store = self
+            .delivery_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = store.as_mut().ok_or_else(|| {
+            failure(
+                NodeFailureCode::DeliveryStageStorageFailed,
+                "node delivery store is unavailable",
+            )
+        })?;
+        let accepted = store
+            .put_chunk(&stage_id, &blob_digest, offset, &chunk_hex.decode())
+            .map_err(delivery_failure)?;
+        Ok(NodeResponse::DeliveryBlobChunkAccepted {
+            stage_id: accepted.stage_id,
+            blob_digest: accepted.blob_digest,
+            next_offset: accepted.next_offset,
+        })
+    }
+
+    fn commit_delivery_stage(
+        &self,
+        stage_id: DeliveryStageId,
+    ) -> Result<DeliveryCommitReceiptV1, NodeFailure> {
+        let mut store = self
+            .delivery_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = store.as_mut().ok_or_else(|| {
+            failure(
+                NodeFailureCode::DeliveryStageStorageFailed,
+                "node delivery store is unavailable",
+            )
+        })?;
+        let prepared = store.prepare_commit(&stage_id).map_err(delivery_failure)?;
+        let mut catalog = self
+            .bundle_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next_catalog = catalog.clone();
+        next_catalog
+            .insert_idempotent(prepared.bundle().clone())
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::DeliveryStageConflict,
+                    "delivery bundle identity conflicts with installed content",
+                )
+            })?;
+        let receipt = store.publish_commit(prepared).map_err(delivery_failure)?;
+        *catalog = next_catalog;
+        Ok(receipt)
+    }
+
+    fn abort_delivery_stage(
+        &self,
+        stage_id: &DeliveryStageId,
+    ) -> Result<(), NodeFailure> {
+        let mut store = self
+            .delivery_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = store.as_mut().ok_or_else(|| {
+            failure(
+                NodeFailureCode::DeliveryStageStorageFailed,
+                "node delivery store is unavailable",
+            )
+        })?;
+        store.abort(stage_id).map_err(delivery_failure)
     }
 
     fn resolve_context(
@@ -2238,17 +3589,35 @@ impl NodeShared {
                 })?,
             ))
         } else if has_environment_overlay {
-            Some(PreparedNativeLaunchOverlay::Environment(NativeLaunchEnvironmentOverlay::new(
-                provider.clone(),
-                transport,
-                environment,
-            )
-            .map_err(|_| {
-                failure(
-                    NodeFailureCode::BackendOperationFailed,
-                    "session environment overlay is invalid",
+            let context_only = environment_profile.is_none()
+                && bundle.is_none()
+                && context.is_some();
+            let overlay = if context_only {
+                NativeLaunchEnvironmentOverlay::new_context_root(
+                    provider.clone(),
+                    transport,
+                    environment,
                 )
-            })?))
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::ContextPackMaterializationFailed,
+                        "context-only launch overlay is invalid",
+                    )
+                })?
+            } else {
+                NativeLaunchEnvironmentOverlay::new(
+                    provider.clone(),
+                    transport,
+                    environment,
+                )
+                .map_err(|_| {
+                    failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "session environment overlay is invalid",
+                    )
+                })?
+            };
+            Some(PreparedNativeLaunchOverlay::Environment(overlay))
         } else {
             None
         };
@@ -2907,6 +4276,35 @@ impl NodeShared {
             );
     }
 
+    fn claim_harness_mcp_spawn(
+        &self,
+        _reservation_id: &HarnessMcpReservationId,
+        _activation_digest: &HarnessMcpActivationDigest,
+        spec: &SpawnSpec,
+        now: Instant,
+    ) -> Result<(), NodeFailure> {
+        let mut cache = self.spawn_idempotency.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.entries.retain(|_, entry| entry.expires_at > now);
+        if cache.entries.contains_key(&spec.idempotency_key) {
+            return Err(failure(
+                NodeFailureCode::SpawnIdempotencyConflict,
+                "spawn idempotency key was reused across spawn kinds",
+            ));
+        }
+        if cache.entries.len() >= SPAWN_IDEMPOTENCY_MAX_ENTRIES {
+            return Err(failure(
+                NodeFailureCode::SpawnIdempotencyCapacity,
+                "spawn idempotency cache reached its bounded capacity",
+            ));
+        }
+        cache.entries.insert(spec.idempotency_key.clone(), SpawnIdempotencyEntry {
+            value: SpawnIdempotencyValue::HarnessMcp,
+            expires_at: now + Duration::from_millis(SPAWN_IDEMPOTENCY_TTL_MS),
+        });
+        Ok(())
+    }
+
     fn replay_managed_spawn(
         &self,
         request: &ManagedWorktreeSpawnRequest,
@@ -2970,11 +4368,15 @@ impl NodeShared {
                 "spawn profile is unavailable on this node",
             )
         })?;
-        let resolved = spec.resolve(defaults).map_err(|_| {
-            failure(
+        let resolved = spec.resolve(defaults).map_err(|error| match error {
+            SpawnSpecResolveError::ProfileRevisionMismatch { .. } => failure(
+                NodeFailureCode::SpawnProfileRevisionMismatch,
+                "spawn profile revision does not match the loaded profile",
+            ),
+            _ => failure(
                 NodeFailureCode::InvalidRequest,
                 "spawn specification could not be resolved",
-            )
+            ),
         })?;
         if resolved.target.worktree_id.is_some() {
             self.require_worktree_service(&resolved.target.workspace_id)?;
@@ -3024,9 +4426,19 @@ impl NodeShared {
         &self,
         spec: SpawnSpec,
     ) -> Result<ResolvedSpawnReceipt, NodeFailure> {
+        self.spawn_from_spec_with_proxy(spec, None).await
+    }
+
+    async fn spawn_from_spec_with_proxy(
+        &self,
+        spec: SpawnSpec,
+        harness_mcp: Option<&PreparedHarnessMcpSpawn>,
+    ) -> Result<ResolvedSpawnReceipt, NodeFailure> {
         let accepted_at = Instant::now();
-        if let Some(replayed) = self.replay_spawn_spec(&spec, accepted_at)? {
-            return replayed;
+        if harness_mcp.is_none() {
+            if let Some(replayed) = self.replay_spawn_spec(&spec, accepted_at)? {
+                return replayed;
+            }
         }
         let resolved = self.resolve_spawn_spec(&spec)?;
         let environment_profile = self.resolve_environment_profile(&resolved)?;
@@ -3039,7 +4451,9 @@ impl NodeShared {
             Ok(workspace_id) => workspace_id,
             Err(error) => {
                 let result = Err(error);
-                self.remember_spawn_spec(spec, result.clone(), accepted_at);
+                if harness_mcp.is_none() {
+                    self.remember_spawn_spec(spec, result.clone(), accepted_at);
+                }
                 return result;
             }
         };
@@ -3052,7 +4466,9 @@ impl NodeShared {
                 NodeFailureCode::ManagedWorktreeOwnershipConflict,
                 "managed worktree targets may only be spawned through their lease request",
             ));
-            self.remember_spawn_spec(spec, result.clone(), accepted_at);
+            if harness_mcp.is_none() {
+                self.remember_spawn_spec(spec, result.clone(), accepted_at);
+            }
             return result;
         }
         let result = self
@@ -3067,8 +4483,10 @@ impl NodeShared {
                 context.clone(),
                 None,
                 None,
+                SpawnRecordPolicy::Always,
                 Some(deadline),
                 &required_capabilities,
+                harness_mcp,
             )
             .await
             .map(|session| {
@@ -3080,8 +4498,90 @@ impl NodeShared {
                     context,
                 )
             });
-        self.remember_spawn_spec(spec, result.clone(), accepted_at);
+        if harness_mcp.is_none() {
+            self.remember_spawn_spec(spec, result.clone(), accepted_at);
+        }
         result
+    }
+
+    async fn spawn_from_spec_with_harness_mcp(
+        &self,
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        spec: SpawnSpec,
+        deadline_unix_ms: u64,
+    ) -> Result<ResolvedSpawnReceipt, NodeFailure> {
+        let registry = self.harness_mcp_registry.as_ref().ok_or_else(|| {
+            failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP proxy is not configured")
+        })?;
+        if let Some(receipt) = registry
+            .replay_spawn(&reservation_id, &activation_digest, &spec)
+            .map_err(harness_mcp_failure)?
+        {
+            return Ok(receipt);
+        }
+        let resolved = self.resolve_spawn_spec(&spec)?;
+        let prepared = registry
+            .prepare_spawn(
+                &reservation_id,
+                &activation_digest,
+                &spec,
+                deadline_unix_ms,
+                resolved.provider.clone(),
+            )
+            .map_err(harness_mcp_failure)?;
+        self.claim_harness_mcp_spawn(
+            &reservation_id,
+            &activation_digest,
+            &spec,
+            Instant::now(),
+        )?;
+        let spawn = self.spawn_from_spec_with_proxy(spec, Some(&prepared)).await;
+        let mut receipt = match spawn {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = registry.abort(&reservation_id, &activation_digest);
+                return Err(error);
+            }
+        };
+        let record_id = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&receipt.session.session.instance_id)
+            .and_then(|binding| binding.record_id.clone());
+        let record_id = match record_id {
+            Some(record_id) => record_id,
+            None => {
+                let rollback = self.remove_session(&receipt.session).await;
+                let _ = registry.abort(&reservation_id, &activation_digest);
+                if let Err(rollback_error) = rollback {
+                    return Err(rollback_error);
+                }
+                return Err(failure(
+                    NodeFailureCode::BindingMismatch,
+                    "harness MCP spawn did not retain its exact managed record",
+                ));
+            }
+        };
+        receipt.harness_mcp_proxy = Some(ResolvedHarnessMcpProxyReceiptV1 {
+            reservation_id: reservation_id.clone(),
+            activation_digest: activation_digest.clone(),
+        });
+        if let Err(error) = registry.mark_spawned(
+            &prepared,
+            receipt.session.clone(),
+            record_id,
+            receipt.clone(),
+        ) {
+            let rollback = self.remove_session(&receipt.session).await;
+            let _ = registry.abort(&reservation_id, &activation_digest);
+            if let Err(rollback_error) = rollback {
+                return Err(rollback_error);
+            }
+            return Err(harness_mcp_failure(error));
+        }
+        Ok(receipt)
     }
 
     async fn spawn_managed_worktree(
@@ -3092,6 +4592,7 @@ impl NodeShared {
         if let Some(replayed) = self.replay_managed_spawn(&request, accepted_at)? {
             return replayed;
         }
+        let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
         if request.spawn_spec.target.worktree_id.is_some() {
             let result = Err(failure(
                 NodeFailureCode::InvalidRequest,
@@ -3100,7 +4601,6 @@ impl NodeShared {
             self.remember_managed_spawn(request, result.clone(), accepted_at);
             return result;
         }
-        let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
         let environment_profile = self.resolve_environment_profile(&resolved)?;
         let bundle = self.resolve_bundle(&resolved, environment_profile.as_ref())?;
         let context = self.resolve_context(&resolved)?;
@@ -3260,25 +4760,40 @@ impl NodeShared {
             context.clone(),
             Some(lease.lease_id.clone()),
             Some(runtime_policy),
+            SpawnRecordPolicy::Always,
             Some(deadline),
             &required_capabilities,
+            None,
         ).await;
         let session = match spawn {
             Ok(session) => session,
             Err(error) => {
-                let _ = self.cleanup_managed_worktree(&lease.lease_id, true).await;
+                if self
+                    .cleanup_managed_worktree(&lease.lease_id, true)
+                    .await
+                    .is_err()
+                {
+                    self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::Backend,
+                    );
+                }
                 let result = Err(error);
                 self.remember_managed_spawn(request, result.clone(), accepted_at);
                 return result;
             }
         };
-        let record_id = {
+        let (record_id, raw_inventory_record_id) = {
             let mut bindings = self.session_bindings.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let binding = bindings.get_mut(&session.session.instance_id)
                 .expect("successful spawn retains its session binding");
             binding.managed_worktree_lease_id = Some(lease.lease_id.clone());
-            binding.record_id.clone()
+            if runtime_policy.provider_session_identity {
+                (binding.record_id.clone(), None)
+            } else {
+                (None, binding.record_id.clone())
+            }
         };
         let bound = self.managed_worktrees.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3296,6 +4811,15 @@ impl NodeShared {
         let snapshot = match bound {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                if raw_inventory_record_id
+                    .as_ref()
+                    .is_some_and(|record_id| self.discard_record(record_id).is_err())
+                {
+                    self.mark_managed_recovery_required(
+                        &lease.lease_id,
+                        ManagedWorktreeCleanupFailure::Backend,
+                    );
+                }
                 let _ = self.remove_session(&session).await;
                 self.mark_managed_recovery_required(
                     &lease.lease_id,
@@ -3307,8 +4831,26 @@ impl NodeShared {
             }
         };
         if let Err(error) = self.persist_state() {
+            if raw_inventory_record_id
+                .as_ref()
+                .is_some_and(|record_id| self.discard_record(record_id).is_err())
+            {
+                self.mark_managed_recovery_required(
+                    &lease.lease_id,
+                    ManagedWorktreeCleanupFailure::Backend,
+                );
+            }
             let _ = self.remove_session(&session).await;
-            let _ = self.cleanup_managed_worktree(&lease.lease_id, true).await;
+            if self
+                .cleanup_managed_worktree(&lease.lease_id, true)
+                .await
+                .is_err()
+            {
+                self.mark_managed_recovery_required(
+                    &lease.lease_id,
+                    ManagedWorktreeCleanupFailure::Backend,
+                );
+            }
             let result = Err(persistence_failure(error));
             self.remember_managed_spawn(request, result.clone(), accepted_at);
             return result;
@@ -3567,8 +5109,7 @@ impl NodeShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         managed.reattach_record_holders(
-            &records.iter().map(|record| (record.record_id.clone(), record.workspace_id.clone()))
-                .collect::<Vec<_>>(),
+            &managed_worktree_record_holders(&records),
             unix_time_ms(),
         );
         let materializations = self
@@ -3578,7 +5119,7 @@ impl NodeShared {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let result = session_registry::save_v8(
+        let result = session_registry::save_v9(
             self.state_path.as_deref(),
             &self.node_id,
             &workspaces,
@@ -3602,6 +5143,14 @@ impl NodeShared {
     async fn begin_shutdown_locked(&self) -> Result<(), NodeFailure> {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        if let Some(registry) = self.harness_mcp_registry.as_ref() {
+            let instances = registry.shutdown();
+            if let Some(control) = self.native_launch_profile_control.as_ref() {
+                for instance_id in instances {
+                    control.clear_native_harness_mcp_launch_overlay(instance_id);
+                }
+            }
         }
         let deadline = Instant::now() + Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
         let mut first_error = None;
@@ -3770,6 +5319,7 @@ impl NodeShared {
         provider: AgentId,
         mode: SessionMode,
         runtime_policy: ProviderRuntimePolicy,
+        record_policy: SpawnRecordPolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     ) -> Result<Option<SessionRecordId>, NodeFailure> {
         self.bind_spawn_session_with_materialization(
@@ -3777,6 +5327,7 @@ impl NodeShared {
             provider,
             mode,
             runtime_policy,
+            record_policy,
             environment_profile,
             None,
             None,
@@ -3790,12 +5341,15 @@ impl NodeShared {
         provider: AgentId,
         mode: SessionMode,
         runtime_policy: ProviderRuntimePolicy,
+        record_policy: SpawnRecordPolicy,
         environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
         bundle: Option<ResolvedBundleReceipt>,
         context: Option<ResolvedContextPackReceipt>,
         materialization_id: Option<MaterializationId>,
     ) -> Result<Option<SessionRecordId>, NodeFailure> {
-        if !runtime_policy.provider_session_identity {
+        if record_policy == SpawnRecordPolicy::ProviderIdentityOnly
+            && !runtime_policy.provider_session_identity
+        {
             self.bind_session_with_materialization(
                 address,
                 runtime_policy,
@@ -3806,15 +5360,16 @@ impl NodeShared {
             );
             return Ok(None);
         }
+        let record_owns_lifecycle = runtime_policy.provider_session_identity;
         let record = self.new_record(
             address,
             provider,
             mode,
-            ManagedSessionState::IdentityPending,
+            active_record_state(runtime_policy.provider_session_identity, false),
             None,
-            environment_profile.clone(),
-            bundle.clone(),
-            context.clone(),
+            record_owns_lifecycle.then(|| environment_profile.clone()).flatten(),
+            record_owns_lifecycle.then(|| bundle.clone()).flatten(),
+            record_owns_lifecycle.then(|| context.clone()).flatten(),
         )?;
         let record_id = record.record_id.clone();
         let transaction = self
@@ -3822,32 +5377,36 @@ impl NodeShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.insert_record(record.clone())?;
-        let previous_materialization = if let Some(materialization_id) = materialization_id.as_ref() {
-            let mut materializations = self
-                .materializations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(ownership) = materializations.get_mut(materialization_id) else {
-                drop(materializations);
-                self.remove_record_memory(&record_id);
-                return Err(failure(
-                    NodeFailureCode::BackendOperationFailed,
-                    "session environment ownership disappeared before binding",
-                ));
-            };
-            let previous = ownership.clone();
-            if ownership
-                .transfer_to_record(record_id.clone(), unix_time_ms())
-                .is_err()
-            {
-                drop(materializations);
-                self.remove_record_memory(&record_id);
-                return Err(failure(
-                    NodeFailureCode::BackendOperationFailed,
-                    "session environment ownership transfer failed",
-                ));
+        let previous_materialization = if record_owns_lifecycle {
+            if let Some(materialization_id) = materialization_id.as_ref() {
+                let mut materializations = self
+                    .materializations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(ownership) = materializations.get_mut(materialization_id) else {
+                    drop(materializations);
+                    self.remove_record_memory(&record_id);
+                    return Err(failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "session environment ownership disappeared before binding",
+                    ));
+                };
+                let previous = ownership.clone();
+                if ownership
+                    .transfer_to_record(record_id.clone(), unix_time_ms())
+                    .is_err()
+                {
+                    drop(materializations);
+                    self.remove_record_memory(&record_id);
+                    return Err(failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "session environment ownership transfer failed",
+                    ));
+                }
+                Some(previous)
+            } else {
+                None
             }
-            Some(previous)
         } else {
             None
         };
@@ -3909,6 +5468,34 @@ impl NodeShared {
         ))
     }
 
+    fn allocate_task_id(&self) -> Result<TaskId, NodeFailure> {
+        for _ in 0..8 {
+            let bytes = random_nonce().map_err(|error| {
+                failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    &format!("task identity generation failed: {error}"),
+                )
+            })?;
+            let mut nonce = [0_u8; 12];
+            nonce.copy_from_slice(&bytes[..12]);
+            let task_id = TaskId::from_nonce(nonce);
+            let records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !records.records.values().any(|record| {
+                record.task_binding.as_ref().and_then(|binding| binding.task_id.as_ref())
+                    == Some(&task_id)
+            }) {
+                return Ok(task_id);
+            }
+        }
+        Err(failure(
+            NodeFailureCode::BackendBusy,
+            "could not allocate a unique task ID",
+        ))
+    }
+
     fn default_record_name(&self, provider: &AgentId) -> String {
         let records = self
             .session_records
@@ -3950,6 +5537,7 @@ impl NodeShared {
             bundle,
             context_id: context.as_ref().map(|receipt| receipt.id.clone()),
             context,
+            task_binding: None,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             last_error: None,
@@ -4011,6 +5599,30 @@ impl NodeShared {
                     "managed session record does not exist",
                 )
             })
+    }
+
+    fn revalidate_session_record_preview(
+        &self,
+        expected: &ManagedSessionRecord,
+        identity: &ProviderSessionIdentity,
+    ) -> Result<(), NodeFailure> {
+        let current = self.record(&expected.record_id)?;
+        let current_root = self.workspace_root(&current.workspace_id)?;
+        if current.provider != expected.provider
+            || current.workspace_id != expected.workspace_id
+            || current.canonical_root != expected.canonical_root
+            || current.provider_session.as_ref() != Some(identity)
+            || !platform::roots_equal(
+                &current_root,
+                windows_path_text(&current.canonical_root),
+            )
+        {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session changed while its preview was loading",
+            ));
+        }
+        Ok(())
     }
 
     fn remove_record_memory(&self, record_id: &SessionRecordId) -> Option<ManagedSessionRecord> {
@@ -4125,6 +5737,192 @@ impl NodeShared {
         let updated = self.record(record_id)?;
         self.publish_record(updated.clone());
         Ok(updated)
+    }
+
+    fn set_session_task(
+        &self,
+        record_id: &SessionRecordId,
+        expected_revision: u64,
+        target: SessionTaskTargetV1,
+    ) -> Result<ManagedSessionRecord, NodeFailure> {
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.record(record_id)?;
+        let current_task_id = current
+            .task_binding
+            .as_ref()
+            .and_then(|binding| binding.task_id.as_ref());
+        let current_revision = current
+            .task_binding
+            .as_ref()
+            .map_or(0, |binding| binding.revision);
+        if expected_revision != current_revision {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session task binding revision changed",
+            ));
+        }
+        let exact = match &target {
+            SessionTaskTargetV1::Existing { task_id } => current_task_id == Some(task_id),
+            SessionTaskTargetV1::Clear => current_task_id.is_none(),
+            SessionTaskTargetV1::New => false,
+        };
+        if exact {
+            return Ok(current);
+        }
+        let revision = current_revision.checked_add(1).ok_or_else(|| {
+            failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session task binding revision is exhausted",
+            )
+        })?;
+        let task_id = match target {
+            SessionTaskTargetV1::New => Some(self.allocate_task_id()?),
+            SessionTaskTargetV1::Existing { task_id } => Some(task_id),
+            SessionTaskTargetV1::Clear => None,
+        };
+        let changed_at_unix_ms = unix_time_ms()
+            .max(current.updated_at_unix_ms.checked_add(1).ok_or_else(|| {
+                failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "managed session record timestamp is exhausted",
+                )
+            })?);
+        let updated = {
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let record = records.records.get_mut(record_id).ok_or_else(|| {
+                failure(
+                    NodeFailureCode::UnknownSessionRecord,
+                    "managed session record does not exist",
+                )
+            })?;
+            record.task_binding = Some(SessionTaskBindingV1 {
+                revision,
+                task_id,
+                changed_at_unix_ms,
+            });
+            record.updated_at_unix_ms = changed_at_unix_ms;
+            record.clone()
+        };
+        if let Err(error) = self.persist_state_locked() {
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .insert(record_id.clone(), current);
+            return Err(persistence_failure(error));
+        }
+        drop(transaction);
+        self.publish_record(updated.clone());
+        Ok(updated)
+    }
+
+    fn index_provider_session(
+        &self,
+        workspace_id: WorkspaceId,
+        provider: AgentId,
+        identity: ProviderSessionIdentity,
+        display_name: String,
+    ) -> Result<ManagedSessionRecord, NodeFailure> {
+        self.index_provider_session_with_policy(
+            workspace_id,
+            provider,
+            identity,
+            display_name,
+            false,
+        )
+    }
+
+    fn index_provider_session_with_policy(
+        &self,
+        workspace_id: WorkspaceId,
+        provider: AgentId,
+        identity: ProviderSessionIdentity,
+        display_name: String,
+        allow_validated_transcript_path: bool,
+    ) -> Result<ManagedSessionRecord, NodeFailure> {
+        validate_display_name(&display_name)
+            .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        identity
+            .validate()
+            .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+        if identity.transcript_path.is_some() && !allow_validated_transcript_path {
+            return Err(failure(
+                NodeFailureCode::InvalidRequest,
+                "provider session reference index v1 does not accept transcript paths",
+            ));
+        }
+        let canonical_root = self.workspace_root(&workspace_id)?;
+        if !self.enabled_providers.contains(&provider) {
+            return Err(failure(
+                NodeFailureCode::InvalidRequest,
+                "provider is not enabled on this node",
+            ));
+        }
+
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing) = records.records.values().find(|candidate| {
+                candidate.provider_session.as_ref().is_some_and(|candidate_identity| {
+                    candidate_identity.key == identity.key && candidate_identity.id == identity.id
+                })
+            }) {
+                if existing.provider == provider && existing.workspace_id == workspace_id {
+                    return Ok(existing.clone());
+                }
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "provider session reference conflicts with another provider or workspace",
+                ));
+            }
+            if records.records.len() >= MAX_MANAGED_SESSION_RECORDS {
+                return Err(failure(
+                    NodeFailureCode::BackendBusy,
+                    "managed session record capacity is full; forget an inactive record first",
+                ));
+            }
+        }
+
+        let now = unix_time_ms();
+        let record = ManagedSessionRecord {
+            record_id: self.allocate_record_id()?,
+            display_name,
+            provider,
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id,
+            canonical_root: opaque_windows_path(canonical_root),
+            provider_session: Some(identity),
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            last_error: None,
+        };
+        self.insert_record(record.clone())?;
+        if let Err(error) = self.persist_state_locked() {
+            self.remove_record_memory(&record.record_id);
+            return Err(persistence_failure(error));
+        }
+        drop(transaction);
+        self.publish_record(record.clone());
+        Ok(record)
     }
 
     fn bound_address_for_record(&self, record_id: &SessionRecordId) -> Option<SessionAddress> {
@@ -4528,6 +6326,15 @@ impl NodeShared {
             .ok_or_else(|| failure(NodeFailureCode::UnknownWorkspace, "workspace does not exist"))
     }
 
+    fn workspace_roots(&self) -> Vec<PathBuf> {
+        self.workspaces
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(PathBuf::from)
+            .collect()
+    }
+
     async fn inspect_workspace(
         &self,
         workspace_id: WorkspaceId,
@@ -4572,12 +6379,55 @@ impl NodeShared {
                     .map(|(workspace_id, _)| workspace_id.clone());
             }
         }
+        if git.is_repository {
+            git.managed_worktree = self
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .git_scope(&workspace_id, git.branch.as_deref());
+        }
         Ok(WorkspaceInspection {
             workspace_id,
             entries,
             tree_truncated,
             git,
         })
+    }
+
+    async fn browse_host_directories(
+        &self,
+        directory: Option<OpaqueHostPath>,
+        after: Option<OpaqueHostPath>,
+    ) -> Result<HostDirectoryListing, NodeFailure> {
+        let permit = self
+            .inspection_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendBusy,
+                    "host directory browse capacity is busy",
+                )
+            })?;
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            browse_host_directories(directory, after)
+        });
+        timeout(Duration::from_millis(HOST_DIRECTORY_BROWSE_TIMEOUT_MS), task)
+            .await
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::HostDirectoryReadTimedOut,
+                    "host directory browse exceeded its bounded deadline",
+                )
+            })?
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::HostDirectoryReadFailed,
+                    "host directory browse task failed",
+                )
+            })?
+            .map_err(host_directory_failure)
     }
 
     async fn read_workspace_file(
@@ -4620,11 +6470,19 @@ impl NodeShared {
         })?
         .map_err(workspace_file_failure)?;
         let content = match content {
-            WorkspaceFileBytes::Utf8(text) => WorkspaceFileContent::Utf8 {
-                byte_len: u32::try_from(text.len())
-                    .expect("bounded workspace text length must fit u32"),
-                text,
-            },
+            WorkspaceFileBytes::Utf8(text) => {
+                let revision = Some(workspace_file_revision(text.as_bytes()));
+                return Ok(WorkspaceFileRead {
+                    workspace_id,
+                    path,
+                    content: WorkspaceFileContent::Utf8 {
+                        byte_len: u32::try_from(text.len())
+                            .expect("bounded workspace text length must fit u32"),
+                        text,
+                    },
+                    revision,
+                });
+            }
             WorkspaceFileBytes::NonUtf8 { byte_length } => {
                 WorkspaceFileContent::NonUtf8 {
                     byte_len: u32::try_from(byte_length)
@@ -4639,7 +6497,501 @@ impl NodeShared {
             workspace_id,
             path,
             content,
+            revision: None,
         })
+    }
+
+    async fn write_workspace_file(
+        &self,
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+        expected_revision: WorkspaceFileRevision,
+        text: String,
+    ) -> Result<WorkspaceFileRead, NodeFailure> {
+        let canonical_root = self.workspace_root(&workspace_id)?;
+        let permit = self.inspection_slots.clone().try_acquire_owned().map_err(|_| {
+            failure(NodeFailureCode::BackendBusy, "workspace file write capacity is busy")
+        })?;
+        let path_to_write = path.clone();
+        let expected = expected_revision.as_str().to_owned();
+        let text_to_write = text.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            write_workspace_file_to_disk(
+                Path::new(&canonical_root),
+                &path_to_write,
+                &expected,
+                &text_to_write,
+            )
+        });
+        let revision = timeout(Duration::from_millis(WORKSPACE_FILE_WRITE_TIMEOUT_MS), task)
+            .await
+            .map_err(|_| failure(NodeFailureCode::RepositoryFileWriteTimedOut, "repository file write exceeded its bounded deadline"))?
+            .map_err(|_| failure(NodeFailureCode::RepositoryFileWriteFailed, "repository file write task failed"))?
+            .map_err(workspace_file_write_failure)?;
+        Ok(WorkspaceFileRead {
+            workspace_id,
+            path,
+            content: WorkspaceFileContent::Utf8 {
+                byte_len: u32::try_from(text.len()).expect("bounded workspace text length must fit u32"),
+                text,
+            },
+            revision: Some(WorkspaceFileRevision::new(revision)
+                .expect("workspace writer returns a valid SHA-256 revision")),
+        })
+    }
+
+    async fn create_workspace_file(
+        &self,
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+    ) -> Result<WorkspaceFileRead, NodeFailure> {
+        let canonical_root = self.workspace_root(&workspace_id)?;
+        let permit = self.inspection_slots.clone().try_acquire_owned().map_err(|_| {
+            failure(NodeFailureCode::BackendBusy, "workspace entry create capacity is busy")
+        })?;
+        let path_to_create = path.clone();
+        let commit_state = Arc::new(AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING));
+        let task_commit_state = Arc::clone(&commit_state);
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            create_workspace_file_on_disk(
+                Path::new(&canonical_root),
+                &path_to_create,
+                &task_commit_state,
+            )
+        });
+        let revision = settle_workspace_entry_create(
+            task,
+            commit_state,
+            Duration::from_millis(WORKSPACE_ENTRY_CREATE_TIMEOUT_MS),
+            "repository file create exceeded its bounded deadline",
+            "repository file create task failed",
+        )
+        .await?;
+        Ok(WorkspaceFileRead {
+            workspace_id,
+            path,
+            content: WorkspaceFileContent::Utf8 {
+                text: String::new(),
+                byte_len: 0,
+            },
+            revision: Some(WorkspaceFileRevision::new(revision)
+                .expect("workspace creator returns a valid SHA-256 revision")),
+        })
+    }
+
+    async fn create_workspace_directory(
+        &self,
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+    ) -> Result<WorkspaceEntry, NodeFailure> {
+        let canonical_root = self.workspace_root(&workspace_id)?;
+        let permit = self.inspection_slots.clone().try_acquire_owned().map_err(|_| {
+            failure(NodeFailureCode::BackendBusy, "workspace entry create capacity is busy")
+        })?;
+        let path_to_create = path.clone();
+        let commit_state = Arc::new(AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING));
+        let task_commit_state = Arc::clone(&commit_state);
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            create_workspace_directory_on_disk(
+                Path::new(&canonical_root),
+                &path_to_create,
+                &task_commit_state,
+            )
+        });
+        settle_workspace_entry_create(
+            task,
+            commit_state,
+            Duration::from_millis(WORKSPACE_ENTRY_CREATE_TIMEOUT_MS),
+            "repository directory create exceeded its bounded deadline",
+            "repository directory create task failed",
+        )
+        .await?;
+        Ok(WorkspaceEntry {
+            relative_path: path,
+            kind: WorkspaceEntryKind::Directory,
+        })
+    }
+
+    async fn read_git_history(
+        &self,
+        workspace_id: WorkspaceId,
+        path: Option<RepositoryPath>,
+        before: Option<GitObjectId>,
+        limit: u16,
+    ) -> Result<GitHistoryPage, NodeFailure> {
+        let _permit = self.inspection_slots.clone().try_acquire_owned().map_err(|_| {
+            failure(NodeFailureCode::BackendBusy, "git history capacity is busy")
+        })?;
+        let root = self.workspace_root(&workspace_id)?;
+        read_git_history_bounded(&root, path.as_ref(), before.as_ref(), limit).await
+    }
+
+    async fn read_git_diff(
+        &self,
+        workspace_id: WorkspaceId,
+        request: GitDiffRequest,
+    ) -> Result<GitDiff, NodeFailure> {
+        let _permit = self.inspection_slots.clone().try_acquire_owned().map_err(|_| {
+            failure(NodeFailureCode::BackendBusy, "git diff capacity is busy")
+        })?;
+        let root = self.workspace_root(&workspace_id)?;
+        read_git_diff_bounded(&root, request).await
+    }
+
+    fn native_session_route_root(
+        &self,
+        route: &NativeSessionCatalogRoute,
+    ) -> Result<Option<String>, NodeFailure> {
+        route
+            .validate()
+            .map_err(|message| failure(NodeFailureCode::InvalidRequest, message))?;
+        match route.scope {
+            gate4agent_types::NativeSessionCatalogScope::Workspace => route
+                .workspace_id
+                .as_ref()
+                .map(|workspace_id| self.workspace_root(workspace_id))
+                .transpose(),
+            gate4agent_types::NativeSessionCatalogScope::Unregistered => Ok(None),
+        }
+    }
+
+    fn project_native_session_entries(
+        &self,
+        route: &NativeSessionCatalogRoute,
+        entries: Vec<ScopedNativeSessionCatalogEntry>,
+    ) -> Vec<crate::protocol::NativeSessionCatalogEntry> {
+        let current_root = route
+            .workspace_id
+            .as_ref()
+            .and_then(|workspace_id| self.workspace_root(workspace_id).ok());
+        let records = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut seen_records = std::collections::HashSet::new();
+        entries
+            .into_iter()
+            .map(|entry| {
+                let record_id = route.workspace_id.as_ref().and_then(|workspace_id| {
+                    let matches = records
+                        .records
+                        .values()
+                        .filter(|record| {
+                            record.provider == route.provider
+                                && record.workspace_id == *workspace_id
+                                && current_root.as_deref().is_some_and(|root| {
+                                    platform::roots_equal(
+                                        root,
+                                        windows_path_text(&record.canonical_root),
+                                    )
+                                })
+                                && record.provider_session.as_ref().is_some_and(|identity| {
+                                    session_registry::same_provider_session(
+                                        &record.provider,
+                                        identity,
+                                        &route.provider,
+                                        &entry.provider_session,
+                                    )
+                                })
+                        })
+                        .map(|record| record.record_id.clone())
+                        .collect::<Vec<_>>();
+                    (matches.len() == 1
+                        && seen_records.insert(matches[0].clone()))
+                        .then(|| matches[0].clone())
+                });
+                let metadata = entry.metadata;
+                crate::protocol::NativeSessionCatalogEntry {
+                    selection_id: metadata.selection_id,
+                    title: metadata.title,
+                    modified_at_unix_ms: metadata.modified_at_unix_ms,
+                    model: metadata.model,
+                    message_count: metadata.message_count,
+                    completed_turn_count: metadata.completed_turn_count,
+                    external_group: entry.external_group,
+                    record_id,
+                }
+            })
+            .collect()
+    }
+
+    async fn catalog_native_sessions(
+        &self,
+        route: NativeSessionCatalogRoute,
+        limit: u16,
+    ) -> Result<(
+        Vec<crate::protocol::NativeSessionCatalogEntry>,
+        crate::protocol::NativeSessionCatalogSummary,
+    ), NodeFailure> {
+        let canonical_root = self.native_session_route_root(&route)?;
+        let registered_workspace_roots = self.workspace_roots();
+        let provider = route.provider.clone();
+        let scope = route.scope;
+        let catalog = self.native_session_catalog.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::InvalidRequest,
+                "native session catalog is not configured",
+            )
+        })?;
+        let _permit = Arc::clone(&self.inspection_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendBusy,
+                    "native session catalog capacity is busy",
+                )
+            })?;
+        let page = run_native_session_catalog_operation(
+            catalog,
+            "native session catalog",
+            move |catalog| {
+                catalog.catalog_initial_for_scope(
+                    &provider,
+                    scope,
+                    canonical_root.as_deref().map(Path::new),
+                    &registered_workspace_roots,
+                    limit,
+                )
+            },
+        )
+        .await?;
+        let summary = crate::protocol::NativeSessionCatalogSummary {
+            catalog_revision: page.revision,
+            recent_cutoff_unix_ms: page.cutoff_unix_ms,
+            recent_total_count: page.recent_total_count,
+            older_total_count: page.older_total_count,
+            recent_next_after_selection_id: page.next_after_selection_id,
+            recent_has_more: page.remaining_count > 0,
+        };
+        Ok((self.project_native_session_entries(&route, page.entries), summary))
+    }
+
+    async fn page_native_sessions(
+        &self,
+        route: NativeSessionCatalogRoute,
+        window: crate::protocol::NativeSessionCatalogWindow,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        after_selection_id: Option<String>,
+        limit: u16,
+    ) -> Result<crate::protocol::NativeSessionCatalogPage, NodeFailure> {
+        let canonical_root = self.native_session_route_root(&route)?;
+        let registered_workspace_roots = self.workspace_roots();
+        let provider = route.provider.clone();
+        let scope = route.scope;
+        let catalog = self.native_session_catalog.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::InvalidRequest,
+                "native session catalog is not configured",
+            )
+        })?;
+        let _permit = Arc::clone(&self.inspection_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendBusy,
+                    "native session catalog capacity is busy",
+                )
+            })?;
+        let page = run_native_session_catalog_operation(
+            catalog,
+            "native session catalog page",
+            move |catalog| {
+                Ok::<_, std::convert::Infallible>(catalog.catalog_page_for_scope(
+                    &provider,
+                    scope,
+                    canonical_root.as_deref().map(Path::new),
+                    &registered_workspace_roots,
+                    window,
+                    catalog_revision,
+                    recent_cutoff_unix_ms,
+                    after_selection_id.as_deref(),
+                    limit,
+                ))
+            },
+        )
+        .await?;
+        let page = page.map_err(|error| match error {
+            NativeSessionCatalogError::StaleCatalog => failure(
+                NodeFailureCode::StaleNativeSessionCatalog,
+                "native session catalog revision or cursor is stale",
+            ),
+            _ => failure(
+                NodeFailureCode::BackendOperationFailed,
+                "native session catalog page failed",
+            ),
+        })?;
+        let entries = self.project_native_session_entries(&route, page.entries);
+        Ok(crate::protocol::NativeSessionCatalogPage {
+            window: page.window,
+            revision: page.revision,
+            entries,
+            next_after_selection_id: page.next_after_selection_id,
+            remaining_count: page.remaining_count,
+            has_more: page.remaining_count > 0,
+        })
+    }
+
+    async fn preview_native_session(
+        &self,
+        selection: NativeSessionSelection,
+        message_limit: u16,
+    ) -> Result<crate::protocol::NativeSessionPreview, NodeFailure> {
+        selection
+            .validate()
+            .map_err(|message| failure(NodeFailureCode::InvalidRequest, message))?;
+        let canonical_root = self.native_session_route_root(&selection.route)?;
+        let registered_workspace_roots = self.workspace_roots();
+        let provider = selection.route.provider.clone();
+        let scope = selection.route.scope;
+        let catalog_revision = selection.catalog_revision;
+        let recent_cutoff_unix_ms = selection.recent_cutoff_unix_ms;
+        let selection_id = selection.selection_id.clone();
+        let catalog = self.native_session_catalog.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::InvalidRequest,
+                "native session preview is not configured",
+            )
+        })?;
+        let _permit = Arc::clone(&self.inspection_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendBusy,
+                    "native session preview capacity is busy",
+                )
+            })?;
+        let preview = run_native_session_catalog_operation(
+            catalog,
+            "native session preview",
+            move |catalog| {
+                Ok::<_, std::convert::Infallible>(catalog.preview_for_scope(
+                    &provider,
+                    scope,
+                    canonical_root.as_deref().map(Path::new),
+                    &registered_workspace_roots,
+                    catalog_revision,
+                    recent_cutoff_unix_ms,
+                    &selection_id,
+                    message_limit,
+                ))
+            },
+        )
+        .await?;
+        preview
+            .map(Into::into)
+            .map_err(native_session_preview_failure)
+    }
+
+    async fn index_native_session(
+        &self,
+        selection: NativeSessionSelection,
+        display_name: String,
+    ) -> Result<ManagedSessionRecord, NodeFailure> {
+        selection
+            .validate()
+            .map_err(|message| failure(NodeFailureCode::InvalidRequest, message))?;
+        if selection.route.scope
+            != gate4agent_types::NativeSessionCatalogScope::Workspace
+        {
+            return Err(failure(
+                NodeFailureCode::WorkspaceRegistrationRequired,
+                "register the external project as a workspace before indexing or resuming it",
+            ));
+        }
+        let workspace_id = selection
+            .route
+            .workspace_id
+            .clone()
+            .ok_or_else(|| failure(NodeFailureCode::InvalidRequest, "workspace route is incomplete"))?;
+        let canonical_root = self
+            .native_session_route_root(&selection.route)?
+            .ok_or_else(|| failure(NodeFailureCode::InvalidRequest, "workspace route is incomplete"))?;
+        let registered_workspace_roots = self.workspace_roots();
+        let provider = selection.route.provider.clone();
+        let catalog_revision = selection.catalog_revision;
+        let recent_cutoff_unix_ms = selection.recent_cutoff_unix_ms;
+        let selection_id = selection.selection_id.clone();
+        let catalog = self.native_session_catalog.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::InvalidRequest,
+                "native session index is not configured",
+            )
+        })?;
+        let _permit = Arc::clone(&self.inspection_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendBusy,
+                    "native session index capacity is busy",
+                )
+            })?;
+        let resolved = run_native_session_catalog_operation(
+            catalog,
+            "native session index resolution",
+            move |catalog| {
+                Ok::<_, std::convert::Infallible>(catalog.resolve_selection_for_scope(
+                    &provider,
+                    gate4agent_types::NativeSessionCatalogScope::Workspace,
+                    Some(Path::new(&canonical_root)),
+                    &registered_workspace_roots,
+                    catalog_revision,
+                    recent_cutoff_unix_ms,
+                    &selection_id,
+                ))
+            },
+        )
+        .await?
+        .map_err(native_session_preview_failure)?;
+        self.index_provider_session_with_policy(
+            workspace_id,
+            selection.route.provider,
+            resolved.identity,
+            display_name,
+            true,
+        )
+    }
+
+    async fn preview_native_session_by_session_id(
+        &self,
+        workspace_id: WorkspaceId,
+        provider: AgentId,
+        session_id: String,
+        message_limit: u16,
+    ) -> Result<gate4agent_types::NativeSessionPreview, NodeFailure> {
+        let canonical_root = self.workspace_root(&workspace_id)?;
+        let registered_workspace_roots = self.workspace_roots();
+        let catalog = self.native_session_catalog.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::InvalidRequest,
+                "native session preview is not configured",
+            )
+        })?;
+        let _permit = Arc::clone(&self.inspection_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::BackendBusy,
+                    "native session preview capacity is busy",
+                )
+            })?;
+        run_native_session_catalog_operation(
+            catalog,
+            "native session preview",
+            move |catalog| {
+                catalog.preview_session_id_for_workspace(
+                    &provider,
+                    Path::new(&canonical_root),
+                    &registered_workspace_roots,
+                    &session_id,
+                    message_limit,
+                )
+            },
+        )
+        .await
     }
 
     async fn register_workspace(
@@ -4707,6 +7059,10 @@ impl NodeShared {
             workspace_id: workspace_id.clone(),
             canonical_root: opaque_windows_path(workspace.canonical_root().to_owned()),
             sessions: Vec::new(),
+            worktree_service_mode: Some(WorktreeServiceMode::Manual),
+            managed_worktree_profiles: Some(WorktreeProfileInventory {
+                profiles: Vec::new(),
+            }),
         };
         workspaces.insert(workspace_id.clone(), workspace.canonical_root().to_owned());
         drop(workspaces);
@@ -4761,6 +7117,70 @@ impl NodeShared {
             self.publish_record(record);
         }
         Ok(snapshot)
+    }
+
+    async fn create_standalone_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        root: String,
+        initial_branch: Option<String>,
+    ) -> Result<WorkspaceSnapshot, NodeFailure> {
+        validate_workspace_request_root(&root)?;
+        validate_git_revision("initial branch", initial_branch.as_deref())?;
+        let preflight_workspace_id = workspace_id.clone();
+        let preflight_root = root.clone();
+        let canonical_candidate = tokio::task::spawn_blocking(move || {
+            canonical_standalone_workspace_candidate(&preflight_workspace_id, &preflight_root)
+        })
+        .await
+        .map_err(|_| failure(
+            NodeFailureCode::BackendOperationFailed,
+            "standalone workspace root preflight task failed",
+        ))?
+        .map_err(|error| failure(NodeFailureCode::InvalidWorkspaceRoot, &error.to_string()))?;
+        {
+            let workspaces = self
+                .workspaces
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if workspaces.contains_key(&workspace_id) {
+                return Err(failure(
+                    NodeFailureCode::DuplicateWorkspaceId,
+                    "workspace ID is already registered",
+                ));
+            }
+            if let Some((existing_id, _)) = workspaces.iter().find(|(_, existing_root)| {
+                platform::roots_equal(existing_root, &canonical_candidate)
+            }) {
+                return Err(failure(
+                    NodeFailureCode::DuplicateWorkspaceRoot,
+                    &format!("workspace root is already registered as '{existing_id}'"),
+                ));
+            }
+        }
+        let prepared = prepare_standalone_workspace(root, initial_branch.as_deref())
+            .await
+            .map_err(standalone_workspace_failure)?;
+        prepared
+            .verify_for_registration()
+            .await
+            .map_err(standalone_workspace_failure)?;
+        match self
+            .register_workspace(workspace_id, prepared.root().to_owned())
+            .await
+        {
+            Ok(workspace) => Ok(workspace),
+            Err(registration_error) => {
+                if prepared.compensate_registration_failure().await {
+                    Err(registration_error)
+                } else {
+                    Err(failure(
+                        NodeFailureCode::StandaloneWorkspaceRecoveryRequired,
+                        "standalone workspace initialization succeeded but registration failed; recovery is required",
+                    ))
+                }
+            }
+        }
     }
 
     fn unregister_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), NodeFailure> {
@@ -4885,10 +7305,24 @@ impl NodeShared {
         )
         .await
         .map_err(git_worktree_failure)?;
-        let workspace = self
+        let workspace = match self
             .register_workspace(workspace_id, worktree.path.clone())
             .await
-            .map_err(|error| failure(error.code, &error.message))?;
+        {
+            Ok(workspace) => workspace,
+            Err(registration_error) => {
+                if remove_git_worktree(&source_root, &worktree.path).await.is_err() {
+                    return Err(failure(
+                        NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                        "worktree registration failed and compensation requires recovery",
+                    ));
+                }
+                return Err(failure(
+                    registration_error.code,
+                    &registration_error.message,
+                ));
+            }
+        };
         worktree.workspace_id = Some(workspace.workspace_id.clone());
         Ok((protocol_worktree(worktree), workspace))
     }
@@ -5238,6 +7672,14 @@ impl NodeShared {
         }) {
             let removed = bindings.remove(&address.session.instance_id);
             self.clear_terminal_frame_watermark(address);
+            if let Some(control) = self.native_launch_profile_control.as_ref() {
+                control.clear_native_harness_mcp_launch_overlay(
+                    address.session.instance_id,
+                );
+            }
+            if let Some(registry) = self.harness_mcp_registry.as_ref() {
+                registry.revoke_session(address);
+            }
             if removed
                 .as_ref()
                 .is_some_and(|binding| {
@@ -5364,6 +7806,12 @@ impl NodeShared {
     }
 
     fn publish_control(&self, event: ControlEvent) {
+        let revokes_harness_mcp = matches!(
+            &event.event,
+            ControlEventKind::Exited { .. }
+                | ControlEventKind::Failed { .. }
+                | ControlEventKind::Removed
+        );
         let (address, previous_address, record_id, identity_admitted, resume_command_rejected) = {
             let mut bindings = self
                 .session_bindings
@@ -5443,7 +7891,43 @@ impl NodeShared {
                 resume_command_rejected,
             );
         }
-        self.publish(NodeEvent::Control { address, event });
+        let managed_record_id = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&address.session.instance_id)
+            .filter(|binding| {
+                binding.workspace_id == address.workspace_id
+                    && binding.generation == address.session.generation
+            })
+            .and_then(|binding| binding.record_id.clone());
+        let observations = provider_observations(&event);
+        self.publish(NodeEvent::Control {
+            address: address.clone(),
+            event,
+        });
+        for observation in observations {
+            self.publish(NodeEvent::Observation {
+                address: address.clone(),
+                observation: observation.clone(),
+            });
+            if let Some(record_id) = managed_record_id.as_ref() {
+                self.publish(NodeEvent::ManagedObservation {
+                    record_id: record_id.clone(),
+                    observation,
+                });
+            }
+        }
+        if revokes_harness_mcp {
+            if let Some(registry) = self.harness_mcp_registry.as_ref() {
+                registry.revoke_session(&address);
+            }
+            if let Some(control) = self.native_launch_profile_control.as_ref() {
+                control.clear_native_harness_mcp_launch_overlay(
+                    address.session.instance_id,
+                );
+            }
+        }
     }
 
     fn reconcile_managed_record(
@@ -5628,6 +8112,7 @@ impl NodeShared {
                             bundle: current_snapshot.bundle,
                             context_id: current_snapshot.context_id,
                             context: current_snapshot.context,
+                            task_binding: current_snapshot.task_binding,
                             created_at_unix_ms: now,
                             updated_at_unix_ms: now,
                             last_error: None,
@@ -5665,11 +8150,10 @@ impl NodeShared {
                     | ControlEventKind::ResumeAuthorized { .. }
                     | ControlEventKind::Resumed { .. } => {
                         current.active_session = Some(address.clone());
-                        current.state = if current.provider_session.is_some() {
-                            ManagedSessionState::Live
-                        } else {
-                            ManagedSessionState::IdentityPending
-                        };
+                        current.state = active_record_state(
+                            identity_admitted,
+                            current.provider_session.is_some(),
+                        );
                         current.updated_at_unix_ms = unix_time_ms();
                         current.last_error = None;
                         upserts.push(current.clone());
@@ -5856,10 +8340,30 @@ impl NodeShared {
                         workspace_id: workspace_id.clone(),
                         canonical_root: opaque_windows_path(canonical_root.clone()),
                         sessions: Vec::new(),
+                        worktree_service_mode: Some(
+                            self.worktree_service_modes
+                                .get(workspace_id)
+                                .copied()
+                                .unwrap_or(WorktreeServiceMode::Manual),
+                        ),
+                        managed_worktree_profiles: Some(WorktreeProfileInventory {
+                            profiles: self
+                                .managed_worktree_profiles
+                                .get(workspace_id)
+                                .into_iter()
+                                .flat_map(BTreeMap::values)
+                                .map(|profile| ManagedWorktreeProfileSummary {
+                                    id: profile.profile_id().clone(),
+                                    revision: profile.revision().clone(),
+                                    retention: profile.retention(),
+                                })
+                                .collect(),
+                        }),
                     },
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let mut agent_progress = Vec::new();
         for session in &control.sessions {
             let Some(binding) = bindings.get(&session.instance_id) else {
                 continue;
@@ -5868,6 +8372,18 @@ impl NodeShared {
                 continue;
             }
             if let Some(workspace) = workspaces.get_mut(&binding.workspace_id) {
+                let address = SessionAddress {
+                    workspace_id: binding.workspace_id.clone(),
+                    session: SessionKey {
+                        instance_id: session.instance_id,
+                        generation: session.generation,
+                    },
+                };
+                if let Some(progress) =
+                    agent_progress_from_provider_snapshot(address, &session.provider)
+                {
+                    agent_progress.push(progress);
+                }
                 workspace.sessions.push(session.clone());
             }
         }
@@ -5901,6 +8417,23 @@ impl NodeShared {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .snapshots(),
+            launch_inventory: Some(LaunchInventory {
+                spawn_profiles: Some(self.spawn_profiles.iter().map(|profile| {
+                    SpawnProfileSummary {
+                        id: profile.profile_id.clone(),
+                        revision: profile.revision.clone(),
+                    }
+                }).collect()),
+                bundles: Some(
+                    self.bundle_catalog
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .iter()
+                        .map(NodeBundle::receipt)
+                        .collect(),
+                ),
+            }),
+            agent_progress,
         }
     }
 
@@ -5916,10 +8449,17 @@ impl NodeShared {
             .expect("node event sequence exhausted");
         if history.events.len() == NODE_EVENT_HISTORY_MAX {
             if let Some(evicted) = history.events.pop_front() {
+                history.replay_floor_sequence = evicted
+                    .sequence
+                    .checked_add(1)
+                    .expect("node replay floor sequence exhausted");
                 history.removed_record_providers.remove(&evicted.sequence);
             }
         }
         match &event {
+            NodeEvent::HarnessMcpReadCall { .. } => {
+                panic!("transient harness MCP calls must not enter durable event history")
+            }
             NodeEvent::SessionRecordUpserted { record } => {
                 history
                     .record_providers
@@ -5933,6 +8473,8 @@ impl NodeShared {
             NodeEvent::ManagedWorktreeUpserted { .. }
             | NodeEvent::ManagedWorktreeRemoved { .. }
             | NodeEvent::Control { .. }
+            | NodeEvent::Observation { .. }
+            | NodeEvent::ManagedObservation { .. }
             | NodeEvent::ControllerChanged { .. }
             | NodeEvent::WorkspaceAdded { .. }
             | NodeEvent::WorkspaceRemoved { .. }
@@ -5945,6 +8487,12 @@ impl NodeShared {
         let _ = self.event_tx.send(envelope.clone());
         drop(history);
         envelope
+    }
+
+    fn publish_transient(&self, event: NodeEvent) {
+        assert!(event.requires_harness_mcp_proxy_capability());
+        assert!(event.harness_mcp_contract_is_valid_at(unix_time_ms()));
+        let _ = self.event_tx.send(NodeEventEnvelope { sequence: 0, event });
     }
 
     fn publish_terminal_frames(&self) {
@@ -6372,15 +8920,15 @@ impl NodeShared {
         })
     }
 
-    fn export_context_pack(
+    async fn export_context_pack(
         &self,
         address: &SessionAddress,
     ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
         let snapshot = self.internal_session_snapshot(address)?;
-        if !matches!(snapshot.status, SessionStatus::Running) {
+        if !context_pack_source_status_is_usable(&snapshot.status) {
             return Err(failure(
                 NodeFailureCode::InvalidRequest,
-                "context export requires a running source session",
+                "context export requires a running or successfully exited source session",
             ));
         }
         if snapshot.history.pending.is_some()
@@ -6391,19 +8939,37 @@ impl NodeShared {
                 "context export requires settled loaded history",
             ));
         }
-        let loaded = snapshot.history.loaded.as_ref().ok_or_else(|| {
+        let loaded = snapshot.history.loaded.clone().ok_or_else(|| {
             failure(
                 NodeFailureCode::InvalidRequest,
                 "context export requires settled loaded history",
             )
         })?;
-        let pack = NodeContextPack::export(
+        let source_provider = snapshot.agent_id.clone();
+        let loaded_candidate_id = snapshot.history.loaded_candidate_id.clone();
+        let repository = self
+            .context_pack_repository(&address.workspace_id)
+            .await?;
+        let current = self.internal_session_snapshot(address)?;
+        if !context_pack_source_status_is_usable(&current.status)
+            || current.agent_id != source_provider
+            || current.history.pending.is_some()
+            || current.history.loaded_candidate_id != loaded_candidate_id
+            || current.history.loaded.as_ref() != Some(&loaded)
+        {
+            return Err(failure(
+                NodeFailureCode::ContextPackMaterializationFailed,
+                "context source changed during bounded repository capture",
+            ));
+        }
+        let pack = NodeContextPack::export_with_repository(
             ContextPackLineageReceipt {
                 source_node_id: self.node_id.clone(),
                 source_session: address.clone(),
-                source_provider: snapshot.agent_id,
+                source_provider,
             },
-            loaded,
+            &loaded,
+            Some(repository),
         )
         .map_err(|_| {
             failure(
@@ -6423,6 +8989,102 @@ impl NodeShared {
                 )
             })?;
         Ok(receipt)
+    }
+
+    async fn context_pack_repository(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<ContextPackRepository, NodeFailure> {
+        let first = self
+            .context_pack_repository_observation(workspace_id)
+            .await?;
+        let second = self
+            .context_pack_repository_observation(workspace_id)
+            .await?;
+        stable_context_pack_repository(first, second)
+    }
+
+    async fn context_pack_repository_observation(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<ContextPackRepositoryObservation, NodeFailure> {
+        let git = self.inspect_workspace(workspace_id.clone()).await?.git;
+        let head = if git.is_repository {
+            let root = self.workspace_root(workspace_id)?;
+            match resolve_base_commit_with_timeout(
+                &root,
+                "HEAD",
+                GIT_COMMAND_TIMEOUT_MS,
+            )
+            .await
+            {
+                Ok(commit) => ContextPackRepositoryHead::Commit(commit),
+                Err(error) if error.kind == GitWorktreeErrorKind::Conflict => {
+                    ContextPackRepositoryHead::Unborn
+                }
+                Err(_) => {
+                    return Err(failure(
+                        NodeFailureCode::ContextPackMaterializationFailed,
+                        "context pack HEAD observation failed",
+                    ));
+                }
+            }
+        } else {
+            ContextPackRepositoryHead::NotRepository
+        };
+        let mut files = Vec::with_capacity(CONTEXT_PACK_SELECTED_FILES.len());
+        for selected_path in CONTEXT_PACK_SELECTED_FILES {
+            let path = RepositoryPath::utf8(selected_path.to_owned()).map_err(|_| {
+                failure(
+                    NodeFailureCode::InvalidRepositoryPath,
+                    "context pack selected file path is invalid",
+                )
+            })?;
+            match self.read_workspace_file(workspace_id.clone(), path).await {
+                Ok(WorkspaceFileRead {
+                    content: WorkspaceFileContent::Utf8 { text, byte_len },
+                    ..
+                }) => files.push(ContextPackRepositoryFileSource::utf8(
+                    selected_path,
+                    text,
+                    byte_len,
+                )),
+                Ok(WorkspaceFileRead {
+                    content: WorkspaceFileContent::NonUtf8 { byte_len },
+                    ..
+                }) => files.push(ContextPackRepositoryFileSource::skipped(
+                    selected_path,
+                    ContextPackSelectedFileSkipReason::NonUtf8,
+                    Some(byte_len),
+                )),
+                Ok(WorkspaceFileRead {
+                    content: WorkspaceFileContent::TooLarge { .. },
+                    ..
+                }) => files.push(ContextPackRepositoryFileSource::skipped(
+                    selected_path,
+                    ContextPackSelectedFileSkipReason::TooLarge,
+                    None,
+                )),
+                Err(error) => {
+                    let reason = if matches!(
+                        error.code,
+                        NodeFailureCode::InvalidRepositoryPath
+                            | NodeFailureCode::RepositoryFileNotRegular
+                            | NodeFailureCode::RepositoryPathUnsafe
+                    ) {
+                        ContextPackSelectedFileSkipReason::Unsafe
+                    } else {
+                        ContextPackSelectedFileSkipReason::Unavailable
+                    };
+                    files.push(ContextPackRepositoryFileSource::skipped(
+                        selected_path,
+                        reason,
+                        None,
+                    ));
+                }
+            }
+        }
+        Ok(ContextPackRepositoryObservation { head, git, files })
     }
 
     fn forget_context_pack(&self, context_id: &SpawnContextId) -> Result<(), NodeFailure> {
@@ -6675,8 +9337,10 @@ impl NodeShared {
                 None,
                 None,
                 None,
+                SpawnRecordPolicy::ProviderIdentityOnly,
                 None,
                 &[],
+                None,
             )
             .await
     }
@@ -6693,8 +9357,10 @@ impl NodeShared {
         context: Option<ResolvedContextPackReceipt>,
         managed_authority: Option<ManagedWorktreeLeaseId>,
         admitted_runtime_policy: Option<ProviderRuntimePolicy>,
+        record_policy: SpawnRecordPolicy,
         deadline: Option<Instant>,
         required_capabilities: &[ProviderRuntimeCapability],
+        harness_mcp: Option<&PreparedHarnessMcpSpawn>,
     ) -> Result<SessionAddress, NodeFailure> {
         let reserved_lease = self.managed_worktrees.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6736,6 +9402,15 @@ impl NodeShared {
         } else {
             self.admit_provider_runtime(&provider, runtime_requirement).await?
         };
+        #[cfg(feature = "fixture")]
+        let runtime_policy = if self.fixture_semantic_hook_policy {
+            ProviderRuntimePolicy::new(true, true, true, true, false)
+                .expect("monitoring Hook fixture policy is internally valid")
+        } else {
+            runtime_policy
+        };
+        let runtime_policy =
+            self.admit_qwen_sidecar_observation_policy(&provider, mode, runtime_policy);
         if required_capabilities
             .iter()
             .any(|capability| !runtime_policy.admits(*capability))
@@ -6758,6 +9433,36 @@ impl NodeShared {
         let address = SessionAddress {
             workspace_id: workspace_id.clone(),
             session,
+        };
+        let mut harness_mcp_overlay = if let Some(prepared) = harness_mcp {
+            if mode != SessionMode::Pty || prepared.provider != provider {
+                return Err(failure(
+                    NodeFailureCode::BindingMismatch,
+                    "harness MCP reservation does not match the exact PTY provider",
+                ));
+            }
+            prepared.verify_helper_program().map_err(harness_mcp_failure)?;
+            let control = self.native_launch_profile_control.clone().ok_or_else(|| {
+                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP launch control is unavailable")
+            })?;
+            let overlay = NativeHarnessMcpLaunchOverlay::new(
+                provider.clone(),
+                prepared.endpoint().as_os_str().to_os_string(),
+                prepared.token().expose().into(),
+                prepared.helper_program().as_os_str().to_os_string(),
+            ).map_err(|_| failure(
+                NodeFailureCode::HarnessMcpUnavailable,
+                "harness MCP launch overlay is unavailable",
+            ))?;
+            control
+                .install_native_harness_mcp_launch_overlay(instance_id, overlay)
+                .map_err(|_| failure(
+                    NodeFailureCode::HarnessMcpUnavailable,
+                    "harness MCP launch overlay could not be installed",
+                ))?;
+            Some(NativeHarnessMcpOverlayGuard { control, instance_id })
+        } else {
+            None
         };
         let prepared_materialization = self.prepare_session_materialization(
             &address,
@@ -6793,6 +9498,7 @@ impl NodeShared {
             provider.clone(),
             mode,
             runtime_policy,
+            record_policy,
             environment_profile,
             bundle,
             context,
@@ -6857,6 +9563,18 @@ impl NodeShared {
                 };
             }
         };
+        if let Err(start_error) = self.verify_harness_mcp_before_start(harness_mcp) {
+            if let Err(recovery_error) = self
+                .rollback_spawn(&address, Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS))
+                .await
+            {
+                return Err(recovery_error);
+            }
+            if let Some(record_id) = record_id.as_ref() {
+                self.discard_record(record_id)?;
+            }
+            return Err(start_error);
+        }
         let start_result = self
             .dispatch_bounded(
                 ControlCommand::Start {
@@ -6939,6 +9657,9 @@ impl NodeShared {
                     };
                 }
                 if !matches!(current.status, gate4agent_types::SessionStatus::Registered) {
+                    if let Some(overlay) = harness_mcp_overlay.take() {
+                        overlay.retain();
+                    }
                     return Ok(address);
                 }
             }
@@ -6969,6 +9690,17 @@ impl NodeShared {
             }
             sleep(Duration::from_millis(2)).await;
         }
+    }
+
+    fn verify_harness_mcp_before_start(
+        &self,
+        prepared: Option<&PreparedHarnessMcpSpawn>,
+    ) -> Result<(), NodeFailure> {
+        prepared
+            .map(PreparedHarnessMcpSpawn::verify_helper_program)
+            .transpose()
+            .map(|_| ())
+            .map_err(harness_mcp_failure)
     }
 
     async fn rollback_spawn(
@@ -7054,6 +9786,7 @@ impl NodeShared {
     fn resync(&self, after_sequence: u64) -> NodeResponse {
         let history = self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let event_sequence = history.last_sequence;
+        let oldest_available_sequence = history.replay_floor_sequence;
         let events = history
             .events
             .iter()
@@ -7063,6 +9796,7 @@ impl NodeShared {
         drop(history);
         NodeResponse::Resync {
             event_sequence,
+            oldest_available_sequence,
             snapshot: self.snapshot(),
             events,
         }
@@ -7229,6 +9963,9 @@ async fn serve_connection(
     let include_terminal_frame_events = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY
     });
+    let include_spawn_profiles = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
+    });
     let include_managed_worktrees = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY
     }) && selected_capabilities.iter().any(|capability| {
@@ -7242,6 +9979,25 @@ async fn serve_connection(
     });
     let include_history_context_packs = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_HISTORY_CONTEXT_PACK_CAPABILITY
+    });
+    let include_agent_progress = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY
+    });
+    let include_session_task_correlation = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_SESSION_TASK_CORRELATION_CAPABILITY
+    });
+    let include_observation_events = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_OBSERVATION_EVENTS_CAPABILITY
+    });
+    let include_observation_managed_target = include_observation_events
+        && selected_capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY
+        });
+    let include_observation_workflow_detail = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY
+    });
+    let include_harness_mcp_proxy = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_HARNESS_MCP_READ_PROXY_CAPABILITY
     });
     let authenticated_permit = Arc::clone(&shared.authenticated_slots)
         .try_acquire_owned()
@@ -7271,10 +10027,13 @@ async fn serve_connection(
                 &shared,
                 include_provider_runtime_status,
                 include_open_provider_ids,
+                include_spawn_profiles,
                 include_managed_worktrees,
                 include_child_environment_profiles,
                 include_session_bundles,
                 include_history_context_packs,
+                include_agent_progress,
+                include_session_task_correlation,
             ),
             compatibility,
         }),
@@ -7375,6 +10134,37 @@ async fn serve_connection(
                 } else {
                     project_event_without_context_pack(event)
                 });
+                let event = event.map(|event| if include_session_task_correlation {
+                    event
+                } else {
+                    project_event_without_session_task_binding(event)
+                });
+                let event = event.and_then(|event| if include_observation_events {
+                    Some(event)
+                } else {
+                    project_event_without_observation(event)
+                });
+                let event = event.and_then(|event| if include_observation_managed_target {
+                    Some(event)
+                } else {
+                    project_event_without_managed_observation(event)
+                });
+                let event = event.and_then(|event| if include_observation_workflow_detail {
+                    Some(event)
+                } else {
+                    project_event_without_observation_workflow_detail(event)
+                });
+                let exact_harness_controller = hello.role == ClientRole::Operator
+                    && shared.controller_state().is_some_and(|controller| {
+                        controller.connection_id == connection_id
+                    });
+                let event = event.and_then(|event| {
+                    if include_harness_mcp_proxy && exact_harness_controller {
+                        Some(event)
+                    } else {
+                        project_event_without_harness_mcp_proxy(event)
+                    }
+                });
                 if let Some(event) = event {
                     write_json_frame(&mut writer, &ServerFrame::Event(event)).await?;
                 }
@@ -7474,6 +10264,21 @@ async fn serve_connection(
                 if !include_history_context_packs {
                     project_response_without_context_pack(&mut reply);
                 }
+                if !include_agent_progress {
+                    project_response_without_agent_progress(&mut reply);
+                }
+                if !include_session_task_correlation {
+                    project_response_without_session_task_binding(&mut reply);
+                }
+                if !include_observation_events {
+                    project_response_without_observations(&mut reply);
+                }
+                if !include_observation_managed_target {
+                    project_response_without_managed_observations(&mut reply);
+                }
+                if !include_observation_workflow_detail {
+                    project_response_without_observation_workflow_detail(&mut reply);
+                }
                 write_json_frame(&mut writer, &ServerFrame::Reply(reply)).await?;
             }
             _ = tokio::task::yield_now(), if !pending_events.is_empty() => {}
@@ -7526,7 +10331,9 @@ fn queue_connection_event(
     event: NodeEventEnvelope,
     discard_through: u64,
 ) {
-    if event.sequence <= discard_through {
+    if event.sequence <= discard_through
+        && !event.event.requires_harness_mcp_proxy_capability()
+    {
         return;
     }
     if let NodeEvent::TerminalFrame { address, .. } = &event.event {
@@ -7543,6 +10350,12 @@ fn queue_connection_event(
         }
     }
     pending.push(event);
+}
+
+fn project_event_without_harness_mcp_proxy(
+    envelope: NodeEventEnvelope,
+) -> Option<NodeEventEnvelope> {
+    (!envelope.event.requires_harness_mcp_proxy_capability()).then_some(envelope)
 }
 
 fn queue_connection_event_batch(
@@ -7574,10 +10387,7 @@ fn resync_required_event(shared: &NodeShared) -> NodeEventEnvelope {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let sequence = history.last_sequence;
-    let oldest_available_sequence = history
-        .events
-        .front()
-        .map_or(sequence, |event| event.sequence);
+    let oldest_available_sequence = history.replay_floor_sequence;
     NodeEventEnvelope {
         sequence,
         event: NodeEvent::ResyncRequired {
@@ -7589,10 +10399,28 @@ fn resync_required_event(shared: &NodeShared) -> NodeEventEnvelope {
 fn node_compatibility_support(
     shared: &NodeShared,
 ) -> Result<NodeCompatibilitySupport, NodeServerError> {
-    node_compatibility_support_for_manifest(
+    let mut support = node_compatibility_support_for_manifest(
         &shared.provider_contracts,
         &shared.provider_adapter_contracts,
-    )
+    )?;
+    if shared
+        .delivery_store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+    {
+        support.capabilities.push(
+            CapabilityId::new(NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY)
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        );
+    }
+    if shared.harness_mcp_registry.is_some() {
+        support.capabilities.push(
+            CapabilityId::new(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY)
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        );
+    }
+    Ok(support)
 }
 
 fn node_compatibility_support_for_manifest(
@@ -7607,7 +10435,7 @@ fn node_compatibility_support_for_manifest(
         path_semantics: platform::path_semantics(),
         local_transport: platform::local_transport(),
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V8)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V9)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: provider_contracts.to_vec(),
@@ -7616,27 +10444,52 @@ fn node_compatibility_support_for_manifest(
 }
 
 fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
-    [
+    let capabilities = [
         NODE_COMPATIBILITY_METADATA_CAPABILITY,
+        CAPABILITY_HOST_DIRECTORY_BROWSE_V1,
         NODE_REPOSITORY_PATH_CAPABILITY,
         NODE_WORKSPACE_FILE_READ_CAPABILITY,
+        NODE_WORKSPACE_FILE_WRITE_CAPABILITY,
+        NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
+        NODE_GIT_READ_CAPABILITY,
         NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
         NODE_PROVIDER_ID_OPEN_CAPABILITY,
+        NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
         NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
         NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
         NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+        NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
         NODE_WORKTREE_SELECTION_CAPABILITY,
         NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
         NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
         NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
         NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+        NODE_NATIVE_SESSION_CATALOG_CAPABILITY,
+        NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
+        NODE_NATIVE_SESSION_INDEX_CAPABILITY,
+        NODE_NATIVE_SESSION_PREVIEW_CAPABILITY,
+        NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+        NODE_SESSION_TASK_CORRELATION_CAPABILITY,
+        NODE_OBSERVATION_EVENTS_CAPABILITY,
+        NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+        NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
     ]
         .into_iter()
         .map(|capability| {
             CapabilityId::new(capability)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(windows)]
+    let capabilities = {
+        let mut capabilities = capabilities;
+        capabilities.push(
+            CapabilityId::new(NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY)
+                .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        );
+        capabilities
+    };
+    Ok(capabilities)
 }
 
 fn request_uses_unnegotiated_capability(
@@ -7655,6 +10508,8 @@ fn request_uses_unnegotiated_capability(
             && !selected(NODE_WORKTREE_SELECTION_CAPABILITY))
         || (request.requires_spawn_spec_defaults_overrides_capability()
             && !selected(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY))
+        || (request.requires_spawn_profile_revision_capability()
+            && !selected(NODE_SPAWN_PROFILE_REVISION_CAPABILITY))
         || (request.requires_child_environment_profile_capability()
             && !selected(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY))
         || (request.requires_session_bundle_materialization_capability()
@@ -7667,10 +10522,13 @@ fn snapshot_for_wire(
     shared: &NodeShared,
     include_provider_runtime_status: bool,
     include_open_provider_ids: bool,
+    include_spawn_profiles: bool,
     include_managed_worktrees: bool,
     include_child_environment_profiles: bool,
     include_session_bundles: bool,
     include_history_context_packs: bool,
+    include_agent_progress: bool,
+    include_session_task_correlation: bool,
 ) -> NodeSnapshot {
     let mut snapshot = shared.snapshot();
     if !include_provider_runtime_status {
@@ -7681,6 +10539,20 @@ fn snapshot_for_wire(
     }
     if !include_managed_worktrees {
         snapshot.managed_worktrees.clear();
+        for workspace in &mut snapshot.workspaces {
+            workspace.managed_worktree_profiles = None;
+        }
+    }
+    if let Some(inventory) = snapshot.launch_inventory.as_mut() {
+        if !include_spawn_profiles {
+            inventory.spawn_profiles = None;
+        }
+        if !include_session_bundles {
+            inventory.bundles = None;
+        }
+        if inventory.spawn_profiles.is_none() && inventory.bundles.is_none() {
+            snapshot.launch_inventory = None;
+        }
     }
     if !include_child_environment_profiles {
         clear_snapshot_child_environment_profiles(&mut snapshot);
@@ -7692,17 +10564,135 @@ fn snapshot_for_wire(
     if !include_history_context_packs {
         clear_snapshot_context_packs(&mut snapshot);
     }
+    if !include_agent_progress {
+        snapshot.agent_progress.clear();
+    }
+    if !include_session_task_correlation {
+        clear_snapshot_session_task_bindings(&mut snapshot);
+    }
     snapshot
 }
 
-fn project_event_without_managed_worktrees(
+fn clear_snapshot_session_task_bindings(snapshot: &mut NodeSnapshot) {
+    for record in &mut snapshot.session_records {
+        record.task_binding = None;
+    }
+}
+
+fn project_event_without_session_task_binding(
+    mut envelope: NodeEventEnvelope,
+) -> NodeEventEnvelope {
+    if let NodeEvent::SessionRecordUpserted { record } = &mut envelope.event {
+        record.task_binding = None;
+    }
+    envelope
+}
+
+fn project_event_without_observation(
     envelope: NodeEventEnvelope,
 ) -> Option<NodeEventEnvelope> {
-    (!matches!(
+    (!envelope.event.requires_observation_events_capability()).then_some(envelope)
+}
+
+fn project_event_without_managed_observation(
+    envelope: NodeEventEnvelope,
+) -> Option<NodeEventEnvelope> {
+    (!envelope
+        .event
+        .requires_observation_managed_target_capability())
+    .then_some(envelope)
+}
+
+fn project_event_without_observation_workflow_detail(
+    envelope: NodeEventEnvelope,
+) -> Option<NodeEventEnvelope> {
+    (!envelope
+        .event
+        .requires_observation_workflow_detail_capability())
+    .then_some(envelope)
+}
+
+fn project_response_without_observations(reply: &mut ResponseEnvelope) {
+    let Ok(NodeResponse::Resync { events, .. }) = reply.result.as_mut() else {
+        return;
+    };
+    strip_observation_events(events);
+}
+
+fn strip_observation_events(events: &mut Vec<NodeEventEnvelope>) {
+    events.retain(|event| !event.event.requires_observation_events_capability());
+}
+
+fn project_response_without_managed_observations(reply: &mut ResponseEnvelope) {
+    let Ok(NodeResponse::Resync { events, .. }) = reply.result.as_mut() else {
+        return;
+    };
+    events.retain(|event| {
+        !event
+            .event
+            .requires_observation_managed_target_capability()
+    });
+}
+
+fn project_response_without_observation_workflow_detail(reply: &mut ResponseEnvelope) {
+    let Ok(NodeResponse::Resync { events, .. }) = reply.result.as_mut() else {
+        return;
+    };
+    events.retain(|event| {
+        !event
+            .event
+            .requires_observation_workflow_detail_capability()
+    });
+}
+
+fn project_response_without_session_task_binding(reply: &mut ResponseEnvelope) {
+    let Ok(response) = reply.result.as_mut() else { return };
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } => {
+            clear_snapshot_session_task_bindings(snapshot);
+        }
+        NodeResponse::Resync { snapshot, events, .. } => {
+            clear_snapshot_session_task_bindings(snapshot);
+            for event in events {
+                if let NodeEvent::SessionRecordUpserted { record } = &mut event.event {
+                    record.task_binding = None;
+                }
+            }
+        }
+        NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::ProviderSessionIndexed { record }
+        | NodeResponse::NativeSessionIndexed { record, .. }
+        | NodeResponse::SessionRecordResumed { record, .. } => {
+            record.task_binding = None;
+        }
+        _ => {}
+    }
+}
+
+fn project_response_without_agent_progress(reply: &mut ResponseEnvelope) {
+    let Ok(response) = reply.result.as_mut() else { return };
+    match response {
+        NodeResponse::Snapshot { snapshot, .. } | NodeResponse::Resync { snapshot, .. } => {
+            snapshot.agent_progress.clear();
+        }
+        _ => {}
+    }
+}
+
+fn project_event_without_managed_worktrees(
+    mut envelope: NodeEventEnvelope,
+) -> Option<NodeEventEnvelope> {
+    if matches!(
         envelope.event,
         NodeEvent::ManagedWorktreeUpserted { .. }
             | NodeEvent::ManagedWorktreeRemoved { .. }
-    )).then_some(envelope)
+    ) {
+        return None;
+    }
+    if let NodeEvent::WorkspaceAdded { workspace } = &mut envelope.event {
+        workspace.managed_worktree_profiles = None;
+    }
+    Some(envelope)
 }
 
 fn project_response_without_managed_worktrees(reply: &mut ResponseEnvelope) {
@@ -7719,14 +10709,29 @@ fn project_response_without_managed_worktrees(reply: &mut ResponseEnvelope) {
     }
     let Ok(response) = reply.result.as_mut() else { return };
     match response {
-        NodeResponse::Snapshot { snapshot, .. } => snapshot.managed_worktrees.clear(),
+        NodeResponse::Snapshot { snapshot, .. } => {
+            snapshot.managed_worktrees.clear();
+            for workspace in &mut snapshot.workspaces {
+                workspace.managed_worktree_profiles = None;
+            }
+        }
         NodeResponse::Resync { snapshot, events, .. } => {
             snapshot.managed_worktrees.clear();
-            events.retain(|event| !matches!(
-                event.event,
-                NodeEvent::ManagedWorktreeUpserted { .. }
-                    | NodeEvent::ManagedWorktreeRemoved { .. }
-            ));
+            for workspace in &mut snapshot.workspaces {
+                workspace.managed_worktree_profiles = None;
+            }
+            *events = std::mem::take(events)
+                .into_iter()
+                .filter_map(project_event_without_managed_worktrees)
+                .collect();
+        }
+        NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::StandaloneWorkspaceCreated { workspace }
+        | NodeResponse::WorktreeCreated { workspace, .. } => {
+            workspace.managed_worktree_profiles = None;
+        }
+        NodeResponse::WorkspaceInspected { inspection } => {
+            inspection.git.managed_worktree = None;
         }
         _ => {}
     }
@@ -7749,7 +10754,9 @@ fn project_negotiated_provider_ids(compatibility: &mut NegotiatedNodeCompatibili
 
 fn request_requires_open_provider_ids(shared: &NodeShared, request: &NodeRequest) -> bool {
     if let Some(spec) = match request {
-        NodeRequest::SpawnSpec { spec } => Some(spec),
+        NodeRequest::SpawnSpec { spec }
+        | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
+        | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
         _ => None,
     } {
@@ -7769,7 +10776,9 @@ fn request_requires_child_environment_profile(
     request: &NodeRequest,
 ) -> bool {
     if let Some(spec) = match request {
-        NodeRequest::SpawnSpec { spec } => Some(spec),
+        NodeRequest::SpawnSpec { spec }
+        | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
+        | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
         _ => None,
     } {
@@ -7801,24 +10810,48 @@ fn request_requires_child_environment_profile(
             })
             .map_or(true, |binding| binding.environment_profile.is_some()),
         NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::SetSessionTask { record_id, .. }
         | NodeRequest::ResumeSessionRecord { record_id, .. }
         | NodeRequest::ForgetSessionRecord { record_id } => shared
             .record(record_id)
             .map_or(true, |record| record.environment_profile.is_some()),
-        NodeRequest::Snapshot
+        NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
+        | NodeRequest::IndexProviderSession { .. }
+        | NodeRequest::IndexNativeSession { .. }
+        | NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
@@ -7826,7 +10859,9 @@ fn request_requires_child_environment_profile(
 
 fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -> bool {
     if let Some(spec) = match request {
-        NodeRequest::SpawnSpec { spec } => Some(spec),
+        NodeRequest::SpawnSpec { spec }
+        | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
+        | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
         _ => None,
     } {
@@ -7858,24 +10893,48 @@ fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -
             })
             .map_or(true, |binding| binding.bundle.is_some()),
         NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::SetSessionTask { record_id, .. }
         | NodeRequest::ResumeSessionRecord { record_id, .. }
         | NodeRequest::ForgetSessionRecord { record_id } => shared
             .record(record_id)
             .map_or(true, |record| record.bundle.is_some()),
-        NodeRequest::Snapshot
+        NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
+        | NodeRequest::IndexProviderSession { .. }
+        | NodeRequest::IndexNativeSession { .. }
+        | NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
@@ -7886,7 +10945,9 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
         return true;
     }
     if let Some(spec) = match request {
-        NodeRequest::SpawnSpec { spec } => Some(spec),
+        NodeRequest::SpawnSpec { spec }
+        | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
+        | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
         _ => None,
     } {
@@ -7915,24 +10976,48 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
             })
             .map_or(true, |binding| binding.context.is_some()),
         NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::SetSessionTask { record_id, .. }
         | NodeRequest::ResumeSessionRecord { record_id, .. }
         | NodeRequest::ForgetSessionRecord { record_id } => shared
             .record(record_id)
             .map_or(true, |record| record.context.is_some()),
-        NodeRequest::Snapshot
+        NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
+        | NodeRequest::IndexProviderSession { .. }
+        | NodeRequest::IndexNativeSession { .. }
+        | NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
         | NodeRequest::ExportContextPack { .. }
@@ -7948,7 +11033,17 @@ fn request_requires_open_provider_ids_with(
 ) -> bool {
     match request {
         NodeRequest::Spawn { provider, .. } => !provider_id_is_legacy(provider),
-        NodeRequest::SpawnSpec { .. } => false,
+        NodeRequest::IndexProviderSession { provider, .. } => !provider_id_is_legacy(provider),
+        NodeRequest::CatalogNativeSessions { route, .. }
+        | NodeRequest::PageNativeSessions { route, .. } => {
+            !provider_id_is_legacy(&route.provider)
+        }
+        NodeRequest::PreviewNativeSession { selection, .. }
+        | NodeRequest::IndexNativeSession { selection, .. } => {
+            !provider_id_is_legacy(&selection.route.provider)
+        }
+        NodeRequest::SpawnSpec { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. } => false,
         NodeRequest::SpawnManagedWorktree { .. } => false,
         NodeRequest::Resume { session, .. }
         | NodeRequest::Prompt { session, .. }
@@ -7965,16 +11060,35 @@ fn request_requires_open_provider_ids_with(
         | NodeRequest::ExportContextPack { session } => provider_for_session(session)
             .map_or(true, |provider| !provider_id_is_legacy(&provider)),
         NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::SetSessionTask { record_id, .. }
         | NodeRequest::ResumeSessionRecord { record_id, .. }
         | NodeRequest::ForgetSessionRecord { record_id } => provider_for_record(record_id)
             .map_or(true, |provider| !provider_id_is_legacy(&provider)),
-        NodeRequest::Snapshot
+        NodeRequest::PreviewSessionRecord { record_id, .. } => provider_for_record(record_id)
+            .map_or(true, |provider| !provider_id_is_legacy(&provider)),
+        NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
@@ -8053,22 +11167,45 @@ fn project_response_without_child_environment_profile(reply: &mut ResponseEnvelo
             }
         }
         NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::ProviderSessionIndexed { record }
+        | NodeResponse::NativeSessionIndexed { record, .. }
         | NodeResponse::SessionRecordResumed { record, .. } => {
             record.environment_profile = None;
         }
-        NodeResponse::WorkspaceInspected { .. }
+        NodeResponse::Armed { .. }
+        | NodeResponse::Spawned { .. }
+        | NodeResponse::Activated { .. }
+        | NodeResponse::Aborted { .. }
+        | NodeResponse::ReplyChunkAccepted { .. }
+        | NodeResponse::CallRejected { .. }
+        | NodeResponse::DeliveryStageBegun { .. }
+        | NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | NodeResponse::DeliveryCommitted { .. }
+        | NodeResponse::DeliveryStageAborted { .. }
+        | NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::HostDirectoriesBrowsed { .. }
         | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::WorkspaceFileWritten { .. }
+        | NodeResponse::WorkspaceFileCreated { .. }
+        | NodeResponse::WorkspaceDirectoryCreated { .. }
+        | NodeResponse::GitHistoryRead { .. }
+        | NodeResponse::GitDiffRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
+        | NodeResponse::NativeSessionsCataloged { .. }
+        | NodeResponse::NativeSessionsPaged { .. }
+        | NodeResponse::NativeSessionPreviewed { .. }
+        | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::StandaloneWorkspaceCreated { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeCreated { .. }
         | NodeResponse::WorktreeRemoved { .. }
@@ -8121,20 +11258,43 @@ fn project_response_without_session_bundle(reply: &mut ResponseEnvelope) {
             }
         }
         NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::ProviderSessionIndexed { record }
+        | NodeResponse::NativeSessionIndexed { record, .. }
         | NodeResponse::SessionRecordResumed { record, .. } => record.bundle = None,
-        NodeResponse::WorkspaceInspected { .. }
+        NodeResponse::Armed { .. }
+        | NodeResponse::Spawned { .. }
+        | NodeResponse::Activated { .. }
+        | NodeResponse::Aborted { .. }
+        | NodeResponse::ReplyChunkAccepted { .. }
+        | NodeResponse::CallRejected { .. }
+        | NodeResponse::DeliveryStageBegun { .. }
+        | NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | NodeResponse::DeliveryCommitted { .. }
+        | NodeResponse::DeliveryStageAborted { .. }
+        | NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::HostDirectoriesBrowsed { .. }
         | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::WorkspaceFileWritten { .. }
+        | NodeResponse::WorkspaceFileCreated { .. }
+        | NodeResponse::WorkspaceDirectoryCreated { .. }
+        | NodeResponse::GitHistoryRead { .. }
+        | NodeResponse::GitDiffRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
+        | NodeResponse::NativeSessionsCataloged { .. }
+        | NodeResponse::NativeSessionsPaged { .. }
+        | NodeResponse::NativeSessionPreviewed { .. }
+        | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::StandaloneWorkspaceCreated { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeCreated { .. }
         | NodeResponse::WorktreeRemoved { .. }
@@ -8197,6 +11357,7 @@ fn project_response_history_for_wire(
             }
         }
         NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::StandaloneWorkspaceCreated { workspace }
         | NodeResponse::WorktreeCreated { workspace, .. } => {
             for session in &mut workspace.sessions {
                 if include_history_metadata {
@@ -8263,6 +11424,8 @@ fn project_response_without_context_pack(reply: &mut ResponseEnvelope) {
             }
         }
         NodeResponse::SessionRecordUpdated { record }
+        | NodeResponse::ProviderSessionIndexed { record }
+        | NodeResponse::NativeSessionIndexed { record, .. }
         | NodeResponse::SessionRecordResumed { record, .. } => {
             record.context_id = None;
             record.context = None;
@@ -8274,14 +11437,26 @@ fn project_response_without_context_pack(reply: &mut ResponseEnvelope) {
 fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut ResponseEnvelope) {
     let contains_open_record = match reply.result.as_ref() {
         Ok(NodeResponse::SessionRecordUpdated { record })
+        | Ok(NodeResponse::ProviderSessionIndexed { record })
         | Ok(NodeResponse::SessionRecordResumed { record, .. }) => {
             !provider_id_is_legacy(&record.provider)
+        }
+        Ok(NodeResponse::NativeSessionIndexed { selection, record }) => {
+            !provider_id_is_legacy(&selection.route.provider)
+                || !provider_id_is_legacy(&record.provider)
         }
         Ok(NodeResponse::SpawnSpecAccepted { receipt }) => {
             !provider_id_is_legacy(&receipt.provider)
         }
         Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt }) => {
             !provider_id_is_legacy(&receipt.spawn.provider)
+        }
+        Ok(NodeResponse::NativeSessionsCataloged { route, .. })
+        | Ok(NodeResponse::NativeSessionsPaged { route, .. }) => {
+            !provider_id_is_legacy(&route.provider)
+        }
+        Ok(NodeResponse::NativeSessionPreviewed { selection, .. }) => {
+            !provider_id_is_legacy(&selection.route.provider)
         }
         _ => false,
     };
@@ -8307,23 +11482,46 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
                 .collect();
         }
         NodeResponse::WorkspaceRegistered { workspace }
+        | NodeResponse::StandaloneWorkspaceCreated { workspace }
         | NodeResponse::WorktreeCreated { workspace, .. } => {
             workspace
                 .sessions
                 .retain(|session| provider_id_is_legacy(&session.agent_id));
         }
-        NodeResponse::WorkspaceInspected { .. }
+        NodeResponse::Armed { .. }
+        | NodeResponse::Spawned { .. }
+        | NodeResponse::Activated { .. }
+        | NodeResponse::Aborted { .. }
+        | NodeResponse::ReplyChunkAccepted { .. }
+        | NodeResponse::CallRejected { .. }
+        | NodeResponse::DeliveryStageBegun { .. }
+        | NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | NodeResponse::DeliveryCommitted { .. }
+        | NodeResponse::DeliveryStageAborted { .. }
+        | NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::HostDirectoriesBrowsed { .. }
         | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::WorkspaceFileWritten { .. }
+        | NodeResponse::WorkspaceFileCreated { .. }
+        | NodeResponse::WorkspaceDirectoryCreated { .. }
+        | NodeResponse::GitHistoryRead { .. }
+        | NodeResponse::GitDiffRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
+        | NodeResponse::NativeSessionsCataloged { .. }
+        | NodeResponse::NativeSessionsPaged { .. }
+        | NodeResponse::NativeSessionPreviewed { .. }
+        | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordUpdated { .. }
+        | NodeResponse::ProviderSessionIndexed { .. }
+        | NodeResponse::NativeSessionIndexed { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
@@ -8338,10 +11536,13 @@ fn project_event_legacy_provider_ids(
     mut envelope: NodeEventEnvelope,
 ) -> Option<NodeEventEnvelope> {
     let include = match &mut envelope.event {
+        NodeEvent::HarnessMcpReadCall { .. } => true,
         NodeEvent::Control { address, .. }
+        | NodeEvent::Observation { address, .. }
         | NodeEvent::TerminalFrame { address, .. } => shared
             .validate_address(address)
             .is_ok_and(|provider| provider_id_is_legacy(&provider)),
+        NodeEvent::ManagedObservation { .. } => false,
         NodeEvent::WorkspaceAdded { workspace } => {
             workspace
                 .sessions
@@ -8375,21 +11576,44 @@ fn clear_response_provider_runtime_status(reply: &mut ResponseEnvelope) {
         NodeResponse::Snapshot { snapshot, .. } | NodeResponse::Resync { snapshot, .. } => {
             snapshot.provider_runtime_statuses.clear();
         }
-        NodeResponse::WorkspaceInspected { .. }
+        NodeResponse::Armed { .. }
+        | NodeResponse::Spawned { .. }
+        | NodeResponse::Activated { .. }
+        | NodeResponse::Aborted { .. }
+        | NodeResponse::ReplyChunkAccepted { .. }
+        | NodeResponse::CallRejected { .. }
+        | NodeResponse::DeliveryStageBegun { .. }
+        | NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | NodeResponse::DeliveryCommitted { .. }
+        | NodeResponse::DeliveryStageAborted { .. }
+        | NodeResponse::WorkspaceInspected { .. }
+        | NodeResponse::HostDirectoriesBrowsed { .. }
         | NodeResponse::WorkspaceFileRead { .. }
+        | NodeResponse::WorkspaceFileWritten { .. }
+        | NodeResponse::WorkspaceFileCreated { .. }
+        | NodeResponse::WorkspaceDirectoryCreated { .. }
+        | NodeResponse::GitHistoryRead { .. }
+        | NodeResponse::GitDiffRead { .. }
         | NodeResponse::Controller { .. }
         | NodeResponse::SpawnAccepted { .. }
         | NodeResponse::SpawnSpecAccepted { .. }
         | NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | NodeResponse::ManagedWorktreeCleanup { .. }
+        | NodeResponse::NativeSessionsCataloged { .. }
+        | NodeResponse::NativeSessionsPaged { .. }
+        | NodeResponse::NativeSessionPreviewed { .. }
+        | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordUpdated { .. }
+        | NodeResponse::ProviderSessionIndexed { .. }
+        | NodeResponse::NativeSessionIndexed { .. }
         | NodeResponse::SessionRecordResumed { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
+        | NodeResponse::StandaloneWorkspaceCreated { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeCreated { .. }
         | NodeResponse::WorktreeRemoved { .. }
@@ -8525,6 +11749,43 @@ fn is_skipped_workspace_directory(name: &str) -> bool {
         || name.eq_ignore_ascii_case("node_modules")
 }
 
+fn context_pack_source_status_is_usable(status: &SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Running | SessionStatus::Exited { exit_code: Some(0) }
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContextPackRepositoryHead {
+    NotRepository,
+    Unborn,
+    Commit(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContextPackRepositoryObservation {
+    head: ContextPackRepositoryHead,
+    git: GitSnapshot,
+    files: Vec<ContextPackRepositoryFileSource>,
+}
+
+fn stable_context_pack_repository(
+    first: ContextPackRepositoryObservation,
+    second: ContextPackRepositoryObservation,
+) -> Result<ContextPackRepository, NodeFailure> {
+    if first != second {
+        return Err(failure(
+            NodeFailureCode::ContextPackMaterializationFailed,
+            "context repository changed during bounded capture",
+        ));
+    }
+    Ok(ContextPackRepository::from_sources(
+        &second.git,
+        second.files,
+    ))
+}
+
 async fn inspect_git_workspace(root: &str) -> GitSnapshot {
     let mut snapshot = GitSnapshot {
         is_repository: false,
@@ -8532,6 +11793,7 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
         status: Vec::new(),
         recent_commits: Vec::new(),
         worktrees: Vec::new(),
+        managed_worktree: None,
         truncated: false,
         diagnostic: None,
     };
@@ -8789,18 +12051,162 @@ async fn run_git_bounded(
     run_git_read_bounded(root, arguments, output_limit, GIT_COMMAND_TIMEOUT_MS).await
 }
 
+async fn read_git_history_bounded(
+    root: &str,
+    path: Option<&RepositoryPath>,
+    before: Option<&GitObjectId>,
+    limit: u16,
+) -> Result<GitHistoryPage, NodeFailure> {
+    let path = path
+        .map(|path| {
+            path.as_utf8().ok_or_else(|| {
+                failure(
+                    NodeFailureCode::InvalidRepositoryPath,
+                    "git history path must use UTF-8",
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(".");
+    let count = (usize::from(limit) + 1).to_string();
+    let start = before
+        .map(|revision| format!("{}^", revision.as_str()))
+        .unwrap_or_else(|| "HEAD".to_owned());
+    let arguments = [
+        "--no-pager",
+        "log",
+        "--no-decorate",
+        "--date=iso-strict",
+        "--pretty=format:%H%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1e",
+        "-n",
+        count.as_str(),
+        start.as_str(),
+        "--",
+        path,
+    ];
+    let output = run_git_bounded(root, &arguments, 256 * 1_024)
+        .await
+        .map_err(|_| failure(NodeFailureCode::GitReadFailed, "git history command failed"))?;
+    if output.timed_out {
+        return Err(failure(NodeFailureCode::GitReadTimedOut, "git history exceeded its bounded deadline"));
+    }
+    if !output.success {
+        return Err(failure(NodeFailureCode::GitReadFailed, "git history could not be read"));
+    }
+    let mut commits = parse_git_history(&output.stdout);
+    let has_more = commits.len() > usize::from(limit) || output.truncated;
+    commits.truncate(usize::from(limit));
+    let next_before = has_more.then(|| commits.last().map(|commit| commit.id.clone())).flatten();
+    Ok(GitHistoryPage { commits, next_before, truncated: output.truncated })
+}
+
+fn parse_git_history(output: &[u8]) -> Vec<GitCommitDetails> {
+    String::from_utf8_lossy(output)
+        .split('\u{1e}')
+        .filter_map(|record| {
+            let fields = record.trim_matches(['\r', '\n']).split('\u{1f}').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return None;
+            }
+            let id = GitObjectId::new(fields[0].to_owned()).ok()?;
+            let parents = if fields[1].is_empty() {
+                Vec::new()
+            } else {
+                fields[1]
+                    .split(' ')
+                    .map(|value| GitObjectId::new(value.to_owned()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?
+            };
+            Some(GitCommitDetails {
+                id,
+                parents,
+                subject: bounded_git_text(fields[2], 512),
+                author_name: bounded_git_text(fields[3], 256),
+                author_email: bounded_git_text(fields[4], 320),
+                authored_at: bounded_git_text(fields[5], 64),
+                committer_name: bounded_git_text(fields[6], 256),
+                committer_email: bounded_git_text(fields[7], 320),
+                committed_at: bounded_git_text(fields[8], 64),
+                signature_status: GitSignatureStatus::NoSignature,
+                signer: None,
+            })
+        })
+        .take(usize::from(MAX_GIT_HISTORY_COMMITS) + 1)
+        .collect()
+}
+
+fn bounded_git_text(value: &str, max_bytes: usize) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    if normalized.len() <= max_bytes {
+        return normalized;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !normalized.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    normalized[..boundary].to_owned()
+}
+
+async fn read_git_diff_bounded(root: &str, request: GitDiffRequest) -> Result<GitDiff, NodeFailure> {
+    let path = request.path.as_ref().map(|path| {
+        path.as_utf8()
+            .ok_or_else(|| failure(NodeFailureCode::InvalidRepositoryPath, "git diff path must use UTF-8"))
+    }).transpose()?;
+    let mut arguments = match &request.mode {
+        GitDiffMode::Working => vec!["--no-pager", "-c", "diff.external=", "diff", "--no-ext-diff", "--no-textconv"],
+        GitDiffMode::Staged => vec!["--no-pager", "-c", "diff.external=", "diff", "--cached", "--no-ext-diff", "--no-textconv"],
+        GitDiffMode::Commit { .. } => vec!["--no-pager", "-c", "diff.external=", "show", "--format=fuller", "--no-ext-diff", "--no-textconv"],
+    };
+    if let GitDiffMode::Commit { revision } = &request.mode {
+        arguments.push(revision.as_str());
+    }
+    arguments.push("--");
+    if let Some(path) = path {
+        arguments.push(path);
+    }
+    let output = run_git_bounded(root, &arguments, MAX_GIT_DIFF_BYTES)
+        .await
+        .map_err(|_| failure(NodeFailureCode::GitReadFailed, "git diff command failed"))?;
+    if output.timed_out {
+        return Err(failure(NodeFailureCode::GitReadTimedOut, "git diff exceeded its bounded deadline"));
+    }
+    if !output.success {
+        return Err(failure(NodeFailureCode::GitReadFailed, "git diff could not be read"));
+    }
+    Ok(GitDiff {
+        mode: request.mode,
+        path: request.path,
+        text: String::from_utf8_lossy(&output.stdout).into_owned(),
+        truncated: output.truncated,
+    })
+}
+
 async fn process_request(shared: &NodeShared, connection_id: u64, role: ClientRole, envelope: RequestEnvelope) -> ResponseEnvelope {
     let result = process_request_inner(shared, connection_id, role, envelope.request).await;
     ResponseEnvelope { request_id: envelope.request_id, result }
 }
 
 async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: ClientRole, request: NodeRequest) -> Result<NodeResponse, NodeFailure> {
+    if !request.harness_mcp_contract_is_valid_at(unix_time_ms()) {
+        return Err(failure(NodeFailureCode::InvalidRequest, "harness MCP request is invalid or stale"));
+    }
     let read_only = matches!(
         &request,
         NodeRequest::Snapshot
             | NodeRequest::Resync { .. }
+            | NodeRequest::BrowseHostDirectories { .. }
             | NodeRequest::InspectWorkspace { .. }
             | NodeRequest::ReadWorkspaceFile { .. }
+            | NodeRequest::ReadGitHistory { .. }
+            | NodeRequest::ReadGitDiff { .. }
+            | NodeRequest::CatalogNativeSessions { .. }
+            | NodeRequest::PageNativeSessions { .. }
+            | NodeRequest::PreviewNativeSession { .. }
+            | NodeRequest::PreviewSessionRecord { .. }
     );
     let _mutation_guard = if read_only {
         None
@@ -8818,6 +12224,124 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             snapshot: shared.snapshot(),
         }),
         NodeRequest::Resync { after_sequence } => Ok(shared.resync(after_sequence)),
+        NodeRequest::ArmHarnessMcpReservation {
+            reservation_id,
+            activation_digest,
+            spawn_spec,
+            expires_at_unix_ms,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let registry = shared.harness_mcp_registry.as_ref().ok_or_else(|| {
+                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP proxy is not configured")
+            })?;
+            let expires_at_unix_ms = registry
+                .arm(reservation_id.clone(), activation_digest.clone(), spawn_spec, expires_at_unix_ms)
+                .await
+                .map_err(harness_mcp_failure)?;
+            Ok(NodeResponse::Armed { reservation_id, activation_digest, expires_at_unix_ms })
+        }
+        NodeRequest::SpawnSpecWithHarnessMcp {
+            reservation_id,
+            activation_digest,
+            spec,
+            deadline_unix_ms,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let receipt = shared
+                .spawn_from_spec_with_harness_mcp(
+                    reservation_id.clone(), activation_digest.clone(), spec, deadline_unix_ms,
+                )
+                .await?;
+            Ok(NodeResponse::Spawned { reservation_id, activation_digest, receipt })
+        }
+        NodeRequest::ActivateHarnessMcpReservation {
+            reservation_id,
+            activation_digest,
+            record_id,
+            session,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let provider_root_pid = shared.handle.snapshot().sessions.iter().find(|current| {
+                current.instance_id == session.session.instance_id
+                    && current.generation == session.session.generation
+            }).and_then(|current| current.process_id).ok_or_else(|| {
+                failure(NodeFailureCode::BindingMismatch, "provider root process is unavailable")
+            })?;
+            shared.harness_mcp_registry.as_ref().ok_or_else(|| {
+                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP proxy is not configured")
+            })?.activate(
+                &reservation_id, &activation_digest, &record_id, &session, provider_root_pid,
+            ).map_err(harness_mcp_failure)?;
+            Ok(NodeResponse::Activated { reservation_id, activation_digest, record_id, session })
+        }
+        NodeRequest::AbortHarnessMcpReservation { reservation_id, activation_digest } => {
+            shared.require_controller(connection_id, role)?;
+            let instance_id = shared.harness_mcp_registry.as_ref().ok_or_else(|| {
+                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP proxy is not configured")
+            })?.abort(&reservation_id, &activation_digest).map_err(harness_mcp_failure)?;
+            if let (Some(control), Some(instance_id)) =
+                (shared.native_launch_profile_control.as_ref(), instance_id)
+            {
+                control.clear_native_harness_mcp_launch_overlay(instance_id);
+            }
+            Ok(NodeResponse::Aborted { reservation_id, activation_digest })
+        }
+        NodeRequest::PutHarnessMcpReplyChunk {
+            reservation_id, activation_digest, record_id, session, call_id,
+            offset, final_chunk, chunk_hex,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let (next_offset, completed) = shared.harness_mcp_registry.as_ref().ok_or_else(|| {
+                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP proxy is not configured")
+            })?.put_reply_chunk(
+                &reservation_id, &activation_digest, &record_id, &session, &call_id,
+                offset, final_chunk, &chunk_hex,
+            ).map_err(harness_mcp_failure)?;
+            Ok(NodeResponse::ReplyChunkAccepted {
+                reservation_id, activation_digest, record_id, session, call_id,
+                next_offset, completed,
+            })
+        }
+        NodeRequest::RejectHarnessMcpCall {
+            reservation_id, activation_digest, record_id, session, call_id, reason,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            shared.harness_mcp_registry.as_ref().ok_or_else(|| {
+                failure(NodeFailureCode::HarnessMcpUnavailable, "harness MCP proxy is not configured")
+            })?.reject_call(
+                &reservation_id, &activation_digest, &record_id, &session, &call_id, reason,
+            ).map_err(harness_mcp_failure)?;
+            Ok(NodeResponse::CallRejected {
+                reservation_id, activation_digest, record_id, session, call_id,
+            })
+        }
+        NodeRequest::BeginDeliveryStage { manifest } => {
+            shared.require_controller(connection_id, role)?;
+            shared.begin_delivery_stage(manifest)
+        }
+        NodeRequest::PutDeliveryBlobChunk {
+            stage_id,
+            blob_digest,
+            offset,
+            chunk_hex,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            shared.put_delivery_blob_chunk(stage_id, blob_digest, offset, chunk_hex)
+        }
+        NodeRequest::CommitDeliveryStage { stage_id } => {
+            shared.require_controller(connection_id, role)?;
+            let receipt = shared.commit_delivery_stage(stage_id)?;
+            Ok(NodeResponse::DeliveryCommitted { receipt })
+        }
+        NodeRequest::AbortDeliveryStage { stage_id } => {
+            shared.require_controller(connection_id, role)?;
+            shared.abort_delivery_stage(&stage_id)?;
+            Ok(NodeResponse::DeliveryStageAborted { stage_id })
+        }
+        NodeRequest::BrowseHostDirectories { directory, after } => {
+            let listing = shared.browse_host_directories(directory, after).await?;
+            Ok(NodeResponse::HostDirectoriesBrowsed { listing })
+        }
         NodeRequest::InspectWorkspace { workspace_id } => {
             let inspection = shared.inspect_workspace(workspace_id).await?;
             Ok(NodeResponse::WorkspaceInspected { inspection })
@@ -8825,6 +12349,209 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         NodeRequest::ReadWorkspaceFile { workspace_id, path } => {
             let file = shared.read_workspace_file(workspace_id, path).await?;
             Ok(NodeResponse::WorkspaceFileRead { file })
+        }
+        NodeRequest::WriteWorkspaceFile { workspace_id, path, expected_revision, text } => {
+            shared.require_controller(connection_id, role)?;
+            let file = shared
+                .write_workspace_file(workspace_id, path, expected_revision, text)
+                .await?;
+            Ok(NodeResponse::WorkspaceFileWritten { file })
+        }
+        NodeRequest::CreateWorkspaceFile { workspace_id, path } => {
+            shared.require_controller(connection_id, role)?;
+            let file = shared.create_workspace_file(workspace_id, path).await?;
+            Ok(NodeResponse::WorkspaceFileCreated { file })
+        }
+        NodeRequest::CreateWorkspaceDirectory { workspace_id, path } => {
+            shared.require_controller(connection_id, role)?;
+            let entry = shared
+                .create_workspace_directory(workspace_id.clone(), path)
+                .await?;
+            Ok(NodeResponse::WorkspaceDirectoryCreated { workspace_id, entry })
+        }
+        NodeRequest::ReadGitHistory { workspace_id, path, before, limit } => {
+            if role != ClientRole::Operator {
+                return Err(failure(NodeFailureCode::ObserverReadOnly, "git history requires an operator connection"));
+            }
+            if !(1..=MAX_GIT_HISTORY_COMMITS).contains(&limit) {
+                return Err(failure(NodeFailureCode::InvalidRequest, "git history limit is invalid"));
+            }
+            let page = shared
+                .read_git_history(workspace_id.clone(), path, before, limit)
+                .await?;
+            Ok(NodeResponse::GitHistoryRead { workspace_id, page })
+        }
+        NodeRequest::ReadGitDiff { workspace_id, request } => {
+            if role != ClientRole::Operator {
+                return Err(failure(NodeFailureCode::ObserverReadOnly, "git diff requires an operator connection"));
+            }
+            let diff = shared.read_git_diff(workspace_id.clone(), request).await?;
+            Ok(NodeResponse::GitDiffRead { workspace_id, diff })
+        }
+        NodeRequest::CatalogNativeSessions { route, limit } => {
+            if role != ClientRole::Operator {
+                return Err(failure(
+                    NodeFailureCode::ObserverReadOnly,
+                    "native session catalog requires an operator connection",
+                ));
+            }
+            if !(1..=gate4agent_types::NATIVE_SESSION_CATALOG_LIMIT_MAX).contains(&limit) {
+                return Err(failure(
+                    NodeFailureCode::InvalidRequest,
+                    "native session catalog limit is invalid",
+                ));
+            }
+            let (entries, summary) = shared
+                .catalog_native_sessions(route.clone(), limit)
+                .await?;
+            Ok(NodeResponse::NativeSessionsCataloged {
+                route,
+                entries,
+                summary: Some(summary),
+            })
+        }
+        NodeRequest::PageNativeSessions {
+            route,
+            window,
+            catalog_revision,
+            recent_cutoff_unix_ms,
+            after_selection_id,
+            limit,
+        } => {
+            if role != ClientRole::Operator {
+                return Err(failure(
+                    NodeFailureCode::ObserverReadOnly,
+                    "native session catalog paging requires an operator connection",
+                ));
+            }
+            if !(1..=gate4agent_types::NATIVE_SESSION_CATALOG_LIMIT_MAX).contains(&limit)
+                || after_selection_id
+                    .as_deref()
+                    .is_some_and(|cursor| validate_candidate_id(cursor).is_err())
+            {
+                return Err(failure(
+                    NodeFailureCode::InvalidRequest,
+                    "native session catalog page request is invalid",
+                ));
+            }
+            let page = shared
+                .page_native_sessions(
+                    route.clone(),
+                    window,
+                    catalog_revision,
+                    recent_cutoff_unix_ms,
+                    after_selection_id,
+                    limit,
+                )
+                .await?;
+            Ok(NodeResponse::NativeSessionsPaged {
+                route,
+                page,
+            })
+        }
+        NodeRequest::PreviewNativeSession {
+            selection,
+            message_limit,
+        } => {
+            if role != ClientRole::Operator {
+                return Err(failure(
+                    NodeFailureCode::ObserverReadOnly,
+                    "native session preview requires an operator connection",
+                ));
+            }
+            if !(1..=gate4agent_types::NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX)
+                .contains(&message_limit)
+                || selection.validate().is_err()
+            {
+                return Err(failure(
+                    NodeFailureCode::InvalidRequest,
+                    "native session preview request is invalid",
+                ));
+            }
+            let preview = shared
+                .preview_native_session(selection.clone(), message_limit)
+                .await?;
+            Ok(NodeResponse::NativeSessionPreviewed {
+                selection,
+                preview,
+            })
+        }
+        NodeRequest::IndexNativeSession {
+            selection,
+            display_name,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let record = shared
+                .index_native_session(selection.clone(), display_name)
+                .await?;
+            Ok(NodeResponse::NativeSessionIndexed { selection, record })
+        }
+        NodeRequest::PreviewSessionRecord {
+            record_id,
+            message_limit,
+        } => {
+            if role != ClientRole::Operator {
+                return Err(failure(
+                    NodeFailureCode::ObserverReadOnly,
+                    "native session preview requires an operator connection",
+                ));
+            }
+            if !(1..=gate4agent_types::NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX)
+                .contains(&message_limit)
+            {
+                return Err(failure(
+                    NodeFailureCode::InvalidRequest,
+                    "native session preview request is invalid",
+                ));
+            }
+            let record = shared.record(&record_id)?;
+            let working_directory = shared.workspace_root(&record.workspace_id)?;
+            if !platform::roots_equal(
+                &working_directory,
+                windows_path_text(&record.canonical_root),
+            ) {
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "managed session workspace root changed; refusing to preview another directory",
+                ));
+            }
+            let identity = record.provider_session.clone().ok_or_else(|| {
+                failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "native session preview is unavailable for this session record",
+                )
+            })?;
+            if identity.key != ProviderSessionKey::SessionId {
+                return Err(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "native session preview is unavailable for this session identity",
+                ));
+            }
+            let preview = shared
+                .preview_native_session_by_session_id(
+                    record.workspace_id.clone(), record.provider.clone(), identity.id.clone(), message_limit,
+                )
+                .await?;
+            if preview.session_id != identity.id {
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "native session preview identity changed while loading",
+                ));
+            }
+            shared.revalidate_session_record_preview(&record, &identity)?;
+            let preview: gate4agent_types::SessionRecordPreview = preview.into();
+            for observation in history_summary_observations(&preview) {
+                if observation.validate().is_ok() {
+                    shared.publish(NodeEvent::ManagedObservation {
+                        record_id: record_id.clone(),
+                        observation,
+                    });
+                }
+            }
+            Ok(NodeResponse::SessionRecordPreviewed {
+                record_id,
+                preview,
+            })
         }
         NodeRequest::AcquireController { lease_ms } => {
             let controller = shared.acquire_controller(connection_id, role, lease_ms)?;
@@ -8840,6 +12567,19 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             shared.reject_managed_reservation(Some(&workspace_id), Some(&root))?;
             let workspace = shared.register_workspace(workspace_id, root).await?;
             Ok(NodeResponse::WorkspaceRegistered { workspace })
+        }
+        NodeRequest::CreateStandaloneWorkspace {
+            workspace_id,
+            root,
+            initial_branch,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let root = require_windows_path(root)?;
+            shared.reject_managed_reservation(Some(&workspace_id), Some(&root))?;
+            let workspace = shared
+                .create_standalone_workspace(workspace_id, root, initial_branch)
+                .await?;
+            Ok(NodeResponse::StandaloneWorkspaceCreated { workspace })
         }
         NodeRequest::UnregisterWorkspace { workspace_id } => {
             shared.require_controller(connection_id, role)?;
@@ -8931,11 +12671,12 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
                 session,
                 session_id: loaded.session_id,
                 message_count: loaded.message_count,
+                completed_turn_count: loaded.completed_turn_count,
             })
         }
         NodeRequest::ExportContextPack { session } => {
             controlled_session(shared, connection_id, role, &session)?;
-            let context = shared.export_context_pack(&session)?;
+            let context = shared.export_context_pack(&session).await?;
             Ok(NodeResponse::ContextPackExported { context })
         }
         NodeRequest::ForgetContextPack { context_id } => {
@@ -8987,6 +12728,30 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             shared.require_controller(connection_id, role)?;
             let record = shared.rename_session_record(&record_id, display_name)?;
             Ok(NodeResponse::SessionRecordUpdated { record })
+        }
+        NodeRequest::SetSessionTask {
+            record_id,
+            expected_revision,
+            target,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let record = shared.set_session_task(&record_id, expected_revision, target)?;
+            Ok(NodeResponse::SessionRecordUpdated { record })
+        }
+        NodeRequest::IndexProviderSession {
+            workspace_id,
+            provider,
+            identity,
+            display_name,
+        } => {
+            shared.require_controller(connection_id, role)?;
+            let record = shared.index_provider_session(
+                workspace_id,
+                provider,
+                identity,
+                display_name,
+            )?;
+            Ok(NodeResponse::ProviderSessionIndexed { record })
         }
         NodeRequest::ResumeSessionRecord {
             record_id,
@@ -9162,6 +12927,58 @@ fn validate_workspace_request_root(root: &str) -> Result<(), NodeFailure> {
     Ok(())
 }
 
+fn canonical_standalone_workspace_candidate(
+    workspace_id: &WorkspaceId,
+    root: &str,
+) -> Result<String, NodeServerError> {
+    let path = Path::new(root);
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => WorkspaceConfig::new(workspace_id.clone(), path)
+            .map(|workspace| workspace.canonical_root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !path.is_absolute() {
+                return Err(NodeServerError::InvalidWorkspaceRoot {
+                    workspace_id: workspace_id.clone(),
+                    path: root.to_owned(),
+                    message: "path is not absolute".to_owned(),
+                });
+            }
+            let name = path.file_name().ok_or_else(|| NodeServerError::InvalidWorkspaceRoot {
+                workspace_id: workspace_id.clone(),
+                path: root.to_owned(),
+                message: "path has no standalone directory name".to_owned(),
+            })?;
+            let parent = path.parent().ok_or_else(|| NodeServerError::InvalidWorkspaceRoot {
+                workspace_id: workspace_id.clone(),
+                path: root.to_owned(),
+                message: "path has no parent directory".to_owned(),
+            })?;
+            let canonical = std::fs::canonicalize(parent)
+                .map(|parent| parent.join(name))
+                .map_err(|error| NodeServerError::InvalidWorkspaceRoot {
+                    workspace_id: workspace_id.clone(),
+                    path: root.to_owned(),
+                    message: error.to_string(),
+                })?;
+            let canonical_root = canonical.into_os_string().into_string().map_err(|path| {
+                NodeServerError::InvalidWorkspaceRoot {
+                    workspace_id: workspace_id.clone(),
+                    path: path.to_string_lossy().into_owned(),
+                    message: "canonical path is not valid Unicode".to_owned(),
+                }
+            })?;
+            let canonical_root = platform::normalize_canonical_root(canonical_root);
+            validate_workspace_root(workspace_id, &canonical_root)?;
+            Ok(canonical_root)
+        }
+        Err(error) => Err(NodeServerError::InvalidWorkspaceRoot {
+            workspace_id: workspace_id.clone(),
+            path: root.to_owned(),
+            message: error.to_string(),
+        }),
+    }
+}
+
 fn validate_git_revision(field: &str, revision: Option<&str>) -> Result<(), NodeFailure> {
     let Some(revision) = revision else {
         return Ok(());
@@ -9191,6 +13008,20 @@ fn git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
         GitWorktreeErrorKind::Failed => NodeFailureCode::BackendOperationFailed,
     };
     failure(code, &error.message)
+}
+
+fn standalone_workspace_failure(error: StandaloneWorkspaceError) -> NodeFailure {
+    let code = match error.kind {
+        StandaloneWorkspaceErrorKind::InvalidRoot => NodeFailureCode::InvalidWorkspaceRoot,
+        StandaloneWorkspaceErrorKind::InvalidInitialBranch => NodeFailureCode::InvalidRequest,
+        StandaloneWorkspaceErrorKind::GitInitializationFailed => {
+            NodeFailureCode::BackendOperationFailed
+        }
+        StandaloneWorkspaceErrorKind::RecoveryRequired => {
+            NodeFailureCode::StandaloneWorkspaceRecoveryRequired
+        }
+    };
+    failure(code, error.message)
 }
 
 fn managed_git_worktree_failure(error: GitWorktreeError) -> NodeFailure {
@@ -9290,8 +13121,170 @@ fn workspace_file_failure(error: WorkspaceFileReadError) -> NodeFailure {
         WorkspaceFileReadErrorKind::AccessDenied | WorkspaceFileReadErrorKind::Io => {
             NodeFailureCode::RepositoryFileReadFailed
         }
+        WorkspaceFileReadErrorKind::RevisionConflict => {
+            NodeFailureCode::RepositoryFileRevisionConflict
+        }
+        WorkspaceFileReadErrorKind::AlreadyExists
+        | WorkspaceFileReadErrorKind::ParentNotFound
+        | WorkspaceFileReadErrorKind::ParentNotDirectory
+        | WorkspaceFileReadErrorKind::Canceled => {
+            NodeFailureCode::RepositoryFileReadFailed
+        }
     };
     failure(code, "repository file read failed")
+}
+
+fn workspace_file_write_failure(error: WorkspaceFileReadError) -> NodeFailure {
+    let code = match error.kind() {
+        WorkspaceFileReadErrorKind::InvalidPath => NodeFailureCode::InvalidRepositoryPath,
+        WorkspaceFileReadErrorKind::UnsafePath | WorkspaceFileReadErrorKind::ReparsePoint => {
+            NodeFailureCode::RepositoryPathUnsafe
+        }
+        WorkspaceFileReadErrorKind::NotFound => NodeFailureCode::RepositoryFileNotFound,
+        WorkspaceFileReadErrorKind::NotRegularFile => {
+            NodeFailureCode::RepositoryFileNotRegular
+        }
+        WorkspaceFileReadErrorKind::AccessDenied | WorkspaceFileReadErrorKind::Io => {
+            NodeFailureCode::RepositoryFileWriteFailed
+        }
+        WorkspaceFileReadErrorKind::RevisionConflict => {
+            NodeFailureCode::RepositoryFileRevisionConflict
+        }
+        WorkspaceFileReadErrorKind::AlreadyExists
+        | WorkspaceFileReadErrorKind::ParentNotFound
+        | WorkspaceFileReadErrorKind::ParentNotDirectory
+        | WorkspaceFileReadErrorKind::Canceled => {
+            NodeFailureCode::RepositoryFileWriteFailed
+        }
+    };
+    failure(code, "repository file write failed")
+}
+
+async fn settle_workspace_entry_create<T>(
+    mut task: tokio::task::JoinHandle<Result<T, WorkspaceFileReadError>>,
+    commit_state: Arc<AtomicU8>,
+    deadline: Duration,
+    timeout_message: &'static str,
+    task_failure_message: &'static str,
+) -> Result<T, NodeFailure> {
+    let joined = match timeout(deadline, &mut task).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            if commit_state
+                .compare_exchange(
+                    WORKSPACE_ENTRY_CREATE_PENDING,
+                    WORKSPACE_ENTRY_CREATE_CANCELED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Err(failure(
+                    NodeFailureCode::RepositoryEntryCreateTimedOut,
+                    timeout_message,
+                ));
+            }
+            debug_assert_eq!(
+                commit_state.load(Ordering::Acquire),
+                WORKSPACE_ENTRY_CREATE_COMMITTING,
+            );
+            task.await
+        }
+    };
+    joined
+        .map_err(|_| {
+            failure(
+                NodeFailureCode::RepositoryEntryCreateFailed,
+                task_failure_message,
+            )
+        })?
+        .map_err(workspace_entry_create_failure)
+}
+
+fn workspace_entry_create_failure(error: WorkspaceFileReadError) -> NodeFailure {
+    let code = match error.kind() {
+        WorkspaceFileReadErrorKind::InvalidPath => NodeFailureCode::InvalidRepositoryPath,
+        WorkspaceFileReadErrorKind::UnsafePath | WorkspaceFileReadErrorKind::ReparsePoint => {
+            NodeFailureCode::RepositoryPathUnsafe
+        }
+        WorkspaceFileReadErrorKind::AlreadyExists => {
+            NodeFailureCode::RepositoryEntryAlreadyExists
+        }
+        WorkspaceFileReadErrorKind::ParentNotFound | WorkspaceFileReadErrorKind::NotFound => {
+            NodeFailureCode::RepositoryParentNotFound
+        }
+        WorkspaceFileReadErrorKind::ParentNotDirectory
+        | WorkspaceFileReadErrorKind::NotRegularFile => {
+            NodeFailureCode::RepositoryParentNotDirectory
+        }
+        WorkspaceFileReadErrorKind::AccessDenied | WorkspaceFileReadErrorKind::Io => {
+            NodeFailureCode::RepositoryEntryCreateFailed
+        }
+        WorkspaceFileReadErrorKind::RevisionConflict => {
+            NodeFailureCode::RepositoryEntryCreateFailed
+        }
+        WorkspaceFileReadErrorKind::Canceled => {
+            NodeFailureCode::RepositoryEntryCreateTimedOut
+        }
+    };
+    failure(code, "repository entry create failed")
+}
+
+fn workspace_file_revision(bytes: &[u8]) -> WorkspaceFileRevision {
+    let value = digest(&SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    WorkspaceFileRevision::new(value).expect("SHA-256 produces a valid workspace revision")
+}
+
+fn native_session_preview_failure(error: NativeSessionPreviewError) -> NodeFailure {
+    let code = match error {
+        NativeSessionPreviewError::InvalidLimit => NodeFailureCode::InvalidRequest,
+        NativeSessionPreviewError::WorkspaceUnavailable => NodeFailureCode::UnknownWorkspace,
+        NativeSessionPreviewError::StaleCatalog => NodeFailureCode::StaleNativeSessionCatalog,
+        NativeSessionPreviewError::UnsupportedProvider
+        | NativeSessionPreviewError::PreviewUnavailable
+        | NativeSessionPreviewError::SessionNotFound
+        | NativeSessionPreviewError::AmbiguousSession => {
+            NodeFailureCode::BackendOperationFailed
+        }
+    };
+    failure(code, "native session preview failed")
+}
+
+fn host_directory_failure(error: HostDirectoryBrowseError) -> NodeFailure {
+    let code = match error.kind() {
+        HostDirectoryBrowseErrorKind::Invalid => NodeFailureCode::HostDirectoryInvalid,
+        HostDirectoryBrowseErrorKind::ReadFailed => NodeFailureCode::HostDirectoryReadFailed,
+    };
+    failure(code, "host directory browse failed")
+}
+
+fn delivery_failure(error: DeliveryStoreError) -> NodeFailure {
+    let code = match error {
+        DeliveryStoreError::InvalidManifest => NodeFailureCode::DeliveryManifestInvalid,
+        DeliveryStoreError::UnknownStage => NodeFailureCode::UnknownDeliveryStage,
+        DeliveryStoreError::Capacity | DeliveryStoreError::StageConflict => {
+            NodeFailureCode::DeliveryStageConflict
+        }
+        DeliveryStoreError::UnexpectedBlob => NodeFailureCode::DeliveryBlobUnexpected,
+        DeliveryStoreError::ChunkOutOfOrder | DeliveryStoreError::ChunkOverflow => {
+            NodeFailureCode::DeliveryChunkOutOfOrder
+        }
+        DeliveryStoreError::BlobDigestMismatch => {
+            NodeFailureCode::DeliveryBlobDigestMismatch
+        }
+        DeliveryStoreError::BundleDigestMismatch => {
+            NodeFailureCode::DeliveryBundleDigestMismatch
+        }
+        DeliveryStoreError::StageIncomplete => NodeFailureCode::DeliveryStageIncomplete,
+        DeliveryStoreError::Unavailable
+        | DeliveryStoreError::Corrupt
+        | DeliveryStoreError::Storage(_) => NodeFailureCode::DeliveryStageStorageFailed,
+    };
+    failure(code, "delivery operation failed")
 }
 
 fn validate_workspace_root(
@@ -9324,6 +13317,21 @@ fn failure(code: NodeFailureCode, _message: &str) -> NodeFailure {
         code,
         message: node_failure_category(code).to_owned(),
     }
+}
+
+fn harness_mcp_failure(error: HarnessMcpProxyError) -> NodeFailure {
+    let code = match error {
+        HarnessMcpProxyError::Unavailable => NodeFailureCode::HarnessMcpUnavailable,
+        HarnessMcpProxyError::NotFound => NodeFailureCode::ReservationNotFound,
+        HarnessMcpProxyError::Conflict => NodeFailureCode::ReservationConflict,
+        HarnessMcpProxyError::Expired => NodeFailureCode::ReservationExpired,
+        HarnessMcpProxyError::BindingMismatch => NodeFailureCode::BindingMismatch,
+        HarnessMcpProxyError::NotActivated => NodeFailureCode::NotActivated,
+        HarnessMcpProxyError::CallNotFound => NodeFailureCode::CallNotFound,
+        HarnessMcpProxyError::ChunkOutOfOrder => NodeFailureCode::ChunkOutOfOrder,
+        HarnessMcpProxyError::ResponseTooLarge => NodeFailureCode::ResponseTooLarge,
+    };
+    failure(code, "harness MCP proxy operation failed")
 }
 
 fn spawn_deadline_remaining(deadline: Instant) -> Result<Duration, NodeFailure> {
@@ -9389,18 +13397,50 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
     match code {
         NodeFailureCode::InvalidRequest => "invalid-request",
         NodeFailureCode::UnsupportedCapability => "unsupported-capability",
+        NodeFailureCode::HarnessMcpUnavailable => "harness-mcp-unavailable",
+        NodeFailureCode::ReservationNotFound => "reservation-not-found",
+        NodeFailureCode::ReservationConflict => "reservation-conflict",
+        NodeFailureCode::ReservationExpired => "reservation-expired",
+        NodeFailureCode::BindingMismatch => "binding-mismatch",
+        NodeFailureCode::NotActivated => "not-activated",
+        NodeFailureCode::CallNotFound => "call-not-found",
+        NodeFailureCode::ChunkOutOfOrder => "chunk-out-of-order",
+        NodeFailureCode::ResponseTooLarge => "response-too-large",
+        NodeFailureCode::DeliveryManifestInvalid => "delivery-manifest-invalid",
+        NodeFailureCode::UnknownDeliveryStage => "unknown-delivery-stage",
+        NodeFailureCode::DeliveryStageConflict => "delivery-stage-conflict",
+        NodeFailureCode::DeliveryBlobUnexpected => "delivery-blob-unexpected",
+        NodeFailureCode::DeliveryChunkOutOfOrder => "delivery-chunk-out-of-order",
+        NodeFailureCode::DeliveryBlobDigestMismatch => "delivery-blob-digest-mismatch",
+        NodeFailureCode::DeliveryBundleDigestMismatch => "delivery-bundle-digest-mismatch",
+        NodeFailureCode::DeliveryStageIncomplete => "delivery-stage-incomplete",
+        NodeFailureCode::DeliveryStageStorageFailed => "delivery-stage-storage-failed",
         NodeFailureCode::Unauthorized => "unauthorized",
         NodeFailureCode::ObserverReadOnly => "observer-read-only",
         NodeFailureCode::ControllerBusy => "controller-busy",
         NodeFailureCode::ControllerRequired => "controller-required",
         NodeFailureCode::UnknownWorkspace => "unknown-workspace",
+        NodeFailureCode::HostDirectoryInvalid => "host-directory-invalid",
+        NodeFailureCode::HostDirectoryReadFailed => "host-directory-read-failed",
+        NodeFailureCode::HostDirectoryReadTimedOut => "host-directory-read-timed-out",
         NodeFailureCode::InvalidRepositoryPath => "invalid-repository-path",
         NodeFailureCode::RepositoryFileNotFound => "repository-file-not-found",
         NodeFailureCode::RepositoryFileNotRegular => "repository-file-not-regular",
         NodeFailureCode::RepositoryPathUnsafe => "repository-path-unsafe",
         NodeFailureCode::RepositoryFileReadTimedOut => "repository-file-read-timed-out",
         NodeFailureCode::RepositoryFileReadFailed => "repository-file-read-failed",
+        NodeFailureCode::RepositoryFileWriteTimedOut => "repository-file-write-timed-out",
+        NodeFailureCode::RepositoryFileWriteFailed => "repository-file-write-failed",
+        NodeFailureCode::RepositoryFileRevisionConflict => "repository-file-revision-conflict",
+        NodeFailureCode::RepositoryEntryAlreadyExists => "repository-entry-already-exists",
+        NodeFailureCode::RepositoryParentNotFound => "repository-parent-not-found",
+        NodeFailureCode::RepositoryParentNotDirectory => "repository-parent-not-directory",
+        NodeFailureCode::RepositoryEntryCreateTimedOut => "repository-entry-create-timed-out",
+        NodeFailureCode::RepositoryEntryCreateFailed => "repository-entry-create-failed",
+        NodeFailureCode::GitReadTimedOut => "git-read-timed-out",
+        NodeFailureCode::GitReadFailed => "git-read-failed",
         NodeFailureCode::UnknownSpawnProfile => "unknown-spawn-profile",
+        NodeFailureCode::SpawnProfileRevisionMismatch => "spawn-profile-revision-mismatch",
         NodeFailureCode::SpawnTargetMismatch => "spawn-target-mismatch",
         NodeFailureCode::SpawnIdempotencyConflict => "spawn-idempotency-conflict",
         NodeFailureCode::SpawnIdempotencyCapacity => "spawn-idempotency-capacity",
@@ -9432,12 +13472,19 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::ManagedWorktreeBusy => "managed-worktree-busy",
         NodeFailureCode::ManagedWorktreeOwnershipConflict => "managed-worktree-ownership-conflict",
         NodeFailureCode::ManagedWorktreeRecoveryRequired => "managed-worktree-recovery-required",
+        NodeFailureCode::StandaloneWorkspaceRecoveryRequired => {
+            "standalone-workspace-recovery-required"
+        }
         NodeFailureCode::UnknownSession => "unknown-session",
         NodeFailureCode::UnknownSessionRecord => "unknown-session-record",
         NodeFailureCode::SessionRecordNotResumable => "session-record-not-resumable",
         NodeFailureCode::SessionRecordBusy => "session-record-busy",
         NodeFailureCode::SessionRecordConflict => "session-record-conflict",
         NodeFailureCode::SessionWorkspaceMismatch => "session-workspace-mismatch",
+        NodeFailureCode::WorkspaceRegistrationRequired => {
+            "workspace-registration-required"
+        }
+        NodeFailureCode::StaleNativeSessionCatalog => "stale-native-session-catalog",
         NodeFailureCode::StaleGeneration => "stale-generation",
         NodeFailureCode::BackendBusy => "backend-busy",
         NodeFailureCode::BackendDisconnected => "backend-disconnected",
@@ -9482,6 +13529,27 @@ fn detached_record_state(record: &ManagedSessionRecord) -> ManagedSessionState {
     }
 }
 
+fn active_record_state(
+    identity_admitted: bool,
+    provider_session_is_known: bool,
+) -> ManagedSessionState {
+    if identity_admitted && !provider_session_is_known {
+        ManagedSessionState::IdentityPending
+    } else {
+        ManagedSessionState::Live
+    }
+}
+
+fn managed_worktree_record_holders(
+    records: &[ManagedSessionRecord],
+) -> Vec<(SessionRecordId, WorkspaceId)> {
+    records
+        .iter()
+        .filter(|record| record.provider_session.is_some())
+        .map(|record| (record.record_id.clone(), record.workspace_id.clone()))
+        .collect()
+}
+
 #[derive(Debug, Error)]
 pub enum NodeServerError {
     #[error("node endpoint must be a bounded absolute local transport path")]
@@ -9492,6 +13560,8 @@ pub enum NodeServerError {
     InvalidApiListen(std::net::SocketAddr),
     #[error("node durable state path must be an absolute file path: {0}")]
     InvalidStatePath(String),
+    #[error("harness MCP helper must be an exact reviewed absolute regular file")]
+    InvalidHarnessMcpHelper,
     #[error("the local state directory is unavailable; supply an explicit state path")]
     LocalStateDirectoryUnavailable,
     #[error("the local runtime directory is unavailable; supply an explicit endpoint")]
@@ -9523,6 +13593,11 @@ pub enum NodeServerError {
         workspace_id: WorkspaceId,
         profile_id: WorktreeProfileId,
     },
+    #[error("workspace '{workspace_id}' exceeds the {max}-profile managed worktree limit")]
+    ManagedWorktreeProfileCapacity {
+        workspace_id: WorkspaceId,
+        max: usize,
+    },
     #[error("workspace '{workspace_id}' managed worktree profile '{profile_id}' is invalid: {message}")]
     InvalidManagedWorktreeProfile {
         workspace_id: WorkspaceId,
@@ -9547,6 +13622,8 @@ pub enum NodeServerError {
     SessionEnvironmentMaterializer,
     #[error("node bundle catalog is invalid: {0}")]
     BundleCatalog(String),
+    #[error("node delivery store failed to initialize")]
+    DeliveryStore,
     #[error("active agent registry failed: {0}")]
     Registry(String),
     #[error("node provider contract manifest is invalid: {0}")]
@@ -9579,9 +13656,1181 @@ pub enum NodeServerError {
     ShutdownTimedOut { active_native_sessions: usize },
 }
 
+#[cfg(test)]
+mod observation_projection_tests {
+    use super::*;
+    use gate4agent_types::{
+        AdapterId, AdapterVerification, ContextWindowUsage, ProviderSource, TokenUsage,
+    };
+
+    fn observation_test_shared() -> NodeShared {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("observation-test").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-observation-test").unwrap(),
+            vec![workspace],
+            vec![AgentId::new("claude").unwrap()],
+        )
+    }
+
+    fn provider_control_event(
+        family: AdapterFamily,
+        provider_event: ProviderEvent,
+    ) -> ControlEvent {
+        provider_control_event_at(family, "fixture", 9, provider_event)
+    }
+
+    fn provider_control_event_at(
+        family: AdapterFamily,
+        adapter: &str,
+        source_sequence: u64,
+        provider_event: ProviderEvent,
+    ) -> ControlEvent {
+        ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 41,
+            command_id: None,
+            instance_id: AgentInstanceId(7),
+            generation: SessionGeneration(3),
+            event: ControlEventKind::ProviderEvent {
+                sequence: 8,
+                source: provider_source(family, adapter),
+                source_sequence,
+                event: provider_event,
+            },
+        }
+    }
+
+    fn address() -> SessionAddress {
+        SessionAddress {
+            workspace_id: WorkspaceId::new("observation-test").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(3),
+            },
+        }
+    }
+
+    fn provider_source(family: AdapterFamily, adapter: &str) -> ProviderSource {
+        ProviderSource {
+            family,
+            binding: AdapterBinding::new(
+                AdapterId::new(adapter).unwrap(),
+                "fixture/v1",
+                AdapterVerification::SyntheticFixture,
+            )
+            .unwrap(),
+        }
+    }
+
+    fn timeline_observations(observations: &[ObservationV1]) -> Vec<&ObservationV1> {
+        observations
+            .iter()
+            .filter(|observation| {
+                !matches!(observation.kind, ObservationKindV1::SourceCapabilities { .. })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hook_capability_matrix_claims_only_current_normalizer_emitters() {
+        let (_, pty) = observation_source_capabilities(&provider_source(
+            AdapterFamily::PtySemantic,
+            "codex",
+        ));
+        assert_eq!(pty, ObservationCapabilitiesV1::default());
+
+        for (adapter, tools, attention, subagents) in [
+            ("claude-code", true, true, true),
+            ("codex", true, true, false),
+            ("gemini", true, false, false),
+            ("opencode", false, true, false),
+            ("mimo-code", false, true, false),
+            ("pi", true, false, false),
+            ("omp", true, false, false),
+            ("antigravity", true, true, false),
+            ("amp", true, false, false),
+            ("command-code", true, false, false),
+            ("hermes", true, true, false),
+            ("devin", true, true, false),
+            ("grok", true, true, true),
+            ("kimi", true, true, true),
+            ("copilot", true, true, true),
+            ("droid", true, true, true),
+            ("cursor", true, false, true),
+        ] {
+            let (family, actual) = observation_source_capabilities(&provider_source(
+                AdapterFamily::Hook,
+                adapter,
+            ));
+            assert_eq!(family, ObservationSourceFamilyV1::Hook, "{adapter}");
+            assert_eq!(
+                actual,
+                ObservationCapabilitiesV1 {
+                    tools,
+                    attention,
+                    subagents,
+                    ..ObservationCapabilitiesV1::default()
+                },
+                "{adapter}",
+            );
+        }
+        assert_eq!(
+            observation_source_capabilities(&provider_source(
+                AdapterFamily::Hook,
+                "unsupported",
+            )),
+            (
+                ObservationSourceFamilyV1::Hook,
+                ObservationCapabilitiesV1::default(),
+            )
+        );
+
+        let (_, pipe) = observation_source_capabilities(&provider_source(
+            AdapterFamily::Pipe,
+            "codex",
+        ));
+        assert!(pipe.tools && pipe.usage);
+        assert!(!pipe.attention && !pipe.subagents && !pipe.todo && !pipe.file_changes);
+        let (_, kimi_pipe) = observation_source_capabilities(&provider_source(
+            AdapterFamily::Pipe,
+            "kimi",
+        ));
+        assert!(kimi_pipe.tools);
+        assert!(!kimi_pipe.usage);
+        let (_, qwen_pipe) = observation_source_capabilities(&provider_source(
+            AdapterFamily::Pipe,
+            "qwen-code",
+        ));
+        assert!(qwen_pipe.tools && qwen_pipe.attention && qwen_pipe.usage);
+        assert!(!qwen_pipe.subagents && !qwen_pipe.todo && !qwen_pipe.file_changes);
+        assert!(observation_evidence(AdapterFamily::History).is_none());
+    }
+
+    #[test]
+    fn current_five_enabled_provider_matrix_is_exact() {
+        let registry = active_registry().unwrap();
+        let (providers, adapters) = provider_contract_manifest(&registry).unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|contract| contract.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "grok", "kimi", "qwen-code"],
+        );
+        assert_eq!(
+            adapters
+                .iter()
+                .filter(|contract| contract.family == AdapterFamily::Hook)
+                .map(|contract| (contract.provider.as_str(), contract.adapter_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claude", "claude-code"),
+                ("codex", "codex"),
+                ("grok", "grok"),
+                ("kimi", "kimi"),
+            ],
+        );
+        assert!(!adapters.iter().any(|contract| {
+            contract.provider.as_str() == "qwen-code" && contract.family == AdapterFamily::Hook
+        }));
+
+        for (adapter, subagents) in [
+            ("claude-code", true),
+            ("codex", false),
+            ("grok", true),
+            ("kimi", true),
+        ] {
+            let (family, capabilities) = observation_source_capabilities(&provider_source(
+                AdapterFamily::Hook,
+                adapter,
+            ));
+            assert_eq!(family, ObservationSourceFamilyV1::Hook);
+            assert!(capabilities.tools && capabilities.attention);
+            assert!(!capabilities.usage);
+            assert_eq!(capabilities.subagents, subagents, "{adapter}");
+            assert!(!capabilities.todo && !capabilities.file_changes && !capabilities.owned_processes);
+        }
+    }
+
+    #[test]
+    fn subagent_capability_is_exact() {
+        for adapter in [
+            "claude-code",
+            "grok",
+            "kimi",
+            "copilot",
+            "droid",
+            "cursor",
+        ] {
+            assert!(hook_observation_capabilities(adapter).subagents, "{adapter}");
+        }
+        for adapter in [
+            "codex",
+            "gemini",
+            "opencode",
+            "mimo-code",
+            "pi",
+            "omp",
+            "antigravity",
+            "amp",
+            "command-code",
+            "hermes",
+            "devin",
+            "unsupported",
+        ] {
+            assert!(!hook_observation_capabilities(adapter).subagents, "{adapter}");
+        }
+    }
+
+    #[test]
+    fn acp_source_capabilities_match_emitted_tool_and_usage_events() {
+        let (family, capabilities) = observation_source_capabilities(&provider_source(
+            AdapterFamily::Acp,
+            "codex",
+        ));
+        assert_eq!(family, ObservationSourceFamilyV1::Acp);
+        assert!(capabilities.tools);
+        assert!(capabilities.usage);
+        assert!(!capabilities.attention);
+        assert!(!capabilities.subagents);
+        assert!(!capabilities.todo);
+        assert!(!capabilities.owned_processes);
+        assert!(!capabilities.file_changes);
+        assert!(!capabilities.history_summary);
+    }
+
+    #[test]
+    fn non_session_start_hook_event_receives_capabilities() {
+        let event = provider_control_event_at(
+            AdapterFamily::Hook,
+            "claude-code",
+            1,
+            ProviderEvent::WorkingObserved,
+        );
+        let projected = provider_observations(&event);
+        assert_eq!(projected.len(), 2);
+        let ObservationKindV1::SourceCapabilities {
+            source_family,
+            source_adapter,
+            capabilities,
+        } = &projected[0].kind else {
+            panic!("expected source capabilities");
+        };
+        assert_eq!(*source_family, ObservationSourceFamilyV1::Hook);
+        assert_eq!(source_adapter, "claude-code");
+        assert_eq!(*capabilities, hook_observation_capabilities("claude-code"));
+        assert!(!projected[0].kind.requires_workflow_detail_capability());
+        assert_eq!(projected[1].kind, ObservationKindV1::Working);
+        let base = project_event_without_observation_workflow_detail(NodeEventEnvelope {
+            sequence: 1,
+            event: NodeEvent::Observation {
+                address: address(),
+                observation: projected[0].clone(),
+            },
+        });
+        assert!(base.is_some());
+    }
+
+    #[test]
+    fn later_hook_events_do_not_repeat_capabilities() {
+        let text = provider_control_event_at(
+            AdapterFamily::Hook,
+            "claude-code",
+            2,
+            ProviderEvent::Text {
+                text: "private text delta".to_owned(),
+                is_delta: true,
+            },
+        );
+        assert!(provider_observations(&text).is_empty());
+
+        let working = provider_control_event_at(
+            AdapterFamily::Hook,
+            "claude-code",
+            3,
+            ProviderEvent::WorkingObserved,
+        );
+        let projected = provider_observations(&working);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].kind, ObservationKindV1::Working);
+    }
+
+    #[test]
+    fn first_identity_only_event_emits_capabilities() {
+        let identity = provider_control_event_at(
+            AdapterFamily::Hook,
+            "claude-code",
+            1,
+            ProviderEvent::SessionIdentityObserved {
+                identity: ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id: "private-provider-session".to_owned(),
+                    transcript_path: None,
+                },
+            },
+        );
+        let projected = provider_observations(&identity);
+        assert_eq!(projected.len(), 1);
+        assert!(matches!(
+            &projected[0].kind,
+            ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::Hook,
+                source_adapter,
+                ..
+            } if source_adapter == "claude-code"
+        ));
+    }
+
+    #[test]
+    fn hook_stop_turn_completed_has_no_usage_observation() {
+        let completed = provider_control_event_at(
+            AdapterFamily::Hook,
+            "claude-code",
+            1,
+            ProviderEvent::TurnCompleted {
+                usage: TokenUsage::default(),
+                is_cumulative: false,
+            },
+        );
+        let projected = provider_observations(&completed);
+        let ObservationKindV1::SourceCapabilities { capabilities, .. } = &projected[0].kind else {
+            panic!("expected source capabilities");
+        };
+        assert!(!capabilities.usage);
+        assert_eq!(timeline_observations(&projected).len(), 1);
+        assert_eq!(projected[1].kind, ObservationKindV1::TurnCompleted);
+        assert!(!projected
+            .iter()
+            .any(|observation| matches!(observation.kind, ObservationKindV1::Usage { .. })));
+    }
+
+    #[test]
+    fn token_bearing_pipe_turn_completed_projects_usage() {
+        let completed = provider_control_event_at(
+            AdapterFamily::Pipe,
+            "codex",
+            1,
+            ProviderEvent::TurnCompleted {
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cache_read_tokens: 30,
+                    cache_write_tokens: 40,
+                    reasoning_tokens: 50,
+                    context_window: Some(128_000),
+                },
+                is_cumulative: true,
+            },
+        );
+        let projected = provider_observations(&completed);
+        let ObservationKindV1::SourceCapabilities { capabilities, .. } = &projected[0].kind else {
+            panic!("expected source capabilities");
+        };
+        assert!(capabilities.usage);
+        assert_eq!(projected[1].kind, ObservationKindV1::TurnCompleted);
+        assert!(matches!(
+            projected[2].kind,
+            ObservationKindV1::Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                is_cumulative: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exact_context_projects_only_from_structured_non_pty_provider_events() {
+        let usage = ContextWindowUsage {
+            uncached_input_tokens: 70,
+            cache_read_tokens: 20,
+            cache_write_tokens: 0,
+            output_tokens: 10,
+            unattributed_tokens: 5,
+            used_tokens: 105,
+            capacity_tokens: 100,
+        };
+        let structured = provider_observations(&provider_control_event_at(
+            AdapterFamily::Pipe,
+            "codex",
+            2,
+            ProviderEvent::ContextWindowUsage { usage },
+        ));
+        let timeline = timeline_observations(&structured);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].evidence, ObservationEvidenceV1::StructuredProvider);
+        assert_eq!(
+            timeline[0].kind,
+            ObservationKindV1::ContextWindowUsage {
+                uncached_input_tokens: 70,
+                cache_read_tokens: 20,
+                cache_write_tokens: 0,
+                output_tokens: 10,
+                unattributed_tokens: 5,
+                used_tokens: 105,
+                capacity_tokens: 100,
+            }
+        );
+
+        for family in [AdapterFamily::PtySemantic, AdapterFamily::ManagedHook] {
+            let projected = provider_observations(&provider_control_event_at(
+                family,
+                "codex",
+                2,
+                ProviderEvent::ContextWindowUsage { usage },
+            ));
+            assert!(
+                timeline_observations(&projected).is_empty(),
+                "{family:?} must not project an authoritative context fact"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_pipe_events_project_private_categorical_tools_attention_and_usage() {
+        let mut shared = observation_test_shared();
+        let (_, adapters) = provider_contract_manifest(&active_registry().unwrap()).unwrap();
+        shared.provider_adapter_contracts = adapters;
+        let raw = ProviderRuntimePolicy::raw_pty();
+        let observed = shared.admit_qwen_sidecar_observation_policy(
+            &AgentId::new("qwen-code").unwrap(),
+            SessionMode::Pty,
+            raw,
+        );
+        assert!(observed.raw_pty_lifecycle && observed.semantic_readiness);
+        assert!(!observed.structured_prompt);
+        assert!(!observed.provider_session_identity);
+        assert!(!observed.semantic_resume);
+        assert_eq!(
+            shared.admit_qwen_sidecar_observation_policy(
+                &AgentId::new("qwen-code").unwrap(),
+                SessionMode::Inline,
+                raw,
+            ),
+            raw
+        );
+        assert_eq!(
+            shared.admit_qwen_sidecar_observation_policy(
+                &AgentId::new("codex").unwrap(),
+                SessionMode::Pty,
+                raw,
+            ),
+            raw
+        );
+
+        let ready = provider_control_event_at(
+            AdapterFamily::Pipe,
+            "qwen-code",
+            1,
+            ProviderEvent::Ready,
+        );
+        let projected = provider_observations(&ready);
+        let ObservationKindV1::SourceCapabilities { capabilities, .. } = &projected[0].kind else {
+            panic!("expected source capabilities");
+        };
+        assert!(capabilities.tools && capabilities.attention && capabilities.usage);
+        assert!(!capabilities.subagents && !capabilities.todo && !capabilities.file_changes);
+
+        let tool = provider_observations(&provider_control_event_at(
+            AdapterFamily::Pipe,
+            "qwen-code",
+            2,
+            ProviderEvent::ToolStarted {
+                id: "private-provider-tool-id".to_owned(),
+                name: "run_shell_command".to_owned(),
+                input_json: String::new(),
+                agent_id: None,
+            },
+        ));
+        assert!(matches!(
+            timeline_observations(&tool)[0].kind,
+            ObservationKindV1::ToolStarted { ref class, .. } if class == "Shell"
+        ));
+        let attention = provider_observations(&provider_control_event_at(
+            AdapterFamily::Pipe,
+            "qwen-code",
+            3,
+            ProviderEvent::InteractionRequested {
+                request_id: Some("private-request-id".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "Shell".to_owned(),
+                prompt: String::new(),
+                agent_id: None,
+            },
+        ));
+        let ObservationKindV1::ApprovalRequested {
+            correlation_id: requested_correlation,
+            tool_class,
+        } = &timeline_observations(&attention)[0].kind else {
+            panic!("expected Qwen approval observation");
+        };
+        assert_eq!(tool_class, "Shell");
+        let requested_correlation = requested_correlation.clone();
+        let raw_resolution = provider_observations(&provider_control_event_at(
+            AdapterFamily::Pipe,
+            "qwen-code",
+            4,
+            ProviderEvent::InteractionResolved {
+                request_id: "private-request-id".to_owned(),
+                outcome: gate4agent_types::ProviderInteractionOutcome::Approved,
+            },
+        ));
+        assert!(raw_resolution.is_empty());
+        let resolved = provider_observations(&ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 42,
+            command_id: None,
+            instance_id: AgentInstanceId(7),
+            generation: SessionGeneration(3),
+            event: ControlEventKind::InteractionResolved {
+                interaction_id: gate4agent_types::ProviderInteractionId(8),
+                outcome: gate4agent_types::ProviderInteractionOutcome::Approved,
+            },
+        });
+        let ObservationKindV1::InteractionResolved {
+            correlation_id,
+            outcome,
+        } = &resolved[0].kind else {
+            panic!("expected Qwen interaction resolution observation");
+        };
+        assert_eq!(correlation_id, &requested_correlation);
+        assert_eq!(*outcome, ObservationInteractionOutcomeV1::Approved);
+        let usage = provider_observations(&provider_control_event_at(
+            AdapterFamily::Pipe,
+            "qwen-code",
+            5,
+            ProviderEvent::TurnCompleted {
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 8,
+                    ..TokenUsage::default()
+                },
+                is_cumulative: false,
+            },
+        ));
+        assert!(timeline_observations(&usage).iter().any(|observation| matches!(
+            observation.kind,
+            ObservationKindV1::Usage { input_tokens: 5, output_tokens: 8, .. }
+        )));
+        let encoded = serde_json::to_string(&(
+            projected,
+            tool,
+            attention,
+            raw_resolution,
+            resolved,
+            usage,
+        ))
+        .unwrap();
+        assert!(!encoded.contains("private-provider-tool-id"));
+        assert!(!encoded.contains("private-request-id"));
+    }
+
+    #[test]
+    fn observation_projection_is_private_categorical_and_capability_gated() {
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_OBSERVATION_EVENTS_CAPABILITY
+        }));
+
+        let tool = provider_control_event(
+            AdapterFamily::Hook,
+            ProviderEvent::ToolStarted {
+                id: "private-tool-id".to_owned(),
+                name: "PowerShell command containing a private path".to_owned(),
+                input_json: r#"{"prompt":"secret","path":"C:\\private"}"#.to_owned(),
+                agent_id: Some("private-provider-agent".to_owned()),
+            },
+        );
+        let projected = provider_observations(&tool);
+        assert_eq!(projected.len(), 1);
+        let timeline = timeline_observations(&projected);
+        assert_eq!(timeline.len(), 1);
+        let tool_observation = (*timeline[0]).clone();
+        assert_eq!(tool_observation.source_sequence, 9);
+        assert_eq!(tool_observation.evidence, ObservationEvidenceV1::ManagedHook);
+        let ObservationKindV1::ToolStarted {
+            correlation_id,
+            class,
+        } = &tool_observation.kind
+        else {
+            panic!("expected tool start observation");
+        };
+        assert!(correlation_id.starts_with("tool-"));
+        assert_eq!(class, "Shell");
+        let tool_correlation = correlation_id.clone();
+        let completed = provider_control_event(
+            AdapterFamily::Hook,
+            ProviderEvent::ToolCompleted {
+                id: "private-tool-id".to_owned(),
+                output: "private output".to_owned(),
+                is_error: false,
+                duration_ms: Some(7),
+                agent_id: None,
+            },
+        );
+        let completed = provider_observations(&completed);
+        let completed = timeline_observations(&completed);
+        let ObservationKindV1::ToolCompleted { correlation_id, .. } = &completed[0].kind
+        else {
+            panic!("expected tool completion observation");
+        };
+        assert_eq!(correlation_id, &tool_correlation);
+        let gated = project_event_without_observation(NodeEventEnvelope {
+            sequence: 1,
+            event: NodeEvent::Observation {
+                address: address(),
+                observation: tool_observation.clone(),
+            },
+        });
+        assert!(gated.is_none());
+        let safe = project_event_without_observation_workflow_detail(NodeEventEnvelope {
+            sequence: 2,
+            event: NodeEvent::Observation {
+                address: address(),
+                observation: tool_observation,
+            },
+        });
+        assert!(safe.is_some());
+        let detail = project_event_without_observation_workflow_detail(NodeEventEnvelope {
+            sequence: 3,
+            event: NodeEvent::Observation {
+                address: address(),
+                observation: ObservationV1 {
+                    source_sequence: 10,
+                    observed_at_unix_ms: Some(1),
+                    evidence: ObservationEvidenceV1::StructuredProvider,
+                    kind: ObservationKindV1::Error {
+                        detail: "provider-error".to_owned(),
+                    },
+                    truncated: false,
+                },
+            },
+        });
+        assert!(detail.is_none());
+        let wire = serde_json::to_string(&projected).unwrap();
+        for private in [
+            "private-tool-id",
+            "private-provider-agent",
+            "secret",
+            "C:\\\\private",
+            "PowerShell command containing a private path",
+        ] {
+            assert!(!wire.contains(private));
+        }
+
+        let subagent = provider_control_event(
+            AdapterFamily::OneShot,
+            ProviderEvent::SubagentStarted {
+                agent_id: "raw-provider-subagent-id".to_owned(),
+                agent_type: Some("research-agent-with-private-label".to_owned()),
+                description: Some("private task description".to_owned()),
+            },
+        );
+        let projected = provider_observations(&subagent);
+        let timeline = timeline_observations(&projected);
+        let ObservationKindV1::SubagentStarted {
+            correlation_id,
+            class,
+        } = &timeline[0].kind
+        else {
+            panic!("expected subagent observation");
+        };
+        assert!(correlation_id.starts_with("sub-"));
+        assert_ne!(correlation_id, "raw-provider-subagent-id");
+        assert_eq!(class, "Search");
+        let wire = serde_json::to_string(&projected).unwrap();
+        assert!(!wire.contains("raw-provider-subagent-id"));
+        assert!(!wire.contains("private task description"));
+        assert!(!wire.contains("research-agent-with-private-label"));
+
+        let same_source_local_id = ProviderEvent::SubagentStarted {
+            agent_id: "same-provider-local-id".to_owned(),
+            agent_type: Some("task".to_owned()),
+            description: None,
+        };
+        let managed = provider_observations(&provider_control_event(
+            AdapterFamily::Hook,
+            same_source_local_id.clone(),
+        ));
+        let structured = provider_observations(&provider_control_event(
+            AdapterFamily::OneShot,
+            same_source_local_id,
+        ));
+        let managed = timeline_observations(&managed);
+        let structured = timeline_observations(&structured);
+        let ObservationKindV1::SubagentStarted {
+            correlation_id: managed_correlation,
+            ..
+        } = &managed[0].kind
+        else {
+            panic!("expected managed subagent observation");
+        };
+        let ObservationKindV1::SubagentStarted {
+            correlation_id: structured_correlation,
+            ..
+        } = &structured[0].kind
+        else {
+            panic!("expected structured subagent observation");
+        };
+        assert_ne!(managed_correlation, structured_correlation);
+
+        let thinking = provider_control_event(
+            AdapterFamily::Pipe,
+            ProviderEvent::Thinking {
+                text: "private hidden reasoning canary".to_owned(),
+            },
+        );
+        let thinking = provider_observations(&thinking);
+        let timeline = timeline_observations(&thinking);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].kind, ObservationKindV1::Working);
+        assert!(!serde_json::to_string(&thinking)
+            .unwrap()
+            .contains("private hidden reasoning canary"));
+
+        let requested = provider_control_event(
+            AdapterFamily::Hook,
+            ProviderEvent::InteractionRequested {
+                request_id: Some("private-request".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "PowerShell".to_owned(),
+                prompt: "private approval prompt".to_owned(),
+                agent_id: None,
+            },
+        );
+        let requested = provider_observations(&requested);
+        let requested = timeline_observations(&requested);
+        let ObservationKindV1::ApprovalRequested { correlation_id, .. } = &requested[0].kind
+        else {
+            panic!("expected approval request observation");
+        };
+        let interaction_correlation = correlation_id.clone();
+        let resolved = ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 42,
+            command_id: None,
+            instance_id: AgentInstanceId(7),
+            generation: SessionGeneration(3),
+            event: ControlEventKind::InteractionResolved {
+                interaction_id: gate4agent_types::ProviderInteractionId(8),
+                outcome: gate4agent_types::ProviderInteractionOutcome::Approved,
+            },
+        };
+        let resolved = provider_observations(&resolved);
+        let ObservationKindV1::InteractionResolved {
+            correlation_id,
+            outcome,
+        } = &resolved[0].kind
+        else {
+            panic!("expected interaction resolution observation");
+        };
+        assert_eq!(correlation_id, &interaction_correlation);
+        assert_eq!(*outcome, ObservationInteractionOutcomeV1::Approved);
+    }
+
+    #[test]
+    fn pty_hint_never_projects_authoritative_completion() {
+        let completed = provider_control_event(
+            AdapterFamily::PtySemantic,
+            ProviderEvent::TurnCompleted {
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cache_read_tokens: 30,
+                    cache_write_tokens: 40,
+                    reasoning_tokens: 50,
+                    context_window: Some(128_000),
+                },
+                is_cumulative: true,
+            },
+        );
+        let projected = provider_observations(&completed);
+        assert!(projected.is_empty());
+        assert!(timeline_observations(&projected).is_empty());
+        let tool_completed = provider_control_event(
+            AdapterFamily::PtySemantic,
+            ProviderEvent::ToolCompleted {
+                id: "private-tool-id".to_owned(),
+                output: "private output".to_owned(),
+                is_error: false,
+                duration_ms: Some(5),
+                agent_id: None,
+            },
+        );
+        let projected = provider_observations(&tool_completed);
+        assert!(projected.is_empty());
+        assert!(timeline_observations(&projected).is_empty());
+        let subagent_completed = provider_control_event(
+            AdapterFamily::PtySemantic,
+            ProviderEvent::SubagentStopped {
+                agent_id: "private-subagent-id".to_owned(),
+            },
+        );
+        let projected = provider_observations(&subagent_completed);
+        assert!(projected.is_empty());
+        assert!(timeline_observations(&projected).is_empty());
+
+        let working = provider_control_event(
+            AdapterFamily::PtySemantic,
+            ProviderEvent::WorkingObserved,
+        );
+        let projected = provider_observations(&working);
+        assert_eq!(projected.len(), 1);
+        let timeline = timeline_observations(&projected);
+        assert_eq!(timeline[0].evidence, ObservationEvidenceV1::PtyHint);
+        assert_eq!(timeline[0].kind, ObservationKindV1::Working);
+    }
+
+    #[test]
+    fn subagent_stop_without_provider_outcome_projects_unknown_success() {
+        let stopped = provider_control_event(
+            AdapterFamily::Hook,
+            ProviderEvent::SubagentStopped {
+                agent_id: "private-subagent-id".to_owned(),
+            },
+        );
+        let projected = provider_observations(&stopped);
+        let timeline = timeline_observations(&projected);
+        let ObservationKindV1::SubagentCompleted { success, .. } = &timeline[0].kind else {
+            panic!("expected subagent completion observation");
+        };
+        assert_eq!(*success, None);
+    }
+
+    #[test]
+    fn unproven_codex_workflow_tool_payloads_do_not_project_detail() {
+        for (name, input_json, private_value) in [
+            (
+                "plan_update",
+                r#"{"summary":"private plan summary","status":"in_progress"}"#,
+                "private plan summary",
+            ),
+            (
+                "FileChange",
+                r#"{"path":"C:\\private\\host.rs","status":"in_progress"}"#,
+                r#"C:\\private\\host.rs"#,
+            ),
+        ] {
+            let event = provider_control_event(
+                AdapterFamily::Pipe,
+                ProviderEvent::ToolStarted {
+                    id: "private-workflow-id".to_owned(),
+                    name: name.to_owned(),
+                    input_json: input_json.to_owned(),
+                    agent_id: None,
+                },
+            );
+            let projected = provider_observations(&event);
+            assert_eq!(projected.len(), 1);
+            let timeline = timeline_observations(&projected);
+            assert_eq!(
+                timeline[0].evidence,
+                ObservationEvidenceV1::StructuredProvider,
+            );
+            assert!(matches!(
+                &timeline[0].kind,
+                ObservationKindV1::ToolStarted { .. }
+            ));
+            assert!(!matches!(
+                &timeline[0].kind,
+                ObservationKindV1::TodoSnapshot { .. }
+                    | ObservationKindV1::FileChanged { .. }
+            ));
+            let wire = serde_json::to_string(&projected).unwrap();
+            assert!(!wire.contains("private-workflow-id"));
+            assert!(!wire.contains(private_value));
+        }
+
+        for name in ["plan_update", "FileChange"] {
+            let pty = provider_control_event(
+                AdapterFamily::PtySemantic,
+                ProviderEvent::ToolStarted {
+                    id: "private-workflow-id".to_owned(),
+                    name: name.to_owned(),
+                    input_json: r#"{"path":"C:\\private\\host.rs"}"#.to_owned(),
+                    agent_id: None,
+                },
+            );
+            let projected = provider_observations(&pty);
+            assert_eq!(projected.len(), 1);
+            let timeline = timeline_observations(&projected);
+            assert_eq!(timeline[0].evidence, ObservationEvidenceV1::PtyHint);
+            assert!(matches!(
+                &timeline[0].kind,
+                ObservationKindV1::ToolStarted { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn resync_strips_observations_without_capability() {
+        let mut events = vec![
+            NodeEventEnvelope {
+                sequence: 1,
+                event: NodeEvent::Observation {
+                    address: address(),
+                    observation: ObservationV1 {
+                        source_sequence: 1,
+                        observed_at_unix_ms: Some(1),
+                        evidence: ObservationEvidenceV1::NodeLifecycle,
+                        kind: ObservationKindV1::SessionStarted,
+                        truncated: false,
+                    },
+                },
+            },
+            NodeEventEnvelope {
+                sequence: 2,
+                event: NodeEvent::ManagedObservation {
+                    record_id: SessionRecordId::new("record-a").unwrap(),
+                    observation: ObservationV1 {
+                        source_sequence: 1,
+                        observed_at_unix_ms: Some(1),
+                        evidence: ObservationEvidenceV1::NodeLifecycle,
+                        kind: ObservationKindV1::SessionStarted,
+                        truncated: false,
+                    },
+                },
+            },
+            NodeEventEnvelope {
+                sequence: 3,
+                event: NodeEvent::ControllerChanged { controller: None },
+            },
+        ];
+        strip_observation_events(&mut events);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, NodeEvent::ControllerChanged { .. }));
+
+        let runtime = NodeEventEnvelope {
+            sequence: 4,
+            event: NodeEvent::Observation {
+                address: address(),
+                observation: ObservationV1 {
+                    source_sequence: 2,
+                    observed_at_unix_ms: Some(2),
+                    evidence: ObservationEvidenceV1::StructuredProvider,
+                    kind: ObservationKindV1::Working,
+                    truncated: false,
+                },
+            },
+        };
+        assert!(project_event_without_managed_observation(runtime).is_some());
+        let managed = NodeEventEnvelope {
+            sequence: 5,
+            event: NodeEvent::ManagedObservation {
+                record_id: SessionRecordId::new("record-a").unwrap(),
+                observation: ObservationV1 {
+                    source_sequence: 2,
+                    observed_at_unix_ms: Some(2),
+                    evidence: ObservationEvidenceV1::StructuredProvider,
+                    kind: ObservationKindV1::Working,
+                    truncated: false,
+                },
+            },
+        };
+        assert!(project_event_without_managed_observation(managed).is_none());
+    }
+
+    #[test]
+    fn provider_gap_receives_capabilities_and_preserves_source_sequence() {
+        let control = ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 99,
+            command_id: None,
+            instance_id: AgentInstanceId(7),
+            generation: SessionGeneration(3),
+            event: ControlEventKind::ProviderGap {
+                sequence: 44,
+                source: provider_source(AdapterFamily::Hook, "grok"),
+                source_sequence: 11,
+                missed: 2,
+            },
+        };
+        let projected = provider_observations(&control);
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0].source_sequence, 11);
+        assert!(matches!(
+            &projected[0].kind,
+            ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::Hook,
+                source_adapter,
+                capabilities,
+            } if source_adapter == "grok"
+                && capabilities == &hook_observation_capabilities("grok")
+        ));
+        assert_eq!(projected[1].source_sequence, 11);
+        assert_eq!(projected[1].kind, ObservationKindV1::Gap { missed: 2 });
+    }
+
+    #[test]
+    fn managed_inline_observation_uses_exact_record_binding() {
+        let shared = observation_test_shared();
+        let address = address();
+        let pending_record_id = SessionRecordId::new("record-inline-pending").unwrap();
+        let durable_record_id = SessionRecordId::new("record-inline-durable").unwrap();
+        let canonical_root = shared.snapshot().workspaces[0].canonical_root.clone();
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "provider-session-a".to_owned(),
+            transcript_path: None,
+        };
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: durable_record_id.clone(),
+                display_name: "inline durable".to_owned(),
+                provider: AgentId::new("claude").unwrap(),
+                mode: SessionMode::Inline,
+                state: ManagedSessionState::Dormant,
+                workspace_id: address.workspace_id.clone(),
+                canonical_root: canonical_root.clone(),
+                provider_session: Some(identity.clone()),
+                active_session: None,
+                environment_profile: None,
+                bundle: None,
+                context_id: None,
+                context: None,
+                task_binding: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_error: None,
+            })
+            .unwrap();
+        shared
+            .insert_record(ManagedSessionRecord {
+                record_id: pending_record_id.clone(),
+                display_name: "inline pending".to_owned(),
+                provider: AgentId::new("claude").unwrap(),
+                mode: SessionMode::Inline,
+                state: ManagedSessionState::IdentityPending,
+                workspace_id: address.workspace_id.clone(),
+                canonical_root,
+                provider_session: None,
+                active_session: Some(address.clone()),
+                environment_profile: None,
+                bundle: None,
+                context_id: None,
+                context: None,
+                task_binding: None,
+                created_at_unix_ms: 2,
+                updated_at_unix_ms: 2,
+                last_error: None,
+            })
+            .unwrap();
+        shared.bind_managed_session(
+            &address,
+            pending_record_id.clone(),
+            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            None,
+        );
+
+        shared.publish_control(provider_control_event(
+            AdapterFamily::Hook,
+            ProviderEvent::SessionIdentityObserved { identity },
+        ));
+        let rebound_record_id = shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&address.session.instance_id)
+            .and_then(|binding| binding.record_id.clone());
+        assert_eq!(rebound_record_id.as_ref(), Some(&durable_record_id));
+
+        shared.publish_control(provider_control_event(
+            AdapterFamily::Hook,
+            ProviderEvent::WorkingObserved,
+        ));
+
+        let history = shared
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = history.events.iter().find_map(|envelope| match &envelope.event {
+            NodeEvent::Observation {
+                address: observed_address,
+                observation,
+            } if observed_address == &address => Some(observation),
+            _ => None,
+        });
+        let managed = history.events.iter().find_map(|envelope| match &envelope.event {
+            NodeEvent::ManagedObservation {
+                record_id: observed_record_id,
+                observation,
+            } if observed_record_id == &durable_record_id => Some(observation),
+            _ => None,
+        });
+        assert!(runtime.is_some());
+        assert_eq!(managed, runtime);
+        assert!(!history.events.iter().any(|envelope| matches!(
+            &envelope.event,
+            NodeEvent::ManagedObservation { record_id, .. }
+                if record_id == &pending_record_id
+        )));
+    }
+
+    #[test]
+    fn runtime_unmanaged_has_no_managed_event() {
+        let shared = observation_test_shared();
+        let address = address();
+        shared.bind_session_with_policy(
+            &address,
+            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            None,
+        );
+
+        shared.publish_control(provider_control_event(
+            AdapterFamily::Hook,
+            ProviderEvent::WorkingObserved,
+        ));
+
+        let history = shared
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(history.events.iter().any(|envelope| matches!(
+            &envelope.event,
+            NodeEvent::Observation { address: observed, .. } if observed == &address
+        )));
+        assert!(!history.events.iter().any(|envelope| matches!(
+            &envelope.event,
+            NodeEvent::ManagedObservation { .. }
+        )));
+    }
+}
+
+#[cfg(test)]
+mod standalone_capability_platform_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_workspace_capability_requires_windows_identity_guards() {
+        let capabilities = baseline_capabilities().unwrap();
+        let advertised = capabilities.iter().any(|capability| {
+            capability.as_str() == NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY
+        });
+        assert_eq!(advertised, cfg!(windows));
+
+        let request = NodeRequest::CreateStandaloneWorkspace {
+            workspace_id: WorkspaceId::new("standalone-platform").unwrap(),
+            root: OpaqueHostPath::utf8("standalone-platform-root".to_owned()).unwrap(),
+            initial_branch: None,
+        };
+        assert_eq!(
+            request_uses_unnegotiated_capability(&request, &capabilities),
+            !cfg!(windows),
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use gate4agent_types::ProviderActivity;
     use crate::session_environment::{
         NodeSecretReference, NodeSecretResolveError, NodeSecretValue,
         NodeSessionEnvironmentMutation, NodeSessionFile, NodeSessionPathBinding,
@@ -9652,6 +14901,234 @@ mod tests {
         terminal_test_shared_with_mode(WorktreeServiceMode::Manual)
     }
 
+    #[test]
+    fn launch_snapshot_is_authoritative_bounded_and_path_free() {
+        let source = temporary_workspace_root("launch-inventory-source");
+        let allocation = temporary_workspace_root("launch-inventory-allocation");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&allocation).unwrap();
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let mut workspace = WorkspaceConfig::new(workspace_id.clone(), &source)
+            .unwrap()
+            .with_worktree_service_mode(WorktreeServiceMode::Managed);
+        for index in 0..MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE {
+            workspace = workspace
+                .with_managed_worktree_profile(
+                    ManagedWorktreeProfile::new(
+                        WorktreeProfileId::new(format!("profile-{index}")).unwrap(),
+                        crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+                        &allocation,
+                        "gate4agent",
+                        "HEAD",
+                        ManagedWorktreeRetention::RemoveWhenReleased,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let overflow = workspace.clone().with_managed_worktree_profile(
+            ManagedWorktreeProfile::new(
+                WorktreeProfileId::new("overflow").unwrap(),
+                crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+                &allocation,
+                "gate4agent",
+                "HEAD",
+                ManagedWorktreeRetention::Retain,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            overflow,
+            Err(NodeServerError::ManagedWorktreeProfileCapacity {
+                max: MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE,
+                ..
+            }),
+        ));
+
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-launch-inventory").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let snapshot = shared.snapshot();
+        let launch = snapshot.launch_inventory.as_ref().unwrap();
+        assert_eq!(launch.spawn_profiles.as_ref().unwrap().len(), 1);
+        assert!(launch.bundles.as_ref().unwrap().is_empty());
+        let profiles = snapshot.workspaces[0]
+            .managed_worktree_profiles
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            snapshot.workspaces[0].worktree_service_mode,
+            Some(WorktreeServiceMode::Managed),
+        );
+        assert_eq!(
+            profiles.profiles.len(),
+            MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE,
+        );
+        let public_inventory = serde_json::to_string(&(launch, profiles)).unwrap();
+        for forbidden in ["allocation_root", "branch_prefix", "base", "prompt", "environment", "home"] {
+            assert!(!public_inventory.contains(forbidden), "launch inventory leaked {forbidden}");
+        }
+        let legacy = snapshot_for_wire(
+            &shared,
+            true,
+            true,
+            false,
+            false,
+            true,
+            false,
+            true,
+            false,
+            true,
+        );
+        assert!(legacy.launch_inventory.is_none());
+        assert!(legacy.workspaces[0].managed_worktree_profiles.is_none());
+
+        drop(shared);
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(allocation).unwrap();
+    }
+
+    #[test]
+    fn agent_progress_projection_omits_sensitive_provider_payloads_and_is_capability_gated() {
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY
+        }));
+        let source = gate4agent_types::ProviderSource {
+            family: AdapterFamily::PtySemantic,
+            binding: AdapterBinding::new(
+                gate4agent_types::AdapterId::new("claude").unwrap(),
+                "fixture/v1",
+                gate4agent_types::AdapterVerification::SyntheticFixture,
+            )
+            .unwrap(),
+        };
+        let provider = ProviderSnapshot {
+            sequence: 17,
+            session: Some(ProviderSessionIdentity {
+                key: ProviderSessionKey::SessionId,
+                id: "PRIVATE_PROVIDER_SESSION".to_owned(),
+                transcript_path: Some(r"C:\PRIVATE_PROVIDER_PATH".to_owned()),
+            }),
+            model: Some("PRIVATE_MODEL".to_owned()),
+            tools: vec!["PRIVATE_TOOL_INVENTORY".to_owned()],
+            completed_turns: 3,
+            usage: gate4agent_types::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_read_tokens: 30,
+                cache_write_tokens: 40,
+                reasoning_tokens: 50,
+                context_window: Some(200_000),
+            },
+            lead_activity: ProviderActivity::WaitingForInput,
+            activity: ProviderActivity::WaitingForInput,
+            current_prompt: Some("PRIVATE_CURRENT_PROMPT".to_owned()),
+            active_tools: (0..9)
+                .map(|index| gate4agent_types::ActiveProviderTool {
+                    id: format!("private-tool-id-{index}"),
+                    name: if index == 0 {
+                        format!("  Read\u{0000}{}", "x".repeat(80))
+                    } else {
+                        format!("Tool-{index}")
+                    },
+                    input_json: "PRIVATE_TOOL_INPUT_JSON".to_owned(),
+                })
+                .collect(),
+            interactions: vec![gate4agent_types::ProviderInteraction {
+                id: gate4agent_types::ProviderInteractionId(17),
+                source: source.clone(),
+                provider_request_id: Some("PRIVATE_PROVIDER_REQUEST".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: " Approve\u{0007}Tool ".to_owned(),
+                prompt: "PRIVATE_INTERACTION_PROMPT".to_owned(),
+                agent_id: Some("PRIVATE_INTERACTION_AGENT".to_owned()),
+                resume_lead_activity: Some(ProviderActivity::Working),
+                status: ProviderInteractionStatus::Pending,
+            }],
+            subagents: vec![gate4agent_types::ProviderSubagent {
+                source: source.clone(),
+                provider_agent_id: "PRIVATE_SUBAGENT_ID".to_owned(),
+                agent_type: Some("PRIVATE_SUBAGENT_TYPE".to_owned()),
+                description: Some("PRIVATE_SUBAGENT_DESCRIPTION".to_owned()),
+            }],
+            sources: vec![gate4agent_types::ProviderSourceCursor {
+                source,
+                sequence: 17,
+                gap_count: 2,
+                stale: true,
+            }],
+            last_event: Some(ProviderEvent::Error {
+                message: "PRIVATE_PROVIDER_ERROR".to_owned(),
+            }),
+            gap_count: 2,
+            stale: true,
+        };
+        let address = terminal_address(3);
+        let entry = agent_progress_from_provider_snapshot(address.clone(), &provider).unwrap();
+        assert_eq!(entry.address, address);
+        assert_eq!(entry.progress.provider_sequence, 17);
+        assert_eq!(entry.progress.active_tool_count, 9);
+        assert_eq!(
+            entry.progress.active_tool_labels.len(),
+            MAX_AGENT_PROGRESS_ACTIVE_TOOL_LABELS,
+        );
+        assert_eq!(entry.progress.subagent_count, 1);
+        assert_eq!(entry.progress.last_event_kind, Some(AgentProgressEventKindV1::Error));
+        assert!(entry.progress.truncated);
+        let encoded = serde_json::to_string(&entry).unwrap();
+        for forbidden in [
+            "PRIVATE_PROVIDER_SESSION",
+            "PRIVATE_PROVIDER_PATH",
+            "PRIVATE_MODEL",
+            "PRIVATE_TOOL_INVENTORY",
+            "PRIVATE_CURRENT_PROMPT",
+            "PRIVATE_TOOL_INPUT_JSON",
+            "PRIVATE_PROVIDER_REQUEST",
+            "PRIVATE_INTERACTION_PROMPT",
+            "PRIVATE_INTERACTION_AGENT",
+            "PRIVATE_SUBAGENT_ID",
+            "PRIVATE_SUBAGENT_TYPE",
+            "PRIVATE_SUBAGENT_DESCRIPTION",
+            "PRIVATE_PROVIDER_ERROR",
+            "input_json",
+            "current_prompt",
+            "session_id",
+        ] {
+            assert!(!encoded.contains(forbidden), "agent progress leaked {forbidden}");
+        }
+
+        let snapshot = NodeSnapshot {
+            node_id: NodeId::new("node-progress-test").unwrap(),
+            enabled_providers: vec![agent("claude")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: vec![entry],
+        };
+        let mut legacy_reply = ResponseEnvelope {
+            request_id: 1,
+            result: Ok(NodeResponse::Snapshot {
+                event_sequence: 0,
+                controller: None,
+                snapshot: snapshot.clone(),
+            }),
+        };
+        project_response_without_agent_progress(&mut legacy_reply);
+        let Ok(NodeResponse::Snapshot { snapshot: legacy, .. }) = legacy_reply.result else {
+            panic!("agent progress projection changed response kind");
+        };
+        assert!(legacy.agent_progress.is_empty());
+        assert_eq!(snapshot.agent_progress.len(), 1);
+    }
+
     fn terminal_address(generation: u64) -> SessionAddress {
         SessionAddress {
             workspace_id: WorkspaceId::new("primary").unwrap(),
@@ -9670,6 +15147,8 @@ mod tests {
                 worktree_id: None,
             },
             profile_id: crate::protocol::SpawnProfileId::new("default").unwrap(),
+            expected_profile_revision: crate::protocol::SpawnProfileRevision::new("builtin-v1")
+                .unwrap(),
             overrides: crate::protocol::SpawnOverrides::default(),
             deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("spawn-spec-fixture").unwrap(),
@@ -9742,6 +15221,7 @@ mod tests {
             Some(control),
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -9766,6 +15246,24 @@ mod tests {
 
     fn materialization_test_shared(
         deny_secret: bool,
+    ) -> (
+        NodeShared,
+        NativeRuntime,
+        ResolvedEnvironmentProfileReceipt,
+        PathBuf,
+        Arc<AtomicBool>,
+    ) {
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        materialization_test_shared_with_workspace(deny_secret, workspace)
+    }
+
+    fn materialization_test_shared_with_workspace(
+        deny_secret: bool,
+        workspace: WorkspaceConfig,
     ) -> (
         NodeShared,
         NativeRuntime,
@@ -9834,11 +15332,6 @@ mod tests {
         for native_profile in native_profiles {
             runtime.upsert_native_launch_profile(native_profile).unwrap();
         }
-        let workspace = WorkspaceConfig::new(
-            WorkspaceId::new("primary").unwrap(),
-            std::env::current_dir().unwrap(),
-        )
-        .unwrap();
         let shared = NodeShared::new_with_incarnation(
             handle,
             "fixture-token".to_owned(),
@@ -9852,6 +15345,7 @@ mod tests {
             Vec::new(),
             SpawnProfileRegistry::default(),
             Some(control),
+            None,
             Some(materializer),
             None,
             Vec::new(),
@@ -10144,6 +15638,7 @@ mod tests {
                 agent("codex"),
                 SessionMode::Pty,
                 ProviderRuntimePolicy::new(true, false, false, true, false).unwrap(),
+                SpawnRecordPolicy::ProviderIdentityOnly,
                 Some(receipt.clone()),
                 Some(bundle_receipt.clone()),
                 None,
@@ -10234,6 +15729,7 @@ mod tests {
                 agent("claude"),
                 SessionMode::Pty,
                 policy,
+                SpawnRecordPolicy::ProviderIdentityOnly,
                 Some(receipt.clone()),
                 None,
                 None,
@@ -10253,8 +15749,10 @@ mod tests {
             capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
         }));
         let support = node_compatibility_support_for_manifest(&[], &[]).unwrap();
-        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V8);
-        let spec = spawn_spec_fixture();
+        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V9);
+        let mut spec = spawn_spec_fixture();
+        spec.expected_profile_revision =
+            crate::protocol::SpawnProfileRevision::new("test-r1").unwrap();
         assert!(matches!(
             &spec.overrides.environment_profile_id,
             crate::protocol::SpawnOverride::Inherit,
@@ -10297,7 +15795,9 @@ mod tests {
             },
         ));
 
-        let snapshot = snapshot_for_wire(&shared, false, true, true, false, false, false);
+        let snapshot = snapshot_for_wire(
+            &shared, false, true, true, true, false, false, false, false, true,
+        );
         assert_eq!(snapshot.session_records.len(), 1);
         assert!(snapshot.session_records[0].environment_profile.is_none());
         let event = project_event_without_child_environment_profile(NodeEventEnvelope {
@@ -10353,8 +15853,13 @@ mod tests {
             },
         ));
 
-        let snapshot = snapshot_for_wire(&shared, false, true, true, true, false, false);
+        let snapshot = snapshot_for_wire(
+            &shared, false, true, true, true, true, false, false, false, true,
+        );
         assert!(snapshot.session_records[0].bundle.is_none());
+        let launch = snapshot.launch_inventory.as_ref().unwrap();
+        assert!(launch.spawn_profiles.is_some());
+        assert!(launch.bundles.is_none());
         let event = project_event_without_session_bundle(NodeEventEnvelope {
             sequence: 1,
             event: NodeEvent::SessionRecordUpserted { record: bundled },
@@ -10439,6 +15944,7 @@ mod tests {
                     cwd: Some(r"C:\private\history-root".to_owned()),
                     model: Some("private-model".to_owned()),
                     message_count: 2,
+                    completed_turn_count: None,
                     total_tokens: 19,
                     messages: vec![
                         gate4agent_types::HistoryMessageRecord {
@@ -10467,9 +15973,13 @@ mod tests {
                     std::env::current_dir().unwrap().to_string_lossy().into_owned(),
                 ),
                 sessions: vec![session],
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
             }],
             session_records: vec![bound_record],
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         };
 
         let mut negotiated = original.clone();
@@ -10514,6 +16024,7 @@ mod tests {
             cwd: None,
             model: None,
             message_count: 1,
+            completed_turn_count: None,
             total_tokens: 0,
             messages: vec![gate4agent_types::HistoryMessageRecord {
                 role: gate4agent_types::HistoryMessageRole::User,
@@ -10873,6 +16384,7 @@ mod tests {
                 agent("claude"),
                 SessionMode::Pty,
                 policy,
+                SpawnRecordPolicy::ProviderIdentityOnly,
                 Some(receipt.clone()),
                 None,
                 None,
@@ -11037,6 +16549,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -11126,6 +16639,248 @@ mod tests {
         drop(shared);
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_managed_record_is_inventory_only_and_does_not_block_session_cleanup() {
+        let git_root = temporary_workspace_root("raw-managed-inventory");
+        let source = git_root.join("source");
+        let allocation = git_root.join("allocation");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&allocation).unwrap();
+        run_test_git(&source, &["init"]);
+        run_test_git(&source, &["config", "user.email", "gate4agent@example.invalid"]);
+        run_test_git(&source, &["config", "user.name", "Gate4Agent Test"]);
+        std::fs::write(source.join("seed.txt"), "seed\n").unwrap();
+        run_test_git(&source, &["add", "seed.txt"]);
+        run_test_git(&source, &["commit", "-m", "seed"]);
+        let profile = ManagedWorktreeProfile::new(
+            WorktreeProfileId::new("default").unwrap(),
+            crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+            &allocation,
+            "gate4agent",
+            "HEAD",
+            ManagedWorktreeRetention::RemoveWhenReleased,
+        )
+        .unwrap();
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            &source,
+        )
+        .unwrap()
+        .with_worktree_service_mode(WorktreeServiceMode::Managed)
+        .with_managed_worktree_profile(profile.clone())
+        .unwrap();
+        let (shared, mut runtime, receipt, materialization_fixture_root, _deny) =
+            materialization_test_shared_with_workspace(false, workspace);
+        let target = PathBuf::from(profile.allocation_root()).join("mw-raw-inventory");
+        let source_text = source.to_string_lossy().into_owned();
+        let target_text = target.to_string_lossy().into_owned();
+        let created = create_git_worktree(
+            &source_text,
+            &target_text,
+            "gate4agent/mw-raw-inventory",
+            Some("HEAD"),
+        )
+        .await
+        .unwrap();
+        let lease = ManagedWorktreeLeaseRecord {
+            lease_id: ManagedWorktreeLeaseId::new("mw-raw-inventory").unwrap(),
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: WorkspaceId::new("managed-raw-inventory").unwrap(),
+            profile_id: profile.profile_id().clone(),
+            profile_revision: profile.revision().clone(),
+            target_root: created.path.clone(),
+            branch: "gate4agent/mw-raw-inventory".to_owned(),
+            base_commit: created.head.clone(),
+            expected_head: Some(created.head.clone()),
+            retention: ManagedWorktreeRetention::RemoveWhenReleased,
+            state: ManagedWorktreeLeaseState::Ready,
+            session_holders: Vec::new(),
+            record_holders: Vec::new(),
+            cleanup_failure: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        shared
+            .workspaces
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(lease.workspace_id.clone(), created.path.clone());
+        *shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ManagedWorktreeRegistry::from_records(vec![lease.clone()], Vec::new()).unwrap();
+        let address = SessionAddress {
+            workspace_id: lease.workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(205),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (overlay, materialization_guard) = shared
+            .prepare_session_materialization(
+                &address,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+                None,
+                None,
+                Some(lease.lease_id.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        let materialization_id = materialization_guard.id().unwrap().clone();
+        let materialization_root = shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&materialization_id)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let selection = shared
+            .select_environment_profile(
+                address.session.instance_id,
+                &agent("claude"),
+                SessionMode::Pty,
+                Some(&receipt),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(shared
+            .install_prepared_launch_overlay(address.session.instance_id, overlay.unwrap())
+            .unwrap()
+            .is_none());
+        let record_id = shared
+            .bind_spawn_session_with_materialization(
+                &address,
+                agent("claude"),
+                SessionMode::Pty,
+                ProviderRuntimePolicy::raw_pty(),
+                SpawnRecordPolicy::Always,
+                Some(receipt.clone()),
+                None,
+                None,
+                Some(materialization_id.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        selection.retain();
+        materialization_guard.retain();
+        let record = shared.record(&record_id).unwrap();
+        assert_eq!(record.state, ManagedSessionState::Live);
+        assert!(record.provider_session.is_none());
+        assert!(record.environment_profile.is_none());
+        assert!(record.bundle.is_none());
+        assert!(record.context_id.is_none());
+        assert!(record.context.is_none());
+        assert_eq!(record.active_session.as_ref(), Some(&address));
+        assert_eq!(
+            shared
+                .materializations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&materialization_id)
+                .unwrap()
+                .owner(),
+            &MaterializationOwner::Session {
+                incarnation_id: shared.incarnation_id,
+                instance_id: address.session.instance_id,
+                generation: address.session.generation,
+            },
+        );
+        {
+            let mut bindings = shared
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            bindings
+                .get_mut(&address.session.instance_id)
+                .unwrap()
+                .managed_worktree_lease_id = Some(lease.lease_id.clone());
+        }
+        let lease_snapshot = shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bind_session(
+                &lease.lease_id,
+                ManagedWorktreeSessionHolder {
+                    incarnation_id: shared.incarnation_id,
+                    instance_id: address.session.instance_id,
+                    generation: address.session.generation,
+                },
+                None,
+                unix_time_ms(),
+            )
+            .unwrap();
+        assert_eq!(lease_snapshot.active_session_count, 1);
+        assert_eq!(lease_snapshot.managed_record_count, 0);
+        shared.persist_state().unwrap();
+        assert!(shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&lease.lease_id)
+            .unwrap()
+            .record_holders
+            .is_empty());
+        shared
+            .handle
+            .dispatch(shared.prepare_command(ControlCommand::Register {
+                instance_id: address.session.instance_id,
+                agent_id: agent("claude"),
+                transport: TransportKind::Pty,
+            }))
+            .unwrap();
+        runtime.tick().await;
+        shared.reconcile_managed_record(
+            &record_id,
+            &address,
+            &ControlEvent {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                sequence: 1,
+                command_id: None,
+                instance_id: address.session.instance_id,
+                generation: address.session.generation,
+                event: ControlEventKind::Removed,
+            },
+            false,
+            false,
+        );
+        let remove = shared.remove_session(&address);
+        let drive_runtime = async {
+            runtime.tick().await;
+        };
+        let (removed, ()) = tokio::join!(remove, drive_runtime);
+        removed.unwrap();
+
+        assert!(!materialization_root.exists());
+        assert!(!Path::new(&created.path).exists());
+        assert_eq!(
+            shared
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&lease.lease_id)
+                .unwrap()
+                .state,
+            ManagedWorktreeLeaseState::Removed,
+        );
+        let renamed = shared
+            .rename_session_record(&record_id, "raw managed inventory".to_owned())
+            .unwrap();
+        assert_eq!(renamed.record_id, record_id);
+        assert_eq!(renamed.display_name, "raw managed inventory");
+        assert_eq!(renamed.state, ManagedSessionState::Unavailable);
+        assert!(renamed.active_session.is_none());
+
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(materialization_fixture_root).unwrap();
+        std::fs::remove_dir_all(git_root).unwrap();
     }
 
     fn install_managed_lease(shared: &NodeShared) -> ManagedWorktreeLeaseRecord {
@@ -11227,12 +16982,18 @@ mod tests {
     fn legacy_projection_omits_managed_snapshot_events_and_path_bearing_diagnostics() {
         let shared = terminal_test_shared();
         let lease = install_managed_lease(&shared);
-        let snapshot = snapshot_for_wire(&shared, true, true, false, true, true, false);
+        let snapshot = snapshot_for_wire(
+            &shared, true, true, true, false, true, true, false, false, true,
+        );
         assert!(snapshot.managed_worktrees.is_empty());
+        assert!(snapshot.workspaces.iter().all(|workspace| {
+            workspace.managed_worktree_profiles.is_none()
+        }));
         let mut reply = ResponseEnvelope {
             request_id: 1,
             result: Ok(NodeResponse::Resync {
                 event_sequence: 1,
+                oldest_available_sequence: 1,
                 snapshot: shared.snapshot(),
                 events: vec![NodeEventEnvelope {
                     sequence: 1,
@@ -11246,6 +17007,32 @@ mod tests {
         };
         assert!(snapshot.managed_worktrees.is_empty());
         assert!(events.is_empty());
+        let mut git = git_snapshot_for_parser();
+        git.branch = Some(lease.branch.clone());
+        git.managed_worktree = Some(crate::protocol::ManagedWorktreeGitScope {
+            lease_id: lease.lease_id.clone(),
+            source_workspace_id: lease.source_workspace_id.clone(),
+            branch: lease.branch.clone(),
+            base_commit: GitObjectId::new(lease.base_commit.clone()).unwrap(),
+            active_session_count: 1,
+            managed_record_count: 0,
+        });
+        let mut inspection_reply = ResponseEnvelope {
+            request_id: 2,
+            result: Ok(NodeResponse::WorkspaceInspected {
+                inspection: WorkspaceInspection {
+                    workspace_id: lease.workspace_id.clone(),
+                    entries: Vec::new(),
+                    tree_truncated: false,
+                    git,
+                },
+            }),
+        };
+        project_response_without_managed_worktrees(&mut inspection_reply);
+        let Ok(NodeResponse::WorkspaceInspected { inspection }) = inspection_reply.result else {
+            panic!("projection changed the inspection response kind");
+        };
+        assert!(inspection.git.managed_worktree.is_none());
         let failure = managed_git_worktree_failure(GitWorktreeError {
             kind: GitWorktreeErrorKind::Failed,
             message: r"git failed at C:\private\managed-target".to_owned(),
@@ -11325,6 +17112,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             vec![lease.clone()],
             Vec::new(),
@@ -11364,6 +17152,9 @@ mod tests {
             capability.as_str() == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
         }));
         assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_SPAWN_PROFILE_REVISION_CAPABILITY
+        }));
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
             capability.as_str() == NODE_WORKTREE_SELECTION_CAPABILITY
         }));
 
@@ -11377,6 +17168,14 @@ mod tests {
         unknown_profile.profile_id = crate::protocol::SpawnProfileId::new("missing").unwrap();
         let failure = shared.spawn_from_spec(unknown_profile).await.unwrap_err();
         assert_eq!(failure.code, NodeFailureCode::UnknownSpawnProfile);
+
+        let mut revision_mismatch = spawn_spec_fixture();
+        revision_mismatch.idempotency_key =
+            SpawnIdempotencyKey::new("profile-revision-mismatch").unwrap();
+        revision_mismatch.expected_profile_revision =
+            crate::protocol::SpawnProfileRevision::new("test-r2").unwrap();
+        let failure = shared.spawn_from_spec(revision_mismatch).await.unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::SpawnProfileRevisionMismatch);
 
         let mut unsupported_materializer = spawn_spec_fixture();
         unsupported_materializer.idempotency_key =
@@ -11405,8 +17204,10 @@ mod tests {
                 None,
                 None,
                 None,
+                SpawnRecordPolicy::ProviderIdentityOnly,
                 Some(Instant::now()),
                 &[],
+                None,
             )
             .await
             .unwrap_err();
@@ -11428,15 +17229,21 @@ mod tests {
         ));
         let worktree_capability =
             CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
+        assert!(request_uses_unnegotiated_capability(
+            &request,
+            &[spawn_spec_capability.clone(), worktree_capability.clone()],
+        ));
+        let profile_revision_capability =
+            CapabilityId::new(NODE_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap();
         assert!(!request_uses_unnegotiated_capability(
             &request,
-            &[spawn_spec_capability, worktree_capability],
+            &[spawn_spec_capability, worktree_capability, profile_revision_capability],
         ));
     }
 
     #[tokio::test]
     async fn spawn_spec_idempotency_replays_receipt_and_conflicts_before_session_mutation() {
-        let shared = terminal_test_shared();
+        let mut shared = terminal_test_shared();
         let spec = spawn_spec_fixture();
         let receipt = shared
             .resolve_spawn_spec(&spec)
@@ -11444,7 +17251,23 @@ mod tests {
             .receipt(shared.incarnation_id, terminal_address(1));
         shared.remember_spawn_spec(spec.clone(), Ok(receipt.clone()), Instant::now());
 
+        let mut revised = shared.spawn_profiles.get(&spec.profile_id).unwrap().clone();
+        revised.revision = crate::protocol::SpawnProfileRevision::new("builtin-v2").unwrap();
+        shared.spawn_profiles = SpawnProfileRegistry::new([revised]).unwrap();
+
         assert_eq!(shared.spawn_from_spec(spec.clone()).await.unwrap(), receipt);
+
+        let mut revision_conflicting = spec.clone();
+        revision_conflicting.expected_profile_revision =
+            crate::protocol::SpawnProfileRevision::new("builtin-v2").unwrap();
+        let failure = shared.spawn_from_spec(revision_conflicting).await.unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::SpawnIdempotencyConflict);
+
+        let mut stale_cache_miss = spec.clone();
+        stale_cache_miss.idempotency_key =
+            SpawnIdempotencyKey::new("stale-profile-cache-miss").unwrap();
+        let failure = shared.spawn_from_spec(stale_cache_miss).await.unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::SpawnProfileRevisionMismatch);
 
         let mut conflicting = spec;
         conflicting.deadline_ms = crate::protocol::SpawnDeadlineMs::new(31_000).unwrap();
@@ -11484,6 +17307,53 @@ mod tests {
         assert_eq!(failure.code, NodeFailureCode::UnsupportedSpawnCapability);
         assert_eq!(shared.next_instance_id.load(Ordering::Acquire), 1);
         assert!(shared.handle.snapshot().sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_worktree_registration_failure_removes_the_created_worktree() {
+        let root = temporary_workspace_root("manual-worktree-compensation");
+        let source = root.join("source");
+        let target = root.join("target");
+        let invalid_state_parent = root.join("state-parent-is-a-file");
+        let invalid_state_path = invalid_state_parent.join("state.json");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(&invalid_state_parent, "not a directory").unwrap();
+        run_test_git(&source, &["init"]);
+        run_test_git(&source, &["config", "user.email", "gate4agent@example.invalid"]);
+        run_test_git(&source, &["config", "user.name", "Gate4Agent Test"]);
+        std::fs::write(source.join("seed.txt"), "seed\n").unwrap();
+        run_test_git(&source, &["add", "seed.txt"]);
+        run_test_git(&source, &["commit", "-m", "seed"]);
+
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            &source,
+        ).unwrap();
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-worktree-compensation").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        shared.state_path = Some(invalid_state_path);
+
+        let error = shared.create_worktree(
+            WorkspaceId::new("primary").unwrap(),
+            WorkspaceId::new("compensated").unwrap(),
+            target.to_string_lossy().into_owned(),
+            "gate4agent/compensated".to_owned(),
+            Some("HEAD".to_owned()),
+        ).await.unwrap_err();
+
+        assert_eq!(error.code, NodeFailureCode::BackendOperationFailed);
+        assert!(!target.exists());
+        assert!(list_git_worktrees(source.to_str().unwrap()).await.unwrap()
+            .iter()
+            .all(|worktree| !worktree_paths_equal(&worktree.path, &target.to_string_lossy())));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11607,7 +17477,25 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(history.events.is_empty());
         assert_eq!(history.last_sequence, count);
+        assert_eq!(history.replay_floor_sequence, 1);
         drop(history);
+        let NodeResponse::Resync {
+            event_sequence,
+            oldest_available_sequence,
+            events,
+            ..
+        } = shared.resync(0) else {
+            unreachable!("resync helper returned another response")
+        };
+        assert_eq!(event_sequence, count);
+        assert_eq!(oldest_available_sequence, 1);
+        assert!(events.is_empty());
+        assert!(matches!(
+            resync_required_event(&shared).event,
+            NodeEvent::ResyncRequired {
+                oldest_available_sequence: 1,
+            }
+        ));
         assert!(matches!(
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(skipped)) if skipped == count - 1
@@ -11615,6 +17503,33 @@ mod tests {
         let latest = receiver.try_recv().unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].sequence, count);
+    }
+
+    #[test]
+    fn real_durable_eviction_advances_authoritative_replay_floor() {
+        let shared = terminal_test_shared();
+        for _ in 0..=NODE_EVENT_HISTORY_MAX {
+            shared.publish(NodeEvent::ControllerChanged { controller: None });
+        }
+
+        let NodeResponse::Resync {
+            event_sequence,
+            oldest_available_sequence,
+            events,
+            ..
+        } = shared.resync(0) else {
+            unreachable!("resync helper returned another response")
+        };
+        assert_eq!(event_sequence, NODE_EVENT_HISTORY_MAX as u64 + 1);
+        assert_eq!(oldest_available_sequence, 2);
+        assert_eq!(events.first().map(|event| event.sequence), Some(2));
+        assert_eq!(events.len(), NODE_EVENT_HISTORY_MAX);
+        assert!(matches!(
+            resync_required_event(&shared).event,
+            NodeEvent::ResyncRequired {
+                oldest_available_sequence: 2,
+            }
+        ));
     }
 
     #[test]
@@ -11743,10 +17658,211 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             last_error: None,
         }
+    }
+
+    #[tokio::test]
+    async fn session_task_binding_mints_assigns_clears_with_cas_and_persists_v9() {
+        let root = temporary_workspace_root("session-task-binding");
+        std::fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("node-state.json");
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(WorkspaceId::new("primary").unwrap(), &root).unwrap();
+        let node_id = NodeId::new("node-1").unwrap();
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            node_id.clone(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        shared.state_path = Some(state_path.clone());
+        let record = record("claude", "sr-task");
+        let record_id = record.record_id.clone();
+        shared.insert_record(record).unwrap();
+        shared.persist_state().unwrap();
+        shared
+            .acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS)
+            .unwrap();
+
+        let minted = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::SetSessionTask {
+                record_id: record_id.clone(),
+                expected_revision: 0,
+                target: SessionTaskTargetV1::New,
+            },
+        )
+        .await
+        .unwrap();
+        let NodeResponse::SessionRecordUpdated { record: minted } = minted else {
+            panic!("session task mutation returned another response");
+        };
+        let minted_binding = minted.task_binding.clone().unwrap();
+        let minted_task_id = minted_binding.task_id.clone().unwrap();
+        assert_eq!(minted_binding.revision, 1);
+        assert!(minted_task_id.as_str().starts_with("task-"));
+        assert_eq!(minted_task_id.as_str().len(), 29);
+
+        let event_count = shared.current_sequence();
+        let repeated = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::SetSessionTask {
+                record_id: record_id.clone(),
+                expected_revision: 1,
+                target: SessionTaskTargetV1::Existing {
+                    task_id: minted_task_id.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated, NodeResponse::SessionRecordUpdated { record: minted.clone() });
+        assert_eq!(shared.current_sequence(), event_count);
+
+        let stale = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::SetSessionTask {
+                record_id: record_id.clone(),
+                expected_revision: 0,
+                target: SessionTaskTargetV1::Existing {
+                    task_id: minted_task_id,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code, NodeFailureCode::SessionRecordConflict);
+
+        let assigned_id: TaskId = "task-ffeeddccbbaa998877665544".parse().unwrap();
+        let assigned = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::SetSessionTask {
+                record_id: record_id.clone(),
+                expected_revision: 1,
+                target: SessionTaskTargetV1::Existing {
+                    task_id: assigned_id.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let NodeResponse::SessionRecordUpdated { record: assigned } = assigned else {
+            panic!("session task assignment returned another response");
+        };
+        assert_eq!(assigned.task_binding.as_ref().unwrap().revision, 2);
+        assert_eq!(assigned.task_binding.as_ref().unwrap().task_id.as_ref(), Some(&assigned_id));
+
+        let cleared = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::SetSessionTask {
+                record_id: record_id.clone(),
+                expected_revision: 2,
+                target: SessionTaskTargetV1::Clear,
+            },
+        )
+        .await
+        .unwrap();
+        let NodeResponse::SessionRecordUpdated { record: cleared } = cleared else {
+            panic!("session task clear returned another response");
+        };
+        assert_eq!(cleared.task_binding.as_ref().unwrap().revision, 3);
+        assert!(cleared.task_binding.as_ref().unwrap().task_id.is_none());
+        assert!(cleared.task_binding.as_ref().unwrap().changed_at_unix_ms > 0);
+        assert_eq!(
+            cleared.task_binding.as_ref().unwrap().changed_at_unix_ms,
+            cleared.updated_at_unix_ms,
+        );
+
+        let persisted = std::fs::read(&state_path).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&persisted).unwrap()["version"], NODE_STATE_SCHEMA_V9);
+        let loaded = session_registry::load(Some(&state_path), &node_id).unwrap();
+        assert_eq!(loaded.records[0].task_binding, cleared.task_binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_task_capability_strips_snapshots_events_and_replies() {
+        let mut bound = record("claude", "sr-task-projection");
+        bound.updated_at_unix_ms = 2;
+        bound.task_binding = Some(SessionTaskBindingV1 {
+            revision: 1,
+            task_id: Some("task-00112233445566778899aaff".parse().unwrap()),
+            changed_at_unix_ms: 2,
+        });
+        let request = NodeRequest::SetSessionTask {
+            record_id: bound.record_id.clone(),
+            expected_revision: 1,
+            target: SessionTaskTargetV1::Clear,
+        };
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_SESSION_TASK_CORRELATION_CAPABILITY
+        }));
+        assert!(!request_uses_unnegotiated_capability(
+            &request,
+            &baseline_capabilities().unwrap(),
+        ));
+        assert!(request_uses_unnegotiated_capability(&request, &[]));
+
+        let mut snapshot = terminal_test_shared().snapshot();
+        snapshot.session_records.push(bound.clone());
+        let mut reply = ResponseEnvelope {
+            request_id: 1,
+            result: Ok(NodeResponse::Resync {
+                event_sequence: 1,
+                oldest_available_sequence: 1,
+                snapshot,
+                events: vec![NodeEventEnvelope {
+                    sequence: 1,
+                    event: NodeEvent::SessionRecordUpserted {
+                        record: bound.clone(),
+                    },
+                }],
+            }),
+        };
+        project_response_without_session_task_binding(&mut reply);
+        let Ok(NodeResponse::Resync { snapshot, events, .. }) = reply.result else {
+            panic!("task projection changed the response kind");
+        };
+        assert!(snapshot.session_records[0].task_binding.is_none());
+        let NodeEvent::SessionRecordUpserted { record } = &events[0].event else {
+            panic!("task projection changed the event kind");
+        };
+        assert!(record.task_binding.is_none());
+
+        let projected = project_event_without_session_task_binding(NodeEventEnvelope {
+            sequence: 2,
+            event: NodeEvent::SessionRecordUpserted { record: bound.clone() },
+        });
+        let NodeEvent::SessionRecordUpserted { record } = projected.event else {
+            panic!("task event projection changed the event kind");
+        };
+        assert!(record.task_binding.is_none());
+
+        let mut direct = ResponseEnvelope {
+            request_id: 2,
+            result: Ok(NodeResponse::SessionRecordUpdated { record: bound }),
+        };
+        project_response_without_session_task_binding(&mut direct);
+        let Ok(NodeResponse::SessionRecordUpdated { record }) = direct.result else {
+            panic!("task reply projection changed the response kind");
+        };
+        assert!(record.task_binding.is_none());
     }
 
     #[test]
@@ -11765,6 +17881,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.endpoint, DEFAULT_NODE_ENDPOINT);
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    #[test]
+    fn provider_bundle_argv_hold_fixture_is_parent_bounded_and_waits_after_proof() {
+        let root = temporary_workspace_root("provider-bundle-argv-hold");
+        let outside = temporary_workspace_root("provider-bundle-argv-hold-outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let proof_path = root.join("provider.proof");
+        let release_signal = root.join("release.signal");
+        let config = NodeServerConfig::new(
+            format!(
+                r"\\.\pipe\gate4agent-provider-bundle-hold-{}",
+                std::process::id(),
+            ),
+            "fixture-token",
+            NodeId::new("provider-bundle-hold-node").unwrap(),
+            [WorkspaceConfig::new(
+                WorkspaceId::new("primary").unwrap(),
+                std::env::current_dir().unwrap(),
+            )
+            .unwrap()],
+        )
+        .unwrap()
+        .with_spawn_profiles(SpawnProfileRegistry::new([
+            crate::protocol::SpawnProfileDefaults {
+                profile_id: crate::protocol::SpawnProfileId::new("kimi-bundle-hold").unwrap(),
+                revision: crate::protocol::SpawnProfileRevision::new("kimi-bundle-hold-r1")
+                    .unwrap(),
+                provider: agent("kimi"),
+                mode: SessionMode::Pty,
+                terminal_size: gate4agent_types::TerminalSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                prompt: None,
+                bundle_id: None,
+                context_id: None,
+                environment_profile_id: None,
+            },
+        ])
+        .unwrap());
+        let server = NodeServer::new_provider_bundle_argv_hold_fixture(
+            config,
+            agent("kimi"),
+            proof_path.clone(),
+            release_signal.clone(),
+        )
+        .unwrap();
+        assert_eq!(server.shared.enabled_providers, [agent("kimi")]);
+
+        let spec = NodeServer::provider_bundle_argv_fixture_spec(
+            agent("kimi"),
+            proof_path.clone(),
+            Some(release_signal.clone()),
+        )
+        .unwrap();
+        let wrapper = &spec.launch.fixed_args[spec.launch.fixed_args.len() - 3];
+        let proof_write = wrapper.find("WriteAllLines($proofPath").unwrap();
+        let release_wait = wrapper
+            .find("while (-not (Test-Path -LiteralPath $releaseSignal -PathType Leaf))")
+            .unwrap();
+        let fixture_ready = wrapper.find("fixture-ready>").unwrap();
+        assert!(proof_write < release_wait);
+        assert!(release_wait < fixture_ready);
+        assert!(wrapper.contains("[DateTime]::UtcNow.AddSeconds(45)"));
+        assert!(wrapper.contains("Start-Sleep -Milliseconds 20"));
+        assert_eq!(
+            &spec.launch.fixed_args[spec.launch.fixed_args.len() - 2..],
+            &[
+                proof_path.to_string_lossy().into_owned(),
+                release_signal.to_string_lossy().into_owned(),
+            ],
+        );
+
+        let error = NodeServer::provider_bundle_argv_fixture_spec(
+            agent("kimi"),
+            proof_path,
+            Some(outside.join("release.signal")),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeServerError::Registry(message)
+                if message == "provider bundle argv release path must share the proof parent"
+        ));
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[cfg(feature = "fixture")]
@@ -11806,6 +18012,402 @@ mod tests {
                         && contract.family == AdapterFamily::History
                 }));
         }
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "fixture")]
+    #[test]
+    fn kimi_context_only_fixture_is_bounded_and_preserves_codex_validation() {
+        let root = temporary_workspace_root("kimi-context-only-fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        let proof_path = root.join("context.proof");
+        let standard = NodeServer::context_pack_fixture_catalog(proof_path.clone(), None).unwrap();
+        let kimi = AgentId::new("kimi").unwrap();
+        let context_only = NodeServer::context_pack_fixture_catalog(
+            proof_path,
+            Some(&kimi),
+        )
+        .unwrap();
+
+        let codex = AgentId::new("codex").unwrap();
+        assert_eq!(
+            standard.get(&codex).unwrap().launch.fixed_args,
+            context_only.get(&codex).unwrap().launch.fixed_args,
+        );
+        let script = context_only
+            .get(&kimi)
+            .unwrap()
+            .launch
+            .fixed_args
+            .iter()
+            .find(|argument| argument.contains("F7_KIMI_CONTEXT_ONLY_VALIDATED"))
+            .expect("Kimi context-only validation script is missing");
+        for required in [
+            "$bundleArgs.Count -ne 0",
+            "GATE4AGENT_CONTEXT_ROOT",
+            "context-pack.json",
+            "$entries.Count -ne 1",
+            "g4a-context-pack-v1",
+            "$document.PSObject.Properties['cwd']",
+            "'claude', 'codex', 'grok', 'kimi', 'qwen-code'",
+            "$hasUser",
+            "$hasAssistant",
+            "SHA256",
+            "context-only",
+        ] {
+            assert!(script.contains(required), "missing validation: {required}");
+        }
+        for forbidden in ["CODEX_HOME", "USERPROFILE", "auth", "token", "global config"] {
+            assert!(!script.contains(forbidden), "forbidden home/auth access: {forbidden}");
+        }
+        assert!(!standard
+            .get(&kimi)
+            .unwrap()
+            .launch
+            .fixed_args
+            .iter()
+            .any(|argument| argument.contains("F7_KIMI_CONTEXT_ONLY_VALIDATED")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    #[tokio::test]
+    async fn kimi_context_only_fixture_spawns_catalogued_context_pack_through_spawn_spec() {
+        let root = temporary_workspace_root("kimi-context-only-spawn");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let materialization_root = root.join("private-materializations");
+        let proof_path = root.join("context.proof");
+        let node_id = NodeId::new("node-kimi-context-only-spawn").unwrap();
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let profile_id = crate::protocol::SpawnProfileId::new("target-kimi").unwrap();
+        let endpoint = format!(
+            r"\\.\pipe\gate4agent-kimi-context-only-spawn-{}-{}",
+            std::process::id(),
+            unix_time_ms(),
+        );
+        let spawn_profiles = SpawnProfileRegistry::new([
+            crate::protocol::SpawnProfileDefaults {
+                profile_id: profile_id.clone(),
+                revision: crate::protocol::SpawnProfileRevision::new("target-kimi-r1").unwrap(),
+                provider: agent("kimi"),
+                mode: SessionMode::Pty,
+                terminal_size: gate4agent_types::TerminalSize {
+                    rows: 30,
+                    columns: 120,
+                },
+                prompt: None,
+                bundle_id: None,
+                context_id: None,
+                environment_profile_id: None,
+            },
+        ])
+        .unwrap();
+        let mut config = NodeServerConfig::new(
+            &endpoint,
+            "fixture-token",
+            node_id.clone(),
+            [WorkspaceConfig::new(workspace_id.clone(), &workspace_root).unwrap()],
+        )
+        .unwrap()
+        .with_spawn_profiles(spawn_profiles)
+        .with_session_environment_materialization(
+            materialization_root,
+            Arc::new(FixtureSecretResolver {
+                deny: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .unwrap();
+        config.fixture_raw_pty_runtime = true;
+        let server = NodeServer::new_context_only_proof_fixture(
+            config,
+            agent("kimi"),
+            proof_path.clone(),
+        )
+        .unwrap();
+        let shared = Arc::clone(&server.shared);
+        let shutdown = server.shutdown_handle();
+
+        let history = HistorySessionRecord {
+            session_id: "context-only-source-history".to_owned(),
+            title: None,
+            cwd: None,
+            model: None,
+            message_count: 2,
+            completed_turn_count: None,
+            total_tokens: 0,
+            messages: vec![
+                gate4agent_types::HistoryMessageRecord {
+                    role: gate4agent_types::HistoryMessageRole::User,
+                    text: "continue the bounded parent run through native C2".to_owned(),
+                },
+                gate4agent_types::HistoryMessageRecord {
+                    role: gate4agent_types::HistoryMessageRole::Assistant,
+                    text: "the exact parent context is ready for the child run".to_owned(),
+                },
+            ],
+        };
+        let pack = NodeContextPack::export(
+            ContextPackLineageReceipt {
+                source_node_id: node_id.clone(),
+                source_session: SessionAddress {
+                    workspace_id: workspace_id.clone(),
+                    session: SessionKey {
+                        instance_id: AgentInstanceId(71),
+                        generation: SessionGeneration(1),
+                    },
+                },
+                source_provider: agent("qwen-code"),
+            },
+            &history,
+        )
+        .unwrap();
+        let expected_context_hash = digest(&SHA256, pack.bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let context = shared
+            .context_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(pack)
+            .unwrap();
+        let spec = SpawnSpec {
+            target: crate::protocol::SpawnTarget {
+                node_id,
+                workspace_id: workspace_id.clone(),
+                worktree_id: None,
+            },
+            profile_id,
+            expected_profile_revision: crate::protocol::SpawnProfileRevision::new(
+                "target-kimi-r1",
+            ).unwrap(),
+            overrides: crate::protocol::SpawnOverrides {
+                context_id: crate::protocol::SpawnOverride::Set {
+                    value: context.id.clone(),
+                },
+                ..crate::protocol::SpawnOverrides::default()
+            },
+            deadline_ms: crate::protocol::SpawnDeadlineMs::new(10_000).unwrap(),
+            idempotency_key: SpawnIdempotencyKey::new("kimi-context-only-spawn").unwrap(),
+            required_capabilities: SpawnRequiredCapabilities::default(),
+        };
+        let resolved = match shared.resolve_spawn_spec(&spec) {
+            Ok(resolved) => resolved,
+            Err(error) => panic!(
+                "Kimi context-only resolve rejected: exact_code={:?} message={}",
+                error.code,
+                error.message,
+            ),
+        };
+        let resolved_context = match shared.resolve_context(&resolved) {
+            Ok(Some(resolved_context)) => resolved_context,
+            Ok(None) => panic!("Kimi context-only resolve omitted the exact ContextPack"),
+            Err(error) => panic!(
+                "Kimi context catalog resolve rejected: exact_code={:?} message={}",
+                error.code,
+                error.message,
+            ),
+        };
+        assert_eq!(resolved_context, context);
+        let runtime_policy = match shared
+            .admit_provider_runtime(&agent("kimi"), ProviderRuntimeRequirement::RawPty)
+            .await
+        {
+            Ok(runtime_policy) => runtime_policy,
+            Err(error) => panic!(
+                "Kimi RawPty admission rejected: exact_code={:?} message={}",
+                error.code,
+                error.message,
+            ),
+        };
+        assert!(runtime_policy.raw_pty_lifecycle);
+
+        let launch_control = shared.native_launch_profile_control.as_ref().unwrap();
+        let generic_overlay = NativeLaunchEnvironmentOverlay::new(
+            agent("kimi"),
+            TransportKind::Pty,
+            vec![EnvMutation {
+                key: OsString::from("GATE4AGENT_UNPROFILED_GENERIC"),
+                value: Some(OsString::from("must-remain-rejected")),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            launch_control
+                .install_native_launch_environment_overlay(
+                    AgentInstanceId(72),
+                    generic_overlay,
+                )
+                .unwrap_err(),
+            gate4agent_runtime_native::NativeLaunchProfileError::EnvironmentOverlaySelectionMissing,
+        );
+
+        let diagnostic_address = SessionAddress {
+            workspace_id: workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(73),
+                generation: SessionGeneration(1),
+            },
+        };
+        let (diagnostic_overlay, diagnostic_materialization) = match shared
+            .prepare_session_materialization(
+                &diagnostic_address,
+                &agent("kimi"),
+                SessionMode::Pty,
+                None,
+                None,
+                Some(&resolved_context),
+                None,
+            )
+        {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => panic!("Kimi context-only materialization produced no launch overlay"),
+            Err(error) => panic!(
+                "Kimi context-only materialization rejected: exact_code={:?} message={}",
+                error.code,
+                error.message,
+            ),
+        };
+        let diagnostic_overlay = diagnostic_overlay
+            .expect("Kimi context-only materialization omitted its environment overlay");
+        assert!(matches!(
+            &diagnostic_overlay,
+            PreparedNativeLaunchOverlay::Environment(_),
+        ));
+        match shared.install_prepared_launch_overlay(
+            diagnostic_address.session.instance_id,
+            diagnostic_overlay,
+        ) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("Kimi context-only overlay unexpectedly retained argv authority"),
+            Err(error) => panic!(
+                "Kimi context-only overlay installation rejected: exact_code={:?} message={}",
+                error.code,
+                error.message,
+            ),
+        }
+        assert!(launch_control.clear_native_instance_launch_overlay(
+            diagnostic_address.session.instance_id,
+        ));
+        drop(diagnostic_materialization);
+        assert!(shared
+            .materializations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+
+        let node_task = tokio::spawn(server.run());
+        let ready_client = timeout(Duration::from_secs(5), async {
+            loop {
+                match gate4agent_node_wire::LocalNodeClient::connect(
+                    &endpoint,
+                    &shared.node_id,
+                    ClientRole::Observer,
+                    "fixture-token",
+                )
+                .await
+                {
+                    Ok(client) => break client,
+                    Err(_) if !node_task.is_finished() => sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("Kimi context-only Node stopped before readiness: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Kimi context-only Node did not become ready");
+        assert_eq!(
+            ready_client
+                .hello()
+                .snapshot
+                .provider_runtime_statuses
+                .iter()
+                .find(|status| status.provider().as_str() == "kimi")
+                .expect("Kimi runtime status is missing")
+                .mode(),
+            crate::protocol::ProviderRuntimeMode::RawPassthrough,
+        );
+        drop(ready_client);
+
+        let receipt = match shared.spawn_from_spec(spec).await {
+            Ok(receipt) => receipt,
+            Err(error) => panic!(
+                "Kimi context-only SpawnSpec rejected: exact_code={:?} message={}",
+                error.code,
+                error.message,
+            ),
+        };
+        assert_eq!(receipt.provider, agent("kimi"));
+        assert_eq!(receipt.context.as_ref(), Some(&context));
+        assert!(receipt.context_binding_is_valid());
+        timeout(Duration::from_secs(5), async {
+            while !proof_path.is_file() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Kimi context-only fixture did not write its proof");
+
+        let proof = std::fs::read_to_string(&proof_path).unwrap();
+        let lines = proof.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 7);
+        assert_eq!(lines[0], "context-only");
+        assert!(Path::new(lines[1]).is_absolute());
+        assert_ne!(
+            std::fs::canonicalize(Path::new(lines[1])).unwrap(),
+            std::fs::canonicalize(&workspace_root).unwrap(),
+        );
+        assert_eq!(
+            std::fs::canonicalize(Path::new(lines[2])).unwrap(),
+            std::fs::canonicalize(&workspace_root).unwrap(),
+        );
+        assert_eq!(lines[3], expected_context_hash);
+        assert_eq!(lines[4], "g4a-context-pack-v1");
+        assert_eq!(lines[5], "qwen-code");
+        assert_eq!(lines[6], "2");
+        assert!(shared.handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == receipt.session.session.instance_id
+                && session.agent_id.as_str() == "kimi"
+        }));
+
+        shutdown.request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), node_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(shutdown);
+        drop(shared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "fixture")]
+    #[test]
+    fn clean_exit_fixture_constructor_is_fixture_scoped_and_path_bounded() {
+        let root = temporary_workspace_root("clean-exit-constructor");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = construction_test_config("clean-exit-constructor")
+            .with_state_path(root.join("node-state.json"))
+            .unwrap();
+        let server = NodeServer::new_clean_exit_fixture(
+            config,
+            root.clone(),
+            root.join("started.marker"),
+            root.join("release.signal"),
+        )
+        .unwrap();
+        assert_eq!(
+            server
+                .shared
+                .enabled_providers
+                .iter()
+                .map(AgentId::as_str)
+                .collect::<Vec<_>>(),
+            ["claude"],
+        );
         drop(server);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -11865,6 +18467,8 @@ mod tests {
                 ("kimi", AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
                 ("kimi", AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
                 ("kimi", AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
+                ("qwen-code", AdapterFamily::Pipe, "qwen-code", "qwen-code-dual-output/v1"),
+                ("qwen-code", AdapterFamily::History, "qwen-code", "gate4agent-adapter/v1"),
             ]
         );
     }
@@ -12312,6 +18916,7 @@ mod tests {
             request_id: 2,
             result: Ok(NodeResponse::Resync {
                 event_sequence: open_removed.sequence,
+                oldest_available_sequence: 1,
                 snapshot: shared.snapshot(),
                 events: vec![legacy_upsert, open_upsert, legacy_removed, open_removed],
             }),
@@ -12433,7 +19038,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_spawn_binding_is_visible_without_a_durable_identity_pending_record() {
+    async fn raw_spawn_binding_is_visible_with_a_durable_live_record() {
         let catalog = active_registry().unwrap();
         let (handle, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
         let workspace_id = WorkspaceId::new("primary").unwrap();
@@ -12457,18 +19062,17 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            shared
-                .bind_spawn_session(
-                    &address,
-                    agent("claude"),
-                    SessionMode::Pty,
-                    ProviderRuntimePolicy::raw_pty(),
-                    None,
-                )
-                .unwrap(),
-            None,
-        );
+        let record_id = shared
+            .bind_spawn_session(
+                &address,
+                agent("claude"),
+                SessionMode::Pty,
+                ProviderRuntimePolicy::raw_pty(),
+                SpawnRecordPolicy::Always,
+                None,
+            )
+            .unwrap()
+            .unwrap();
         shared
             .handle
             .dispatch(shared.prepare_command(ControlCommand::Register {
@@ -12483,12 +19087,118 @@ mod tests {
             session.instance_id == address.session.instance_id
                 && session.generation == address.session.generation
         }));
-        assert!(shared
-            .session_records
+        let record = shared.record(&record_id).unwrap();
+        assert_eq!(record.display_name, "claude #1");
+        assert_eq!(record.state, ManagedSessionState::Live);
+        assert_eq!(record.active_session.as_ref(), Some(&address));
+        assert!(record.provider_session.is_none());
+        let binding_record_id = shared
+            .session_bindings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .records
-            .is_empty());
+            .get(&address.session.instance_id)
+            .and_then(|binding| binding.record_id.clone());
+        assert_eq!(binding_record_id.as_ref(), Some(&record_id));
+
+        let renamed = shared
+            .rename_session_record(&record_id, "raw review".to_owned())
+            .unwrap();
+        assert_eq!(renamed.record_id, record_id);
+        assert_eq!(renamed.display_name, "raw review");
+        shared.reconcile_managed_record(
+            &record_id,
+            &address,
+            &ControlEvent {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                sequence: 1,
+                command_id: None,
+                instance_id: address.session.instance_id,
+                generation: address.session.generation,
+                event: ControlEventKind::Running { process_id: None },
+            },
+            false,
+            false,
+        );
+        let running = shared.record(&record_id).unwrap();
+        assert_eq!(running.state, ManagedSessionState::Live);
+        assert_eq!(running.active_session.as_ref(), Some(&address));
+        assert_eq!(running.display_name, "raw review");
+
+        shared.reconcile_managed_record(
+            &record_id,
+            &address,
+            &ControlEvent {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                sequence: 2,
+                command_id: None,
+                instance_id: address.session.instance_id,
+                generation: address.session.generation,
+                event: ControlEventKind::Exited {
+                    exit_code: Some(0),
+                    forced: false,
+                },
+            },
+            false,
+            false,
+        );
+        let detached = shared.record(&record_id).unwrap();
+        assert_eq!(detached.state, ManagedSessionState::Unavailable);
+        assert!(detached.active_session.is_none());
+        assert_eq!(detached.display_name, "raw review");
+        let renamed_detached = shared
+            .rename_session_record(&record_id, "raw review detached".to_owned())
+            .unwrap();
+        assert_eq!(renamed_detached.record_id, record_id);
+        assert_eq!(renamed_detached.state, ManagedSessionState::Unavailable);
+        assert!(renamed_detached.active_session.is_none());
+        assert_eq!(renamed_detached.display_name, "raw review detached");
+        assert_eq!(shared.snapshot().session_records, vec![renamed_detached]);
+    }
+
+    #[test]
+    fn legacy_raw_spawn_binding_remains_untracked() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let workspace = WorkspaceConfig::new(
+            workspace_id.clone(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-legacy-raw-spawn").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let address = SessionAddress {
+            workspace_id,
+            session: SessionKey {
+                instance_id: AgentInstanceId(72),
+                generation: SessionGeneration::default(),
+            },
+        };
+
+        let record_id = shared
+            .bind_spawn_session(
+                &address,
+                agent("claude"),
+                SessionMode::Pty,
+                ProviderRuntimePolicy::raw_pty(),
+                SpawnRecordPolicy::ProviderIdentityOnly,
+                None,
+            )
+            .unwrap();
+
+        assert!(record_id.is_none());
+        let binding_record_id = shared
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&address.session.instance_id)
+            .and_then(|binding| binding.record_id.clone());
+        assert!(binding_record_id.is_none());
         assert!(shared.snapshot().session_records.is_empty());
     }
 
@@ -12706,6 +19416,357 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn provider_session_reference_index_is_controller_gated_and_idempotent() {
+        let secondary_root = temporary_workspace_root("provider-session-reference-index");
+        std::fs::create_dir_all(&secondary_root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let primary_id = WorkspaceId::new("primary").unwrap();
+        let secondary_id = WorkspaceId::new("secondary").unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-session-reference-index").unwrap(),
+            vec![
+                WorkspaceConfig::new(primary_id.clone(), std::env::current_dir().unwrap())
+                    .unwrap(),
+                WorkspaceConfig::new(secondary_id.clone(), &secondary_root).unwrap(),
+            ],
+            vec![agent("claude"), agent("codex")],
+        );
+        let identity = ProviderSessionIdentity {
+            key: gate4agent_types::ProviderSessionKey::SessionId,
+            id: "provider-session-42".to_owned(),
+            transcript_path: None,
+        };
+        let index_request = |workspace_id: WorkspaceId,
+                             provider: AgentId,
+                             identity: ProviderSessionIdentity,
+                             display_name: &str| {
+            NodeRequest::IndexProviderSession {
+                workspace_id,
+                provider,
+                identity,
+                display_name: display_name.to_owned(),
+            }
+        };
+        let request = index_request(
+            primary_id.clone(),
+            agent("claude"),
+            identity.clone(),
+            "release shepherd",
+        );
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY
+        }));
+        let observer = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Observer,
+            request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(observer.code, NodeFailureCode::ObserverReadOnly);
+        let uncontrolled = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(uncontrolled.code, NodeFailureCode::ControllerRequired);
+        shared
+            .acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS)
+            .unwrap();
+
+        let indexed = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            request.clone(),
+        )
+        .await
+        .unwrap();
+        let NodeResponse::ProviderSessionIndexed { record } = indexed else {
+            panic!("provider session reference index returned another response");
+        };
+        assert_eq!(record.state, ManagedSessionState::Dormant);
+        assert_eq!(record.mode, SessionMode::Pty);
+        assert_eq!(record.workspace_id, primary_id);
+        assert_eq!(record.provider_session.as_ref(), Some(&identity));
+        assert!(record.active_session.is_none());
+        assert!(record.environment_profile.is_none());
+        assert!(record.bundle.is_none());
+        assert!(record.context.is_none());
+
+        let repeated = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            index_request(
+                primary_id.clone(),
+                agent("claude"),
+                identity.clone(),
+                "ignored replacement",
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            repeated,
+            NodeResponse::ProviderSessionIndexed { record: ref existing }
+                if existing.record_id == record.record_id
+                    && existing.display_name == "release shepherd"
+        ));
+        let conflicting_workspace = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            index_request(
+                secondary_id,
+                agent("claude"),
+                identity.clone(),
+                "release shepherd",
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflicting_workspace.code, NodeFailureCode::SessionRecordConflict);
+        let conflicting_provider = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            index_request(
+                primary_id.clone(),
+                agent("codex"),
+                identity.clone(),
+                "release shepherd",
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflicting_provider.code, NodeFailureCode::SessionRecordConflict);
+        let transcript_rejected = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            index_request(
+                primary_id,
+                agent("claude"),
+                ProviderSessionIdentity {
+                    transcript_path: Some("C:/provider/transcript.jsonl".to_owned()),
+                    ..identity
+                },
+                "release shepherd",
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(transcript_rejected.code, NodeFailureCode::InvalidRequest);
+        let upserts = shared
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .events
+            .iter()
+            .filter(|event| matches!(
+                &event.event,
+                NodeEvent::SessionRecordUpserted { record: published }
+                    if published.record_id == record.record_id
+            ))
+            .count();
+        assert_eq!(upserts, 1);
+        std::fs::remove_dir_all(secondary_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_workspace_is_independent_registered_and_controller_gated() {
+        let fixture_root = temporary_workspace_root("standalone-independent");
+        let target = fixture_root.join("independent");
+        std::fs::create_dir_all(&fixture_root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let selected = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let selected_root = selected.canonical_root().to_owned();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-standalone").unwrap(),
+            vec![selected],
+            vec![agent("claude")],
+        );
+        let workspace_id = WorkspaceId::new("independent").unwrap();
+        let request = NodeRequest::CreateStandaloneWorkspace {
+            workspace_id: workspace_id.clone(),
+            root: opaque_windows_path(target.to_string_lossy().into_owned()),
+            initial_branch: Some("main".to_owned()),
+        };
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY
+        }));
+        assert!(!request_uses_unnegotiated_capability(
+            &request,
+            &baseline_capabilities().unwrap(),
+        ));
+        assert!(request_uses_unnegotiated_capability(&request, &[]));
+
+        let observer = process_request_inner(&shared, 77, ClientRole::Observer, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(observer.code, NodeFailureCode::ObserverReadOnly);
+        assert!(!target.exists());
+        let uncontrolled = process_request_inner(&shared, 77, ClientRole::Operator, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(uncontrolled.code, NodeFailureCode::ControllerRequired);
+        assert!(!target.exists());
+        shared
+            .acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS)
+            .unwrap();
+
+        let response = process_request_inner(&shared, 77, ClientRole::Operator, request)
+            .await
+            .unwrap();
+        let NodeResponse::StandaloneWorkspaceCreated { workspace } = response else {
+            panic!("standalone workspace creation returned another response");
+        };
+        assert_eq!(workspace.workspace_id, workspace_id);
+        assert!(target.join(".git").is_dir());
+        let branch = run_git_bounded(
+            target.to_str().unwrap(),
+            &["branch", "--show-current"],
+            GIT_OUTPUT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        assert!(branch.success);
+        assert_eq!(String::from_utf8(branch.stdout).unwrap().trim(), "main");
+        let worktrees = list_git_worktrees(target.to_str().unwrap()).await.unwrap();
+        assert_eq!(worktrees.len(), 1);
+        let listed_root = WorkspaceConfig::new(
+            WorkspaceId::new("listed-independent").unwrap(),
+            &worktrees[0].path,
+        )
+        .unwrap();
+        assert!(platform::roots_equal(
+            listed_root.canonical_root(),
+            windows_path_text(&workspace.canonical_root),
+        ));
+        assert!(!platform::roots_equal(listed_root.canonical_root(), &selected_root));
+        assert!(shared.snapshot().workspaces.iter().any(|snapshot| {
+            snapshot.workspace_id == workspace_id
+                && snapshot.canonical_root == workspace.canonical_root
+        }));
+        assert!(shared
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .events
+            .iter()
+            .any(|event| matches!(
+                &event.event,
+                NodeEvent::WorkspaceAdded { workspace }
+                    if workspace.workspace_id == workspace_id
+            )));
+        std::fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_workspace_registration_failure_preserves_guarded_repository_for_recovery() {
+        let fixture_root = temporary_workspace_root("standalone-compensation");
+        let created_target = fixture_root.join("created-target");
+        let existing_target = fixture_root.join("existing-target");
+        let invalid_state_parent = fixture_root.join("state-parent-is-a-file");
+        let invalid_state_path = invalid_state_parent.join("state.json");
+        std::fs::create_dir_all(&existing_target).unwrap();
+        std::fs::write(&invalid_state_parent, "not a directory").unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let primary = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-standalone-compensation").unwrap(),
+            vec![primary],
+            vec![agent("claude")],
+        );
+        shared.state_path = Some(invalid_state_path);
+
+        let created_recovery = shared
+            .create_standalone_workspace(
+                WorkspaceId::new("compensated").unwrap(),
+                created_target.to_string_lossy().into_owned(),
+                Some("main".to_owned()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            created_recovery.code,
+            NodeFailureCode::StandaloneWorkspaceRecoveryRequired,
+        );
+        assert!(created_target.join(".git").is_dir());
+        assert!(shared.snapshot().workspaces.iter().all(|workspace| {
+            workspace.workspace_id.as_str() != "compensated"
+        }));
+
+        let existing_recovery = shared
+            .create_standalone_workspace(
+                WorkspaceId::new("restored").unwrap(),
+                existing_target.to_string_lossy().into_owned(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            existing_recovery.code,
+            NodeFailureCode::StandaloneWorkspaceRecoveryRequired,
+        );
+        assert!(existing_target.is_dir());
+        assert!(existing_target.join(".git").is_dir());
+        assert!(shared.snapshot().workspaces.iter().all(|workspace| {
+            workspace.workspace_id.as_str() != "restored"
+        }));
+
+        let registered_empty = fixture_root.join("registered-empty");
+        std::fs::create_dir(&registered_empty).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let registered = WorkspaceConfig::new(
+            WorkspaceId::new("registered-empty").unwrap(),
+            &registered_empty,
+        )
+        .unwrap();
+        let duplicate_shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-standalone-duplicate-root").unwrap(),
+            vec![registered],
+            vec![agent("claude")],
+        );
+        let duplicate = duplicate_shared
+            .create_standalone_workspace(
+                WorkspaceId::new("duplicate-root").unwrap(),
+                registered_empty.to_string_lossy().into_owned(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code, NodeFailureCode::DuplicateWorkspaceRoot);
+        assert!(std::fs::read_dir(&registered_empty).unwrap().next().is_none());
+        std::fs::remove_dir_all(fixture_root).unwrap();
+    }
+
     #[test]
     fn managed_record_id_collision_preserves_the_existing_record() {
         let catalog = active_registry().unwrap();
@@ -12737,6 +19798,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             last_error: None,
@@ -12781,6 +19843,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -12842,6 +19905,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -12927,6 +19991,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -12955,6 +20020,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
                 last_error: None,
@@ -13037,6 +20103,7 @@ mod tests {
             SpawnProfileRegistry::default(),
             None,
             None,
+            None,
             Some(state_path.clone()),
             Vec::new(),
             Vec::new(),
@@ -13066,6 +20133,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -13094,6 +20162,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
                 last_error: None,
@@ -13203,6 +20272,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             loaded.records,
             loaded.managed_worktrees,
             loaded.managed_worktree_tombstones,
@@ -13260,6 +20330,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
                 last_error: None,
@@ -13633,6 +20704,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observer_can_browse_host_directories_without_controller() {
+        let root = temporary_workspace_root("host-directory-observer");
+        std::fs::create_dir_all(root.join("directory-b")).unwrap();
+        std::fs::create_dir_all(root.join("directory-a")).unwrap();
+        std::fs::write(root.join("ordinary-file"), b"not a directory").unwrap();
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let workspace = WorkspaceConfig::new(workspace_id, &root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let request = NodeRequest::BrowseHostDirectories {
+            directory: Some(OpaqueHostPath::utf8(root.to_string_lossy().into_owned()).unwrap()),
+            after: None,
+        };
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == CAPABILITY_HOST_DIRECTORY_BROWSE_V1
+        }));
+        assert!(!request_uses_unnegotiated_capability(
+            &request,
+            &baseline_capabilities().unwrap(),
+        ));
+        assert!(request_uses_unnegotiated_capability(&request, &[]));
+
+        let response = process_request_inner(&shared, 77, ClientRole::Observer, request)
+            .await
+            .unwrap();
+        let NodeResponse::HostDirectoriesBrowsed { listing } = response else {
+            panic!("host directory browse returned another response");
+        };
+        assert_eq!(
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["directory-a", "directory-b"],
+        );
+        assert!(listing.entries.iter().all(|entry| !entry.is_link));
+        assert!(!listing.incomplete);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn observer_can_inspect_only_a_registered_workspace() {
         let root = temporary_workspace_root("observer");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -13681,6 +20801,626 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[tokio::test]
+    async fn context_pack_repository_reads_only_the_registered_source_workspace() {
+        let root = temporary_workspace_root("context-pack-registered-root");
+        let other_root = temporary_workspace_root("context-pack-unregistered-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        std::fs::write(
+            root.join("README.md"),
+            b"REGISTERED_CONTEXT_MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(
+            other_root.join("README.md"),
+            b"UNREGISTERED_CONTEXT_MARKER\n",
+        )
+        .unwrap();
+        run_git_fixture(&root, &["init", "--quiet"]).await;
+        run_git_fixture(&root, &["add", "--", "README.md"]).await;
+        run_git_fixture(
+            &root,
+            &[
+                "-c",
+                "user.name=Gate4Agent Fixture",
+                "-c",
+                "user.email=fixture@gate4agent.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "registered context commit",
+            ],
+        )
+        .await;
+        let workspace_id = WorkspaceId::new("source-workspace").unwrap();
+        let workspace = WorkspaceConfig::new(workspace_id.clone(), &root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-context-pack-root").unwrap(),
+            vec![workspace],
+            vec![agent("codex")],
+        );
+        let repository = shared
+            .context_pack_repository(&workspace_id)
+            .await
+            .unwrap();
+        let history = HistorySessionRecord {
+            session_id: "provider-session".to_owned(),
+            title: None,
+            cwd: Some(other_root.to_string_lossy().into_owned()),
+            model: Some("codex".to_owned()),
+            message_count: 1,
+            completed_turn_count: None,
+            total_tokens: 0,
+            messages: vec![gate4agent_types::HistoryMessageRecord {
+                role: gate4agent_types::HistoryMessageRole::User,
+                text: "summarize the bounded context".to_owned(),
+            }],
+        };
+        let pack = NodeContextPack::export_with_repository(
+            ContextPackLineageReceipt {
+                source_node_id: shared.node_id.clone(),
+                source_session: SessionAddress {
+                    workspace_id,
+                    session: SessionKey {
+                        instance_id: AgentInstanceId(7),
+                        generation: SessionGeneration(1),
+                    },
+                },
+                source_provider: agent("codex"),
+            },
+            &history,
+            Some(repository),
+        )
+        .unwrap();
+        let encoded = String::from_utf8(pack.bytes().to_vec()).unwrap();
+
+        assert!(encoded.contains("REGISTERED_CONTEXT_MARKER"));
+        assert!(encoded.contains("registered context commit"));
+        assert!(!encoded.contains("UNREGISTERED_CONTEXT_MARKER"));
+        assert!(!encoded.contains(root.to_string_lossy().as_ref()));
+        assert!(!encoded.contains(other_root.to_string_lossy().as_ref()));
+        assert!(!encoded.contains("diagnostic"));
+        assert!(!encoded.contains("worktrees"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&other_root).unwrap();
+    }
+
+    #[test]
+    fn context_pack_source_accepts_only_running_or_successful_exit() {
+        assert!(context_pack_source_status_is_usable(&SessionStatus::Running));
+        assert!(context_pack_source_status_is_usable(&SessionStatus::Exited {
+            exit_code: Some(0),
+        }));
+        assert!(!context_pack_source_status_is_usable(&SessionStatus::Exited {
+            exit_code: Some(1),
+        }));
+        assert!(!context_pack_source_status_is_usable(&SessionStatus::Exited {
+            exit_code: None,
+        }));
+        assert!(!context_pack_source_status_is_usable(&SessionStatus::Failed {
+            message: "provider failed".to_owned(),
+        }));
+        assert!(!context_pack_source_status_is_usable(&SessionStatus::Registered));
+        assert!(!context_pack_source_status_is_usable(&SessionStatus::Starting));
+        assert!(!context_pack_source_status_is_usable(&SessionStatus::Stopping));
+    }
+
+    #[test]
+    fn context_pack_repository_rejects_changed_head_with_same_git_snapshot() {
+        let git = git_snapshot_for_parser();
+        let first = ContextPackRepositoryObservation {
+            head: ContextPackRepositoryHead::Commit("a".repeat(40)),
+            git: git.clone(),
+            files: Vec::new(),
+        };
+        let second = ContextPackRepositoryObservation {
+            head: ContextPackRepositoryHead::Commit("b".repeat(40)),
+            git,
+            files: Vec::new(),
+        };
+
+        let error = stable_context_pack_repository(first, second).unwrap_err();
+
+        assert_eq!(
+            error.code,
+            NodeFailureCode::ContextPackMaterializationFailed,
+        );
+    }
+
+    #[test]
+    fn context_pack_repository_rejects_changed_file_with_same_git_snapshot() {
+        let git = git_snapshot_for_parser();
+        let first = ContextPackRepositoryObservation {
+            head: ContextPackRepositoryHead::Commit("a".repeat(40)),
+            git: git.clone(),
+            files: vec![ContextPackRepositoryFileSource::utf8(
+                "README.md",
+                "first\n".to_owned(),
+                6,
+            )],
+        };
+        let second = ContextPackRepositoryObservation {
+            head: ContextPackRepositoryHead::Commit("a".repeat(40)),
+            git,
+            files: vec![ContextPackRepositoryFileSource::utf8(
+                "README.md",
+                "other\n".to_owned(),
+                6,
+            )],
+        };
+
+        let error = stable_context_pack_repository(first, second).unwrap_err();
+
+        assert_eq!(
+            error.code,
+            NodeFailureCode::ContextPackMaterializationFailed,
+        );
+    }
+
+    #[tokio::test]
+    async fn native_session_catalog_zero_active_session_fixture() {
+        let workspace_root = temporary_workspace_root("native-catalog-workspace");
+        let history_root = temporary_workspace_root("native-catalog-history");
+        let outside_root = temporary_workspace_root("native-catalog-outside");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&history_root).unwrap();
+        std::fs::create_dir_all(&outside_root).unwrap();
+        let transcript = |session_id: &str, cwd: &Path, title: &str| {
+            [
+                serde_json::json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_str().unwrap(),
+                    "message": { "content": "raw user text must not cross the catalog wire" }
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_str().unwrap(),
+                    "message": { "model": "claude-sonnet", "content": "raw answer" }
+                }),
+                serde_json::json!({
+                    "type": "ai-title",
+                    "sessionId": session_id,
+                    "aiTitle": title
+                }),
+            ]
+            .into_iter()
+            .map(|record| record.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+        std::fs::write(
+            history_root.join("stable-session.jsonl"),
+            transcript("stable-session", &workspace_root, "Workspace review"),
+        )
+        .unwrap();
+        std::fs::write(
+            history_root.join("outside-session.jsonl"),
+            transcript("outside-session", &outside_root, "Outside review"),
+        )
+        .unwrap();
+        let history = NativeHistoryConfig::new(vec![
+            NativeHistoryRoot::new(
+                gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                HistorySourceLayout::SingleNdjson,
+                history_root.clone(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        assert!(handle.snapshot().sessions.is_empty());
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let workspace = WorkspaceConfig::new(workspace_id.clone(), &workspace_root).unwrap();
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-native-catalog").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        shared.native_session_catalog = Some(Arc::new(Mutex::new(
+            NativeSessionCatalogAuthority::new(history),
+        )));
+        let route = NativeSessionCatalogRoute::workspace(
+            workspace_id.clone(),
+            agent("claude"),
+        );
+        let request = NodeRequest::CatalogNativeSessions {
+            route: route.clone(),
+            limit: 2,
+        };
+        let observer = process_request_inner(&shared, 7, ClientRole::Observer, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(observer.code, NodeFailureCode::ObserverReadOnly);
+        let response = process_request_inner(&shared, 7, ClientRole::Operator, request)
+            .await
+            .unwrap();
+        let NodeResponse::NativeSessionsCataloged { entries, summary, .. } = response else {
+            panic!("native catalog returned a different response");
+        };
+        let summary = summary.expect("node must emit native session catalog summary metadata");
+        assert_eq!(entries.len(), 1);
+        assert!(gate4agent_types::validate_candidate_id(&entries[0].selection_id).is_ok());
+        assert_eq!(entries[0].external_group, None);
+        assert_eq!(entries[0].record_id, None);
+        assert_eq!(entries[0].title, None);
+        assert_eq!(entries[0].model, None);
+        assert_eq!(entries[0].message_count, 0);
+        let encoded_entries = serde_json::to_string(&entries).unwrap();
+        assert!(!encoded_entries.contains("stable-session"));
+        assert!(!encoded_entries.contains(history_root.to_string_lossy().as_ref()));
+        let page_request = NodeRequest::PageNativeSessions {
+            route: route.clone(),
+            window: crate::protocol::NativeSessionCatalogWindow::Recent,
+            catalog_revision: summary.catalog_revision,
+            recent_cutoff_unix_ms: summary.recent_cutoff_unix_ms,
+            after_selection_id: None,
+            limit: 2,
+        };
+        let observer = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Observer,
+            page_request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(observer.code, NodeFailureCode::ObserverReadOnly);
+        let page_response = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            page_request.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            page_response,
+            NodeResponse::NativeSessionsPaged { page, .. }
+                if page.entries.len() == 1 && !page.has_more && page.remaining_count == 0
+        ));
+        let stale = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::PageNativeSessions {
+                route: route.clone(),
+                window: crate::protocol::NativeSessionCatalogWindow::Recent,
+                catalog_revision: summary.catalog_revision.wrapping_add(1),
+                recent_cutoff_unix_ms: summary.recent_cutoff_unix_ms,
+                after_selection_id: None,
+                limit: 2,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code, NodeFailureCode::StaleNativeSessionCatalog);
+        let selection = NativeSessionSelection {
+            route: route.clone(),
+            catalog_revision: summary.catalog_revision,
+            recent_cutoff_unix_ms: summary.recent_cutoff_unix_ms,
+            selection_id: entries[0].selection_id.clone(),
+        };
+        let preview_response = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::PreviewNativeSession {
+                selection: selection.clone(),
+                message_limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let NodeResponse::NativeSessionPreviewed { preview, .. } = preview_response else {
+            panic!("native preview returned a different response");
+        };
+        assert_eq!(preview.messages.len(), 1);
+        assert!(preview.message_count_exact);
+        assert_eq!(preview.messages[0].text, "raw answer");
+        assert!(preview.truncated);
+
+        let index_request = NodeRequest::IndexNativeSession {
+            selection: selection.clone(),
+            display_name: "Saved Claude".to_owned(),
+        };
+        let observer = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Observer,
+            index_request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(observer.code, NodeFailureCode::ObserverReadOnly);
+        let without_controller = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            index_request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(without_controller.code, NodeFailureCode::ControllerRequired);
+        let acquired = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::AcquireController { lease_ms: 5_000 },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(acquired, NodeResponse::Controller { controller: Some(_) }));
+        let indexed = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            index_request,
+        )
+        .await
+        .unwrap();
+        assert!(indexed.native_session_index_contract_is_valid());
+        let NodeResponse::NativeSessionIndexed {
+            selection: echoed_selection,
+            record,
+        } = indexed else {
+            panic!("native session index returned a different response");
+        };
+        assert_eq!(echoed_selection, selection);
+        let recataloged = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::CatalogNativeSessions {
+                route,
+                limit: 2,
+            },
+        )
+        .await
+        .unwrap();
+        let NodeResponse::NativeSessionsCataloged { entries, .. } = recataloged else {
+            panic!("native catalog returned a different response after indexing");
+        };
+        assert_eq!(entries[0].record_id.as_ref(), Some(&record.record_id));
+
+        let unregistered_route = NativeSessionCatalogRoute::unregistered(agent("claude"));
+        let external_catalog = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::CatalogNativeSessions {
+                route: unregistered_route.clone(),
+                limit: 2,
+            },
+        )
+        .await
+        .unwrap();
+        let external_json = serde_json::to_string(&external_catalog).unwrap();
+        assert!(!external_json.contains("outside-session"));
+        assert!(!external_json.contains(outside_root.to_string_lossy().as_ref()));
+        assert!(!external_json.contains(history_root.to_string_lossy().as_ref()));
+        assert!(!external_json.contains("\"session_id\""));
+        assert!(!external_json.contains("\"cwd\""));
+        assert!(!external_json.contains("\"path\""));
+        let NodeResponse::NativeSessionsCataloged {
+            route: echoed_route,
+            entries: external_entries,
+            summary: Some(external_summary),
+        } = external_catalog
+        else {
+            panic!("unregistered native catalog returned a different response");
+        };
+        assert_eq!(echoed_route, unregistered_route);
+        assert_eq!(external_entries.len(), 1);
+        assert_eq!(external_entries[0].record_id, None);
+        let external_group = external_entries[0]
+            .external_group
+            .as_ref()
+            .expect("unregistered session must have an external group");
+        assert_eq!(
+            external_group.kind,
+            gate4agent_types::NativeSessionExternalGroupKind::Project,
+        );
+        assert!(external_group.group_id.starts_with("external-"));
+        assert_eq!(
+            external_group.display_name,
+            outside_root.file_name().unwrap().to_string_lossy(),
+        );
+        let external_selection = NativeSessionSelection {
+            route: unregistered_route,
+            catalog_revision: external_summary.catalog_revision,
+            recent_cutoff_unix_ms: external_summary.recent_cutoff_unix_ms,
+            selection_id: external_entries[0].selection_id.clone(),
+        };
+        let external_preview = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::PreviewNativeSession {
+                selection: external_selection.clone(),
+                message_limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let external_preview_json = serde_json::to_string(&external_preview).unwrap();
+        assert!(!external_preview_json.contains("outside-session"));
+        assert!(!external_preview_json.contains(outside_root.to_string_lossy().as_ref()));
+        assert!(!external_preview_json.contains("\"session_id\""));
+        let NodeResponse::NativeSessionPreviewed { preview, .. } = external_preview else {
+            panic!("unregistered native preview returned a different response");
+        };
+        assert_eq!(preview.messages.len(), 1);
+        let external_index = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::IndexNativeSession {
+                selection: external_selection,
+                display_name: "External Claude".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            external_index.code,
+            NodeFailureCode::WorkspaceRegistrationRequired,
+        );
+        let record_response = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::PreviewSessionRecord {
+                record_id: record.record_id.clone(),
+                message_limit: 2,
+            },
+        )
+        .await
+        .unwrap();
+        let NodeResponse::SessionRecordPreviewed { record_id, preview } = record_response else {
+            panic!("record preview returned a different response");
+        };
+        assert_eq!(record_id, record.record_id);
+        assert_eq!(preview.messages.len(), 2);
+        let encoded = serde_json::to_string(&preview).unwrap();
+        assert!(!encoded.contains("stable-session"));
+        assert!(!encoded.contains(history_root.to_string_lossy().as_ref()));
+        let NodeResponse::Resync { events, .. } = shared.resync(0) else {
+            panic!("record preview observation history returned a different response");
+        };
+        let history_observations = events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                NodeEvent::ManagedObservation {
+                    record_id,
+                    observation,
+                } if record_id == &record.record_id
+                    && observation.evidence == ObservationEvidenceV1::HistoryProjection =>
+                {
+                    Some(observation)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history_observations.len(), 2);
+        assert!(history_observations.iter().any(|observation| matches!(
+            observation.kind,
+            ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::History,
+                capabilities: ObservationCapabilitiesV1 {
+                    history_summary: true,
+                    ..
+                },
+                ..
+            }
+        )));
+        let history_snapshot = history_observations
+            .iter()
+            .find_map(|observation| match &observation.kind {
+                ObservationKindV1::HistorySnapshot {
+                    message_count,
+                    message_count_exact,
+                    completed_turn_count,
+                    total_tokens,
+                } => Some((
+                    *message_count,
+                    *message_count_exact,
+                    *completed_turn_count,
+                    *total_tokens,
+                )),
+                _ => None,
+            })
+            .expect("managed history preview must emit an aggregate snapshot");
+        assert_eq!(
+            history_snapshot,
+            (
+                preview.message_count,
+                preview.message_count_exact,
+                preview.completed_turn_count,
+                preview.total_tokens,
+            ),
+        );
+        let history_observation_json = serde_json::to_string(&history_observations).unwrap();
+        for private in [
+            "stable-session",
+            "raw user text must not cross the catalog wire",
+            "raw answer",
+            "Workspace review",
+            "claude-sonnet",
+            history_root.to_string_lossy().as_ref(),
+            workspace_root.to_string_lossy().as_ref(),
+        ] {
+            assert!(!history_observation_json.contains(private), "{private}");
+        }
+        let identity = record.provider_session.clone().unwrap();
+        assert_eq!(
+            shared.revalidate_session_record_preview(&record, &identity),
+            Ok(())
+        );
+        shared.remove_record_memory(&record.record_id);
+        assert_eq!(
+            shared
+                .revalidate_session_record_preview(&record, &identity)
+                .unwrap_err()
+                .code,
+            NodeFailureCode::UnknownSessionRecord
+        );
+        let released = process_request_inner(
+            &shared,
+            7,
+            ClientRole::Operator,
+            NodeRequest::ReleaseController,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(released, NodeResponse::Controller { controller: None }));
+        assert!(shared.controller_state().is_none());
+        std::fs::remove_dir_all(workspace_root).unwrap();
+        std::fs::remove_dir_all(history_root).unwrap();
+        std::fs::remove_dir_all(outside_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_session_catalog_concurrent_operation_fails_fast_without_waiting_on_mutex() {
+        let history_root = temporary_workspace_root("native-catalog-concurrent-operation");
+        std::fs::create_dir_all(&history_root).unwrap();
+        let history = NativeHistoryConfig::new(vec![
+            NativeHistoryRoot::new(
+                gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                HistorySourceLayout::SingleNdjson,
+                history_root.clone(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let catalog = Arc::new(Mutex::new(NativeSessionCatalogAuthority::new(history)));
+        let held = catalog.lock().unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            run_native_session_catalog_operation(
+                Arc::clone(&catalog),
+                "native session catalog",
+                |_| Ok::<(), std::convert::Infallible>(()),
+            ),
+        )
+        .await
+        .expect("concurrent native catalog request must not wait for the operation deadline")
+        .unwrap_err();
+        assert_eq!(result.code, NodeFailureCode::BackendBusy);
+        drop(held);
+        std::fs::remove_dir_all(history_root).unwrap();
+    }
+
     fn temporary_workspace_root(label: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -13699,9 +21439,340 @@ mod tests {
             status: Vec::new(),
             recent_commits: Vec::new(),
             worktrees: Vec::new(),
+            managed_worktree: None,
             truncated: false,
             diagnostic: None,
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_inspection_scopes_only_exact_active_managed_branch() {
+        let root = temporary_workspace_root("managed-git-scope");
+        std::fs::create_dir_all(&root).unwrap();
+        run_test_git(&root, &["init"]);
+        run_test_git(&root, &["config", "user.email", "gate4agent@example.invalid"]);
+        run_test_git(&root, &["config", "user.name", "Gate4Agent Test"]);
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        run_test_git(&root, &["add", "seed.txt"]);
+        run_test_git(&root, &["commit", "-m", "seed"]);
+        run_test_git(&root, &["checkout", "-b", "gate4agent/a"]);
+
+        let workspace_id = WorkspaceId::new("managed-a").unwrap();
+        let workspace = WorkspaceConfig::new(workspace_id.clone(), &root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let mut lease = ManagedWorktreeLeaseRecord {
+            lease_id: ManagedWorktreeLeaseId::new("mw-a").unwrap(),
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            workspace_id: workspace_id.clone(),
+            profile_id: WorktreeProfileId::new("default").unwrap(),
+            profile_revision: crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+            target_root: root.to_string_lossy().into_owned(),
+            branch: "gate4agent/a".to_owned(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            expected_head: None,
+            retention: ManagedWorktreeRetention::Retain,
+            state: ManagedWorktreeLeaseState::InUse,
+            session_holders: vec![ManagedWorktreeSessionHolder {
+                incarnation_id: shared.incarnation_id,
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(1),
+            }],
+            record_holders: Vec::new(),
+            cleanup_failure: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        *shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ManagedWorktreeRegistry::from_records(vec![lease.clone()], Vec::new()).unwrap();
+
+        let inspection = shared.inspect_workspace(workspace_id.clone()).await.unwrap();
+        let scope = inspection.git.managed_worktree.unwrap();
+        assert_eq!(scope.lease_id, lease.lease_id);
+        assert_eq!(scope.branch, "gate4agent/a");
+        assert_eq!(scope.active_session_count, 1);
+
+        lease.branch = "gate4agent/b".to_owned();
+        *shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ManagedWorktreeRegistry::from_records(vec![lease], Vec::new()).unwrap();
+        let mismatch = shared.inspect_workspace(workspace_id).await.unwrap();
+        assert!(mismatch.git.managed_worktree.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_file_write_requires_controller_and_rejects_stale_revision() {
+        let root = temporary_workspace_root("workspace-file-write-controller");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"old\n").unwrap();
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let workspace = WorkspaceConfig::new(workspace_id.clone(), &root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let expected_revision = workspace_file_revision(b"old\n");
+        let request = NodeRequest::WriteWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+            expected_revision: expected_revision.clone(),
+            text: "new\n".to_owned(),
+        };
+        let observer = process_request_inner(&shared, 77, ClientRole::Observer, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(observer.code, NodeFailureCode::ObserverReadOnly);
+        let uncontrolled = process_request_inner(&shared, 77, ClientRole::Operator, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(uncontrolled.code, NodeFailureCode::ControllerRequired);
+        shared.acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS).unwrap();
+        let response = process_request_inner(&shared, 77, ClientRole::Operator, request).await.unwrap();
+        let NodeResponse::WorkspaceFileWritten { file } = response else {
+            panic!("workspace file write returned another response");
+        };
+        assert_eq!(file.revision, Some(workspace_file_revision(b"new\n")));
+        assert_eq!(std::fs::read(root.join("src/lib.rs")).unwrap(), b"new\n");
+        let stale = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::WriteWorkspaceFile {
+                workspace_id,
+                path,
+                expected_revision,
+                text: "lost update\n".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code, NodeFailureCode::RepositoryFileRevisionConflict);
+        assert_eq!(std::fs::read(root.join("src/lib.rs")).unwrap(), b"new\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_entry_create_requires_controller_and_never_overwrites() {
+        let root = temporary_workspace_root("workspace-entry-create-controller");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let workspace = WorkspaceConfig::new(workspace_id.clone(), &root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let path = RepositoryPath::utf8("src/new.rs".to_owned()).unwrap();
+        let request = NodeRequest::CreateWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        };
+        assert!(baseline_capabilities().unwrap().iter().any(|capability| {
+            capability.as_str() == NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY
+        }));
+        assert!(!request_uses_unnegotiated_capability(
+            &request,
+            &baseline_capabilities().unwrap(),
+        ));
+        assert!(request_uses_unnegotiated_capability(&request, &[]));
+        let observer = process_request_inner(&shared, 77, ClientRole::Observer, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(observer.code, NodeFailureCode::ObserverReadOnly);
+        let uncontrolled = process_request_inner(&shared, 77, ClientRole::Operator, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(uncontrolled.code, NodeFailureCode::ControllerRequired);
+        shared.acquire_controller(77, ClientRole::Operator, DEFAULT_CONTROLLER_LEASE_MS).unwrap();
+
+        let response = process_request_inner(&shared, 77, ClientRole::Operator, request.clone())
+            .await
+            .unwrap();
+        let NodeResponse::WorkspaceFileCreated { file } = response else {
+            panic!("workspace file create returned another response");
+        };
+        assert_eq!(file.workspace_id, workspace_id);
+        assert_eq!(file.path, path);
+        assert_eq!(file.revision, Some(workspace_file_revision(&[])));
+        assert_eq!(std::fs::read(root.join("src/new.rs")).unwrap(), Vec::<u8>::new());
+
+        let duplicate = process_request_inner(&shared, 77, ClientRole::Operator, request)
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code, NodeFailureCode::RepositoryEntryAlreadyExists);
+
+        let directory_path = RepositoryPath::utf8("src/nested".to_owned()).unwrap();
+        let response = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::CreateWorkspaceDirectory {
+                workspace_id: workspace_id.clone(),
+                path: directory_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response,
+            NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id: workspace_id.clone(),
+                entry: WorkspaceEntry {
+                    relative_path: directory_path,
+                    kind: WorkspaceEntryKind::Directory,
+                },
+            },
+        );
+        assert!(root.join("src/nested").is_dir());
+
+        let missing_parent = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::CreateWorkspaceFile {
+                workspace_id: workspace_id.clone(),
+                path: RepositoryPath::utf8("missing/new.rs".to_owned()).unwrap(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_parent.code, NodeFailureCode::RepositoryParentNotFound);
+        let non_directory_parent = process_request_inner(
+            &shared,
+            77,
+            ClientRole::Operator,
+            NodeRequest::CreateWorkspaceFile {
+                workspace_id,
+                path: RepositoryPath::utf8("src/new.rs/child".to_owned()).unwrap(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            non_directory_parent.code,
+            NodeFailureCode::RepositoryParentNotDirectory,
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_entry_create_timeout_cancels_before_commit_without_late_mutation() {
+        let root = temporary_workspace_root("workspace-entry-create-timeout-cancel");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        #[cfg(windows)]
+        let root = std::fs::canonicalize(root).unwrap();
+        let path = RepositoryPath::utf8("src/late.rs".to_owned()).unwrap();
+        let commit_state = Arc::new(AtomicU8::new(WORKSPACE_ENTRY_CREATE_PENDING));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let done = Arc::new(AtomicBool::new(false));
+        let task_commit_state = Arc::clone(&commit_state);
+        let task_barrier = Arc::clone(&barrier);
+        let task_done = Arc::clone(&done);
+        let task_root = root.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            task_barrier.wait();
+            let result = create_workspace_file_on_disk(
+                &task_root,
+                &path,
+                &task_commit_state,
+            );
+            task_done.store(true, Ordering::Release);
+            result
+        });
+
+        let error = settle_workspace_entry_create(
+            task,
+            Arc::clone(&commit_state),
+            Duration::from_millis(10),
+            "fixture deadline",
+            "fixture task failed",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, NodeFailureCode::RepositoryEntryCreateTimedOut);
+        assert_eq!(
+            commit_state.load(Ordering::Acquire),
+            WORKSPACE_ENTRY_CREATE_CANCELED,
+        );
+
+        barrier.wait();
+        timeout(Duration::from_secs(1), async {
+            while !done.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled blocking create did not settle");
+        assert!(!root.join("src/late.rs").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_history_filters_by_file_without_executing_repository_gpg_program() {
+        let root = temporary_workspace_root("git-history-gpg-program");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("README.md"), b"safe\n").unwrap();
+        run_git_fixture(&root, &["init", "--quiet"]).await;
+        run_git_fixture(&root, &["add", "--", "README.md"]).await;
+        run_git_fixture(
+            &root,
+            &["-c", "user.name=Gate4Agent", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "safe commit"],
+        )
+        .await;
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn separate() {}\n").unwrap();
+        run_git_fixture(&root, &["add", "--", "src/lib.rs"]).await;
+        run_git_fixture(
+            &root,
+            &["-c", "user.name=Gate4Agent", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "separate commit"],
+        )
+        .await;
+        let sentinel = root.join("gpg-program-ran");
+        let program = root.join("malicious-gpg.cmd");
+        std::fs::write(&program, format!("@echo off\r\necho ran>\"{}\"\r\n", sentinel.display())).unwrap();
+        run_git_fixture(
+            &root,
+            &["config", "gpg.program", program.to_str().unwrap()],
+        )
+        .await;
+
+        let path = RepositoryPath::utf8("README.md".to_owned()).unwrap();
+        let page = read_git_history_bounded(
+            root.to_str().unwrap(),
+            Some(&path),
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.commits.len(), 1);
+        assert_eq!(page.commits[0].subject, "safe commit");
+        assert_eq!(page.commits[0].signature_status, GitSignatureStatus::NoSignature);
+        assert!(!sentinel.exists(), "repository-controlled gpg.program executed");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn run_git_fixture(root: &Path, arguments: &[&str]) {

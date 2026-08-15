@@ -1,6 +1,6 @@
 use gate4agent_types::AdapterId;
 use serde_json::{Map, Value};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use thiserror::Error;
 
 pub const HISTORY_METADATA_MAX_BYTES: usize = 1_048_576;
@@ -8,6 +8,7 @@ pub const HISTORY_DOCUMENT_MAX_BYTES: usize = 8_388_608;
 pub const HISTORY_STORED_MESSAGES_MAX: usize = 256;
 pub const HISTORY_MESSAGE_MAX_CHARS: usize = 4_096;
 const HISTORY_TITLE_MAX_CHARS: usize = 96;
+const HISTORY_PROVIDER_MESSAGE_ID_MAX_BYTES: usize = 512;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HistoryDocument {
@@ -27,7 +28,9 @@ pub struct HistorySession {
     pub cwd: Option<String>,
     pub model: Option<String>,
     pub message_count: u64,
+    pub completed_turn_count: Option<u64>,
     pub total_tokens: u64,
+    pub total_tokens_observed: bool,
     pub messages: Vec<HistoryMessage>,
 }
 
@@ -181,6 +184,7 @@ fn validate_document(document: &HistoryDocument) -> Result<(), HistoryAdapterErr
 
 fn parse_claude(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
     let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
+    let mut completed_turn_ids = HashSet::new();
     let mut custom_title = None;
     let mut generated_title = None;
     let mut first_user_title = None;
@@ -206,35 +210,37 @@ fn parse_claude(document: &HistoryDocument) -> Result<HistorySession, HistoryAda
             }
             Some("user") => {
                 let message = record.get("message").and_then(Value::as_object);
+                let is_meta = record.get("isMeta").and_then(Value::as_bool) == Some(true);
                 let text = message
                     .and_then(|message| message.get("content"))
-                    .and_then(content_text);
-                if let Some(title) = text.clone().and_then(normalize_title) {
-                    if record.get("isMeta").and_then(Value::as_bool) == Some(true)
-                        || is_known_harness_injected_user_turn(&title)
-                    {
-                        meta_title = meta_title.or(Some(title));
-                    } else {
-                        first_user_title = first_user_title.or(Some(title));
-                    }
+                    .and_then(claude_visible_message_text);
+                let is_harness_injected = text
+                    .as_deref()
+                    .is_some_and(is_known_harness_injected_user_turn);
+                if !is_meta && !is_harness_injected {
+                    first_user_title = first_user_title
+                        .or_else(|| text.clone().and_then(normalize_title));
+                    session.push(HistoryRole::User, text);
                 }
-                session.push(HistoryRole::User, text);
             }
             Some("assistant") => {
                 let message = record.get("message").and_then(Value::as_object);
+                if let Some(message) = message {
+                    if let Some(message_id) = claude_completed_turn_message_id(&record, message) {
+                        completed_turn_ids.insert(message_id);
+                    }
+                }
                 session.model = message
                     .and_then(|message| string(message, &["model"]))
                     .or(session.model);
                 if let Some(usage) = message.and_then(|message| message.get("usage")) {
-                    session.total_tokens = session
-                        .total_tokens
-                        .saturating_add(claude_usage_total(usage));
+                    session.add_total_tokens(claude_usage_total(usage));
                 }
                 session.push(
                     HistoryRole::Assistant,
                     message
                         .and_then(|message| message.get("content"))
-                        .and_then(content_text),
+                        .and_then(claude_visible_message_text),
                 );
             }
             _ => {}
@@ -244,6 +250,7 @@ fn parse_claude(document: &HistoryDocument) -> Result<HistorySession, HistoryAda
         .or(generated_title)
         .or(first_user_title)
         .or(meta_title);
+    session.completed_turn_count = Some(completed_turn_ids.len() as u64);
     Ok(session.finish())
 }
 
@@ -306,6 +313,7 @@ fn parse_codex(document: &HistoryDocument) -> Result<HistorySession, HistoryAdap
                                 .and_then(normalize_codex_usage);
                             let last = info.get("last_token_usage").and_then(normalize_codex_usage);
                             if let Some(total) = total {
+                                session.total_tokens_observed = true;
                                 session.total_tokens = session.total_tokens.saturating_add(
                                     total.total_tokens.saturating_sub(
                                         previous_usage
@@ -315,6 +323,7 @@ fn parse_codex(document: &HistoryDocument) -> Result<HistorySession, HistoryAdap
                                 );
                                 previous_usage = Some(total);
                             } else if let Some(last) = last {
+                                session.total_tokens_observed = true;
                                 session.total_tokens =
                                     session.total_tokens.saturating_add(last.total_tokens);
                                 previous_usage = Some(previous_usage.unwrap_or_default().add(last));
@@ -384,7 +393,7 @@ fn consume_gemini_message(session: &mut SessionBuilder, record: &Map<String, Val
         Some("gemini") => {
             session.model = string(record, &["model"]).or(session.model.take());
             if let Some(tokens) = record.get("tokens") {
-                session.total_tokens = session.total_tokens.saturating_add(token_total(tokens));
+                session.add_total_tokens(token_total(tokens));
             }
             session.push(
                 HistoryRole::Assistant,
@@ -462,7 +471,7 @@ fn parse_kimi(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapt
             {
                 session.model = string(&record, &["model"]).or(session.model);
                 if let Some(usage) = record.get("usage").and_then(Value::as_object) {
-                    session.total_tokens = session.total_tokens.saturating_add(sum_named_numbers(
+                    session.add_total_tokens(sum_named_numbers(
                         usage,
                         &[
                             "inputOther",
@@ -553,9 +562,7 @@ fn parse_qwen(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapt
             {
                 session.model = string(&record, &["model"]).or(session.model);
                 if let Some(usage) = record.get("usageMetadata") {
-                    session.total_tokens = session
-                        .total_tokens
-                        .saturating_add(qwen_usage_total(usage));
+                    session.add_total_tokens(qwen_usage_total(usage));
                 }
                 session.push(HistoryRole::Assistant, qwen_message_text(&record));
             }
@@ -614,13 +621,9 @@ fn parse_copilot(document: &HistoryDocument) -> Result<HistorySession, HistoryAd
                     .and_then(|value| string(value, &["currentModel"]))
                     .or(session.model);
                 if let Some(data) = data {
-                    session.total_tokens = session
-                        .total_tokens
-                        .saturating_add(u64_value(data, &["currentTokens"]).unwrap_or(0));
+                    session.add_total_tokens(u64_value(data, &["currentTokens"]));
                     if let Some(metrics) = data.get("modelMetrics") {
-                        session.total_tokens = session
-                            .total_tokens
-                            .saturating_add(copilot_model_metrics_total(metrics));
+                        session.add_total_tokens(copilot_model_metrics_total(metrics));
                     }
                 }
             }
@@ -667,7 +670,7 @@ fn parse_droid(document: &HistoryDocument) -> Result<HistorySession, HistoryAdap
             Some("completion") => {
                 session.push(HistoryRole::Assistant, string(&record, &["finalText"]));
                 if let Some(usage) = record.get("usage") {
-                    session.total_tokens = session.total_tokens.saturating_add(token_total(usage));
+                    session.add_total_tokens(token_total(usage));
                 }
             }
             _ => {}
@@ -706,7 +709,7 @@ fn parse_opencode(document: &HistoryDocument) -> Result<HistorySession, HistoryA
     session.title = string(&metadata, &["title"]).and_then(normalize_title);
     session.cwd = string(&metadata, &["directory"]);
     session.model = opencode_model(&metadata);
-    session.total_tokens = sum_named_numbers(
+    session.replace_total_tokens(sum_named_numbers(
         &metadata,
         &[
             "tokens_input",
@@ -714,7 +717,7 @@ fn parse_opencode(document: &HistoryDocument) -> Result<HistorySession, HistoryA
             "tokens_reasoning",
             "tokens_cache_read",
         ],
-    );
+    ));
     let declared_count = u64_value(&metadata, &["message_count"]);
 
     for record in ndjson_records(&document.transcript) {
@@ -745,7 +748,7 @@ fn parse_opencode(document: &HistoryDocument) -> Result<HistorySession, HistoryA
         session.push(role, text);
         session.model = opencode_model(&record).or(session.model);
         if let Some(tokens) = record.get("tokens") {
-            session.total_tokens = session.total_tokens.saturating_add(token_total(tokens));
+            session.add_total_tokens(token_total(tokens));
         }
     }
     if let Some(declared_count) = declared_count {
@@ -854,8 +857,7 @@ fn parse_message_graph(document: &HistoryDocument) -> Result<HistorySession, His
                 if role == HistoryRole::Assistant {
                     session.model = string(message, &["model"]).or(session.model);
                     if let Some(usage) = message.get("usage") {
-                        session.total_tokens =
-                            session.total_tokens.saturating_add(token_total(usage));
+                        session.add_total_tokens(token_total(usage));
                     }
                 }
                 session.push(role, message.get("content").and_then(content_text));
@@ -890,9 +892,7 @@ fn parse_devin(document: &HistoryDocument) -> Result<HistorySession, HistoryAdap
                 .and_then(|metadata| string(metadata, &["generation_model"]))
                 .or_else(|| metrics.and_then(|metrics| string(metrics, &["generation_model"])))
                 .or(session.model);
-            session.total_tokens = session
-                .total_tokens
-                .saturating_add(devin_step_token_total(metadata, metrics));
+            session.add_total_tokens(devin_step_token_total(metadata, metrics));
             let is_user = metadata
                 .and_then(|metadata| metadata.get("is_user_input"))
                 .and_then(Value::as_bool)
@@ -928,7 +928,9 @@ struct SessionBuilder {
     cwd: Option<String>,
     model: Option<String>,
     message_count: u64,
+    completed_turn_count: Option<u64>,
     total_tokens: u64,
+    total_tokens_observed: bool,
     messages: VecDeque<HistoryMessage>,
 }
 
@@ -940,9 +942,23 @@ impl SessionBuilder {
             cwd: None,
             model: None,
             message_count: 0,
+            completed_turn_count: None,
             total_tokens: 0,
+            total_tokens_observed: false,
             messages: VecDeque::new(),
         }
+    }
+
+    fn add_total_tokens(&mut self, observed: Option<u64>) {
+        let Some(total) = observed else { return; };
+        self.total_tokens_observed = true;
+        self.total_tokens = self.total_tokens.saturating_add(total);
+    }
+
+    fn replace_total_tokens(&mut self, observed: Option<u64>) {
+        let Some(total) = observed else { return; };
+        self.total_tokens_observed = true;
+        self.total_tokens = total;
     }
 
     fn push(&mut self, role: HistoryRole, text: Option<String>) {
@@ -966,7 +982,9 @@ impl SessionBuilder {
             cwd: self.cwd,
             model: self.model,
             message_count: self.message_count,
+            completed_turn_count: self.completed_turn_count,
             total_tokens: self.total_tokens,
+            total_tokens_observed: self.total_tokens_observed,
             messages: self.messages.into_iter().collect(),
         }
     }
@@ -1058,15 +1076,22 @@ fn u64_value(record: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
     })
 }
 
-fn sum_named_numbers(record: &Map<String, Value>, keys: &[&str]) -> u64 {
-    keys.iter()
-        .filter_map(|key| u64_value(record, &[*key]))
-        .fold(0, u64::saturating_add)
+fn sum_named_numbers(record: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    let mut observed = false;
+    let total = keys
+        .iter()
+        .filter_map(|key| {
+            let value = u64_value(record, &[*key]);
+            observed |= value.is_some();
+            value
+        })
+        .fold(0, u64::saturating_add);
+    observed.then_some(total)
 }
 
-fn claude_usage_total(value: &Value) -> u64 {
+fn claude_usage_total(value: &Value) -> Option<u64> {
     let Some(usage) = value.as_object() else {
-        return 0;
+        return None;
     };
     sum_named_numbers(
         usage,
@@ -1079,6 +1104,43 @@ fn claude_usage_total(value: &Value) -> u64 {
     )
 }
 
+fn claude_completed_turn_message_id(
+    record: &Map<String, Value>,
+    message: &Map<String, Value>,
+) -> Option<String> {
+    if record.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || message.get("stop_reason").and_then(Value::as_str) != Some("end_turn")
+    {
+        return None;
+    }
+    let message_id = message.get("id")?.as_str()?.trim();
+    if message_id.is_empty()
+        || message_id.len() > HISTORY_PROVIDER_MESSAGE_ID_MAX_BYTES
+        || !message_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    let has_visible_text = message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|block| {
+                let Some(block) = block.as_object() else {
+                    return false;
+                };
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .and_then(|text| normalize_message(text.to_owned()))
+                        .is_some()
+            })
+        });
+    has_visible_text.then(|| message_id.to_owned())
+}
+
 fn copilot_trusted_folder(message: String) -> Option<String> {
     message
         .strip_prefix("Folder ")
@@ -1088,15 +1150,21 @@ fn copilot_trusted_folder(message: String) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn copilot_model_metrics_total(value: &Value) -> u64 {
-    value
+fn copilot_model_metrics_total(value: &Value) -> Option<u64> {
+    let mut observed = false;
+    let total = value
         .as_object()
         .into_iter()
         .flat_map(|metrics| metrics.values())
         .filter_map(Value::as_object)
         .filter_map(|metric| metric.get("usage"))
-        .map(token_total)
-        .fold(0, u64::saturating_add)
+        .filter_map(|usage| {
+            let total = token_total(usage);
+            observed |= total.is_some();
+            total
+        })
+        .fold(0, u64::saturating_add);
+    observed.then_some(total)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1118,6 +1186,9 @@ impl CodexUsage {
 
 fn normalize_codex_usage(value: &Value) -> Option<CodexUsage> {
     let usage = value.as_object()?;
+    if u64_value(usage, &["input_tokens", "output_tokens", "total_tokens"]).is_none() {
+        return None;
+    }
     let input_tokens = u64_value(usage, &["input_tokens"]).unwrap_or(0);
     let output_tokens = u64_value(usage, &["output_tokens"]).unwrap_or(0);
     Some(CodexUsage {
@@ -1214,14 +1285,13 @@ fn extract_antigravity_user_request(content: String) -> Option<String> {
     normalize_message(content[body_start..body_end].to_owned())
 }
 
-fn token_total(value: &Value) -> u64 {
+fn token_total(value: &Value) -> Option<u64> {
     let Some(usage) = value.as_object() else {
-        return 0;
+        return None;
     };
-    if let Some(total) =
-        u64_value(usage, &["total", "totalTokens", "total_tokens"]).filter(|total| *total > 0)
+    if let Some(total) = u64_value(usage, &["total", "totalTokens", "total_tokens"])
     {
-        return total;
+        return Some(total);
     }
     sum_named_numbers(
         usage,
@@ -1296,8 +1366,9 @@ fn rovo_parts_text(value: Option<&Value>, role: HistoryRole) -> Option<String> {
 fn devin_step_token_total(
     metadata: Option<&Map<String, Value>>,
     metrics: Option<&Map<String, Value>>,
-) -> u64 {
-    [
+) -> Option<u64> {
+    let mut observed = false;
+    let total = [
         &["total_input_tokens", "input_tokens"][..],
         &["output_tokens"][..],
         &["cache_read_tokens", "cache_read_input_tokens"][..],
@@ -1308,10 +1379,12 @@ fn devin_step_token_total(
         [metadata, metrics]
             .into_iter()
             .flatten()
-            .find_map(|source| u64_value(source, keys).filter(|value| *value > 0))
+            .find_map(|source| u64_value(source, keys))
+            .inspect(|_| observed = true)
             .unwrap_or(0)
     })
-    .fold(0, u64::saturating_add)
+    .fold(0, u64::saturating_add);
+    observed.then_some(total)
 }
 
 fn grok_content_text(value: &Value) -> Option<String> {
@@ -1382,19 +1455,35 @@ fn qwen_message_text(record: &Map<String, Value>) -> Option<String> {
     normalize_message(text)
 }
 
-fn qwen_usage_total(value: &Value) -> u64 {
+fn qwen_usage_total(value: &Value) -> Option<u64> {
     let Some(usage) = value.as_object() else {
-        return 0;
+        return None;
     };
     u64_value(usage, &["totalTokenCount"])
-        .filter(|total| *total > 0)
-        .unwrap_or_else(|| {
+        .or_else(|| {
             sum_named_numbers(usage, &["promptTokenCount", "candidatesTokenCount"])
         })
 }
 
 fn content_text(value: &Value) -> Option<String> {
     content_text_at_depth(value, 0).and_then(normalize_message)
+}
+
+fn claude_visible_message_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => normalize_message(text.clone()),
+        Value::Array(parts) => {
+            let visible = parts
+                .iter()
+                .filter_map(Value::as_object)
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            normalize_message(visible)
+        }
+        _ => None,
+    }
 }
 
 fn content_text_at_depth(value: &Value, depth: usize) -> Option<String> {
@@ -1564,7 +1653,149 @@ mod tests {
         assert_eq!(session.cwd.as_deref(), Some("/repo"));
         assert_eq!(session.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(session.total_tokens, 14);
-        assert_eq!(session.message_count, 3);
+        assert!(session.total_tokens_observed);
+        assert_eq!(session.message_count, 2);
+        assert_eq!(session.completed_turn_count, Some(0));
+    }
+
+    #[test]
+    fn history_metrics_distinguish_unknown_token_total_from_zero() {
+        let without_usage = parse_history(
+            &id("claude-code"),
+            &HistoryDocument {
+                session_id_hint: "without-usage".to_owned(),
+                metadata_json: None,
+                transcript: r#"{"type":"assistant","message":{"content":"done"}}"#.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(without_usage.total_tokens, 0);
+        assert!(!without_usage.total_tokens_observed);
+
+        let observed_zero = parse_history(
+            &id("claude-code"),
+            &HistoryDocument {
+                session_id_hint: "observed-zero".to_owned(),
+                metadata_json: None,
+                transcript: r#"{"type":"assistant","message":{"content":"done","usage":{"input_tokens":0,"output_tokens":0}}}"#.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(observed_zero.total_tokens, 0);
+        assert!(observed_zero.total_tokens_observed);
+    }
+
+    #[test]
+    fn claude_history_excludes_tool_results_tools_and_thinking_from_messages() {
+        let transcript = [
+            r#"{"type":"user","sessionId":"claude-visible","cwd":"/repo","isMeta":true,"message":{"content":"META_TEXT_SENTINEL"}}"#,
+            r#"{"type":"user","sessionId":"claude-visible","cwd":"/repo","message":{"content":[{"type":"tool_result","content":"TOOL_OUTPUT_SENTINEL"},{"type":"text","text":"visible question"}]}}"#,
+            r#"{"type":"assistant","sessionId":"claude-visible","message":{"content":[{"type":"thinking","thinking":"THINKING_SENTINEL"},{"type":"tool_use","name":"read","input":{"path":"TOOL_INPUT_SENTINEL"}},{"type":"text","text":"visible answer"}]}}"#,
+        ]
+        .join("\n");
+        let session = parse_history(
+            &id("claude-code"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].text, "visible question");
+        assert_eq!(session.messages[1].text, "visible answer");
+        let projected = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for sentinel in [
+            "TOOL_OUTPUT_SENTINEL",
+            "THINKING_SENTINEL",
+            "TOOL_INPUT_SENTINEL",
+            "META_TEXT_SENTINEL",
+        ] {
+            assert!(!projected.contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn claude_history_excludes_meta_and_harness_user_turns_from_title_and_messages() {
+        let transcript = [
+            r#"{"type":"user","sessionId":"claude-private","cwd":"/repo","isMeta":true,"message":{"content":"META_TITLE_SENTINEL"}}"#,
+            r#"{"type":"user","sessionId":"claude-private","message":{"content":"This session is being continued from a previous conversation HARNESS_TITLE_SENTINEL"}}"#,
+            r#"{"type":"assistant","sessionId":"claude-private","message":{"content":[{"type":"text","text":"visible answer"}]}}"#,
+        ]
+        .join("\n");
+        let session = parse_history(
+            &id("claude-code"),
+            &HistoryDocument {
+                session_id_hint: "fallback".to_owned(),
+                metadata_json: None,
+                transcript,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(session.title, None);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].text, "visible answer");
+        let projected = format!(
+            "{} {}",
+            session.title.as_deref().unwrap_or_default(),
+            session
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for sentinel in ["META_TITLE_SENTINEL", "HARNESS_TITLE_SENTINEL"] {
+            assert!(!projected.contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn claude_completed_turn_count_requires_distinct_valid_end_turn_text_messages() {
+        let oversized_id_record = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": "x".repeat(HISTORY_PROVIDER_MESSAGE_ID_MAX_BYTES + 1),
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "oversized id"}],
+            },
+        })
+        .to_string();
+        let transcript = [[
+            r#"{"type":"assistant","message":{"id":"msg-1","stop_reason":"end_turn","content":[{"type":"text","text":"first answer"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg-1","stop_reason":"end_turn","content":[{"type":"text","text":"duplicate answer"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_2","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"private"},{"type":"tool_use","id":"tool-1","name":"read"},{"type":"text","text":"second answer"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg-tool","stop_reason":"end_turn","content":[{"type":"tool_use","id":"tool-2","name":"write"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg-thinking","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"private"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg-hidden","stop_reason":"end_turn","content":[{"type":"text","text":"<system-reminder>internal</system-reminder>"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg-not-finished","stop_reason":"tool_use","content":[{"type":"text","text":"not finished"}]}}"#,
+            r#"{"type":"user","message":{"id":"msg-user","stop_reason":"end_turn","content":[{"type":"text","text":"user text"}]}}"#,
+            r#"{"type":"assistant","isMeta":true,"message":{"id":"msg-meta","stop_reason":"end_turn","content":[{"type":"text","text":"metadata"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"bad/id","stop_reason":"end_turn","content":[{"type":"text","text":"invalid id"}]}}"#,
+            r#"{"type":"assistant","message":{"id":42,"stop_reason":"end_turn","content":[{"type":"text","text":"non-string id"}]}}"#,
+        ]
+        .join("\n"), oversized_id_record]
+        .join("\n");
+
+        let session = parse_history(
+            &id("claude-code"),
+            &HistoryDocument {
+                session_id_hint: "claude-completed-turns".to_owned(),
+                metadata_json: None,
+                transcript,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(session.completed_turn_count, Some(2));
     }
 
     #[test]
@@ -1594,6 +1825,7 @@ mod tests {
         assert_eq!(session.model.as_deref(), Some("gpt-5"));
         assert_eq!(session.total_tokens, 15);
         assert_eq!(session.message_count, 3);
+        assert_eq!(session.completed_turn_count, None);
 
         let worker = parse_history(
             &id("codex"),

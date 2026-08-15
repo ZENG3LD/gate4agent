@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
 const BUNDLE_ID: &str = "review-tools";
+const SPAWN_PROFILE_REVISION: &str = "codex-bundle-r1";
 const BUNDLE_REVISION: &str = "review-tools-r1";
 const BUNDLE_DIGEST: &str =
     "sha256:7667f0d83d5a8cfa0f9ad232f22669a1b122c6253cf1ae8fe5171ae1f8df752d";
@@ -257,7 +258,7 @@ fn node_config(
         .unwrap();
     let profiles = SpawnProfileRegistry::new([SpawnProfileDefaults {
         profile_id: spawn_profile_id.clone(),
-        revision: SpawnProfileRevision::new("codex-bundle-r1").unwrap(),
+        revision: SpawnProfileRevision::new(SPAWN_PROFILE_REVISION).unwrap(),
         provider: agent("codex"),
         mode: SessionMode::Pty,
         terminal_size: TerminalSize {
@@ -298,6 +299,8 @@ fn spawn_request(
                 worktree_id: None,
             },
             profile_id: spawn_profile_id.clone(),
+            expected_profile_revision:
+                SpawnProfileRevision::new(SPAWN_PROFILE_REVISION).unwrap(),
             overrides: SpawnOverrides {
                 provider: SpawnOverride::Inherit,
                 mode: SpawnOverride::Inherit,

@@ -31,6 +31,8 @@ fn snapshot() -> NodeSnapshot {
         provider_runtime_statuses: ProviderRuntimeStatuses::default(),
         workspaces: Vec::new(),
         session_records: Vec::new(),
+        managed_worktrees: Vec::new(),
+        launch_inventory: None,
     }
 }
 

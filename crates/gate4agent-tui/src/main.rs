@@ -1,11 +1,12 @@
-use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::str::FromStr;
 
-use gate4agent_node_protocol::{NodeId, WorkspaceId};
-use gate4agent_tui::{C2Endpoint, NodeEndpoint, Provider, PtyColorMode, RunOptions, StartupRequest};
+use gate4agent_harness_client::HarnessOperatorCredential;
+use gate4agent_harness_protocol::HarnessSelectorV1;
+use gate4agent_tui::{HarnessOperatorEndpoint, PtyColorMode, RunOptions, StartupMode};
 
-const TOKEN_ENV_PREFIX: &str = "GATE4AGENT_NODE_TOKEN_";
-const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
+const HARNESS_OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
+const HARNESS_LAUNCH_PLAN_ID_ENV: &str = "GATE4AGENT_HARNESS_LAUNCH_PLAN_ID";
 
 fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
     *index += 1;
@@ -14,73 +15,31 @@ fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, Strin
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
-fn token_env_name(node_id: &NodeId) -> String {
-    format!(
-        "{TOKEN_ENV_PREFIX}{}",
-        node_id.as_str().to_ascii_uppercase().replace('-', "_")
-    )
-}
-
-fn parse_node(value: &str) -> Result<(NodeId, String), String> {
-    let (node_id, endpoint) = value
-        .split_once('=')
-        .ok_or_else(|| "--node must be NODE_ID=PIPE".to_owned())?;
-    let node_id = NodeId::new(node_id).map_err(|error| error.to_string())?;
-    if endpoint.is_empty() {
-        return Err("--node pipe endpoint cannot be empty".to_owned());
-    }
-    Ok((node_id, endpoint.to_owned()))
-}
-
 fn parse_args_from(
     args: &[String],
     mut read_secret: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<RunOptions, String> {
-    let mut node_specs = Vec::new();
-    let mut c2_control = None;
-    let mut startup_node = None;
-    let mut workspace = None;
-    let mut provider = None;
+    let mut harness_operator = None;
     let mut color_mode_override = None;
     let mut index = 1;
 
     while index < args.len() {
         match args[index].as_str() {
-            "--node" => node_specs.push(parse_node(&value(args, &mut index, "--node")?)?),
-            "--c2-control" => {
-                if c2_control.is_some() {
-                    return Err("--c2-control can be specified only once".to_owned());
+            "--harness-operator" => {
+                if harness_operator.is_some() {
+                    return Err("--harness-operator can be specified only once".to_owned());
                 }
-                c2_control = Some(value(args, &mut index, "--c2-control")?);
-            }
-            "--startup-node" => {
-                startup_node = Some(
-                    NodeId::new(value(args, &mut index, "--startup-node")?)
-                        .map_err(|error| error.to_string())?,
-                )
-            }
-            "--workspace" => {
-                workspace = Some(
-                    WorkspaceId::new(value(args, &mut index, "--workspace")?)
-                        .map_err(|error| error.to_string())?,
-                )
-            }
-            "--agent" => {
-                provider = Some(
-                    Provider::from_str(&value(args, &mut index, "--agent")?)
-                        .map_err(|error| error.to_string())?,
-                )
+                let endpoint = value(args, &mut index, "--harness-operator")?;
+                harness_operator = Some(parse_harness_operator_endpoint(&endpoint)?);
             }
             "--style" => {
                 color_mode_override = Some(PtyColorMode::from_str(&value(args, &mut index, "--style")?)?)
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: gate4agent-tui (--node NODE_ID=PIPE [--node NODE_ID=PIPE ...] | --c2-control PIPE)\n\
-                     token env: GATE4AGENT_NODE_TOKEN_<NORMALIZED_NODE_ID>\n\
-                     C2 token env: GATE4AGENT_C2_TOKEN\n\
-                     optional startup: --startup-node NODE_ID --workspace WORKSPACE_ID \
-                     --agent PROVIDER_ID [--style inherit|gate]"
+                    "usage: gate4agent-tui --harness-operator LOOPBACK_SOCKET [--style inherit|gate]\n\
+                     credential env: GATE4AGENT_HARNESS_OPERATOR_TOKEN\n\
+                     optional selector env: GATE4AGENT_HARNESS_LAUNCH_PLAN_ID"
                         .to_owned(),
                 )
             }
@@ -88,65 +47,48 @@ fn parse_args_from(
         }
         index += 1;
     }
-    if node_specs.is_empty() == c2_control.is_none() {
-        return Err("configure exactly one --node set or one --c2-control PIPE".to_owned());
-    }
-    let mut unique = BTreeSet::new();
-    let mut nodes = Vec::new();
-    for (node_id, endpoint) in node_specs {
-        if !unique.insert(node_id.clone()) {
-            return Err(format!("duplicate --node for {node_id}"));
-        }
-        let token_env = token_env_name(&node_id);
-        let token = read_secret(&token_env)?;
-        if token.is_empty() {
-            return Err(format!("{token_env} must not be empty"));
-        }
-        nodes.push(NodeEndpoint {
-            expected_node_id: node_id,
+    let endpoint = harness_operator
+        .ok_or_else(|| "configure --harness-operator LOOPBACK_SOCKET".to_owned())?;
+    let token = read_secret(HARNESS_OPERATOR_TOKEN_ENV)?;
+    let credential = HarnessOperatorCredential::parse(token)
+        .map_err(|_| format!("{HARNESS_OPERATOR_TOKEN_ENV} is malformed"))?;
+    Ok(RunOptions {
+        mode: StartupMode::Harness(HarnessOperatorEndpoint {
             endpoint,
-            token,
-        });
-    }
-    let c2 = if let Some(endpoint) = c2_control {
-        let token = read_secret(C2_TOKEN_ENV)?;
-        if token.is_empty() {
-            return Err(format!("{C2_TOKEN_ENV} must not be empty"));
-        }
-        Some(C2Endpoint { endpoint, token })
-    } else {
-        None
-    };
+            credential,
+            launch_plan_id: None,
+        }),
+        startup: None,
+        color_mode_override,
+    })
+}
 
-    let startup_requested = startup_node.is_some() || workspace.is_some() || provider.is_some();
-    let startup = if startup_requested {
-        let node_id = startup_node
-            .ok_or_else(|| "startup requires --startup-node".to_owned())?;
-        let workspace_id = workspace
-            .ok_or_else(|| "startup requires --workspace".to_owned())?;
-        let provider = provider.ok_or_else(|| "startup requires --agent".to_owned())?;
-        if c2.is_none() && !nodes.iter().any(|node| node.expected_node_id == node_id) {
-            return Err(format!("startup node {node_id} is not configured by --node"));
-        }
-        Some(StartupRequest {
-            node_id,
-            workspace_id,
-            provider,
-        })
-    } else {
-        None
-    };
-    Ok(RunOptions { nodes, c2, startup, color_mode_override })
+fn parse_harness_operator_endpoint(value: &str) -> Result<SocketAddr, String> {
+    let endpoint = value.parse::<SocketAddr>()
+        .map_err(|_| "--harness-operator must be an IP socket address".to_owned())?;
+    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+        return Err("--harness-operator must be a concrete loopback socket address".to_owned());
+    }
+    Ok(endpoint)
 }
 
 fn parse_args() -> Result<RunOptions, String> {
     let args = std::env::args().collect::<Vec<_>>();
-    parse_args_from(&args, |name| {
+    let mut options = parse_args_from(&args, |name| {
         let value = std::env::var(name)
             .map_err(|_| format!("{name} is required and must be valid Unicode"))?;
         std::env::remove_var(name);
         Ok(value)
-    })
+    })?;
+    let launch_plan_id = std::env::var(HARNESS_LAUNCH_PLAN_ID_ENV).ok()
+        .map(HarnessSelectorV1::new)
+        .transpose()
+        .map_err(|_| format!("{HARNESS_LAUNCH_PLAN_ID_ENV} is malformed"))?;
+    let StartupMode::Harness(operator) = &mut options.mode else {
+        unreachable!("the primary TUI parser only constructs Harness mode")
+    };
+    operator.launch_plan_id = launch_plan_id;
+    Ok(options)
 }
 
 #[tokio::main]
@@ -185,116 +127,48 @@ mod tests {
     }
 
     #[test]
-    fn repeated_nodes_use_separate_normalized_token_environments() {
+    fn harness_endpoint_is_required_before_secret_access() {
+        let args = vec!["gate4agent-tui".to_owned()];
+        let mut requested_secrets = Vec::new();
+        let error = parse_args_from(&args, |name| {
+            requested_secrets.push(name.to_owned());
+            Err("unexpected secret read".to_owned())
+        }).err().unwrap();
+        assert_eq!(error, "configure --harness-operator LOOPBACK_SOCKET");
+        assert!(requested_secrets.is_empty());
+    }
+
+    #[test]
+    fn harness_mode_is_authenticated_and_loopback_only() {
+        let non_loopback = parse_harness_operator_endpoint("192.0.2.1:18080")
+            .err().unwrap();
+        assert_eq!(
+            non_loopback,
+            "--harness-operator must be a concrete loopback socket address",
+        );
+        let token = format!("g4aho_{}", "0".repeat(64));
         let options = parse(
             &[
                 "gate4agent-tui",
-                "--node",
-                r"desk-a=\\.\pipe\desk-a",
-                "--node",
-                r"lab_2=\\.\pipe\lab-2",
-            ],
-            &[
-                ("GATE4AGENT_NODE_TOKEN_DESK_A", "desk-token"),
-                ("GATE4AGENT_NODE_TOKEN_LAB_2", "lab-token"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(options.nodes.len(), 2);
-        assert_eq!(options.nodes[0].expected_node_id.as_str(), "desk-a");
-        assert_eq!(options.nodes[1].token, "lab-token");
-    }
-
-    #[test]
-    fn startup_requires_explicit_configured_node_and_workspace() {
-        let error = parse(
-            &[
-                "gate4agent-tui",
-                "--node",
-                r"desk-a=\\.\pipe\desk-a",
-                "--agent",
-                "codex",
-            ],
-            &[("GATE4AGENT_NODE_TOKEN_DESK_A", "token")],
-        )
-        .err()
-        .unwrap();
-        assert_eq!(error, "startup requires --startup-node");
-    }
-
-    #[test]
-    fn cwd_is_not_a_supported_tui_argument() {
-        let error = parse(
-            &[
-                "gate4agent-tui",
-                "--node",
-                r"desk-a=\\.\pipe\desk-a",
-                "--cwd",
-                r"C:\work",
-            ],
-            &[("GATE4AGENT_NODE_TOKEN_DESK_A", "token")],
-        )
-        .err()
-        .unwrap();
-        assert_eq!(error, "unknown argument: --cwd");
-    }
-
-    #[test]
-    fn style_is_explicit_and_defaults_to_terminal_inheritance() {
-        let inherited = parse(
-            &["gate4agent-tui", "--node", r"desk-a=\\.\pipe\desk-a"],
-            &[("GATE4AGENT_NODE_TOKEN_DESK_A", "token")],
-        )
-        .unwrap();
-        assert_eq!(inherited.color_mode_override, None);
-        let gate = parse(
-            &[
-                "gate4agent-tui",
-                "--node",
-                r"desk-a=\\.\pipe\desk-a",
+                "--harness-operator",
+                "127.0.0.1:18080",
                 "--style",
                 "gate",
             ],
-            &[("GATE4AGENT_NODE_TOKEN_DESK_A", "token")],
-        )
-        .unwrap();
-        assert_eq!(gate.color_mode_override, Some(PtyColorMode::GateOverride));
+            &[(HARNESS_OPERATOR_TOKEN_ENV, token.as_str())],
+        ).unwrap();
+        let StartupMode::Harness(endpoint) = options.mode else { panic!("Harness mode") };
+        assert_eq!(endpoint.endpoint, "127.0.0.1:18080".parse().unwrap());
+        assert!(options.startup.is_none());
+        assert_eq!(options.color_mode_override, Some(PtyColorMode::GateOverride));
     }
 
     #[test]
-    fn c2_control_is_authenticated_and_mutually_exclusive_with_direct_nodes() {
-        let c2 = parse(
-            &[
-                "gate4agent-tui",
-                "--c2-control",
-                r"\\.\pipe\gate4agent-c2",
-                "--startup-node",
-                "desk-a",
-                "--workspace",
-                "nemo",
-                "--agent",
-                "claude",
-            ],
-            &[("GATE4AGENT_C2_TOKEN", "c2-token")],
-        )
-        .unwrap();
-        assert!(c2.nodes.is_empty());
-        assert_eq!(c2.c2.as_ref().unwrap().endpoint, r"\\.\pipe\gate4agent-c2");
-        assert_eq!(c2.startup.as_ref().unwrap().node_id.as_str(), "desk-a");
-
-        let mixed = parse(
-            &[
-                "gate4agent-tui",
-                "--node",
-                r"desk-a=\\.\pipe\desk-a",
-                "--c2-control",
-                r"\\.\pipe\gate4agent-c2",
-            ],
-            &[],
-        )
-        .err()
-        .unwrap();
-        assert_eq!(mixed, "configure exactly one --node set or one --c2-control PIPE");
+    fn manual_c2_and_startup_arguments_are_not_accepted() {
+        for argument in ["--node", "--c2-control", "--startup-node", "--workspace", "--agent"] {
+            let error = parse(&["gate4agent-tui", argument, "value"], &[])
+                .err().unwrap();
+            assert_eq!(error, format!("unknown argument: {argument}"));
+        }
     }
-
 }

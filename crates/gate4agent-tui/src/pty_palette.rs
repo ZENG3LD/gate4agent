@@ -54,6 +54,14 @@ fn gate_foreground(color: Color) -> Color {
         Color::Magenta => ANSI[5],
         Color::Cyan => ANSI[6],
         Color::White => ANSI[7],
+        Color::Gray => ANSI[7],
+        Color::DarkGray => ANSI[8],
+        Color::LightRed => ANSI[9],
+        Color::LightGreen => ANSI[10],
+        Color::LightYellow => ANSI[11],
+        Color::LightBlue => ANSI[12],
+        Color::LightMagenta => ANSI[13],
+        Color::LightCyan => ANSI[14],
         Color::Indexed(index @ 0..=15) => ANSI[index as usize],
         Color::Indexed(index) => nearest_swatch(indexed_rgb(index)),
         Color::Rgb(red, green, blue) => nearest_swatch((red, green, blue)),
@@ -139,6 +147,14 @@ mod tests {
     #[test]
     fn override_maps_ansi_indexed_and_rgb_to_fixed_swatches() {
         assert_eq!(gate_foreground(Color::Red), ANSI[1]);
+        assert_eq!(gate_foreground(Color::Gray), ANSI[7]);
+        assert_eq!(gate_foreground(Color::DarkGray), ANSI[8]);
+        assert_eq!(gate_foreground(Color::LightRed), ANSI[9]);
+        assert_eq!(gate_foreground(Color::LightGreen), ANSI[10]);
+        assert_eq!(gate_foreground(Color::LightYellow), ANSI[11]);
+        assert_eq!(gate_foreground(Color::LightBlue), ANSI[12]);
+        assert_eq!(gate_foreground(Color::LightMagenta), ANSI[13]);
+        assert_eq!(gate_foreground(Color::LightCyan), ANSI[14]);
         assert_eq!(gate_foreground(Color::Indexed(12)), ANSI[12]);
         assert_eq!(gate_foreground(Color::Rgb(137, 180, 250)), ANSI[4]);
         assert_eq!(gate_foreground(Color::Indexed(196)), ANSI[1]);

@@ -5,8 +5,12 @@ mod vendor_contract;
 
 pub use launch_profiles::{
     NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver, NativeLaunchProfile,
-    NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay, NativeLaunchProfileControl,
+    NativeHarnessMcpLaunchOverlay, NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay,
+    NativeLaunchProfileControl,
     NativeLaunchProfileDescriptor, NativeLaunchProfileError, NativeLaunchProfileId,
+    HARNESS_MCP_PROGRAM_ENV, HARNESS_MCP_SESSION_ENDPOINT_ENV,
+    HARNESS_MCP_SESSION_TOKEN_ENV, LEGACY_HARNESS_READ_CREDENTIAL_ENV,
+    LEGACY_HARNESS_READ_ENDPOINT_ENV,
     ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
     ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
     ZAI_GLM_CLAUDE_PROFILE_REVISION, ZAI_GLM_CLAUDE_REQUIRED_ENV_KEYS,
@@ -21,7 +25,7 @@ pub use vendor_contract::{
     CLAUDE_WINDOWS_X86_64_2_1_224_CONTRACT_ID,
 };
 
-use gate4agent_catalog::{AgentRegistry, EnvMutation};
+use gate4agent_catalog::{builtin_registry, AgentRegistry, EnvMutation};
 use gate4agent_handle::{
     bounded_control_plane, ControlPlaneKernelPort, Gate4AgentHandle,
     ProviderRuntimeError, PublishReport, ToolAuthorityHandle,
@@ -31,11 +35,12 @@ use gate4agent_provider_ports::{
     discover_history, load_history_session, prepare_resume, HistoryCandidate,
     HistoryDiscoveryRequest, HistoryLoadRequest, PreparedResume, ResumeAuthority,
     ResumeAuthorityDecision, ResumeOutcome, ResumeRequest,
+    HISTORY_DISCOVERY_LIMIT_MAX as PROVIDER_HISTORY_DISCOVERY_LIMIT_MAX,
 };
 use gate4agent_shell_capabilities::NativeCapabilityProbeAuthority;
 use gate4agent_shell_history::NativeHistoryAuthority;
-pub use gate4agent_shell_history::{NativeHistoryConfig, NativeHistoryRoot};
-pub use gate4agent_adapters::HistorySourceLayout;
+pub use gate4agent_shell_history::{orca_home_roots, NativeHistoryConfig, NativeHistoryRoot};
+pub use gate4agent_adapters::{HistorySourceLayout, OneShotSessionPersistence};
 pub use gate4agent_shell_hooks::{HookIngressConfig, HookIngressEndpoint};
 use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
 pub use gate4agent_shell_native::{
@@ -45,7 +50,7 @@ pub use gate4agent_shell_native::{
     ProviderSupervisorFaultKind, ProviderSupervisorSnapshot, ProviderSupervisorState,
 };
 use gate4agent_shell_native::{
-    NativeEffectShell, ProviderSupervisor, ProviderSupervisorBuildError,
+    NativeEffectShell, ProviderSupervisor, ProviderSupervisorBuildError, QwenDualOutputLaunch,
     MAX_PROVIDER_SUPERVISOR_EVENTS,
 };
 use gate4agent_tool_engine::{
@@ -55,16 +60,21 @@ use gate4agent_tool_engine::{
 use gate4agent_types::{
     AgentId, AgentInstanceId, CapabilityProbeFailure, ControlEffect, ControlObservation,
     EffectEnvelope, HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole,
-    HistorySessionRecord, ObservationEnvelope, ProviderRuntimeCapability, ProviderRuntimePolicy,
+    HistorySessionRecord, NativeSessionCatalogEntry, NativeSessionCatalogScope,
+    NativeSessionCatalogWindow, NativeSessionExternalGroup, NativeSessionExternalGroupKind,
+    NativeSessionPreview,
+    NativeSessionPreviewMessage, ObservationEnvelope, ProviderSessionIdentity,
+    ProviderRuntimeCapability, ProviderRuntimePolicy,
     PipeProtocol, ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration, SessionStatus,
     TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
 use tokio::time::MissedTickBehavior;
@@ -72,6 +82,1138 @@ use tokio::time::MissedTickBehavior;
 type TerminalFrameKey = (AgentInstanceId, SessionGeneration);
 const PROVIDER_EVENT_DRAIN_QUANTUM: usize = 64;
 const MAX_PROVIDER_SHUTDOWN_TIMEOUT_MS: u64 = 86_400_000;
+const NATIVE_SESSION_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const NATIVE_SESSION_RECENT_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// Independent read-only authority for projecting provider-native history into
+/// bounded session metadata. It does not create kernel or provider sessions.
+pub struct NativeSessionCatalogAuthority {
+    catalog: AgentRegistry,
+    history_config: NativeHistoryConfig,
+    authorities: HashMap<AgentId, NativeHistoryAuthority>,
+    indexes: HashMap<AgentId, NativeProviderSessionIndex>,
+}
+
+struct NativeProviderSessionIndex {
+    refreshed_at: Instant,
+    revision: u64,
+    recent_cutoff_unix_ms: u64,
+    sessions: Vec<IndexedNativeSession>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct IndexedNativeSession {
+    candidate: HistoryCandidate,
+    selection_id: String,
+    modified_at_unix_ms: Option<u64>,
+    cwd_key: Option<NativePathKey>,
+    session_id: String,
+    title: Option<String>,
+    model: Option<String>,
+    project_label: String,
+    provider_session: ProviderSessionIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedNativeSessionCatalogEntry {
+    pub metadata: NativeSessionCatalogEntry,
+    pub external_group: Option<NativeSessionExternalGroup>,
+    pub provider_session: ProviderSessionIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedNativeSessionCatalogPage {
+    pub revision: u64,
+    pub cutoff_unix_ms: u64,
+    pub window: NativeSessionCatalogWindow,
+    pub entries: Vec<ScopedNativeSessionCatalogEntry>,
+    pub recent_total_count: u32,
+    pub older_total_count: u32,
+    pub next_after_selection_id: Option<String>,
+    pub remaining_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionSelectionResolution {
+    pub identity: ProviderSessionIdentity,
+    pub external_group: Option<NativeSessionExternalGroup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSessionCatalogPage {
+    pub revision: u64,
+    pub cutoff_unix_ms: u64,
+    pub window: NativeSessionCatalogWindow,
+    pub entries: Vec<NativeSessionCatalogEntry>,
+    pub recent_total_count: u32,
+    pub older_total_count: u32,
+    pub next_after_selection_id: Option<String>,
+    pub remaining_count: u32,
+}
+
+impl NativeSessionCatalogAuthority {
+    pub fn new(config: NativeHistoryConfig) -> Self {
+        Self {
+            catalog: builtin_registry().clone(),
+            history_config: config,
+            authorities: HashMap::new(),
+            indexes: HashMap::new(),
+        }
+    }
+
+    pub fn catalog(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        limit: u16,
+    ) -> Result<Vec<NativeSessionCatalogEntry>, NativeSessionCatalogError> {
+        self.catalog_for_workspace(
+            provider,
+            canonical_workspace,
+            &[canonical_workspace.to_path_buf()],
+            limit,
+        )
+    }
+
+    pub fn catalog_for_workspace(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        registered_workspace_roots: &[PathBuf],
+        limit: u16,
+    ) -> Result<Vec<NativeSessionCatalogEntry>, NativeSessionCatalogError> {
+        self.catalog_initial_for_workspace(
+            provider,
+            canonical_workspace,
+            registered_workspace_roots,
+            limit,
+        )
+        .map(|page| page.entries)
+    }
+
+    pub fn catalog_initial_for_workspace(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        registered_workspace_roots: &[PathBuf],
+        limit: u16,
+    ) -> Result<NativeSessionCatalogPage, NativeSessionCatalogError> {
+        self.catalog_initial_for_scope(
+            provider,
+            NativeSessionCatalogScope::Workspace,
+            Some(canonical_workspace),
+            registered_workspace_roots,
+            limit,
+        )
+        .map(unscoped_native_catalog_page)
+    }
+
+    pub fn catalog_initial_for_scope(
+        &mut self,
+        provider: &AgentId,
+        scope: NativeSessionCatalogScope,
+        canonical_workspace: Option<&Path>,
+        registered_workspace_roots: &[PathBuf],
+        limit: u16,
+    ) -> Result<ScopedNativeSessionCatalogPage, NativeSessionCatalogError> {
+        let ownership = NativeSessionOwnership::new(
+            scope,
+            canonical_workspace,
+            registered_workspace_roots,
+        )
+        .map_err(|_| NativeSessionCatalogError::WorkspaceUnavailable)?;
+        self.ensure_provider_index(provider)
+            .map_err(map_catalog_index_error)?;
+        let (index_revision, cutoff_unix_ms) = self
+            .indexes
+            .get(provider)
+            .map(|index| (index.revision, index.recent_cutoff_unix_ms))
+            .ok_or(NativeSessionCatalogError::CatalogUnavailable)?;
+        let revision = scoped_native_catalog_snapshot_revision(
+            index_revision,
+            cutoff_unix_ms,
+            ownership.fingerprint(),
+        );
+        self.catalog_page_for_scope(
+            provider,
+            scope,
+            canonical_workspace,
+            registered_workspace_roots,
+            NativeSessionCatalogWindow::Recent,
+            revision,
+            cutoff_unix_ms,
+            None,
+            limit,
+        )
+    }
+
+    pub fn catalog_page_for_workspace(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        registered_workspace_roots: &[PathBuf],
+        window: NativeSessionCatalogWindow,
+        revision: u64,
+        cutoff_unix_ms: u64,
+        after_selection_id: Option<&str>,
+        limit: u16,
+    ) -> Result<NativeSessionCatalogPage, NativeSessionCatalogError> {
+        self.catalog_page_for_scope(
+            provider,
+            NativeSessionCatalogScope::Workspace,
+            Some(canonical_workspace),
+            registered_workspace_roots,
+            window,
+            revision,
+            cutoff_unix_ms,
+            after_selection_id,
+            limit,
+        )
+        .map(unscoped_native_catalog_page)
+    }
+
+    pub fn catalog_page_for_scope(
+        &mut self,
+        provider: &AgentId,
+        scope: NativeSessionCatalogScope,
+        canonical_workspace: Option<&Path>,
+        registered_workspace_roots: &[PathBuf],
+        window: NativeSessionCatalogWindow,
+        revision: u64,
+        cutoff_unix_ms: u64,
+        after_selection_id: Option<&str>,
+        limit: u16,
+    ) -> Result<ScopedNativeSessionCatalogPage, NativeSessionCatalogError> {
+        if !(1..=gate4agent_types::NATIVE_SESSION_CATALOG_LIMIT_MAX).contains(&limit) {
+            return Err(NativeSessionCatalogError::InvalidLimit);
+        }
+        let ownership = NativeSessionOwnership::new(
+            scope,
+            canonical_workspace,
+            registered_workspace_roots,
+        )
+            .map_err(|_| NativeSessionCatalogError::WorkspaceUnavailable)?;
+        self.ensure_provider_index(provider)
+            .map_err(map_catalog_index_error)?;
+        let index = self
+            .indexes
+            .get(provider)
+            .expect("ensured native provider index must exist");
+        if scoped_native_catalog_snapshot_revision(
+            index.revision,
+            cutoff_unix_ms,
+            ownership.fingerprint(),
+        ) != revision
+        {
+            return Err(NativeSessionCatalogError::StaleCatalog);
+        }
+        let external_group_ids = ownership.external_group_ids(&index.sessions);
+        let mut seen_sessions = std::collections::HashSet::new();
+        let mut recent = Vec::new();
+        let mut older = Vec::new();
+        for indexed in &index.sessions {
+            if !ownership.owns(&indexed.cwd_key)
+                || !seen_sessions.insert(indexed.session_id.clone())
+            {
+                continue;
+            }
+            let entry = NativeSessionCatalogEntry {
+                selection_id: indexed.selection_id.clone(),
+                session_id: indexed.session_id.clone(),
+                title: indexed.title.clone(),
+                modified_at_unix_ms: indexed.modified_at_unix_ms,
+                model: indexed.model.clone(),
+                message_count: 0,
+                completed_turn_count: None,
+            };
+            let external_group = ownership.external_group(indexed, &external_group_ids);
+            if entry.validate().is_ok()
+                && external_group
+                    .as_ref()
+                    .map_or(true, |group| group.validate().is_ok())
+            {
+                let entry = ScopedNativeSessionCatalogEntry {
+                    metadata: entry,
+                    external_group,
+                    provider_session: indexed.provider_session.clone(),
+                };
+                match native_catalog_window_for_modified(
+                    indexed.modified_at_unix_ms,
+                    cutoff_unix_ms,
+                ) {
+                    NativeSessionCatalogWindow::Recent => recent.push(entry),
+                    NativeSessionCatalogWindow::Older => older.push(entry),
+                }
+            }
+        }
+        let recent_total_count = u32::try_from(recent.len()).unwrap_or(u32::MAX);
+        let older_total_count = u32::try_from(older.len()).unwrap_or(u32::MAX);
+        let selected = match window {
+            NativeSessionCatalogWindow::Recent => recent,
+            NativeSessionCatalogWindow::Older => older,
+        };
+        let start = match after_selection_id {
+            Some(cursor) => selected
+                .iter()
+                .position(|entry| entry.metadata.selection_id == cursor)
+                .map(|index| index + 1)
+                .ok_or(NativeSessionCatalogError::StaleCatalog)?,
+            None => 0,
+        };
+        let end = start.saturating_add(usize::from(limit)).min(selected.len());
+        let entries = selected[start..end].to_vec();
+        let next_after_selection_id = (end < selected.len())
+            .then(|| entries.last().map(|entry| entry.metadata.selection_id.clone()))
+            .flatten();
+        let remaining_count = u32::try_from(selected.len().saturating_sub(end))
+            .unwrap_or(u32::MAX);
+        Ok(ScopedNativeSessionCatalogPage {
+            revision,
+            cutoff_unix_ms,
+            window,
+            entries,
+            recent_total_count,
+            older_total_count,
+            next_after_selection_id,
+            remaining_count,
+        })
+    }
+
+    fn ensure_provider_index(
+        &mut self,
+        provider: &AgentId,
+    ) -> Result<(), NativeSessionIndexError> {
+        if self.indexes.get(provider).is_some_and(|index| {
+            index.refreshed_at.elapsed() < NATIVE_SESSION_INDEX_REFRESH_INTERVAL
+        }) {
+            return Ok(());
+        }
+        let spec = self
+            .catalog
+            .get(provider)
+            .cloned()
+            .ok_or(NativeSessionIndexError::UnsupportedProvider)?;
+        let request = HistoryDiscoveryRequest::from_spec(
+            &spec,
+            None,
+            PROVIDER_HISTORY_DISCOVERY_LIMIT_MAX,
+        )
+        .map_err(|_| NativeSessionIndexError::UnsupportedProvider)?;
+        let authority = self
+            .authorities
+            .entry(provider.clone())
+            .or_insert_with(|| NativeHistoryAuthority::new(self.history_config.clone()));
+        let locators = authority.discover_locator_index(&request)
+            .map_err(|_| NativeSessionIndexError::Unavailable)?;
+        if !authority.take_discovery_issues().is_empty() {
+            return Err(NativeSessionIndexError::Unavailable);
+        }
+        let mut sessions = Vec::with_capacity(locators.len());
+        for locator in locators {
+            let indexed_candidate = locator.candidate().clone();
+            let candidate = locator.candidate();
+            let selection_id = candidate.id().as_str().to_owned();
+            let modified_at_unix_ms = candidate.modified_at_unix_ms();
+            let cwd_key = locator.cwd().and_then(NativePathKey::from_declared_cwd);
+            let project_label = if cwd_key.is_some() {
+                locator
+                    .cwd()
+                    .map(native_external_group_label)
+                    .unwrap_or_else(|| "Global".to_owned())
+            } else {
+                "Global".to_owned()
+            };
+            let load = HistoryLoadRequest::new(&request, indexed_candidate.clone())
+                .map_err(|_| NativeSessionIndexError::Unavailable)?;
+            let provider_session = authority
+                .resume_provider_session(&load, locator.session_id().to_owned())
+                .map_err(|_| NativeSessionIndexError::Unavailable)?;
+            sessions.push(IndexedNativeSession {
+                candidate: indexed_candidate,
+                selection_id,
+                modified_at_unix_ms,
+                cwd_key,
+                session_id: locator.session_id().to_owned(),
+                title: locator.title().map(str::to_owned),
+                model: locator.model().map(str::to_owned),
+                project_label,
+                provider_session,
+            });
+        }
+        sessions.sort_by(|left, right| {
+            right
+                .modified_at_unix_ms
+                .cmp(&left.modified_at_unix_ms)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.selection_id.cmp(&right.selection_id))
+        });
+        if let Some(current) = self.indexes.get_mut(provider) {
+            if current.sessions == sessions {
+                current.refreshed_at = Instant::now();
+                return Ok(());
+            }
+        }
+        let revision = self
+            .indexes
+            .get(provider)
+            .map(|index| index.revision.saturating_add(1))
+            .unwrap_or(1);
+        let recent_cutoff_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .map(|now| now.saturating_sub(NATIVE_SESSION_RECENT_WINDOW_MS))
+            .ok_or(NativeSessionIndexError::Unavailable)?;
+        self.indexes.insert(
+            provider.clone(),
+            NativeProviderSessionIndex {
+                refreshed_at: Instant::now(),
+                revision,
+                recent_cutoff_unix_ms,
+                sessions,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn preview(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        selection_id: &str,
+        message_limit: u16,
+    ) -> Result<NativeSessionPreview, NativeSessionPreviewError> {
+        self.preview_for_workspace(
+            provider,
+            canonical_workspace,
+            &[canonical_workspace.to_path_buf()],
+            selection_id,
+            message_limit,
+        )
+    }
+
+    pub fn preview_for_workspace(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        registered_workspace_roots: &[PathBuf],
+        selection_id: &str,
+        message_limit: u16,
+    ) -> Result<NativeSessionPreview, NativeSessionPreviewError> {
+        self.preview_selected(
+            provider,
+            NativeSessionCatalogScope::Workspace,
+            Some(canonical_workspace),
+            registered_workspace_roots,
+            None,
+            NativeSessionPreviewSelector::Candidate(selection_id),
+            message_limit,
+        )
+    }
+
+    pub fn preview_for_scope(
+        &mut self,
+        provider: &AgentId,
+        scope: NativeSessionCatalogScope,
+        canonical_workspace: Option<&Path>,
+        registered_workspace_roots: &[PathBuf],
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: &str,
+        message_limit: u16,
+    ) -> Result<NativeSessionPreview, NativeSessionPreviewError> {
+        self.preview_selected(
+            provider,
+            scope,
+            canonical_workspace,
+            registered_workspace_roots,
+            Some((catalog_revision, recent_cutoff_unix_ms)),
+            NativeSessionPreviewSelector::Candidate(selection_id),
+            message_limit,
+        )
+    }
+
+    pub fn preview_session_id(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        session_id: &str,
+        message_limit: u16,
+    ) -> Result<NativeSessionPreview, NativeSessionPreviewError> {
+        self.preview_session_id_for_workspace(
+            provider,
+            canonical_workspace,
+            &[canonical_workspace.to_path_buf()],
+            session_id,
+            message_limit,
+        )
+    }
+
+    pub fn preview_session_id_for_workspace(
+        &mut self,
+        provider: &AgentId,
+        canonical_workspace: &Path,
+        registered_workspace_roots: &[PathBuf],
+        session_id: &str,
+        message_limit: u16,
+    ) -> Result<NativeSessionPreview, NativeSessionPreviewError> {
+        self.preview_selected(
+            provider,
+            NativeSessionCatalogScope::Workspace,
+            Some(canonical_workspace),
+            registered_workspace_roots,
+            None,
+            NativeSessionPreviewSelector::Session(session_id),
+            message_limit,
+        )
+    }
+
+    fn preview_selected(
+        &mut self,
+        provider: &AgentId,
+        scope: NativeSessionCatalogScope,
+        canonical_workspace: Option<&Path>,
+        registered_workspace_roots: &[PathBuf],
+        catalog_snapshot: Option<(u64, u64)>,
+        selector: NativeSessionPreviewSelector<'_>,
+        message_limit: u16,
+    ) -> Result<NativeSessionPreview, NativeSessionPreviewError> {
+        if !(1..=gate4agent_types::NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX)
+            .contains(&message_limit)
+        {
+            return Err(NativeSessionPreviewError::InvalidLimit);
+        }
+        let ownership = NativeSessionOwnership::new(
+            scope,
+            canonical_workspace,
+            registered_workspace_roots,
+        )
+            .map_err(|_| NativeSessionPreviewError::WorkspaceUnavailable)?;
+        let cached_candidate = match selector {
+            NativeSessionPreviewSelector::Candidate(selection_id) => self
+                .indexes
+                .get(provider)
+                .is_some_and(|index| {
+                    index.sessions.iter().any(|session| {
+                        session.selection_id == selection_id
+                            && ownership.owns(&session.cwd_key)
+                    })
+                }),
+            NativeSessionPreviewSelector::Session(_) => false,
+        };
+        if !cached_candidate {
+            self.ensure_provider_index(provider)
+                .map_err(|error| match error {
+                    NativeSessionIndexError::UnsupportedProvider => {
+                        NativeSessionPreviewError::UnsupportedProvider
+                    }
+                    NativeSessionIndexError::Unavailable => {
+                        NativeSessionPreviewError::PreviewUnavailable
+                    }
+                })?;
+        }
+        let index = self
+            .indexes
+            .get(provider)
+            .ok_or(NativeSessionPreviewError::SessionNotFound)?;
+        if let Some((catalog_revision, recent_cutoff_unix_ms)) = catalog_snapshot {
+            if index.recent_cutoff_unix_ms != recent_cutoff_unix_ms
+                || scoped_native_catalog_snapshot_revision(
+                    index.revision,
+                    recent_cutoff_unix_ms,
+                    ownership.fingerprint(),
+                ) != catalog_revision
+            {
+                return Err(NativeSessionPreviewError::StaleCatalog);
+            }
+        }
+        let mut matched = None;
+        for indexed in &index.sessions {
+            if matches!(selector, NativeSessionPreviewSelector::Candidate(selection_id)
+                if indexed.selection_id != selection_id)
+                || matches!(selector, NativeSessionPreviewSelector::Session(session_id)
+                    if indexed.session_id != session_id)
+                || !ownership.owns(&indexed.cwd_key)
+            {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(NativeSessionPreviewError::AmbiguousSession);
+            }
+            matched = Some((
+                indexed.candidate.clone(),
+                indexed.session_id.clone(),
+                indexed.cwd_key.clone(),
+                indexed.modified_at_unix_ms,
+            ));
+        }
+        let (candidate, expected_session_id, expected_cwd, modified_at_unix_ms) =
+            matched.ok_or(NativeSessionPreviewError::SessionNotFound)?;
+        let spec = self
+            .catalog
+            .get(provider)
+            .cloned()
+            .ok_or(NativeSessionPreviewError::UnsupportedProvider)?;
+        let request = HistoryDiscoveryRequest::from_spec(
+            &spec,
+            None,
+            PROVIDER_HISTORY_DISCOVERY_LIMIT_MAX,
+        )
+        .map_err(|_| NativeSessionPreviewError::UnsupportedProvider)?;
+        let load = HistoryLoadRequest::new(&request, candidate)
+            .map_err(|_| NativeSessionPreviewError::PreviewUnavailable)?;
+        let authority = self
+            .authorities
+            .get_mut(provider)
+            .ok_or(NativeSessionPreviewError::PreviewUnavailable)?;
+        let preview_load = authority.load_preview_session(&load)
+            .map_err(|_| NativeSessionPreviewError::PreviewUnavailable)?;
+        let source_truncated = preview_load.source_truncated();
+        let session = preview_load.session();
+        let current_cwd = session
+            .cwd
+            .as_deref()
+            .and_then(NativePathKey::from_declared_cwd);
+        if session.session_id != expected_session_id
+            || current_cwd != expected_cwd
+            || !ownership.owns(&current_cwd)
+        {
+            return Err(NativeSessionPreviewError::PreviewUnavailable);
+        }
+        project_native_session_preview(
+            session,
+            modified_at_unix_ms,
+            source_truncated,
+            message_limit,
+        )
+    }
+
+    pub fn resolve_selection_for_scope(
+        &mut self,
+        provider: &AgentId,
+        scope: NativeSessionCatalogScope,
+        canonical_workspace: Option<&Path>,
+        registered_workspace_roots: &[PathBuf],
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        selection_id: &str,
+    ) -> Result<NativeSessionSelectionResolution, NativeSessionPreviewError> {
+        gate4agent_types::validate_candidate_id(selection_id)
+            .map_err(|_| NativeSessionPreviewError::SessionNotFound)?;
+        let ownership = NativeSessionOwnership::new(
+            scope,
+            canonical_workspace,
+            registered_workspace_roots,
+        )
+        .map_err(|_| NativeSessionPreviewError::WorkspaceUnavailable)?;
+        self.ensure_provider_index(provider)
+            .map_err(|error| match error {
+                NativeSessionIndexError::UnsupportedProvider => {
+                    NativeSessionPreviewError::UnsupportedProvider
+                }
+                NativeSessionIndexError::Unavailable => {
+                    NativeSessionPreviewError::PreviewUnavailable
+                }
+            })?;
+        let index = self
+            .indexes
+            .get(provider)
+            .ok_or(NativeSessionPreviewError::SessionNotFound)?;
+        if index.recent_cutoff_unix_ms != recent_cutoff_unix_ms
+            || scoped_native_catalog_snapshot_revision(
+                index.revision,
+                recent_cutoff_unix_ms,
+                ownership.fingerprint(),
+            ) != catalog_revision
+        {
+            return Err(NativeSessionPreviewError::StaleCatalog);
+        }
+        let external_group_ids = ownership.external_group_ids(&index.sessions);
+        let mut matched = None;
+        for indexed in &index.sessions {
+            if indexed.selection_id != selection_id || !ownership.owns(&indexed.cwd_key) {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(NativeSessionPreviewError::AmbiguousSession);
+            }
+            matched = Some((
+                indexed.candidate.clone(),
+                indexed.session_id.clone(),
+                indexed.cwd_key.clone(),
+                ownership.external_group(indexed, &external_group_ids),
+            ));
+        }
+        let (candidate, expected_session_id, expected_cwd, external_group) =
+            matched.ok_or(NativeSessionPreviewError::SessionNotFound)?;
+        let spec = self
+            .catalog
+            .get(provider)
+            .cloned()
+            .ok_or(NativeSessionPreviewError::UnsupportedProvider)?;
+        let request = HistoryDiscoveryRequest::from_spec(
+            &spec,
+            None,
+            PROVIDER_HISTORY_DISCOVERY_LIMIT_MAX,
+        )
+        .map_err(|_| NativeSessionPreviewError::UnsupportedProvider)?;
+        let load = HistoryLoadRequest::new(&request, candidate)
+            .map_err(|_| NativeSessionPreviewError::PreviewUnavailable)?;
+        let authority = self
+            .authorities
+            .get_mut(provider)
+            .ok_or(NativeSessionPreviewError::PreviewUnavailable)?;
+        let session = authority
+            .load_preview_session(&load)
+            .map_err(|_| NativeSessionPreviewError::PreviewUnavailable)?
+            .session();
+        let current_cwd = session
+            .cwd
+            .as_deref()
+            .and_then(NativePathKey::from_declared_cwd);
+        if session.session_id != expected_session_id
+            || current_cwd != expected_cwd
+            || !ownership.owns(&current_cwd)
+        {
+            return Err(NativeSessionPreviewError::PreviewUnavailable);
+        }
+        let identity = authority
+            .resume_provider_session(&load, session.session_id)
+            .map_err(|_| NativeSessionPreviewError::PreviewUnavailable)?;
+        identity
+            .validate()
+            .map_err(|_| NativeSessionPreviewError::PreviewUnavailable)?;
+        if external_group
+            .as_ref()
+            .is_some_and(|group| group.validate().is_err())
+        {
+            return Err(NativeSessionPreviewError::PreviewUnavailable);
+        }
+        Ok(NativeSessionSelectionResolution {
+            identity,
+            external_group,
+        })
+    }
+}
+
+struct NativeSessionOwnership {
+    scope: NativeSessionCatalogScope,
+    selected: Option<NativePathKey>,
+    registered: Vec<NativePathKey>,
+}
+
+impl NativeSessionOwnership {
+    fn new(
+        scope: NativeSessionCatalogScope,
+        selected: Option<&Path>,
+        registered: &[PathBuf],
+    ) -> Result<Self, ()> {
+        let mut registered = registered
+            .iter()
+            .filter(|root| root.is_absolute())
+            .map(std::fs::canonicalize)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ())?
+            .into_iter()
+            .map(|root| NativePathKey::from_canonical_root(&root).ok_or(()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected = match (scope, selected) {
+            (NativeSessionCatalogScope::Workspace, Some(selected)) => {
+                let selected = std::fs::canonicalize(selected).map_err(|_| ())?;
+                if !selected.is_dir() {
+                    return Err(());
+                }
+                let selected = NativePathKey::from_canonical_root(&selected).ok_or(())?;
+                if !registered.iter().any(|root| root == &selected) {
+                    registered.push(selected.clone());
+                }
+                Some(selected)
+            }
+            (NativeSessionCatalogScope::Unregistered, None) => None,
+            _ => return Err(()),
+        };
+        registered.sort();
+        registered.dedup();
+        Ok(Self {
+            scope,
+            selected,
+            registered,
+        })
+    }
+
+    fn owns(&self, cwd: &Option<NativePathKey>) -> bool {
+        let Some(cwd) = cwd.as_ref() else {
+            return matches!(self.scope, NativeSessionCatalogScope::Unregistered);
+        };
+        let owner = self.registered
+            .iter()
+            .filter(|root| cwd.starts_with(root))
+            .max_by_key(|root| root.components.len());
+        match self.scope {
+            NativeSessionCatalogScope::Workspace => owner == self.selected.as_ref(),
+            NativeSessionCatalogScope::Unregistered => owner.is_none(),
+        }
+    }
+
+    fn external_group(
+        &self,
+        indexed: &IndexedNativeSession,
+        group_ids: &BTreeMap<NativeExternalGroupKey, String>,
+    ) -> Option<NativeSessionExternalGroup> {
+        matches!(self.scope, NativeSessionCatalogScope::Unregistered).then(|| {
+            let key = NativeExternalGroupKey::from_cwd(indexed.cwd_key.as_ref());
+            NativeSessionExternalGroup {
+                group_id: group_ids
+                    .get(&key)
+                    .cloned()
+                    .expect("owned unregistered session must have an opaque group token"),
+                kind: match key {
+                    NativeExternalGroupKey::Project(_) => NativeSessionExternalGroupKind::Project,
+                    NativeExternalGroupKey::Global => NativeSessionExternalGroupKind::Global,
+                },
+                display_name: indexed.project_label.clone(),
+            }
+        })
+    }
+
+    fn external_group_ids(
+        &self,
+        sessions: &[IndexedNativeSession],
+    ) -> BTreeMap<NativeExternalGroupKey, String> {
+        if !matches!(self.scope, NativeSessionCatalogScope::Unregistered) {
+            return BTreeMap::new();
+        }
+        let mut paths = sessions
+            .iter()
+            .filter(|session| self.owns(&session.cwd_key))
+            .map(|session| NativeExternalGroupKey::from_cwd(session.cwd_key.as_ref()))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| (path, format!("external-{:04}", index + 1)))
+            .collect()
+    }
+
+    fn fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        hash = native_hash_bytes(
+            hash,
+            &[match self.scope {
+                NativeSessionCatalogScope::Workspace => 1,
+                NativeSessionCatalogScope::Unregistered => 2,
+            }],
+        );
+        if let Some(selected) = self.selected.as_ref() {
+            hash = native_hash_path(hash, selected);
+        }
+        for root in &self.registered {
+            hash = native_hash_bytes(hash, &[0xff]);
+            hash = native_hash_path(hash, root);
+        }
+        hash.max(1)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NativeExternalGroupKey {
+    Global,
+    Project(NativePathKey),
+}
+
+impl NativeExternalGroupKey {
+    fn from_cwd(cwd: Option<&NativePathKey>) -> Self {
+        match cwd {
+            Some(cwd) => Self::Project(cwd.clone()),
+            None => Self::Global,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NativePathKey {
+    components: Vec<String>,
+}
+
+impl NativePathKey {
+    fn from_canonical_root(path: &Path) -> Option<Self> {
+        Self::from_absolute_path(path)
+    }
+
+    fn from_declared_cwd(value: &str) -> Option<Self> {
+        let path = Path::new(value);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return None;
+        }
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return Self::from_absolute_path(&canonical);
+        }
+        let mut existing = path;
+        let mut missing = Vec::<OsString>::new();
+        while !existing.exists() {
+            missing.push(existing.file_name()?.to_os_string());
+            existing = existing.parent()?;
+        }
+        let mut resolved = std::fs::canonicalize(existing).ok()?;
+        for component in missing.into_iter().rev() {
+            resolved.push(component);
+        }
+        Self::from_absolute_path(&resolved)
+    }
+
+    fn from_absolute_path(path: &Path) -> Option<Self> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut components = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => {
+                    components.push(normalize_native_path_component(
+                        &prefix.as_os_str().to_string_lossy(),
+                    ));
+                }
+                Component::RootDir => {}
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if components.len() <= 1 {
+                        return None;
+                    }
+                    components.pop();
+                }
+                Component::Normal(value) => components.push(normalize_native_path_component(
+                    &value.to_string_lossy(),
+                )),
+            }
+        }
+        (!components.is_empty()).then_some(Self { components })
+    }
+
+    fn starts_with(&self, root: &Self) -> bool {
+        self.components.starts_with(&root.components)
+    }
+}
+
+fn native_external_group_label(cwd: &str) -> String {
+    let raw = Path::new(cwd)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "project".to_owned());
+    let sanitized = raw
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    let sanitized = if sanitized.is_empty() { "project" } else { sanitized };
+    let mut end = sanitized
+        .len()
+        .min(gate4agent_types::NATIVE_SESSION_EXTERNAL_GROUP_LABEL_MAX_BYTES);
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    sanitized[..end].to_owned()
+}
+
+fn native_hash_path(mut hash: u64, path: &NativePathKey) -> u64 {
+    for component in &path.components {
+        hash = native_hash_bytes(hash, &(component.len() as u64).to_le_bytes());
+        hash = native_hash_bytes(hash, component.as_bytes());
+    }
+    hash
+}
+
+fn native_hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[cfg(windows)]
+fn normalize_native_path_component(value: &str) -> String {
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}").to_lowercase()
+    } else {
+        value.trim_start_matches(r"\\?\").to_lowercase()
+    }
+}
+
+#[cfg(not(windows))]
+fn normalize_native_path_component(value: &str) -> String {
+    value.to_owned()
+}
+
+#[derive(Clone, Copy)]
+enum NativeSessionPreviewSelector<'a> {
+    Candidate(&'a str),
+    Session(&'a str),
+}
+
+fn normalize_preview_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut end = normalized.len().min(gate4agent_types::NATIVE_SESSION_PREVIEW_TEXT_MAX_BYTES);
+    while !normalized.is_char_boundary(end) {
+        end -= 1;
+    }
+    normalized[..end]
+        .chars()
+        .filter(|character| {
+            !character.is_control() || matches!(character, '\n' | '\t')
+        })
+        .collect()
+}
+
+fn project_native_session_preview(
+    session: gate4agent_adapters::HistorySession,
+    modified_at_unix_ms: Option<u64>,
+    source_truncated: bool,
+    message_limit: u16,
+) -> Result<NativeSessionPreview, NativeSessionPreviewError> {
+    let skip = session
+        .messages
+        .len()
+        .saturating_sub(usize::from(message_limit));
+    let messages: Vec<NativeSessionPreviewMessage> = session
+        .messages
+        .into_iter()
+        .skip(skip)
+        .map(|message| NativeSessionPreviewMessage {
+            role: match message.role {
+                gate4agent_adapters::HistoryRole::User => HistoryMessageRole::User,
+                gate4agent_adapters::HistoryRole::Assistant => HistoryMessageRole::Assistant,
+            },
+            text: normalize_preview_text(&message.text),
+        })
+        .collect();
+    let truncated = source_truncated || session.message_count > messages.len() as u64;
+    let preview = NativeSessionPreview {
+        session_id: session.session_id,
+        title: session.title,
+        modified_at_unix_ms,
+        model: session.model,
+        message_count: session.message_count,
+        message_count_exact: !source_truncated,
+        completed_turn_count: session.completed_turn_count,
+        total_tokens: session
+            .total_tokens_observed
+            .then_some(session.total_tokens),
+        truncated,
+        messages,
+    };
+    preview
+        .validate()
+        .map_err(|_| NativeSessionPreviewError::PreviewUnavailable)?;
+    Ok(preview)
+}
+
+fn native_catalog_window_for_modified(
+    modified_at_unix_ms: Option<u64>,
+    recent_cutoff: u64,
+) -> NativeSessionCatalogWindow {
+    if modified_at_unix_ms.is_some_and(|modified| modified >= recent_cutoff) {
+        NativeSessionCatalogWindow::Recent
+    } else {
+        NativeSessionCatalogWindow::Older
+    }
+}
+
+fn native_catalog_snapshot_revision(index_revision: u64, cutoff_unix_ms: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in index_revision
+        .to_le_bytes()
+        .into_iter()
+        .chain(cutoff_unix_ms.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+fn scoped_native_catalog_snapshot_revision(
+    index_revision: u64,
+    cutoff_unix_ms: u64,
+    ownership_fingerprint: u64,
+) -> u64 {
+    native_hash_bytes(
+        native_catalog_snapshot_revision(index_revision, cutoff_unix_ms),
+        &ownership_fingerprint.to_le_bytes(),
+    )
+    .max(1)
+}
+
+fn unscoped_native_catalog_page(
+    page: ScopedNativeSessionCatalogPage,
+) -> NativeSessionCatalogPage {
+    NativeSessionCatalogPage {
+        revision: page.revision,
+        cutoff_unix_ms: page.cutoff_unix_ms,
+        window: page.window,
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| entry.metadata)
+            .collect(),
+        recent_total_count: page.recent_total_count,
+        older_total_count: page.older_total_count,
+        next_after_selection_id: page.next_after_selection_id,
+        remaining_count: page.remaining_count,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSessionIndexError {
+    UnsupportedProvider,
+    Unavailable,
+}
+
+fn map_catalog_index_error(error: NativeSessionIndexError) -> NativeSessionCatalogError {
+    match error {
+        NativeSessionIndexError::UnsupportedProvider => {
+            NativeSessionCatalogError::UnsupportedProvider
+        }
+        NativeSessionIndexError::Unavailable => NativeSessionCatalogError::CatalogUnavailable,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum NativeSessionCatalogError {
+    #[error("native session catalog limit is outside the supported bounded range")]
+    InvalidLimit,
+    #[error("native session catalog provider is unsupported")]
+    UnsupportedProvider,
+    #[error("native session catalog workspace is unavailable")]
+    WorkspaceUnavailable,
+    #[error("native session catalog is unavailable")]
+    CatalogUnavailable,
+    #[error("native session catalog revision or cursor is stale")]
+    StaleCatalog,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum NativeSessionPreviewError {
+    #[error("native session preview limit is outside the supported bounded range")]
+    InvalidLimit,
+    #[error("native session preview provider is unsupported")]
+    UnsupportedProvider,
+    #[error("native session preview workspace is unavailable")]
+    WorkspaceUnavailable,
+    #[error("native session preview is unavailable")]
+    PreviewUnavailable,
+    #[error("native session preview was not found")]
+    SessionNotFound,
+    #[error("native session catalog revision is stale")]
+    StaleCatalog,
+    #[error("native session preview is ambiguous")]
+    AmbiguousSession,
+}
 
 fn drain_queue<T>(queue: &mut VecDeque<T>, limit: usize) -> Vec<T> {
     let count = limit.min(queue.len());
@@ -621,16 +1763,30 @@ struct EffectWorker {
     sender: Sender<NativeEffectRequest>,
 }
 
-#[derive(Default)]
 struct NativeSpawnOverlay {
     environment: Vec<EnvMutation>,
     extra_args: Vec<OsString>,
+    one_shot_session_persistence: OneShotSessionPersistence,
+    qwen_sidecar: Option<QwenDualOutputLaunch>,
+}
+
+impl Default for NativeSpawnOverlay {
+    fn default() -> Self {
+        Self {
+            environment: Vec::new(),
+            extra_args: Vec::new(),
+            one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
+            qwen_sidecar: None,
+        }
+    }
 }
 
 struct NativeEffectRequest {
     effect: EffectEnvelope,
     spawn_env: Vec<EnvMutation>,
     spawn_extra_args: Vec<OsString>,
+    one_shot_session_persistence: OneShotSessionPersistence,
+    qwen_sidecar: Option<QwenDualOutputLaunch>,
 }
 
 #[derive(Clone)]
@@ -723,6 +1879,8 @@ impl NativeEffectDispatcher {
             effect,
             spawn_env: spawn_overlay.environment,
             spawn_extra_args: spawn_overlay.extra_args,
+            one_shot_session_persistence: spawn_overlay.one_shot_session_persistence,
+            qwen_sidecar: spawn_overlay.qwen_sidecar,
         };
         for _ in 0..2 {
             let sender = self.worker_sender(instance_id);
@@ -754,6 +1912,8 @@ impl NativeEffectDispatcher {
             effect,
             spawn_env: Vec::new(),
             spawn_extra_args: Vec::new(),
+            one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
+            qwen_sidecar: None,
         };
         for _ in 0..2 {
             let sender = self.capability_sender();
@@ -813,6 +1973,8 @@ impl NativeEffectDispatcher {
             effect,
             spawn_env: Vec::new(),
             spawn_extra_args: Vec::new(),
+            one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
+            qwen_sidecar: None,
         };
         for _ in 0..2 {
             let sender = self.authority_sender();
@@ -861,15 +2023,13 @@ impl NativeEffectDispatcher {
             ControlEffect::Spawn {
                 agent_id,
                 transport: gate4agent_types::TransportKind::Pty,
-                runtime_policy,
                 ..
             }
             | ControlEffect::SpawnResume {
                 agent_id,
                 transport: gate4agent_types::TransportKind::Pty,
-                runtime_policy,
                 ..
-            } if runtime_policy.provider_session_identity => agent_id,
+            } => agent_id,
             _ => return Ok(Vec::new()),
         };
         let control = self
@@ -906,7 +2066,35 @@ impl NativeEffectDispatcher {
     ) -> Result<NativeSpawnOverlay, String> {
         let mut overlay = self.profile_spawn_overlay(effect)?;
         overlay.environment.extend(self.hook_pty_env(effect)?);
+        overlay.qwen_sidecar = self.qwen_pty_sidecar(effect);
         Ok(overlay)
+    }
+
+    fn qwen_pty_sidecar(&self, effect: &EffectEnvelope) -> Option<QwenDualOutputLaunch> {
+        let agent_id = match &effect.effect {
+            ControlEffect::Spawn {
+                agent_id,
+                transport: TransportKind::Pty,
+                ..
+            }
+            | ControlEffect::SpawnResume {
+                agent_id,
+                transport: TransportKind::Pty,
+                ..
+            } => agent_id,
+            _ => return None,
+        };
+        let binding = self
+            .catalog
+            .get(agent_id)?
+            .capabilities
+            .adapters
+            .pty_sidecar
+            .clone()?;
+        Some(
+            QwenDualOutputLaunch::prepare(binding.clone())
+                .unwrap_or_else(|_| QwenDualOutputLaunch::unavailable(binding)),
+        )
     }
 
     fn profile_spawn_overlay(&self, effect: &EffectEnvelope) -> Result<NativeSpawnOverlay, String> {
@@ -940,6 +2128,8 @@ impl NativeEffectDispatcher {
             .map(|overlay| NativeSpawnOverlay {
                 environment: overlay.environment,
                 extra_args: overlay.extra_args,
+                one_shot_session_persistence: overlay.one_shot_session_persistence,
+                qwen_sidecar: None,
             })
             .map_err(|error| error.to_string())
     }
@@ -1385,6 +2575,7 @@ fn history_session_record(session: gate4agent_adapters::HistorySession) -> Histo
         cwd: session.cwd,
         model: session.model,
         message_count: session.message_count,
+        completed_turn_count: session.completed_turn_count,
         total_tokens: session.total_tokens,
         messages: session
             .messages
@@ -1419,10 +2610,12 @@ async fn run_effect_worker(
                 last_effect = Instant::now();
                 let before = shell.active_session_count();
                 let completion = shell
-                    .execute_with_launch_overlay(
+                    .execute_with_launch_context(
                         request.effect,
                         request.spawn_env,
                         request.spawn_extra_args,
+                        request.one_shot_session_persistence,
+                        request.qwen_sidecar,
                     )
                     .await;
                 update_active_count(&context.active_sessions, before, shell.active_session_count());
@@ -1583,7 +2776,7 @@ fn validate_effect_runtime_policy(effect: &ControlEffect) -> Result<(), String> 
         require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
         require_runtime_capability(policy, ProviderRuntimeCapability::StructuredPrompt)?;
     }
-    if is_resume {
+    if is_resume && has_initial_prompt {
         require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
         require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
     }
@@ -1641,7 +2834,696 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_shell_hooks::{
+        HOOK_PORT_ENV, HOOK_ROUTE_ENV, HOOK_TOKEN_ENV, HOOK_URL_ENV, HOOK_VERSION_ENV,
+    };
+    use gate4agent_testkit::{
+        hook_posting_agent_spec, interactive_agent_spec, CONTROL_FIXTURE_ID,
+        HOOK_POSTING_FIXTURE_ID,
+    };
     use gate4agent_types::{OperationId, StartRequest, TerminalSize};
+
+    #[test]
+    fn history_record_preserves_completed_turn_count() {
+        let record = history_session_record(gate4agent_adapters::HistorySession {
+            session_id: "session-1".to_owned(),
+            title: None,
+            cwd: None,
+            model: None,
+            message_count: 5,
+            completed_turn_count: Some(2),
+            total_tokens: 8,
+            total_tokens_observed: true,
+            messages: Vec::new(),
+        });
+
+        assert_eq!(record.completed_turn_count, Some(2));
+    }
+
+    #[test]
+    fn runtime_preview_maps_known_and_unknown_token_totals_exactly() {
+        let session = |total_tokens_observed, total_tokens| {
+            gate4agent_adapters::HistorySession {
+                session_id: "session-1".to_owned(),
+                title: None,
+                cwd: None,
+                model: None,
+                message_count: 0,
+                completed_turn_count: None,
+                total_tokens,
+                total_tokens_observed,
+                messages: Vec::new(),
+            }
+        };
+
+        let unknown = project_native_session_preview(session(false, 0), None, false, 1).unwrap();
+        let observed_zero =
+            project_native_session_preview(session(true, 0), None, false, 1).unwrap();
+        let observed_nonzero =
+            project_native_session_preview(session(true, 42), None, false, 1).unwrap();
+
+        assert_eq!(unknown.total_tokens, None);
+        assert_eq!(observed_zero.total_tokens, Some(0));
+        assert_eq!(observed_nonzero.total_tokens, Some(42));
+    }
+
+    #[test]
+    fn native_catalog_high_cardinality_outside_workspace_does_not_hide_match() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-native-catalog-prelimit-{}-{unique}",
+            std::process::id(),
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let history = root.join("central-history");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+
+        let transcript = |session_id: &str, cwd: &Path| {
+            let cwd = cwd
+                .to_str()
+                .unwrap()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{session_id}\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"question\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session_id}\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"answer\"}}}}"
+            )
+        };
+        std::fs::write(
+            history.join("zz-workspace-session.jsonl"),
+            transcript("workspace-session", &workspace),
+        )
+        .unwrap();
+        for index in 0..1_100 {
+            let session_id = format!("outside-session-{index:04}");
+            std::fs::write(
+                history.join(format!("aa-outside-session-{index:04}.jsonl")),
+                transcript(&session_id, &outside),
+            )
+            .unwrap();
+        }
+
+        let config = NativeHistoryConfig::new(vec![
+            NativeHistoryRoot::new(
+                gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                HistorySourceLayout::SingleNdjson,
+                &history,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let mut catalog = NativeSessionCatalogAuthority::new(config);
+        let entries = catalog
+            .catalog(&AgentId::new("claude").unwrap(), &workspace, 1)
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "workspace-session");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_catalog_attributes_deleted_historical_cwd_lexically() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-native-catalog-deleted-cwd-{}-{unique}",
+            std::process::id(),
+        ));
+        let workspace = root.join("workspace");
+        let deleted_cwd = workspace.join("removed-subdirectory");
+        let history = root.join("central-history");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+        let cwd = deleted_cwd
+            .to_str()
+            .unwrap()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let workspace_key = NativePathKey::from_canonical_root(
+            &std::fs::canonicalize(&workspace).unwrap(),
+        )
+        .unwrap();
+        let deleted_key = NativePathKey::from_declared_cwd(
+            deleted_cwd.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            deleted_key.starts_with(&workspace_key),
+            "declared cwd {deleted_key:?} must remain beneath workspace {workspace_key:?}",
+        );
+        std::fs::write(
+            history.join("deleted-cwd-session.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"deleted-cwd-session\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"question\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"deleted-cwd-session\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"answer\"}}}}"
+            ),
+        )
+        .unwrap();
+
+        let config = NativeHistoryConfig::new(vec![
+            NativeHistoryRoot::new(
+                gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                HistorySourceLayout::SingleNdjson,
+                &history,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let mut catalog = NativeSessionCatalogAuthority::new(config);
+        let entries = catalog
+            .catalog(&AgentId::new("claude").unwrap(), &workspace, 10)
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "deleted-cwd-session");
+        let preview = catalog
+            .preview(
+                &AgentId::new("claude").unwrap(),
+                &workspace,
+                &entries[0].selection_id,
+                10,
+            )
+            .unwrap();
+        assert_eq!(preview.session_id, "deleted-cwd-session");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_catalog_keeps_provider_candidate_indexes_isolated() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-native-catalog-provider-isolation-{}-{unique}",
+            std::process::id(),
+        ));
+        let workspace = root.join("workspace");
+        let claude_history = root.join("claude-history");
+        let qwen_history = root.join("qwen-history");
+        let qwen_chats = qwen_history.join("project").join("chats");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&claude_history).unwrap();
+        std::fs::create_dir_all(&qwen_chats).unwrap();
+        let cwd = workspace
+            .to_str()
+            .unwrap()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        std::fs::write(
+            claude_history.join("claude-session.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"claude-session\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"question\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"claude-session\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"answer\"}}}}"
+            ),
+        )
+        .unwrap();
+        let qwen_session = "11111111-1111-4111-8111-111111111111";
+        std::fs::write(
+            qwen_chats.join(format!("{qwen_session}.jsonl")),
+            format!(
+                "{{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"{qwen_session}\",\"type\":\"user\",\"provenance\":\"real_user\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"parts\":[{{\"text\":\"question\"}}]}}}}\n\
+                 {{\"uuid\":\"a1\",\"parentUuid\":\"u1\",\"sessionId\":\"{qwen_session}\",\"type\":\"assistant\",\"provenance\":\"assistant_output\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"answer\"}}]}}}}"
+            ),
+        )
+        .unwrap();
+        let limits = gate4agent_shell_history::NativeHistoryLimits {
+            max_candidates: 1,
+            ..gate4agent_shell_history::NativeHistoryLimits::default()
+        };
+        let config = NativeHistoryConfig::with_limits(
+            vec![
+                NativeHistoryRoot::new(
+                    gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                    HistorySourceLayout::SingleNdjson,
+                    &claude_history,
+                )
+                .unwrap(),
+                NativeHistoryRoot::new(
+                    gate4agent_types::AdapterId::new("qwen-code").unwrap(),
+                    HistorySourceLayout::SingleNdjson,
+                    &qwen_history,
+                )
+                .unwrap(),
+            ],
+            limits,
+        )
+        .unwrap();
+        let mut catalog = NativeSessionCatalogAuthority::new(config);
+        let claude = catalog
+            .catalog(&AgentId::new("claude").unwrap(), &workspace, 1)
+            .unwrap();
+        let qwen = catalog
+            .catalog(&AgentId::new("qwen-code").unwrap(), &workspace, 1)
+            .unwrap();
+
+        assert_eq!(claude.len(), 1);
+        assert_eq!(qwen.len(), 1);
+        let preview = catalog
+            .preview(
+                &AgentId::new("claude").unwrap(),
+                &workspace,
+                &claude[0].selection_id,
+                10,
+            )
+            .unwrap();
+        assert_eq!(preview.session_id, "claude-session");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_catalog_rejects_incomplete_provider_scan() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-native-catalog-incomplete-{}-{unique}",
+            std::process::id(),
+        ));
+        let workspace = root.join("workspace");
+        let history = root.join("history");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+        let cwd = workspace
+            .to_str()
+            .unwrap()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        for index in 0..2 {
+            std::fs::write(
+                history.join(format!("session-{index}.jsonl")),
+                format!(
+                    "{{\"type\":\"user\",\"sessionId\":\"session-{index}\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"question\"}}}}"
+                ),
+            )
+            .unwrap();
+        }
+        let limits = gate4agent_shell_history::NativeHistoryLimits {
+            max_walk_entries: 1,
+            ..gate4agent_shell_history::NativeHistoryLimits::default()
+        };
+        let config = NativeHistoryConfig::with_limits(
+            vec![NativeHistoryRoot::new(
+                gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                HistorySourceLayout::SingleNdjson,
+                &history,
+            )
+            .unwrap()],
+            limits,
+        )
+        .unwrap();
+        let mut catalog = NativeSessionCatalogAuthority::new(config);
+
+        assert_eq!(
+            catalog.catalog(&AgentId::new("claude").unwrap(), &workspace, 10),
+            Err(NativeSessionCatalogError::CatalogUnavailable),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_catalog_initial_window_excludes_older_until_explicit_page() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "gate4agent-native-catalog-window-{}-{unique}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let provider = AgentId::new("claude").unwrap();
+        let mut catalog = NativeSessionCatalogAuthority::new(
+            NativeHistoryConfig::new(Vec::new()).unwrap(),
+        );
+        let spec = catalog.catalog.get(&provider).unwrap().clone();
+        let request = HistoryDiscoveryRequest::from_spec(&spec, None, 2).unwrap();
+        let cwd_key = NativePathKey::from_canonical_root(
+            &std::fs::canonicalize(&workspace).unwrap(),
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let indexed = |id: &str, modified_at_unix_ms| IndexedNativeSession {
+            candidate: HistoryCandidate::new(
+                &request,
+                gate4agent_provider_ports::HistoryCandidateId::new(id).unwrap(),
+                id,
+                Some(modified_at_unix_ms),
+            )
+            .unwrap(),
+            selection_id: id.to_owned(),
+            modified_at_unix_ms: Some(modified_at_unix_ms),
+            cwd_key: Some(cwd_key.clone()),
+            session_id: id.to_owned(),
+            title: Some(id.to_owned()),
+            model: None,
+            project_label: "workspace".to_owned(),
+            provider_session: ProviderSessionIdentity {
+                key: gate4agent_types::ProviderSessionKey::SessionId,
+                id: id.to_owned(),
+                transcript_path: None,
+            },
+        };
+        catalog.indexes.insert(
+            provider.clone(),
+            NativeProviderSessionIndex {
+                refreshed_at: Instant::now(),
+                revision: 1,
+                recent_cutoff_unix_ms: now.saturating_sub(NATIVE_SESSION_RECENT_WINDOW_MS),
+                sessions: vec![
+                    indexed("recent-session", now),
+                    indexed("recent-session-2", now.saturating_sub(1)),
+                    indexed(
+                        "older-session",
+                        now.saturating_sub(NATIVE_SESSION_RECENT_WINDOW_MS + 1),
+                    ),
+                ],
+            },
+        );
+
+        let recent = catalog
+            .catalog_initial_for_workspace(
+                &provider,
+                &workspace,
+                &[workspace.clone()],
+                1,
+            )
+            .unwrap();
+        let older = catalog
+            .catalog_page_for_workspace(
+                &provider,
+                &workspace,
+                &[workspace.clone()],
+                NativeSessionCatalogWindow::Older,
+                recent.revision,
+                recent.cutoff_unix_ms,
+                None,
+                64,
+            )
+            .unwrap();
+
+        assert_eq!(recent.entries.len(), 1);
+        assert_eq!(recent.entries[0].session_id, "recent-session");
+        assert_eq!(recent.recent_total_count, 2);
+        assert_eq!(recent.older_total_count, 1);
+        assert_eq!(recent.next_after_selection_id.as_deref(), Some("recent-session"));
+        let next = catalog
+            .catalog_page_for_workspace(
+                &provider,
+                &workspace,
+                &[workspace.clone()],
+                NativeSessionCatalogWindow::Recent,
+                recent.revision,
+                recent.cutoff_unix_ms,
+                recent.next_after_selection_id.as_deref(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(next.entries[0].session_id, "recent-session-2");
+        assert_eq!(next.next_after_selection_id, None);
+        assert_eq!(older.entries.len(), 1);
+        assert_eq!(older.entries[0].session_id, "older-session");
+        assert_eq!(
+            catalog.catalog_page_for_workspace(
+                &provider,
+                &workspace,
+                &[workspace.clone()],
+                NativeSessionCatalogWindow::Recent,
+                recent.revision + 1,
+                recent.cutoff_unix_ms,
+                None,
+                1,
+            ),
+            Err(NativeSessionCatalogError::StaleCatalog),
+        );
+        assert_eq!(
+            catalog.catalog_page_for_workspace(
+                &provider,
+                &workspace,
+                &[workspace.clone()],
+                NativeSessionCatalogWindow::Recent,
+                recent.revision,
+                recent.cutoff_unix_ms + 1,
+                None,
+                1,
+            ),
+            Err(NativeSessionCatalogError::StaleCatalog),
+        );
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn unregistered_catalog_uses_revision_bound_opaque_groups_for_same_basename() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-native-external-groups-{}-{unique}",
+            std::process::id(),
+        ));
+        let first = root.join("private-a").join("shared");
+        let second = root.join("private-b").join("shared");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let provider = AgentId::new("claude").unwrap();
+        let mut catalog = NativeSessionCatalogAuthority::new(
+            NativeHistoryConfig::new(Vec::new()).unwrap(),
+        );
+        let spec = catalog.catalog.get(&provider).unwrap().clone();
+        let request = HistoryDiscoveryRequest::from_spec(&spec, None, 2).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let indexed = |id: &str, cwd: &Path| IndexedNativeSession {
+            candidate: HistoryCandidate::new(
+                &request,
+                gate4agent_provider_ports::HistoryCandidateId::new(id).unwrap(),
+                id,
+                Some(now),
+            )
+            .unwrap(),
+            selection_id: id.to_owned(),
+            modified_at_unix_ms: Some(now),
+            cwd_key: Some(
+                NativePathKey::from_declared_cwd(cwd.to_str().unwrap()).unwrap(),
+            ),
+            session_id: id.to_owned(),
+            title: None,
+            model: None,
+            project_label: "shared".to_owned(),
+            provider_session: ProviderSessionIdentity {
+                key: gate4agent_types::ProviderSessionKey::SessionId,
+                id: id.to_owned(),
+                transcript_path: None,
+            },
+        };
+        catalog.indexes.insert(
+            provider.clone(),
+            NativeProviderSessionIndex {
+                refreshed_at: Instant::now(),
+                revision: 1,
+                recent_cutoff_unix_ms: now.saturating_sub(NATIVE_SESSION_RECENT_WINDOW_MS),
+                sessions: vec![indexed("session-a", &first), indexed("session-b", &second)],
+            },
+        );
+
+        let page = catalog
+            .catalog_initial_for_scope(
+                &provider,
+                NativeSessionCatalogScope::Unregistered,
+                None,
+                &[],
+                64,
+            )
+            .unwrap();
+        let groups = page
+            .entries
+            .iter()
+            .map(|entry| entry.external_group.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].display_name, "shared");
+        assert_eq!(groups[1].display_name, "shared");
+        assert_ne!(groups[0].group_id, groups[1].group_id);
+        assert!(groups.iter().all(|group| group.group_id.starts_with("external-")));
+        assert!(groups.iter().all(|group| !group.group_id.contains("private")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_catalog_revision_changes_only_when_locator_metadata_changes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-native-catalog-revision-{}-{unique}",
+            std::process::id(),
+        ));
+        let workspace = root.join("workspace");
+        let history = root.join("history");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+        let cwd = workspace.to_str().unwrap().replace('\\', "\\\\");
+        let transcript = |title: &str| {
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"revision-session\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"{title}\"}}}}"
+            )
+        };
+        let path = history.join("revision-session.jsonl");
+        std::fs::write(&path, transcript("first title")).unwrap();
+        let config = NativeHistoryConfig::new(vec![
+            NativeHistoryRoot::new(
+                gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                HistorySourceLayout::SingleNdjson,
+                &history,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let provider = AgentId::new("claude").unwrap();
+        let mut catalog = NativeSessionCatalogAuthority::new(config);
+
+        let first = catalog
+            .catalog_initial_for_workspace(&provider, &workspace, &[workspace.clone()], 64)
+            .unwrap();
+        catalog.indexes.get_mut(&provider).unwrap().refreshed_at =
+            Instant::now() - NATIVE_SESSION_INDEX_REFRESH_INTERVAL;
+        let unchanged = catalog
+            .catalog_initial_for_workspace(&provider, &workspace, &[workspace.clone()], 64)
+            .unwrap();
+        assert_eq!(unchanged.revision, first.revision);
+
+        std::fs::write(&path, transcript("changed title")).unwrap();
+        catalog.indexes.get_mut(&provider).unwrap().refreshed_at =
+            Instant::now() - NATIVE_SESSION_INDEX_REFRESH_INTERVAL;
+        let changed = catalog
+            .catalog_initial_for_workspace(&provider, &workspace, &[workspace.clone()], 64)
+            .unwrap();
+        assert_ne!(changed.revision, first.revision);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_catalog_high_cardinality_nested_worktree_uses_deepest_owner() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gate4agent-native-catalog-worktree-owner-{}-{unique}",
+            std::process::id(),
+        ));
+        let parent = root.join("workspace");
+        let worktree = parent.join("linked-worktree");
+        let history = root.join("central-history");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+        let cwd = worktree
+            .to_str()
+            .unwrap()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        std::fs::write(
+            history.join("worktree-session.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"worktree-session\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"question\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"worktree-session\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"answer\"}}}}"
+            ),
+        )
+        .unwrap();
+        let parent_cwd = parent
+            .to_str()
+            .unwrap()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        std::fs::write(
+            history.join("parent-session.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"parent-session\",\"cwd\":\"{parent_cwd}\",\"message\":{{\"content\":\"parent question\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"parent-session\",\"cwd\":\"{parent_cwd}\",\"message\":{{\"content\":\"parent answer\"}}}}"
+            ),
+        )
+        .unwrap();
+        for index in 0..1_100 {
+            std::fs::write(
+                history.join(format!("child-session-{index:04}.jsonl")),
+                format!(
+                    "{{\"type\":\"user\",\"sessionId\":\"child-session-{index:04}\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"child question\"}}}}\n\
+                     {{\"type\":\"assistant\",\"sessionId\":\"child-session-{index:04}\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":\"child answer\"}}}}"
+                ),
+            )
+            .unwrap();
+        }
+
+        let config = NativeHistoryConfig::new(vec![
+            NativeHistoryRoot::new(
+                gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                HistorySourceLayout::SingleNdjson,
+                &history,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let registered = vec![parent.clone(), worktree.clone()];
+        let mut catalog = NativeSessionCatalogAuthority::new(config);
+        let parent_entries = catalog
+            .catalog_for_workspace(
+                &AgentId::new("claude").unwrap(),
+                &parent,
+                &registered,
+                1,
+            )
+            .unwrap();
+        let worktree_entries = catalog
+            .catalog_for_workspace(
+                &AgentId::new("claude").unwrap(),
+                &worktree,
+                &registered,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(parent_entries.len(), 1);
+        assert_eq!(parent_entries[0].session_id, "parent-session");
+        assert_eq!(worktree_entries.len(), 10);
+        assert_eq!(
+            catalog.preview_for_workspace(
+                &AgentId::new("claude").unwrap(),
+                &parent,
+                &registered,
+                &worktree_entries[0].selection_id,
+                10,
+            ),
+            Err(NativeSessionPreviewError::SessionNotFound),
+        );
+        let preview = catalog
+            .preview_for_workspace(
+                &AgentId::new("claude").unwrap(),
+                &worktree,
+                &registered,
+                &worktree_entries[0].selection_id,
+                10,
+            )
+            .unwrap();
+        assert_eq!(preview.session_id, worktree_entries[0].session_id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn runtime_dispatcher_rejects_raw_semantic_prompt_before_worker_dispatch() {
@@ -1680,10 +3562,167 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn pty_hook_spawn_attaches_route_environment_without_identity_authority() {
+        let catalog = AgentRegistry::new([hook_posting_agent_spec()]).unwrap();
+        let (_, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        runtime
+            .start_hook_ingress(HookIngressConfig::default())
+            .await
+            .unwrap();
+        let hook_monitoring_policy =
+            ProviderRuntimePolicy::new(true, true, true, false, false).unwrap();
+        assert!(!hook_monitoring_policy.provider_session_identity);
+        let spawn = |operation_id, instance_id, agent_id, transport, runtime_policy| {
+            EffectEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: OperationId(operation_id),
+                instance_id: AgentInstanceId(instance_id),
+                generation: SessionGeneration(1),
+                effect: ControlEffect::Spawn {
+                    agent_id: AgentId::new(agent_id).unwrap(),
+                    transport,
+                    runtime_policy,
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize { rows: 24, columns: 80 },
+                        initial_prompt: None,
+                        session_options: None,
+                    },
+                },
+            }
+        };
+
+        let hook_spawn = spawn(
+            10,
+            10,
+            HOOK_POSTING_FIXTURE_ID,
+            TransportKind::Pty,
+            hook_monitoring_policy,
+        );
+        let overlay = runtime
+            .effects
+            .compose_spawn_overlay(&hook_spawn)
+            .unwrap();
+        let environment_keys = overlay
+            .environment
+            .iter()
+            .map(|mutation| mutation.key.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(overlay.environment.len(), 5);
+        for key in [
+            HOOK_PORT_ENV,
+            HOOK_TOKEN_ENV,
+            HOOK_ROUTE_ENV,
+            HOOK_URL_ENV,
+            HOOK_VERSION_ENV,
+        ] {
+            assert!(environment_keys.contains(&key), "missing hook environment key {key}");
+        }
+        assert!(overlay
+            .environment
+            .iter()
+            .all(|mutation| mutation.value.is_some()));
+        assert_eq!(runtime.active_hook_routes(), 1);
+
+        runtime.effects.remove_hook_route(&hook_spawn);
+        assert_eq!(runtime.active_hook_routes(), 0);
+
+        let non_pty_hook_spawn = spawn(
+            11,
+            11,
+            HOOK_POSTING_FIXTURE_ID,
+            TransportKind::Pipe,
+            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+        );
+        assert!(runtime
+            .effects
+            .compose_spawn_overlay(&non_pty_hook_spawn)
+            .unwrap()
+            .environment
+            .is_empty());
+        assert_eq!(runtime.active_hook_routes(), 0);
+
+        runtime.stop_hook_ingress().await;
+
+        let raw_pty_without_hook = spawn(
+            12,
+            12,
+            CONTROL_FIXTURE_ID,
+            TransportKind::Pty,
+            ProviderRuntimePolicy::raw_pty(),
+        );
+        let no_hook_catalog = AgentRegistry::new([interactive_agent_spec()]).unwrap();
+        let (_, mut no_hook_runtime) =
+            NativeRuntime::new(no_hook_catalog, NativeRuntimeConfig::default());
+        no_hook_runtime
+            .start_hook_ingress(HookIngressConfig::default())
+            .await
+            .unwrap();
+        assert!(no_hook_runtime
+            .effects
+            .compose_spawn_overlay(&raw_pty_without_hook)
+            .unwrap()
+            .environment
+            .is_empty());
+        assert_eq!(no_hook_runtime.active_hook_routes(), 0);
+
+        no_hook_runtime.stop_hook_ingress().await;
+    }
+
     #[test]
-    fn runtime_policy_requires_identity_and_resume_before_spawn_resume() {
+    fn qwen_dual_output_overlay_is_exactly_pty_only_and_hook_independent() {
+        let catalog = builtin_registry().clone();
+        let (_, runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let spawn = |operation_id, instance_id, agent_id, transport| EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: OperationId(operation_id),
+            instance_id: AgentInstanceId(instance_id),
+            generation: SessionGeneration(1),
+            effect: ControlEffect::Spawn {
+                agent_id: AgentId::new(agent_id).unwrap(),
+                transport,
+                runtime_policy: ProviderRuntimePolicy::raw_pty(),
+                request: StartRequest {
+                    working_directory: ".".to_owned(),
+                    terminal_size: TerminalSize { rows: 24, columns: 80 },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        };
+
+        let qwen_pty = runtime
+            .effects
+            .compose_spawn_overlay(&spawn(21, 21, "qwen-code", TransportKind::Pty))
+            .unwrap();
+        assert!(qwen_pty.environment.is_empty());
+        let mut sidecar_args = Vec::new();
+        qwen_pty
+            .qwen_sidecar
+            .as_ref()
+            .unwrap()
+            .append_launch_arguments(&mut sidecar_args);
+        assert_eq!(sidecar_args.len(), 2);
+        assert_eq!(sidecar_args[0], OsString::from("--json-file"));
+        assert!(sidecar_args[1].to_string_lossy().ends_with("events.jsonl"));
+
+        let qwen_pipe = runtime
+            .effects
+            .compose_spawn_overlay(&spawn(22, 22, "qwen-code", TransportKind::Pipe))
+            .unwrap();
+        assert!(qwen_pipe.qwen_sidecar.is_none());
+        let codex_pty = runtime
+            .effects
+            .compose_spawn_overlay(&spawn(23, 23, "codex", TransportKind::Pty))
+            .unwrap();
+        assert!(codex_pty.qwen_sidecar.is_none());
+    }
+
+    #[test]
+    fn runtime_policy_admits_raw_native_resume_without_prompt_only() {
         let raw = ProviderRuntimePolicy::raw_pty();
-        let effect = ControlEffect::SpawnResume {
+        let raw_resume = ControlEffect::SpawnResume {
             agent_id: AgentId::new("unknown-provider").unwrap(),
             transport: TransportKind::Pty,
             provider_session: gate4agent_types::ProviderSessionIdentity {
@@ -1699,8 +3738,25 @@ mod tests {
             },
         };
 
-        assert!(validate_effect_runtime_policy(&effect)
+        assert!(validate_effect_runtime_policy(&raw_resume).is_ok());
+
+        let resume_with_prompt = ControlEffect::SpawnResume {
+            agent_id: AgentId::new("unknown-provider").unwrap(),
+            transport: TransportKind::Pty,
+            provider_session: gate4agent_types::ProviderSessionIdentity {
+                key: gate4agent_types::ProviderSessionKey::SessionId,
+                id: "session-1".to_owned(),
+                transcript_path: None,
+            },
+            runtime_policy: raw,
+            request: ResumeLaunchRequest {
+                working_directory: ".".to_owned(),
+                terminal_size: gate4agent_types::TerminalSize { rows: 24, columns: 80 },
+                initial_prompt: Some("must-not-run".to_owned()),
+            },
+        };
+        assert!(validate_effect_runtime_policy(&resume_with_prompt)
             .unwrap_err()
-            .contains("ProviderSessionIdentity"));
+            .contains("SemanticReadiness"));
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "gate4agent-observation-api"
+version = "0.2.37"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gate4agent_observation_api"
+
+[dependencies]
+gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+gate4agent-observation-protocol = { path = "../gate4agent-observation-protocol" }
+gate4agent-types = { path = "../gate4agent-types" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

@@ -11,7 +11,9 @@ pub use auth::{
     auth_proof, local_hmac_sha256, negotiated_auth_proof, proofs_match, random_incarnation_id,
     random_nonce, AuthDirection,
 };
-pub use client::{LocalNodeClient, NodeClientError};
+pub use client::{
+    LocalNodeClient, LocalSessionHarnessMcpClient, LocalSessionHarnessMcpError, NodeClientError,
+};
 #[cfg(windows)]
 pub type NamedPipeNodeClient = LocalNodeClient;
 #[cfg(windows)]

@@ -130,6 +130,21 @@ pub enum RateLimitType {
     Unknown,
 }
 
+/// Exact current context-window usage reported atomically by a structured provider.
+///
+/// The five segment fields are normalized and must sum exactly to `used_tokens`.
+/// `used_tokens` may exceed `capacity_tokens`; callers must not clamp provider facts.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextWindowUsage {
+    pub uncached_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub unattributed_tokens: u64,
+    pub used_tokens: u64,
+    pub capacity_tokens: u64,
+}
+
 /// Unified event type produced by both PTY and pipe transports.
 ///
 /// Consumers subscribe to a `broadcast::Receiver<AgentEvent>` and
@@ -177,6 +192,8 @@ pub enum AgentEvent {
         context_window: Option<u64>,
         is_cumulative: bool,
     },
+    /// Exact current context-window usage from a structured provider event.
+    ContextWindowUsage { usage: ContextWindowUsage },
     /// Session ended with final result.
     SessionEnd { result: String, cost_usd: Option<f64>, is_error: bool },
 

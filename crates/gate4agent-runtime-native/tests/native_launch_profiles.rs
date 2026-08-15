@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gate4agent_catalog::{AgentRegistry, EnvMutation};
+use gate4agent_catalog::{builtin_registry, AgentRegistry, EnvMutation};
 use gate4agent_runtime_native::{
     HookIngressConfig, NativeChildEnvironmentResolveError, NativeChildEnvironmentResolver,
     NativeInstanceLaunchOverlay, NativeLaunchEnvironmentOverlay, NativeLaunchProfile,
     NativeLaunchProfileControl, NativeLaunchProfileError, NativeLaunchProfileId, NativeRuntime,
-    NativeRuntimeConfig,
+    NativeRuntimeConfig, OneShotSessionPersistence,
     ZAI_GLM_ANTHROPIC_BASE_URL, ZAI_GLM_CLAUDE_OPTIONAL_ENV_KEYS,
     ZAI_GLM_CLAUDE_OWNED_ENV_KEYS, ZAI_GLM_CLAUDE_PROFILE, ZAI_GLM_CLAUDE_PROFILE_ID,
     ZAI_GLM_CLAUDE_PROFILE_REVISION,
@@ -520,6 +520,52 @@ fn native_launch_profile_control_clear_and_remove_semantics_are_linearizable() {
     assert_eq!(runtime.remove_native_launch_profile(&profile_id()), Ok(true));
 }
 
+#[test]
+fn persistent_one_shot_profile_requires_exact_codex_pipe_binding() {
+    let persistent_claude = NativeLaunchProfile::new(
+        profile_id(),
+        AgentId::new("claude").unwrap(),
+        TransportKind::Pipe,
+        vec![OsString::from(PROFILE_SENTINEL)],
+        Arc::new(EmptyResolver),
+    )
+    .unwrap()
+    .with_one_shot_session_persistence(OneShotSessionPersistence::Persist)
+    .err()
+    .expect("persistent Claude Pipe profile must fail closed");
+    assert_eq!(
+        persistent_claude,
+        NativeLaunchProfileError::OneShotSessionPersistenceBindingMismatch
+    );
+
+    let persistent_codex_pty = NativeLaunchProfile::new(
+        profile_id(),
+        AgentId::new("codex").unwrap(),
+        TransportKind::Pty,
+        vec![OsString::from(PROFILE_SENTINEL)],
+        Arc::new(EmptyResolver),
+    )
+    .unwrap()
+    .with_one_shot_session_persistence(OneShotSessionPersistence::Persist)
+    .err()
+    .expect("persistent Codex PTY profile must fail closed");
+    assert_eq!(
+        persistent_codex_pty,
+        NativeLaunchProfileError::OneShotSessionPersistenceBindingMismatch
+    );
+
+    assert!(NativeLaunchProfile::new(
+        profile_id(),
+        AgentId::new("codex").unwrap(),
+        TransportKind::Pipe,
+        vec![OsString::from(PROFILE_SENTINEL)],
+        Arc::new(EmptyResolver),
+    )
+    .unwrap()
+    .with_one_shot_session_persistence(OneShotSessionPersistence::Persist)
+    .is_ok());
+}
+
 #[tokio::test]
 async fn native_launch_profile_revalidates_resolver_output_before_spawn() {
     let registry = AgentRegistry::new([hook_posting_agent_spec()]).expect("fixture registry");
@@ -995,6 +1041,113 @@ async fn native_launch_profile_control_selects_before_spawn_for_exact_one_shot_p
             ..
         } if text == "profile=profile-value-1;fixture-one-shot:fixture prompt"
     )));
+}
+
+#[tokio::test]
+async fn persistent_codex_pipe_policy_reaches_the_exact_one_shot_spawn() {
+    let mut spec = one_shot_agent_spec();
+    spec.id = AgentId::new("codex").unwrap();
+    let binding = builtin_registry()
+        .get_by_id("codex")
+        .expect("built-in Codex spec")
+        .capabilities
+        .adapters
+        .one_shot
+        .clone()
+        .expect("built-in Codex one-shot binding");
+    spec.capabilities.adapters.one_shot = Some(binding.clone());
+    spec.capabilities
+        .transports
+        .pipe
+        .as_mut()
+        .expect("one-shot fixture Pipe transport")
+        .adapter = binding;
+
+    let (handle, mut runtime) = NativeRuntime::new(
+        AgentRegistry::new([spec]).expect("Codex one-shot fixture registry"),
+        NativeRuntimeConfig::default(),
+    );
+    let resolver_calls = Arc::new(AtomicUsize::new(0));
+    runtime
+        .upsert_native_launch_profile(
+            NativeLaunchProfile::new(
+                profile_id(),
+                AgentId::new("codex").unwrap(),
+                TransportKind::Pipe,
+                vec![
+                    OsString::from(PROFILE_SENTINEL),
+                    OsString::from(REMOVE_SENTINEL),
+                    OsString::from(CHILD_SENTINEL),
+                ],
+                Arc::new(SentinelResolver {
+                    generation: Arc::new(AtomicUsize::new(1)),
+                    calls: Arc::clone(&resolver_calls),
+                }),
+            )
+            .unwrap()
+            .with_one_shot_session_persistence(OneShotSessionPersistence::Persist)
+            .unwrap(),
+        )
+        .unwrap();
+    let instance_id = AgentInstanceId(8403);
+    runtime
+        .select_native_launch_profile(instance_id, profile_id())
+        .unwrap();
+    handle
+        .dispatch(command(
+            80,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new("codex").unwrap(),
+                transport: TransportKind::Pipe,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            81,
+            ControlCommand::Start {
+                instance_id,
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: Some("must not spawn".to_owned()),
+                    session_options: None,
+                },
+            },
+        ))
+        .unwrap();
+
+    drive_until(&mut runtime, |_| {
+        handle.snapshot().sessions.iter().any(|session| {
+            session.instance_id == instance_id
+                && matches!(session.status, SessionStatus::Failed { .. })
+        })
+    })
+    .await;
+    let failure = handle
+        .snapshot()
+        .sessions
+        .iter()
+        .find(|session| session.instance_id == instance_id)
+        .and_then(|session| match &session.status {
+            SessionStatus::Failed { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("persistent launch override must fail before spawn");
+    assert_eq!(
+        failure,
+        "persistent one-shot sessions do not allow a launch override"
+    );
+    assert_eq!(resolver_calls.load(Ordering::Acquire), 1);
+    assert_eq!(runtime.active_native_sessions(), 0);
 }
 
 #[tokio::test]

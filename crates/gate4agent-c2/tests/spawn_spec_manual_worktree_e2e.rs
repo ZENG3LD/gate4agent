@@ -307,6 +307,8 @@ fn spawn_spec(
             worktree_id: Some(worktree_id),
         },
         profile_id: SpawnProfileId::new("default").unwrap(),
+        expected_profile_revision:
+            gate4agent_node::protocol::SpawnProfileRevision::new("builtin-v1").unwrap(),
         overrides: SpawnOverrides {
             provider: SpawnOverride::Set {
                 value: agent("claude"),

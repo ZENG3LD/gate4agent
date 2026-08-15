@@ -1,8 +1,9 @@
 use crate::git_worktree::{paths_equal, validate_managed_allocation_root};
 use crate::protocol::{
-    ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
-    ManagedWorktreeLeaseState, ManagedWorktreeRetention, NodeIncarnationId, SessionRecordId,
-    WorktreeProfileId, WorktreeProfileRevision, WorkspaceId, MAX_MANAGED_WORKTREE_LEASES,
+    GitObjectId, ManagedWorktreeCleanupFailure, ManagedWorktreeGitScope,
+    ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState,
+    ManagedWorktreeRetention, NodeIncarnationId, SessionRecordId, WorktreeProfileId,
+    WorktreeProfileRevision, WorkspaceId, MAX_MANAGED_WORKTREE_LEASES,
 };
 use gate4agent_node_wire::random_nonce;
 use gate4agent_types::{AgentInstanceId, SessionGeneration};
@@ -260,6 +261,27 @@ impl ManagedWorktreeRegistry {
 
     pub(crate) fn active_records(&self) -> impl Iterator<Item = &ManagedWorktreeLeaseRecord> {
         self.leases.values()
+    }
+
+    pub(crate) fn git_scope(
+        &self,
+        workspace_id: &WorkspaceId,
+        branch: Option<&str>,
+    ) -> Option<ManagedWorktreeGitScope> {
+        let lease = self.leases.values().find(|lease| {
+            &lease.workspace_id == workspace_id && branch == Some(lease.branch.as_str())
+        })?;
+        if lease.source_workspace_id == *workspace_id || !lease.has_holders() {
+            return None;
+        }
+        Some(ManagedWorktreeGitScope {
+            lease_id: lease.lease_id.clone(),
+            source_workspace_id: lease.source_workspace_id.clone(),
+            branch: lease.branch.clone(),
+            base_commit: GitObjectId::new(lease.base_commit.clone()).ok()?,
+            active_session_count: u16::try_from(lease.session_holders.len()).unwrap_or(u16::MAX),
+            managed_record_count: u16::try_from(lease.record_holders.len()).unwrap_or(u16::MAX),
+        })
     }
 
     pub(crate) fn allocate(
@@ -596,5 +618,33 @@ mod tests {
         let record = registry.get(&lease_id).unwrap();
         assert!(exact_owned_worktree(record, "C:/trees/a", Some("gate4agent/a"), "new-head"));
         assert!(!exact_created_worktree(record, "C:/trees/a", Some("gate4agent/a"), "new-head"));
+    }
+
+    #[test]
+    fn managed_git_scope_requires_exact_active_workspace_and_branch() {
+        let mut record = lease("mw-a", "managed-a", "C:/trees/a", "gate4agent/a");
+        record.session_holders.push(ManagedWorktreeSessionHolder {
+            incarnation_id: NodeIncarnationId::from_bytes([
+                1;
+                crate::protocol::NODE_INCARNATION_ID_BYTES
+            ]),
+            instance_id: AgentInstanceId(7),
+            generation: SessionGeneration(2),
+        });
+        record.record_holders.push(SessionRecordId::new("sr-a").unwrap());
+        let registry = ManagedWorktreeRegistry::from_records(vec![record], Vec::new()).unwrap();
+        let workspace_id = WorkspaceId::new("managed-a").unwrap();
+        let scope = registry
+            .git_scope(&workspace_id, Some("gate4agent/a"))
+            .unwrap();
+        assert_eq!(scope.lease_id.as_str(), "mw-a");
+        assert_eq!(scope.source_workspace_id.as_str(), "source");
+        assert_eq!(scope.branch, "gate4agent/a");
+        assert_eq!(scope.active_session_count, 1);
+        assert_eq!(scope.managed_record_count, 1);
+        assert!(registry.git_scope(&workspace_id, Some("gate4agent/b")).is_none());
+        assert!(registry
+            .git_scope(&WorkspaceId::new("managed-b").unwrap(), Some("gate4agent/a"))
+            .is_none());
     }
 }

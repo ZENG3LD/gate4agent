@@ -111,6 +111,10 @@ pub struct AgentCapabilities {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentAdapterCapabilities {
+    /// Structured observation emitted beside an interactive PTY. This is an
+    /// adapter binding only and does not declare Pipe as a launch transport.
+    #[serde(default)]
+    pub pty_sidecar: Option<AdapterBinding>,
     #[serde(default)]
     pub hook: Option<AdapterBinding>,
     /// Explicit host-level install/status/remove support for provider Hook

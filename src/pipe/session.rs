@@ -372,6 +372,7 @@ pub(crate) fn map_cli_event(event: CliEvent) -> AgentEvent {
             context_window,
             is_cumulative,
         },
+        CliEvent::ContextWindowUsage { usage } => AgentEvent::ContextWindowUsage { usage },
         CliEvent::SessionEnd {
             result,
             cost_usd,
@@ -405,7 +406,25 @@ fn uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::ContextWindowUsage;
     use crate::pipe::cli::NdjsonParser;
+
+    #[test]
+    fn exact_context_usage_maps_without_becoming_turn_usage() {
+        let usage = ContextWindowUsage {
+            uncached_input_tokens: 70,
+            cache_read_tokens: 20,
+            cache_write_tokens: 0,
+            output_tokens: 10,
+            unattributed_tokens: 5,
+            used_tokens: 105,
+            capacity_tokens: 100,
+        };
+        assert!(matches!(
+            map_cli_event(CliEvent::ContextWindowUsage { usage: usage.clone() }),
+            AgentEvent::ContextWindowUsage { usage: mapped } if mapped == usage
+        ));
+    }
 
     /// A fake parser that never emits SessionEnd.
     struct NeverEndsParser;

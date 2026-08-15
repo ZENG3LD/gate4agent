@@ -7,7 +7,10 @@ use gate4agent_types::{AdapterBinding, AdapterFamily, AgentId, AgentSpec};
 use std::error::Error;
 use thiserror::Error;
 
-pub const HISTORY_DISCOVERY_LIMIT_MAX: u16 = 256;
+/// Internal provider-history discovery ceiling. Product wire requests remain
+/// independently bounded; Node uses the wider ceiling so workspace filtering
+/// happens before the caller's page limit.
+pub const HISTORY_DISCOVERY_LIMIT_MAX: u16 = 1_024;
 pub const HISTORY_CANDIDATE_ID_MAX_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -22,7 +22,8 @@ pub use capability::{
     CAPABILITY_MODELS_MAX, CAPABILITY_MODEL_ID_MAX_BYTES, CAPABILITY_MODEL_LABEL_MAX_BYTES,
 };
 pub use control::{
-    ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
+    ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ContextWindowUsage,
+    ControlCommand, ControlEffect,
     ControlError, ControlEvent, ControlEventKind, ControlHealth, ControlObservation,
     ControlSnapshot, EffectEnvelope, ForegroundAuthority, ForegroundProcess, ForegroundProcessKind,
     ForegroundRequirement, ForegroundSnapshot, ObservationEnvelope, ObservationIgnoredReason,
@@ -44,12 +45,20 @@ pub use control::{
 };
 pub use executable::normalize_executable_name;
 pub use history::{
-    validate_candidate_id, validate_history_error, HistoryCandidateSummary, HistoryMessageRecord,
+    validate_candidate_id, validate_history_error, validate_native_session_id,
+    HistoryCandidateSummary, HistoryMessageRecord,
     HistoryMessageRole, HistoryOperation, HistoryQuery, HistorySessionRecord, HistorySnapshot,
+    NativeSessionCatalogEntry, NativeSessionCatalogPage, NativeSessionCatalogSummary,
+    NativeSessionCatalogScope, NativeSessionCatalogWindow, NativeSessionExternalGroup,
+    NativeSessionExternalGroupKind,
+    NativeSessionPreview, NativeSessionPreviewMessage,
+    SessionRecordPreview,
     HistoryValidationError, PendingHistoryOperation, HISTORY_CANDIDATE_ID_MAX_BYTES,
     HISTORY_DISCOVERY_LIMIT_MAX, HISTORY_ERROR_MAX_BYTES, HISTORY_MESSAGES_MAX,
     HISTORY_MESSAGE_MAX_BYTES, HISTORY_MODEL_MAX_BYTES, HISTORY_SESSION_ID_MAX_BYTES,
-    HISTORY_TITLE_MAX_BYTES,
+    HISTORY_TITLE_MAX_BYTES, NATIVE_SESSION_CATALOG_LIMIT_MAX,
+    NATIVE_SESSION_EXTERNAL_GROUP_ID_MAX_BYTES, NATIVE_SESSION_EXTERNAL_GROUP_LABEL_MAX_BYTES,
+    NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX, NATIVE_SESSION_PREVIEW_TEXT_MAX_BYTES,
 };
 pub use id::{AgentId, AgentIdError};
 pub use input::{

@@ -21,6 +21,7 @@ pub(crate) fn discover_root(
     root_slot: usize,
     limits: NativeHistoryLimits,
     requested_limit: usize,
+    report_candidate_overflow: bool,
 ) -> DiscoveryResult {
     if root.layout == HistorySourceLayout::ReadOnlySqliteProjection {
         return sqlite::discover_sessions(root, root_slot, limits, requested_limit);
@@ -62,6 +63,7 @@ pub(crate) fn discover_root(
     let candidate_limit = requested_limit.min(limits.max_candidates).max(1);
     let mut entries_seen = 0usize;
     let mut limit_reported = false;
+    let mut candidate_limit_reported = false;
     while let Some((directory, depth)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
@@ -122,6 +124,17 @@ pub(crate) fn discover_root(
                 session_id_hint,
                 modified_at_unix_ms,
             });
+            if report_candidate_overflow
+                && result.candidates.len() > candidate_limit
+                && !candidate_limit_reported
+            {
+                result.issues.push(issue(
+                    root,
+                    root_slot,
+                    NativeHistoryDiscoveryIssueKind::CandidateLimitReached,
+                ));
+                candidate_limit_reported = true;
+            }
             if result.candidates.len() > candidate_limit.saturating_mul(2) {
                 retain_newest(&mut result.candidates, candidate_limit);
             }

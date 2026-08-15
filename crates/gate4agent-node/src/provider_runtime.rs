@@ -41,6 +41,7 @@ struct ProviderStaticCapabilities {
     raw_pty: bool,
     semantic_pty_adapter: bool,
     resume_adapter: bool,
+    pty_sidecar_observation: bool,
 }
 
 impl ProviderRuntimeMonitor {
@@ -60,6 +61,11 @@ impl ProviderRuntimeMonitor {
                                 .pty_adapter
                                 .is_some(),
                             resume_adapter: spec.capabilities.adapters.resume.is_some(),
+                            pty_sidecar_observation: spec
+                                .capabilities
+                                .adapters
+                                .pty_sidecar
+                                .is_some(),
                         },
                     )
                 })
@@ -100,6 +106,23 @@ impl ProviderRuntimeMonitor {
                 Err(ProviderRuntimeAdmissionError::LauncherUnavailable),
             );
         };
+        if static_capabilities.pty_sidecar_observation {
+            let policy = ProviderRuntimePolicy::new(
+                static_capabilities.raw_pty,
+                true,
+                false,
+                false,
+                false,
+            )
+            .expect("catalog-declared PTY sidecar policy is internally valid");
+            return (
+                Some(ProviderRuntimeStatus::raw_passthrough(
+                    provider.clone(),
+                    None,
+                )),
+                Ok(policy),
+            );
+        }
         let mut cache = match self.probe_cache.try_lock() {
             Ok(cache) => cache,
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -157,9 +180,12 @@ pub(crate) fn require_policy(
             policy.semantic_readiness && policy.structured_prompt
         }
         ProviderRuntimeRequirement::Inline => false,
-        ProviderRuntimeRequirement::Resume => {
-            policy.provider_session_identity && policy.semantic_resume
-        }
+        // A provider-native PTY resume is still a raw PTY launch. The durable
+        // session record supplies the exact provider identity and workspace;
+        // the native shell separately requires a declared resume adapter before
+        // it can construct the provider argv. Semantic resume is only needed
+        // when Gate4Agent must also inject a prompt without operator input.
+        ProviderRuntimeRequirement::Resume => policy.raw_pty_lifecycle,
         ProviderRuntimeRequirement::ResumeWithPrompt => {
             policy.provider_session_identity
                 && policy.semantic_resume
@@ -404,6 +430,37 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sidecar_admission_skips_version_probe_and_non_qwen_does_not() {
+        let launcher = std::env::temp_dir().join(format!(
+            "gate4agent-qwen-sidecar-runtime-monitor-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX,
+        ));
+        std::fs::write(&launcher, b"fixture launcher identity").unwrap();
+        let mut qwen = builtin_registry().get_by_id("qwen-code").unwrap().clone();
+        qwen.launch.program = launcher.to_string_lossy().into_owned();
+        let mut grok = builtin_registry().get_by_id("grok").unwrap().clone();
+        grok.launch.program = launcher.to_string_lossy().into_owned();
+        let catalog = AgentRegistry::new([qwen, grok]).unwrap();
+        let monitor = ProviderRuntimeMonitor::new(&catalog);
+        let cache_guard = monitor.probe_cache.lock().unwrap();
+
+        let (qwen_status, qwen_admission) =
+            monitor.evaluate(&AgentId::new("qwen-code").unwrap());
+        assert_eq!(qwen_status.unwrap().mode(), ProviderRuntimeMode::RawPassthrough);
+        assert_eq!(
+            qwen_admission,
+            Ok(ProviderRuntimePolicy::new(true, true, false, false, false).unwrap())
+        );
+        let (grok_status, grok_admission) = monitor.evaluate(&AgentId::new("grok").unwrap());
+        assert!(grok_status.is_none());
+        assert_eq!(grok_admission, Err(ProviderRuntimeAdmissionError::ProbeBusy));
+
+        drop(cache_guard);
+        std::fs::remove_file(launcher).unwrap();
+    }
+
+    #[test]
     fn spawn_admission_fails_bounded_when_probe_is_busy() {
         let launcher = std::env::temp_dir().join(format!(
             "gate4agent-runtime-monitor-busy-{}{}",
@@ -432,6 +489,7 @@ mod tests {
             raw_pty: true,
             semantic_pty_adapter: true,
             resume_adapter: true,
+            pty_sidecar_observation: false,
         };
         let full = policy_from_capability_flags(
             &full_static,
@@ -488,6 +546,20 @@ mod tests {
                 true,
             ),
             ProviderRuntimePolicy::raw_pty(),
+        );
+    }
+
+    #[test]
+    fn raw_pty_admits_provider_native_resume_without_prompt_only() {
+        let raw = ProviderRuntimePolicy::raw_pty();
+
+        assert_eq!(
+            require_policy(raw, ProviderRuntimeRequirement::Resume),
+            Ok(()),
+        );
+        assert_eq!(
+            require_policy(raw, ProviderRuntimeRequirement::ResumeWithPrompt),
+            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
         );
     }
 }

@@ -3,9 +3,11 @@
 use gate4agent_node::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, ClientAuthentication,
     ClientFrame, ClientHello, ClientRole, NodeFailureCode, NodeId, NodeRequest, NodeResponse,
-    RepositoryPath, RequestEnvelope, ServerFrame, WorkspaceFileContent, WorkspaceId,
+    RepositoryPath, RequestEnvelope, ServerFrame, WorkspaceEntryKind, WorkspaceFileContent,
+    WorkspaceId,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
-    MAX_WORKSPACE_FILE_BYTES, NODE_WORKSPACE_FILE_READ_CAPABILITY,
+    MAX_WORKSPACE_FILE_BYTES, NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
+    NODE_WORKSPACE_FILE_READ_CAPABILITY,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
 use gate4agent_node_wire::{
@@ -158,8 +160,150 @@ fn failure_message(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::RepositoryFileNotFound => "repository-file-not-found",
         NodeFailureCode::RepositoryFileNotRegular => "repository-file-not-regular",
         NodeFailureCode::RepositoryPathUnsafe => "repository-path-unsafe",
+        NodeFailureCode::ControllerRequired => "controller-required",
+        NodeFailureCode::RepositoryEntryAlreadyExists => "repository-entry-already-exists",
+        NodeFailureCode::RepositoryParentNotFound => "repository-parent-not-found",
+        NodeFailureCode::RepositoryParentNotDirectory => "repository-parent-not-directory",
         _ => panic!("unexpected test failure code: {code:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_operator_named_pipe_creates_workspace_entries_without_reparse_escape_or_overwrite() {
+    let tree = TestTree::create();
+    let endpoint = endpoint();
+    let token = "workspace-entry-create-token";
+    let server = NodeServer::new_fixture(server_config(&endpoint, token, &tree.root)).unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_task = tokio::spawn(server.run());
+    let mut operator = NamedPipeNodeClient::connect(
+        &endpoint,
+        &node_id(),
+        ClientRole::Operator,
+        token,
+    )
+    .await
+    .unwrap();
+    assert!(operator
+        .hello()
+        .compatibility
+        .as_ref()
+        .unwrap()
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY));
+
+    assert_node_failure(
+        operator
+            .request(NodeRequest::CreateWorkspaceDirectory {
+                workspace_id: workspace_id(),
+                path: repository_path("created"),
+            })
+            .await,
+        NodeFailureCode::ControllerRequired,
+    );
+    assert!(matches!(
+        operator
+            .request(NodeRequest::AcquireController { lease_ms: 5_000 })
+            .await
+            .unwrap(),
+        NodeResponse::Controller { controller: Some(_) },
+    ));
+
+    let NodeResponse::WorkspaceDirectoryCreated { workspace_id: created_workspace, entry } =
+        operator
+            .request(NodeRequest::CreateWorkspaceDirectory {
+                workspace_id: workspace_id(),
+                path: repository_path("created"),
+            })
+            .await
+            .unwrap()
+    else {
+        panic!("directory create returned another response");
+    };
+    assert_eq!(created_workspace, workspace_id());
+    assert_eq!(entry.relative_path, repository_path("created"));
+    assert_eq!(entry.kind, WorkspaceEntryKind::Directory);
+
+    let NodeResponse::WorkspaceFileCreated { file } = operator
+        .request(NodeRequest::CreateWorkspaceFile {
+            workspace_id: workspace_id(),
+            path: repository_path("created/note.txt"),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("file create returned another response");
+    };
+    assert_eq!(file.workspace_id, workspace_id());
+    assert_eq!(file.path, repository_path("created/note.txt"));
+    assert_eq!(
+        file.content,
+        WorkspaceFileContent::Utf8 {
+            text: String::new(),
+            byte_len: 0,
+        },
+    );
+    assert!(file.revision.is_some());
+    assert_eq!(std::fs::read(tree.root.join("created/note.txt")).unwrap(), b"");
+
+    for (request, expected) in [
+        (
+            NodeRequest::CreateWorkspaceFile {
+                workspace_id: workspace_id(),
+                path: repository_path("created/note.txt"),
+            },
+            NodeFailureCode::RepositoryEntryAlreadyExists,
+        ),
+        (
+            NodeRequest::CreateWorkspaceDirectory {
+                workspace_id: workspace_id(),
+                path: repository_path("created"),
+            },
+            NodeFailureCode::RepositoryEntryAlreadyExists,
+        ),
+        (
+            NodeRequest::CreateWorkspaceFile {
+                workspace_id: workspace_id(),
+                path: repository_path("missing/note.txt"),
+            },
+            NodeFailureCode::RepositoryParentNotFound,
+        ),
+        (
+            NodeRequest::CreateWorkspaceFile {
+                workspace_id: workspace_id(),
+                path: repository_path("normal.txt/child.txt"),
+            },
+            NodeFailureCode::RepositoryParentNotDirectory,
+        ),
+        (
+            NodeRequest::CreateWorkspaceFile {
+                workspace_id: workspace_id(),
+                path: repository_path("through-junction/escaped.txt"),
+            },
+            NodeFailureCode::RepositoryPathUnsafe,
+        ),
+    ] {
+        assert_node_failure(operator.request(request).await, expected);
+    }
+    assert!(!tree
+        .root
+        .parent()
+        .unwrap()
+        .join("outside/escaped.txt")
+        .exists());
+    assert!(matches!(
+        operator.request(NodeRequest::Snapshot).await.unwrap(),
+        NodeResponse::Snapshot { .. },
+    ));
+
+    drop(operator);
+    shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("workspace entry create node did not shut down")
+        .expect("workspace entry create node task panicked")
+        .expect("workspace entry create node failed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

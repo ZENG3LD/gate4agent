@@ -1,11 +1,23 @@
 //! Bounded wire contract for the local Gate4Agent node.
 
 pub use gate4agent_types::{
-    AdapterFamily, AdapterId, AgentId, HistoryCandidateSummary, HISTORY_DISCOVERY_LIMIT_MAX,
+    AdapterFamily, AdapterId, AgentId, HistoryCandidateSummary, NativeSessionCatalogScope,
+    NativeSessionCatalogSummary, NativeSessionCatalogWindow, NativeSessionExternalGroup,
+    NativeSessionExternalGroupKind, SessionRecordPreview, HISTORY_DISCOVERY_LIMIT_MAX,
+    NATIVE_SESSION_CATALOG_LIMIT_MAX,
+    NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX,
+};
+pub use gate4agent_observation_protocol::{
+    ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
+    ObservationKindV1, ObservationSourceFamilyV1, ObservationTodoItemV1,
+    ObservationTodoStateV1, ObservationV1,
+};
+pub use gate4agent_harness_api::{
+    HarnessReadHostErrorV1, HarnessReadRequestV1, HarnessReadResponseV1,
 };
 use gate4agent_types::{
-    AgentInstanceId, ControlEvent, ProviderSessionIdentity, SessionGeneration, SessionSnapshot,
-    TerminalControl, TerminalFrame, TerminalSize,
+    AgentInstanceId, ControlEvent, ProviderActivity, ProviderSessionIdentity, SessionGeneration,
+    SessionSnapshot, TerminalControl, TerminalFrame, TerminalSize,
 };
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
@@ -20,7 +32,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-pub const NODE_PROTOCOL_VERSION: u16 = 9;
+pub const NODE_PROTOCOL_VERSION: u16 = 11;
 pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_STATE_SCHEMA_V3: u16 = 3;
@@ -29,16 +41,22 @@ pub const NODE_STATE_SCHEMA_V5: u16 = 5;
 pub const NODE_STATE_SCHEMA_V6: u16 = 6;
 pub const NODE_STATE_SCHEMA_V7: u16 = 7;
 pub const NODE_STATE_SCHEMA_V8: u16 = 8;
+pub const NODE_STATE_SCHEMA_V9: u16 = 9;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
 pub const NODE_WORKSPACE_FILE_READ_CAPABILITY: &str = "workspace-file-read-v1";
+pub const NODE_WORKSPACE_FILE_WRITE_CAPABILITY: &str = "workspace-file-write-v1";
+pub const NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY: &str = "workspace-entry-create-v1";
+pub const NODE_GIT_READ_CAPABILITY: &str = "git-read-v1";
 pub const NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str = "provider-contract-manifest-v1";
 pub const NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str = "provider-runtime-status-v1";
 pub const NODE_PROVIDER_ID_OPEN_CAPABILITY: &str = "provider-id.open-v1";
 pub const NODE_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = "terminal-frame-events-v1";
 pub const NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
     "spawn-spec.defaults-overrides-v1";
+pub const NODE_SPAWN_PROFILE_REVISION_CAPABILITY: &str =
+    "spawn-spec.profile-revision-v1";
 pub const NODE_WORKTREE_SELECTION_CAPABILITY: &str = "worktree-selection-v1";
 pub const NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     "managed-worktree-lifecycle-v1";
@@ -47,6 +65,28 @@ pub const NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
 pub const NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
     "session-bundle-materialization-v1";
 pub const NODE_HISTORY_CONTEXT_PACK_CAPABILITY: &str = "history-context-pack-v1";
+pub const NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY: &str =
+    "standalone-workspace-lifecycle-v1";
+pub const NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY: &str =
+    "provider-session-reference-index-v1";
+pub const NODE_NATIVE_SESSION_CATALOG_CAPABILITY: &str = "native-session-catalog-v2";
+pub const NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY: &str =
+    "native-session-catalog-paging-v2";
+pub const NODE_NATIVE_SESSION_PREVIEW_CAPABILITY: &str = "native-session-preview-v2";
+pub const NODE_NATIVE_SESSION_INDEX_CAPABILITY: &str = "native-session-index-v2";
+pub const NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY: &str = "agent-progress-snapshot-v1";
+pub const NODE_SESSION_TASK_CORRELATION_CAPABILITY: &str = "session-task-correlation-v1";
+pub const NODE_OBSERVATION_EVENTS_CAPABILITY: &str = "observation-events-v1";
+pub const NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY: &str =
+    "observation-managed-target-v1";
+pub const NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY: &str =
+    "observation-workflow-detail-v1";
+pub const NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY: &str =
+    "delivery-bundle-v2-stage-commit";
+pub const NODE_HARNESS_MCP_READ_PROXY_CAPABILITY: &str = "harness-mcp-read-proxy-v1";
+/// Read-only, paged directory browsing using UTF-8 absolute host paths only.
+/// `OpaqueHostPath::UnixBytes` is outside this capability revision.
+pub const CAPABILITY_HOST_DIRECTORY_BROWSE_V1: &str = "host-directory-browse-v1";
 pub const SPAWN_RUNTIME_RAW_PTY_LIFECYCLE: &str = "raw-pty-lifecycle";
 pub const SPAWN_RUNTIME_SEMANTIC_READINESS: &str = "semantic-readiness";
 pub const SPAWN_RUNTIME_STRUCTURED_PROMPT: &str = "structured-prompt";
@@ -63,7 +103,12 @@ pub const MAX_PROVIDER_IDENTITIES: usize = 16;
 pub const MAX_PROVIDER_CONTRACTS: usize = MAX_PROVIDER_IDENTITIES;
 pub const MAX_PROVIDER_RUNTIME_STATUSES: usize = MAX_PROVIDER_IDENTITIES;
 pub const MAX_PROVIDER_ADAPTER_CONTRACTS: usize = 32;
+pub const MAX_AGENT_PROGRESS_ENTRIES: usize = 128;
+pub const MAX_AGENT_PROGRESS_ENTRY_BYTES: usize = 4_096;
+pub const MAX_AGENT_PROGRESS_ACTIVE_TOOL_LABELS: usize = 8;
+pub const MAX_AGENT_PROGRESS_TOOL_LABEL_BYTES: usize = 64;
 pub const NODE_INCARNATION_ID_BYTES: usize = 16;
+pub const TASK_ID_NONCE_BYTES: usize = 12;
 pub const MAX_NODE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_NODE_CLIENT_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_NODE_TEXT_BYTES: usize = 32 * 1024;
@@ -71,6 +116,7 @@ pub const MAX_NODE_TERMINAL_BYTES: usize = 64;
 pub const MAX_SESSION_DISPLAY_NAME_BYTES: usize = 256;
 pub const MAX_SPAWN_PROFILE_ID_BYTES: usize = 64;
 pub const MAX_SPAWN_PROFILE_REVISION_BYTES: usize = 128;
+pub const MAX_SPAWN_PROFILES: usize = 64;
 pub const MAX_SPAWN_ENVIRONMENT_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_BUNDLE_REVISION_BYTES: usize = 128;
 pub const MAX_SPAWN_RESOURCE_ID_BYTES: usize = 128;
@@ -83,10 +129,32 @@ pub const MAX_WORKTREE_PROFILE_ID_BYTES: usize = 64;
 pub const MAX_WORKTREE_PROFILE_REVISION_BYTES: usize = 128;
 pub const MAX_MANAGED_WORKTREE_LEASE_ID_BYTES: usize = 128;
 pub const MAX_MANAGED_WORKTREE_LEASES: usize = 128;
+pub const MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE: usize = 64;
+pub const MAX_LAUNCH_BUNDLES: usize = 128;
 pub const MAX_SPAWN_DEADLINE_MS: u64 = 120_000;
 pub const MAX_WORKSPACE_ROOT_BYTES: usize = gate4agent_types::WORKING_DIRECTORY_MAX_BYTES;
 pub const MAX_REPOSITORY_PATH_BYTES: usize = 1_024;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
+pub const MAX_GIT_HISTORY_COMMITS: u16 = 50;
+pub const MAX_GIT_DIFF_BYTES: usize = 512 * 1024;
+pub const MAX_HOST_DIRECTORY_ENTRIES: usize = 256;
+pub const MAX_HOST_DIRECTORY_DISPLAY_NAME_BYTES: usize = 1_024;
+pub const MAX_DELIVERY_FILES: usize = 128;
+pub const MAX_DELIVERY_FILE_BYTES: usize = 1024 * 1024;
+pub const MAX_DELIVERY_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_DELIVERY_RELATIVE_PATH_BYTES: usize = 512;
+pub const MAX_DELIVERY_CHUNK_RAW_BYTES: usize = 48 * 1024;
+pub const MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES: usize = MAX_DELIVERY_CHUNK_RAW_BYTES;
+pub const MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES: usize =
+    gate4agent_harness_api::HARNESS_READ_REQUEST_MAX_BYTES;
+pub const MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES: usize =
+    gate4agent_harness_api::HARNESS_READ_RESPONSE_MAX_BYTES;
+pub const MAX_HARNESS_MCP_PENDING_CALLS_PER_SESSION: usize = 32;
+pub const MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE: usize = 128;
+pub const MAX_HARNESS_MCP_RESERVATION_TTL_MS: u64 = 120_000;
+pub const MAX_HARNESS_MCP_CALL_DEADLINE_MS: u64 = 3_000;
+pub const MAX_HARNESS_MCP_SPAWN_RELAY_DEADLINE_MS: u64 = 125_000;
+pub const DELIVERY_STAGE_NONCE_BYTES: usize = 16;
 pub const MAX_NODE_HELLO_FRAME_BYTES: usize = 8 * 1024;
 pub const NODE_AUTH_NONCE_BYTES: usize = 32;
 pub const NODE_AUTH_PROOF_BYTES: usize = 32;
@@ -846,7 +914,7 @@ pub enum SpawnRequiredCapabilitiesError {
     Duplicate { capability: CapabilityId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnTarget {
     pub node_id: NodeId,
@@ -855,7 +923,7 @@ pub struct SpawnTarget {
     pub worktree_id: Option<WorkspaceId>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SpawnOverride<T> {
     Inherit,
@@ -914,6 +982,7 @@ pub struct SpawnProfileDefaults {
 pub struct SpawnSpec {
     pub target: SpawnTarget,
     pub profile_id: SpawnProfileId,
+    pub expected_profile_revision: SpawnProfileRevision,
     #[serde(default)]
     pub overrides: SpawnOverrides,
     /// Node-local processing budget. It starts when the authenticated Node accepts the
@@ -1191,6 +1260,202 @@ pub struct ResolvedBundleReceipt {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SpawnProfileSummary {
+    pub id: SpawnProfileId,
+    pub revision: SpawnProfileRevision,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeProfileSummary {
+    pub id: WorktreeProfileId,
+    pub revision: WorktreeProfileRevision,
+    pub retention: ManagedWorktreeRetention,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct WorktreeProfileInventory {
+    pub profiles: Vec<ManagedWorktreeProfileSummary>,
+}
+
+impl<'de> Deserialize<'de> for WorktreeProfileInventory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_bounded_worktree_profiles(deserializer).map(|profiles| Self { profiles })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchInventory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_profiles: Option<Vec<SpawnProfileSummary>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundles: Option<Vec<ResolvedBundleReceipt>>,
+}
+
+impl<'de> Deserialize<'de> for LaunchInventory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireInventory {
+            #[serde(default)]
+            spawn_profiles: Option<BoundedSpawnProfiles>,
+            #[serde(default)]
+            bundles: Option<BoundedLaunchBundles>,
+        }
+
+        let wire = WireInventory::deserialize(deserializer)?;
+        if wire.spawn_profiles.is_none() && wire.bundles.is_none() {
+            return Err(serde::de::Error::custom(
+                "launch inventory must expose at least one negotiated component",
+            ));
+        }
+        Ok(Self {
+            spawn_profiles: wire.spawn_profiles.map(|profiles| profiles.0),
+            bundles: wire.bundles.map(|bundles| bundles.0),
+        })
+    }
+}
+
+struct BoundedSpawnProfiles(Vec<SpawnProfileSummary>);
+
+impl<'de> Deserialize<'de> for BoundedSpawnProfiles {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SpawnProfilesVisitor;
+
+        impl<'de> Visitor<'de> for SpawnProfilesVisitor {
+            type Value = BoundedSpawnProfiles;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "at most {MAX_SPAWN_PROFILES} spawn profiles")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut profiles = Vec::with_capacity(
+                    sequence.size_hint().unwrap_or(0).min(MAX_SPAWN_PROFILES),
+                );
+                while let Some(profile) = sequence.next_element::<SpawnProfileSummary>()? {
+                    if profiles.len() == MAX_SPAWN_PROFILES {
+                        return Err(serde::de::Error::invalid_length(profiles.len() + 1, &self));
+                    }
+                    if profiles.iter().any(|existing: &SpawnProfileSummary| existing.id == profile.id) {
+                        return Err(serde::de::Error::custom(
+                            "launch inventory contains duplicate spawn profile identity",
+                        ));
+                    }
+                    profiles.push(profile);
+                }
+                Ok(BoundedSpawnProfiles(profiles))
+            }
+        }
+
+        deserializer.deserialize_seq(SpawnProfilesVisitor)
+    }
+}
+
+struct BoundedLaunchBundles(Vec<ResolvedBundleReceipt>);
+
+impl<'de> Deserialize<'de> for BoundedLaunchBundles {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LaunchBundlesVisitor;
+
+        impl<'de> Visitor<'de> for LaunchBundlesVisitor {
+            type Value = BoundedLaunchBundles;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "at most {MAX_LAUNCH_BUNDLES} launch bundles")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bundles = Vec::with_capacity(
+                    sequence.size_hint().unwrap_or(0).min(MAX_LAUNCH_BUNDLES),
+                );
+                while let Some(bundle) = sequence.next_element::<ResolvedBundleReceipt>()? {
+                    if bundles.len() == MAX_LAUNCH_BUNDLES {
+                        return Err(serde::de::Error::invalid_length(bundles.len() + 1, &self));
+                    }
+                    if bundles.iter().any(|existing: &ResolvedBundleReceipt| existing.id == bundle.id) {
+                        return Err(serde::de::Error::custom(
+                            "launch inventory contains duplicate bundle identity",
+                        ));
+                    }
+                    bundles.push(bundle);
+                }
+                Ok(BoundedLaunchBundles(bundles))
+            }
+        }
+
+        deserializer.deserialize_seq(LaunchBundlesVisitor)
+    }
+}
+
+fn deserialize_bounded_worktree_profiles<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ManagedWorktreeProfileSummary>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct WorktreeProfilesVisitor;
+
+    impl<'de> Visitor<'de> for WorktreeProfilesVisitor {
+        type Value = Vec<ManagedWorktreeProfileSummary>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE} managed worktree profiles",
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut profiles = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE),
+            );
+            while let Some(profile) = sequence.next_element::<ManagedWorktreeProfileSummary>()? {
+                if profiles.len() == MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE {
+                    return Err(serde::de::Error::invalid_length(profiles.len() + 1, &self));
+                }
+                if profiles.iter().any(|existing: &ManagedWorktreeProfileSummary| existing.id == profile.id) {
+                    return Err(serde::de::Error::custom(
+                        "workspace inventory contains duplicate managed worktree profile identity",
+                    ));
+                }
+                profiles.push(profile);
+            }
+            Ok(profiles)
+        }
+    }
+
+    deserializer.deserialize_seq(WorktreeProfilesVisitor)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextPackLineageReceipt {
     pub source_node_id: NodeId,
     pub source_session: SessionAddress,
@@ -1269,6 +1534,185 @@ fn context_receipt_binding_is_valid(
     }
 }
 
+#[derive(Debug, Error)]
+pub enum HarnessMcpContractError {
+    #[error("invalid harness MCP reservation ID")]
+    InvalidReservationId,
+    #[error("invalid harness MCP call ID")]
+    InvalidCallId,
+    #[error("invalid harness MCP activation digest")]
+    InvalidActivationDigest,
+    #[error("invalid harness MCP local token")]
+    InvalidLocalToken,
+    #[error("invalid harness MCP reply chunk")]
+    InvalidReplyChunk,
+    #[error("invalid harness MCP local request")]
+    InvalidLocalRequest,
+    #[error("invalid harness MCP local reply")]
+    InvalidLocalReply,
+}
+
+fn is_exact_lower_hex(value: &str, prefix: &str, digits: usize) -> bool {
+    value.len() == prefix.len() + digits
+        && value.starts_with(prefix)
+        && value[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+macro_rules! harness_mcp_wire_string {
+    ($name:ident, $prefix:literal, $digits:literal, $error:ident) => {
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, HarnessMcpContractError> {
+                let value = value.into();
+                if !is_exact_lower_hex(&value, $prefix, $digits) {
+                    return Err(HarnessMcpContractError::$error);
+                }
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str { &self.0 }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where D: Deserializer<'de> {
+                Self::new(String::deserialize(deserializer)?)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+harness_mcp_wire_string!(HarnessMcpReservationId, "hmcpres_", 24, InvalidReservationId);
+harness_mcp_wire_string!(HarnessMcpCallId, "hmcpcall_", 24, InvalidCallId);
+harness_mcp_wire_string!(HarnessMcpActivationDigest, "sha256:", 64, InvalidActivationDigest);
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct HarnessMcpLocalToken(String);
+
+impl HarnessMcpLocalToken {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessMcpContractError> {
+        let value = value.into();
+        if !is_exact_lower_hex(&value, "g4ah3_", 64) {
+            return Err(HarnessMcpContractError::InvalidLocalToken);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn expose(&self) -> &str { &self.0 }
+}
+
+impl fmt::Debug for HarnessMcpLocalToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HarnessMcpLocalToken([REDACTED])")
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessMcpLocalToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMcpLocalRequestV1 {
+    pub version: u16,
+    pub token: HarnessMcpLocalToken,
+    pub request: HarnessReadRequestV1,
+}
+
+impl HarnessMcpLocalRequestV1 {
+    pub fn validate(&self) -> Result<(), HarnessMcpContractError> {
+        if self.version != 1
+            || self.request.validate().is_err()
+            || serde_json::to_vec(self)
+                .map_or(true, |wire| wire.len() > MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES)
+        {
+            return Err(HarnessMcpContractError::InvalidLocalRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessMcpLocalReplyV1 {
+    Ok { response: HarnessReadResponseV1 },
+    Error { error: HarnessReadHostErrorV1 },
+}
+
+impl HarnessMcpLocalReplyV1 {
+    pub fn validate(&self) -> Result<(), HarnessMcpContractError> {
+        let content_is_valid = match self {
+            Self::Ok { response } => response.validate().is_ok(),
+            Self::Error { .. } => true,
+        };
+        if !content_is_valid
+            || serde_json::to_vec(self)
+                .map_or(true, |wire| wire.len() > MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES)
+        {
+            return Err(HarnessMcpContractError::InvalidLocalReply);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct HarnessMcpReplyChunkHexV1(String);
+
+impl HarnessMcpReplyChunkHexV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessMcpContractError> {
+        let value = value.into();
+        if value.len() > MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES * 2
+            || value.len() % 2 != 0
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            })
+        {
+            return Err(HarnessMcpContractError::InvalidReplyChunk);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn raw_len(&self) -> usize { self.0.len() / 2 }
+}
+
+impl<'de> Deserialize<'de> for HarnessMcpReplyChunkHexV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessMcpRejectReasonV1 {
+    Unauthorized,
+    Unavailable,
+    InvalidRequest,
+    NotFoundOrDenied,
+    ResponseTooLarge,
+    Deadline,
+    Internal,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedHarnessMcpProxyReceiptV1 {
+    pub reservation_id: HarnessMcpReservationId,
+    pub activation_digest: HarnessMcpActivationDigest,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedSpawnReceipt {
@@ -1293,6 +1737,8 @@ pub struct ResolvedSpawnReceipt {
     pub idempotency_key: SpawnIdempotencyKey,
     pub required_capabilities: SpawnRequiredCapabilities,
     pub provenance: SpawnResolutionProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_mcp_proxy: Option<ResolvedHarnessMcpProxyReceiptV1>,
 }
 
 impl ResolvedSpawnReceipt {
@@ -1330,6 +1776,8 @@ impl<'de> Deserialize<'de> for ResolvedSpawnReceipt {
             idempotency_key: SpawnIdempotencyKey,
             required_capabilities: SpawnRequiredCapabilities,
             provenance: SpawnResolutionProvenance,
+            #[serde(default)]
+            harness_mcp_proxy: Option<ResolvedHarnessMcpProxyReceiptV1>,
         }
 
         let wire = WireReceipt::deserialize(deserializer)?;
@@ -1352,6 +1800,7 @@ impl<'de> Deserialize<'de> for ResolvedSpawnReceipt {
             idempotency_key: wire.idempotency_key,
             required_capabilities: wire.required_capabilities,
             provenance: wire.provenance,
+            harness_mcp_proxy: wire.harness_mcp_proxy,
         };
         if !receipt.context_binding_is_valid() {
             return Err(serde::de::Error::custom(
@@ -1371,6 +1820,12 @@ impl SpawnSpec {
             return Err(SpawnSpecResolveError::ProfileMismatch {
                 requested: self.profile_id.clone(),
                 loaded: defaults.profile_id.clone(),
+            });
+        }
+        if self.expected_profile_revision != defaults.revision {
+            return Err(SpawnSpecResolveError::ProfileRevisionMismatch {
+                expected: self.expected_profile_revision.clone(),
+                loaded: defaults.revision.clone(),
             });
         }
         let (provider, provider_source) = resolve_required_spawn_field(
@@ -1411,7 +1866,7 @@ impl SpawnSpec {
         Ok(ResolvedSpawnSpec {
             target: self.target.clone(),
             profile_id: self.profile_id.clone(),
-            profile_revision: defaults.revision.clone(),
+            profile_revision: self.expected_profile_revision.clone(),
             provider,
             mode,
             terminal_size,
@@ -1486,6 +1941,7 @@ impl ResolvedSpawnSpec {
             idempotency_key: self.idempotency_key.clone(),
             required_capabilities: self.required_capabilities.clone(),
             provenance: self.provenance.clone(),
+            harness_mcp_proxy: None,
         }
     }
 }
@@ -1522,6 +1978,11 @@ pub enum SpawnSpecResolveError {
         requested: SpawnProfileId,
         loaded: SpawnProfileId,
     },
+    #[error("expected spawn profile revision {expected} does not match loaded revision {loaded}")]
+    ProfileRevisionMismatch {
+        expected: SpawnProfileRevision,
+        loaded: SpawnProfileRevision,
+    },
     #[error("required spawn field {field} cannot be cleared")]
     RequiredFieldCleared { field: &'static str },
     #[error("resolved spawn terminal size is invalid")]
@@ -1536,6 +1997,78 @@ pub struct WorkspaceId(String);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SessionRecordId(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct TaskId(String);
+
+impl TaskId {
+    pub fn new(value: impl Into<String>) -> Result<Self, TaskIdError> {
+        let value = value.into();
+        let hex = value.strip_prefix("task-").ok_or(TaskIdError)?;
+        if hex.len() != TASK_ID_NONCE_BYTES * 2
+            || !hex.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(TaskIdError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn from_nonce(nonce: [u8; TASK_ID_NONCE_BYTES]) -> Self {
+        let mut value = String::with_capacity(5 + TASK_ID_NONCE_BYTES * 2);
+        value.push_str("task-");
+        for byte in nonce {
+            use std::fmt::Write as _;
+            write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for TaskId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for TaskId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TaskId {
+    type Err = TaskIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("task ID must be exactly `task-` followed by 24 lowercase hexadecimal characters")]
+pub struct TaskIdError;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeIncarnationId([u8; NODE_INCARNATION_ID_BYTES]);
@@ -1679,6 +2212,176 @@ macro_rules! identifier_impl {
 identifier_impl!(NodeId, "node");
 identifier_impl!(WorkspaceId, "workspace");
 identifier_impl!(SessionRecordId, "session record");
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSessionCatalogRoute {
+    pub scope: NativeSessionCatalogScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
+    pub provider: AgentId,
+}
+
+impl NativeSessionCatalogRoute {
+    pub fn workspace(workspace_id: WorkspaceId, provider: AgentId) -> Self {
+        Self {
+            scope: NativeSessionCatalogScope::Workspace,
+            workspace_id: Some(workspace_id),
+            provider,
+        }
+    }
+
+    pub fn unregistered(provider: AgentId) -> Self {
+        Self {
+            scope: NativeSessionCatalogScope::Unregistered,
+            workspace_id: None,
+            provider,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.scope, self.workspace_id.as_ref()) {
+            (NativeSessionCatalogScope::Workspace, Some(_))
+            | (NativeSessionCatalogScope::Unregistered, None) => Ok(()),
+            _ => Err("native session catalog route scope and workspace do not match"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSessionSelection {
+    pub route: NativeSessionCatalogRoute,
+    pub catalog_revision: u64,
+    pub recent_cutoff_unix_ms: u64,
+    #[serde(deserialize_with = "deserialize_history_candidate_id")]
+    pub selection_id: String,
+}
+
+impl NativeSessionSelection {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.route.validate()?;
+        if self.catalog_revision == 0 {
+            return Err("native session selection catalog revision is invalid");
+        }
+        gate4agent_types::validate_candidate_id(&self.selection_id)
+            .map_err(|_| "native session selection ID is invalid")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSessionCatalogEntry {
+    pub selection_id: String,
+    pub title: Option<String>,
+    pub modified_at_unix_ms: Option<u64>,
+    pub model: Option<String>,
+    pub message_count: u64,
+    pub completed_turn_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_group: Option<NativeSessionExternalGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<SessionRecordId>,
+}
+
+impl NativeSessionCatalogEntry {
+    pub fn validate(&self) -> Result<(), gate4agent_types::HistoryValidationError> {
+        gate4agent_types::NativeSessionCatalogEntry {
+            selection_id: self.selection_id.clone(),
+            session_id: "redacted-provider-session".to_owned(),
+            title: self.title.clone(),
+            modified_at_unix_ms: self.modified_at_unix_ms,
+            model: self.model.clone(),
+            message_count: self.message_count,
+            completed_turn_count: self.completed_turn_count,
+        }
+        .validate()?;
+        if let Some(group) = self.external_group.as_ref() {
+            group.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_route(
+        &self,
+        route: &NativeSessionCatalogRoute,
+    ) -> Result<(), &'static str> {
+        self.validate()
+            .map_err(|_| "native session catalog entry is invalid")?;
+        match route.scope {
+            NativeSessionCatalogScope::Workspace if self.external_group.is_none() => Ok(()),
+            NativeSessionCatalogScope::Unregistered
+                if self.external_group.is_some() && self.record_id.is_none() => Ok(()),
+            NativeSessionCatalogScope::Workspace => {
+                Err("workspace native session entry contains an external group")
+            }
+            NativeSessionCatalogScope::Unregistered => {
+                Err("unregistered native session entry is missing its group or exposes a record")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSessionCatalogPage {
+    pub window: NativeSessionCatalogWindow,
+    pub revision: u64,
+    pub entries: Vec<NativeSessionCatalogEntry>,
+    pub next_after_selection_id: Option<String>,
+    pub remaining_count: u32,
+    pub has_more: bool,
+}
+
+impl NativeSessionCatalogPage {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.entries.len() > usize::from(NATIVE_SESSION_CATALOG_LIMIT_MAX) {
+            return Err("native session catalog page exceeds the bounded entry limit");
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            entry
+                .validate()
+                .map_err(|_| "native session catalog entry is invalid")?;
+            if self.entries[..index]
+                .iter()
+                .any(|existing| existing.selection_id == entry.selection_id)
+            {
+                return Err("native session catalog page contains duplicate selections");
+            }
+            if entry.record_id.as_ref().is_some_and(|record_id| {
+                self.entries[..index]
+                    .iter()
+                    .any(|existing| existing.record_id.as_ref() == Some(record_id))
+            }) {
+                return Err("native session catalog page contains duplicate managed records");
+            }
+        }
+        if self
+            .next_after_selection_id
+            .as_deref()
+            .is_some_and(|cursor| gate4agent_types::validate_candidate_id(cursor).is_err())
+            || self.has_more != self.next_after_selection_id.is_some()
+            || self.has_more != (self.remaining_count > 0)
+        {
+            return Err("native session catalog page cursor is invalid");
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_route(
+        &self,
+        route: &NativeSessionCatalogRoute,
+    ) -> Result<(), &'static str> {
+        route.validate()?;
+        self.validate()?;
+        for entry in &self.entries {
+            entry.validate_for_route(route)?;
+        }
+        Ok(())
+    }
+}
+
+pub type NativeSessionPreview = SessionRecordPreview;
 
 fn validate_identifier(label: &'static str, value: &str) -> Result<(), NodeIdentifierError> {
     if value.is_empty() {
@@ -2730,18 +3433,36 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         },
         capabilities: [
             NODE_COMPATIBILITY_METADATA_CAPABILITY,
+            NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
+            NODE_HARNESS_MCP_READ_PROXY_CAPABILITY,
+            CAPABILITY_HOST_DIRECTORY_BROWSE_V1,
+            NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
             NODE_OPAQUE_UNIX_PATH_CAPABILITY,
             NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
             NODE_PROVIDER_ID_OPEN_CAPABILITY,
             NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+            NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
             NODE_REPOSITORY_PATH_CAPABILITY,
             NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
             NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
             NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+            NODE_NATIVE_SESSION_CATALOG_CAPABILITY,
+            NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
+            NODE_NATIVE_SESSION_INDEX_CAPABILITY,
+            NODE_NATIVE_SESSION_PREVIEW_CAPABILITY,
+            NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+            NODE_SESSION_TASK_CORRELATION_CAPABILITY,
+            NODE_OBSERVATION_EVENTS_CAPABILITY,
+            NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+            NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+            NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             NODE_WORKSPACE_FILE_READ_CAPABILITY,
+            NODE_WORKSPACE_FILE_WRITE_CAPABILITY,
+            NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
+            NODE_GIT_READ_CAPABILITY,
             NODE_WORKTREE_SELECTION_CAPABILITY,
         ]
         .into_iter()
@@ -2750,7 +3471,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V8,
+                maximum: NODE_STATE_SCHEMA_V9,
             },
         }),
     }
@@ -2959,6 +3680,22 @@ pub enum ManagedSessionState {
     Unavailable,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTaskBindingV1 {
+    pub revision: u64,
+    pub task_id: Option<TaskId>,
+    pub changed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SessionTaskTargetV1 {
+    New,
+    Existing { task_id: TaskId },
+    Clear,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ManagedSessionRecord {
     pub record_id: SessionRecordId,
@@ -2978,6 +3715,8 @@ pub struct ManagedSessionRecord {
     pub context_id: Option<SpawnContextId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ResolvedContextPackReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_binding: Option<SessionTaskBindingV1>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub last_error: Option<String>,
@@ -2986,6 +3725,17 @@ pub struct ManagedSessionRecord {
 impl ManagedSessionRecord {
     pub fn context_binding_is_valid(&self) -> bool {
         context_receipt_binding_is_valid(self.context_id.as_ref(), self.context.as_ref())
+    }
+
+    pub fn task_binding_is_valid(&self) -> bool {
+        self.task_binding
+            .as_ref()
+            .map_or(true, |binding| {
+                binding.revision > 0
+                    && binding.changed_at_unix_ms > 0
+                    && binding.changed_at_unix_ms >= self.created_at_unix_ms
+                    && binding.changed_at_unix_ms <= self.updated_at_unix_ms
+            })
     }
 }
 
@@ -3013,6 +3763,8 @@ impl<'de> Deserialize<'de> for ManagedSessionRecord {
             context_id: Option<SpawnContextId>,
             #[serde(default)]
             context: Option<ResolvedContextPackReceipt>,
+            #[serde(default)]
+            task_binding: Option<SessionTaskBindingV1>,
             created_at_unix_ms: u64,
             updated_at_unix_ms: u64,
             last_error: Option<String>,
@@ -3033,6 +3785,7 @@ impl<'de> Deserialize<'de> for ManagedSessionRecord {
             bundle: wire.bundle,
             context_id: wire.context_id,
             context: wire.context,
+            task_binding: wire.task_binding,
             created_at_unix_ms: wire.created_at_unix_ms,
             updated_at_unix_ms: wire.updated_at_unix_ms,
             last_error: wire.last_error,
@@ -3040,6 +3793,11 @@ impl<'de> Deserialize<'de> for ManagedSessionRecord {
         if !record.context_binding_is_valid() {
             return Err(serde::de::Error::custom(
                 "managed session context id and materialization receipt are not correlated",
+            ));
+        }
+        if !record.task_binding_is_valid() {
+            return Err(serde::de::Error::custom(
+                "managed session task binding revision or timestamp is invalid",
             ));
         }
         Ok(record)
@@ -3051,6 +3809,18 @@ pub struct WorkspaceSnapshot {
     pub workspace_id: WorkspaceId,
     pub canonical_root: OpaqueHostPath,
     pub sessions: Vec<SessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_service_mode: Option<WorktreeServiceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree_profiles: Option<WorktreeProfileInventory>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorktreeServiceMode {
+    Manual,
+    Managed,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3081,6 +3851,95 @@ pub struct GitCommitSummary {
     pub summary: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct GitObjectId(String);
+
+impl GitObjectId {
+    pub fn new(value: String) -> Result<Self, GitObjectIdError> {
+        if !matches!(value.len(), 40 | 64)
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(GitObjectIdError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for GitObjectId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("git object id must be a 40- or 64-character lowercase hexadecimal digest")]
+pub struct GitObjectIdError;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitSignatureStatus {
+    Good,
+    Bad,
+    UnknownValidity,
+    ExpiredSignature,
+    ExpiredKey,
+    RevokedKey,
+    CannotCheck,
+    NoSignature,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitCommitDetails {
+    pub id: GitObjectId,
+    pub parents: Vec<GitObjectId>,
+    pub subject: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at: String,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub committed_at: String,
+    pub signature_status: GitSignatureStatus,
+    pub signer: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitHistoryPage {
+    pub commits: Vec<GitCommitDetails>,
+    pub next_before: Option<GitObjectId>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum GitDiffMode {
+    Working,
+    Staged,
+    Commit { revision: GitObjectId },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitDiffRequest {
+    pub mode: GitDiffMode,
+    pub path: Option<RepositoryPath>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitDiff {
+    pub mode: GitDiffMode,
+    pub path: Option<RepositoryPath>,
+    pub text: String,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitWorktreeSnapshot {
     pub path: OpaqueHostPath,
@@ -3096,6 +3955,31 @@ pub struct GitWorktreeSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeGitScope {
+    pub lease_id: ManagedWorktreeLeaseId,
+    pub source_workspace_id: WorkspaceId,
+    #[serde(deserialize_with = "deserialize_managed_worktree_git_branch")]
+    pub branch: String,
+    pub base_commit: GitObjectId,
+    pub active_session_count: u16,
+    pub managed_record_count: u16,
+}
+
+fn deserialize_managed_worktree_git_branch<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let branch = String::deserialize(deserializer)?;
+    if branch.is_empty() || branch.len() > MAX_REPOSITORY_PATH_BYTES {
+        return Err(serde::de::Error::custom(
+            "managed worktree git branch must be non-empty and bounded",
+        ));
+    }
+    Ok(branch)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitSnapshot {
     pub is_repository: bool,
     pub branch: Option<String>,
@@ -3103,11 +3987,26 @@ pub struct GitSnapshot {
     pub recent_commits: Vec<GitCommitSummary>,
     #[serde(default)]
     pub worktrees: Vec<GitWorktreeSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree: Option<ManagedWorktreeGitScope>,
     pub truncated: bool,
     pub diagnostic: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+impl GitSnapshot {
+    pub fn managed_worktree_is_valid_for(&self, workspace_id: &WorkspaceId) -> bool {
+        self.managed_worktree.as_ref().map_or(true, |scope| {
+            self.is_repository
+                && self.branch.as_deref() == Some(scope.branch.as_str())
+                && &scope.source_workspace_id != workspace_id
+                && (u32::from(scope.active_session_count)
+                    + u32::from(scope.managed_record_count))
+                    > 0
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceInspection {
     pub workspace_id: WorkspaceId,
     pub entries: Vec<WorkspaceEntry>,
@@ -3115,12 +4014,188 @@ pub struct WorkspaceInspection {
     pub git: GitSnapshot,
 }
 
+impl<'de> Deserialize<'de> for WorkspaceInspection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireInspection {
+            workspace_id: WorkspaceId,
+            entries: Vec<WorkspaceEntry>,
+            tree_truncated: bool,
+            git: GitSnapshot,
+        }
+
+        let wire = WireInspection::deserialize(deserializer)?;
+        if !wire.git.managed_worktree_is_valid_for(&wire.workspace_id) {
+            return Err(serde::de::Error::custom(
+                "managed worktree git scope is inconsistent with workspace inspection",
+            ));
+        }
+        Ok(Self {
+            workspace_id: wire.workspace_id,
+            entries: wire.entries,
+            tree_truncated: wire.tree_truncated,
+            git: wire.git,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDirectoryEntry {
+    pub path: OpaqueHostPath,
+    pub display_name: String,
+    pub is_link: bool,
+}
+
+impl HostDirectoryEntry {
+    pub fn new(
+        path: OpaqueHostPath,
+        display_name: String,
+        is_link: bool,
+    ) -> Result<Self, HostDirectoryEntryError> {
+        if path.as_utf8().is_none() {
+            return Err(HostDirectoryEntryError::NonUtf8Path);
+        }
+        if display_name.is_empty() {
+            return Err(HostDirectoryEntryError::EmptyDisplayName);
+        }
+        if display_name.len() > MAX_HOST_DIRECTORY_DISPLAY_NAME_BYTES {
+            return Err(HostDirectoryEntryError::DisplayNameTooLong {
+                len: display_name.len(),
+                max: MAX_HOST_DIRECTORY_DISPLAY_NAME_BYTES,
+            });
+        }
+        if display_name.chars().any(char::is_control) {
+            return Err(HostDirectoryEntryError::ControlCharacter);
+        }
+        Ok(Self { path, display_name, is_link })
+    }
+}
+
+impl<'de> Deserialize<'de> for HostDirectoryEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireEntry {
+            path: OpaqueHostPath,
+            display_name: String,
+            is_link: bool,
+        }
+
+        let wire = WireEntry::deserialize(deserializer)?;
+        Self::new(wire.path, wire.display_name, wire.is_link)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum HostDirectoryEntryError {
+    #[error("host directory path must use the UTF-8 wire representation")]
+    NonUtf8Path,
+    #[error("host directory display name cannot be empty")]
+    EmptyDisplayName,
+    #[error("host directory display name length {len} exceeds the {max}-byte limit")]
+    DisplayNameTooLong { len: usize, max: usize },
+    #[error("host directory display name cannot contain control characters")]
+    ControlCharacter,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDirectoryListing {
+    pub directory: Option<OpaqueHostPath>,
+    pub parent: Option<OpaqueHostPath>,
+    #[serde(deserialize_with = "deserialize_host_directory_entries")]
+    pub entries: Vec<HostDirectoryEntry>,
+    pub next_after: Option<OpaqueHostPath>,
+    /// True only when another page of supported directory entries is available.
+    pub incomplete: bool,
+}
+
+fn deserialize_host_directory_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<HostDirectoryEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct HostDirectoryEntriesVisitor;
+
+    impl<'de> Visitor<'de> for HostDirectoryEntriesVisitor {
+        type Value = Vec<HostDirectoryEntry>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "at most {MAX_HOST_DIRECTORY_ENTRIES} host directory entries")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut entries = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_HOST_DIRECTORY_ENTRIES),
+            );
+            while let Some(entry) = sequence.next_element::<HostDirectoryEntry>()? {
+                if entries.len() == MAX_HOST_DIRECTORY_ENTRIES {
+                    return Err(serde::de::Error::invalid_length(entries.len() + 1, &self));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(HostDirectoryEntriesVisitor)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceFileRead {
     pub workspace_id: WorkspaceId,
     pub path: RepositoryPath,
     pub content: WorkspaceFileContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<WorkspaceFileRevision>,
 }
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct WorkspaceFileRevision(String);
+
+impl WorkspaceFileRevision {
+    pub fn new(value: String) -> Result<Self, WorkspaceFileRevisionError> {
+        if value.len() != 64
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(WorkspaceFileRevisionError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceFileRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("workspace file revision must be a 64-character lowercase SHA-256 digest")]
+pub struct WorkspaceFileRevisionError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -3182,6 +4257,187 @@ impl<'de> Deserialize<'de> for WorkspaceFileContent {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProgressCurrentV1 {
+    Idle,
+    Working,
+    WaitingForInput,
+    Blocked,
+}
+
+impl From<ProviderActivity> for AgentProgressCurrentV1 {
+    fn from(activity: ProviderActivity) -> Self {
+        match activity {
+            ProviderActivity::Idle => Self::Idle,
+            ProviderActivity::Working => Self::Working,
+            ProviderActivity::WaitingForInput => Self::WaitingForInput,
+            ProviderActivity::Blocked => Self::Blocked,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProgressAttentionKindV1 {
+    Approval,
+    Question,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProgressAttentionV1 {
+    pub kind: AgentProgressAttentionKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_label: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProgressEventKindV1 {
+    SessionStarted,
+    SessionIdentityObserved,
+    TurnStarted,
+    WorkingObserved,
+    Text,
+    Thinking,
+    ToolStarted,
+    ToolCompleted,
+    TurnCompleted,
+    TurnInterrupted,
+    SessionEnded,
+    Error,
+    Ready,
+    InteractionRequested,
+    InteractionResolved,
+    SubagentStarted,
+    SubagentStopped,
+    RateLimited,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProgressUsageV1 {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProgressV1 {
+    pub provider_sequence: u64,
+    pub activity: ProviderActivity,
+    pub completed_turns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentProgressUsageV1>,
+    pub current: AgentProgressCurrentV1,
+    pub active_tool_labels: Vec<String>,
+    pub active_tool_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<AgentProgressAttentionV1>,
+    pub subagent_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_kind: Option<AgentProgressEventKindV1>,
+    pub gap_count: u64,
+    pub stale: bool,
+    pub truncated: bool,
+}
+
+impl<'de> Deserialize<'de> for AgentProgressV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireProgress {
+            provider_sequence: u64,
+            activity: ProviderActivity,
+            completed_turns: u64,
+            #[serde(default)]
+            usage: Option<AgentProgressUsageV1>,
+            current: AgentProgressCurrentV1,
+            active_tool_labels: Vec<String>,
+            active_tool_count: u32,
+            #[serde(default)]
+            attention: Option<AgentProgressAttentionV1>,
+            subagent_count: u32,
+            #[serde(default)]
+            last_event_kind: Option<AgentProgressEventKindV1>,
+            gap_count: u64,
+            stale: bool,
+            truncated: bool,
+        }
+
+        let wire = WireProgress::deserialize(deserializer)?;
+        if wire.active_tool_labels.len() > MAX_AGENT_PROGRESS_ACTIVE_TOOL_LABELS {
+            return Err(serde::de::Error::custom(
+                "agent progress contains too many active tool labels",
+            ));
+        }
+        if usize::try_from(wire.active_tool_count).unwrap_or(usize::MAX)
+            < wire.active_tool_labels.len()
+        {
+            return Err(serde::de::Error::custom(
+                "agent progress active tool count is smaller than its labels",
+            ));
+        }
+        for label in &wire.active_tool_labels {
+            validate_agent_progress_tool_label(label)
+                .map_err(serde::de::Error::custom)?;
+        }
+        if let Some(label) = wire
+            .attention
+            .as_ref()
+            .and_then(|attention| attention.tool_label.as_deref())
+        {
+            validate_agent_progress_tool_label(label)
+                .map_err(serde::de::Error::custom)?;
+        }
+        if wire.current != AgentProgressCurrentV1::from(wire.activity) {
+            return Err(serde::de::Error::custom(
+                "agent progress current state conflicts with provider activity",
+            ));
+        }
+        Ok(Self {
+            provider_sequence: wire.provider_sequence,
+            activity: wire.activity,
+            completed_turns: wire.completed_turns,
+            usage: wire.usage,
+            current: wire.current,
+            active_tool_labels: wire.active_tool_labels,
+            active_tool_count: wire.active_tool_count,
+            attention: wire.attention,
+            subagent_count: wire.subagent_count,
+            last_event_kind: wire.last_event_kind,
+            gap_count: wire.gap_count,
+            stale: wire.stale,
+            truncated: wire.truncated,
+        })
+    }
+}
+
+fn validate_agent_progress_tool_label(label: &str) -> Result<(), &'static str> {
+    if !matches!(
+        label,
+        "Read" | "Write" | "Edit" | "Shell" | "Search" | "Browse" | "Git"
+            | "Ask" | "Task" | "Tool"
+    ) {
+        return Err("agent progress tool label is outside the safe class vocabulary");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAgentProgress {
+    pub address: SessionAddress,
+    pub progress: AgentProgressV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeSnapshot {
     pub node_id: NodeId,
@@ -3197,6 +4453,14 @@ pub struct NodeSnapshot {
         deserialize_with = "deserialize_managed_worktree_leases"
     )]
     pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_inventory: Option<LaunchInventory>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_agent_progress_entries"
+    )]
+    pub agent_progress: Vec<SessionAgentProgress>,
 }
 
 impl NodeSnapshot {
@@ -3219,6 +4483,61 @@ impl NodeSnapshot {
     }
 }
 
+fn deserialize_agent_progress_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SessionAgentProgress>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AgentProgressEntriesVisitor;
+
+    impl<'de> Visitor<'de> for AgentProgressEntriesVisitor {
+        type Value = Vec<SessionAgentProgress>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_AGENT_PROGRESS_ENTRIES} bounded agent progress entries",
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut entries = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_AGENT_PROGRESS_ENTRIES),
+            );
+            while let Some(value) = sequence.next_element::<serde_json::Value>()? {
+                if entries.len() == MAX_AGENT_PROGRESS_ENTRIES {
+                    continue;
+                }
+                let Ok(encoded) = serde_json::to_vec(&value) else {
+                    continue;
+                };
+                if encoded.len() > MAX_AGENT_PROGRESS_ENTRY_BYTES {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_value::<SessionAgentProgress>(value) else {
+                    continue;
+                };
+                if entries.iter().any(|existing: &SessionAgentProgress| {
+                    existing.address == entry.address
+                }) {
+                    continue;
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(AgentProgressEntriesVisitor)
+}
+
 fn deserialize_history_discovery_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
 where
     D: Deserializer<'de>,
@@ -3232,6 +4551,130 @@ where
     Ok(limit)
 }
 
+fn deserialize_native_session_catalog_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let limit = u16::deserialize(deserializer)?;
+    if !(1..=NATIVE_SESSION_CATALOG_LIMIT_MAX).contains(&limit) {
+        return Err(serde::de::Error::custom(
+            "native session catalog limit is outside the supported bounded range",
+        ));
+    }
+    Ok(limit)
+}
+
+fn deserialize_native_session_catalog_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<NativeSessionCatalogEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let entries = Vec::<NativeSessionCatalogEntry>::deserialize(deserializer)?;
+    if entries.len() > usize::from(NATIVE_SESSION_CATALOG_LIMIT_MAX) {
+        return Err(serde::de::Error::custom(
+            "native session catalog exceeds the supported bounded range",
+        ));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        entry.validate().map_err(serde::de::Error::custom)?;
+        if entries[..index]
+            .iter()
+            .any(|existing| existing.selection_id == entry.selection_id)
+        {
+            return Err(serde::de::Error::custom(
+                "native session catalog contains a duplicate selection ID",
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn validate_native_session_catalog_entries(
+    route: &NativeSessionCatalogRoute,
+    entries: &[NativeSessionCatalogEntry],
+) -> Result<(), &'static str> {
+    if entries.len() > usize::from(NATIVE_SESSION_CATALOG_LIMIT_MAX) {
+        return Err("native session catalog exceeds the bounded entry limit");
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        entry.validate_for_route(route)?;
+        if entries[..index]
+            .iter()
+            .any(|existing| existing.selection_id == entry.selection_id)
+        {
+            return Err("native session catalog contains duplicate selections");
+        }
+        if entry.record_id.as_ref().is_some_and(|record_id| {
+            entries[..index]
+                .iter()
+                .any(|existing| existing.record_id.as_ref() == Some(record_id))
+        }) {
+            return Err("native session catalog contains duplicate managed records");
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_optional_native_session_catalog_summary<'de, D>(
+    deserializer: D,
+) -> Result<Option<NativeSessionCatalogSummary>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let summary = Option::<NativeSessionCatalogSummary>::deserialize(deserializer)?;
+    if let Some(summary) = summary.as_ref() {
+        summary.validate().map_err(serde::de::Error::custom)?;
+    }
+    Ok(summary)
+}
+
+fn deserialize_native_session_catalog_page<'de, D>(
+    deserializer: D,
+) -> Result<NativeSessionCatalogPage, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let page = NativeSessionCatalogPage::deserialize(deserializer)?;
+    page.validate().map_err(serde::de::Error::custom)?;
+    Ok(page)
+}
+
+fn deserialize_native_session_preview_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let limit = u16::deserialize(deserializer)?;
+    if !(1..=NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX).contains(&limit) {
+        return Err(serde::de::Error::custom(
+            "native session preview limit is outside the supported bounded range",
+        ));
+    }
+    Ok(limit)
+}
+
+fn deserialize_native_session_preview<'de, D>(
+    deserializer: D,
+) -> Result<NativeSessionPreview, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let preview = NativeSessionPreview::deserialize(deserializer)?;
+    preview.validate().map_err(serde::de::Error::custom)?;
+    Ok(preview)
+}
+
+fn deserialize_session_record_preview<'de, D>(
+    deserializer: D,
+) -> Result<SessionRecordPreview, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let preview = SessionRecordPreview::deserialize(deserializer)?;
+    preview.validate().map_err(serde::de::Error::custom)?;
+    Ok(preview)
+}
+
 fn deserialize_history_candidate_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -3239,6 +4682,20 @@ where
     let candidate_id = String::deserialize(deserializer)?;
     gate4agent_types::validate_candidate_id(&candidate_id)
         .map_err(serde::de::Error::custom)?;
+    Ok(candidate_id)
+}
+
+fn deserialize_optional_history_candidate_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let candidate_id = Option::<String>::deserialize(deserializer)?;
+    if let Some(candidate_id) = candidate_id.as_deref() {
+        gate4agent_types::validate_candidate_id(candidate_id)
+            .map_err(serde::de::Error::custom)?;
+    }
     Ok(candidate_id)
 }
 
@@ -3253,6 +4710,7 @@ where
         cwd: None,
         model: None,
         message_count: 0,
+        completed_turn_count: None,
         total_tokens: 0,
         messages: Vec::new(),
     };
@@ -3394,6 +4852,506 @@ pub struct ControllerState {
     pub lease_remaining_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct DeliveryBlobDigestV1(String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct DeliveryManifestDigestV2(String);
+
+macro_rules! delivery_digest_impl {
+    ($type:ident, $label:literal) => {
+        impl $type {
+            pub fn new(value: impl Into<String>) -> Result<Self, DeliveryDigestError> {
+                let value = value.into();
+                let hex = value.strip_prefix("sha256:").ok_or(DeliveryDigestError($label))?;
+                if hex.len() != 64
+                    || !hex.bytes().all(|byte| {
+                        byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+                    })
+                {
+                    return Err(DeliveryDigestError($label));
+                }
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl FromStr for $type {
+            type Err = DeliveryDigestError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $type {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                Self::new(String::deserialize(deserializer)?)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+delivery_digest_impl!(DeliveryBlobDigestV1, "delivery blob");
+delivery_digest_impl!(DeliveryManifestDigestV2, "delivery manifest");
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("{0} digest must be sha256: followed by exactly 64 lowercase hexadecimal characters")]
+pub struct DeliveryDigestError(&'static str);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct DeliveryStageId(String);
+
+impl DeliveryStageId {
+    pub fn new(value: impl Into<String>) -> Result<Self, DeliveryStageIdError> {
+        let value = value.into();
+        let hex = value
+            .strip_prefix("delivery-stage-")
+            .ok_or(DeliveryStageIdError)?;
+        if hex.len() != DELIVERY_STAGE_NONCE_BYTES * 2
+            || !hex.bytes().all(|byte| {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            })
+        {
+            return Err(DeliveryStageIdError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn from_nonce(nonce: [u8; DELIVERY_STAGE_NONCE_BYTES]) -> Self {
+        let mut value = String::with_capacity(15 + DELIVERY_STAGE_NONCE_BYTES * 2);
+        value.push_str("delivery-stage-");
+        for byte in nonce {
+            use std::fmt::Write as _;
+            write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DeliveryStageId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeliveryStageId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("delivery stage ID must be delivery-stage- followed by exactly 32 lowercase hexadecimal characters")]
+pub struct DeliveryStageIdError;
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct DeliveryRelativePathV2(String);
+
+impl DeliveryRelativePathV2 {
+    pub fn new(value: impl Into<String>) -> Result<Self, DeliveryRelativePathError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_DELIVERY_RELATIVE_PATH_BYTES
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains('\\')
+            || value.chars().any(char::is_control)
+            || value
+                .split('/')
+                .any(|part| !delivery_path_component_is_portable(part))
+        {
+            return Err(DeliveryRelativePathError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn delivery_path_component_is_portable(component: &str) -> bool {
+    let invalid_character = component.chars().any(|character| {
+        character <= '\u{1f}'
+            || matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    });
+    let stem = component.split('.').next().unwrap_or(component);
+    let uppercase_stem = stem.to_ascii_uppercase();
+    let reserved = matches!(uppercase_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || delivery_reserved_numbered_name(&uppercase_stem, "COM")
+        || delivery_reserved_numbered_name(&uppercase_stem, "LPT");
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.ends_with('.')
+        && !component.ends_with(' ')
+        && !invalid_character
+        && !reserved
+}
+
+fn delivery_reserved_numbered_name(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
+    })
+}
+
+impl fmt::Display for DeliveryRelativePathV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeliveryRelativePathV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("delivery path must be a safe forward-slash relative path of at most 512 UTF-8 bytes")]
+pub struct DeliveryRelativePathError;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryScopeV2 {
+    Workspace,
+    Session,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryComponentKindV2 {
+    Skill,
+    PluginManifest,
+    Prompt,
+    Instructions,
+    AgentDefinition,
+    Command,
+    File,
+    Template,
+    McpDeclaration,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryBlobReceiptV1 {
+    pub digest: DeliveryBlobDigestV1,
+    pub byte_len: u64,
+}
+
+impl DeliveryBlobReceiptV1 {
+    pub fn new(
+        digest: DeliveryBlobDigestV1,
+        byte_len: u64,
+    ) -> Result<Self, DeliveryContractError> {
+        if byte_len > MAX_DELIVERY_FILE_BYTES as u64 {
+            return Err(DeliveryContractError::FileTooLarge);
+        }
+        Ok(Self { digest, byte_len })
+    }
+}
+
+impl<'de> Deserialize<'de> for DeliveryBlobReceiptV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            digest: DeliveryBlobDigestV1,
+            byte_len: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.digest, wire.byte_len).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryComponentV2 {
+    pub kind: DeliveryComponentKindV2,
+    pub scope: DeliveryScopeV2,
+    pub relative_path: DeliveryRelativePathV2,
+    pub blob: DeliveryBlobReceiptV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryBundleManifestV2 {
+    pub bundle_id: SpawnBundleId,
+    pub revision: SpawnBundleRevision,
+    pub bundle_digest: SpawnBundleDigest,
+    pub manifest_digest: DeliveryManifestDigestV2,
+    pub components: Vec<DeliveryComponentV2>,
+}
+
+impl DeliveryBundleManifestV2 {
+    pub fn validate(&self) -> Result<(), DeliveryContractError> {
+        if self.components.is_empty() {
+            return Err(DeliveryContractError::EmptyManifest);
+        }
+        if self.components.len() > MAX_DELIVERY_FILES {
+            return Err(DeliveryContractError::TooManyFiles);
+        }
+        let mut total = 0_u64;
+        let mut previous_path: Option<&str> = None;
+        let mut folded_paths = std::collections::BTreeSet::new();
+        for component in &self.components {
+            let path = component.relative_path.as_str();
+            if previous_path.is_some_and(|previous| previous >= path) {
+                return Err(DeliveryContractError::ComponentsNotOrdered);
+            }
+            previous_path = Some(path);
+            let folded = path.to_lowercase();
+            if !folded_paths.insert(folded) {
+                return Err(DeliveryContractError::CaseFoldPathCollision);
+            }
+            total = total
+                .checked_add(component.blob.byte_len)
+                .ok_or(DeliveryContractError::TotalTooLarge)?;
+            if total > MAX_DELIVERY_TOTAL_BYTES as u64 {
+                return Err(DeliveryContractError::TotalTooLarge);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn canonical_manifest_digest_material(&self) -> Vec<u8> {
+        fn push_field(material: &mut Vec<u8>, value: &[u8]) {
+            material.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            material.extend_from_slice(value);
+        }
+
+        let mut material = Vec::new();
+        material.extend_from_slice(b"g4a-delivery-manifest-v2\0");
+        push_field(&mut material, self.bundle_id.as_str().as_bytes());
+        push_field(&mut material, self.revision.as_str().as_bytes());
+        push_field(&mut material, self.bundle_digest.as_str().as_bytes());
+        material.extend_from_slice(&(self.components.len() as u32).to_be_bytes());
+        for component in &self.components {
+            material.push(component.kind.canonical_tag());
+            material.push(component.scope.canonical_tag());
+            push_field(&mut material, component.relative_path.as_str().as_bytes());
+            push_field(&mut material, component.blob.digest.as_str().as_bytes());
+            material.extend_from_slice(&component.blob.byte_len.to_be_bytes());
+        }
+        material
+    }
+}
+
+impl DeliveryComponentKindV2 {
+    pub fn canonical_tag(self) -> u8 {
+        match self {
+            Self::Skill => 1,
+            Self::PluginManifest => 2,
+            Self::Prompt => 3,
+            Self::Instructions => 4,
+            Self::AgentDefinition => 5,
+            Self::Command => 6,
+            Self::File => 7,
+            Self::Template => 8,
+            Self::McpDeclaration => 9,
+        }
+    }
+}
+
+impl DeliveryScopeV2 {
+    pub fn canonical_tag(self) -> u8 {
+        match self {
+            Self::Workspace => 1,
+            Self::Session => 2,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DeliveryBundleManifestV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            bundle_id: SpawnBundleId,
+            revision: SpawnBundleRevision,
+            bundle_digest: SpawnBundleDigest,
+            manifest_digest: DeliveryManifestDigestV2,
+            components: Vec<DeliveryComponentV2>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let manifest = Self {
+            bundle_id: wire.bundle_id,
+            revision: wire.revision,
+            bundle_digest: wire.bundle_digest,
+            manifest_digest: wire.manifest_digest,
+            components: wire.components,
+        };
+        manifest.validate().map_err(serde::de::Error::custom)?;
+        Ok(manifest)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct DeliveryBlobChunkHexV1(String);
+
+impl DeliveryBlobChunkHexV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, DeliveryContractError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_DELIVERY_CHUNK_RAW_BYTES * 2
+            || value.len() % 2 != 0
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            })
+        {
+            return Err(DeliveryContractError::InvalidChunkHex);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn raw_len(&self) -> usize {
+        self.0.len() / 2
+    }
+
+    pub fn decode(&self) -> Vec<u8> {
+        fn nibble(value: u8) -> u8 {
+            match value {
+                b'0'..=b'9' => value - b'0',
+                b'a'..=b'f' => value - b'a' + 10,
+                _ => unreachable!("validated delivery chunk contains only lowercase hex"),
+            }
+        }
+
+        self.0
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for DeliveryBlobChunkHexV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum DeliveryContractError {
+    #[error("delivery manifest must contain at least one component")]
+    EmptyManifest,
+    #[error("delivery manifest exceeds the file count limit")]
+    TooManyFiles,
+    #[error("delivery file exceeds the byte limit")]
+    FileTooLarge,
+    #[error("delivery manifest exceeds the total byte limit")]
+    TotalTooLarge,
+    #[error("delivery components must be strictly ordered by relative path")]
+    ComponentsNotOrdered,
+    #[error("delivery component paths collide under case folding")]
+    CaseFoldPathCollision,
+    #[error("delivery blob receipts must be strictly ordered and unique by digest")]
+    BlobReceiptsNotOrdered,
+    #[error("delivery chunk must encode 1 through 49152 raw bytes as lowercase hexadecimal")]
+    InvalidChunkHex,
+    #[error("delivery chunk exceeds the declared file bounds")]
+    ChunkOutOfBounds,
+}
+
+fn validate_delivery_blob_receipts(
+    blobs: &[DeliveryBlobReceiptV1],
+) -> Result<(), DeliveryContractError> {
+    if blobs.len() > MAX_DELIVERY_FILES {
+        return Err(DeliveryContractError::TooManyFiles);
+    }
+    let mut previous: Option<&DeliveryBlobDigestV1> = None;
+    for blob in blobs {
+        if previous.is_some_and(|digest| digest >= &blob.digest) {
+            return Err(DeliveryContractError::BlobReceiptsNotOrdered);
+        }
+        previous = Some(&blob.digest);
+    }
+    Ok(())
+}
+
+fn deserialize_delivery_blob_receipts<'de, D>(
+    deserializer: D,
+) -> Result<Vec<DeliveryBlobReceiptV1>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let blobs = Vec::<DeliveryBlobReceiptV1>::deserialize(deserializer)?;
+    validate_delivery_blob_receipts(&blobs).map_err(serde::de::Error::custom)?;
+    Ok(blobs)
+}
+
+fn deserialize_delivery_blob_digests<'de, D>(
+    deserializer: D,
+) -> Result<Vec<DeliveryBlobDigestV1>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let digests = Vec::<DeliveryBlobDigestV1>::deserialize(deserializer)?;
+    if digests.len() > MAX_DELIVERY_FILES
+        || digests.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(serde::de::Error::custom(
+            "delivery blob digests must be bounded, strictly ordered, and unique",
+        ));
+    }
+    Ok(digests)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryCommitReceiptV1 {
+    pub bundle_id: SpawnBundleId,
+    pub revision: SpawnBundleRevision,
+    pub bundle_digest: SpawnBundleDigest,
+    pub manifest_digest: DeliveryManifestDigestV2,
+    #[serde(deserialize_with = "deserialize_delivery_blob_receipts")]
+    pub blobs: Vec<DeliveryBlobReceiptV1>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct NodeCursor {
     pub incarnation_id: NodeIncarnationId,
@@ -3424,16 +5382,108 @@ pub struct RequestEnvelope {
 pub enum NodeRequest {
     Snapshot,
     Resync { after_sequence: u64 },
+    ArmHarnessMcpReservation {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        spawn_spec: SpawnSpec,
+        expires_at_unix_ms: u64,
+    },
+    SpawnSpecWithHarnessMcp {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        spec: SpawnSpec,
+        deadline_unix_ms: u64,
+    },
+    ActivateHarnessMcpReservation {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+    },
+    AbortHarnessMcpReservation {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+    },
+    PutHarnessMcpReplyChunk {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+        offset: u32,
+        final_chunk: bool,
+        chunk_hex: HarnessMcpReplyChunkHexV1,
+    },
+    RejectHarnessMcpCall {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+        reason: HarnessMcpRejectReasonV1,
+    },
+    BeginDeliveryStage {
+        manifest: DeliveryBundleManifestV2,
+    },
+    PutDeliveryBlobChunk {
+        stage_id: DeliveryStageId,
+        blob_digest: DeliveryBlobDigestV1,
+        offset: u64,
+        chunk_hex: DeliveryBlobChunkHexV1,
+    },
+    CommitDeliveryStage {
+        stage_id: DeliveryStageId,
+    },
+    AbortDeliveryStage {
+        stage_id: DeliveryStageId,
+    },
+    BrowseHostDirectories {
+        directory: Option<OpaqueHostPath>,
+        after: Option<OpaqueHostPath>,
+    },
     InspectWorkspace { workspace_id: WorkspaceId },
     ReadWorkspaceFile {
         workspace_id: WorkspaceId,
         path: RepositoryPath,
+    },
+    WriteWorkspaceFile {
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+        expected_revision: WorkspaceFileRevision,
+        #[serde(deserialize_with = "deserialize_workspace_file_text")]
+        text: String,
+    },
+    CreateWorkspaceFile {
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+    },
+    CreateWorkspaceDirectory {
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+    },
+    ReadGitHistory {
+        workspace_id: WorkspaceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<RepositoryPath>,
+        before: Option<GitObjectId>,
+        #[serde(deserialize_with = "deserialize_git_history_limit")]
+        limit: u16,
+    },
+    ReadGitDiff {
+        workspace_id: WorkspaceId,
+        request: GitDiffRequest,
     },
     AcquireController { lease_ms: u64 },
     ReleaseController,
     RegisterWorkspace {
         workspace_id: WorkspaceId,
         root: OpaqueHostPath,
+    },
+    CreateStandaloneWorkspace {
+        workspace_id: WorkspaceId,
+        root: OpaqueHostPath,
+        #[serde(default, deserialize_with = "deserialize_optional_initial_branch")]
+        initial_branch: Option<String>,
     },
     UnregisterWorkspace {
         workspace_id: WorkspaceId,
@@ -3474,6 +5524,21 @@ pub enum NodeRequest {
         record_id: SessionRecordId,
         display_name: String,
     },
+    SetSessionTask {
+        record_id: SessionRecordId,
+        expected_revision: u64,
+        target: SessionTaskTargetV1,
+    },
+    IndexProviderSession {
+        workspace_id: WorkspaceId,
+        provider: AgentId,
+        identity: ProviderSessionIdentity,
+        display_name: String,
+    },
+    IndexNativeSession {
+        selection: NativeSessionSelection,
+        display_name: String,
+    },
     ResumeSessionRecord {
         record_id: SessionRecordId,
         terminal_size: TerminalSize,
@@ -3481,6 +5546,31 @@ pub enum NodeRequest {
     },
     ForgetSessionRecord {
         record_id: SessionRecordId,
+    },
+    CatalogNativeSessions {
+        route: NativeSessionCatalogRoute,
+        #[serde(deserialize_with = "deserialize_native_session_catalog_limit")]
+        limit: u16,
+    },
+    PageNativeSessions {
+        route: NativeSessionCatalogRoute,
+        window: NativeSessionCatalogWindow,
+        catalog_revision: u64,
+        recent_cutoff_unix_ms: u64,
+        #[serde(default, deserialize_with = "deserialize_optional_history_candidate_id")]
+        after_selection_id: Option<String>,
+        #[serde(deserialize_with = "deserialize_native_session_catalog_limit")]
+        limit: u16,
+    },
+    PreviewNativeSession {
+        selection: NativeSessionSelection,
+        #[serde(deserialize_with = "deserialize_native_session_preview_limit")]
+        message_limit: u16,
+    },
+    PreviewSessionRecord {
+        record_id: SessionRecordId,
+        #[serde(deserialize_with = "deserialize_native_session_preview_limit")]
+        message_limit: u16,
     },
     DiscoverHistory {
         session: SessionAddress,
@@ -3510,7 +5600,103 @@ pub enum NodeRequest {
     Shutdown,
 }
 
+fn deserialize_workspace_file_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    if text.len() > MAX_WORKSPACE_FILE_BYTES {
+        return Err(serde::de::Error::custom("workspace file text exceeds the byte limit"));
+    }
+    Ok(text)
+}
+
+fn deserialize_git_history_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let limit = u16::deserialize(deserializer)?;
+    if !(1..=MAX_GIT_HISTORY_COMMITS).contains(&limit) {
+        return Err(serde::de::Error::custom("git history limit is invalid"));
+    }
+    Ok(limit)
+}
+
+fn deserialize_optional_initial_branch<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let branch = Option::<String>::deserialize(deserializer)?;
+    if let Some(branch) = branch.as_deref() {
+        if branch.is_empty()
+            || branch.len() > MAX_REPOSITORY_PATH_BYTES
+            || branch.starts_with('-')
+            || branch.chars().any(char::is_control)
+        {
+            return Err(serde::de::Error::custom(
+                "initial branch must be bounded, non-empty, option-safe, and free of control characters",
+            ));
+        }
+    }
+    Ok(branch)
+}
+
 impl NodeRequest {
+    pub fn harness_mcp_contract_is_valid_at(&self, now_unix_ms: u64) -> bool {
+        match self {
+            Self::ArmHarnessMcpReservation { expires_at_unix_ms, .. } => {
+                *expires_at_unix_ms > now_unix_ms
+                    && expires_at_unix_ms.saturating_sub(now_unix_ms)
+                        <= MAX_HARNESS_MCP_RESERVATION_TTL_MS
+            }
+            Self::SpawnSpecWithHarnessMcp { deadline_unix_ms, .. } => {
+                *deadline_unix_ms > now_unix_ms
+                    && deadline_unix_ms.saturating_sub(now_unix_ms)
+                        <= MAX_HARNESS_MCP_SPAWN_RELAY_DEADLINE_MS
+            }
+            Self::PutHarnessMcpReplyChunk { offset, chunk_hex, .. } => {
+                usize::try_from(*offset).ok()
+                    .and_then(|offset| offset.checked_add(chunk_hex.raw_len()))
+                    .is_some_and(|end| end <= MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES)
+            }
+            _ => true,
+        }
+    }
+
+    pub fn native_session_catalog_contract_is_valid(&self) -> bool {
+        match self {
+            Self::CatalogNativeSessions { route, limit } => {
+                route.validate().is_ok()
+                    && (1..=NATIVE_SESSION_CATALOG_LIMIT_MAX).contains(limit)
+            }
+            Self::PageNativeSessions { route, after_selection_id, limit, .. } => {
+                route.validate().is_ok()
+                    && (1..=NATIVE_SESSION_CATALOG_LIMIT_MAX).contains(limit)
+                    && after_selection_id
+                        .as_deref()
+                        .map_or(true, |cursor| {
+                            gate4agent_types::validate_candidate_id(cursor).is_ok()
+                        })
+            }
+            _ => true,
+        }
+    }
+
+    pub fn native_session_preview_contract_is_valid(&self) -> bool {
+        match self {
+            Self::PreviewNativeSession { selection, message_limit } => {
+                (1..=NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX).contains(message_limit)
+                    && selection.validate().is_ok()
+            }
+            Self::PreviewSessionRecord { message_limit, .. } => {
+                (1..=NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX).contains(message_limit)
+            }
+            _ => true,
+        }
+    }
+
     pub fn history_context_pack_contract_is_valid(&self) -> bool {
         match self {
             Self::DiscoverHistory { limit, .. } => {
@@ -3521,11 +5707,28 @@ impl NodeRequest {
             }
             Self::Snapshot
             | Self::Resync { .. }
+            | Self::ArmHarnessMcpReservation { .. }
+            | Self::SpawnSpecWithHarnessMcp { .. }
+            | Self::ActivateHarnessMcpReservation { .. }
+            | Self::AbortHarnessMcpReservation { .. }
+            | Self::PutHarnessMcpReplyChunk { .. }
+            | Self::RejectHarnessMcpCall { .. }
+            | Self::BeginDeliveryStage { .. }
+            | Self::PutDeliveryBlobChunk { .. }
+            | Self::CommitDeliveryStage { .. }
+            | Self::AbortDeliveryStage { .. }
+            | Self::BrowseHostDirectories { .. }
             | Self::InspectWorkspace { .. }
             | Self::ReadWorkspaceFile { .. }
+            | Self::WriteWorkspaceFile { .. }
+            | Self::CreateWorkspaceFile { .. }
+            | Self::CreateWorkspaceDirectory { .. }
+            | Self::ReadGitHistory { .. }
+            | Self::ReadGitDiff { .. }
             | Self::AcquireController { .. }
             | Self::ReleaseController
             | Self::RegisterWorkspace { .. }
+            | Self::CreateStandaloneWorkspace { .. }
             | Self::UnregisterWorkspace { .. }
             | Self::CreateWorktree { .. }
             | Self::RemoveWorktree { .. }
@@ -3535,8 +5738,15 @@ impl NodeRequest {
             | Self::CleanupManagedWorktree { .. }
             | Self::Resume { .. }
             | Self::RenameSessionRecord { .. }
+            | Self::SetSessionTask { .. }
+            | Self::IndexProviderSession { .. }
+            | Self::IndexNativeSession { .. }
             | Self::ResumeSessionRecord { .. }
             | Self::ForgetSessionRecord { .. }
+            | Self::CatalogNativeSessions { .. }
+            | Self::PageNativeSessions { .. }
+            | Self::PreviewNativeSession { .. }
+            | Self::PreviewSessionRecord { .. }
             | Self::ExportContextPack { .. }
             | Self::ForgetContextPack { .. }
             | Self::Prompt { .. }
@@ -3554,7 +5764,43 @@ impl NodeRequest {
 
     pub fn required_capability(&self) -> Option<&'static str> {
         match self {
+            Self::ArmHarnessMcpReservation { .. }
+            | Self::SpawnSpecWithHarnessMcp { .. }
+            | Self::ActivateHarnessMcpReservation { .. }
+            | Self::AbortHarnessMcpReservation { .. }
+            | Self::PutHarnessMcpReplyChunk { .. }
+            | Self::RejectHarnessMcpCall { .. } => {
+                Some(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY)
+            }
+            Self::BeginDeliveryStage { .. }
+            | Self::PutDeliveryBlobChunk { .. }
+            | Self::CommitDeliveryStage { .. }
+            | Self::AbortDeliveryStage { .. } => {
+                Some(NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY)
+            }
+            Self::BrowseHostDirectories { .. } => Some(CAPABILITY_HOST_DIRECTORY_BROWSE_V1),
+            Self::CreateStandaloneWorkspace { .. } => {
+                Some(NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY)
+            }
             Self::ReadWorkspaceFile { .. } => Some(NODE_WORKSPACE_FILE_READ_CAPABILITY),
+            Self::WriteWorkspaceFile { .. } => Some(NODE_WORKSPACE_FILE_WRITE_CAPABILITY),
+            Self::CreateWorkspaceFile { .. } | Self::CreateWorkspaceDirectory { .. } => {
+                Some(NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY)
+            }
+            Self::ReadGitHistory { .. } | Self::ReadGitDiff { .. } => {
+                Some(NODE_GIT_READ_CAPABILITY)
+            }
+            Self::IndexProviderSession { .. } => {
+                Some(NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY)
+            }
+            Self::SetSessionTask { .. } => Some(NODE_SESSION_TASK_CORRELATION_CAPABILITY),
+            Self::IndexNativeSession { .. } => Some(NODE_NATIVE_SESSION_INDEX_CAPABILITY),
+            Self::CatalogNativeSessions { .. } => Some(NODE_NATIVE_SESSION_CATALOG_CAPABILITY),
+            Self::PageNativeSessions { .. } => {
+                Some(NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY)
+            }
+            Self::PreviewNativeSession { .. } => Some(NODE_NATIVE_SESSION_PREVIEW_CAPABILITY),
+            Self::PreviewSessionRecord { .. } => Some(NODE_NATIVE_SESSION_PREVIEW_CAPABILITY),
             Self::SpawnSpec { .. } => Some(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
             Self::SpawnManagedWorktree { .. }
             | Self::CleanupManagedWorktree { .. } => {
@@ -3595,6 +5841,10 @@ impl NodeRequest {
 
     pub fn requires_worktree_selection_capability(&self) -> bool {
         matches!(self, Self::SpawnSpec { spec } if spec.target.worktree_id.is_some())
+            || matches!(self,
+                Self::ArmHarnessMcpReservation { spawn_spec: spec, .. }
+                | Self::SpawnSpecWithHarnessMcp { spec, .. }
+                if spec.target.worktree_id.is_some())
             || matches!(
                 self,
                 Self::SpawnManagedWorktree { .. } | Self::CleanupManagedWorktree { .. }
@@ -3604,13 +5854,28 @@ impl NodeRequest {
     pub fn requires_spawn_spec_defaults_overrides_capability(&self) -> bool {
         matches!(
             self,
-            Self::SpawnSpec { .. } | Self::SpawnManagedWorktree { .. }
+            Self::SpawnSpec { .. }
+                | Self::SpawnManagedWorktree { .. }
+                | Self::ArmHarnessMcpReservation { .. }
+                | Self::SpawnSpecWithHarnessMcp { .. }
+        )
+    }
+
+    pub fn requires_spawn_profile_revision_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::SpawnSpec { .. }
+                | Self::SpawnManagedWorktree { .. }
+                | Self::ArmHarnessMcpReservation { .. }
+                | Self::SpawnSpecWithHarnessMcp { .. }
         )
     }
 
     pub fn requires_child_environment_profile_capability(&self) -> bool {
         let spec = match self {
             Self::SpawnSpec { spec } => spec,
+            Self::ArmHarnessMcpReservation { spawn_spec: spec, .. }
+            | Self::SpawnSpecWithHarnessMcp { spec, .. } => spec,
             Self::SpawnManagedWorktree { request } => &request.spawn_spec,
             _ => return false,
         };
@@ -3624,6 +5889,8 @@ impl NodeRequest {
     pub fn requires_session_bundle_materialization_capability(&self) -> bool {
         let spec = match self {
             Self::SpawnSpec { spec } => spec,
+            Self::ArmHarnessMcpReservation { spawn_spec: spec, .. }
+            | Self::SpawnSpecWithHarnessMcp { spec, .. } => spec,
             Self::SpawnManagedWorktree { request } => &request.spawn_spec,
             _ => return false,
         };
@@ -3637,6 +5904,10 @@ impl NodeRequest {
             | Self::ExportContextPack { .. }
             | Self::ForgetContextPack { .. } => true,
             Self::SpawnSpec { spec } => {
+                !matches!(spec.overrides.context_id, SpawnOverride::Clear)
+            }
+            Self::ArmHarnessMcpReservation { spawn_spec: spec, .. }
+            | Self::SpawnSpecWithHarnessMcp { spec, .. } => {
                 !matches!(spec.overrides.context_id, SpawnOverride::Clear)
             }
             Self::SpawnManagedWorktree { request } => {
@@ -3663,14 +5934,89 @@ pub enum NodeResponse {
     },
     Resync {
         event_sequence: u64,
+        oldest_available_sequence: u64,
         snapshot: NodeSnapshot,
         events: Vec<NodeEventEnvelope>,
+    },
+    Armed {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        expires_at_unix_ms: u64,
+    },
+    Spawned {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        receipt: ResolvedSpawnReceipt,
+    },
+    Activated {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+    },
+    Aborted {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+    },
+    ReplyChunkAccepted {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+        next_offset: u32,
+        completed: bool,
+    },
+    CallRejected {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+    },
+    DeliveryStageBegun {
+        stage_id: DeliveryStageId,
+        manifest_digest: DeliveryManifestDigestV2,
+        #[serde(deserialize_with = "deserialize_delivery_blob_digests")]
+        missing_blobs: Vec<DeliveryBlobDigestV1>,
+    },
+    DeliveryBlobChunkAccepted {
+        stage_id: DeliveryStageId,
+        blob_digest: DeliveryBlobDigestV1,
+        next_offset: u64,
+    },
+    DeliveryCommitted {
+        receipt: DeliveryCommitReceiptV1,
+    },
+    DeliveryStageAborted {
+        stage_id: DeliveryStageId,
     },
     WorkspaceInspected {
         inspection: WorkspaceInspection,
     },
+    HostDirectoriesBrowsed {
+        listing: HostDirectoryListing,
+    },
     WorkspaceFileRead {
         file: WorkspaceFileRead,
+    },
+    WorkspaceFileWritten {
+        file: WorkspaceFileRead,
+    },
+    WorkspaceFileCreated {
+        file: WorkspaceFileRead,
+    },
+    WorkspaceDirectoryCreated {
+        workspace_id: WorkspaceId,
+        entry: WorkspaceEntry,
+    },
+    GitHistoryRead {
+        workspace_id: WorkspaceId,
+        page: GitHistoryPage,
+    },
+    GitDiffRead {
+        workspace_id: WorkspaceId,
+        diff: GitDiff,
     },
     Controller {
         controller: Option<ControllerState>,
@@ -3690,12 +6036,45 @@ pub enum NodeResponse {
     SessionRecordUpdated {
         record: ManagedSessionRecord,
     },
+    ProviderSessionIndexed {
+        record: ManagedSessionRecord,
+    },
+    NativeSessionIndexed {
+        selection: NativeSessionSelection,
+        record: ManagedSessionRecord,
+    },
     SessionRecordResumed {
         record: ManagedSessionRecord,
         session: SessionAddress,
     },
     SessionRecordForgotten {
         record_id: SessionRecordId,
+    },
+    NativeSessionsCataloged {
+        route: NativeSessionCatalogRoute,
+        #[serde(deserialize_with = "deserialize_native_session_catalog_entries")]
+        entries: Vec<NativeSessionCatalogEntry>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_native_session_catalog_summary"
+        )]
+        summary: Option<NativeSessionCatalogSummary>,
+    },
+    NativeSessionsPaged {
+        route: NativeSessionCatalogRoute,
+        #[serde(deserialize_with = "deserialize_native_session_catalog_page")]
+        page: NativeSessionCatalogPage,
+    },
+    NativeSessionPreviewed {
+        selection: NativeSessionSelection,
+        #[serde(deserialize_with = "deserialize_native_session_preview")]
+        preview: NativeSessionPreview,
+    },
+    SessionRecordPreviewed {
+        record_id: SessionRecordId,
+        #[serde(deserialize_with = "deserialize_session_record_preview")]
+        preview: SessionRecordPreview,
     },
     HistoryDiscovered {
         session: SessionAddress,
@@ -3707,6 +6086,8 @@ pub enum NodeResponse {
         #[serde(deserialize_with = "deserialize_history_session_id")]
         session_id: String,
         message_count: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completed_turn_count: Option<u64>,
     },
     ContextPackExported {
         context: ResolvedContextPackReceipt,
@@ -3715,6 +6096,9 @@ pub enum NodeResponse {
         context_id: SpawnContextId,
     },
     WorkspaceRegistered {
+        workspace: WorkspaceSnapshot,
+    },
+    StandaloneWorkspaceCreated {
         workspace: WorkspaceSnapshot,
     },
     WorkspaceUnregistered {
@@ -3733,8 +6117,83 @@ pub enum NodeResponse {
 }
 
 impl NodeResponse {
+    pub fn requires_harness_mcp_proxy_capability(&self) -> bool {
+        matches!(self,
+            Self::Armed { .. }
+                | Self::Spawned { .. }
+                | Self::Activated { .. }
+                | Self::Aborted { .. }
+                | Self::ReplyChunkAccepted { .. }
+                | Self::CallRejected { .. })
+            || matches!(self, Self::SpawnSpecAccepted { receipt }
+                if receipt.harness_mcp_proxy.is_some())
+            || matches!(self, Self::ManagedWorktreeSpawnAccepted { receipt }
+                if receipt.spawn.harness_mcp_proxy.is_some())
+    }
+
+    pub fn native_session_catalog_contract_is_valid(&self) -> bool {
+        match self {
+            Self::NativeSessionsCataloged { route, entries, summary: Some(summary) } => {
+                route.validate().is_ok()
+                    && validate_native_session_catalog_entries(route, entries).is_ok()
+                    && summary.validate_initial_entries(entries.len()).is_ok()
+            }
+            Self::NativeSessionsCataloged { route, entries, summary: None } => {
+                route.validate().is_ok()
+                    && validate_native_session_catalog_entries(route, entries).is_ok()
+            }
+            Self::NativeSessionsPaged { route, page } => {
+                page.validate_for_route(route).is_ok()
+            }
+            _ => true,
+        }
+    }
+
+    pub fn requires_native_session_catalog_capability(&self) -> bool {
+        matches!(self, Self::NativeSessionsCataloged { .. })
+    }
+
+    pub fn requires_native_session_catalog_paging_capability(&self) -> bool {
+        matches!(self, Self::NativeSessionsPaged { .. })
+    }
+
+    pub fn requires_native_session_preview_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeSessionPreviewed { .. } | Self::SessionRecordPreviewed { .. }
+        )
+    }
+
+    pub fn requires_native_session_index_capability(&self) -> bool {
+        matches!(self, Self::NativeSessionIndexed { .. })
+    }
+
+    pub fn native_session_index_contract_is_valid(&self) -> bool {
+        match self {
+            Self::NativeSessionIndexed { selection, record } => {
+                selection.validate().is_ok()
+                    && selection.route.scope == NativeSessionCatalogScope::Workspace
+                    && selection.route.workspace_id.as_ref() == Some(&record.workspace_id)
+                    && selection.route.provider == record.provider
+            }
+            _ => false,
+        }
+    }
+
+    pub fn native_session_preview_contract_is_valid(&self) -> bool {
+        match self {
+            Self::NativeSessionPreviewed { selection, preview } => {
+                selection.validate().is_ok() && preview.validate().is_ok()
+            }
+            Self::SessionRecordPreviewed { preview, .. } => preview.validate().is_ok(),
+            _ => true,
+        }
+    }
+
     pub fn requires_worktree_selection_capability(&self) -> bool {
-        matches!(self, Self::SpawnSpecAccepted { receipt }
+        matches!(self,
+            Self::SpawnSpecAccepted { receipt }
+                | Self::Spawned { receipt, .. }
             if receipt.target.worktree_id.is_some())
             || matches!(
                 self,
@@ -3747,9 +6206,21 @@ impl NodeResponse {
     pub fn requires_spawn_spec_defaults_overrides_capability(&self) -> bool {
         matches!(
             self,
-            Self::SpawnSpecAccepted { .. } | Self::ManagedWorktreeSpawnAccepted { .. }
+            Self::SpawnSpecAccepted { .. }
+                | Self::Spawned { .. }
+                | Self::ManagedWorktreeSpawnAccepted { .. }
         )
     }
+
+    pub fn requires_spawn_profile_revision_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::SpawnSpecAccepted { .. }
+                | Self::Spawned { .. }
+                | Self::ManagedWorktreeSpawnAccepted { .. }
+        )
+    }
+
     pub fn requires_child_environment_profile_capability(&self) -> bool {
         match self {
             Self::Snapshot { snapshot, .. } => {
@@ -3763,25 +6234,48 @@ impl NodeResponse {
                         event.event.requires_child_environment_profile_capability()
                     })
             }
-            Self::SpawnSpecAccepted { receipt } => receipt.environment_profile.is_some(),
+            Self::SpawnSpecAccepted { receipt }
+            | Self::Spawned { receipt, .. } => receipt.environment_profile.is_some(),
             Self::ManagedWorktreeSpawnAccepted { receipt } => {
                 receipt.spawn.environment_profile.is_some()
             }
             Self::SessionRecordUpdated { record }
+            | Self::ProviderSessionIndexed { record }
+            | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => {
                 record.environment_profile.is_some()
             }
-            Self::WorkspaceInspected { .. }
+            Self::Armed { .. }
+            | Self::Activated { .. }
+            | Self::Aborted { .. }
+            | Self::ReplyChunkAccepted { .. }
+            | Self::CallRejected { .. }
+            | Self::WorkspaceInspected { .. }
+            | Self::DeliveryStageBegun { .. }
+            | Self::DeliveryBlobChunkAccepted { .. }
+            | Self::DeliveryCommitted { .. }
+            | Self::DeliveryStageAborted { .. }
+            | Self::HostDirectoriesBrowsed { .. }
             | Self::WorkspaceFileRead { .. }
+            | Self::WorkspaceFileWritten { .. }
+            | Self::WorkspaceFileCreated { .. }
+            | Self::WorkspaceDirectoryCreated { .. }
+            | Self::GitHistoryRead { .. }
+            | Self::GitDiffRead { .. }
             | Self::Controller { .. }
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::NativeSessionsCataloged { .. }
+            | Self::NativeSessionsPaged { .. }
+            | Self::NativeSessionPreviewed { .. }
+            | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
+            | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
             | Self::WorktreeRemoved { .. }
@@ -3803,21 +6297,44 @@ impl NodeResponse {
                         event.event.requires_session_bundle_materialization_capability()
                     })
             }
-            Self::SpawnSpecAccepted { receipt } => receipt.bundle.is_some(),
+            Self::SpawnSpecAccepted { receipt }
+            | Self::Spawned { receipt, .. } => receipt.bundle.is_some(),
             Self::ManagedWorktreeSpawnAccepted { receipt } => receipt.spawn.bundle.is_some(),
             Self::SessionRecordUpdated { record }
+            | Self::ProviderSessionIndexed { record }
+            | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
-            Self::WorkspaceInspected { .. }
+            Self::Armed { .. }
+            | Self::Activated { .. }
+            | Self::Aborted { .. }
+            | Self::ReplyChunkAccepted { .. }
+            | Self::CallRejected { .. }
+            | Self::WorkspaceInspected { .. }
+            | Self::DeliveryStageBegun { .. }
+            | Self::DeliveryBlobChunkAccepted { .. }
+            | Self::DeliveryCommitted { .. }
+            | Self::DeliveryStageAborted { .. }
+            | Self::HostDirectoriesBrowsed { .. }
             | Self::WorkspaceFileRead { .. }
+            | Self::WorkspaceFileWritten { .. }
+            | Self::WorkspaceFileCreated { .. }
+            | Self::WorkspaceDirectoryCreated { .. }
+            | Self::GitHistoryRead { .. }
+            | Self::GitDiffRead { .. }
             | Self::Controller { .. }
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::NativeSessionsCataloged { .. }
+            | Self::NativeSessionsPaged { .. }
+            | Self::NativeSessionPreviewed { .. }
+            | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
+            | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
             | Self::WorktreeRemoved { .. }
@@ -3839,13 +6356,16 @@ impl NodeResponse {
                         event.event.requires_history_context_pack_capability()
                     })
             }
-            Self::SpawnSpecAccepted { receipt } => {
+            Self::SpawnSpecAccepted { receipt }
+            | Self::Spawned { receipt, .. } => {
                 receipt.context_id.is_some() || receipt.context.is_some()
             }
             Self::ManagedWorktreeSpawnAccepted { receipt } => {
                 receipt.spawn.context_id.is_some() || receipt.spawn.context.is_some()
             }
             Self::SessionRecordUpdated { record }
+            | Self::ProviderSessionIndexed { record }
+            | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => {
                 record.context_id.is_some() || record.context.is_some()
             }
@@ -3853,13 +6373,33 @@ impl NodeResponse {
             | Self::HistoryLoaded { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. } => true,
-            Self::WorkspaceInspected { .. }
+            Self::Armed { .. }
+            | Self::Activated { .. }
+            | Self::Aborted { .. }
+            | Self::ReplyChunkAccepted { .. }
+            | Self::CallRejected { .. }
+            | Self::WorkspaceInspected { .. }
+            | Self::DeliveryStageBegun { .. }
+            | Self::DeliveryBlobChunkAccepted { .. }
+            | Self::DeliveryCommitted { .. }
+            | Self::DeliveryStageAborted { .. }
+            | Self::HostDirectoriesBrowsed { .. }
             | Self::WorkspaceFileRead { .. }
+            | Self::WorkspaceFileWritten { .. }
+            | Self::WorkspaceFileCreated { .. }
+            | Self::WorkspaceDirectoryCreated { .. }
+            | Self::GitHistoryRead { .. }
+            | Self::GitDiffRead { .. }
             | Self::Controller { .. }
             | Self::SpawnAccepted { .. }
             | Self::ManagedWorktreeCleanup { .. }
             | Self::SessionRecordForgotten { .. }
+            | Self::NativeSessionsCataloged { .. }
+            | Self::NativeSessionsPaged { .. }
+            | Self::NativeSessionPreviewed { .. }
+            | Self::SessionRecordPreviewed { .. }
             | Self::WorkspaceRegistered { .. }
+            | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
             | Self::WorktreeCreated { .. }
             | Self::WorktreeRemoved { .. }
@@ -3880,17 +6420,49 @@ pub struct NodeFailure {
 pub enum NodeFailureCode {
     InvalidRequest,
     UnsupportedCapability,
+    SpawnProfileRevisionMismatch,
+    HarnessMcpUnavailable,
+    ReservationNotFound,
+    ReservationConflict,
+    ReservationExpired,
+    BindingMismatch,
+    NotActivated,
+    CallNotFound,
+    ChunkOutOfOrder,
+    ResponseTooLarge,
+    DeliveryManifestInvalid,
+    UnknownDeliveryStage,
+    DeliveryStageConflict,
+    DeliveryBlobUnexpected,
+    DeliveryChunkOutOfOrder,
+    DeliveryBlobDigestMismatch,
+    DeliveryBundleDigestMismatch,
+    DeliveryStageIncomplete,
+    DeliveryStageStorageFailed,
     Unauthorized,
     ObserverReadOnly,
     ControllerBusy,
     ControllerRequired,
     UnknownWorkspace,
+    HostDirectoryInvalid,
+    HostDirectoryReadFailed,
+    HostDirectoryReadTimedOut,
     InvalidRepositoryPath,
     RepositoryFileNotFound,
     RepositoryFileNotRegular,
     RepositoryPathUnsafe,
     RepositoryFileReadTimedOut,
     RepositoryFileReadFailed,
+    RepositoryFileWriteTimedOut,
+    RepositoryFileWriteFailed,
+    RepositoryFileRevisionConflict,
+    RepositoryEntryAlreadyExists,
+    RepositoryParentNotFound,
+    RepositoryParentNotDirectory,
+    RepositoryEntryCreateTimedOut,
+    RepositoryEntryCreateFailed,
+    GitReadTimedOut,
+    GitReadFailed,
     InvalidWorkspaceRoot,
     DuplicateWorkspaceId,
     DuplicateWorkspaceRoot,
@@ -3905,6 +6477,7 @@ pub enum NodeFailureCode {
     ManagedWorktreeBusy,
     ManagedWorktreeOwnershipConflict,
     ManagedWorktreeRecoveryRequired,
+    StandaloneWorkspaceRecoveryRequired,
     UnknownSpawnProfile,
     UnknownBundle,
     UnknownContextPack,
@@ -3925,6 +6498,8 @@ pub enum NodeFailureCode {
     SessionRecordBusy,
     SessionRecordConflict,
     SessionWorkspaceMismatch,
+    WorkspaceRegistrationRequired,
+    StaleNativeSessionCatalog,
     StaleGeneration,
     BackendBusy,
     BackendDisconnected,
@@ -3941,7 +6516,18 @@ pub struct NodeEventEnvelope {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum NodeEvent {
+    HarnessMcpReadCall {
+        reservation_id: HarnessMcpReservationId,
+        activation_digest: HarnessMcpActivationDigest,
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        call_id: HarnessMcpCallId,
+        request: HarnessReadRequestV1,
+        deadline_unix_ms: u64,
+    },
     Control { address: SessionAddress, event: ControlEvent },
+    Observation { address: SessionAddress, observation: ObservationV1 },
+    ManagedObservation { record_id: SessionRecordId, observation: ObservationV1 },
     TerminalFrame { address: SessionAddress, frame: TerminalFrame },
     ControllerChanged { controller: Option<ControllerState> },
     WorkspaceAdded { workspace: WorkspaceSnapshot },
@@ -3954,6 +6540,38 @@ pub enum NodeEvent {
 }
 
 impl NodeEvent {
+    pub fn requires_harness_mcp_proxy_capability(&self) -> bool {
+        matches!(self, Self::HarnessMcpReadCall { .. })
+    }
+
+    pub fn harness_mcp_contract_is_valid_at(&self, now_unix_ms: u64) -> bool {
+        match self {
+            Self::HarnessMcpReadCall { request, deadline_unix_ms, .. } => {
+                request.validate().is_ok()
+                    && serde_json::to_vec(request)
+                        .is_ok_and(|wire| wire.len() <= MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES)
+                    && *deadline_unix_ms > now_unix_ms
+                    && deadline_unix_ms.saturating_sub(now_unix_ms)
+                        <= MAX_HARNESS_MCP_CALL_DEADLINE_MS
+            }
+            _ => true,
+        }
+    }
+    pub fn requires_observation_events_capability(&self) -> bool {
+        matches!(self, Self::Observation { .. } | Self::ManagedObservation { .. })
+    }
+
+    pub fn requires_observation_managed_target_capability(&self) -> bool {
+        matches!(self, Self::ManagedObservation { .. })
+    }
+
+    pub fn requires_observation_workflow_detail_capability(&self) -> bool {
+        matches!(self,
+            Self::Observation { observation, .. }
+            | Self::ManagedObservation { observation, .. }
+            if observation.kind.requires_workflow_detail_capability())
+    }
+
     pub fn requires_child_environment_profile_capability(&self) -> bool {
         matches!(self, Self::SessionRecordUpserted { record }
             if record.environment_profile.is_some())
@@ -4089,6 +6707,77 @@ pub enum FrameError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn harness_mcp_protocol_serde_bounds_and_privacy() {
+        let reservation_id = HarnessMcpReservationId::new(format!(
+            "hmcpres_{}", "a".repeat(24),
+        )).unwrap();
+        let call_id = HarnessMcpCallId::new(format!("hmcpcall_{}", "b".repeat(24))).unwrap();
+        let digest = HarnessMcpActivationDigest::new(format!(
+            "sha256:{}", "c".repeat(64),
+        )).unwrap();
+        let token = HarnessMcpLocalToken::new(format!("g4ah3_{}", "d".repeat(64))).unwrap();
+        assert!(!format!("{token:?}").contains(token.expose()));
+        assert!(HarnessMcpReservationId::new(format!("hmcpres_{}", "A".repeat(24))).is_err());
+        assert!(HarnessMcpCallId::new(format!("hmcpcall_{}", "b".repeat(23))).is_err());
+        assert!(HarnessMcpActivationDigest::new(format!("sha256:{}", "g".repeat(64))).is_err());
+
+        let local = HarnessMcpLocalRequestV1 {
+            version: 1,
+            token,
+            request: HarnessReadRequestV1::ContextGet,
+        };
+        local.validate().unwrap();
+        let mut unknown = serde_json::to_value(&local).unwrap();
+        unknown["endpoint"] = serde_json::Value::String("forbidden".to_owned());
+        assert!(serde_json::from_value::<HarnessMcpLocalRequestV1>(unknown).is_err());
+        assert!(HarnessMcpReplyChunkHexV1::new(
+            "00".repeat(MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES),
+        ).is_ok());
+        assert!(HarnessMcpReplyChunkHexV1::new(
+            "00".repeat(MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES + 1),
+        ).is_err());
+
+        let event = NodeEvent::HarnessMcpReadCall {
+            reservation_id: reservation_id.clone(),
+            activation_digest: digest.clone(),
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            session: session_address("primary", 1),
+            call_id,
+            request: HarnessReadRequestV1::ContextGet,
+            deadline_unix_ms: 4_000,
+        };
+        assert!(event.harness_mcp_contract_is_valid_at(1_000));
+        assert!(!event.harness_mcp_contract_is_valid_at(999));
+        let request = NodeRequest::AbortHarnessMcpReservation {
+            reservation_id,
+            activation_digest: digest,
+        };
+        assert_eq!(request.required_capability(), Some(NODE_HARNESS_MCP_READ_PROXY_CAPABILITY));
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("g4ah3_"));
+        assert!(!json.contains("endpoint"));
+        assert!(!json.contains("path"));
+    }
+
+    #[test]
+    fn task_id_is_fixed_opaque_and_bounded() {
+        let task_id = TaskId::from_nonce([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xff,
+        ]);
+        assert_eq!(task_id.as_str(), "task-00112233445566778899aaff");
+        assert_eq!(task_id.as_str().len(), 29);
+        assert_eq!(task_id.as_str().parse::<TaskId>().unwrap(), task_id);
+        assert!("task-00112233445566778899aaf".parse::<TaskId>().is_err());
+        assert!("task-00112233445566778899aaff00".parse::<TaskId>().is_err());
+        assert!("task-00112233445566778899aaFF".parse::<TaskId>().is_err());
+        assert!("work-00112233445566778899aaff".parse::<TaskId>().is_err());
+        assert!(serde_json::from_str::<TaskId>(
+            r#""task-00112233445566778899aaff-extra""#,
+        )
+        .is_err());
+    }
+
     fn agent(value: &str) -> AgentId {
         AgentId::new(value).unwrap()
     }
@@ -4221,6 +6910,37 @@ mod tests {
     }
 
     #[test]
+    fn history_loaded_completed_turn_count_is_optional_wire_metadata() {
+        let legacy_json = r#"{"kind":"history-loaded","session":{"workspace_id":"primary","session":{"instance_id":7,"generation":1}},"session_id":"session-7","message_count":12}"#;
+        let legacy = serde_json::from_str::<NodeResponse>(legacy_json).unwrap();
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), legacy_json);
+        assert!(matches!(
+            legacy,
+            NodeResponse::HistoryLoaded {
+                completed_turn_count: None,
+                ..
+            }
+        ));
+
+        let current = NodeResponse::HistoryLoaded {
+            session: SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(1),
+                },
+            },
+            session_id: "session-7".to_owned(),
+            message_count: 12,
+            completed_turn_count: Some(5),
+        };
+        assert_eq!(
+            serde_json::to_string(&current).unwrap(),
+            r#"{"kind":"history-loaded","session":{"workspace_id":"primary","session":{"instance_id":7,"generation":1}},"session_id":"session-7","message_count":12,"completed_turn_count":5}"#,
+        );
+    }
+
+    #[test]
     fn spawn_spec_defaults_overrides_are_deterministic() {
         let profile_id = SpawnProfileId::new("review-default").unwrap();
         let defaults = SpawnProfileDefaults {
@@ -4246,6 +6966,7 @@ mod tests {
                 worktree_id: Some(WorkspaceId::new("review-tree").unwrap()),
             },
             profile_id,
+            expected_profile_revision: defaults.revision.clone(),
             overrides: SpawnOverrides {
                 provider: SpawnOverride::Inherit,
                 mode: SpawnOverride::Set {
@@ -4384,10 +7105,27 @@ mod tests {
             Err(SpawnSpecResolveError::RequiredFieldCleared { field: "provider" }),
         ));
 
-        let minimal_json = r#"{"target":{"node_id":"node-a","workspace_id":"primary"},"profile_id":"review-default","deadline_ms":1,"idempotency_key":"request-0002"}"#;
+        let mut stale_revision = spec.clone();
+        stale_revision.expected_profile_revision =
+            SpawnProfileRevision::new("review-default.r2").unwrap();
+        assert!(matches!(
+            stale_revision.resolve(&defaults),
+            Err(SpawnSpecResolveError::ProfileRevisionMismatch {
+                expected,
+                loaded,
+            }) if expected.as_str() == "review-default.r2"
+                && loaded.as_str() == "review-default.r3",
+        ));
+
+        let missing_revision_json = r#"{"target":{"node_id":"node-a","workspace_id":"primary"},"profile_id":"review-default","deadline_ms":1,"idempotency_key":"request-0002"}"#;
+        assert!(serde_json::from_str::<SpawnSpec>(missing_revision_json).is_err());
+        let minimal_json = r#"{"target":{"node_id":"node-a","workspace_id":"primary"},"profile_id":"review-default","expected_profile_revision":"review-default.r3","deadline_ms":1,"idempotency_key":"request-0002"}"#;
         let minimal = serde_json::from_str::<SpawnSpec>(minimal_json).unwrap();
         assert_eq!(minimal.overrides, SpawnOverrides::default());
         assert!(minimal.required_capabilities.is_empty());
+        let mut unknown_field = serde_json::to_value(&minimal).unwrap();
+        unknown_field["profile_revision"] = serde_json::json!("review-default.r3");
+        assert!(serde_json::from_value::<SpawnSpec>(unknown_field).is_err());
         assert!(SpawnDeadlineMs::new(MAX_SPAWN_DEADLINE_MS + 1).is_err());
         assert!(SpawnProfileId::new("unsafe/profile").is_err());
         assert!(serde_json::from_str::<SpawnOverride<AgentId>>(
@@ -4398,7 +7136,7 @@ mod tests {
 
     #[test]
     fn session_bundle_materialization_contract_is_bounded_exact_and_dual_gated() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 9);
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         assert_eq!(NODE_STATE_SCHEMA_V7, 7);
         assert_eq!(NODE_STATE_SCHEMA_V8, 8);
         assert_eq!(
@@ -4457,7 +7195,7 @@ mod tests {
             assert!(SpawnBundleDigest::new(invalid).is_err());
         }
 
-        let minimal_json = r#"{"target":{"node_id":"node-a","workspace_id":"primary"},"profile_id":"review-default","deadline_ms":1,"idempotency_key":"request-bundle"}"#;
+        let minimal_json = r#"{"target":{"node_id":"node-a","workspace_id":"primary"},"profile_id":"review-default","expected_profile_revision":"review-default.r3","deadline_ms":1,"idempotency_key":"request-bundle"}"#;
         let inherited = serde_json::from_str::<SpawnSpec>(minimal_json).unwrap();
         assert!(NodeRequest::SpawnSpec {
             spec: inherited.clone(),
@@ -5249,7 +7987,7 @@ mod tests {
 
     #[test]
     fn history_context_pack_wire_is_bounded_path_free_and_auth_bound() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 9);
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         assert_eq!(NODE_HISTORY_CONTEXT_PACK_CAPABILITY, "history-context-pack-v1");
         let capability = CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
         assert!(production_node_client_compatibility_offer()
@@ -5321,6 +8059,175 @@ mod tests {
     }
 
     #[test]
+    fn native_session_catalog_wire_is_bounded_metadata_only() {
+        assert_eq!(NODE_NATIVE_SESSION_CATALOG_CAPABILITY, "native-session-catalog-v2");
+        let route = NativeSessionCatalogRoute::workspace(
+            WorkspaceId::new("primary").unwrap(),
+            agent("codex"),
+        );
+        let request = NodeRequest::CatalogNativeSessions {
+            route: route.clone(),
+            limit: NATIVE_SESSION_CATALOG_LIMIT_MAX,
+        };
+        assert_eq!(
+            request.required_capability(),
+            Some(NODE_NATIVE_SESSION_CATALOG_CAPABILITY)
+        );
+        assert!(request.native_session_catalog_contract_is_valid());
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["limit"] = serde_json::Value::from(65);
+        assert!(serde_json::from_value::<NodeRequest>(invalid).is_err());
+
+        let response = NodeResponse::NativeSessionsCataloged {
+            route: route.clone(),
+            entries: vec![NativeSessionCatalogEntry {
+                selection_id: "hist_selection_1".to_owned(),
+                title: Some("Review".to_owned()),
+                modified_at_unix_ms: Some(9),
+                model: Some("model-1".to_owned()),
+                message_count: 4,
+                completed_turn_count: Some(2),
+                external_group: None,
+                record_id: Some(SessionRecordId::new("record-1").unwrap()),
+            }],
+            summary: Some(NativeSessionCatalogSummary {
+                catalog_revision: 7,
+                recent_cutoff_unix_ms: 8,
+                recent_total_count: 1,
+                older_total_count: 2,
+                recent_next_after_selection_id: None,
+                recent_has_more: false,
+            }),
+        };
+        assert!(response.requires_native_session_catalog_capability());
+        assert!(response.native_session_catalog_contract_is_valid());
+        let json = serde_json::to_string(&response).unwrap();
+        for forbidden in ["session_id", "stable-session", "cwd", "candidate", "path", "messages", "tokens", "documents", "raw"] {
+            assert!(!json.contains(forbidden));
+        }
+        assert_eq!(serde_json::from_str::<NodeResponse>(&json).unwrap(), response);
+        assert!(serde_json::from_str::<NodeResponse>(
+            r#"{"kind":"native-sessions-cataloged","workspace_id":"primary","provider":"codex","entries":[]}"#,
+        )
+        .is_err());
+        let mut injected = serde_json::to_value(&response).unwrap();
+        injected["entries"][0]["title"] = serde_json::Value::String("safe\nunsafe".to_owned());
+        assert!(serde_json::from_value::<NodeResponse>(injected).is_err());
+
+        let external = NodeResponse::NativeSessionsCataloged {
+            route: NativeSessionCatalogRoute::unregistered(agent("codex")),
+            entries: vec![NativeSessionCatalogEntry {
+                selection_id: "external_selection_1".to_owned(),
+                title: None,
+                modified_at_unix_ms: Some(9),
+                model: None,
+                message_count: 0,
+                completed_turn_count: None,
+                external_group: Some(NativeSessionExternalGroup {
+                    group_id: "external-0001".to_owned(),
+                    kind: gate4agent_types::NativeSessionExternalGroupKind::Project,
+                    display_name: "shared".to_owned(),
+                }),
+                record_id: None,
+            }],
+            summary: Some(NativeSessionCatalogSummary {
+                catalog_revision: 9,
+                recent_cutoff_unix_ms: 8,
+                recent_total_count: 1,
+                older_total_count: 0,
+                recent_next_after_selection_id: None,
+                recent_has_more: false,
+            }),
+        };
+        assert!(external.native_session_catalog_contract_is_valid());
+        let external_json = serde_json::to_string(&external).unwrap();
+        assert!(!external_json.contains("project-"));
+        for hostile in [r"C:\private", "/srv/private", "..", "nested/path"] {
+            let mut injected = serde_json::to_value(&external).unwrap();
+            injected["entries"][0]["external_group"]["display_name"] =
+                serde_json::Value::String(hostile.to_owned());
+            assert!(serde_json::from_value::<NodeResponse>(injected).is_err());
+        }
+
+        let page_request = NodeRequest::PageNativeSessions {
+            route: route.clone(),
+            window: NativeSessionCatalogWindow::Older,
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 8,
+            after_selection_id: Some("hist_selection_1".to_owned()),
+            limit: 1,
+        };
+        assert_eq!(
+            page_request.required_capability(),
+            Some(NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY),
+        );
+        let paged = NodeResponse::NativeSessionsPaged {
+            route,
+            page: NativeSessionCatalogPage {
+                window: NativeSessionCatalogWindow::Older,
+                revision: 7,
+                entries: Vec::new(),
+                next_after_selection_id: None,
+                remaining_count: 0,
+                has_more: false,
+            },
+        };
+        assert!(paged.requires_native_session_catalog_paging_capability());
+        assert!(paged.native_session_catalog_contract_is_valid());
+    }
+
+    #[test]
+    fn native_session_preview_wire_is_bounded_and_record_projection_is_redacted() {
+        assert_eq!(NODE_NATIVE_SESSION_PREVIEW_CAPABILITY, "native-session-preview-v2");
+        let selection = NativeSessionSelection {
+            route: NativeSessionCatalogRoute::workspace(
+                WorkspaceId::new("primary").unwrap(),
+                agent("claude"),
+            ),
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 8,
+            selection_id: "hist_selection_1".to_owned(),
+        };
+        let request = NodeRequest::PreviewNativeSession {
+            selection: selection.clone(),
+            message_limit: NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX,
+        };
+        assert_eq!(
+            request.required_capability(),
+            Some(NODE_NATIVE_SESSION_PREVIEW_CAPABILITY)
+        );
+        assert!(request.native_session_preview_contract_is_valid());
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["message_limit"] = serde_json::Value::from(25);
+        assert!(serde_json::from_value::<NodeRequest>(invalid).is_err());
+
+        let preview = NativeSessionPreview {
+            title: Some("Review".to_owned()),
+            modified_at_unix_ms: Some(9),
+            model: Some("model-1".to_owned()),
+            message_count: 8,
+            message_count_exact: true,
+            completed_turn_count: Some(4),
+            total_tokens: None,
+            truncated: true,
+            messages: vec![gate4agent_types::NativeSessionPreviewMessage {
+                role: gate4agent_types::HistoryMessageRole::Assistant,
+                text: "visible answer".to_owned(),
+            }],
+        };
+        let response = NodeResponse::NativeSessionPreviewed {
+            selection,
+            preview,
+        };
+        assert!(response.requires_native_session_preview_capability());
+        let json = serde_json::to_string(&response).unwrap();
+        for forbidden in ["native-secret-id", "cwd", "path", "tokens", "tool_result", "thinking"] {
+            assert!(!json.contains(forbidden));
+        }
+        assert_eq!(serde_json::from_str::<NodeResponse>(&json).unwrap(), response);
+    }
+
+    #[test]
     fn context_receipts_are_nonempty_and_strictly_correlated() {
         assert!(SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).is_ok());
         assert!(SpawnContextDigest::new(format!("sha256:{}", "A".repeat(64))).is_err());
@@ -5339,6 +8246,7 @@ mod tests {
             bundle: None,
             context_id: Some(context.id.clone()),
             context: Some(context.clone()),
+            task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
             last_error: None,
@@ -5346,6 +8254,21 @@ mod tests {
         assert!(record.context_binding_is_valid());
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(serde_json::from_value::<ManagedSessionRecord>(json.clone()).unwrap(), record);
+
+        let mut invalid_task_revision = json.clone();
+        invalid_task_revision["task_binding"] = serde_json::json!({
+            "revision": 0,
+            "task_id": "task-00112233445566778899aaff",
+            "changed_at_unix_ms": 1,
+        });
+        assert!(serde_json::from_value::<ManagedSessionRecord>(invalid_task_revision).is_err());
+        let mut invalid_task_timestamp = json.clone();
+        invalid_task_timestamp["task_binding"] = serde_json::json!({
+            "revision": 1,
+            "task_id": "task-00112233445566778899aaff",
+            "changed_at_unix_ms": 3,
+        });
+        assert!(serde_json::from_value::<ManagedSessionRecord>(invalid_task_timestamp).is_err());
 
         let mut metadata_without_id = json.clone();
         metadata_without_id["context_id"] = serde_json::Value::Null;
@@ -5398,6 +8321,7 @@ mod tests {
                 context_id: SpawnFieldProvenance::Profile,
                 environment_profile_id: SpawnFieldProvenance::Profile,
             },
+            harness_mcp_proxy: None,
         };
         assert!(receipt.context_binding_is_valid());
         let mut mismatched = serde_json::to_value(&receipt).unwrap();
@@ -5407,7 +8331,7 @@ mod tests {
 
     #[test]
     fn protocol_v9_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 9);
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         assert_eq!(MAX_WORKSPACE_ROOT_BYTES, gate4agent_types::WORKING_DIRECTORY_MAX_BYTES);
 
         let register = NodeRequest::RegisterWorkspace {
@@ -5420,6 +8344,30 @@ mod tests {
             r#"{"kind":"register-workspace","workspace_id":"repo-2","root":"C:\\repo-2"}"#,
         );
         assert_eq!(serde_json::from_str::<NodeRequest>(&register_json).unwrap(), register);
+
+        let standalone = NodeRequest::CreateStandaloneWorkspace {
+            workspace_id: WorkspaceId::new("independent").unwrap(),
+            root: host_path(r"C:\independent"),
+            initial_branch: Some("main".to_owned()),
+        };
+        let standalone_json = serde_json::to_string(&standalone).unwrap();
+        assert_eq!(
+            standalone_json,
+            r#"{"kind":"create-standalone-workspace","workspace_id":"independent","root":"C:\\independent","initial_branch":"main"}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<NodeRequest>(&standalone_json).unwrap(),
+            standalone,
+        );
+        assert_eq!(
+            standalone.required_capability(),
+            Some(NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY),
+        );
+        let oversized_branch = format!(
+            r#"{{"kind":"create-standalone-workspace","workspace_id":"independent","root":"C:\\independent","initial_branch":"{}"}}"#,
+            "x".repeat(MAX_REPOSITORY_PATH_BYTES + 1),
+        );
+        assert!(serde_json::from_str::<NodeRequest>(&oversized_branch).is_err());
 
         let unregister = NodeRequest::UnregisterWorkspace {
             workspace_id: WorkspaceId::new("repo-2").unwrap(),
@@ -5511,6 +8459,8 @@ mod tests {
                 workspaces: Vec::new(),
                 session_records: Vec::new(),
                 managed_worktrees: Vec::new(),
+                launch_inventory: None,
+                agent_progress: Vec::new(),
             },
             compatibility: None,
         };
@@ -5523,12 +8473,166 @@ mod tests {
     }
 
     #[test]
+    fn agent_progress_v1_rejects_oversize_and_controls() {
+        let address = serde_json::json!({
+            "workspace_id": "primary",
+            "session": { "instance_id": 7, "generation": 3 }
+        });
+        let valid_progress = serde_json::json!({
+            "provider_sequence": 11,
+            "activity": "working",
+            "completed_turns": 2,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_read_tokens": 30,
+                "cache_write_tokens": 40,
+                "reasoning_tokens": 50
+            },
+            "current": "working",
+            "active_tool_labels": ["Read"],
+            "active_tool_count": 1,
+            "attention": null,
+            "subagent_count": 0,
+            "last_event_kind": "tool-started",
+            "gap_count": 0,
+            "stale": false,
+            "truncated": false
+        });
+        let mut controlled = valid_progress.clone();
+        controlled["active_tool_labels"] = serde_json::json!(["unsafe\u{0000}tool"]);
+        assert!(serde_json::from_value::<AgentProgressV1>(controlled.clone()).is_err());
+
+        let mut path_like = valid_progress.clone();
+        path_like["active_tool_labels"] = serde_json::json!([r"Read C:\private\secret"]);
+        assert!(serde_json::from_value::<AgentProgressV1>(path_like).is_err());
+
+        let mut oversized_label = valid_progress.clone();
+        oversized_label["active_tool_labels"] =
+            serde_json::json!(["x".repeat(MAX_AGENT_PROGRESS_TOOL_LABEL_BYTES + 1)]);
+        assert!(serde_json::from_value::<AgentProgressV1>(oversized_label.clone()).is_err());
+
+        let oversized_entry = serde_json::json!({
+            "address": address.clone(),
+            "progress": valid_progress,
+            "padding": "x".repeat(MAX_AGENT_PROGRESS_ENTRY_BYTES)
+        });
+        assert!(serde_json::to_vec(&oversized_entry).unwrap().len()
+            > MAX_AGENT_PROGRESS_ENTRY_BYTES);
+        let snapshot = serde_json::json!({
+            "node_id": "fixture-node",
+            "enabled_providers": [],
+            "workspaces": [],
+            "session_records": [],
+            "agent_progress": [
+                { "address": address.clone(), "progress": controlled },
+                { "address": address, "progress": oversized_label },
+                oversized_entry
+            ]
+        });
+        let decoded = serde_json::from_value::<NodeSnapshot>(snapshot).unwrap();
+        assert!(decoded.agent_progress.is_empty());
+    }
+
+    #[test]
+    fn launch_inventory_preserves_legacy_absence_and_authoritative_empty() {
+        let legacy = serde_json::from_str::<NodeSnapshot>(
+            r#"{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}"#,
+        )
+        .unwrap();
+        assert!(legacy.launch_inventory.is_none());
+        assert!(serde_json::from_str::<LaunchInventory>(r#"{}"#).is_err());
+
+        let current = LaunchInventory {
+            spawn_profiles: Some(Vec::new()),
+            bundles: Some(Vec::new()),
+        };
+        assert_eq!(
+            serde_json::to_string(&current).unwrap(),
+            r#"{"spawn_profiles":[],"bundles":[]}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<LaunchInventory>(
+                r#"{"spawn_profiles":[],"bundles":[]}"#,
+            )
+            .unwrap(),
+            current,
+        );
+
+        let legacy_workspace = serde_json::from_str::<WorkspaceSnapshot>(
+            r#"{"workspace_id":"repo","canonical_root":"fixture-root","sessions":[]}"#,
+        )
+        .unwrap();
+        assert!(legacy_workspace.managed_worktree_profiles.is_none());
+        let current_workspace = WorkspaceSnapshot {
+            managed_worktree_profiles: Some(WorktreeProfileInventory {
+                profiles: Vec::new(),
+            }),
+            ..legacy_workspace
+        };
+        assert!(serde_json::to_string(&current_workspace)
+            .unwrap()
+            .contains(r#""managed_worktree_profiles":[]"#));
+    }
+
+    #[test]
+    fn launch_inventory_rejects_duplicate_and_overflow_identities() {
+        let duplicate_profiles = r#"{"spawn_profiles":[{"id":"default","revision":"v1"},{"id":"default","revision":"v2"}]}"#;
+        assert!(serde_json::from_str::<LaunchInventory>(duplicate_profiles).is_err());
+
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let duplicate_bundles = serde_json::json!({
+            "bundles": [
+                { "id": "review", "revision": "v1", "digest": digest },
+                { "id": "review", "revision": "v2", "digest": format!("sha256:{}", "1".repeat(64)) },
+            ],
+        });
+        assert!(serde_json::from_value::<LaunchInventory>(duplicate_bundles).is_err());
+
+        let duplicate_worktrees = r#"[{"id":"default","revision":"v1","retention":"retain"},{"id":"default","revision":"v2","retention":"remove-when-released"}]"#;
+        assert!(serde_json::from_str::<WorktreeProfileInventory>(duplicate_worktrees).is_err());
+
+        let profiles = (0..=MAX_SPAWN_PROFILES)
+            .map(|index| serde_json::json!({
+                "id": format!("profile-{index}"),
+                "revision": "v1",
+            }))
+            .collect::<Vec<_>>();
+        let overflow = serde_json::json!({ "spawn_profiles": profiles });
+        assert!(serde_json::from_value::<LaunchInventory>(overflow).is_err());
+
+        let bundles = (0..=MAX_LAUNCH_BUNDLES)
+            .map(|index| serde_json::json!({
+                "id": format!("bundle-{index}"),
+                "revision": "v1",
+                "digest": format!("sha256:{}", "2".repeat(64)),
+            }))
+            .collect::<Vec<_>>();
+        assert!(serde_json::from_value::<LaunchInventory>(
+            serde_json::json!({ "bundles": bundles }),
+        )
+        .is_err());
+
+        let worktrees = (0..=MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE)
+            .map(|index| serde_json::json!({
+                "id": format!("profile-{index}"),
+                "revision": "v1",
+                "retention": "retain",
+            }))
+            .collect::<Vec<_>>();
+        assert!(serde_json::from_value::<WorktreeProfileInventory>(
+            serde_json::Value::Array(worktrees),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn managed_worktree_contract_is_bounded_dual_gated_and_path_free() {
         assert_eq!(
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             "managed-worktree-lifecycle-v1",
         );
-        assert_eq!(NODE_PROTOCOL_VERSION, 9);
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         assert_eq!(NODE_STATE_SCHEMA_V4, 4);
         assert_eq!(NODE_STATE_SCHEMA_V5, 5);
         assert_eq!(NODE_STATE_SCHEMA_V6, 6);
@@ -5552,6 +8656,7 @@ mod tests {
                         worktree_id: None,
                     },
                     profile_id: SpawnProfileId::new("default").unwrap(),
+                    expected_profile_revision: SpawnProfileRevision::new("default.r1").unwrap(),
                     overrides: SpawnOverrides::default(),
                     deadline_ms: SpawnDeadlineMs::new(30_000).unwrap(),
                     idempotency_key: SpawnIdempotencyKey::new("managed-1").unwrap(),
@@ -5746,6 +8851,39 @@ mod tests {
     }
 
     #[test]
+    fn managed_observation_requires_managed_target_capability() {
+        assert_eq!(
+            NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+            "observation-managed-target-v1",
+        );
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .iter()
+            .any(|capability| {
+                capability.as_str() == NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY
+            }));
+        let event = NodeEvent::ManagedObservation {
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            observation: ObservationV1 {
+                source_sequence: 3,
+                observed_at_unix_ms: Some(2),
+                evidence: ObservationEvidenceV1::StructuredProvider,
+                kind: ObservationKindV1::Working,
+                truncated: false,
+            },
+        };
+        assert!(event.requires_observation_events_capability());
+        assert!(event.requires_observation_managed_target_capability());
+        assert!(!event.requires_observation_workflow_detail_capability());
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"managed-observation","record_id":"record-a","observation":{"source_sequence":3,"observed_at_unix_ms":2,"evidence":"structured-provider","kind":{"kind":"working"},"truncated":false}}"#,
+        );
+        assert_eq!(serde_json::from_str::<NodeEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
     fn terminal_frame_events_capability_is_optional_and_auth_bound_exactly() {
         assert_eq!(
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -5876,6 +9014,8 @@ mod tests {
             workspace_id: WorkspaceId::new("repo-2").unwrap(),
             canonical_root: host_path(r"C:\repo-2"),
             sessions: Vec::new(),
+            worktree_service_mode: None,
+            managed_worktree_profiles: None,
         };
         let registered = NodeResponse::WorkspaceRegistered {
             workspace: workspace.clone(),
@@ -5884,6 +9024,14 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<NodeResponse>(&registered_json).unwrap(),
             registered,
+        );
+        let standalone = NodeResponse::StandaloneWorkspaceCreated {
+            workspace: workspace.clone(),
+        };
+        let standalone_json = serde_json::to_string(&standalone).unwrap();
+        assert_eq!(
+            serde_json::from_str::<NodeResponse>(&standalone_json).unwrap(),
+            standalone,
         );
         let added = NodeEventEnvelope {
             sequence: 19,
@@ -5985,13 +9133,52 @@ mod tests {
                         prunable_reason: None,
                         workspace_id: Some(WorkspaceId::new("primary").unwrap()),
                     }],
+                    managed_worktree: None,
                     truncated: false,
                     diagnostic: None,
                 },
             },
         };
         let response_json = serde_json::to_string(&response).unwrap();
+        assert!(!response_json.contains("managed_worktree"));
         assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn managed_worktree_git_scope_is_optional_bounded_and_round_trips() {
+        let scope = ManagedWorktreeGitScope {
+            lease_id: ManagedWorktreeLeaseId::new("mw-scope").unwrap(),
+            source_workspace_id: WorkspaceId::new("primary").unwrap(),
+            branch: "gate4agent/mw-scope".to_owned(),
+            base_commit: GitObjectId::new(
+                "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            )
+            .unwrap(),
+            active_session_count: 1,
+            managed_record_count: 1,
+        };
+        let json = serde_json::to_string(&scope).unwrap();
+        assert_eq!(serde_json::from_str::<ManagedWorktreeGitScope>(&json).unwrap(), scope);
+
+        let oversized = format!(
+            r#"{{"lease_id":"mw-scope","source_workspace_id":"primary","branch":"{}","base_commit":"0123456789abcdef0123456789abcdef01234567","active_session_count":0,"managed_record_count":0}}"#,
+            "x".repeat(MAX_REPOSITORY_PATH_BYTES + 1),
+        );
+        assert!(serde_json::from_str::<ManagedWorktreeGitScope>(&oversized).is_err());
+    }
+
+    #[test]
+    fn workspace_inspection_rejects_inconsistent_managed_git_scope() {
+        let valid = r#"{"workspace_id":"managed-a","entries":[],"tree_truncated":false,"git":{"is_repository":true,"branch":"gate4agent/a","status":[],"recent_commits":[],"worktrees":[],"managed_worktree":{"lease_id":"mw-a","source_workspace_id":"primary","branch":"gate4agent/a","base_commit":"0123456789abcdef0123456789abcdef01234567","active_session_count":1,"managed_record_count":0},"truncated":false,"diagnostic":null}}"#;
+        assert!(serde_json::from_str::<WorkspaceInspection>(valid).is_ok());
+        for invalid in [
+            valid.replace("\"is_repository\":true", "\"is_repository\":false"),
+            valid.replacen("\"branch\":\"gate4agent/a\"", "\"branch\":\"gate4agent/b\"", 1),
+            valid.replace("\"source_workspace_id\":\"primary\"", "\"source_workspace_id\":\"managed-a\""),
+            valid.replace("\"active_session_count\":1", "\"active_session_count\":0"),
+        ] {
+            assert!(serde_json::from_str::<WorkspaceInspection>(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -6018,6 +9205,7 @@ mod tests {
                     text: "fn main() {}\n".to_owned(),
                     byte_len: 13,
                 },
+                revision: None,
             },
         };
         let response_json = serde_json::to_string(&response).unwrap();
@@ -6026,6 +9214,64 @@ mod tests {
             r#"{"kind":"workspace-file-read","file":{"workspace_id":"primary","path":"src/lib.rs","content":{"kind":"utf8","text":"fn main() {}\n","byte_len":13}}}"#,
         );
         assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn workspace_entry_create_has_exact_capability_gated_wire_contracts() {
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY));
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let file_path = repository_path("src/new.rs");
+        let directory_path = repository_path("src/new");
+        let create_file = NodeRequest::CreateWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: file_path.clone(),
+        };
+        let create_directory = NodeRequest::CreateWorkspaceDirectory {
+            workspace_id: workspace_id.clone(),
+            path: directory_path.clone(),
+        };
+        assert_eq!(
+            serde_json::to_string(&create_file).unwrap(),
+            r#"{"kind":"create-workspace-file","workspace_id":"primary","path":"src/new.rs"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&create_directory).unwrap(),
+            r#"{"kind":"create-workspace-directory","workspace_id":"primary","path":"src/new"}"#,
+        );
+        for request in [create_file, create_directory] {
+            assert_eq!(
+                request.required_capability(),
+                Some(NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY),
+            );
+            let encoded = serde_json::to_string(&request).unwrap();
+            assert_eq!(serde_json::from_str::<NodeRequest>(&encoded).unwrap(), request);
+        }
+
+        let file_response = NodeResponse::WorkspaceFileCreated {
+            file: WorkspaceFileRead {
+                workspace_id: workspace_id.clone(),
+                path: file_path,
+                content: WorkspaceFileContent::Utf8 {
+                    text: String::new(),
+                    byte_len: 0,
+                },
+                revision: Some(WorkspaceFileRevision::new("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()).unwrap()),
+            },
+        };
+        let directory_response = NodeResponse::WorkspaceDirectoryCreated {
+            workspace_id,
+            entry: WorkspaceEntry {
+                relative_path: directory_path,
+                kind: WorkspaceEntryKind::Directory,
+            },
+        };
+        for response in [file_response, directory_response] {
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert_eq!(serde_json::from_str::<NodeResponse>(&encoded).unwrap(), response);
+        }
     }
 
     #[test]
@@ -6038,10 +9284,48 @@ mod tests {
                     text: "\0".repeat(MAX_WORKSPACE_FILE_BYTES),
                     byte_len: u32::try_from(MAX_WORKSPACE_FILE_BYTES).unwrap(),
                 },
+                revision: None,
             },
         };
         let encoded = serde_json::to_vec(&response).unwrap();
         assert!(encoded.len() <= MAX_NODE_FRAME_BYTES, "{}", encoded.len());
+    }
+
+    #[test]
+    fn workspace_write_and_git_reads_have_exact_capability_gated_contracts() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let path = repository_path("src/lib.rs");
+        let revision = WorkspaceFileRevision::new("a".repeat(64)).unwrap();
+        let write = NodeRequest::WriteWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+            expected_revision: revision,
+            text: "updated\n".to_owned(),
+        };
+        assert_eq!(write.required_capability(), Some(NODE_WORKSPACE_FILE_WRITE_CAPABILITY));
+        let encoded = serde_json::to_string(&write).unwrap();
+        assert_eq!(serde_json::from_str::<NodeRequest>(&encoded).unwrap(), write);
+
+        let history = NodeRequest::ReadGitHistory {
+            workspace_id: workspace_id.clone(),
+            path: Some(path.clone()),
+            before: Some(GitObjectId::new("b".repeat(40)).unwrap()),
+            limit: MAX_GIT_HISTORY_COMMITS,
+        };
+        let diff = NodeRequest::ReadGitDiff {
+            workspace_id,
+            request: GitDiffRequest {
+                mode: GitDiffMode::Commit {
+                    revision: GitObjectId::new("c".repeat(40)).unwrap(),
+                },
+                path: Some(path),
+            },
+        };
+        for request in [history, diff] {
+            assert_eq!(request.required_capability(), Some(NODE_GIT_READ_CAPABILITY));
+            let encoded = serde_json::to_string(&request).unwrap();
+            assert_eq!(serde_json::from_str::<NodeRequest>(&encoded).unwrap(), request);
+        }
     }
 
     #[test]
@@ -6096,6 +9380,87 @@ mod tests {
         for request in legacy_requests {
             assert_eq!(request.required_capability(), None);
         }
+    }
+
+    #[test]
+    fn host_directory_browse_wire_contract_is_bounded_and_capability_gated() {
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == CAPABILITY_HOST_DIRECTORY_BROWSE_V1));
+        let directory = OpaqueHostPath::utf8(r"C:\repo".to_owned()).unwrap();
+        let request = NodeRequest::BrowseHostDirectories {
+            directory: Some(directory.clone()),
+            after: None,
+        };
+        assert_eq!(
+            request.required_capability(),
+            Some(CAPABILITY_HOST_DIRECTORY_BROWSE_V1),
+        );
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"kind":"browse-host-directories","directory":"C:\\repo","after":null}"#,
+        );
+
+        let response = NodeResponse::HostDirectoriesBrowsed {
+            listing: HostDirectoryListing {
+                directory: Some(directory.clone()),
+                parent: Some(OpaqueHostPath::utf8(r"C:\".to_owned()).unwrap()),
+                entries: vec![HostDirectoryEntry {
+                    path: OpaqueHostPath::utf8(r"C:\repo\child".to_owned()).unwrap(),
+                    display_name: "child".to_owned(),
+                    is_link: false,
+                }],
+                next_after: None,
+                incomplete: false,
+            },
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert_eq!(serde_json::from_str::<NodeResponse>(&encoded).unwrap(), response);
+
+        let entries = (0..=MAX_HOST_DIRECTORY_ENTRIES)
+            .map(|index| serde_json::json!({
+                "path": format!(r"C:\directory-{index}"),
+                "display_name": format!("directory-{index}"),
+                "is_link": false,
+            }))
+            .collect::<Vec<_>>();
+        let overflow = serde_json::json!({
+            "directory": null,
+            "parent": null,
+            "entries": entries,
+            "next_after": null,
+            "incomplete": true,
+        });
+        assert!(serde_json::from_value::<HostDirectoryListing>(overflow).is_err());
+        assert_eq!(
+            serde_json::to_string(&NodeFailureCode::HostDirectoryReadTimedOut).unwrap(),
+            r#""host-directory-read-timed-out""#,
+        );
+    }
+
+    #[test]
+    fn host_directory_entry_rejects_unbounded_control_or_non_utf8_wire_values() {
+        let path = host_path(r"C:\repo\child");
+        assert!(HostDirectoryEntry::new(path.clone(), "child".to_owned(), false).is_ok());
+        for display_name in [
+            String::new(),
+            "child\nname".to_owned(),
+            "x".repeat(MAX_HOST_DIRECTORY_DISPLAY_NAME_BYTES + 1),
+        ] {
+            let encoded = serde_json::json!({
+                "path": path,
+                "display_name": display_name,
+                "is_link": false,
+            });
+            assert!(serde_json::from_value::<HostDirectoryEntry>(encoded).is_err());
+        }
+        let non_utf8 = serde_json::json!({
+            "path": { "kind": "unix-bytes", "bytes": [47, 255] },
+            "display_name": "child",
+            "is_link": false,
+        });
+        assert!(serde_json::from_value::<HostDirectoryEntry>(non_utf8).is_err());
     }
 
     #[test]
@@ -6157,6 +9522,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            task_binding: None,
             created_at_unix_ms: 1_723_000_000_000,
             updated_at_unix_ms: 1_723_000_000_123,
             last_error: None,
@@ -6165,7 +9531,31 @@ mod tests {
             .unwrap()
             .contains("environment_profile"));
 
+        let native_selection = NativeSessionSelection {
+            route: NativeSessionCatalogRoute::workspace(
+                record.workspace_id.clone(),
+                record.provider.clone(),
+            ),
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 8,
+            selection_id: "hist_selection_1".to_owned(),
+        };
+
         let requests = [
+            NodeRequest::IndexProviderSession {
+                workspace_id: record.workspace_id.clone(),
+                provider: record.provider.clone(),
+                identity: ProviderSessionIdentity {
+                    key: gate4agent_types::ProviderSessionKey::SessionId,
+                    id: "b1ef3250-47a2-42ca-9076-cc241487ea22".to_owned(),
+                    transcript_path: None,
+                },
+                display_name: "release shepherd".to_owned(),
+            },
+            NodeRequest::IndexNativeSession {
+                selection: native_selection.clone(),
+                display_name: "release shepherd".to_owned(),
+            },
             NodeRequest::RenameSessionRecord {
                 record_id: record.record_id.clone(),
                 display_name: "release verification".to_owned(),
@@ -6182,9 +9572,31 @@ mod tests {
         for request in requests {
             let json = serde_json::to_string(&request).unwrap();
             assert_eq!(serde_json::from_str::<NodeRequest>(&json).unwrap(), request);
+            if matches!(request, NodeRequest::IndexProviderSession { .. }) {
+                assert_eq!(
+                    request.required_capability(),
+                    Some(NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY),
+                );
+            }
+            if matches!(request, NodeRequest::IndexNativeSession { .. }) {
+                assert_eq!(
+                    request.required_capability(),
+                    Some(NODE_NATIVE_SESSION_INDEX_CAPABILITY),
+                );
+            }
         }
 
+        let native_indexed = NodeResponse::NativeSessionIndexed {
+            selection: native_selection,
+            record: record.clone(),
+        };
+        assert!(native_indexed.requires_native_session_index_capability());
+        assert!(native_indexed.native_session_index_contract_is_valid());
         let responses = [
+            NodeResponse::ProviderSessionIndexed {
+                record: record.clone(),
+            },
+            native_indexed,
             NodeResponse::SessionRecordUpdated {
                 record: record.clone(),
             },
@@ -6240,5 +9652,184 @@ mod tests {
         let legacy = r#"{"node_id":"fixture-node","enabled_providers":[],"workspaces":[]}"#;
         let snapshot = serde_json::from_str::<NodeSnapshot>(legacy).unwrap();
         assert!(snapshot.session_records.is_empty());
+    }
+
+    fn delivery_manifest() -> DeliveryBundleManifestV2 {
+        DeliveryBundleManifestV2 {
+            bundle_id: SpawnBundleId::new("review-bundle").unwrap(),
+            revision: SpawnBundleRevision::new("review-bundle.r2").unwrap(),
+            bundle_digest: SpawnBundleDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap(),
+            manifest_digest: DeliveryManifestDigestV2::new(format!(
+                "sha256:{}",
+                "b".repeat(64),
+            ))
+            .unwrap(),
+            components: vec![DeliveryComponentV2 {
+                kind: DeliveryComponentKindV2::AgentDefinition,
+                scope: DeliveryScopeV2::Workspace,
+                relative_path: DeliveryRelativePathV2::new("agents/reviewer.md").unwrap(),
+                blob: DeliveryBlobReceiptV1::new(
+                    DeliveryBlobDigestV1::new(format!("sha256:{}", "c".repeat(64))).unwrap(),
+                    12,
+                )
+                .unwrap(),
+            }],
+        }
+    }
+
+    #[test]
+    fn delivery_wire_serialization_is_exact() {
+        let begin = NodeRequest::BeginDeliveryStage {
+            manifest: delivery_manifest(),
+        };
+        assert_eq!(
+            serde_json::to_string(&begin).unwrap(),
+            format!(
+                r#"{{"kind":"begin-delivery-stage","manifest":{{"bundle_id":"review-bundle","revision":"review-bundle.r2","bundle_digest":"sha256:{}","manifest_digest":"sha256:{}","components":[{{"kind":"agent-definition","scope":"workspace","relative_path":"agents/reviewer.md","blob":{{"digest":"sha256:{}","byte_len":12}}}}]}}}}"#,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+            ),
+        );
+
+        let chunk = NodeRequest::PutDeliveryBlobChunk {
+            stage_id: DeliveryStageId::new(format!(
+                "delivery-stage-{}",
+                "1".repeat(32),
+            ))
+            .unwrap(),
+            blob_digest: DeliveryBlobDigestV1::new(format!("sha256:{}", "c".repeat(64)))
+                .unwrap(),
+            offset: 0,
+            chunk_hex: DeliveryBlobChunkHexV1::new("00ff").unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&chunk).unwrap(),
+            format!(
+                r#"{{"kind":"put-delivery-blob-chunk","stage_id":"delivery-stage-{}","blob_digest":"sha256:{}","offset":0,"chunk_hex":"00ff"}}"#,
+                "1".repeat(32),
+                "c".repeat(64),
+            ),
+        );
+
+        let committed = NodeResponse::DeliveryCommitted {
+            receipt: DeliveryCommitReceiptV1 {
+                bundle_id: SpawnBundleId::new("review-bundle").unwrap(),
+                revision: SpawnBundleRevision::new("review-bundle.r2").unwrap(),
+                bundle_digest: SpawnBundleDigest::new(format!("sha256:{}", "a".repeat(64)))
+                    .unwrap(),
+                manifest_digest: DeliveryManifestDigestV2::new(format!(
+                    "sha256:{}",
+                    "b".repeat(64),
+                ))
+                .unwrap(),
+                blobs: vec![DeliveryBlobReceiptV1::new(
+                    DeliveryBlobDigestV1::new(format!("sha256:{}", "c".repeat(64))).unwrap(),
+                    12,
+                )
+                .unwrap()],
+            },
+        };
+        assert_eq!(
+            serde_json::from_str::<NodeResponse>(&serde_json::to_string(&committed).unwrap())
+                .unwrap(),
+            committed,
+        );
+    }
+
+    #[test]
+    fn delivery_wire_rejects_bounds_order_and_case_fold_collisions() {
+        assert!(DeliveryRelativePathV2::new("a".repeat(MAX_DELIVERY_RELATIVE_PATH_BYTES))
+            .is_ok());
+        assert!(DeliveryRelativePathV2::new("a".repeat(MAX_DELIVERY_RELATIVE_PATH_BYTES + 1))
+            .is_err());
+        for invalid in [
+            "CON",
+            "con.txt",
+            "PRN.md",
+            "AUX",
+            "NUL.json",
+            "COM1.txt",
+            "LPT9",
+            "trailing.",
+            "trailing ",
+            "bad<name",
+            "bad>name",
+            "bad\"name",
+            "bad|name",
+            "bad?name",
+            "bad*name",
+        ] {
+            assert!(DeliveryRelativePathV2::new(invalid).is_err(), "{invalid}");
+        }
+        assert!(DeliveryBlobChunkHexV1::new("00".repeat(MAX_DELIVERY_CHUNK_RAW_BYTES)).is_ok());
+        assert!(DeliveryBlobChunkHexV1::new("00".repeat(MAX_DELIVERY_CHUNK_RAW_BYTES + 1))
+            .is_err());
+        assert!(DeliveryBlobChunkHexV1::new("AA").is_err());
+        assert!(DeliveryBlobChunkHexV1::new("").is_err());
+
+        let mut manifest = delivery_manifest();
+        let mut collision = manifest.components[0].clone();
+        collision.relative_path = DeliveryRelativePathV2::new("AGENTS/REVIEWER.MD").unwrap();
+        manifest.components.push(collision);
+        manifest.components.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(serde_json::from_str::<DeliveryBundleManifestV2>(&json).is_err());
+
+        let mut over_total = delivery_manifest();
+        over_total.components.clear();
+        for index in 0..=MAX_DELIVERY_TOTAL_BYTES / MAX_DELIVERY_FILE_BYTES {
+            over_total.components.push(DeliveryComponentV2 {
+                kind: DeliveryComponentKindV2::File,
+                scope: DeliveryScopeV2::Workspace,
+                relative_path: DeliveryRelativePathV2::new(format!("file-{index:03}.txt"))
+                    .unwrap(),
+                blob: DeliveryBlobReceiptV1::new(
+                    DeliveryBlobDigestV1::new(format!(
+                        "sha256:{index:064x}",
+                    ))
+                    .unwrap(),
+                    MAX_DELIVERY_FILE_BYTES as u64,
+                )
+                .unwrap(),
+            });
+        }
+        assert!(over_total.validate().is_err());
+        assert!(DeliveryBlobReceiptV1::new(
+            DeliveryBlobDigestV1::new(format!("sha256:{}", "d".repeat(64))).unwrap(),
+            MAX_DELIVERY_FILE_BYTES as u64 + 1,
+        )
+        .is_err());
+
+        let mut too_many = delivery_manifest();
+        too_many.components = (0..=MAX_DELIVERY_FILES)
+            .map(|index| DeliveryComponentV2 {
+                kind: DeliveryComponentKindV2::File,
+                scope: DeliveryScopeV2::Workspace,
+                relative_path: DeliveryRelativePathV2::new(format!("file-{index:03}.txt"))
+                    .unwrap(),
+                blob: DeliveryBlobReceiptV1::new(
+                    DeliveryBlobDigestV1::new(format!("sha256:{index:064x}")).unwrap(),
+                    0,
+                )
+                .unwrap(),
+            })
+            .collect();
+        assert!(serde_json::from_str::<DeliveryBundleManifestV2>(
+            &serde_json::to_string(&too_many).unwrap(),
+        )
+        .is_err());
+
+        let digest_a = format!("sha256:{}", "a".repeat(64));
+        let digest_b = format!("sha256:{}", "b".repeat(64));
+        let unsorted = format!(
+            r#"{{"kind":"delivery-stage-begun","stage_id":"delivery-stage-{}","manifest_digest":"{}","missing_blobs":["{}","{}"]}}"#,
+            "1".repeat(32),
+            digest_a,
+            digest_b,
+            digest_a,
+        );
+        assert!(serde_json::from_str::<NodeResponse>(&unsorted).is_err());
     }
 }

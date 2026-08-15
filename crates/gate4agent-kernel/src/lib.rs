@@ -1109,12 +1109,23 @@ fn declared_provider_binding<'a>(
 ) -> Option<&'a AdapterBinding> {
     match source.family {
         AdapterFamily::PtySemantic => spec.capabilities.transports.pty_adapter.as_ref(),
-        AdapterFamily::Pipe => spec
-            .capabilities
-            .transports
-            .pipe
-            .as_ref()
-            .map(|transport| &transport.adapter),
+        AdapterFamily::Pipe => {
+            let transport_binding = spec
+                .capabilities
+                .transports
+                .pipe
+                .as_ref()
+                .map(|transport| &transport.adapter);
+            transport_binding
+                .filter(|binding| *binding == &source.binding)
+                .or_else(|| {
+                    spec.capabilities
+                        .adapters
+                        .pty_sidecar
+                        .as_ref()
+                        .filter(|binding| *binding == &source.binding)
+                })
+        }
         AdapterFamily::Acp => spec
             .capabilities
             .transports
@@ -1779,6 +1790,90 @@ mod tests {
                     source: ProviderSource {
                         family: AdapterFamily::Hook,
                         binding: kimi_hook,
+                    },
+                    source_sequence: 2,
+                    events: vec![ProviderEvent::Ready],
+                },
+            )],
+            [],
+        );
+        assert!(matches!(
+            rejected.command_outcomes[0].result,
+            Err(KernelCommandError::InvalidProviderSource { .. })
+        ));
+    }
+
+    #[test]
+    fn pipe_provider_ingress_accepts_exact_pty_sidecar_binding_only() {
+        let mut kernel = Gate4AgentKernel::default();
+        kernel.step([register(1, "qwen-code")], []);
+        let started = kernel.step(
+            [command(
+                2,
+                ControlCommand::Start {
+                    instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
+                    request: StartRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                        session_options: None,
+                    },
+                },
+            )],
+            [],
+        );
+        let generation = started.snapshot.sessions[0].generation;
+        let sidecar = kernel
+            .catalog()
+            .get_by_id("qwen-code")
+            .unwrap()
+            .capabilities
+            .adapters
+            .pty_sidecar
+            .clone()
+            .unwrap();
+        let accepted = kernel.step(
+            [command(
+                3,
+                ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation,
+                    source: ProviderSource {
+                        family: AdapterFamily::Pipe,
+                        binding: sidecar,
+                    },
+                    source_sequence: 1,
+                    events: vec![ProviderEvent::Ready],
+                },
+            )],
+            [],
+        );
+        assert_eq!(accepted.command_outcomes[0].result, Ok(()));
+
+        let foreign_pipe = kernel
+            .catalog()
+            .get_by_id("codex")
+            .unwrap()
+            .capabilities
+            .transports
+            .pipe
+            .as_ref()
+            .unwrap()
+            .adapter
+            .clone();
+        let rejected = kernel.step(
+            [command(
+                4,
+                ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation,
+                    source: ProviderSource {
+                        family: AdapterFamily::Pipe,
+                        binding: foreign_pipe,
                     },
                     source_sequence: 2,
                     events: vec![ProviderEvent::Ready],

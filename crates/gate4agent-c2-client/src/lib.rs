@@ -14,7 +14,9 @@ use tokio::time::timeout;
 mod runtime;
 
 #[cfg(any(windows, unix))]
-pub use runtime::{connect_local, C2ControlError, C2ControlHandle, C2EventReceiver};
+pub use runtime::{
+    connect_local, C2ControlError, C2ControlHandle, C2EventReceiver, C2PendingRequest,
+};
 
 const MAX_RESPONSE_HEADERS: usize = 16 * 1024;
 

@@ -1,19 +1,19 @@
 #![cfg(windows)]
 
 use gate4agent_c2::protocol::{
-    C2NodeEvent, C2NodeResponse, C2NodeSnapshot, C2SessionStatus, NodeId, NodeRoute,
-    NodeTransportState, RoutedNodeEvent, C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
-    C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    C2ManagedSessionRecord, C2NodeEvent, C2NodeResponse, C2NodeSnapshot, C2SessionStatus,
+    NodeId, NodeRoute, NodeTransportState, RoutedNodeEvent,
+    C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY, C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
 };
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlHandle};
 use gate4agent_catalog::EnvMutation;
 use gate4agent_node::protocol::{
-    CapabilityId, NodeRequest, SessionAddress, SessionMode, SpawnDeadlineMs,
-    SpawnEnvironmentProfileId, SpawnEnvironmentProfileRevision, SpawnFieldProvenance,
-    SpawnIdempotencyKey, SpawnOverride, SpawnOverrides, SpawnProfileDefaults, SpawnProfileId,
-    SpawnProfileRevision, SpawnRequiredCapabilities, SpawnSpec, SpawnTarget, WorkspaceId,
-    SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
+    CapabilityId, ManagedSessionState, NodeRequest, SessionAddress, SessionMode,
+    SpawnDeadlineMs, SpawnEnvironmentProfileId, SpawnEnvironmentProfileRevision,
+    SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides,
+    SpawnProfileDefaults, SpawnProfileId, SpawnProfileRevision, SpawnRequiredCapabilities,
+    SpawnSpec, SpawnTarget, WorkspaceId, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
 };
 use gate4agent_node::{
     NodeEnvironmentProfile, NodeServer, NodeServerConfig, SpawnProfileRegistry, WorkspaceConfig,
@@ -141,6 +141,26 @@ fn session_count(snapshot: &C2NodeSnapshot) -> usize {
         .iter()
         .map(|workspace| workspace.sessions.len())
         .sum()
+}
+
+fn assert_raw_inventory_record(
+    record: &C2ManagedSessionRecord,
+    session: Option<&SessionAddress>,
+    workspace_id: &WorkspaceId,
+    expected_state: ManagedSessionState,
+) {
+    assert_eq!(record.provider, agent("claude"));
+    assert_eq!(record.mode, SessionMode::Pty);
+    assert_eq!(record.state, expected_state);
+    assert_eq!(&record.workspace_id, workspace_id);
+    assert_eq!(record.active_session.as_ref(), session);
+    assert!(record.environment_profile.is_none());
+    assert!(record.bundle.is_none());
+    assert!(record.context_id.is_none());
+    assert!(record.context.is_none());
+    assert!(!record.provider_identity_present);
+    assert!(record.created_at_unix_ms > 0);
+    assert!(record.updated_at_unix_ms >= record.created_at_unix_ms);
 }
 
 async fn wait_running(
@@ -273,7 +293,7 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
 
     let profiles = SpawnProfileRegistry::new([SpawnProfileDefaults {
         profile_id: spawn_profile_id.clone(),
-        revision: spawn_profile_revision,
+        revision: spawn_profile_revision.clone(),
         provider: agent("claude"),
         mode: SessionMode::Pty,
         terminal_size,
@@ -369,10 +389,9 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
             }
         }
     });
-    assert_eq!(
-        session_count(&snapshot(&control, &route, "initial health check").await),
-        0,
-    );
+    let initial = snapshot(&control, &route, "initial health check").await;
+    assert_eq!(session_count(&initial), 0);
+    assert!(initial.session_records.is_empty());
 
     let required_capabilities = SpawnRequiredCapabilities::new([CapabilityId::new(
         SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
@@ -382,10 +401,11 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
     let spec = SpawnSpec {
         target: SpawnTarget {
             node_id: node_id.clone(),
-            workspace_id,
+            workspace_id: workspace_id.clone(),
             worktree_id: None,
         },
         profile_id: spawn_profile_id,
+        expected_profile_revision: spawn_profile_revision,
         overrides: SpawnOverrides {
             provider: SpawnOverride::Inherit,
             mode: SpawnOverride::Inherit,
@@ -465,6 +485,17 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
         wait_sentinel_terminal_frame(&mut terminal_events, &route, &receipt.session).await;
     assert!(!sentinel_frame.formatted.is_empty());
     assert!(sentinel_frame.contents.contains(SENTINEL_VALUE));
+    let live = snapshot(&control, &route, "raw inventory check").await;
+    assert_eq!(live.session_records.len(), 1);
+    let live_record = &live.session_records[0];
+    assert_raw_inventory_record(
+        live_record,
+        Some(&receipt.session),
+        &workspace_id,
+        ManagedSessionState::Live,
+    );
+    let record_id = live_record.record_id.clone();
+    let display_name = live_record.display_name.clone();
 
     let replay = control
         .request(
@@ -479,9 +510,16 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
         }) => assert_eq!(replayed_receipt, receipt),
         response => panic!("environment-profile idempotent replay failed: {response:?}"),
     }
-    assert_eq!(
-        session_count(&snapshot(&control, &route, "idempotent replay check").await),
-        1,
+    let after_replay = snapshot(&control, &route, "idempotent replay check").await;
+    assert_eq!(session_count(&after_replay), 1);
+    assert_eq!(after_replay.session_records.len(), 1);
+    assert_eq!(after_replay.session_records[0].record_id, record_id);
+    assert_eq!(after_replay.session_records[0].display_name, display_name);
+    assert_raw_inventory_record(
+        &after_replay.session_records[0],
+        Some(&receipt.session),
+        &workspace_id,
+        ManagedSessionState::Live,
     );
 
     assert!(matches!(
@@ -499,6 +537,16 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
         Ok(C2NodeResponse::Accepted)
     ));
     wait_stopped(&control, &route, &receipt.session).await;
+    let stopped = snapshot(&control, &route, "post-stop inventory check").await;
+    assert_eq!(stopped.session_records.len(), 1);
+    assert_eq!(stopped.session_records[0].record_id, record_id);
+    assert_eq!(stopped.session_records[0].display_name, display_name);
+    assert_raw_inventory_record(
+        &stopped.session_records[0],
+        None,
+        &workspace_id,
+        ManagedSessionState::Unavailable,
+    );
     assert!(matches!(
         control
             .request(
@@ -514,7 +562,15 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
     ));
     let healthy = snapshot(&control, &route, "post-remove health check").await;
     assert_eq!(session_count(&healthy), 0);
-    assert!(healthy.session_records.is_empty());
+    assert_eq!(healthy.session_records.len(), 1);
+    assert_eq!(healthy.session_records[0].record_id, record_id);
+    assert_eq!(healthy.session_records[0].display_name, display_name);
+    assert_raw_inventory_record(
+        &healthy.session_records[0],
+        None,
+        &workspace_id,
+        ManagedSessionState::Unavailable,
+    );
     assert_eq!(
         http.status().await.unwrap().nodes[&node_id].transport,
         NodeTransportState::Online,

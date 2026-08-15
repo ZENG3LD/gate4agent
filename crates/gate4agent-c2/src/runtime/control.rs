@@ -10,12 +10,27 @@ use crate::protocol::{
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     C2_HISTORY_CONTEXT_PACK_CAPABILITY,
+    C2_NATIVE_SESSION_CATALOG_CAPABILITY, C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
+    C2_NATIVE_SESSION_INDEX_CAPABILITY, C2_NATIVE_SESSION_PREVIEW_CAPABILITY,
+    C2_HOST_DIRECTORY_BROWSE_CAPABILITY,
+    C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
+    C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
+    C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
+    C2_SESSION_TASK_CORRELATION_CAPABILITY,
+    C2_OBSERVATION_EVENTS_CAPABILITY,
+    C2_OBSERVATION_MANAGED_TARGET_CAPABILITY,
+    C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
+    C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
+    C2_HARNESS_MCP_READ_PROXY_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
+    C2_SPAWN_PROFILE_REVISION_CAPABILITY,
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
-    C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_GIT_READ_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
+    C2_WORKSPACE_FILE_WRITE_CAPABILITY,
+    C2_WORKSPACE_ENTRY_CREATE_CAPABILITY,
     C2_WORKTREE_SELECTION_CAPABILITY,
     MAX_C2_AUTH_FRAME_BYTES, MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES,
     MAX_C2_SERVER_FRAME_BYTES,
@@ -39,20 +54,38 @@ const MAX_OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INBOUND_FRAMES: usize = 4;
 const REPLY_QUEUE_DEADLINE: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct NegotiatedPathCapabilities {
     opaque_host_paths: bool,
     repository_paths: bool,
     workspace_file_read: bool,
+    workspace_file_write: bool,
+    workspace_entry_create: bool,
+    git_read: bool,
+    host_directory_browse: bool,
+    standalone_workspace_lifecycle: bool,
+    provider_session_reference_index: bool,
     provider_runtime_status: bool,
     provider_ids_open: bool,
     spawn_spec_defaults_overrides: bool,
+    spawn_profile_revision: bool,
     worktree_selection: bool,
     managed_worktree_lifecycle: bool,
     child_environment_profile: bool,
     session_bundle_materialization: bool,
     history_context_pack: bool,
+    native_session_catalog: bool,
+    native_session_catalog_paging: bool,
+    native_session_index: bool,
+    native_session_preview: bool,
     terminal_frame_events: bool,
+    agent_progress_snapshot: bool,
+    session_task_correlation: bool,
+    observation_events: bool,
+    observation_managed_target: bool,
+    observation_workflow_detail: bool,
+    delivery_bundle_v2_stage_commit: bool,
+    harness_mcp_read_proxy: bool,
 }
 
 pub(super) async fn run(
@@ -191,6 +224,12 @@ async fn serve_connection(
     if !include_provider_runtime_status {
         clear_provider_runtime_statuses(&mut hello_status);
     }
+    project_status_observation_support(
+        &mut hello_status,
+        path_capabilities.observation_events,
+        path_capabilities.observation_managed_target,
+        path_capabilities.observation_workflow_detail,
+    );
     if !path_capabilities.provider_ids_open {
         retain_legacy_provider_status(&mut hello_status);
     }
@@ -211,10 +250,13 @@ async fn serve_connection(
         hub.detach(connection_id);
         return Ok(());
     }
-    let mut last_topology = C2Topology::from_status_with_capabilities(
+    let mut last_topology = C2Topology::from_status_with_projection(
         &hello_status,
         include_provider_contracts,
         include_provider_runtime_status,
+        path_capabilities.observation_events,
+        path_capabilities.observation_managed_target,
+        path_capabilities.observation_workflow_detail,
     );
     if timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
@@ -308,10 +350,13 @@ async fn serve_connection(
                     if !path_capabilities.provider_ids_open {
                         retain_legacy_provider_status(&mut projected);
                     }
-                    C2Topology::from_status_with_capabilities(
+                    C2Topology::from_status_with_projection(
                         &projected,
                         include_provider_contracts,
                         include_provider_runtime_status,
+                        path_capabilities.observation_events,
+                        path_capabilities.observation_managed_target,
+                        path_capabilities.observation_workflow_detail,
                     )
                 };
                 if queue_topology_if_changed(
@@ -376,6 +421,7 @@ async fn refresh_hello_status(
                 response.incarnation_id,
             );
             observed.cursor = Some(NodeCursor { incarnation_id: response.incarnation_id, sequence: event_sequence });
+            observed.observation_support = snapshot.observation_support;
             let mut inventory = SlimNodeInventory::from_c2_snapshot(&snapshot);
             inventory.provider_contracts = provider_contract_manifest.provider_contracts;
             inventory.provider_adapter_contracts =
@@ -477,6 +523,13 @@ async fn control_writer<W>(
 {
     while let Some(queued) = frames.recv().await {
         let mut frame = queued.frame;
+        project_server_frame_launch_inventory(
+            &mut frame,
+            path_capabilities.spawn_spec_defaults_overrides,
+            path_capabilities.managed_worktree_lifecycle
+                && path_capabilities.worktree_selection,
+            path_capabilities.session_bundle_materialization,
+        );
         if !path_capabilities.terminal_frame_events {
             match server_frame_terminal_frame_payload(&frame) {
                 TerminalFramePayload::DirectEvent => {
@@ -490,7 +543,29 @@ async fn control_writer<W>(
                 TerminalFramePayload::None => {}
             }
         }
+        if !project_server_frame_observation_events(
+            &mut frame,
+            path_capabilities.observation_events,
+            path_capabilities.observation_managed_target,
+            path_capabilities.observation_workflow_detail,
+        )
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            continue;
+        }
+        if !path_capabilities.harness_mcp_read_proxy
+            && server_frame_contains_harness_mcp_proxy(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.spawn_spec_defaults_overrides
+            && server_frame_contains_spawn_spec_response(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
+        if !path_capabilities.spawn_profile_revision
             && server_frame_contains_spawn_spec_response(&frame)
         {
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
@@ -526,8 +601,38 @@ async fn control_writer<W>(
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
+        if !path_capabilities.session_task_correlation {
+            strip_session_task_bindings_from_server_frame(&mut frame);
+        }
+        if !path_capabilities.host_directory_browse
+            && server_frame_contains_host_directory_browse(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
+        if !path_capabilities.standalone_workspace_lifecycle
+            && server_frame_contains_standalone_workspace_lifecycle(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
+        if !path_capabilities.provider_session_reference_index
+            && server_frame_contains_provider_session_reference_index(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
+        if !path_capabilities.native_session_index
+            && server_frame_contains_native_session_index(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.provider_runtime_status {
             clear_server_frame_provider_runtime_status(&mut frame);
+        }
+        if !path_capabilities.agent_progress_snapshot {
+            clear_server_frame_agent_progress(&mut frame);
         }
         if !path_capabilities.provider_ids_open {
             match project_server_frame_for_legacy_provider_ids(
@@ -551,6 +656,12 @@ async fn control_writer<W>(
                 && server_frame_contains_unix_repository_path(&frame))
             || (!path_capabilities.workspace_file_read
                 && server_frame_contains_workspace_file_read(&frame))
+            || (!path_capabilities.workspace_file_write
+                && server_frame_contains_workspace_file_write(&frame))
+            || (!path_capabilities.workspace_entry_create
+                && server_frame_contains_workspace_entry_create(&frame))
+            || (!path_capabilities.git_read
+                && server_frame_contains_git_read(&frame))
         {
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
@@ -564,6 +675,114 @@ async fn control_writer<W>(
         if !matches!(result, Ok(Ok(()))) { break; }
     }
     let _ = disconnect.send(true);
+}
+
+fn project_server_frame_launch_inventory(
+    frame: &mut C2ServerFrame,
+    include_spawn_profiles: bool,
+    include_managed_worktree_profiles: bool,
+    include_bundles: bool,
+) {
+    let project_snapshot = |snapshot: &mut crate::protocol::C2NodeSnapshot| {
+        project_c2_snapshot_launch_inventory(
+            snapshot,
+            include_spawn_profiles,
+            include_managed_worktree_profiles,
+            include_bundles,
+        );
+    };
+    let project_slim = |inventory: &mut crate::protocol::SlimNodeInventory| {
+        if !include_managed_worktree_profiles {
+            for workspace in inventory.workspaces.values_mut() {
+                workspace.worktree_service_mode = None;
+                workspace.managed_worktree_profiles = None;
+            }
+        }
+        if let Some(launch) = inventory.launch_inventory.as_mut() {
+            if !include_spawn_profiles {
+                launch.spawn_profiles = None;
+            }
+            if !include_bundles {
+                launch.bundles = None;
+            }
+            if launch.spawn_profiles.is_none() && launch.bundles.is_none() {
+                inventory.launch_inventory = None;
+            }
+        }
+    };
+
+    match frame {
+        C2ServerFrame::Hello(hello) => {
+            for node in hello.status.nodes.values_mut() {
+                if let Some(inventory) = node.inventory.as_mut() {
+                    project_slim(inventory);
+                }
+            }
+        }
+        C2ServerFrame::Reply(reply) => {
+            let Ok(routed) = reply.result.as_mut() else { return };
+            let Ok(response) = routed.response.as_mut() else { return };
+            match response {
+                C2NodeResponse::Snapshot { snapshot, .. } => project_snapshot(snapshot),
+                C2NodeResponse::Resync { snapshot, events, .. } => {
+                    project_snapshot(snapshot);
+                    if !include_managed_worktree_profiles {
+                        for event in events {
+                            if let C2NodeEvent::WorkspaceAdded { workspace } = &mut event.event {
+                                workspace.worktree_service_mode = None;
+                                workspace.managed_worktree_profiles = None;
+                            }
+                        }
+                    }
+                }
+                C2NodeResponse::WorkspaceRegistered { workspace }
+                | C2NodeResponse::StandaloneWorkspaceCreated { workspace }
+                | C2NodeResponse::WorktreeCreated { workspace, .. }
+                    if !include_managed_worktree_profiles =>
+                {
+                    workspace.worktree_service_mode = None;
+                    workspace.managed_worktree_profiles = None;
+                }
+                _ => {}
+            }
+        }
+        C2ServerFrame::Event(event) => {
+            if !include_managed_worktree_profiles {
+                if let C2NodeEvent::WorkspaceAdded { workspace } = &mut event.event {
+                    workspace.worktree_service_mode = None;
+                    workspace.managed_worktree_profiles = None;
+                }
+            }
+        }
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => {}
+    }
+}
+
+fn project_c2_snapshot_launch_inventory(
+    snapshot: &mut crate::protocol::C2NodeSnapshot,
+    include_spawn_profiles: bool,
+    include_managed_worktree_profiles: bool,
+    include_bundles: bool,
+) {
+    if !include_managed_worktree_profiles {
+        for workspace in &mut snapshot.workspaces {
+            workspace.worktree_service_mode = None;
+            workspace.managed_worktree_profiles = None;
+        }
+    }
+    if let Some(inventory) = snapshot.launch_inventory.as_mut() {
+        if !include_spawn_profiles {
+            inventory.spawn_profiles = None;
+        }
+        if !include_bundles {
+            inventory.bundles = None;
+        }
+        if inventory.spawn_profiles.is_none() && inventory.bundles.is_none() {
+            snapshot.launch_inventory = None;
+        }
+    }
 }
 
 fn negotiated_path_capabilities(
@@ -580,10 +799,19 @@ fn negotiated_path_capabilities(
         opaque_host_paths: selected_has(C2_OPAQUE_UNIX_PATH_CAPABILITY),
         repository_paths: selected_has(C2_REPOSITORY_PATH_CAPABILITY),
         workspace_file_read: selected_has(C2_WORKSPACE_FILE_READ_CAPABILITY),
+        workspace_file_write: selected_has(C2_WORKSPACE_FILE_WRITE_CAPABILITY),
+        workspace_entry_create: selected_has(C2_WORKSPACE_ENTRY_CREATE_CAPABILITY),
+        git_read: selected_has(C2_GIT_READ_CAPABILITY),
+        host_directory_browse: selected_has(C2_HOST_DIRECTORY_BROWSE_CAPABILITY),
+        standalone_workspace_lifecycle:
+            selected_has(C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY),
+        provider_session_reference_index:
+            selected_has(C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY),
         provider_runtime_status: selected_has(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY),
         provider_ids_open: selected_has(C2_PROVIDER_ID_OPEN_CAPABILITY),
         spawn_spec_defaults_overrides:
             selected_has(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY),
+        spawn_profile_revision: selected_has(C2_SPAWN_PROFILE_REVISION_CAPABILITY),
         worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
         managed_worktree_lifecycle:
             selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
@@ -592,7 +820,22 @@ fn negotiated_path_capabilities(
         session_bundle_materialization:
             selected_has(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY),
         history_context_pack: selected_has(C2_HISTORY_CONTEXT_PACK_CAPABILITY),
+        native_session_catalog: selected_has(C2_NATIVE_SESSION_CATALOG_CAPABILITY),
+        native_session_catalog_paging:
+            selected_has(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY),
+        native_session_index: selected_has(C2_NATIVE_SESSION_INDEX_CAPABILITY),
+        native_session_preview: selected_has(C2_NATIVE_SESSION_PREVIEW_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
+        agent_progress_snapshot: selected_has(C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY),
+        session_task_correlation: selected_has(C2_SESSION_TASK_CORRELATION_CAPABILITY),
+        observation_events: selected_has(C2_OBSERVATION_EVENTS_CAPABILITY),
+        observation_managed_target: selected_has(C2_OBSERVATION_EVENTS_CAPABILITY)
+            && selected_has(C2_OBSERVATION_MANAGED_TARGET_CAPABILITY),
+        observation_workflow_detail: selected_has(C2_OBSERVATION_EVENTS_CAPABILITY)
+            && selected_has(C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY),
+        delivery_bundle_v2_stage_commit:
+            selected_has(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY),
+        harness_mcp_read_proxy: selected_has(C2_HARNESS_MCP_READ_PROXY_CAPABILITY),
     }
 }
 
@@ -612,21 +855,44 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
                         c2_event_is_terminal_frame(&event.event)
                     }),
                     C2NodeResponse::Snapshot { .. }
+                    | C2NodeResponse::Armed { .. }
+                    | C2NodeResponse::Spawned { .. }
+                    | C2NodeResponse::Activated { .. }
+                    | C2NodeResponse::Aborted { .. }
+                    | C2NodeResponse::ReplyChunkAccepted { .. }
+                    | C2NodeResponse::CallRejected { .. }
+                    | C2NodeResponse::DeliveryStageBegun { .. }
+                    | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+                    | C2NodeResponse::DeliveryCommitted { .. }
+                    | C2NodeResponse::DeliveryStageAborted { .. }
                     | C2NodeResponse::WorkspaceInspected { .. }
+                    | C2NodeResponse::HostDirectoriesBrowsed { .. }
                     | C2NodeResponse::WorkspaceFileRead { .. }
+                    | C2NodeResponse::WorkspaceFileWritten { .. }
+                    | C2NodeResponse::WorkspaceFileCreated { .. }
+                    | C2NodeResponse::WorkspaceDirectoryCreated { .. }
+                    | C2NodeResponse::GitHistoryRead { .. }
+                    | C2NodeResponse::GitDiffRead { .. }
                     | C2NodeResponse::Controller { .. }
                     | C2NodeResponse::SpawnAccepted { .. }
                     | C2NodeResponse::SpawnSpecAccepted { .. }
                     | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
                     | C2NodeResponse::ManagedWorktreeCleanup { .. }
                     | C2NodeResponse::SessionRecordUpdated { .. }
+                    | C2NodeResponse::ProviderSessionIndexed { .. }
+                    | C2NodeResponse::NativeSessionIndexed { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
+                    | C2NodeResponse::NativeSessionsCataloged { .. }
+                    | C2NodeResponse::NativeSessionsPaged { .. }
+                    | C2NodeResponse::NativeSessionPreviewed { .. }
+                    | C2NodeResponse::SessionRecordPreviewed { .. }
                     | C2NodeResponse::HistoryDiscovered { .. }
                     | C2NodeResponse::HistoryLoaded { .. }
                     | C2NodeResponse::ContextPackExported { .. }
                     | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
+                    | C2NodeResponse::StandaloneWorkspaceCreated { .. }
                     | C2NodeResponse::WorkspaceUnregistered { .. }
                     | C2NodeResponse::WorktreeCreated { .. }
                     | C2NodeResponse::WorktreeRemoved { .. }
@@ -650,7 +916,10 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
 fn c2_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
     match event {
         C2NodeEvent::TerminalFrame { .. } => true,
-        C2NodeEvent::Control { .. }
+        C2NodeEvent::HarnessMcpReadCall { .. }
+        | C2NodeEvent::Control { .. }
+        | C2NodeEvent::Observation { .. }
+        | C2NodeEvent::ManagedObservation { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
@@ -662,10 +931,36 @@ fn c2_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
     }
 }
 
+fn server_frame_contains_harness_mcp_proxy(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            match &routed.response {
+                Ok(C2NodeResponse::Resync { events, .. }) => events.iter().any(|event| {
+                    event.event.requires_harness_mcp_proxy_capability()
+                }),
+                Ok(response) => response.requires_harness_mcp_proxy_capability(),
+                Err(failure) => failure.requires_harness_mcp_proxy_capability(),
+            }
+        }),
+        C2ServerFrame::Event(event) => event.event.requires_harness_mcp_proxy_capability(),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
 fn unnegotiated_request_failure(
     request: &NodeRequest,
     capabilities: NegotiatedPathCapabilities,
 ) -> Option<C2RelayFailure> {
+    if !request.harness_mcp_contract_is_valid_at(unix_ms()) {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "invalid harness MCP proxy request",
+            None,
+        ));
+    }
     if !request.history_context_pack_contract_is_valid() {
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
@@ -673,9 +968,36 @@ fn unnegotiated_request_failure(
             None,
         ));
     }
+    if !request.native_session_catalog_contract_is_valid() {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "invalid native session catalog request",
+            None,
+        ));
+    }
+    if !request.native_session_preview_contract_is_valid() {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "invalid native session preview request",
+            None,
+        ));
+    }
+    if matches!(request, NodeRequest::IndexNativeSession { selection, .. }
+        if selection.route.scope
+            != gate4agent_node_protocol::NativeSessionCatalogScope::Workspace)
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "external native sessions must be registered as workspaces before indexing",
+            None,
+        ));
+    }
     let required_capability_available = match request.required_capability() {
         None => true,
         Some(C2_WORKSPACE_FILE_READ_CAPABILITY) => capabilities.workspace_file_read,
+        Some(C2_WORKSPACE_FILE_WRITE_CAPABILITY) => capabilities.workspace_file_write,
+        Some(C2_WORKSPACE_ENTRY_CREATE_CAPABILITY) => capabilities.workspace_entry_create,
+        Some(C2_GIT_READ_CAPABILITY) => capabilities.git_read,
         Some(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY) => {
             capabilities.spawn_spec_defaults_overrides
         }
@@ -683,6 +1005,26 @@ fn unnegotiated_request_failure(
             capabilities.managed_worktree_lifecycle
         }
         Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => capabilities.history_context_pack,
+        Some(C2_NATIVE_SESSION_CATALOG_CAPABILITY) => capabilities.native_session_catalog,
+        Some(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY) => {
+            capabilities.native_session_catalog_paging
+        }
+        Some(C2_NATIVE_SESSION_INDEX_CAPABILITY) => capabilities.native_session_index,
+        Some(C2_NATIVE_SESSION_PREVIEW_CAPABILITY) => capabilities.native_session_preview,
+        Some(C2_HOST_DIRECTORY_BROWSE_CAPABILITY) => capabilities.host_directory_browse,
+        Some(C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY) => {
+            capabilities.standalone_workspace_lifecycle
+        }
+        Some(C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY) => {
+            capabilities.provider_session_reference_index
+        }
+        Some(C2_SESSION_TASK_CORRELATION_CAPABILITY) => {
+            capabilities.session_task_correlation
+        }
+        Some(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY) => {
+            capabilities.delivery_bundle_v2_stage_commit
+        }
+        Some(C2_HARNESS_MCP_READ_PROXY_CAPABILITY) => capabilities.harness_mcp_read_proxy,
         Some(_) => false,
     };
     if !required_capability_available {
@@ -698,6 +1040,15 @@ fn unnegotiated_request_failure(
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
             "spawn spec capability was not negotiated with C2",
+            None,
+        ));
+    }
+    if request.requires_spawn_profile_revision_capability()
+        && !capabilities.spawn_profile_revision
+    {
+        return Some(relay_failure(
+            C2RelayFailureCode::RequestForbidden,
+            "spawn profile revision capability was not negotiated with C2",
             None,
         ));
     }
@@ -739,6 +1090,11 @@ fn unnegotiated_request_failure(
     }
     if !capabilities.provider_ids_open
         && (matches!(request, NodeRequest::Spawn { provider, .. } if !provider_id_is_legacy(provider))
+            || matches!(request, NodeRequest::IndexProviderSession { provider, .. } if !provider_id_is_legacy(provider))
+            || matches!(request, NodeRequest::CatalogNativeSessions { route, .. } if !provider_id_is_legacy(&route.provider))
+            || matches!(request, NodeRequest::PageNativeSessions { route, .. } if !provider_id_is_legacy(&route.provider))
+            || matches!(request, NodeRequest::PreviewNativeSession { selection, .. } if !provider_id_is_legacy(&selection.route.provider))
+            || matches!(request, NodeRequest::IndexNativeSession { selection, .. } if !provider_id_is_legacy(&selection.route.provider))
             || spawn_spec_requires_open_provider_capability(request)
             || matches!(request, NodeRequest::ForgetContextPack { .. }))
     {
@@ -749,8 +1105,13 @@ fn unnegotiated_request_failure(
         ));
     }
     if !capabilities.repository_paths
-        && matches!(request, NodeRequest::ReadWorkspaceFile { path, .. }
+        && (matches!(request, NodeRequest::ReadWorkspaceFile { path, .. }
+            | NodeRequest::WriteWorkspaceFile { path, .. }
+            | NodeRequest::CreateWorkspaceFile { path, .. }
+            | NodeRequest::CreateWorkspaceDirectory { path, .. }
             if path.as_unix_bytes().is_some())
+            || matches!(request, NodeRequest::ReadGitDiff { request, .. }
+                if request.path.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())))
     {
         return Some(relay_failure(
             C2RelayFailureCode::RequestForbidden,
@@ -776,6 +1137,8 @@ fn c2_request_requires_child_environment_profile_capability(request: &NodeReques
 fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
     let spec = match request {
         NodeRequest::SpawnSpec { spec } => spec,
+        NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. } => spec,
         NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
         _ => return false,
     };
@@ -790,13 +1153,33 @@ fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
 
 fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
     match request {
-        NodeRequest::RegisterWorkspace { root, .. } => root.as_unix_bytes().is_some(),
+        NodeRequest::RegisterWorkspace { root, .. }
+        | NodeRequest::CreateStandaloneWorkspace { root, .. } => root.as_unix_bytes().is_some(),
+        NodeRequest::BrowseHostDirectories { directory, after } => {
+            directory.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+                || after.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+        }
         NodeRequest::CreateWorktree { target_root, .. }
         | NodeRequest::RemoveWorktree { target_root, .. } => target_root.as_unix_bytes().is_some(),
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::UnregisterWorkspace { .. }
@@ -806,8 +1189,15 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::SetSessionTask { .. }
+        | NodeRequest::IndexProviderSession { .. }
+        | NodeRequest::IndexNativeSession { .. }
         | NodeRequest::ResumeSessionRecord { .. }
         | NodeRequest::ForgetSessionRecord { .. }
+        | NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
         | NodeRequest::ExportContextPack { .. }
@@ -838,6 +1228,55 @@ fn server_frame_contains_opaque_unix_path(frame: &C2ServerFrame) -> bool {
     }
 }
 
+fn server_frame_contains_host_directory_browse(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            match &routed.response {
+                Ok(response) => response.requires_host_directory_browse_capability(),
+                Err(failure) => failure.requires_host_directory_browse_capability(),
+            }
+        }),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Event(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn server_frame_contains_standalone_workspace_lifecycle(frame: &C2ServerFrame) -> bool {
+    matches!(
+        frame,
+        C2ServerFrame::Reply(reply)
+            if reply.result.as_ref().ok().is_some_and(|routed| matches!(
+                routed.response,
+                Ok(C2NodeResponse::StandaloneWorkspaceCreated { .. })
+            ))
+    )
+}
+
+fn server_frame_contains_provider_session_reference_index(frame: &C2ServerFrame) -> bool {
+    matches!(
+        frame,
+        C2ServerFrame::Reply(reply)
+            if reply.result.as_ref().ok().is_some_and(|routed| matches!(
+                routed.response,
+                Ok(C2NodeResponse::ProviderSessionIndexed { .. })
+            ))
+    )
+}
+
+fn server_frame_contains_native_session_index(frame: &C2ServerFrame) -> bool {
+    matches!(
+        frame,
+        C2ServerFrame::Reply(reply)
+            if reply.result.as_ref().ok().is_some_and(|routed| matches!(
+                routed.response,
+                Ok(C2NodeResponse::NativeSessionIndexed { .. })
+            ))
+    )
+}
+
 fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
     match frame {
         C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
@@ -853,24 +1292,52 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                                 })
                         })
                     }
-                    C2NodeResponse::WorkspaceFileRead { file } => {
+                    C2NodeResponse::WorkspaceFileRead { file }
+                    | C2NodeResponse::WorkspaceFileWritten { file }
+                    | C2NodeResponse::WorkspaceFileCreated { file } => {
                         file.path.as_unix_bytes().is_some()
                     }
+                    C2NodeResponse::WorkspaceDirectoryCreated { entry, .. } => {
+                        entry.relative_path.as_unix_bytes().is_some()
+                    }
+                    C2NodeResponse::GitDiffRead { diff, .. } => diff
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| path.as_unix_bytes().is_some()),
                     C2NodeResponse::Snapshot { .. }
                     | C2NodeResponse::Resync { .. }
+                    | C2NodeResponse::Armed { .. }
+                    | C2NodeResponse::Spawned { .. }
+                    | C2NodeResponse::Activated { .. }
+                    | C2NodeResponse::Aborted { .. }
+                    | C2NodeResponse::ReplyChunkAccepted { .. }
+                    | C2NodeResponse::CallRejected { .. }
+                    | C2NodeResponse::DeliveryStageBegun { .. }
+                    | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+                    | C2NodeResponse::DeliveryCommitted { .. }
+                    | C2NodeResponse::DeliveryStageAborted { .. }
+                    | C2NodeResponse::HostDirectoriesBrowsed { .. }
+                    | C2NodeResponse::GitHistoryRead { .. }
                     | C2NodeResponse::Controller { .. }
                     | C2NodeResponse::SpawnAccepted { .. }
                     | C2NodeResponse::SpawnSpecAccepted { .. }
                     | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
                     | C2NodeResponse::ManagedWorktreeCleanup { .. }
                     | C2NodeResponse::SessionRecordUpdated { .. }
+                    | C2NodeResponse::ProviderSessionIndexed { .. }
+                    | C2NodeResponse::NativeSessionIndexed { .. }
                     | C2NodeResponse::SessionRecordResumed { .. }
                     | C2NodeResponse::SessionRecordForgotten { .. }
+                    | C2NodeResponse::NativeSessionsCataloged { .. }
+                    | C2NodeResponse::NativeSessionsPaged { .. }
+                    | C2NodeResponse::NativeSessionPreviewed { .. }
+                    | C2NodeResponse::SessionRecordPreviewed { .. }
                     | C2NodeResponse::HistoryDiscovered { .. }
                     | C2NodeResponse::HistoryLoaded { .. }
                     | C2NodeResponse::ContextPackExported { .. }
                     | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
+                    | C2NodeResponse::StandaloneWorkspaceCreated { .. }
                     | C2NodeResponse::WorkspaceUnregistered { .. }
                     | C2NodeResponse::WorktreeCreated { .. }
                     | C2NodeResponse::WorktreeRemoved { .. }
@@ -902,12 +1369,34 @@ fn server_frame_contains_workspace_file_read(frame: &C2ServerFrame) -> bool {
     }
 }
 
+fn server_frame_contains_workspace_file_write(frame: &C2ServerFrame) -> bool {
+    matches!(frame, C2ServerFrame::Reply(reply)
+        if reply.result.as_ref().ok().is_some_and(|routed|
+            matches!(routed.response, Ok(C2NodeResponse::WorkspaceFileWritten { .. }))))
+}
+
+fn server_frame_contains_workspace_entry_create(frame: &C2ServerFrame) -> bool {
+    matches!(frame, C2ServerFrame::Reply(reply)
+        if reply.result.as_ref().ok().is_some_and(|routed|
+            routed.response.as_ref().is_ok_and(
+                C2NodeResponse::requires_workspace_entry_create_capability,
+            )))
+}
+
+fn server_frame_contains_git_read(frame: &C2ServerFrame) -> bool {
+    matches!(frame, C2ServerFrame::Reply(reply)
+        if reply.result.as_ref().ok().is_some_and(|routed|
+            matches!(routed.response,
+                Ok(C2NodeResponse::GitHistoryRead { .. } | C2NodeResponse::GitDiffRead { .. }))))
+}
+
 fn server_frame_contains_spawn_spec_response(frame: &C2ServerFrame) -> bool {
     match frame {
         C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
             routed.response.as_ref().ok().is_some_and(|response| {
                 matches!(response,
                     C2NodeResponse::SpawnSpecAccepted { .. }
+                    | C2NodeResponse::Spawned { .. }
                     | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
                 )
             })
@@ -924,7 +1413,9 @@ fn server_frame_contains_worktree_selection_response(frame: &C2ServerFrame) -> b
     match frame {
         C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
             routed.response.as_ref().ok().is_some_and(|response| {
-                matches!(response, C2NodeResponse::SpawnSpecAccepted { receipt }
+                matches!(response,
+                    C2NodeResponse::SpawnSpecAccepted { receipt }
+                        | C2NodeResponse::Spawned { receipt, .. }
                     if receipt.target.worktree_id.is_some())
                     || c2_response_contains_managed_worktree(response)
             })
@@ -1045,6 +1536,105 @@ fn project_server_frame_without_history_context_pack(frame: &mut C2ServerFrame) 
     }
 }
 
+fn project_server_frame_observation_events(
+    frame: &mut C2ServerFrame,
+    include_observations: bool,
+    include_managed_targets: bool,
+    include_workflow_detail: bool,
+) -> bool {
+    let visible = |event: &C2NodeEvent| {
+        (!event.requires_observation_events_capability() || include_observations)
+            && (!event.requires_observation_managed_target_capability()
+                || include_managed_targets)
+            && (!event.requires_observation_workflow_detail_capability()
+                || include_workflow_detail)
+    };
+    match frame {
+        C2ServerFrame::Event(event) => visible(&event.event),
+        C2ServerFrame::Reply(reply) => {
+            if let Ok(routed) = reply.result.as_mut() {
+                if let Ok(response) = routed.response.as_mut() {
+                    match response {
+                        C2NodeResponse::Snapshot { snapshot, .. } => {
+                            project_snapshot_observation_support(
+                                snapshot,
+                                include_observations,
+                                include_managed_targets,
+                                include_workflow_detail,
+                            );
+                        }
+                        C2NodeResponse::Resync { snapshot, events, .. } => {
+                            project_snapshot_observation_support(
+                                snapshot,
+                                include_observations,
+                                include_managed_targets,
+                                include_workflow_detail,
+                            );
+                            events.retain(|event| visible(&event.event));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            true
+        }
+        C2ServerFrame::Hello(hello) => {
+            project_status_observation_support(
+                &mut hello.status,
+                include_observations,
+                include_managed_targets,
+                include_workflow_detail,
+            );
+            true
+        }
+        C2ServerFrame::Topology(topology) => {
+            for node in &mut topology.nodes {
+                node.observation_support = node.observation_support.and_then(|support| {
+                    support.projected_for_downstream(
+                        include_observations,
+                        include_managed_targets,
+                        include_workflow_detail,
+                    )
+                });
+            }
+            true
+        }
+        C2ServerFrame::Challenge(_) | C2ServerFrame::Rejected(_) => true,
+    }
+}
+
+fn project_status_observation_support(
+    status: &mut StatusResponse,
+    include_observations: bool,
+    include_managed_targets: bool,
+    include_workflow_detail: bool,
+) {
+    for node in status.nodes.values_mut() {
+        node.observation_support = node.observation_support.and_then(|support| {
+            support.projected_for_downstream(
+                include_observations,
+                include_managed_targets,
+                include_workflow_detail,
+            )
+        });
+    }
+}
+
+fn project_snapshot_observation_support(
+    snapshot: &mut crate::protocol::C2NodeSnapshot,
+    include_observations: bool,
+    include_managed_targets: bool,
+    include_workflow_detail: bool,
+) {
+    snapshot.observation_support = snapshot.observation_support.and_then(|support| {
+        support.projected_for_downstream(
+            include_observations,
+            include_managed_targets,
+            include_workflow_detail,
+        )
+    });
+}
+
 fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bool {
     match response {
         C2NodeResponse::Snapshot { snapshot, .. } => {
@@ -1058,7 +1648,8 @@ fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bo
             }
             true
         }
-        C2NodeResponse::SpawnSpecAccepted { receipt } => {
+        C2NodeResponse::SpawnSpecAccepted { receipt }
+        | C2NodeResponse::Spawned { receipt, .. } => {
             receipt.context_id = None;
             receipt.context = None;
             true
@@ -1069,6 +1660,8 @@ fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bo
             true
         }
         C2NodeResponse::SessionRecordUpdated { record }
+        | C2NodeResponse::ProviderSessionIndexed { record }
+        | C2NodeResponse::NativeSessionIndexed { record, .. }
         | C2NodeResponse::SessionRecordResumed { record, .. } => {
             strip_history_context_pack_from_record(record);
             true
@@ -1077,13 +1670,33 @@ fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bo
         | C2NodeResponse::HistoryLoaded { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. } => false,
-        C2NodeResponse::WorkspaceInspected { .. }
+        C2NodeResponse::Armed { .. }
+        | C2NodeResponse::Activated { .. }
+        | C2NodeResponse::Aborted { .. }
+        | C2NodeResponse::ReplyChunkAccepted { .. }
+        | C2NodeResponse::CallRejected { .. }
+        | C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::DeliveryStageBegun { .. }
+        | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | C2NodeResponse::DeliveryCommitted { .. }
+        | C2NodeResponse::DeliveryStageAborted { .. }
+        | C2NodeResponse::HostDirectoriesBrowsed { .. }
         | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::WorkspaceFileWritten { .. }
+        | C2NodeResponse::WorkspaceFileCreated { .. }
+        | C2NodeResponse::WorkspaceDirectoryCreated { .. }
+        | C2NodeResponse::GitHistoryRead { .. }
+        | C2NodeResponse::GitDiffRead { .. }
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
         | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::NativeSessionsCataloged { .. }
+        | C2NodeResponse::NativeSessionsPaged { .. }
+        | C2NodeResponse::NativeSessionPreviewed { .. }
+        | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
+        | C2NodeResponse::StandaloneWorkspaceCreated { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::WorktreeCreated { .. }
         | C2NodeResponse::WorktreeRemoved { .. }
@@ -1107,6 +1720,56 @@ fn strip_history_context_pack_from_event(event: &mut C2NodeEvent) {
 fn strip_history_context_pack_from_record(record: &mut crate::protocol::C2ManagedSessionRecord) {
     record.context_id = None;
     record.context = None;
+}
+
+fn strip_session_task_bindings_from_server_frame(frame: &mut C2ServerFrame) {
+    match frame {
+        C2ServerFrame::Reply(reply) => {
+            if let Ok(routed) = reply.result.as_mut() {
+                if let Ok(response) = routed.response.as_mut() {
+                    strip_session_task_bindings_from_response(response);
+                }
+            }
+        }
+        C2ServerFrame::Event(event) => strip_session_task_binding_from_event(&mut event.event),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => {}
+    }
+}
+
+fn strip_session_task_bindings_from_response(response: &mut C2NodeResponse) {
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. } => {
+            strip_session_task_bindings_from_snapshot(snapshot);
+        }
+        C2NodeResponse::Resync { snapshot, events, .. } => {
+            strip_session_task_bindings_from_snapshot(snapshot);
+            for event in events {
+                strip_session_task_binding_from_event(&mut event.event);
+            }
+        }
+        C2NodeResponse::SessionRecordUpdated { record }
+        | C2NodeResponse::ProviderSessionIndexed { record }
+        | C2NodeResponse::NativeSessionIndexed { record, .. }
+        | C2NodeResponse::SessionRecordResumed { record, .. } => {
+            record.task_binding = None;
+        }
+        _ => {}
+    }
+}
+
+fn strip_session_task_bindings_from_snapshot(snapshot: &mut crate::protocol::C2NodeSnapshot) {
+    for record in &mut snapshot.session_records {
+        record.task_binding = None;
+    }
+}
+
+fn strip_session_task_binding_from_event(event: &mut C2NodeEvent) {
+    if let C2NodeEvent::SessionRecordUpserted { record } = event {
+        record.task_binding = None;
+    }
 }
 
 fn c2_response_contains_managed_worktree(response: &C2NodeResponse) -> bool {
@@ -1142,8 +1805,24 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         C2NodeResponse::WorkspaceInspected { inspection } => inspection.git.worktrees
             .iter()
             .any(|worktree| worktree.path.as_unix_bytes().is_some()),
-        C2NodeResponse::WorkspaceFileRead { .. } => false,
-        C2NodeResponse::WorkspaceRegistered { workspace } => {
+        C2NodeResponse::HostDirectoriesBrowsed { listing } => {
+            listing.directory.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+                || listing.parent.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+                || listing.entries.iter().any(|entry| entry.path.as_unix_bytes().is_some())
+                || listing.next_after.as_ref().is_some_and(|path| path.as_unix_bytes().is_some())
+        }
+        C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::WorkspaceFileWritten { .. }
+        | C2NodeResponse::WorkspaceFileCreated { .. }
+        | C2NodeResponse::WorkspaceDirectoryCreated { .. }
+        | C2NodeResponse::GitHistoryRead { .. }
+        | C2NodeResponse::GitDiffRead { .. }
+        | C2NodeResponse::DeliveryStageBegun { .. }
+        | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | C2NodeResponse::DeliveryCommitted { .. }
+        | C2NodeResponse::DeliveryStageAborted { .. } => false,
+        C2NodeResponse::WorkspaceRegistered { workspace }
+        | C2NodeResponse::StandaloneWorkspaceCreated { workspace } => {
             workspace.canonical_root.as_unix_bytes().is_some()
         }
         C2NodeResponse::WorktreeCreated { worktree, workspace } => {
@@ -1154,11 +1833,23 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
         | C2NodeResponse::SpawnSpecAccepted { .. }
+        | C2NodeResponse::Armed { .. }
+        | C2NodeResponse::Spawned { .. }
+        | C2NodeResponse::Activated { .. }
+        | C2NodeResponse::Aborted { .. }
+        | C2NodeResponse::ReplyChunkAccepted { .. }
+        | C2NodeResponse::CallRejected { .. }
         | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
+        | C2NodeResponse::ProviderSessionIndexed { .. }
+        | C2NodeResponse::NativeSessionIndexed { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::NativeSessionsCataloged { .. }
+        | C2NodeResponse::NativeSessionsPaged { .. }
+        | C2NodeResponse::NativeSessionPreviewed { .. }
+        | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
         | C2NodeResponse::ContextPackExported { .. }
@@ -1176,7 +1867,10 @@ fn c2_snapshot_contains_opaque_unix_path(snapshot: &crate::protocol::C2NodeSnaps
 fn c2_event_contains_opaque_unix_path(event: &C2NodeEvent) -> bool {
     match event {
         C2NodeEvent::WorkspaceAdded { workspace } => workspace.canonical_root.as_unix_bytes().is_some(),
-        C2NodeEvent::Control { .. }
+        C2NodeEvent::HarnessMcpReadCall { .. }
+        | C2NodeEvent::Control { .. }
+        | C2NodeEvent::Observation { .. }
+        | C2NodeEvent::ManagedObservation { .. }
         | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
@@ -1376,6 +2070,12 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_WORKSPACE_FILE_WRITE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_WORKSPACE_ENTRY_CREATE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_GIT_READ_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY)
@@ -1383,6 +2083,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
             CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_SPAWN_PROFILE_REVISION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
@@ -1395,6 +2097,34 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
             CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_NATIVE_SESSION_CATALOG_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_NATIVE_SESSION_INDEX_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_NATIVE_SESSION_PREVIEW_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_HOST_DIRECTORY_BROWSE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_SESSION_TASK_CORRELATION_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_OBSERVATION_EVENTS_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_OBSERVATION_MANAGED_TARGET_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_HARNESS_MCP_READ_PROXY_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
@@ -1462,6 +2192,12 @@ fn request_targets_unavailable_provider(
 ) -> bool {
     let node_id = &request.route.node_id;
     match &request.request {
+        NodeRequest::ActivateHarnessMcpReservation { record_id, session, .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { record_id, session, .. }
+        | NodeRequest::RejectHarnessMcpCall { record_id, session, .. } => {
+            !status_address_is_legacy(status, node_id, session)
+                || !status_record_is_legacy(status, node_id, record_id)
+        }
         NodeRequest::Resume { session, .. }
         | NodeRequest::Prompt { session, .. }
         | NodeRequest::Paste { session, .. }
@@ -1478,18 +2214,45 @@ fn request_targets_unavailable_provider(
             !status_address_is_legacy(status, node_id, session)
         }
         NodeRequest::RenameSessionRecord { record_id, .. }
+        | NodeRequest::SetSessionTask { record_id, .. }
         | NodeRequest::ResumeSessionRecord { record_id, .. }
         | NodeRequest::ForgetSessionRecord { record_id } => {
             !status_record_is_legacy(status, node_id, record_id)
         }
+        NodeRequest::PreviewSessionRecord { record_id, .. } => {
+            !status_record_is_legacy(status, node_id, record_id)
+        }
         NodeRequest::ForgetContextPack { .. } => true,
+        NodeRequest::IndexProviderSession { provider, .. } => !provider_id_is_legacy(provider),
+        NodeRequest::CatalogNativeSessions { route, .. }
+        | NodeRequest::PageNativeSessions { route, .. } => {
+            !provider_id_is_legacy(&route.provider)
+        }
+        NodeRequest::PreviewNativeSession { selection, .. }
+        | NodeRequest::IndexNativeSession { selection, .. } => {
+            !provider_id_is_legacy(&selection.route.provider)
+        }
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::SpawnSpecWithHarnessMcp { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::BeginDeliveryStage { .. }
+        | NodeRequest::PutDeliveryBlobChunk { .. }
+        | NodeRequest::CommitDeliveryStage { .. }
+        | NodeRequest::AbortDeliveryStage { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::RegisterWorkspace { .. }
+        | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::UnregisterWorkspace { .. }
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
@@ -1675,10 +2438,16 @@ fn project_legacy_response(
             true
         }
         C2NodeResponse::SessionRecordUpdated { record }
+        | C2NodeResponse::ProviderSessionIndexed { record }
         | C2NodeResponse::SessionRecordResumed { record, .. } => {
             project_legacy_record_provider(record)
         }
-        C2NodeResponse::SpawnSpecAccepted { receipt } => {
+        C2NodeResponse::NativeSessionIndexed { selection, record } => {
+            let record_is_legacy = project_legacy_record_provider(record);
+            provider_id_is_legacy(&selection.route.provider) && record_is_legacy
+        }
+        C2NodeResponse::SpawnSpecAccepted { receipt }
+        | C2NodeResponse::Spawned { receipt, .. } => {
             project_legacy_spawn_provider(receipt)
         }
         C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
@@ -1687,17 +2456,41 @@ fn project_legacy_response(
         C2NodeResponse::ContextPackExported { context } => {
             context_receipt_provider_is_legacy(context)
         }
+        C2NodeResponse::NativeSessionsCataloged { route, .. }
+        | C2NodeResponse::NativeSessionsPaged { route, .. } => {
+            provider_id_is_legacy(&route.provider)
+        }
+        C2NodeResponse::NativeSessionPreviewed { selection, .. } => {
+            provider_id_is_legacy(&selection.route.provider)
+        }
         C2NodeResponse::WorkspaceRegistered { workspace }
+        | C2NodeResponse::StandaloneWorkspaceCreated { workspace }
         | C2NodeResponse::WorktreeCreated { workspace, .. } => {
             retain_legacy_workspace(workspace);
             true
         }
-        C2NodeResponse::WorkspaceInspected { .. }
+        C2NodeResponse::Armed { .. }
+        | C2NodeResponse::Activated { .. }
+        | C2NodeResponse::Aborted { .. }
+        | C2NodeResponse::ReplyChunkAccepted { .. }
+        | C2NodeResponse::CallRejected { .. }
+        | C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::DeliveryStageBegun { .. }
+        | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | C2NodeResponse::DeliveryCommitted { .. }
+        | C2NodeResponse::DeliveryStageAborted { .. }
+        | C2NodeResponse::HostDirectoriesBrowsed { .. }
         | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::WorkspaceFileWritten { .. }
+        | C2NodeResponse::WorkspaceFileCreated { .. }
+        | C2NodeResponse::WorkspaceDirectoryCreated { .. }
+        | C2NodeResponse::GitHistoryRead { .. }
+        | C2NodeResponse::GitDiffRead { .. }
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
         | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
@@ -1715,10 +2508,21 @@ fn project_legacy_event(
     snapshot: Option<&crate::protocol::C2NodeSnapshot>,
 ) -> bool {
     match event {
+        C2NodeEvent::HarnessMcpReadCall { record_id, session, .. } => {
+            address_is_legacy(status, node_id, snapshot, session)
+                && snapshot.map_or_else(
+                    || status_record_is_legacy(status, node_id, record_id),
+                    |snapshot| snapshot.session_records.iter().any(|record| {
+                        &record.record_id == record_id && provider_id_is_legacy(&record.provider)
+                    }),
+                )
+        }
         C2NodeEvent::Control { address, .. }
+        | C2NodeEvent::Observation { address, .. }
         | C2NodeEvent::TerminalFrame { address, .. } => {
             address_is_legacy(status, node_id, snapshot, address)
         }
+        C2NodeEvent::ManagedObservation { .. } => false,
         C2NodeEvent::WorkspaceAdded { workspace } => {
             retain_legacy_workspace(workspace);
             true
@@ -1805,25 +2609,65 @@ fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
             snapshot.provider_runtime_statuses.clear();
         }
         C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::DeliveryStageBegun { .. }
+        | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | C2NodeResponse::DeliveryCommitted { .. }
+        | C2NodeResponse::DeliveryStageAborted { .. }
+        | C2NodeResponse::HostDirectoriesBrowsed { .. }
         | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::WorkspaceFileWritten { .. }
+        | C2NodeResponse::WorkspaceFileCreated { .. }
+        | C2NodeResponse::WorkspaceDirectoryCreated { .. }
+        | C2NodeResponse::GitHistoryRead { .. }
+        | C2NodeResponse::GitDiffRead { .. }
         | C2NodeResponse::Controller { .. }
         | C2NodeResponse::SpawnAccepted { .. }
         | C2NodeResponse::SpawnSpecAccepted { .. }
+        | C2NodeResponse::Armed { .. }
+        | C2NodeResponse::Spawned { .. }
+        | C2NodeResponse::Activated { .. }
+        | C2NodeResponse::Aborted { .. }
+        | C2NodeResponse::ReplyChunkAccepted { .. }
+        | C2NodeResponse::CallRejected { .. }
         | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
         | C2NodeResponse::ManagedWorktreeCleanup { .. }
         | C2NodeResponse::SessionRecordUpdated { .. }
+        | C2NodeResponse::ProviderSessionIndexed { .. }
+        | C2NodeResponse::NativeSessionIndexed { .. }
         | C2NodeResponse::SessionRecordResumed { .. }
         | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::NativeSessionsCataloged { .. }
+        | C2NodeResponse::NativeSessionsPaged { .. }
+        | C2NodeResponse::NativeSessionPreviewed { .. }
+        | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
+        | C2NodeResponse::StandaloneWorkspaceCreated { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::WorktreeCreated { .. }
         | C2NodeResponse::WorktreeRemoved { .. }
         | C2NodeResponse::Accepted
         | C2NodeResponse::ShuttingDown => {}
+    }
+}
+
+fn clear_server_frame_agent_progress(frame: &mut C2ServerFrame) {
+    let C2ServerFrame::Reply(reply) = frame else {
+        return;
+    };
+    let Ok(routed) = reply.result.as_mut() else {
+        return;
+    };
+    let Ok(response) = routed.response.as_mut() else {
+        return;
+    };
+    match response {
+        C2NodeResponse::Snapshot { snapshot, .. }
+        | C2NodeResponse::Resync { snapshot, .. } => snapshot.agent_progress.clear(),
+        _ => {}
     }
 }
 
@@ -1833,7 +2677,8 @@ mod tests {
     use crate::protocol::{
         AdapterContractRevision, AdapterFamily, AdapterId, C2ClientHello, C2GitSnapshot,
         C2SessionSnapshot, C2SessionStatus, C2WorkspaceInspection, C2WorkspaceSnapshot,
-        C2_API_VERSION, NodeFreshness, ObservedNode, OpaqueHostPath,
+        C2_API_VERSION, HostDirectoryEntry, HostDirectoryListing, NodeFreshness, ObservedNode,
+        OpaqueHostPath,
         ProviderAdapterContractSupport, ProviderContractRevision, ProviderContractSupport,
         RepositoryPath, ResolvedSpawnReceipt, SlimManagedSessionRecord, SpawnDeadlineMs,
         SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides, SpawnProfileId,
@@ -1841,6 +2686,32 @@ mod tests {
         SpawnResolutionProvenance, SpawnSpec, SpawnTarget, WorkspaceFileContent,
         WorkspaceFileRead,
     };
+
+    #[test]
+    fn harness_mcp_c2_control_gate_preserves_controller_semantics() {
+        let request = NodeRequest::AbortHarnessMcpReservation {
+            reservation_id: gate4agent_node_protocol::HarnessMcpReservationId::new(
+                format!("hmcpres_{}", "a".repeat(24)),
+            ).unwrap(),
+            activation_digest: gate4agent_node_protocol::HarnessMcpActivationDigest::new(
+                format!("sha256:{}", "b".repeat(64)),
+            ).unwrap(),
+        };
+        assert!(unnegotiated_request_failure(
+            &request,
+            NegotiatedPathCapabilities::default(),
+        ).is_some());
+        let capabilities = NegotiatedPathCapabilities {
+            harness_mcp_read_proxy: true,
+            spawn_spec_defaults_overrides: true,
+            ..NegotiatedPathCapabilities::default()
+        };
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+        assert!(!is_read_only_request(&request));
+        assert!(c2_control_compatibility_support().unwrap().capabilities.iter().any(|capability| {
+            capability.as_str() == C2_HARNESS_MCP_READ_PROXY_CAPABILITY
+        }));
+    }
     use gate4agent_node_protocol::{
         GitStatusEntry, ManagedSessionState, SessionAddress, SessionKey, SessionMode,
         SessionRecordId, WorkspaceEntry, WorkspaceEntryKind, WorkspaceId,
@@ -1871,6 +2742,7 @@ mod tests {
                 last_error: None,
                 gaps: Vec::new(),
                 gaps_truncated: 0,
+                observation_support: None,
             })]),
         }
     }
@@ -1887,6 +2759,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         inventory.provider_contracts = vec![ProviderContractSupport {
             provider: AgentId::new("codex").unwrap(),
@@ -1920,6 +2794,7 @@ mod tests {
                 worktree_id: None,
             },
             profile_id: SpawnProfileId::new("default").unwrap(),
+            expected_profile_revision: SpawnProfileRevision::new("r1").unwrap(),
             overrides: SpawnOverrides::default(),
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("spawn-1").unwrap(),
@@ -1955,6 +2830,7 @@ mod tests {
                 context_id: SpawnFieldProvenance::Profile,
                 environment_profile_id: SpawnFieldProvenance::Profile,
             },
+            harness_mcp_proxy: None,
         }
     }
 
@@ -2011,6 +2887,27 @@ mod tests {
         }
     }
 
+    fn agent_progress(instance_id: u64) -> crate::protocol::SessionAgentProgress {
+        crate::protocol::SessionAgentProgress {
+            address: address(instance_id),
+            progress: crate::protocol::AgentProgressV1 {
+                provider_sequence: 9,
+                activity: ProviderActivity::Working,
+                completed_turns: 2,
+                usage: None,
+                current: crate::protocol::AgentProgressCurrentV1::Working,
+                active_tool_labels: vec!["shell".to_owned()],
+                active_tool_count: 1,
+                attention: None,
+                subagent_count: 0,
+                last_event_kind: Some(crate::protocol::AgentProgressEventKindV1::ToolStarted),
+                gap_count: 0,
+                stale: false,
+                truncated: false,
+            },
+        }
+    }
+
     fn terminal_event_frame(instance_id: u64, sequence: u64) -> C2ServerFrame {
         C2ServerFrame::Event(RoutedNodeEvent {
             node_id: NodeId::new("node-a").unwrap(),
@@ -2033,13 +2930,17 @@ mod tests {
                 incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
                 response: Ok(C2NodeResponse::Resync {
                     event_sequence: sequence,
+                    oldest_available_sequence: 1,
                     snapshot: crate::protocol::C2NodeSnapshot {
                         node_id: NodeId::new("node-a").unwrap(),
                         enabled_providers: Vec::new(),
                         provider_runtime_statuses: Default::default(),
                         workspaces: Vec::new(),
                         session_records: Vec::new(),
+                        agent_progress: Vec::new(),
                         managed_worktrees: Vec::new(),
+                        launch_inventory: None,
+                        observation_support: None,
                     },
                     events: vec![crate::protocol::C2NodeEventEnvelope {
                         sequence,
@@ -2089,16 +2990,32 @@ mod tests {
                 CapabilityId::new(C2_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_REPOSITORY_PATH_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_WORKSPACE_FILE_WRITE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_WORKSPACE_ENTRY_CREATE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_GIT_READ_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_RUNTIME_STATUS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_NATIVE_SESSION_CATALOG_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_NATIVE_SESSION_INDEX_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_NATIVE_SESSION_PREVIEW_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_HOST_DIRECTORY_BROWSE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SESSION_TASK_CORRELATION_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_OBSERVATION_EVENTS_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_OBSERVATION_MANAGED_TARGET_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -2124,21 +3041,473 @@ mod tests {
     }
 
     #[test]
+    fn c2_downstream_agent_progress_is_stripped_from_snapshot_and_resync() {
+        let mut resync = terminal_resync_frame(7, 11);
+        let C2ServerFrame::Reply(reply) = &mut resync else { unreachable!() };
+        let routed = reply.result.as_mut().unwrap();
+        let response = routed.response.as_mut().unwrap();
+        let C2NodeResponse::Resync { snapshot, .. } = response else { unreachable!() };
+        snapshot.agent_progress = vec![agent_progress(7)];
+        clear_server_frame_agent_progress(&mut resync);
+        let C2ServerFrame::Reply(reply) = &resync else { unreachable!() };
+        let C2NodeResponse::Resync { snapshot, .. } = reply
+            .result
+            .as_ref()
+            .unwrap()
+            .response
+            .as_ref()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(snapshot.agent_progress.is_empty());
+
+        let mut snapshot_frame = terminal_resync_frame(7, 12);
+        let C2ServerFrame::Reply(reply) = &mut snapshot_frame else { unreachable!() };
+        let response = reply
+            .result
+            .as_mut()
+            .unwrap()
+            .response
+            .as_mut()
+            .unwrap();
+        let C2NodeResponse::Resync { snapshot, .. } = response else { unreachable!() };
+        snapshot.agent_progress = vec![agent_progress(7)];
+        *response = C2NodeResponse::Snapshot {
+            event_sequence: 12,
+            controller: None,
+            snapshot: snapshot.clone(),
+        };
+        clear_server_frame_agent_progress(&mut snapshot_frame);
+        let C2ServerFrame::Reply(reply) = &snapshot_frame else { unreachable!() };
+        let C2NodeResponse::Snapshot { snapshot, .. } = reply
+            .result
+            .as_ref()
+            .unwrap()
+            .response
+            .as_ref()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(snapshot.agent_progress.is_empty());
+    }
+
+    #[test]
+    fn c2_observation_events_are_stripped_without_downstream_capability() {
+        let observation = || C2NodeEvent::Observation {
+            address: address(7),
+            observation: crate::protocol::ObservationV1 {
+                source_sequence: 3,
+                observed_at_unix_ms: Some(5),
+                evidence: crate::protocol::ObservationEvidenceV1::StructuredProvider,
+                kind: crate::protocol::ObservationKindV1::Working,
+                truncated: false,
+            },
+        };
+        let mut direct = C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                sequence: 3,
+            },
+            event: observation(),
+        });
+        assert!(!project_server_frame_observation_events(
+            &mut direct,
+            false,
+            false,
+            false,
+        ));
+
+        let mut resync = terminal_resync_frame(7, 11);
+        let C2ServerFrame::Reply(reply) = &mut resync else { unreachable!() };
+        let C2NodeResponse::Resync { events, .. } = reply
+            .result
+            .as_mut()
+            .unwrap()
+            .response
+            .as_mut()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        events.push(crate::protocol::C2NodeEventEnvelope {
+            sequence: 12,
+            event: observation(),
+        });
+        assert!(project_server_frame_observation_events(
+            &mut resync,
+            false,
+            false,
+            false,
+        ));
+        let C2ServerFrame::Reply(reply) = resync else { unreachable!() };
+        let C2NodeResponse::Resync { events, .. } = reply
+            .result
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, C2NodeEvent::TerminalFrame { .. }));
+
+        let mut detail = C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                sequence: 13,
+            },
+            event: C2NodeEvent::Observation {
+                address: address(7),
+                observation: crate::protocol::ObservationV1 {
+                    source_sequence: 4,
+                    observed_at_unix_ms: Some(6),
+                    evidence: crate::protocol::ObservationEvidenceV1::StructuredProvider,
+                    kind: crate::protocol::ObservationKindV1::FileChanged {
+                        path: Some("src/lib.rs".to_owned()),
+                    },
+                    truncated: false,
+                },
+            },
+        });
+        assert!(!project_server_frame_observation_events(
+            &mut detail,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn c2_managed_observation_is_capability_gated_and_legacy_stripped() {
+        let managed = || C2NodeEvent::ManagedObservation {
+            record_id: gate4agent_node_protocol::SessionRecordId::new("record-a").unwrap(),
+            observation: crate::protocol::ObservationV1 {
+                source_sequence: 3,
+                observed_at_unix_ms: Some(5),
+                evidence: crate::protocol::ObservationEvidenceV1::ManagedHook,
+                kind: crate::protocol::ObservationKindV1::Working,
+                truncated: false,
+            },
+        };
+        let mut without_target = C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                sequence: 3,
+            },
+            event: managed(),
+        });
+        assert!(!project_server_frame_observation_events(
+            &mut without_target,
+            true,
+            false,
+            false,
+        ));
+
+        let mut selected = C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                sequence: 3,
+            },
+            event: managed(),
+        });
+        assert!(project_server_frame_observation_events(
+            &mut selected,
+            true,
+            true,
+            false,
+        ));
+
+        let mut legacy = managed();
+        assert!(!project_legacy_event(
+            &mut legacy,
+            &NodeId::new("node-a").unwrap(),
+            &status(NodeTransportState::Online, Some(NodeIncarnationId::from_bytes([9; 16]))),
+            None,
+        ));
+    }
+
+    #[test]
+    fn c2_observation_support_projection_matrix_covers_hello_topology_snapshot_and_resync() {
+        let full = crate::protocol::C2ObservationSupport {
+            events: true,
+            managed_target: true,
+            workflow_detail: true,
+        };
+        let mut source_status = status(
+            NodeTransportState::Online,
+            Some(NodeIncarnationId::from_bytes([7; 16])),
+        );
+        source_status
+            .nodes
+            .values_mut()
+            .next()
+            .unwrap()
+            .observation_support = Some(full);
+
+        for (include_events, include_managed, include_detail, expected) in [
+            (false, false, false, None),
+            (
+                true,
+                false,
+                false,
+                Some(crate::protocol::C2ObservationSupport {
+                    events: true,
+                    managed_target: false,
+                    workflow_detail: false,
+                }),
+            ),
+            (
+                true,
+                true,
+                false,
+                Some(crate::protocol::C2ObservationSupport {
+                    events: true,
+                    managed_target: true,
+                    workflow_detail: false,
+                }),
+            ),
+            (
+                true,
+                false,
+                true,
+                Some(crate::protocol::C2ObservationSupport {
+                    events: true,
+                    managed_target: false,
+                    workflow_detail: true,
+                }),
+            ),
+            (true, true, true, Some(full)),
+        ] {
+            let mut hello = C2ServerFrame::Hello(C2Hello {
+                protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+                connection_id: 1,
+                status: source_status.clone(),
+                compatibility: None,
+            });
+            assert!(project_server_frame_observation_events(
+                &mut hello,
+                include_events,
+                include_managed,
+                include_detail,
+            ));
+            let C2ServerFrame::Hello(hello) = hello else { unreachable!() };
+            assert_eq!(
+                hello.status.nodes.values().next().unwrap().observation_support,
+                expected,
+            );
+
+            let mut topology = C2ServerFrame::Topology(C2Topology::from_status(&source_status));
+            assert!(project_server_frame_observation_events(
+                &mut topology,
+                include_events,
+                include_managed,
+                include_detail,
+            ));
+            let C2ServerFrame::Topology(topology) = topology else { unreachable!() };
+            assert_eq!(topology.nodes[0].observation_support, expected);
+
+            let mut resync = terminal_resync_frame(7, 11);
+            let C2ServerFrame::Reply(reply) = &mut resync else { unreachable!() };
+            let C2NodeResponse::Resync { snapshot, .. } = reply
+                .result
+                .as_mut()
+                .unwrap()
+                .response
+                .as_mut()
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            snapshot.observation_support = Some(full);
+            let mut snapshot_frame = resync.clone();
+            let C2ServerFrame::Reply(reply) = &mut snapshot_frame else { unreachable!() };
+            let response = reply.result.as_mut().unwrap().response.as_mut().unwrap();
+            let C2NodeResponse::Resync { event_sequence, snapshot, .. } = response else {
+                unreachable!()
+            };
+            *response = C2NodeResponse::Snapshot {
+                event_sequence: *event_sequence,
+                controller: None,
+                snapshot: snapshot.clone(),
+            };
+
+            for frame in [&mut snapshot_frame, &mut resync] {
+                assert!(project_server_frame_observation_events(
+                    frame,
+                    include_events,
+                    include_managed,
+                    include_detail,
+                ));
+                let C2ServerFrame::Reply(reply) = frame else { unreachable!() };
+                let support = match reply
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .response
+                    .as_ref()
+                    .unwrap()
+                {
+                    C2NodeResponse::Snapshot { snapshot, .. }
+                    | C2NodeResponse::Resync { snapshot, .. } => snapshot.observation_support,
+                    _ => unreachable!(),
+                };
+                assert_eq!(support, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn c2_downstream_task_bindings_are_stripped_from_resync_events_and_replies() {
+        let record = crate::protocol::C2ManagedSessionRecord {
+            record_id: SessionRecordId::new("record-task").unwrap(),
+            display_name: "task".to_owned(),
+            provider: AgentId::new("codex").unwrap(),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: WorkspaceId::new("repo").unwrap(),
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: Some(gate4agent_node_protocol::SessionTaskBindingV1 {
+                revision: 1,
+                task_id: Some(gate4agent_node_protocol::TaskId::from_nonce([1; 12])),
+                changed_at_unix_ms: 1,
+            }),
+            provider_identity_present: false,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let mut resync = terminal_resync_frame(7, 11);
+        let C2ServerFrame::Reply(reply) = &mut resync else { unreachable!() };
+        let C2NodeResponse::Resync { snapshot, events, .. } = reply
+            .result.as_mut().unwrap().response.as_mut().unwrap()
+        else { unreachable!() };
+        snapshot.session_records.push(record.clone());
+        events.push(crate::protocol::C2NodeEventEnvelope {
+            sequence: 12,
+            event: C2NodeEvent::SessionRecordUpserted { record: record.clone() },
+        });
+        strip_session_task_bindings_from_server_frame(&mut resync);
+        let C2ServerFrame::Reply(reply) = &resync else { unreachable!() };
+        let C2NodeResponse::Resync { snapshot, events, .. } = reply
+            .result.as_ref().unwrap().response.as_ref().unwrap()
+        else { unreachable!() };
+        assert!(snapshot.session_records[0].task_binding.is_none());
+        assert!(matches!(&events.last().unwrap().event,
+            C2NodeEvent::SessionRecordUpserted { record } if record.task_binding.is_none()));
+
+        let mut direct = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(1),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([1; 16]),
+                response: Ok(C2NodeResponse::SessionRecordUpdated { record }),
+            }),
+        });
+        strip_session_task_bindings_from_server_frame(&mut direct);
+        let C2ServerFrame::Reply(reply) = direct else { unreachable!() };
+        let C2NodeResponse::SessionRecordUpdated { record } =
+            reply.result.unwrap().response.unwrap()
+        else { unreachable!() };
+        assert!(record.task_binding.is_none());
+    }
+
+    #[test]
+    fn spawn_profile_revision_is_advertised_and_rejected_before_node_relay_on_all_spawn_paths() {
+        let support = c2_control_compatibility_support().unwrap();
+        assert!(support.capabilities.iter().any(|capability| {
+            capability.as_str() == C2_SPAWN_PROFILE_REVISION_CAPABILITY
+        }));
+
+        let spec = spawn_spec("node-a");
+        let reservation_id = gate4agent_node_protocol::HarnessMcpReservationId::new(
+            format!("hmcpres_{}", "a".repeat(24)),
+        ).unwrap();
+        let activation_digest = gate4agent_node_protocol::HarnessMcpActivationDigest::new(
+            format!("sha256:{}", "b".repeat(64)),
+        ).unwrap();
+        let deadline_unix_ms = unix_ms().saturating_add(60_000);
+        let requests = [
+            NodeRequest::SpawnSpec { spec: spec.clone() },
+            NodeRequest::SpawnManagedWorktree {
+                request: ManagedWorktreeSpawnRequest {
+                    spawn_spec: spec.clone(),
+                    worktree_profile_id:
+                        gate4agent_node_protocol::WorktreeProfileId::new("review").unwrap(),
+                },
+            },
+            NodeRequest::ArmHarnessMcpReservation {
+                reservation_id: reservation_id.clone(),
+                activation_digest: activation_digest.clone(),
+                spawn_spec: spec.clone(),
+                expires_at_unix_ms: deadline_unix_ms,
+            },
+            NodeRequest::SpawnSpecWithHarnessMcp {
+                reservation_id,
+                activation_digest,
+                spec,
+                deadline_unix_ms,
+            },
+        ];
+        let capabilities = NegotiatedPathCapabilities {
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            spawn_profile_revision: false,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            session_bundle_materialization: true,
+            harness_mcp_read_proxy: true,
+            ..NegotiatedPathCapabilities::default()
+        };
+        for request in &requests {
+            assert!(matches!(
+                unnegotiated_request_failure(request, capabilities),
+                Some(C2RelayFailure {
+                    code: C2RelayFailureCode::RequestForbidden,
+                    ref message,
+                    ..
+                }) if message ==
+                    "spawn profile revision capability was not negotiated with C2"
+            ));
+        }
+    }
+
+    #[test]
     fn c2_spawn_spec_gate_rejects_unnegotiated_request() {
         let request = NodeRequest::SpawnSpec { spec: spawn_spec("node-a") };
         let mut capabilities = NegotiatedPathCapabilities {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            workspace_file_write: true,
+            workspace_entry_create: true,
+            git_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            spawn_profile_revision: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_none());
         capabilities.provider_ids_open = false;
@@ -2254,6 +3623,9 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
@@ -2262,7 +3634,12 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: false,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         let inherited = spawn_spec("node-a");
         assert!(matches!(
@@ -2305,6 +3682,9 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
@@ -2313,7 +3693,12 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: false,
+            native_session_catalog: false,
+            native_session_catalog_paging: false,
+            native_session_index: false,
+            native_session_preview: false,
             terminal_frame_events: true,
+            ..Default::default()
         };
         assert!(matches!(
             unnegotiated_request_failure(&request, capabilities),
@@ -2370,6 +3755,7 @@ mod tests {
             session: address(7),
             session_id: "session-1".to_owned(),
             message_count: 2,
+            completed_turn_count: None,
         };
         assert!(!strip_history_context_pack_from_response(&mut standalone));
         let mut failure = C2ServerFrame::Reply(C2ReplyEnvelope {
@@ -2401,6 +3787,9 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
@@ -2409,7 +3798,12 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         assert!(unnegotiated_request_failure(&request, capabilities).is_some());
         capabilities.managed_worktree_lifecycle = true;
@@ -2468,6 +3862,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_directory_browse_is_capability_gated_and_routes_exact_incarnation() {
+        let incarnation_id = NodeIncarnationId::from_bytes([21; 16]);
+        let mut capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            child_environment_profile: true,
+            session_bundle_materialization: true,
+            history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
+            terminal_frame_events: true,
+            ..Default::default()
+        };
+        let request = NodeRequest::BrowseHostDirectories {
+            directory: Some(OpaqueHostPath::utf8(r"C:\Users".to_owned()).unwrap()),
+            after: Some(OpaqueHostPath::utf8(r"C:\Users\Public".to_owned()).unwrap()),
+        };
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+        capabilities.host_directory_browse = false;
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ..
+            })
+        ));
+        assert!(node_request_contains_opaque_unix_path(
+            &NodeRequest::BrowseHostDirectories {
+                directory: Some(OpaqueHostPath::unix_bytes(b"/srv/\xff".to_vec()).unwrap()),
+                after: None,
+            },
+        ));
+        assert!(node_request_contains_opaque_unix_path(
+            &NodeRequest::BrowseHostDirectories {
+                directory: None,
+                after: Some(OpaqueHostPath::unix_bytes(b"/srv/\xfe".to_vec()).unwrap()),
+            },
+        ));
+
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        let (releases_tx, _releases_rx) = mpsc::channel(1);
+        let (force_disconnect, _force_disconnect_rx) = watch::channel(0);
+        let relays = BTreeMap::from([(
+            NodeId::new("node-a").unwrap(),
+            RelayEndpoint {
+                commands: commands_tx,
+                releases: releases_tx,
+                force_disconnect,
+            },
+        )]);
+        let (_status_tx, status_rx) = watch::channel(Arc::new(status(
+            NodeTransportState::Online,
+            Some(incarnation_id),
+        )));
+        let routed = crate::protocol::RoutedNodeRequest {
+            route: crate::protocol::NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: incarnation_id,
+            },
+            request: request.clone(),
+        };
+        assert!(matches!(dispatch_start(77, routed, &relays, &status_rx), DispatchStart::Pending(_)));
+        let RelayCommand::Request {
+            operator_connection_id,
+            expected_incarnation_id,
+            request: relayed,
+            ..
+        } = commands_rx.recv().await.unwrap();
+        assert_eq!(operator_connection_id, 77);
+        assert_eq!(expected_incarnation_id, incarnation_id);
+        assert_eq!(relayed, request);
+
+        let frame = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(9),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id,
+                response: Ok(C2NodeResponse::HostDirectoriesBrowsed {
+                    listing: HostDirectoryListing {
+                        directory: None,
+                        parent: None,
+                        entries: vec![HostDirectoryEntry {
+                            path: OpaqueHostPath::utf8(r"C:\Users".to_owned()).unwrap(),
+                            display_name: "Users".to_owned(),
+                            is_link: false,
+                        }],
+                        next_after: None,
+                        incomplete: false,
+                    },
+                }),
+            }),
+        });
+        assert!(server_frame_contains_host_directory_browse(&frame));
+    }
+
+    #[tokio::test]
+    async fn standalone_workspace_is_capability_gated_routed_and_projected_exactly() {
+        let incarnation_id = NodeIncarnationId::from_bytes([22; 16]);
+        let mut capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            child_environment_profile: true,
+            session_bundle_materialization: true,
+            history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
+            terminal_frame_events: true,
+            ..Default::default()
+        };
+        let request = NodeRequest::CreateStandaloneWorkspace {
+            workspace_id: WorkspaceId::new("standalone").unwrap(),
+            root: OpaqueHostPath::utf8(r"C:\standalone".to_owned()).unwrap(),
+            initial_branch: Some("main".to_owned()),
+        };
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+        capabilities.standalone_workspace_lifecycle = false;
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ..
+            })
+        ));
+        assert!(node_request_contains_opaque_unix_path(
+            &NodeRequest::CreateStandaloneWorkspace {
+                workspace_id: WorkspaceId::new("opaque").unwrap(),
+                root: OpaqueHostPath::unix_bytes(b"/srv/standalone".to_vec()).unwrap(),
+                initial_branch: None,
+            },
+        ));
+
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        let (releases_tx, _releases_rx) = mpsc::channel(1);
+        let (force_disconnect, _force_disconnect_rx) = watch::channel(0);
+        let relays = BTreeMap::from([(
+            NodeId::new("node-a").unwrap(),
+            RelayEndpoint {
+                commands: commands_tx,
+                releases: releases_tx,
+                force_disconnect,
+            },
+        )]);
+        let (_status_tx, status_rx) = watch::channel(Arc::new(status(
+            NodeTransportState::Online,
+            Some(incarnation_id),
+        )));
+        let routed = crate::protocol::RoutedNodeRequest {
+            route: crate::protocol::NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: incarnation_id,
+            },
+            request: request.clone(),
+        };
+        assert!(matches!(dispatch_start(78, routed, &relays, &status_rx), DispatchStart::Pending(_)));
+        let RelayCommand::Request {
+            operator_connection_id,
+            expected_incarnation_id,
+            request: relayed,
+            ..
+        } = commands_rx.recv().await.unwrap();
+        assert_eq!(operator_connection_id, 78);
+        assert_eq!(expected_incarnation_id, incarnation_id);
+        assert_eq!(relayed, request);
+
+        let workspace = C2WorkspaceSnapshot {
+            workspace_id: WorkspaceId::new("standalone").unwrap(),
+            canonical_root: OpaqueHostPath::utf8(r"C:\standalone".to_owned()).unwrap(),
+            sessions: Vec::new(),
+            worktree_service_mode: Some(crate::protocol::WorktreeServiceMode::Manual),
+            managed_worktree_profiles: Some(crate::protocol::WorktreeProfileInventory {
+                profiles: Vec::new(),
+            }),
+        };
+        let mut frame = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(10),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id,
+                response: Ok(C2NodeResponse::StandaloneWorkspaceCreated {
+                    workspace: workspace.clone(),
+                }),
+            }),
+        });
+        assert!(server_frame_contains_standalone_workspace_lifecycle(&frame));
+        project_server_frame_launch_inventory(&mut frame, true, false, true);
+        let C2ServerFrame::Reply(reply) = frame else { unreachable!() };
+        let C2NodeResponse::StandaloneWorkspaceCreated { workspace: projected } =
+            reply.result.unwrap().response.unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(projected.canonical_root, workspace.canonical_root);
+        assert!(projected.worktree_service_mode.is_none());
+        assert!(projected.managed_worktree_profiles.is_none());
+    }
+
+    #[tokio::test]
     async fn control_writer_rejects_unnegotiated_spawn_spec_reply_recursively() {
         let frame = C2ServerFrame::Reply(C2ReplyEnvelope {
             request_id: crate::protocol::C2RequestId(3),
@@ -2494,7 +4107,13 @@ mod tests {
                 opaque_host_paths: true,
                 repository_paths: true,
                 workspace_file_read: true,
-                provider_runtime_status: true,
+                workspace_file_write: true,
+                workspace_entry_create: true,
+                git_read: true,
+                host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: false,
                 worktree_selection: true,
@@ -2502,7 +4121,12 @@ mod tests {
                 child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+                ..Default::default()
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
@@ -2547,6 +4171,9 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
@@ -2555,7 +4182,12 @@ mod tests {
             child_environment_profile: false,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         control_writer(
             writer,
@@ -2600,7 +4232,10 @@ mod tests {
                 opaque_host_paths: true,
                 repository_paths: true,
                 workspace_file_read: true,
-                provider_runtime_status: true,
+                host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: false,
@@ -2608,7 +4243,12 @@ mod tests {
                 child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+                ..Default::default()
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
@@ -2685,14 +4325,19 @@ mod tests {
         let snapshot = crate::protocol::C2NodeSnapshot {
             node_id: node_id.clone(),
             enabled_providers: vec![AgentId::new("codex").unwrap()],
+            agent_progress: Vec::new(),
             provider_runtime_statuses: Default::default(),
             workspaces: vec![C2WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("repo").unwrap(),
                 canonical_root: OpaqueHostPath::utf8(r"C:\repo".to_owned()).unwrap(),
                 sessions: vec![c2_session("codex", 1), c2_session("qwen-code", 2)],
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
             }],
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            observation_support: None,
         };
         let empty_status = status(NodeTransportState::Offline, None);
         let mut legacy = C2NodeEvent::TerminalFrame {
@@ -2716,6 +4361,86 @@ mod tests {
             &empty_status,
             Some(&snapshot),
         ));
+    }
+
+    #[test]
+    fn launch_inventory_projection_uses_existing_capability_components() {
+        let inventory = crate::protocol::LaunchInventory {
+            spawn_profiles: Some(vec![crate::protocol::SpawnProfileSummary {
+                id: SpawnProfileId::new("default").unwrap(),
+                revision: SpawnProfileRevision::new("v1").unwrap(),
+            }]),
+            bundles: Some(vec![crate::protocol::ResolvedBundleReceipt {
+                id: crate::protocol::SpawnBundleId::new("review").unwrap(),
+                revision: crate::protocol::SpawnBundleRevision::new("v1").unwrap(),
+                digest: crate::protocol::SpawnBundleDigest::new(format!(
+                    "sha256:{}",
+                    "0".repeat(64),
+                ))
+                .unwrap(),
+            }]),
+        };
+        let snapshot = crate::protocol::C2NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            agent_progress: Vec::new(),
+            provider_runtime_statuses: Default::default(),
+            workspaces: vec![C2WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("repo").unwrap(),
+                canonical_root: OpaqueHostPath::utf8(r"C:\repo".to_owned()).unwrap(),
+                sessions: Vec::new(),
+                worktree_service_mode: None,
+                managed_worktree_profiles: Some(
+                    crate::protocol::WorktreeProfileInventory {
+                        profiles: vec![crate::protocol::ManagedWorktreeProfileSummary {
+                            id: crate::protocol::WorktreeProfileId::new("review").unwrap(),
+                            revision: crate::protocol::WorktreeProfileRevision::new("v1").unwrap(),
+                            retention: crate::protocol::ManagedWorktreeRetention::Retain,
+                        }],
+                    },
+                ),
+            }],
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            launch_inventory: Some(inventory),
+            observation_support: None,
+        };
+        let frame = |snapshot| C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(1),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([1; 16]),
+                response: Ok(C2NodeResponse::Snapshot {
+                    event_sequence: 1,
+                    controller: None,
+                    snapshot,
+                }),
+            }),
+        });
+
+        let mut bundle_only = frame(snapshot.clone());
+        project_server_frame_launch_inventory(&mut bundle_only, false, false, true);
+        let C2ServerFrame::Reply(bundle_only) = bundle_only else { unreachable!() };
+        let C2NodeResponse::Snapshot { snapshot: bundle_only, .. } =
+            bundle_only.result.unwrap().response.unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(bundle_only.workspaces[0].managed_worktree_profiles.is_none());
+        let bundle_only = bundle_only.launch_inventory.unwrap();
+        assert!(bundle_only.spawn_profiles.is_none());
+        assert_eq!(bundle_only.bundles.unwrap().len(), 1);
+
+        let mut legacy = frame(snapshot);
+        project_server_frame_launch_inventory(&mut legacy, false, false, false);
+        let C2ServerFrame::Reply(legacy) = legacy else { unreachable!() };
+        let C2NodeResponse::Snapshot { snapshot: legacy, .. } =
+            legacy.result.unwrap().response.unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(legacy.launch_inventory.is_none());
+        assert!(legacy.workspaces[0].managed_worktree_profiles.is_none());
     }
 
     #[test]
@@ -2781,6 +4506,9 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: false,
             spawn_spec_defaults_overrides: true,
@@ -2789,7 +4517,12 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         assert!(matches!(
             unnegotiated_request_failure(&request, capabilities),
@@ -2925,6 +4658,7 @@ mod tests {
                             }],
                             recent_commits: Vec::new(),
                             worktrees: Vec::new(),
+                            managed_worktree: None,
                             truncated: false,
                             diagnostic_present: false,
                         },
@@ -2972,6 +4706,12 @@ mod tests {
                 opaque_host_paths: false,
                 repository_paths: false,
                 workspace_file_read: false,
+                workspace_file_write: false,
+                workspace_entry_create: false,
+                git_read: false,
+                host_directory_browse: false,
+                standalone_workspace_lifecycle: false,
+                provider_session_reference_index: false,
                 provider_runtime_status: false,
                 provider_ids_open: false,
                 spawn_spec_defaults_overrides: false,
@@ -2980,7 +4720,12 @@ mod tests {
                 child_environment_profile: false,
                 session_bundle_materialization: false,
                 history_context_pack: false,
+                native_session_catalog: false,
+                native_session_catalog_paging: false,
+                native_session_index: false,
+                native_session_preview: false,
                 terminal_frame_events: false,
+                ..Default::default()
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
@@ -3010,7 +4755,10 @@ mod tests {
                 opaque_host_paths: true,
                 repository_paths: true,
                 workspace_file_read: true,
-                provider_runtime_status: true,
+                host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
@@ -3018,7 +4766,12 @@ mod tests {
                 child_environment_profile: true,
                 session_bundle_materialization: true,
                 history_context_pack: true,
+                native_session_catalog: true,
+                native_session_catalog_paging: true,
+                native_session_index: true,
+                native_session_preview: true,
                 terminal_frame_events: false,
+                ..Default::default()
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
@@ -3048,7 +4801,10 @@ mod tests {
                 opaque_host_paths: true,
                 repository_paths: true,
                 workspace_file_read: true,
-                provider_runtime_status: true,
+                host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
@@ -3056,7 +4812,12 @@ mod tests {
                 child_environment_profile: true,
                 session_bundle_materialization: true,
                 history_context_pack: true,
+                native_session_catalog: true,
+                native_session_catalog_paging: true,
+                native_session_index: true,
+                native_session_preview: true,
                 terminal_frame_events: false,
+                ..Default::default()
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ));
@@ -3084,6 +4845,7 @@ mod tests {
                             text: "hello\n".to_owned(),
                             byte_len: 6,
                         },
+                        revision: None,
                     },
                 }),
             }),
@@ -3104,6 +4866,12 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: false,
+            workspace_file_write: false,
+            workspace_entry_create: false,
+            git_read: false,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
@@ -3112,7 +4880,12 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         assert!(matches!(
             unnegotiated_request_failure(&utf8_request, no_file_read),
@@ -3122,6 +4895,9 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: false,
             workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
@@ -3130,7 +4906,12 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         assert!(matches!(
             unnegotiated_request_failure(&tagged_request, no_repository_path),
@@ -3140,6 +4921,9 @@ mod tests {
             opaque_host_paths: true,
             repository_paths: true,
             workspace_file_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
@@ -3148,7 +4932,12 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+            ..Default::default()
         };
         assert!(unnegotiated_request_failure(&tagged_request, all).is_none());
         assert!(server_frame_contains_workspace_file_read(
@@ -3177,7 +4966,10 @@ mod tests {
                 opaque_host_paths: true,
                 repository_paths: true,
                 workspace_file_read: false,
-                provider_runtime_status: true,
+                host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
                 provider_ids_open: true,
                 spawn_spec_defaults_overrides: true,
                 worktree_selection: true,
@@ -3185,10 +4977,102 @@ mod tests {
                 child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
             terminal_frame_events: true,
+                ..Default::default()
             },
             watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
         ).await;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_entry_create_fails_closed_before_c2_relay_or_response_write() {
+        let workspace_id = WorkspaceId::new("repo").unwrap();
+        let path = repository_path("src/new");
+        let request = NodeRequest::CreateWorkspaceDirectory {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        };
+        let mut capabilities = NegotiatedPathCapabilities {
+            opaque_host_paths: true,
+            repository_paths: true,
+            workspace_file_read: true,
+            workspace_file_write: true,
+            workspace_entry_create: false,
+            git_read: true,
+            host_directory_browse: true,
+            standalone_workspace_lifecycle: true,
+            provider_session_reference_index: true,
+            provider_runtime_status: true,
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            spawn_profile_revision: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            child_environment_profile: true,
+            session_bundle_materialization: true,
+            history_context_pack: true,
+            native_session_catalog: true,
+            native_session_catalog_paging: true,
+            native_session_index: true,
+            native_session_preview: true,
+            terminal_frame_events: true,
+            agent_progress_snapshot: true,
+            session_task_correlation: true,
+            observation_events: true,
+            observation_managed_target: true,
+            observation_workflow_detail: true,
+            delivery_bundle_v2_stage_commit: true,
+            harness_mcp_read_proxy: true,
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ..
+            })
+        ));
+        capabilities.workspace_entry_create = true;
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+
+        let frame = C2ServerFrame::Reply(C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(41),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                response: Ok(C2NodeResponse::WorkspaceDirectoryCreated {
+                    workspace_id,
+                    entry: gate4agent_node_protocol::WorkspaceEntry {
+                        relative_path: path,
+                        kind: gate4agent_node_protocol::WorkspaceEntryKind::Directory,
+                    },
+                }),
+            }),
+        });
+        assert!(server_frame_contains_workspace_entry_create(&frame));
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender.send(queued(frame, &budget).unwrap()).await.unwrap();
+        drop(sender);
+        let (disconnect, _disconnected) = watch::channel(false);
+        capabilities.workspace_entry_create = false;
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            capabilities,
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        )
+        .await;
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
         assert!(bytes.is_empty());

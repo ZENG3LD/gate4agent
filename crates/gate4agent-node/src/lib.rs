@@ -4,9 +4,13 @@ mod bundle_catalog;
 
 mod context_pack;
 
+mod harness_mcp_proxy;
+
 mod bundle_provider;
 
 mod git_worktree;
+
+mod host_directory_browser;
 
 mod environment_profiles;
 
@@ -15,6 +19,8 @@ mod session_environment;
 mod worktree_service;
 
 mod session_registry;
+
+mod standalone_workspace;
 
 #[cfg(windows)]
 mod workspace_file_windows;
@@ -29,8 +35,9 @@ mod server;
 
 pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
-    NodeShutdownHandle, WorkspaceConfig, WorktreeServiceMode,
+    NodeShutdownHandle, WorkspaceConfig,
 };
+pub use gate4agent_node_protocol::WorktreeServiceMode;
 pub use bundle_catalog::{
     BundleCatalog, BundleCatalogError, NodeBundle, NodeBundleError, NodeBundleFile,
     MAX_BUNDLE_CATALOG_ENTRIES, MAX_BUNDLE_FILES, MAX_BUNDLE_FILE_BYTES,
@@ -56,7 +63,7 @@ pub use spawn_spec::{
     MAX_SPAWN_PROFILES,
 };
 pub use gate4agent_runtime_native::{
-    HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot,
+    orca_home_roots, HistorySourceLayout, NativeHistoryConfig, NativeHistoryRoot,
 };
 
 #[cfg(windows)]

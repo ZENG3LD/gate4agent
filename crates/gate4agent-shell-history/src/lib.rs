@@ -9,8 +9,8 @@ mod load;
 mod sqlite;
 
 use gate4agent_adapters::{
-    history_source_variants, HistoryDocument, HistorySourceLayout, HISTORY_DOCUMENT_MAX_BYTES,
-    HISTORY_METADATA_MAX_BYTES,
+    history_source_variants, parse_history, HistoryDocument, HistorySession, HistorySourceLayout,
+    HISTORY_DOCUMENT_MAX_BYTES, HISTORY_METADATA_MAX_BYTES,
 };
 use gate4agent_provider_ports::{
     HistoryAuthority, HistoryCandidate, HistoryCandidateId, HistoryDiscoveryRequest,
@@ -26,7 +26,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const HISTORY_ROOTS_MAX: usize = 64;
-pub const HISTORY_CANDIDATES_MAX: usize = 1_024;
+pub const HISTORY_CANDIDATES_MAX: usize = 50_000;
 pub const HISTORY_CACHE_ENTRIES_MAX: usize = 256;
 pub const HISTORY_WALK_ENTRIES_MAX: usize = 50_000;
 pub const HISTORY_WALK_DEPTH_MAX: usize = 16;
@@ -186,6 +186,11 @@ pub fn orca_home_roots(
         home.join(".claude").join("projects"),
     )?;
     push(
+        "claude-code",
+        HistorySourceLayout::SingleNdjson,
+        home.join(".claude").join("archive"),
+    )?;
+    push(
         "codex",
         HistorySourceLayout::NdjsonWithOptionalIndex,
         home.join(".codex").join("sessions"),
@@ -285,6 +290,7 @@ pub fn orca_home_roots(
 struct SourceIdentity {
     agent_id: AgentId,
     binding: AdapterBinding,
+    working_directory: Option<String>,
 }
 
 impl SourceIdentity {
@@ -292,11 +298,14 @@ impl SourceIdentity {
         Self {
             agent_id: request.agent_id().clone(),
             binding: request.binding().clone(),
+            working_directory: request.working_directory().map(str::to_owned),
         }
     }
 
     fn matches_load(&self, request: &HistoryLoadRequest) -> bool {
-        &self.agent_id == request.agent_id() && &self.binding == request.binding()
+        &self.agent_id == request.agent_id()
+            && &self.binding == request.binding()
+            && self.working_directory.as_deref() == request.working_directory()
     }
 }
 
@@ -370,7 +379,54 @@ pub struct NativeHistoryDiscoveryIssue {
 pub enum NativeHistoryDiscoveryIssueKind {
     Inaccessible,
     EntryLimitReached,
+    CandidateLimitReached,
     InvalidDatabase,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHistoryLocator {
+    candidate: HistoryCandidate,
+    session_id: String,
+    cwd: Option<String>,
+    title: Option<String>,
+    model: Option<String>,
+}
+
+pub struct NativeHistoryPreviewLoad {
+    session: HistorySession,
+    source_truncated: bool,
+}
+
+impl NativeHistoryPreviewLoad {
+    pub fn session(self) -> HistorySession {
+        self.session
+    }
+
+    pub fn source_truncated(&self) -> bool {
+        self.source_truncated
+    }
+}
+
+impl NativeHistoryLocator {
+    pub fn candidate(&self) -> &HistoryCandidate {
+        &self.candidate
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
 }
 
 pub struct NativeHistoryAuthority {
@@ -421,9 +477,80 @@ impl NativeHistoryAuthority {
         std::mem::take(&mut self.issues)
     }
 
+    /// Builds a provider-wide opaque locator index from configured history roots.
+    ///
+    /// Unlike the public history discovery port, this scan uses the shell-owned
+    /// hard bound so callers can attribute workspaces before applying a UI page
+    /// limit. Transcript bodies are not retained or returned.
+    pub fn discover_locator_index(
+        &mut self,
+        request: &HistoryDiscoveryRequest,
+    ) -> Result<Vec<NativeHistoryLocator>, NativeHistoryError> {
+        let candidates = self.refresh_candidates(
+            request,
+            self.config.limits.max_candidates,
+            true,
+        )?;
+        let mut locators = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(record) = self.candidates.get(candidate.id().as_str()).cloned() else {
+                continue;
+            };
+            let Ok(document) = load::load_locator_document(&record, self.config.limits) else {
+                continue;
+            };
+            let Ok(session) = parse_history(&record.key.source.binding.id, &document) else {
+                continue;
+            };
+            let cwd = session.cwd.filter(|cwd| !cwd.trim().is_empty());
+            locators.push(NativeHistoryLocator {
+                candidate,
+                session_id: session.session_id,
+                cwd,
+                title: session.title,
+                model: session.model,
+            });
+        }
+        Ok(locators)
+    }
+
+    pub fn load_preview_session(
+        &mut self,
+        request: &HistoryLoadRequest,
+    ) -> Result<NativeHistoryPreviewLoad, NativeHistoryError> {
+        let id = request.candidate().id().as_str();
+        let record = self
+            .candidates
+            .get(id)
+            .ok_or(NativeHistoryError::CandidateExpired)?
+            .clone();
+        if !record.key.source.matches_load(request)
+            || record.session_id_hint != request.candidate().session_id_hint()
+        {
+            return Err(NativeHistoryError::CandidateSourceMismatch);
+        }
+        let (document, source_truncated) =
+            load::load_preview_document(&record, self.config.limits)?;
+        let session = parse_history(&record.key.source.binding.id, &document)
+            .map_err(|_| NativeHistoryError::InvalidDocument)?;
+        Ok(NativeHistoryPreviewLoad {
+            session,
+            source_truncated,
+        })
+    }
+
     fn discover_candidates(
         &mut self,
         request: &HistoryDiscoveryRequest,
+    ) -> Result<Vec<HistoryCandidate>, NativeHistoryError> {
+        self.refresh_candidates(request, usize::from(request.limit()), false)
+    }
+
+    fn refresh_candidates(
+        &mut self,
+        request: &HistoryDiscoveryRequest,
+        scan_limit: usize,
+        report_candidate_overflow: bool,
     ) -> Result<Vec<HistoryCandidate>, NativeHistoryError> {
         self.issues.clear();
         let source = SourceIdentity::from_request(request);
@@ -436,13 +563,22 @@ impl NativeHistoryAuthority {
                 root,
                 root_slot,
                 self.config.limits,
-                usize::from(request.limit()),
+                scan_limit,
+                report_candidate_overflow,
             );
             discovered.extend(result.candidates);
             self.issues.extend(result.issues);
         }
         discovery::dedupe_and_sort(&request.binding().id, &mut discovered);
-        discovered.truncate(usize::from(request.limit()).min(self.config.limits.max_candidates));
+        let scan_limit = scan_limit.min(self.config.limits.max_candidates);
+        if discovered.len() > scan_limit && report_candidate_overflow {
+            self.issues.push(NativeHistoryDiscoveryIssue {
+                root_slot: usize::MAX,
+                adapter_id: request.binding().id.clone(),
+                kind: NativeHistoryDiscoveryIssueKind::CandidateLimitReached,
+            });
+        }
+        discovered.truncate(scan_limit);
 
         let current_locators = discovered
             .iter()
@@ -699,6 +835,8 @@ pub enum NativeHistoryError {
     ReadFailed,
     #[error("history source is not valid UTF-8")]
     InvalidUtf8,
+    #[error("history source document is invalid")]
+    InvalidDocument,
     #[error("history source exceeds the {max}-byte bound")]
     FileTooLarge { max: usize },
     #[error("history SQLite source is unavailable")]

@@ -1,5 +1,5 @@
 use crate::protocol::{
-    C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
+    C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2ObservationSupport, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
     NodeIncarnationId, NodeRequest, ResolvedSpawnReceipt, RoutedNodeEvent, RoutedNodeResponse,
     ManagedWorktreeLeaseState, ManagedWorktreeSpawnRequest, SpawnOverride, SpawnSpec,
     NodeTransportState, ObservedNode, ProviderAdapterContractSupport, ProviderContractSupport,
@@ -33,6 +33,10 @@ use tokio::time::{sleep, timeout, Instant};
 
 const MANAGED_RESUME_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 const NODE_REQUEST_IO_HEADROOM: Duration = Duration::from_secs(5);
+const NATIVE_SESSION_REQUEST_DEADLINE: Duration = Duration::from_secs(35);
+const WORKSPACE_ENTRY_CREATE_NODE_SEMANTIC_DEADLINE: Duration = Duration::from_secs(5);
+const WORKSPACE_ENTRY_CREATE_RELAY_DEADLINE: Duration =
+    WORKSPACE_ENTRY_CREATE_NODE_SEMANTIC_DEADLINE.saturating_add(NODE_REQUEST_IO_HEADROOM);
 
 const HEADER_LIMIT_BYTES: usize = 16 * 1024;
 const MAX_HTTP_CONNECTIONS: usize = 16;
@@ -402,12 +406,9 @@ impl Drop for C2Running {
 
 async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<(), C2Error> {
     let now = unix_ms();
-    let nodes = config.nodes.iter().map(|node| (node.node_id.clone(), ObservedNode {
-        endpoint: node.endpoint.clone(), transport_label: node.transport_label().to_owned(),
-        transport: NodeTransportState::Offline, freshness: NodeFreshness::Unavailable,
-        cursor: None, inventory: None, last_attempt_unix_ms: None, last_success_unix_ms: None,
-        consecutive_failures: 0, last_error: None, gaps: Vec::new(), gaps_truncated: 0,
-    })).collect();
+    let nodes = config.nodes.iter().map(|node| {
+        (node.node_id.clone(), initial_observed_node(node))
+    }).collect();
     let initial = Arc::new(StatusResponse { api_version: C2_API_VERSION, ready: false, observed_at_unix_ms: now, nodes });
     let (status_tx, status_rx) = watch::channel(initial);
     let (ingress_tx, ingress_rx) = mpsc::channel(config.nodes.len().saturating_mul(2).max(2));
@@ -461,6 +462,16 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
     Ok(())
 }
 
+fn initial_observed_node(node: &C2NodeConfig) -> ObservedNode {
+    ObservedNode {
+        endpoint: node.endpoint.clone(), transport_label: node.transport_label().to_owned(),
+        transport: NodeTransportState::Offline, freshness: NodeFreshness::Unavailable,
+        cursor: None, inventory: None, last_attempt_unix_ms: None, last_success_unix_ms: None,
+        consecutive_failures: 0, last_error: None, gaps: Vec::new(), gaps_truncated: 0,
+        observation_support: None,
+    }
+}
+
 #[cfg(windows)]
 fn local_transport_label() -> &'static str { "windows-named-pipe" }
 
@@ -495,6 +506,7 @@ enum AttemptResult {
         snapshot: NodeSnapshot,
         gaps: Vec<GapKind>,
         provider_contract_manifest: ProviderContractManifest,
+        observation_support: C2ObservationSupport,
     },
     Success { cursor: NodeCursor, snapshot: NodeSnapshot, gaps: Vec<GapKind> },
     Cursor {
@@ -550,6 +562,8 @@ async fn node_relay_worker(
         let hello = client.hello().clone();
         let provider_contract_manifest =
             ProviderContractManifest::from_compatibility(hello.compatibility.as_ref());
+        let observation_support =
+            C2ObservationSupport::from_node_compatibility(hello.compatibility.as_ref());
         let incarnation_id = hello.incarnation_id;
         let connection_id = hello.connection_id;
         let mut controller_owned = hello.controller.as_ref().is_some_and(|controller| controller.connection_id == connection_id);
@@ -564,8 +578,19 @@ async fn node_relay_worker(
                 gaps.push(GapKind::CursorRegression);
             } else if cursor.sequence > previous.sequence {
                 match bounded_node_request(&mut client, NodeRequest::Resync { after_sequence: previous.sequence }).await {
-                    Ok(NodeResponse::Resync { event_sequence, snapshot: resync_snapshot, events }) => {
-                        let resync_gaps = validate_resync(previous.sequence, cursor.sequence, event_sequence, &events);
+                    Ok(NodeResponse::Resync {
+                        event_sequence,
+                        oldest_available_sequence,
+                        snapshot: resync_snapshot,
+                        events,
+                    }) => {
+                        let resync_gaps = validate_resync(
+                            previous.sequence,
+                            cursor.sequence,
+                            event_sequence,
+                            oldest_available_sequence,
+                            &events,
+                        );
                         if resync_gaps.is_empty() {
                             publish_recovered_events(&node.node_id, incarnation_id, &events, &hub);
                         } else {
@@ -573,7 +598,7 @@ async fn node_relay_worker(
                                 node_id: node.node_id.clone(),
                                 cursor: NodeCursor { incarnation_id, sequence: event_sequence },
                                 event: C2NodeEvent::ResyncRequired {
-                                    oldest_available_sequence: events.first().map_or(event_sequence, |event| event.sequence),
+                                    oldest_available_sequence,
                                 },
                             });
                         }
@@ -596,6 +621,7 @@ async fn node_relay_worker(
             snapshot,
             gaps,
             provider_contract_manifest,
+            observation_support,
         }).await?;
         if let Err(error) = drain_pending_events(&mut client, &node.node_id, &mut cursor, &hub, &ingress, did_resync, None).await {
             ingress_attempt(&ingress, &node.node_id, relay_failure_attempt(&error)).await?;
@@ -616,6 +642,7 @@ async fn node_relay_worker(
                         result = handle_relay_command(
                             &mut client, command, &node.node_id, incarnation_id, connection_id,
                             &mut controller_owned, &hub, &mut cursor, &ingress,
+                            observation_support,
                         ) => match result {
                             Ok(()) => {}
                             Err(error) => break error,
@@ -750,13 +777,33 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
     match request {
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::ArmHarnessMcpReservation { .. }
+        | NodeRequest::ActivateHarnessMcpReservation { .. }
+        | NodeRequest::AbortHarnessMcpReservation { .. }
+        | NodeRequest::PutHarnessMcpReplyChunk { .. }
+        | NodeRequest::RejectHarnessMcpCall { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::WriteWorkspaceFile { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
         | NodeRequest::AcquireController { .. }
         | NodeRequest::ReleaseController
         | NodeRequest::RenameSessionRecord { .. }
+        | NodeRequest::SetSessionTask { .. }
         | NodeRequest::ForgetSessionRecord { .. } => Duration::from_secs(5),
-        NodeRequest::CreateWorktree { .. }
+        NodeRequest::CreateWorkspaceFile { .. }
+        | NodeRequest::CreateWorkspaceDirectory { .. } => {
+            WORKSPACE_ENTRY_CREATE_RELAY_DEADLINE
+        }
+        NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::IndexNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. } => NATIVE_SESSION_REQUEST_DEADLINE,
+        NodeRequest::CreateStandaloneWorkspace { .. }
+        | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::CleanupManagedWorktree { .. } => Duration::from_secs(240),
         NodeRequest::Spawn { .. }
@@ -764,6 +811,9 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
         | NodeRequest::Stop { .. } => Duration::from_secs(15),
         NodeRequest::SpawnSpec { spec } =>
             Duration::from_millis(spec.deadline_ms.get()) + NODE_REQUEST_IO_HEADROOM,
+        NodeRequest::SpawnSpecWithHarnessMcp { deadline_unix_ms, .. } =>
+            Duration::from_millis(deadline_unix_ms.saturating_sub(unix_ms()))
+                + NODE_REQUEST_IO_HEADROOM,
         NodeRequest::SpawnManagedWorktree { request } =>
             Duration::from_millis(request.spawn_spec.deadline_ms.get())
                 + NODE_REQUEST_IO_HEADROOM,
@@ -773,8 +823,19 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
     }
 }
 
-fn validate_resync(previous: u64, hello: u64, current: u64, events: &[NodeEventEnvelope]) -> Vec<GapKind> {
-    let mut gaps = validate_events(previous, current, events);
+fn validate_resync(
+    previous: u64,
+    hello: u64,
+    current: u64,
+    oldest_available_sequence: u64,
+    events: &[NodeEventEnvelope],
+) -> Vec<GapKind> {
+    let mut gaps = validate_events(
+        previous,
+        current,
+        oldest_available_sequence,
+        events,
+    );
     if current < hello && !gaps.contains(&GapKind::CursorRegression) {
         gaps.push(GapKind::CursorRegression);
     }
@@ -824,6 +885,7 @@ async fn handle_relay_command(
     hub: &OperatorHub,
     cursor: &mut NodeCursor,
     ingress: &mpsc::Sender<Attempt>,
+    observation_support: C2ObservationSupport,
 ) -> Result<(), NodeClientError> {
     match command {
         RelayCommand::Request { operator_connection_id, expected_incarnation_id, request, reply } => {
@@ -835,12 +897,50 @@ async fn handle_relay_command(
                 }
                 _ => None,
             };
+            let expected_provider_session_index = matches!(
+                &request,
+                NodeRequest::IndexProviderSession { .. }
+            ).then(|| request.clone());
+            let expected_native_session = matches!(
+                &request,
+                NodeRequest::CatalogNativeSessions { .. }
+                    | NodeRequest::PageNativeSessions { .. }
+                    | NodeRequest::PreviewNativeSession { .. }
+                    | NodeRequest::IndexNativeSession { .. }
+            ).then(|| request.clone());
+            let expected_workspace_content = matches!(
+                &request,
+                NodeRequest::ReadWorkspaceFile { .. }
+                    | NodeRequest::WriteWorkspaceFile { .. }
+                    | NodeRequest::CreateWorkspaceFile { .. }
+                    | NodeRequest::CreateWorkspaceDirectory { .. }
+                    | NodeRequest::ReadGitHistory { .. }
+                    | NodeRequest::ReadGitDiff { .. }
+            ).then(|| request.clone());
+            let expected_session_task = matches!(
+                &request,
+                NodeRequest::SetSessionTask { .. }
+            ).then(|| request.clone());
+            let expected_harness_mcp = (request.required_capability()
+                == Some(gate4agent_node_protocol::NODE_HARNESS_MCP_READ_PROXY_CAPABILITY))
+                .then(|| request.clone());
             if !hub.is_active(operator_connection_id) {
                 let _ = reply.send(Err(relay_failure(C2RelayFailureCode::ClientLagged, "C2 operator connection is no longer active", Some(incarnation_id))));
                 return Ok(());
             }
             if expected_incarnation_id != incarnation_id {
                 let _ = reply.send(Err(relay_failure(C2RelayFailureCode::StaleNodeIncarnation, "node incarnation changed", Some(incarnation_id))));
+                return Ok(());
+            }
+            if matches!(&request, NodeRequest::IndexNativeSession { selection, .. }
+                if selection.route.scope
+                    != gate4agent_node_protocol::NativeSessionCatalogScope::Workspace)
+            {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::RequestForbidden,
+                    "external native sessions must be registered as workspaces before indexing",
+                    Some(incarnation_id),
+                )));
                 return Ok(());
             }
             if !is_read_only_request(&request) && !*controller_owned {
@@ -896,11 +996,69 @@ async fn handle_relay_command(
                 )));
                 return Err(NodeClientError::Protocol(message.to_owned()));
             }
+            if let Err(message) = validate_provider_session_index_response(
+                expected_provider_session_index.as_ref(),
+                &response,
+            ) {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::NodeOffline,
+                    "node relay returned an invalid provider session index response",
+                    Some(incarnation_id),
+                )));
+                return Err(NodeClientError::Protocol(message.to_owned()));
+            }
+            if let Err(message) = validate_native_session_response(
+                expected_native_session.as_ref(),
+                &response,
+            ) {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::NodeOffline,
+                    "node relay returned an invalid native session response",
+                    Some(incarnation_id),
+                )));
+                return Err(NodeClientError::Protocol(message.to_owned()));
+            }
+            if let Err(message) = validate_workspace_content_response(
+                expected_workspace_content.as_ref(),
+                &response,
+            ) {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::NodeOffline,
+                    "node relay returned an invalid workspace content response",
+                    Some(incarnation_id),
+                )));
+                return Err(NodeClientError::Protocol(message.to_owned()));
+            }
+            if let Err(message) = validate_session_task_response(
+                expected_session_task.as_ref(),
+                &response,
+            ) {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::NodeOffline,
+                    "node relay returned an invalid session task response",
+                    Some(incarnation_id),
+                )));
+                return Err(NodeClientError::Protocol(message.to_owned()));
+            }
+            if let Err(message) = validate_harness_mcp_response(
+                expected_harness_mcp.as_ref(),
+                &response,
+            ) {
+                let _ = reply.send(Err(relay_failure(
+                    C2RelayFailureCode::NodeOffline,
+                    "node relay returned an invalid harness MCP response",
+                    Some(incarnation_id),
+                )));
+                return Err(NodeClientError::Protocol(message.to_owned()));
+            }
             drain_pending_events(client, node_id, cursor, hub, ingress, false, relay_deadline).await?;
             update_inventory_from_response(node_id, cursor, &response, ingress).await
                 .map_err(NodeClientError::Io)?;
             let response = response
-                .map(|response| C2NodeResponse::from(&response))
+                .map(|response| C2NodeResponse::from_node_response_with_observation_support(
+                    &response,
+                    Some(observation_support),
+                ))
                 .map_err(|failure| C2NodeFailure::from(&failure));
             let _ = reply.send(Ok(RoutedNodeResponse { node_id: node_id.clone(), incarnation_id, response }));
         }
@@ -908,9 +1066,248 @@ async fn handle_relay_command(
     Ok(())
 }
 
+fn validate_session_task_response(
+    expected: Option<&NodeRequest>,
+    response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
+) -> Result<(), &'static str> {
+    match (expected, response) {
+        (Some(_), Err(_)) | (None, Err(_)) => Ok(()),
+        (
+            Some(NodeRequest::SetSessionTask {
+                record_id,
+                expected_revision,
+                target,
+            }),
+            Ok(NodeResponse::SessionRecordUpdated { record }),
+        ) if session_task_record_matches(record, record_id, *expected_revision, target) => Ok(()),
+        (Some(NodeRequest::SetSessionTask { .. }), Ok(_)) => {
+            Err("session task response does not match the routed request")
+        }
+        (None, Ok(_)) => Ok(()),
+        (Some(_), Ok(_)) => Ok(()),
+    }
+}
+
+fn validate_harness_mcp_response(
+    expected: Option<&NodeRequest>,
+    response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
+) -> Result<(), &'static str> {
+    use NodeRequest as Request;
+    use NodeResponse as Response;
+    let valid = match (expected, response) {
+        (Some(Request::ArmHarnessMcpReservation { reservation_id, activation_digest, expires_at_unix_ms, .. }),
+            Ok(Response::Armed { reservation_id: echoed_id, activation_digest: echoed_digest, expires_at_unix_ms: echoed_expiry })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && expires_at_unix_ms == echoed_expiry,
+        (Some(Request::SpawnSpecWithHarnessMcp { reservation_id, activation_digest, .. }),
+            Ok(Response::Spawned { reservation_id: echoed_id, activation_digest: echoed_digest, receipt })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && receipt.harness_mcp_proxy.as_ref().is_some_and(|proxy| {
+                    &proxy.reservation_id == reservation_id
+                        && &proxy.activation_digest == activation_digest
+                }),
+        (Some(Request::ActivateHarnessMcpReservation { reservation_id, activation_digest, record_id, session }),
+            Ok(Response::Activated { reservation_id: echoed_id, activation_digest: echoed_digest, record_id: echoed_record, session: echoed_session })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && record_id == echoed_record && session == echoed_session,
+        (Some(Request::AbortHarnessMcpReservation { reservation_id, activation_digest }),
+            Ok(Response::Aborted { reservation_id: echoed_id, activation_digest: echoed_digest })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest,
+        (Some(Request::PutHarnessMcpReplyChunk { reservation_id, activation_digest, record_id, session, call_id, offset, final_chunk, chunk_hex }),
+            Ok(Response::ReplyChunkAccepted { reservation_id: echoed_id, activation_digest: echoed_digest, record_id: echoed_record, session: echoed_session, call_id: echoed_call, next_offset, completed })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && record_id == echoed_record && session == echoed_session && call_id == echoed_call
+                && offset.checked_add(u32::try_from(chunk_hex.raw_len()).unwrap_or(u32::MAX))
+                    == Some(*next_offset) && completed == final_chunk,
+        (Some(Request::RejectHarnessMcpCall { reservation_id, activation_digest, record_id, session, call_id, .. }),
+            Ok(Response::CallRejected { reservation_id: echoed_id, activation_digest: echoed_digest, record_id: echoed_record, session: echoed_session, call_id: echoed_call })) =>
+            reservation_id == echoed_id && activation_digest == echoed_digest
+                && record_id == echoed_record && session == echoed_session && call_id == echoed_call,
+        (Some(_), Err(_)) | (None, Err(_)) => true,
+        (Some(_), Ok(_)) => false,
+        (None, Ok(response)) => !response.requires_harness_mcp_proxy_capability(),
+    };
+    if valid { Ok(()) } else { Err("harness MCP response does not match the routed request") }
+}
+
+fn session_task_record_matches(
+    record: &gate4agent_node_protocol::ManagedSessionRecord,
+    record_id: &gate4agent_node_protocol::SessionRecordId,
+    expected_revision: u64,
+    target: &gate4agent_node_protocol::SessionTaskTargetV1,
+) -> bool {
+    if &record.record_id != record_id { return false; }
+    let next_revision = expected_revision.checked_add(1);
+    match target {
+        gate4agent_node_protocol::SessionTaskTargetV1::New => record.task_binding.as_ref()
+            .is_some_and(|binding| Some(binding.revision) == next_revision && binding.task_id.is_some()),
+        gate4agent_node_protocol::SessionTaskTargetV1::Existing { task_id } => record.task_binding.as_ref()
+            .is_some_and(|binding| (binding.revision == expected_revision || Some(binding.revision) == next_revision)
+                && binding.task_id.as_ref() == Some(task_id)),
+        gate4agent_node_protocol::SessionTaskTargetV1::Clear => match &record.task_binding {
+            None => expected_revision == 0,
+            Some(binding) => binding.task_id.is_none()
+                && (binding.revision == expected_revision || Some(binding.revision) == next_revision),
+        },
+    }
+}
+
+fn validate_workspace_content_response(
+    expected: Option<&NodeRequest>,
+    response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
+) -> Result<(), &'static str> {
+    match (expected, response) {
+        (Some(_), Err(_)) | (None, Err(_)) => Ok(()),
+        (
+            Some(NodeRequest::ReadWorkspaceFile { workspace_id, path }),
+            Ok(NodeResponse::WorkspaceFileRead { file }),
+        ) if &file.workspace_id == workspace_id && &file.path == path => Ok(()),
+        (
+            Some(NodeRequest::WriteWorkspaceFile { workspace_id, path, text, .. }),
+            Ok(NodeResponse::WorkspaceFileWritten { file }),
+        ) if &file.workspace_id == workspace_id
+            && &file.path == path
+            && matches!(
+                &file.content,
+                gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+                    text: written,
+                    byte_len,
+                } if written == text
+                    && u32::try_from(text.len()).ok() == Some(*byte_len)
+            ) => Ok(()),
+        (
+            Some(NodeRequest::CreateWorkspaceFile { workspace_id, path }),
+            Ok(NodeResponse::WorkspaceFileCreated { file }),
+        ) if &file.workspace_id == workspace_id
+            && &file.path == path
+            && file.revision.is_some()
+            && matches!(
+                &file.content,
+                gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+                    text,
+                    byte_len: 0,
+                } if text.is_empty()
+            ) => Ok(()),
+        (
+            Some(NodeRequest::CreateWorkspaceDirectory { workspace_id, path }),
+            Ok(NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id: actual_workspace_id,
+                entry,
+            }),
+        ) if actual_workspace_id == workspace_id
+            && &entry.relative_path == path
+            && entry.kind == gate4agent_node_protocol::WorkspaceEntryKind::Directory => Ok(()),
+        (
+            Some(NodeRequest::ReadGitHistory { workspace_id, .. }),
+            Ok(NodeResponse::GitHistoryRead { workspace_id: actual, .. }),
+        ) if actual == workspace_id => Ok(()),
+        (
+            Some(NodeRequest::ReadGitDiff { workspace_id, request }),
+            Ok(NodeResponse::GitDiffRead { workspace_id: actual, diff }),
+        ) if actual == workspace_id && diff.mode == request.mode && diff.path == request.path => Ok(()),
+        (Some(_), Ok(_)) => Err("workspace content response does not match routed request"),
+        (
+            None,
+            Ok(NodeResponse::WorkspaceFileRead { .. }
+                | NodeResponse::WorkspaceFileWritten { .. }
+                | NodeResponse::WorkspaceFileCreated { .. }
+                | NodeResponse::WorkspaceDirectoryCreated { .. }
+                | NodeResponse::GitHistoryRead { .. }
+                | NodeResponse::GitDiffRead { .. }),
+        ) => Err("unexpected workspace content response"),
+        (None, Ok(_)) => Ok(()),
+    }
+}
+
 enum ExpectedSpawnRequest {
     Spec(SpawnSpec),
     Managed(ManagedWorktreeSpawnRequest),
+}
+
+fn validate_provider_session_index_response(
+    expected: Option<&NodeRequest>,
+    response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
+) -> Result<(), &'static str> {
+    match (expected, response) {
+        (
+            Some(NodeRequest::IndexProviderSession {
+                workspace_id,
+                provider,
+                identity,
+                ..
+            }),
+            Ok(NodeResponse::ProviderSessionIndexed { record }),
+        ) if &record.workspace_id == workspace_id
+            && &record.provider == provider
+            && record.provider_session.as_ref() == Some(identity) => Ok(()),
+        (Some(_), Ok(NodeResponse::ProviderSessionIndexed { .. })) => {
+            Err("provider session index response does not match routed request")
+        }
+        (Some(_), Ok(_)) => Err("provider session index request returned a different response"),
+        (None, Ok(NodeResponse::ProviderSessionIndexed { .. })) => {
+            Err("unexpected provider session index response for a different node request")
+        }
+        (Some(_), Err(_)) | (None, _) => Ok(()),
+    }
+}
+
+fn validate_native_session_response(
+    expected: Option<&NodeRequest>,
+    response: &Result<NodeResponse, gate4agent_node_protocol::NodeFailure>,
+) -> Result<(), &'static str> {
+    match (expected, response) {
+        (
+            Some(NodeRequest::CatalogNativeSessions { route, .. }),
+            Ok(NodeResponse::NativeSessionsCataloged {
+                route: echoed_route,
+                ..
+            }),
+        ) if echoed_route == route => Ok(()),
+        (
+            Some(NodeRequest::PageNativeSessions {
+                route,
+                window,
+                catalog_revision,
+                ..
+            }),
+            Ok(NodeResponse::NativeSessionsPaged {
+                route: echoed_route,
+                page,
+            }),
+        ) if echoed_route == route
+            && page.window == *window
+            && page.revision == *catalog_revision => Ok(()),
+        (
+            Some(NodeRequest::PreviewNativeSession { selection, .. }),
+            Ok(NodeResponse::NativeSessionPreviewed {
+                selection: echoed_selection,
+                ..
+            }),
+        ) if echoed_selection == selection => Ok(()),
+        (
+            Some(NodeRequest::IndexNativeSession { selection, .. }),
+            Ok(NodeResponse::NativeSessionIndexed {
+                selection: echoed_selection,
+                record,
+            }),
+        ) if echoed_selection == selection
+            && selection.route.scope
+                == gate4agent_node_protocol::NativeSessionCatalogScope::Workspace
+            && selection.route.workspace_id.as_ref() == Some(&record.workspace_id)
+            && selection.route.provider == record.provider => Ok(()),
+        (Some(_), Err(_)) => Ok(()),
+        (Some(_), Ok(_)) => Err("native session response does not match routed request"),
+        (
+            None,
+            Ok(
+                NodeResponse::NativeSessionsCataloged { .. }
+                | NodeResponse::NativeSessionsPaged { .. }
+                | NodeResponse::NativeSessionPreviewed { .. }
+                | NodeResponse::NativeSessionIndexed { .. },
+            ),
+        ) => Err("unexpected native session response for a different node request"),
+        (None, _) => Ok(()),
+    }
 }
 
 fn validate_spawn_spec_response(
@@ -1059,8 +1456,15 @@ fn is_read_only_request(request: &NodeRequest) -> bool {
     matches!(request,
         NodeRequest::Snapshot
         | NodeRequest::Resync { .. }
+        | NodeRequest::BrowseHostDirectories { .. }
         | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
+        | NodeRequest::ReadGitHistory { .. }
+        | NodeRequest::ReadGitDiff { .. }
+        | NodeRequest::CatalogNativeSessions { .. }
+        | NodeRequest::PageNativeSessions { .. }
+        | NodeRequest::PreviewNativeSession { .. }
+        | NodeRequest::PreviewSessionRecord { .. }
     )
 }
 
@@ -1121,12 +1525,36 @@ fn publish_recovered_events(
     hub: &OperatorHub,
 ) {
     for envelope in events {
-        hub.publish(RoutedNodeEvent {
+        if let Some(event) = routed_recovered_node_event(node_id, incarnation_id, envelope) {
+            hub.publish(event);
+        }
+    }
+}
+
+fn routed_recovered_node_event(
+    node_id: &NodeId,
+    incarnation_id: NodeIncarnationId,
+    envelope: &NodeEventEnvelope,
+) -> Option<RoutedNodeEvent> {
+    (!matches!(&envelope.event, NodeEvent::HarnessMcpReadCall { .. })).then(|| {
+        RoutedNodeEvent {
             node_id: node_id.clone(),
             cursor: NodeCursor { incarnation_id, sequence: envelope.sequence },
             event: C2NodeEvent::from(&envelope.event),
-        });
-    }
+        }
+    })
+}
+
+fn routed_transient_node_event(
+    node_id: &NodeId,
+    cursor: NodeCursor,
+    envelope: &NodeEventEnvelope,
+) -> Option<RoutedNodeEvent> {
+    matches!(&envelope.event, NodeEvent::HarnessMcpReadCall { .. }).then(|| RoutedNodeEvent {
+        node_id: node_id.clone(),
+        cursor,
+        event: C2NodeEvent::from(&envelope.event),
+    })
 }
 
 async fn drain_pending_events(
@@ -1145,6 +1573,10 @@ async fn drain_pending_events(
         let mut changed = false;
         let mut repair = false;
         while let Some(envelope) = client.take_event() {
+            if let Some(event) = routed_transient_node_event(node_id, *cursor, &envelope) {
+                hub.publish(event);
+                continue;
+            }
             if skip_replayed && envelope.sequence <= cursor.sequence { continue; }
             let resync_required = matches!(&envelope.event, gate4agent_node_protocol::NodeEvent::ResyncRequired { .. });
             if resync_required || envelope.sequence != cursor.sequence.saturating_add(1) {
@@ -1200,26 +1632,38 @@ async fn drain_pending_events(
             NodeRequest::Resync { after_sequence },
             relay_deadline,
         ).await?;
-        let NodeResponse::Resync { event_sequence, snapshot, events } = response else {
+        let NodeResponse::Resync {
+            event_sequence,
+            oldest_available_sequence,
+            snapshot,
+            events,
+        } = response else {
             return Err(NodeClientError::Protocol("event repair resync returned a different response".to_owned()));
         };
-        let repair_gaps = validate_events(after_sequence, event_sequence, &events);
+        let repair_gaps = validate_events(
+            after_sequence,
+            event_sequence,
+            oldest_available_sequence,
+            &events,
+        );
         let contiguous = repair_gaps.is_empty();
-        gaps.extend(repair_gaps);
+        gaps = repair_gaps;
         if contiguous {
             for envelope in events.iter().filter(|event| event.sequence > after_sequence) {
-                hub.publish(RoutedNodeEvent {
-                    node_id: node_id.clone(),
-                    cursor: NodeCursor { incarnation_id: cursor.incarnation_id, sequence: envelope.sequence },
-                    event: C2NodeEvent::from(&envelope.event),
-                });
+                if let Some(event) = routed_recovered_node_event(
+                    node_id,
+                    cursor.incarnation_id,
+                    envelope,
+                ) {
+                    hub.publish(event);
+                }
             }
         } else {
             hub.publish(RoutedNodeEvent {
                 node_id: node_id.clone(),
                 cursor: NodeCursor { incarnation_id: cursor.incarnation_id, sequence: event_sequence },
                 event: C2NodeEvent::ResyncRequired {
-                    oldest_available_sequence: events.first().map_or(event_sequence, |event| event.sequence),
+                    oldest_available_sequence,
                 },
             });
         }
@@ -1239,19 +1683,32 @@ async fn handle_live_node_event(
     hub: &OperatorHub,
     ingress: &mpsc::Sender<Attempt>,
 ) -> Result<(), NodeClientError> {
-    if let Some(gap) = live_event_gap(cursor.sequence, &envelope) {
+    if let Some(event) = routed_transient_node_event(node_id, *cursor, &envelope) {
+        hub.publish(event);
+        return Ok(());
+    }
+    if live_event_gap(cursor.sequence, &envelope).is_some() {
         let after_sequence = cursor.sequence;
         let response = bounded_node_request(
             client,
             NodeRequest::Resync { after_sequence },
         ).await?;
-        let NodeResponse::Resync { event_sequence, snapshot, events } = response else {
+        let NodeResponse::Resync {
+            event_sequence,
+            oldest_available_sequence,
+            snapshot,
+            events,
+        } = response else {
             return Err(NodeClientError::Protocol(
                 "live event repair resync returned a different response".to_owned(),
             ));
         };
-        let mut gaps = vec![gap];
-        let repair_gaps = validate_events(after_sequence, event_sequence, &events);
+        let repair_gaps = validate_events(
+            after_sequence,
+            event_sequence,
+            oldest_available_sequence,
+            &events,
+        );
         if repair_gaps.is_empty() {
             publish_recovered_events(node_id, cursor.incarnation_id, &events, hub);
         } else {
@@ -1262,13 +1719,10 @@ async fn handle_live_node_event(
                     sequence: event_sequence,
                 },
                 event: C2NodeEvent::ResyncRequired {
-                    oldest_available_sequence: events
-                        .first()
-                        .map_or(event_sequence, |event| event.sequence),
+                    oldest_available_sequence,
                 },
             });
         }
-        gaps.extend(repair_gaps);
         cursor.sequence = event_sequence;
         ingress_attempt(
             ingress,
@@ -1276,7 +1730,7 @@ async fn handle_live_node_event(
             AttemptResult::Success {
                 cursor: *cursor,
                 snapshot,
-                gaps,
+                gaps: repair_gaps,
             },
         ).await.map_err(NodeClientError::Io)?;
         return drain_pending_events(
@@ -1346,16 +1800,30 @@ fn acknowledge_disconnected_releases(releases: &mut mpsc::Receiver<oneshot::Send
     while let Ok(reply) = releases.try_recv() { let _ = reply.send(()); }
 }
 
-fn validate_events(previous: u64, current: u64, events: &[NodeEventEnvelope]) -> Vec<GapKind> {
+fn validate_events(
+    previous: u64,
+    current: u64,
+    oldest_available_sequence: u64,
+    events: &[NodeEventEnvelope],
+) -> Vec<GapKind> {
     if current < previous { return vec![GapKind::CursorRegression]; }
-    if current == previous { return Vec::new(); }
-    let expected_first = previous.saturating_add(1);
-    if events.first().map(|event| event.sequence) != Some(expected_first) {
-        return vec![GapKind::HistoryEvicted];
-    }
-    let contiguous = events.windows(2).all(|pair| pair[0].sequence.checked_add(1) == Some(pair[1].sequence));
-    if !contiguous || events.last().map(|event| event.sequence) != Some(current) {
+    let max_floor = current.checked_add(1).unwrap_or(u64::MAX);
+    let minimum_event_sequence = previous
+        .checked_add(1)
+        .unwrap_or(u64::MAX)
+        .max(oldest_available_sequence);
+    if oldest_available_sequence == 0
+        || oldest_available_sequence > max_floor
+        || (current == previous && !events.is_empty())
+        || events.iter().any(|event| {
+            event.sequence < minimum_event_sequence || event.sequence > current
+        })
+        || events.windows(2).any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
         return vec![GapKind::NonContiguousEvents];
+    }
+    if previous.saturating_add(1) < oldest_available_sequence {
+        return vec![GapKind::HistoryEvicted];
     }
     Vec::new()
 }
@@ -1404,6 +1872,7 @@ async fn inventory_owner(
                         snapshot,
                         gaps,
                         provider_contract_manifest,
+                        observation_support,
                     } => {
                         let previous = node.cursor;
                         let mut inventory = SlimNodeInventory::from_snapshot(&snapshot);
@@ -1415,6 +1884,7 @@ async fn inventory_owner(
                         node.freshness = NodeFreshness::Fresh;
                         node.cursor = Some(cursor);
                         node.inventory = Some(inventory);
+                        node.observation_support = Some(observation_support);
                         node.last_success_unix_ms = Some(attempt.at_unix_ms);
                         node.consecutive_failures = 0;
                         node.last_error = None;
@@ -1457,6 +1927,9 @@ async fn inventory_owner(
                         let incarnation_changed = previous.is_some_and(|previous| {
                             previous.incarnation_id != cursor.incarnation_id
                         });
+                        if incarnation_changed {
+                            node.observation_support = None;
+                        }
                         apply_managed_worktree_cursor(
                             node.inventory.as_mut(),
                             incarnation_changed,
@@ -1680,9 +2153,45 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod endpoint_tests {
     use super::*;
+    use crate::protocol::{C2RelayRoute, C2Topology};
 
     fn node(endpoint: &str) -> Result<C2NodeConfig, C2ConfigError> {
         C2NodeConfig::new(NodeId::new("remote-node").unwrap(), endpoint, "safe-token")
+    }
+
+    #[cfg(windows)]
+    const LOCAL_ENDPOINT: &str = r"\\.\pipe\relay-route-fact";
+    #[cfg(unix)]
+    const LOCAL_ENDPOINT: &str = "/tmp/gate4agent-relay-route-fact.sock";
+
+    fn projected_route(node: &C2NodeConfig, transport: NodeTransportState) -> C2RelayRoute {
+        let mut observed = initial_observed_node(node);
+        observed.transport = transport;
+        let status = StatusResponse {
+            api_version: C2_API_VERSION,
+            ready: false,
+            observed_at_unix_ms: 1,
+            nodes: BTreeMap::from([(node.node_id.clone(), observed)]),
+        };
+        C2Topology::from_status(&status).nodes[0].relay_route
+    }
+
+    #[test]
+    fn relay_route_fact_projects_exactly_and_survives_offline_and_parked() {
+        let local = node(LOCAL_ENDPOINT).unwrap();
+        let ssh = node("tcp://127.0.0.1:48100").unwrap();
+
+        for transport in [
+            NodeTransportState::Online,
+            NodeTransportState::Offline,
+            NodeTransportState::Parked,
+        ] {
+            assert_eq!(projected_route(&local, transport), C2RelayRoute::LocalIpc);
+            assert_eq!(
+                projected_route(&ssh, transport),
+                C2RelayRoute::SshForwardedLoopback,
+            );
+        }
     }
 
     #[test]
@@ -1734,6 +2243,8 @@ mod tests {
     use super::*;
     use gate4agent_node_protocol::{
         AgentId, CapabilityId, SessionAddress, SessionKey, SessionMode, SessionRecordId,
+        HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpReservationId,
+        HarnessReadRequestV1,
         SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
         SpawnProfileId, SpawnProfileRevision, SpawnPrompt, SpawnPromptMetadata,
         SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnTarget, WorkspaceId,
@@ -1785,6 +2296,7 @@ mod tests {
                 worktree_id: None,
             },
             profile_id: SpawnProfileId::new("default").unwrap(),
+            expected_profile_revision: SpawnProfileRevision::new("r1").unwrap(),
             overrides: SpawnOverrides {
                 provider: SpawnOverride::Set { value: AgentId::new("codex").unwrap() },
                 mode: SpawnOverride::Set { value: SessionMode::Pty },
@@ -1831,6 +2343,7 @@ mod tests {
                 context_id: SpawnFieldProvenance::Cleared,
                 environment_profile_id: SpawnFieldProvenance::Cleared,
             },
+            harness_mcp_proxy: None,
         };
         let response = |receipt| Ok(NodeResponse::SpawnSpecAccepted { receipt });
         let expected = ExpectedSpawnRequest::Spec(spec.clone());
@@ -1969,6 +2482,270 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_index_correlation_accepts_exact_identity_and_rejects_mismatches() {
+        let identity = gate4agent_types::ProviderSessionIdentity {
+            key: gate4agent_types::ProviderSessionKey::SessionId,
+            id: "native-session-1".to_owned(),
+            transcript_path: Some(r"C:\provider\sessions\native-session-1.jsonl".to_owned()),
+        };
+        let expected = NodeRequest::IndexProviderSession {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            provider: AgentId::new("codex").unwrap(),
+            identity: identity.clone(),
+            display_name: "release shepherd".to_owned(),
+        };
+        let NodeRequest::IndexProviderSession { workspace_id, provider, .. } = &expected else {
+            unreachable!();
+        };
+        let record = gate4agent_node_protocol::ManagedSessionRecord {
+            record_id: SessionRecordId::new("session-001").unwrap(),
+            display_name: "release shepherd".to_owned(),
+            provider: provider.clone(),
+            mode: SessionMode::Pty,
+            state: gate4agent_node_protocol::ManagedSessionState::Dormant,
+            workspace_id: workspace_id.clone(),
+            canonical_root: gate4agent_node_protocol::OpaqueHostPath::utf8(
+                r"C:\repo".to_owned(),
+            ).unwrap(),
+            provider_session: Some(identity),
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            last_error: None,
+        };
+        let response = |record| Ok(NodeResponse::ProviderSessionIndexed { record });
+
+        assert!(validate_provider_session_index_response(
+            Some(&expected),
+            &response(record.clone()),
+        ).is_ok());
+        assert!(validate_provider_session_index_response(
+            None,
+            &response(record.clone()),
+        ).is_err());
+
+        let mut identity_mismatch = record.clone();
+        identity_mismatch.provider_session.as_mut().unwrap().id =
+            "native-session-2".to_owned();
+        assert!(validate_provider_session_index_response(
+            Some(&expected),
+            &response(identity_mismatch),
+        ).is_err());
+
+        let mut workspace_mismatch = record.clone();
+        workspace_mismatch.workspace_id = WorkspaceId::new("other").unwrap();
+        assert!(validate_provider_session_index_response(
+            Some(&expected),
+            &response(workspace_mismatch),
+        ).is_err());
+
+        let mut provider_mismatch = record;
+        provider_mismatch.provider = AgentId::new("claude").unwrap();
+        assert!(validate_provider_session_index_response(
+            Some(&expected),
+            &response(provider_mismatch),
+        ).is_err());
+    }
+
+    #[test]
+    fn native_session_route_correlation_rejects_mismatches_before_projection() {
+        let route = gate4agent_node_protocol::NativeSessionCatalogRoute::workspace(
+            WorkspaceId::new("primary").unwrap(),
+            AgentId::new("codex").unwrap(),
+        );
+        let selection = gate4agent_node_protocol::NativeSessionSelection {
+            route: route.clone(),
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 70,
+            selection_id: "selection-7".to_owned(),
+        };
+        let catalog = NodeRequest::CatalogNativeSessions {
+            route: route.clone(),
+            limit: 10,
+        };
+        let catalog_response = Ok(NodeResponse::NativeSessionsCataloged {
+            route: route.clone(),
+            entries: Vec::new(),
+            summary: None,
+        });
+        assert!(validate_native_session_response(Some(&catalog), &catalog_response).is_ok());
+        let mismatched_route = gate4agent_node_protocol::NativeSessionCatalogRoute::workspace(
+            WorkspaceId::new("other").unwrap(),
+            AgentId::new("codex").unwrap(),
+        );
+        assert!(validate_native_session_response(
+            Some(&catalog),
+            &Ok(NodeResponse::NativeSessionsCataloged {
+                route: mismatched_route,
+                entries: Vec::new(),
+                summary: None,
+            }),
+        )
+        .is_err());
+
+        let page = NodeRequest::PageNativeSessions {
+            route: route.clone(),
+            window: gate4agent_node_protocol::NativeSessionCatalogWindow::Recent,
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 70,
+            after_selection_id: None,
+            limit: 10,
+        };
+        let page_response = |revision| {
+            Ok(NodeResponse::NativeSessionsPaged {
+                route: route.clone(),
+                page: gate4agent_node_protocol::NativeSessionCatalogPage {
+                    window: gate4agent_node_protocol::NativeSessionCatalogWindow::Recent,
+                    revision,
+                    entries: Vec::new(),
+                    next_after_selection_id: None,
+                    remaining_count: 0,
+                    has_more: false,
+                },
+            })
+        };
+        assert!(validate_native_session_response(Some(&page), &page_response(7)).is_ok());
+        assert!(validate_native_session_response(Some(&page), &page_response(8)).is_err());
+
+        let preview = NodeRequest::PreviewNativeSession {
+            selection: selection.clone(),
+            message_limit: 10,
+        };
+        let preview_response = |selection| {
+            Ok(NodeResponse::NativeSessionPreviewed {
+                selection,
+                preview: gate4agent_node_protocol::SessionRecordPreview {
+                    title: None,
+                    modified_at_unix_ms: None,
+                    model: None,
+                    message_count: 0,
+                    message_count_exact: true,
+                    completed_turn_count: None,
+                    total_tokens: None,
+                    truncated: false,
+                    messages: Vec::new(),
+                },
+            })
+        };
+        assert!(validate_native_session_response(
+            Some(&preview),
+            &preview_response(selection.clone()),
+        )
+        .is_ok());
+        let mut mismatched_selection = selection.clone();
+        mismatched_selection.catalog_revision = 8;
+        assert!(validate_native_session_response(
+            Some(&preview),
+            &preview_response(mismatched_selection),
+        )
+        .is_err());
+
+        let index = NodeRequest::IndexNativeSession {
+            selection: selection.clone(),
+            display_name: "Indexed".to_owned(),
+        };
+        let record = gate4agent_node_protocol::ManagedSessionRecord {
+            record_id: SessionRecordId::new("session-007").unwrap(),
+            display_name: "Indexed".to_owned(),
+            provider: route.provider.clone(),
+            mode: SessionMode::Pty,
+            state: gate4agent_node_protocol::ManagedSessionState::Dormant,
+            workspace_id: route.workspace_id.clone().unwrap(),
+            canonical_root: gate4agent_node_protocol::OpaqueHostPath::utf8(
+                r"C:\repo".to_owned(),
+            )
+            .unwrap(),
+            provider_session: None,
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            last_error: None,
+        };
+        assert!(validate_native_session_response(
+            Some(&index),
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: selection.clone(),
+                record: record.clone(),
+            }),
+        )
+        .is_ok());
+        assert!(validate_native_session_response(
+            Some(&index),
+            &Ok(NodeResponse::ProviderSessionIndexed {
+                record: record.clone(),
+            }),
+        )
+        .is_err());
+        let mut wrong_echo = selection.clone();
+        wrong_echo.catalog_revision = 8;
+        assert!(validate_native_session_response(
+            Some(&index),
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: wrong_echo,
+                record: record.clone(),
+            }),
+        )
+        .is_err());
+        let mut wrong_provider = record.clone();
+        wrong_provider.provider = AgentId::new("claude").unwrap();
+        assert!(validate_native_session_response(
+            Some(&index),
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: selection.clone(),
+                record: wrong_provider.clone(),
+            }),
+        )
+        .is_err());
+        let mut wrong_workspace = record.clone();
+        wrong_workspace.workspace_id = WorkspaceId::new("other").unwrap();
+        assert!(validate_native_session_response(
+            Some(&index),
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: selection.clone(),
+                record: wrong_workspace,
+            }),
+        )
+        .is_err());
+
+        let external = NodeRequest::IndexNativeSession {
+            selection: gate4agent_node_protocol::NativeSessionSelection {
+                route: gate4agent_node_protocol::NativeSessionCatalogRoute::unregistered(
+                    AgentId::new("codex").unwrap(),
+                ),
+                ..selection
+            },
+            display_name: "External".to_owned(),
+        };
+        let NodeRequest::IndexNativeSession {
+            selection: external_selection,
+            ..
+        } = &external else {
+            unreachable!();
+        };
+        assert!(validate_native_session_response(
+            Some(&external),
+            &Ok(NodeResponse::NativeSessionIndexed {
+                selection: external_selection.clone(),
+                record: gate4agent_node_protocol::ManagedSessionRecord {
+                    provider: AgentId::new("codex").unwrap(),
+                    ..wrong_provider
+                },
+            }),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn managed_spawn_receipt_correlation_rejects_non_in_use_or_mismatched_leases() {
         let incarnation_id = NodeIncarnationId::from_bytes([7; 16]);
         let spec = SpawnSpec {
@@ -1978,6 +2755,8 @@ mod tests {
                 worktree_id: None,
             },
             profile_id: SpawnProfileId::new("default").unwrap(),
+            expected_profile_revision:
+                SpawnProfileRevision::new("default.r1").unwrap(),
             overrides: SpawnOverrides::default(),
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("managed-1").unwrap(),
@@ -2025,6 +2804,7 @@ mod tests {
                 context_id: SpawnFieldProvenance::Profile,
                 environment_profile_id: SpawnFieldProvenance::Profile,
             },
+            harness_mcp_proxy: None,
         };
         let receipt = ManagedWorktreeSpawnReceipt {
             spawn,
@@ -2108,14 +2888,30 @@ mod tests {
     }
 
     #[test]
-    fn state_gap_validation_distinguishes_eviction_and_non_contiguous_events() {
+    fn terminal_only_sequence_holes_do_not_mark_c2_partial() {
         use gate4agent_node_protocol::{NodeEvent, WorkspaceId};
         let event = |sequence| NodeEventEnvelope { sequence, event: NodeEvent::WorkspaceRemoved { workspace_id: WorkspaceId::new("work").unwrap() } };
-        assert_eq!(validate_events(4, 6, &[event(5), event(6)]), Vec::<GapKind>::new());
-        assert_eq!(validate_events(4, 6, &[event(6)]), vec![GapKind::HistoryEvicted]);
-        assert_eq!(validate_events(4, 7, &[event(5), event(7)]), vec![GapKind::NonContiguousEvents]);
-        assert_eq!(validate_events(7, 6, &[]), vec![GapKind::CursorRegression]);
-        assert_eq!(validate_resync(4, 6, 4, &[]), vec![GapKind::CursorRegression]);
+        assert_eq!(validate_events(4, 7, 1, &[event(6)]), Vec::<GapKind>::new());
+        assert_eq!(validate_events(4, 7, 1, &[]), Vec::<GapKind>::new());
+        assert_eq!(validate_events(4, 7, 1, &[event(7), event(6)]), vec![GapKind::NonContiguousEvents]);
+        assert_eq!(validate_events(7, 6, 1, &[]), vec![GapKind::CursorRegression]);
+        assert_eq!(validate_resync(4, 6, 4, 1, &[]), vec![GapKind::CursorRegression]);
+    }
+
+    #[test]
+    fn real_durable_eviction_marks_c2_history_evicted() {
+        use gate4agent_node_protocol::{NodeEvent, WorkspaceId};
+        let event = |sequence| NodeEventEnvelope {
+            sequence,
+            event: NodeEvent::WorkspaceRemoved {
+                workspace_id: WorkspaceId::new("work").unwrap(),
+            },
+        };
+        assert_eq!(
+            validate_events(4, 7, 6, &[event(6)]),
+            vec![GapKind::HistoryEvicted],
+        );
+        assert_eq!(validate_events(5, 7, 6, &[event(6)]), Vec::<GapKind>::new());
     }
 
     #[test]
@@ -2141,6 +2937,51 @@ mod tests {
             })),
             Some(GapKind::HistoryEvicted),
         );
+    }
+
+    #[test]
+    fn harness_mcp_transient_live_and_pending_projection_preserves_cursor_without_replay() {
+        let node_id = NodeId::new("node-a").unwrap();
+        let cursor = NodeCursor {
+            incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            sequence: 41,
+        };
+        let envelope = NodeEventEnvelope {
+            sequence: 0,
+            event: NodeEvent::HarnessMcpReadCall {
+                reservation_id: HarnessMcpReservationId::new(
+                    format!("hmcpres_{}", "a".repeat(24)),
+                ).unwrap(),
+                activation_digest: HarnessMcpActivationDigest::new(
+                    format!("sha256:{}", "b".repeat(64)),
+                ).unwrap(),
+                record_id: SessionRecordId::new("session-001").unwrap(),
+                session: SessionAddress {
+                    workspace_id: WorkspaceId::new("repo").unwrap(),
+                    session: SessionKey {
+                        instance_id: AgentInstanceId(8),
+                        generation: SessionGeneration(1),
+                    },
+                },
+                call_id: HarnessMcpCallId::new(
+                    format!("hmcpcall_{}", "c".repeat(24)),
+                ).unwrap(),
+                request: HarnessReadRequestV1::ContextGet,
+                deadline_unix_ms: u64::MAX,
+            },
+        };
+
+        let live = routed_transient_node_event(&node_id, cursor, &envelope).unwrap();
+        let pending = routed_transient_node_event(&node_id, cursor, &envelope).unwrap();
+        assert_eq!(live, pending);
+        assert_eq!(live.cursor, cursor);
+        assert!(matches!(live.event, C2NodeEvent::HarnessMcpReadCall { .. }));
+        assert!(routed_recovered_node_event(
+            &node_id,
+            cursor.incarnation_id,
+            &envelope,
+        ).is_none());
+        assert_eq!(cursor.sequence, 41);
     }
 
     #[test]
@@ -2218,6 +3059,171 @@ mod tests {
         assert!(is_read_only_request(&request));
         assert_eq!(node_request_deadline(&request), Duration::from_secs(5));
         assert!(relay_request_deadline(&request, Instant::now()).is_none());
+
+    }
+
+    #[test]
+    fn workspace_entry_create_relay_has_headroom_and_preserves_semantic_timeout() {
+        let workspace_id = gate4agent_node_protocol::WorkspaceId::new("primary").unwrap();
+        let file_path = gate4agent_node_protocol::RepositoryPath::utf8(
+            "src/new.rs".to_owned(),
+        ).unwrap();
+        let create_file = NodeRequest::CreateWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: file_path.clone(),
+        };
+        assert!(!is_read_only_request(&create_file));
+        assert_eq!(
+            node_request_deadline(&create_file),
+            WORKSPACE_ENTRY_CREATE_RELAY_DEADLINE,
+        );
+        assert!(
+            node_request_deadline(&create_file)
+                > WORKSPACE_ENTRY_CREATE_NODE_SEMANTIC_DEADLINE,
+        );
+        assert!(relay_request_deadline(&create_file, Instant::now()).is_none());
+
+        let propagated = relay_node_failure(&NodeClientError::Node(
+            gate4agent_node_protocol::NodeFailure {
+                code: NodeFailureCode::RepositoryEntryCreateTimedOut,
+                message: "private node timeout detail".to_owned(),
+            },
+        )).unwrap();
+        assert_eq!(
+            propagated.code,
+            NodeFailureCode::RepositoryEntryCreateTimedOut,
+        );
+        assert_eq!(propagated.message, "repository entry creation timed out");
+
+        let created_file = gate4agent_node_protocol::WorkspaceFileRead {
+            workspace_id: workspace_id.clone(),
+            path: file_path,
+            content: gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+                text: String::new(),
+                byte_len: 0,
+            },
+            revision: Some(
+                gate4agent_node_protocol::WorkspaceFileRevision::new(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_owned(),
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(validate_workspace_content_response(
+            Some(&create_file),
+            &Ok(NodeResponse::WorkspaceFileCreated {
+                file: created_file.clone(),
+            }),
+        ).is_ok());
+        let mut wrong_content = created_file;
+        wrong_content.content = gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+            text: "unexpected".to_owned(),
+            byte_len: 10,
+        };
+        assert!(validate_workspace_content_response(
+            Some(&create_file),
+            &Ok(NodeResponse::WorkspaceFileCreated { file: wrong_content }),
+        ).is_err());
+
+        let directory_path = gate4agent_node_protocol::RepositoryPath::utf8(
+            "src/new".to_owned(),
+        ).unwrap();
+        let create_directory = NodeRequest::CreateWorkspaceDirectory {
+            workspace_id: workspace_id.clone(),
+            path: directory_path.clone(),
+        };
+        assert!(!is_read_only_request(&create_directory));
+        assert_eq!(
+            node_request_deadline(&create_directory),
+            WORKSPACE_ENTRY_CREATE_RELAY_DEADLINE,
+        );
+        assert!(validate_workspace_content_response(
+            Some(&create_directory),
+            &Ok(NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id,
+                entry: gate4agent_node_protocol::WorkspaceEntry {
+                    relative_path: directory_path,
+                    kind: gate4agent_node_protocol::WorkspaceEntryKind::Directory,
+                },
+            }),
+        ).is_ok());
+        assert!(validate_workspace_content_response(
+            Some(&create_directory),
+            &Ok(NodeResponse::Accepted),
+        ).is_err());
+    }
+
+    #[test]
+    fn native_session_catalog_is_lease_free_read_only() {
+        let route = gate4agent_node_protocol::NativeSessionCatalogRoute::workspace(
+            gate4agent_node_protocol::WorkspaceId::new("primary").unwrap(),
+            gate4agent_types::AgentId::new("codex").unwrap(),
+        );
+        let request = NodeRequest::CatalogNativeSessions {
+            route: route.clone(),
+            limit: 8,
+        };
+        assert!(is_read_only_request(&request));
+        assert_eq!(
+            node_request_deadline(&request),
+            NATIVE_SESSION_REQUEST_DEADLINE,
+        );
+        assert!(relay_request_deadline(&request, Instant::now()).is_none());
+
+        let page = NodeRequest::PageNativeSessions {
+            route: route.clone(),
+            window: gate4agent_types::NativeSessionCatalogWindow::Older,
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 8,
+            after_selection_id: Some("hist_selection_1".to_owned()),
+            limit: 8,
+        };
+        assert!(is_read_only_request(&page));
+        assert_eq!(node_request_deadline(&page), NATIVE_SESSION_REQUEST_DEADLINE);
+        assert!(relay_request_deadline(&page, Instant::now()).is_none());
+
+        let preview = NodeRequest::PreviewNativeSession {
+            selection: gate4agent_node_protocol::NativeSessionSelection {
+                route,
+                catalog_revision: 7,
+                recent_cutoff_unix_ms: 8,
+                selection_id: "hist_selection_1".to_owned(),
+            },
+            message_limit: 12,
+        };
+        assert!(is_read_only_request(&preview));
+        assert_eq!(
+            node_request_deadline(&preview),
+            NATIVE_SESSION_REQUEST_DEADLINE,
+        );
+        assert!(relay_request_deadline(&preview, Instant::now()).is_none());
+
+        let record_preview = NodeRequest::PreviewSessionRecord {
+            record_id: gate4agent_node_protocol::SessionRecordId::new("record-1").unwrap(),
+            message_limit: 12,
+        };
+        assert!(is_read_only_request(&record_preview));
+        assert_eq!(
+            node_request_deadline(&record_preview),
+            NATIVE_SESSION_REQUEST_DEADLINE,
+        );
+        assert!(relay_request_deadline(&record_preview, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn standalone_workspace_creation_is_controller_mutation_with_worktree_deadline() {
+        let request = NodeRequest::CreateStandaloneWorkspace {
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("standalone").unwrap(),
+            root: gate4agent_node_protocol::OpaqueHostPath::utf8(
+                r"C:\standalone".to_owned(),
+            ).unwrap(),
+            initial_branch: Some("main".to_owned()),
+        };
+
+        assert!(!is_read_only_request(&request));
+        assert_eq!(node_request_deadline(&request), Duration::from_secs(240));
+        assert!(relay_request_deadline(&request, Instant::now()).is_none());
     }
 
     #[test]
@@ -2286,6 +3292,7 @@ mod tests {
             transport: NodeTransportState::Offline, freshness: NodeFreshness::Unavailable,
             cursor: None, inventory: None, last_attempt_unix_ms: None, last_success_unix_ms: None,
             consecutive_failures: 0, last_error: None, gaps: Vec::new(), gaps_truncated: 0,
+            observation_support: None,
         });
         let initial = Arc::new(StatusResponse { api_version: C2_API_VERSION, ready: false, observed_at_unix_ms: unix_ms(), nodes });
         let (status_tx, mut status_rx) = watch::channel(initial);
@@ -2299,6 +3306,8 @@ mod tests {
             workspaces: Vec::new(),
             session_records: Vec::new(),
             managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         };
         let cursor = NodeCursor { incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([1; 16]), sequence: 0 };
         let old_manifest = ProviderContractManifest {
@@ -2318,6 +3327,7 @@ mod tests {
             snapshot: snapshot.clone(),
             gaps: Vec::new(),
             provider_contract_manifest: old_manifest,
+            observation_support: C2ObservationSupport::default(),
         } }).await.unwrap();
         status_rx.changed().await.unwrap();
         assert_eq!(status_rx.borrow().nodes[&node_id].freshness, NodeFreshness::Fresh);
@@ -2358,6 +3368,7 @@ mod tests {
             snapshot,
             gaps: Vec::new(),
             provider_contract_manifest: replacement_manifest,
+            observation_support: C2ObservationSupport::default(),
         } }).await.unwrap();
         status_rx.changed().await.unwrap();
         assert_eq!(status_rx.borrow().nodes[&node_id].transport, NodeTransportState::Online);
@@ -2382,9 +3393,12 @@ mod tests {
                     workspaces: Vec::new(),
                     session_records: Vec::new(),
                     managed_worktrees: Vec::new(),
+                    launch_inventory: None,
+                    agent_progress: Vec::new(),
                 },
                 gaps: Vec::new(),
                 provider_contract_manifest: ProviderContractManifest::default(),
+                observation_support: C2ObservationSupport::default(),
             },
         }).await.unwrap();
         status_rx.changed().await.unwrap();
@@ -2431,6 +3445,7 @@ mod tests {
                 last_error: None,
                 gaps: Vec::new(),
                 gaps_truncated: 0,
+                observation_support: None,
             },
         )]);
         let initial = Arc::new(StatusResponse {
@@ -2478,9 +3493,12 @@ mod tests {
                             workspaces: Vec::new(),
                             session_records: Vec::new(),
                             managed_worktrees: Vec::new(),
+                            launch_inventory: None,
+                            agent_progress: Vec::new(),
                         },
                         gaps: Vec::new(),
                         provider_contract_manifest: ProviderContractManifest::default(),
+                        observation_support: C2ObservationSupport::default(),
                     },
                 })
                 .await
@@ -2500,6 +3518,131 @@ mod tests {
         );
         assert_eq!(statuses.as_slice()[0].version().unwrap().as_str(), "2.0.0");
         shutdown.send(true).unwrap();
+        owner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_fleet_observation_support_is_exact_and_incarnation_bound() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let node_b = NodeId::new("node-b").unwrap();
+        let observed = |endpoint: &str| ObservedNode {
+            endpoint: endpoint.to_owned(),
+            transport_label: "windows-named-pipe".to_owned(),
+            transport: NodeTransportState::Offline,
+            freshness: NodeFreshness::Unavailable,
+            cursor: None,
+            inventory: None,
+            last_attempt_unix_ms: None,
+            last_success_unix_ms: None,
+            consecutive_failures: 0,
+            last_error: None,
+            gaps: Vec::new(),
+            gaps_truncated: 0,
+            observation_support: None,
+        };
+        let nodes = BTreeMap::from([
+            (node_a.clone(), observed(r"\\.\pipe\node-a")),
+            (node_b.clone(), observed(r"\\.\pipe\node-b")),
+        ]);
+        let initial = Arc::new(StatusResponse {
+            api_version: C2_API_VERSION,
+            ready: false,
+            observed_at_unix_ms: unix_ms(),
+            nodes,
+        });
+        let (status_tx, mut status_rx) = watch::channel(initial);
+        let (ingress_tx, ingress_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = tokio::spawn(inventory_owner(
+            2,
+            Duration::from_secs(1),
+            ingress_rx,
+            status_tx,
+            shutdown_rx,
+        ));
+        let snapshot = |node_id: &NodeId| NodeSnapshot {
+            node_id: node_id.clone(),
+            enabled_providers: Vec::new(),
+            provider_runtime_statuses: crate::protocol::ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
+        };
+        for (node_id, incarnation, observation_support) in [
+            (
+                node_a.clone(),
+                NodeIncarnationId::from_bytes([1; 16]),
+                C2ObservationSupport {
+                    events: true,
+                    managed_target: true,
+                    workflow_detail: true,
+                },
+            ),
+            (
+                node_b.clone(),
+                NodeIncarnationId::from_bytes([2; 16]),
+                C2ObservationSupport {
+                    events: false,
+                    managed_target: false,
+                    workflow_detail: false,
+                },
+            ),
+        ] {
+            ingress_tx.send(Attempt {
+                node_id: node_id.clone(),
+                at_unix_ms: unix_ms(),
+                result: AttemptResult::Connected {
+                    cursor: NodeCursor { incarnation_id: incarnation, sequence: 0 },
+                    snapshot: snapshot(&node_id),
+                    gaps: Vec::new(),
+                    provider_contract_manifest: ProviderContractManifest::default(),
+                    observation_support,
+                },
+            }).await.unwrap();
+            status_rx.changed().await.unwrap();
+        }
+        assert_eq!(
+            status_rx.borrow().nodes[&node_a].observation_support,
+            Some(C2ObservationSupport {
+                events: true,
+                managed_target: true,
+                workflow_detail: true,
+            }),
+        );
+        assert_eq!(
+            status_rx.borrow().nodes[&node_b].observation_support,
+            Some(C2ObservationSupport {
+                events: false,
+                managed_target: false,
+                workflow_detail: false,
+            }),
+        );
+
+        ingress_tx.send(Attempt {
+            node_id: node_a.clone(),
+            at_unix_ms: unix_ms(),
+            result: AttemptResult::Cursor {
+                cursor: NodeCursor {
+                    incarnation_id: NodeIncarnationId::from_bytes([3; 16]),
+                    sequence: 0,
+                },
+                gaps: vec![GapKind::IncarnationChanged],
+                managed_worktree_events: Vec::new(),
+            },
+        }).await.unwrap();
+        status_rx.changed().await.unwrap();
+        assert_eq!(status_rx.borrow().nodes[&node_a].observation_support, None);
+        assert_eq!(
+            status_rx.borrow().nodes[&node_b].observation_support,
+            Some(C2ObservationSupport {
+                events: false,
+                managed_target: false,
+                workflow_detail: false,
+            }),
+        );
+        shutdown_tx.send(true).unwrap();
         owner.await.unwrap().unwrap();
     }
 
@@ -2527,9 +3670,12 @@ mod tests {
                         workspaces: Vec::new(),
                         session_records: Vec::new(),
                         managed_worktrees: Vec::new(),
+                        launch_inventory: None,
+                        agent_progress: Vec::new(),
                     },
                     gaps: Vec::new(),
                     provider_contract_manifest: ProviderContractManifest::default(),
+                    observation_support: C2ObservationSupport::default(),
                 },
             })
             .await
@@ -2576,6 +3722,8 @@ mod tests {
                 "managed-a",
                 ManagedWorktreeLeaseState::Ready,
             )],
+            launch_inventory: None,
+            agent_progress: Vec::new(),
         });
         apply_managed_worktree_cursor(
             Some(&mut inventory),

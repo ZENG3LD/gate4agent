@@ -1,5 +1,5 @@
 use crate::bundle_catalog::NodeBundle;
-use crate::protocol::SessionMode;
+use crate::protocol::{DeliveryComponentKindV2, DeliveryScopeV2, SessionMode};
 use gate4agent_types::AgentId;
 use std::ffi::OsString;
 use std::path::Path;
@@ -31,14 +31,41 @@ pub(crate) fn validate_bundle_binding(
     mode: SessionMode,
     bundle: &NodeBundle,
 ) -> Result<BundleProviderLayout, BundleProviderError> {
-    resolve_layout(
+    let layout = resolve_layout(
         provider,
         mode,
         bundle
             .files()
             .iter()
             .any(|file| file.path() == CLAUDE_PLUGIN_MANIFEST),
-    )
+    )?;
+    if let Some(manifest) = bundle.delivery_manifest() {
+        if manifest.components.iter().any(|component| {
+            component.scope != DeliveryScopeV2::Session
+                || match component.kind {
+                    DeliveryComponentKindV2::Skill => {
+                        !component.relative_path.as_str().starts_with("skills/")
+                    }
+                    DeliveryComponentKindV2::PluginManifest => !matches!(
+                        component.relative_path.as_str(),
+                        "plugin.json" | CLAUDE_PLUGIN_MANIFEST
+                    ),
+                    DeliveryComponentKindV2::Prompt
+                    | DeliveryComponentKindV2::Instructions
+                    | DeliveryComponentKindV2::AgentDefinition
+                    | DeliveryComponentKindV2::Command
+                    | DeliveryComponentKindV2::File
+                    | DeliveryComponentKindV2::Template
+                    | DeliveryComponentKindV2::McpDeclaration => true,
+                }
+        }) {
+            return Err(BundleProviderError::UnsupportedBinding);
+        }
+        bundle
+            .validate_skill_bundle_contract()
+            .map_err(|_| BundleProviderError::UnsupportedBinding)?;
+    }
+    Ok(layout)
 }
 
 pub(crate) fn bundle_launch_arguments(

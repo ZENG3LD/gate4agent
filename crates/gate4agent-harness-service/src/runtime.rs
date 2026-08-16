@@ -4,7 +4,8 @@ use crate::{
         ArmedHarnessMcpReservationProof,
         ContextPackExportStart, ExportContextPackOutcome, HarnessC2Adapter,
         HarnessC2Error, HarnessC2EventReceiver,
-        HarnessObservationResync, PendingNativeHistoryRequest,
+        HarnessObservationResync, PendingNativeHistoryRequest, PendingRunRead,
+        PreparedRunRead, RunReadCompletion,
         SpawnDispatchOutcome, SpawnProfileRevisionProof,
         StagedDeliveryProof,
     },
@@ -92,6 +93,7 @@ const HOST_COMMAND_CAPACITY: usize = 64;
 const HOST_CONNECTION_LIMIT: usize = 32;
 const HOST_DEADLINE: Duration = Duration::from_secs(3);
 const HOST_NATIVE_HISTORY_RESPONSE_DEADLINE: Duration = Duration::from_secs(40);
+const HOST_RUN_READ_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
 const HOST_CONNECTION_DEADLINE: Duration = Duration::from_secs(45);
 const OBSERVATION_RECOVERY_RETRY: Duration = Duration::from_secs(1);
 const OBSERVATION_RECOVERY_MAX_IN_FLIGHT: usize = 8;
@@ -102,6 +104,7 @@ const HARNESS_MCP_NETWORK_WORKERS_MAX: usize = 8;
 const HARNESS_MCP_GENERAL_NETWORK_WORKERS_MAX: usize =
     HARNESS_MCP_NETWORK_WORKERS_MAX - 1;
 const NATIVE_HISTORY_WORKERS_MAX: usize = 8;
+const RUN_READ_WORKERS_MAX: usize = 8;
 const OPERATOR_CREDENTIAL_DIGEST_DOMAIN: &[u8] = b"gate4agent-harness-operator-credential-digest-v1";
 const OPERATOR_INTENT_OPERATION_ID_DOMAIN: &[u8] =
     b"gate4agent-harness-operator-intent-operation-id-v1";
@@ -270,6 +273,10 @@ enum HostCommand {
         result: Result<HarnessObservationResync, HarnessC2Error>,
     },
     NativeHistoryWorkerFinished,
+    RunReadFinished {
+        completion: RunReadCompletion,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), HarnessRuntimeError>>,
     },
@@ -425,9 +432,26 @@ struct NativeHistoryWorkerRegistry {
     in_flight: usize,
 }
 
+#[derive(Default)]
+struct RunReadWorkerRegistry {
+    in_flight: usize,
+}
+
 impl NativeHistoryWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= NATIVE_HISTORY_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl RunReadWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= RUN_READ_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -1187,6 +1211,74 @@ fn start_native_history_worker(
     });
 }
 
+fn start_run_read_worker(
+    pending: PendingRunRead,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+) {
+    tokio::spawn(async move {
+        let completion = pending.finish().await;
+        let _ = commands.send(HostCommand::RunReadFinished { completion, reply }).await;
+    });
+}
+
+fn map_run_read_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidRunReadRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+        HarnessC2Error::RunReadUnbound => HarnessOperatorHostErrorV1::Conflict,
+        HarnessC2Error::RunReadEnqueue(gate4agent_c2_client::C2ControlError::QueueFull) => {
+            HarnessOperatorHostErrorV1::Busy
+        }
+        HarnessC2Error::RunReadEnqueue(_)
+        | HarnessC2Error::RunReadTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::RunReadRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
+        HarnessC2Error::RunReadDeadline => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::RunReadTooLarge => HarnessOperatorHostErrorV1::TooLarge,
+        HarnessC2Error::RunReadRejected { code } => match code {
+            NodeFailureCode::InvalidRequest
+            | NodeFailureCode::InvalidRepositoryPath => {
+                HarnessOperatorHostErrorV1::InvalidRequest
+            }
+            NodeFailureCode::UnknownWorkspace
+            | NodeFailureCode::RepositoryFileNotFound
+            | NodeFailureCode::RepositoryParentNotFound => {
+                HarnessOperatorHostErrorV1::NotFound
+            }
+            NodeFailureCode::BindingMismatch
+            | NodeFailureCode::RepositoryFileRevisionConflict
+            | NodeFailureCode::RepositoryFileNotRegular
+            | NodeFailureCode::RepositoryPathUnsafe
+            | NodeFailureCode::NotGitRepository
+            | NodeFailureCode::StaleGeneration => HarnessOperatorHostErrorV1::Conflict,
+            NodeFailureCode::ControllerBusy
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::RepositoryFileReadTimedOut
+            | NodeFailureCode::GitReadTimedOut
+            | NodeFailureCode::HostDirectoryReadTimedOut
+            | NodeFailureCode::SpawnDeadlineExceeded => {
+                HarnessOperatorHostErrorV1::Deadline
+            }
+            NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::RepositoryFileReadFailed
+            | NodeFailureCode::GitReadFailed
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        HarnessC2Error::InvalidRunReadBinding
+        | HarnessC2Error::RunReadCorrelationMismatch
+        | HarnessC2Error::RunReadProjection => HarnessOperatorHostErrorV1::Internal,
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
 fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidNativeHistoryRequest => {
@@ -1233,6 +1325,47 @@ fn is_native_history_request(request: &HarnessOperatorRequestV1) -> bool {
             | HarnessOperatorRequestV1::PageNativeSessions { .. }
             | HarnessOperatorRequestV1::PreviewNativeSession { .. }
     )
+}
+
+fn is_run_read_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(
+        request,
+        HarnessOperatorRequestV1::InspectRunWorkspace { .. }
+            | HarnessOperatorRequestV1::ReadRunWorkspaceFile { .. }
+            | HarnessOperatorRequestV1::ReadRunGitHistory { .. }
+            | HarnessOperatorRequestV1::ReadRunGitDiff { .. }
+    )
+}
+
+fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
+    if is_native_history_request(request) {
+        HOST_NATIVE_HISTORY_RESPONSE_DEADLINE
+    } else if is_run_read_request(request) {
+        HOST_RUN_READ_RESPONSE_DEADLINE
+    } else {
+        HOST_DEADLINE
+    }
+}
+
+fn run_read_run_id(request: &HarnessOperatorRequestV1) -> Option<&gate4agent_harness_protocol::HarnessRunId> {
+    match request {
+        HarnessOperatorRequestV1::InspectRunWorkspace { run_id }
+        | HarnessOperatorRequestV1::ReadRunWorkspaceFile { run_id, .. }
+        | HarnessOperatorRequestV1::ReadRunGitHistory { run_id, .. }
+        | HarnessOperatorRequestV1::ReadRunGitDiff { run_id, .. } => Some(run_id),
+        _ => None,
+    }
+}
+
+fn validate_run_read_completion_origin(
+    current: Option<&gate4agent_harness_protocol::HarnessRunV1>,
+    prepared: &PreparedRunRead,
+) -> Result<(), HarnessOperatorHostErrorV1> {
+    let current = current.ok_or(HarnessOperatorHostErrorV1::NotFound)?;
+    if current.binding.as_ref() != Some(prepared.binding()) {
+        return Err(HarnessOperatorHostErrorV1::Conflict);
+    }
+    Ok(())
 }
 
 fn start_delivery_stage_finish(
@@ -1692,6 +1825,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut active_dispatch = None;
         let mut harness_mcp_workers = HarnessMcpWorkerRegistry::default();
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
+        let mut run_read_workers = RunReadWorkerRegistry::default();
         let (harness_mcp_rejects, harness_mcp_reject_rx) = mpsc::channel(
             MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE,
         );
@@ -1800,6 +1934,45 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             let _ = reply.send(reply_value);
                         }
                         Some(HostCommand::Operator { request, reply }) => {
+                            if is_run_read_request(&request) {
+                                let prepared = run_read_run_id(&request)
+                                    .ok_or(HarnessOperatorHostErrorV1::InvalidRequest)
+                                    .and_then(|run_id| {
+                                        harness.engine().run(run_id).cloned()
+                                            .ok_or(HarnessOperatorHostErrorV1::NotFound)
+                                    })
+                                    .and_then(|run| {
+                                        PreparedRunRead::from_operator_request(&run, request)
+                                            .map_err(map_run_read_error)
+                                    });
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(error) => {
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error { error });
+                                        continue;
+                                    }
+                                };
+                                if !run_read_workers.try_start() {
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_run_read(prepared) {
+                                    Ok(pending) => start_run_read_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                    ),
+                                    Err(error) => {
+                                        run_read_workers.finish();
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_run_read_error(error),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
                             if is_native_history_request(&request) {
                                 if !native_history_workers.try_start() {
                                     let _ = reply.send(HarnessOperatorReplyV1::Error {
@@ -2537,6 +2710,23 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 requested_after,
                                 result,
                             )?;
+                        }
+                        Some(HostCommand::RunReadFinished { completion, reply }) => {
+                            run_read_workers.finish();
+                            let (prepared, result) = completion.into_parts();
+                            let reply_value = match validate_run_read_completion_origin(
+                                harness.engine().run(prepared.run_id()),
+                                &prepared,
+                            ) {
+                                Err(error) => HarnessOperatorReplyV1::Error { error },
+                                Ok(()) => match result {
+                                    Ok(response) => HarnessOperatorReplyV1::Ok { response },
+                                    Err(error) => HarnessOperatorReplyV1::Error {
+                                        error: map_run_read_error(error),
+                                    },
+                                },
+                            };
+                            let _ = reply.send(reply_value);
                         }
                         Some(HostCommand::NativeHistoryWorkerFinished) => {
                             native_history_workers.finish();
@@ -3682,7 +3872,11 @@ fn execute_operator_request(
         }
         HarnessOperatorRequestV1::CatalogNativeSessions { .. }
         | HarnessOperatorRequestV1::PageNativeSessions { .. }
-        | HarnessOperatorRequestV1::PreviewNativeSession { .. } => {
+        | HarnessOperatorRequestV1::PreviewNativeSession { .. }
+        | HarnessOperatorRequestV1::InspectRunWorkspace { .. }
+        | HarnessOperatorRequestV1::ReadRunWorkspaceFile { .. }
+        | HarnessOperatorRequestV1::ReadRunGitHistory { .. }
+        | HarnessOperatorRequestV1::ReadRunGitDiff { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
         HarnessOperatorRequestV1::CreateTask { request } => {
@@ -3874,11 +4068,7 @@ async fn handle_connection(
                 request,
                 ..
             } = envelope;
-            let response_deadline = if is_native_history_request(&request) {
-                HOST_NATIVE_HISTORY_RESPONSE_DEADLINE
-            } else {
-                HOST_DEADLINE
-            };
+            let response_deadline = operator_response_deadline(&request);
             let authorized = match operator_authority.as_ref() {
                 Some(authority) => authority.verify(&credential)?,
                 None => false,
@@ -6567,6 +6757,82 @@ mod tests {
         assert_eq!(
             map_native_history_error(HarnessC2Error::NativeHistoryDeadline),
             HarnessOperatorHostErrorV1::Deadline,
+        );
+    }
+
+    #[test]
+    fn run_read_worker_cap_deadline_and_failure_mapping_are_typed() {
+        let mut workers = RunReadWorkerRegistry::default();
+        for _ in 0..RUN_READ_WORKERS_MAX { assert!(workers.try_start()); }
+        assert!(!workers.try_start());
+        workers.finish();
+        assert!(workers.try_start());
+
+        let request = HarnessOperatorRequestV1::InspectRunWorkspace {
+            run_id: HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap(),
+        };
+        assert_eq!(
+            operator_response_deadline(&request),
+            HOST_RUN_READ_RESPONSE_DEADLINE,
+        );
+        assert_eq!(HOST_RUN_READ_RESPONSE_DEADLINE, Duration::from_secs(12));
+        assert_eq!(
+            map_run_read_error(HarnessC2Error::RunReadEnqueue(
+                gate4agent_c2_client::C2ControlError::QueueFull,
+            )),
+            HarnessOperatorHostErrorV1::Busy,
+        );
+        assert_eq!(
+            map_run_read_error(HarnessC2Error::RunReadDeadline),
+            HarnessOperatorHostErrorV1::Deadline,
+        );
+        assert_eq!(
+            map_run_read_error(HarnessC2Error::RunReadRouteMismatch),
+            HarnessOperatorHostErrorV1::Conflict,
+        );
+        assert_eq!(
+            map_run_read_error(HarnessC2Error::RunReadRejected {
+                code: NodeFailureCode::RepositoryFileNotFound,
+            }),
+            HarnessOperatorHostErrorV1::NotFound,
+        );
+        assert_eq!(
+            map_run_read_error(HarnessC2Error::RunReadRejected {
+                code: NodeFailureCode::ResponseTooLarge,
+            }),
+            HarnessOperatorHostErrorV1::TooLarge,
+        );
+    }
+
+    #[test]
+    fn run_read_completion_accepts_lifecycle_only_change_and_rejects_binding_change() {
+        let (harness, _, run_id, _) = running_harness_fixture();
+        let captured = harness.engine().run(&run_id).unwrap();
+        let prepared = PreparedRunRead::from_operator_request(
+            captured,
+            HarnessOperatorRequestV1::InspectRunWorkspace {
+                run_id: run_id.clone(),
+            },
+        ).unwrap();
+
+        let mut lifecycle_only = captured.clone();
+        lifecycle_only.revision = HarnessRevision::new(2).unwrap();
+        lifecycle_only.lifecycle = HarnessRunLifecycleV1::Waiting;
+        lifecycle_only.updated_at_unix_ms += 1;
+        assert_eq!(
+            validate_run_read_completion_origin(Some(&lifecycle_only), &prepared),
+            Ok(()),
+        );
+
+        let mut changed_binding = lifecycle_only;
+        changed_binding.binding.as_mut().unwrap().workspace_id = selector("workspace-b");
+        assert_eq!(
+            validate_run_read_completion_origin(Some(&changed_binding), &prepared),
+            Err(HarnessOperatorHostErrorV1::Conflict),
+        );
+        assert_eq!(
+            validate_run_read_completion_origin(None, &prepared),
+            Err(HarnessOperatorHostErrorV1::NotFound),
         );
     }
 

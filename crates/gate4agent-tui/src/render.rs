@@ -2298,6 +2298,42 @@ fn render_surface_pane(
                 );
             }
         }
+        Some(SurfaceTab::HarnessFile(key)) => {
+            if let Some(file) = app.harness_file_tabs.get(key) {
+                if file.state == WorkspaceFileState::Ready {
+                    render_workspace_file_tab_rich(
+                        file,
+                        key.path.as_utf8().unwrap_or_default(),
+                        viewport,
+                        buf,
+                        theme,
+                        true,
+                    );
+                } else {
+                    render_workspace_file_tab(
+                        file,
+                        key.path.as_utf8().unwrap_or_default(),
+                        viewport,
+                        buf,
+                        theme,
+                    );
+                }
+            }
+        }
+        Some(SurfaceTab::HarnessGit(key)) => {
+            if let Some(git) = app.harness_git_tabs.get(key) {
+                render_workspace_git_tab(
+                    git,
+                    pane_id,
+                    viewport,
+                    buf,
+                    layout,
+                    theme,
+                    app.activity_spinner(),
+                    true,
+                );
+            }
+        }
         Some(SurfaceTab::File(key)) => {
             if let Some(file) = app.file_tabs.get(key) {
                 if let Some(history) = file.inline_history.as_ref() {
@@ -2323,6 +2359,7 @@ fn render_surface_pane(
                         content,
                         buf,
                         theme,
+                        false,
                     );
                     render_file_scrollbar(file, pane_id, viewport, buf, layout, theme);
                 } else {
@@ -2346,6 +2383,7 @@ fn render_surface_pane(
                     layout,
                     theme,
                     app.activity_spinner(),
+                    false,
                 );
             }
         }
@@ -3176,7 +3214,7 @@ fn render_harness_kanban(
         return;
     }
     if let Some(monitor) = app.harness_kanban.monitor.as_ref() {
-        render_harness_monitor(monitor, area, buf, theme);
+        render_harness_monitor(monitor, area, buf, layout, theme);
         return;
     }
     if app.harness_kanban.detail.is_some() {
@@ -3829,9 +3867,15 @@ fn render_harness_task_detail(
                 } else {
                     "[Open monitor]"
                 };
-                let monitor_width = (cell_width(monitor_label) as u16).min(row.width);
-                let monitor_x = row.right().saturating_sub(monitor_width);
-                let main_width = monitor_x.saturating_sub(row.x).saturating_sub(1);
+                let files_label = "[Files]";
+                let git_label = "[Git]";
+                let actions_width = (cell_width(files_label)
+                    + 1
+                    + cell_width(git_label)
+                    + 1
+                    + cell_width(monitor_label)) as u16;
+                let actions_x = row.right().saturating_sub(actions_width.min(row.width));
+                let main_width = actions_x.saturating_sub(row.x).saturating_sub(1);
                 let id = run.run_id.as_str();
                 let line = format!(
                     "{}... | {} | {:?} | {:?} | {correlation}",
@@ -3843,6 +3887,27 @@ fn render_harness_task_detail(
                 Paragraph::new(truncate_cells(&line, main_width as usize))
                     .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
                     .render(Rect::new(row.x, row.y, main_width, 1), buf);
+                let files_width = cell_width(files_label) as u16;
+                let files_rect = Rect::new(actions_x, row.y, files_width, 1);
+                Paragraph::new(files_label)
+                    .style(Style::default().fg(theme.teal).bg(background))
+                    .render(files_rect, buf);
+                layout.hits.push(HitRegion {
+                    rect: files_rect,
+                    target: HitTarget::HarnessTaskDetailRunFiles(run.run_id.clone()),
+                });
+                let git_x = files_rect.right().saturating_add(1);
+                let git_width = cell_width(git_label) as u16;
+                let git_rect = Rect::new(git_x, row.y, git_width, 1);
+                Paragraph::new(git_label)
+                    .style(Style::default().fg(theme.teal).bg(background))
+                    .render(git_rect, buf);
+                layout.hits.push(HitRegion {
+                    rect: git_rect,
+                    target: HitTarget::HarnessTaskDetailRunGit(run.run_id.clone()),
+                });
+                let monitor_x = git_rect.right().saturating_add(1);
+                let monitor_width = row.right().saturating_sub(monitor_x);
                 let monitor_rect = Rect::new(monitor_x, row.y, monitor_width, 1);
                 Paragraph::new(monitor_label)
                     .style(Style::default().fg(if run.binding == gate4agent_harness_client::RedactedBindingStateV1::None { theme.muted } else { theme.teal }).bg(background))
@@ -3913,16 +3978,47 @@ fn render_harness_task_detail(
                         .render(Rect::new(body.x, y, body.width, 1), buf);
                     y = y.saturating_add(1);
                 }
-                for unavailable in [
-                    "PTY: unavailable (Harness-mediated terminal contract pending)",
-                    "Workspace: unavailable (Harness-mediated workspace contract pending)",
-                ] {
-                    if y >= body.bottom() {
-                        break;
-                    }
-                    Paragraph::new(truncate_cells(unavailable, body.width as usize))
+                if y < body.bottom() {
+                    Paragraph::new(truncate_cells(
+                        "PTY: unavailable (Harness-mediated terminal contract pending)",
+                        body.width as usize,
+                    ))
                         .style(Style::default().fg(theme.muted).bg(theme.surface))
                         .render(Rect::new(body.x, y, body.width, 1), buf);
+                    y = y.saturating_add(1);
+                }
+                if y < body.bottom() {
+                    let run_ref = app.harness_run_ref(&run.run_id);
+                    if run_ref.as_ref().is_some_and(|run_ref| {
+                        app.harness_workspace_for_run(run_ref).is_some()
+                    }) {
+                        let actions = Rect::new(body.x, y, body.width, 1);
+                        let files_end = render_toolbar_segment(
+                            "[Files]",
+                            actions.x,
+                            actions,
+                            Style::default().fg(theme.teal).bg(theme.surface),
+                            Some(HitTarget::HarnessTaskDetailRunFiles(run.run_id.clone())),
+                            buf,
+                            layout,
+                        );
+                        let _ = render_toolbar_segment(
+                            "[Git]",
+                            files_end.saturating_add(1),
+                            actions,
+                            Style::default().fg(theme.teal).bg(theme.surface),
+                            Some(HitTarget::HarnessTaskDetailRunGit(run.run_id.clone())),
+                            buf,
+                            layout,
+                        );
+                    } else {
+                        Paragraph::new(truncate_cells(
+                            "Workspace/Git: open Files or Git to load",
+                            body.width as usize,
+                        ))
+                            .style(Style::default().fg(theme.muted).bg(theme.surface))
+                            .render(Rect::new(body.x, y, body.width, 1), buf);
+                    }
                     y = y.saturating_add(1);
                 }
             }
@@ -3930,6 +4026,180 @@ fn render_harness_task_detail(
                 Paragraph::new("No run attempts; no agents are correlated")
                     .style(Style::default().fg(theme.muted).bg(theme.surface))
                     .render(body, buf);
+            }
+        }
+        HarnessTaskDetailSection::Files => {
+            let Some(run_id) = detail.selected_run.as_ref() else {
+                Paragraph::new("Harness workspace unavailable: no run selected")
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(body, buf);
+                return;
+            };
+            let Some(run_ref) = app.harness_run_ref(run_id) else {
+                Paragraph::new("Harness workspace unavailable: selected run is not loaded")
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(body, buf);
+                return;
+            };
+            let Some((origin, workspace)) = app.harness_workspace_for_run(&run_ref) else {
+                let status = match app.harness_kanban.workspace_requests.get(&run_ref) {
+                    Some(request) => match &request.state {
+                        crate::app::HarnessWorkspaceRequestState::Loading => {
+                            format!("Harness run {} r{} | loading workspace...", run_ref.run_id, run_ref.run_revision.get())
+                        }
+                        crate::app::HarnessWorkspaceRequestState::Error(failure) => {
+                            format!("Harness run {} r{} | {}", run_ref.run_id, run_ref.run_revision.get(), failure.display())
+                        }
+                    },
+                    None => format!(
+                        "Harness run {} r{} | workspace not requested",
+                        run_ref.run_id,
+                        run_ref.run_revision.get(),
+                    ),
+                };
+                Paragraph::new(truncate_cells(&status, body.width as usize))
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(body, buf);
+                return;
+            };
+            let heading = format!(
+                "{}{} | node {}@{} | workspace {} | read-only",
+                if workspace.tree_truncated { "file tree truncated | " } else { "" },
+                origin.label(),
+                origin.node_id.as_str(),
+                origin.node_incarnation_id.as_str(),
+                origin.workspace_id.as_str(),
+            );
+            if body.height > 0 {
+                Paragraph::new(truncate_cells(&heading, body.width as usize))
+                    .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
+                    .render(Rect::new(body.x, body.y, body.width, 1), buf);
+            }
+            for (index, entry) in workspace.entries.iter()
+                .skip(workspace.scroll)
+                .take(body.height.saturating_sub(1) as usize)
+                .enumerate()
+            {
+                let row = Rect::new(body.x, body.y + 1 + index as u16, body.width, 1);
+                let marker = if entry.kind == WorkspaceEntryKind::Directory { "[dir] " } else { "      " };
+                Paragraph::new(truncate_cells(
+                    &format!("{marker}{}", entry.relative_path.display_text()),
+                    row.width as usize,
+                ))
+                    .style(Style::default().fg(if entry.kind == WorkspaceEntryKind::File { theme.teal } else { theme.dim }).bg(theme.surface))
+                    .render(row, buf);
+                if entry.kind == WorkspaceEntryKind::File {
+                    layout.hits.push(HitRegion {
+                        rect: row,
+                        target: HitTarget::HarnessWorkspaceFile(
+                            origin.clone(),
+                            entry.relative_path.clone(),
+                        ),
+                    });
+                }
+            }
+            if workspace.entries.is_empty() && body.height > 1 {
+                Paragraph::new("No workspace entries")
+                    .style(Style::default().fg(theme.muted).bg(theme.surface))
+                    .render(Rect::new(body.x, body.y + 1, body.width, 1), buf);
+            }
+        }
+        HarnessTaskDetailSection::Git => {
+            let Some(run_id) = detail.selected_run.as_ref() else {
+                Paragraph::new("Harness Git unavailable: no run selected")
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(body, buf);
+                return;
+            };
+            let Some(run_ref) = app.harness_run_ref(run_id) else {
+                Paragraph::new("Harness Git unavailable: selected run is not loaded")
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(body, buf);
+                return;
+            };
+            let Some((origin, workspace)) = app.harness_workspace_for_run(&run_ref) else {
+                let status = match app.harness_kanban.workspace_requests.get(&run_ref) {
+                    Some(request) => match &request.state {
+                        crate::app::HarnessWorkspaceRequestState::Loading => "loading workspace Git state...".to_owned(),
+                        crate::app::HarnessWorkspaceRequestState::Error(failure) => failure.display(),
+                    },
+                    None => "Harness Git workspace not requested".to_owned(),
+                };
+                Paragraph::new(truncate_cells(
+                    &format!("Harness run {} r{} | {status}", run_ref.run_id, run_ref.run_revision.get()),
+                    body.width as usize,
+                ))
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(body, buf);
+                return;
+            };
+            let Some(git) = workspace.git.as_ref() else {
+                Paragraph::new(format!("{} | Git unavailable: projection omitted", origin.label()))
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(body, buf);
+                return;
+            };
+            if body.height > 0 {
+                Paragraph::new(truncate_cells(
+                    &format!(
+                        "{}{} | branch {} | status {} | read-only",
+                        if git.truncated { "Git snapshot truncated | " } else { "" },
+                        origin.label(),
+                        git.branch.as_deref().unwrap_or("detached"),
+                        git.status.len(),
+                    ),
+                    body.width as usize,
+                ))
+                    .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
+                    .render(Rect::new(body.x, body.y, body.width, 1), buf);
+            }
+            if body.height > 1 {
+                let actions = Rect::new(body.x, body.y + 1, body.width, 1);
+                let mut x = render_toolbar_segment(
+                    "[History]",
+                    actions.x,
+                    actions,
+                    button_style,
+                    Some(HitTarget::HarnessWorkspaceGitHistory(origin.clone())),
+                    buf,
+                    layout,
+                );
+                x = render_toolbar_segment(
+                    "[Working diff]",
+                    x.saturating_add(1),
+                    actions,
+                    button_style,
+                    Some(HitTarget::HarnessWorkspaceGitWorking(origin.clone())),
+                    buf,
+                    layout,
+                );
+                let _ = render_toolbar_segment(
+                    "[Staged diff]",
+                    x.saturating_add(1),
+                    actions,
+                    button_style,
+                    Some(HitTarget::HarnessWorkspaceGitStaged(origin.clone())),
+                    buf,
+                    layout,
+                );
+            }
+            let mut y = body.y.saturating_add(3);
+            for commit in &git.recent_commits {
+                if y >= body.bottom() {
+                    break;
+                }
+                Paragraph::new(truncate_cells(
+                    &format!("{} {}", &commit.id[..commit.id.len().min(10)], commit.summary),
+                    body.width as usize,
+                ))
+                    .style(Style::default().fg(theme.dim).bg(theme.surface))
+                    .render(Rect::new(body.x, y, body.width, 1), buf);
+                y = y.saturating_add(1);
+            }
+            if !git.is_repository && y < body.bottom() {
+                Paragraph::new("Git unavailable: run workspace is not a repository")
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(Rect::new(body.x, y, body.width, 1), buf);
             }
         }
         HarnessTaskDetailSection::Execution => {
@@ -4051,6 +4321,7 @@ fn render_harness_monitor(
     view: &crate::app::HarnessRunMonitorView,
     area: Rect,
     buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
     theme: Theme,
 ) {
     fill_rect(area, theme.surface, buf);
@@ -4083,6 +4354,27 @@ fn render_harness_monitor(
         Paragraph::new(truncate_cells(&status, area.width as usize))
             .style(Style::default().fg(if view.stale_reason.is_some() { theme.yellow } else { theme.dim }).bg(theme.surface))
             .render(Rect::new(area.x, area.y + 1, area.width, 1), buf);
+    }
+    if area.height > 2 {
+        let actions = Rect::new(area.x, area.y + 2, area.width, 1);
+        let x = render_toolbar_segment(
+            "[Files]",
+            actions.x,
+            actions,
+            Style::default().fg(theme.teal).bg(theme.surface),
+            Some(HitTarget::HarnessTaskDetailRunFiles(view.run.run_id.clone())),
+            buf,
+            layout,
+        );
+        let _ = render_toolbar_segment(
+            "[Git]",
+            x.saturating_add(1),
+            actions,
+            Style::default().fg(theme.teal).bg(theme.surface),
+            Some(HitTarget::HarnessTaskDetailRunGit(view.run.run_id.clone())),
+            buf,
+            layout,
+        );
     }
     if area.height > 3 {
         let tokens = view.monitor.as_ref().map(|monitor| format!(
@@ -4366,6 +4658,10 @@ fn surface_pane_tab_title(app: &App, tab: &SurfaceTab) -> String {
         },
         SurfaceTab::File(key) => repository_path_file_name_display(&key.path),
         SurfaceTab::Git(key) => git_surface_title(app, key),
+        SurfaceTab::HarnessFile(key) => repository_path_file_name_display(&key.path),
+        SurfaceTab::HarnessGit(key) => key.history_path.as_ref()
+            .map(|path| format!("{} Git", repository_path_file_name_display(path)))
+            .unwrap_or_else(|| "workspace Git".to_owned()),
         SurfaceTab::Preview(key) => app
             .preview_tabs
             .get(key)
@@ -4618,6 +4914,41 @@ fn render_surface_toolbar(
                 layout,
             );
         }
+        Some(SurfaceTab::HarnessFile(key)) => {
+            let ready = app.harness_file_tabs.get(key)
+                .is_some_and(|file| file.state == WorkspaceFileState::Ready);
+            if ready {
+                x = render_toolbar_segment(
+                    "[History]",
+                    x,
+                    area,
+                    button_style,
+                    Some(HitTarget::HarnessFileHistory(pane_id)),
+                    buf,
+                    layout,
+                );
+            }
+            let _ = render_toolbar_segment(
+                &format!(" read-only | {} ", key.origin.label()),
+                x.saturating_add(1),
+                area,
+                detail_style,
+                None,
+                buf,
+                layout,
+            );
+        }
+        Some(SurfaceTab::HarnessGit(key)) => {
+            let _ = render_toolbar_segment(
+                &format!(" read-only Git | {} ", key.origin.label()),
+                x,
+                area,
+                detail_style,
+                None,
+                buf,
+                layout,
+            );
+        }
         Some(SurfaceTab::Pty(_)) => {
             let _ = render_toolbar_segment(
                 " live PTY | drag select | wheel scrollback ",
@@ -4757,6 +5088,7 @@ fn render_workspace_file_tab_rich(
     area: Rect,
     buf: &mut TerminalBuffer,
     theme: Theme,
+    harness_read_only: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -4837,19 +5169,23 @@ fn render_workspace_file_tab_rich(
                     .render(Rect::new(area.x, y, area.width, 1), buf);
             }
             if status_height > 0 {
-                let sync = match tab.editor.sync_state() {
-                    crate::text_editor::SyncState::Clean => "saved",
-                    crate::text_editor::SyncState::Dirty => "modified",
-                    crate::text_editor::SyncState::Saving => "saving...",
-                    crate::text_editor::SyncState::Conflict(_) => "save conflict",
-                    crate::text_editor::SyncState::Error(_) => "save failed",
+                let status = if harness_read_only {
+                    " read-only Harness run file | select/copy | d Git".to_owned()
+                } else {
+                    let sync = match tab.editor.sync_state() {
+                        crate::text_editor::SyncState::Clean => "saved",
+                        crate::text_editor::SyncState::Dirty => "modified",
+                        crate::text_editor::SyncState::Saving => "saving...",
+                        crate::text_editor::SyncState::Conflict(_) => "save conflict",
+                        crate::text_editor::SyncState::Error(_) => "save failed",
+                    };
+                    format!(
+                        " {} | {} | {} bytes | click/drag select | Ctrl+A/C/X/V",
+                        if tab.edit_mode { "EDIT" } else { "VIEW" },
+                        sync,
+                        tab.editor.byte_len(),
+                    )
                 };
-                let status = format!(
-                    " {} | {} | {} bytes | click/drag select | Ctrl+A/C/X/V",
-                    if tab.edit_mode { "EDIT" } else { "VIEW" },
-                    sync,
-                    tab.editor.byte_len(),
-                );
                 Paragraph::new(truncate_cells(&status, area.width as usize))
                     .style(Style::default().fg(theme.teal).bg(theme.active))
                     .render(Rect::new(area.x, area.bottom() - 1, area.width, 1), buf);
@@ -5198,6 +5534,7 @@ fn render_workspace_git_tab(
     layout: &mut LayoutRects,
     theme: Theme,
     spinner: char,
+    harness_origin: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -5236,10 +5573,20 @@ fn render_workspace_git_tab(
                 .render(row, buf);
             layout.hits.push(HitRegion {
                 rect: row,
-                target: HitTarget::GitCommit(pane_id, index),
+                target: if harness_origin {
+                    HitTarget::HarnessGitCommit(pane_id, index)
+                } else {
+                    HitTarget::GitCommit(pane_id, index)
+                },
             });
         }
-        let footer = if tab.has_more {
+        let footer = if harness_origin && tab.history_truncated && tab.has_more {
+            " history truncated | Up/Down select | Enter open | Load more: l older "
+        } else if harness_origin && tab.history_truncated {
+            " history truncated | no continuation cursor "
+        } else if harness_origin && tab.has_more {
+            " Up/Down select | Enter open | w working | s staged | Load more: l older "
+        } else if tab.has_more {
             " Up/Down select | Enter open | w working | s staged | l older "
         } else {
             " Up/Down select | Enter open | w working | s staged "
@@ -5272,7 +5619,11 @@ fn render_workspace_git_tab(
         let back_width = 7.min(area.width);
         layout.hits.push(HitRegion {
             rect: Rect::new(area.x + 1.min(area.width.saturating_sub(1)), footer_area.y, back_width, 1),
-            target: HitTarget::GitBack(pane_id),
+            target: if harness_origin {
+                HitTarget::HarnessGitBack(pane_id)
+            } else {
+                HitTarget::GitBack(pane_id)
+            },
         });
     }
 }
@@ -8261,6 +8612,12 @@ mod tests {
         assert!(runs_layout.hits.iter().any(|hit| {
             matches!(hit.target, HitTarget::HarnessTaskDetailRunMonitor(_))
         }));
+        assert!(runs_layout.hits.iter().any(|hit| {
+            matches!(hit.target, HitTarget::HarnessTaskDetailRunFiles(_))
+        }));
+        assert!(runs_layout.hits.iter().any(|hit| {
+            matches!(hit.target, HitTarget::HarnessTaskDetailRunGit(_))
+        }));
 
         app.harness_kanban.detail.as_mut().unwrap().section =
             crate::app::HarnessTaskDetailSection::Agents;
@@ -8269,7 +8626,70 @@ mod tests {
         let agents_text = buffer_text(&agents_buf);
         assert!(agents_text.contains("exact correlation unavailable"), "{agents_text}");
         assert!(agents_text.contains("PTY: unavailable"), "{agents_text}");
-        assert!(agents_text.contains("Workspace: unavailable"), "{agents_text}");
+        assert!(
+            agents_text.contains("Workspace/Git: open Files or Git to load"),
+            "{agents_text}"
+        );
+        assert!(!agents_text.contains("workspace contract pending"), "{agents_text}");
+
+        let run_ref = app.harness_run_ref(
+            app.harness_kanban.detail.as_ref().unwrap().selected_run.as_ref().unwrap(),
+        ).unwrap();
+        let origin = crate::app::HarnessRunOrigin {
+            run: run_ref.clone(),
+            node_id: gate4agent_harness_protocol::HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id:
+                gate4agent_harness_client::HarnessNodeIncarnationV1::new("ab".repeat(16)).unwrap(),
+            workspace_id:
+                gate4agent_harness_protocol::HarnessSelectorV1::new("workspace-a").unwrap(),
+        };
+        app.harness_kanban.workspaces.insert(origin.clone(), crate::app::HarnessWorkspaceView {
+            origin: origin.clone(),
+            state: crate::app::HarnessWorkspaceState::Ready,
+            entries: vec![WorkspaceEntry {
+                relative_path: repository_path("src/lib.rs"),
+                kind: WorkspaceEntryKind::File,
+            }],
+            tree_truncated: true,
+            git: Some(GitSnapshot {
+                is_repository: true,
+                branch: Some("main".to_owned()),
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                worktrees: Vec::new(),
+                managed_worktree: None,
+                truncated: true,
+                diagnostic: None,
+            }),
+            selected: 0,
+            scroll: 0,
+            request_token: 1,
+        });
+
+        app.harness_kanban.detail.as_mut().unwrap().section =
+            crate::app::HarnessTaskDetailSection::Files;
+        let mut files_buf = TerminalBuffer::new(120, 28);
+        render(&app, &mut files_buf);
+        assert!(buffer_text(&files_buf).contains("file tree truncated"));
+
+        app.harness_kanban.detail.as_mut().unwrap().section =
+            crate::app::HarnessTaskDetailSection::Git;
+        let mut git_buf = TerminalBuffer::new(120, 28);
+        render(&app, &mut git_buf);
+        assert!(buffer_text(&git_buf).contains("Git snapshot truncated"));
+
+        app.harness_kanban.detail.as_mut().unwrap().section =
+            crate::app::HarnessTaskDetailSection::Agents;
+        let mut loaded_agents_buf = TerminalBuffer::new(120, 28);
+        let loaded_agents_layout = render(&app, &mut loaded_agents_buf);
+        let loaded_agents_text = buffer_text(&loaded_agents_buf);
+        assert!(loaded_agents_text.contains("[Files] [Git]"), "{loaded_agents_text}");
+        assert!(loaded_agents_layout.hits.iter().any(|hit| {
+            matches!(hit.target, HitTarget::HarnessTaskDetailRunFiles(_))
+        }));
+        assert!(loaded_agents_layout.hits.iter().any(|hit| {
+            matches!(hit.target, HitTarget::HarnessTaskDetailRunGit(_))
+        }));
     }
 
     #[test]
@@ -11547,6 +11967,7 @@ mod tests {
                 Rect::new(0, 0, 120, 3),
                 &mut buffer,
                 theme,
+                false,
             );
 
             let content_x = 4;
@@ -11561,6 +11982,39 @@ mod tests {
                 .collect::<String>();
             assert!(footer.contains("click/drag select"), "{footer:?}");
             assert!(footer.contains("Ctrl+A/C/X/V"), "{footer:?}");
+        }
+    }
+
+    #[test]
+    fn harness_workspace_file_status_is_explicitly_read_only() {
+        let tab = WorkspaceFileTabView {
+            editor: crate::text_editor::TextEditor::from_text("let value = 1;".to_owned())
+                .expect("text editor"),
+            state: WorkspaceFileState::Ready,
+            edit_mode: false,
+            request_token: 1,
+            inline_history: None,
+        };
+        let mut buffer = TerminalBuffer::new(120, 3);
+
+        render_workspace_file_tab_rich(
+            &tab,
+            "src/lib.rs",
+            Rect::new(0, 0, 120, 3),
+            &mut buffer,
+            Theme::for_mode(PtyColorMode::GateOverride),
+            true,
+        );
+
+        let footer = (0..120)
+            .map(|column| buffer.get(column, 2).symbol.as_str())
+            .collect::<String>();
+        assert!(
+            footer.contains("read-only Harness run file | select/copy | d Git"),
+            "{footer:?}"
+        );
+        for forbidden in ["EDIT", "VIEW", "saved", "Ctrl+X", "Ctrl+V", "Ctrl+A/C/X/V"] {
+            assert!(!footer.contains(forbidden), "{forbidden}: {footer:?}");
         }
     }
 
@@ -11769,6 +12223,7 @@ mod tests {
                 detail_scroll: 0,
                 next_before: None,
                 has_more: false,
+                history_truncated: false,
                 diff: None,
                 diff_error: None,
                 pending_diff: None,
@@ -11842,6 +12297,51 @@ mod tests {
         assert_eq!(stats, GitDiffStats { files: 2, added: 2, deleted: 2 });
     }
 
+    #[test]
+    fn harness_git_history_warning_and_pagination_are_independent() {
+        let pane_id = PaneId(17);
+        let theme = Theme::for_mode(PtyColorMode::GateOverride);
+        for (history_truncated, next_before, has_more, expected, forbidden) in [
+            (true, None, false, "history truncated", "Load more"),
+            (false, Some("a".repeat(40)), true, "Load more", "history truncated"),
+        ] {
+            let tab = WorkspaceGitTabView {
+                state: WorkspaceGitState::Ready,
+                mode: WorkspaceGitPaneMode::List,
+                history_path: None,
+                commits: Vec::new(),
+                selected: 0,
+                list_scroll: 0,
+                detail_scroll: 0,
+                next_before,
+                has_more,
+                history_truncated,
+                diff: None,
+                diff_error: None,
+                pending_diff: None,
+                history_token: 1,
+                diff_token: 0,
+            };
+            let mut buffer = TerminalBuffer::new(100, 3);
+            let mut layout = LayoutRects::default();
+
+            render_workspace_git_tab(
+                &tab,
+                pane_id,
+                Rect::new(0, 0, 100, 3),
+                &mut buffer,
+                &mut layout,
+                theme,
+                '*',
+                true,
+            );
+
+            let text = buffer_text(&buffer);
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains(forbidden), "{text}");
+        }
+    }
+
     fn git_commit_view(id: char, subject: &str) -> crate::app::GitCommitView {
         crate::app::GitCommitView {
             id: id.to_string().repeat(40),
@@ -11873,6 +12373,7 @@ mod tests {
             detail_scroll: 0,
             next_before: None,
             has_more: false,
+            history_truncated: false,
             diff: None,
             diff_error: None,
             pending_diff: None,
@@ -11928,6 +12429,7 @@ mod tests {
             detail_scroll: 0,
             next_before: None,
             has_more: false,
+            history_truncated: false,
             diff: Some(crate::app::WorkspaceGitDiffView {
                 target: crate::app::WorkspaceGitDiffTarget::Commit {
                     revision,
@@ -12024,6 +12526,7 @@ mod tests {
                 detail_scroll: 0,
                 next_before: None,
                 has_more: false,
+                history_truncated: false,
                 diff: Some(crate::app::WorkspaceGitDiffView {
                     target: crate::app::WorkspaceGitDiffTarget::Commit {
                         revision,

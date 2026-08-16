@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate4agent_c2_protocol::C2RelayRoute;
 use gate4agent_node_protocol::{
-    AgentProgressCurrentV1, AgentProgressV1, GitWorktreeSnapshot, HostDirectoryEntry, HostDirectoryListing, LaunchInventory,
+    AgentProgressCurrentV1, AgentProgressV1, GitSnapshot, GitWorktreeSnapshot, HostDirectoryEntry, HostDirectoryListing, LaunchInventory,
     ManagedSessionState, ManagedWorktreeLeaseSnapshot, ManagedWorktreeSpawnReceipt,
     NativeSessionCatalogPage,
     NodeIncarnationId, OpaqueHostPath, RepositoryPath,
@@ -12,7 +12,7 @@ use gate4agent_node_protocol::{
     ResolvedBundleReceipt, ResolvedContextPackReceipt,
     ResolvedSpawnReceipt, SessionMode, SessionTaskBindingV1, SessionTaskTargetV1,
     SpawnBundleId, SpawnContextId, SpawnProfileId, TaskId,
-    WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorktreeProfileId,
+    WorkspaceEntry, WorkspaceEntryKind, WorkspaceId, WorkspaceInspection, WorktreeProfileId,
     WorktreeServiceMode,
     WorktreeProfileInventory,
     MAX_NODE_IDENTIFIER_BYTES, MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES,
@@ -43,7 +43,7 @@ use gate4agent_types::{
 use gate4agent_harness_client::{
     HarnessExpectedExecutionSpecRevisionV1, HarnessLaunchPlanSummaryV1,
     HarnessOperatorMutationOutcomeV1, HarnessRequestDigest, HarnessRevision,
-    HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
+    HarnessNodeIncarnationV1, HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
     HarnessTaskExecutionSpecInputV1, HarnessTaskExecutionSpecV1, HarnessTaskId,
     HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
     HarnessTaskStateV1, RedactedBindingStateV1, RedactedRunV1, RedactedTaskV1,
@@ -55,7 +55,7 @@ use gate4agent_harness_protocol::HarnessSelectorV1;
 use gate4agent_harness_client::{
     HarnessDispatchIntentV1, HarnessExecutionModeV1, HarnessExecutionSpecId,
     HarnessIdempotencyRef, HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1,
-    HarnessManagedRunSessionV1, HarnessNodeIncarnationV1, HarnessOperationId,
+    HarnessManagedRunSessionV1, HarnessOperationId,
     HarnessRunIntentV1, HarnessScheduledLaunchRefV2,
     HarnessRunCorrelationAvailabilityV1, HarnessRunLifecycleV1, HarnessRuntimeIdentityV1,
     HarnessRunWorktreeViewV1, HarnessWorktreeIntentV1, RedactedRunIntentV1,
@@ -578,17 +578,28 @@ pub enum HarnessTaskDetailSection {
     Overview,
     Runs,
     Agents,
+    Files,
+    Git,
     Execution,
 }
 
 impl HarnessTaskDetailSection {
-    pub const ALL: [Self; 4] = [Self::Overview, Self::Runs, Self::Agents, Self::Execution];
+    pub const ALL: [Self; 6] = [
+        Self::Overview,
+        Self::Runs,
+        Self::Agents,
+        Self::Files,
+        Self::Git,
+        Self::Execution,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
             Self::Runs => "Runs",
             Self::Agents => "Agents",
+            Self::Files => "Files",
+            Self::Git => "Git",
             Self::Execution => "Execution",
         }
     }
@@ -615,6 +626,80 @@ pub struct HarnessTaskDetailState {
     pub scroll: usize,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HarnessRunRef {
+    pub run_id: HarnessRunId,
+    pub run_revision: HarnessRevision,
+}
+
+impl std::hash::Hash for HarnessRunRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.run_id, state);
+        std::hash::Hash::hash(&self.run_revision.get(), state);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HarnessRunOrigin {
+    pub run: HarnessRunRef,
+    pub node_id: HarnessSelectorV1,
+    pub node_incarnation_id: HarnessNodeIncarnationV1,
+    pub workspace_id: HarnessSelectorV1,
+}
+
+impl HarnessRunOrigin {
+    pub fn label(&self) -> String {
+        format!(
+            "Harness run {} r{}",
+            self.run.run_id,
+            self.run.run_revision.get(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessReadFailure {
+    pub category: String,
+    pub message: String,
+}
+
+impl HarnessReadFailure {
+    pub fn display(&self) -> String {
+        format!("{}: {}", self.category, self.message)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessWorkspaceState {
+    Loading,
+    Ready,
+    Error(HarnessReadFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessWorkspaceView {
+    pub origin: HarnessRunOrigin,
+    pub state: HarnessWorkspaceState,
+    pub entries: Vec<WorkspaceEntry>,
+    pub tree_truncated: bool,
+    pub git: Option<GitSnapshot>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub request_token: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessWorkspaceRequestState {
+    Loading,
+    Error(HarnessReadFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessWorkspaceRequest {
+    pub token: u64,
+    pub state: HarnessWorkspaceRequestState,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HarnessKanbanState {
     pub enabled: bool,
@@ -639,6 +724,8 @@ pub struct HarnessKanbanState {
     pub execution_mutation: Option<HarnessExecutionMutationState>,
     pub last_start: Option<HarnessTaskStartOutcomeV1>,
     pub monitor: Option<HarnessRunMonitorView>,
+    pub workspaces: BTreeMap<HarnessRunOrigin, HarnessWorkspaceView>,
+    pub workspace_requests: BTreeMap<HarnessRunRef, HarnessWorkspaceRequest>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1047,6 +1134,10 @@ pub enum DragState {
         key: WorkspaceFileTabKey,
         viewport: Rect,
     },
+    HarnessFileSelection {
+        key: HarnessWorkspaceFileTabKey,
+        viewport: Rect,
+    },
     FileScrollbar {
         key: WorkspaceFileTabKey,
         viewport: Rect,
@@ -1357,11 +1448,29 @@ pub struct WorkspaceGitTabView {
     pub detail_scroll: usize,
     pub next_before: Option<String>,
     pub has_more: bool,
+    pub history_truncated: bool,
     pub diff: Option<WorkspaceGitDiffView>,
     pub diff_error: Option<String>,
     pub pending_diff: Option<WorkspaceGitDiffTarget>,
     pub history_token: u64,
     pub diff_token: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HarnessWorkspaceFileTabKey {
+    pub origin: HarnessRunOrigin,
+    pub path: RepositoryPath,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HarnessWorkspaceGitTabKey {
+    pub origin: HarnessRunOrigin,
+    pub history_path: Option<RepositoryPath>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessWorkspaceGitRequestDestination {
+    Surface(HarnessWorkspaceGitTabKey),
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1372,13 +1481,21 @@ pub enum SurfaceTab {
     Preview(PreviewTabKey),
     File(WorkspaceFileTabKey),
     Git(WorkspaceGitTabKey),
+    HarnessFile(HarnessWorkspaceFileTabKey),
+    HarnessGit(HarnessWorkspaceGitTabKey),
 }
 
 impl SurfaceTab {
     pub fn pty_address(&self) -> Option<&SessionAddress> {
         match self {
             Self::Pty(address) => Some(address),
-            Self::AgentBoard | Self::SessionMonitor(_) | Self::Preview(_) | Self::File(_) | Self::Git(_) => None,
+            Self::AgentBoard
+            | Self::SessionMonitor(_)
+            | Self::Preview(_)
+            | Self::File(_)
+            | Self::Git(_)
+            | Self::HarnessFile(_)
+            | Self::HarnessGit(_) => None,
         }
     }
 }
@@ -1994,6 +2111,29 @@ pub enum AppAction {
         expected_execution_spec_revision: HarnessRevision,
         expected_scheduled_launch_digest: HarnessRequestDigest,
     },
+    HarnessInspectWorkspace {
+        run: HarnessRunRef,
+        token: u64,
+    },
+    HarnessReadWorkspaceFile {
+        origin: HarnessRunOrigin,
+        path: RepositoryPath,
+        token: u64,
+    },
+    HarnessReadGitHistory {
+        origin: HarnessRunOrigin,
+        path: Option<RepositoryPath>,
+        before: Option<String>,
+        limit: u16,
+        token: u64,
+        destination: HarnessWorkspaceGitRequestDestination,
+    },
+    HarnessReadGitDiff {
+        origin: HarnessRunOrigin,
+        target: WorkspaceGitDiffTarget,
+        token: u64,
+        destination: HarnessWorkspaceGitRequestDestination,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2080,6 +2220,12 @@ pub enum HitTarget {
     HarnessTaskDetailSection(HarnessTaskDetailSection),
     HarnessTaskDetailRun(HarnessRunId),
     HarnessTaskDetailRunMonitor(HarnessRunId),
+    HarnessTaskDetailRunFiles(HarnessRunId),
+    HarnessTaskDetailRunGit(HarnessRunId),
+    HarnessWorkspaceFile(HarnessRunOrigin, RepositoryPath),
+    HarnessWorkspaceGitHistory(HarnessRunOrigin),
+    HarnessWorkspaceGitWorking(HarnessRunOrigin),
+    HarnessWorkspaceGitStaged(HarnessRunOrigin),
     HarnessAgentTask(HarnessTaskId, HarnessRunId),
     HarnessExecutionPlan(HarnessSelectorV1),
     HarnessExecutionUsePlan,
@@ -2116,6 +2262,9 @@ pub enum HitTarget {
     FileScrollbar(PaneId),
     GitCommit(PaneId, usize),
     GitBack(PaneId),
+    HarnessFileHistory(PaneId),
+    HarnessGitCommit(PaneId, usize),
+    HarnessGitBack(PaneId),
     PreviewResume(PaneId),
     Settings,
     ControlSection(ControlSection),
@@ -2173,6 +2322,8 @@ pub struct App {
     pub preview_tabs: BTreeMap<PreviewTabKey, PreviewTabView>,
     pub file_tabs: BTreeMap<WorkspaceFileTabKey, WorkspaceFileTabView>,
     pub git_tabs: BTreeMap<WorkspaceGitTabKey, WorkspaceGitTabView>,
+    pub harness_file_tabs: BTreeMap<HarnessWorkspaceFileTabKey, WorkspaceFileTabView>,
+    pub harness_git_tabs: BTreeMap<HarnessWorkspaceGitTabKey, WorkspaceGitTabView>,
     pub session_monitors: BTreeMap<SessionMonitorTarget, SessionMonitorView>,
     pub pending_open: Vec<SessionAddress>,
     pub pending_space: Option<(String, String)>,
@@ -2249,6 +2400,7 @@ pub struct App {
     file_request_token: u64,
     workspace_entry_token: u64,
     git_request_token: u64,
+    harness_read_token: u64,
     existing_session_operation_token: u64,
     preview_resume: Option<PreviewResumeOperation>,
     cancelled_preview_resumes: BTreeSet<(String, String, u64)>,
@@ -2275,6 +2427,8 @@ impl Default for App {
             preview_tabs: BTreeMap::new(),
             file_tabs: BTreeMap::new(),
             git_tabs: BTreeMap::new(),
+            harness_file_tabs: BTreeMap::new(),
+            harness_git_tabs: BTreeMap::new(),
             session_monitors: BTreeMap::new(),
             pending_open: Vec::new(),
             pending_space: None,
@@ -2351,6 +2505,7 @@ impl Default for App {
             file_request_token: 0,
             workspace_entry_token: 0,
             git_request_token: 0,
+            harness_read_token: 0,
             existing_session_operation_token: 0,
             preview_resume: None,
             cancelled_preview_resumes: BTreeSet::new(),
@@ -2496,6 +2651,12 @@ impl App {
                             || history.pending_diff.is_some()
                     }),
                 SurfaceTab::Git(key) => self.git_tabs.get(key).is_some_and(|history| {
+                    history.state == WorkspaceGitState::Loading
+                        || history.pending_diff.is_some()
+                }),
+                SurfaceTab::HarnessFile(key) => self.harness_file_tabs.get(key)
+                    .is_some_and(|file| file.state == WorkspaceFileState::Loading),
+                SurfaceTab::HarnessGit(key) => self.harness_git_tabs.get(key).is_some_and(|history| {
                     history.state == WorkspaceGitState::Loading
                         || history.pending_diff.is_some()
                 }),
@@ -2980,6 +3141,12 @@ impl App {
                 .and_then(|git| git.history_path.as_ref())
                 .map(|path| format!("git {}", repository_path_file_name_display(path)))
                 .unwrap_or_else(|| "git".to_owned()),
+            SurfaceTab::HarnessFile(key) => format!(
+                "{} | {}",
+                repository_path_file_name_display(&key.path),
+                key.origin.label(),
+            ),
+            SurfaceTab::HarnessGit(key) => format!("git | {}", key.origin.label()),
         }
     }
 
@@ -2995,6 +3162,24 @@ impl App {
             return None;
         };
         Some((key, self.git_tabs.get(key)?))
+    }
+
+    pub fn focused_harness_file(
+        &self,
+    ) -> Option<(&HarnessWorkspaceFileTabKey, &WorkspaceFileTabView)> {
+        let SurfaceTab::HarnessFile(key) = self.surface.active_tab()? else {
+            return None;
+        };
+        Some((key, self.harness_file_tabs.get(key)?))
+    }
+
+    pub fn focused_harness_git(
+        &self,
+    ) -> Option<(&HarnessWorkspaceGitTabKey, &WorkspaceGitTabView)> {
+        let SurfaceTab::HarnessGit(key) = self.surface.active_tab()? else {
+            return None;
+        };
+        Some((key, self.harness_git_tabs.get(key)?))
     }
 
     pub fn find_managed_session(&self, key: &AgentRowKey) -> Option<&ManagedSessionView> {
@@ -4917,6 +5102,146 @@ impl App {
         AppAction::HarnessOpenMonitor { run_id }
     }
 
+    pub fn harness_run_ref(&self, run_id: &HarnessRunId) -> Option<HarnessRunRef> {
+        let run = self.harness_kanban.runs.get(run_id)?;
+        Some(HarnessRunRef {
+            run_id: run.run_id.clone(),
+            run_revision: run.revision,
+        })
+    }
+
+    pub fn harness_workspace_for_run(
+        &self,
+        run: &HarnessRunRef,
+    ) -> Option<(&HarnessRunOrigin, &HarnessWorkspaceView)> {
+        self.harness_kanban.workspaces.iter()
+            .find(|(origin, _)| &origin.run == run)
+    }
+
+    fn open_harness_workspace_section(
+        &mut self,
+        run_id: HarnessRunId,
+        section: HarnessTaskDetailSection,
+    ) -> AppAction {
+        let Some(run) = self.harness_run_ref(&run_id) else {
+            self.notice = Some("Harness workspace unavailable: run is not loaded".to_owned());
+            return AppAction::None;
+        };
+        if let Some(detail) = self.harness_kanban.detail.as_mut() {
+            detail.selected_run = Some(run_id);
+            detail.section = section;
+            detail.scroll = 0;
+        }
+        self.harness_kanban.monitor = None;
+        if self.harness_workspace_for_run(&run).is_some()
+            || self.harness_kanban.workspace_requests.get(&run)
+                .is_some_and(|request| matches!(request.state, HarnessWorkspaceRequestState::Loading))
+        {
+            return AppAction::None;
+        }
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let token = self.harness_read_token;
+        self.harness_kanban.workspace_requests.insert(
+            run.clone(),
+            HarnessWorkspaceRequest {
+                token,
+                state: HarnessWorkspaceRequestState::Loading,
+            },
+        );
+        AppAction::HarnessInspectWorkspace { run, token }
+    }
+
+    fn open_harness_workspace_file(
+        &mut self,
+        origin: HarnessRunOrigin,
+        path: RepositoryPath,
+    ) -> AppAction {
+        let valid_file = self.harness_kanban.workspaces.get(&origin).is_some_and(|workspace| {
+            workspace.state == HarnessWorkspaceState::Ready
+                && workspace.entries.iter().any(|entry| {
+                    entry.kind == WorkspaceEntryKind::File && entry.relative_path == path
+                })
+        });
+        if !valid_file {
+            self.notice = Some(
+                "Harness file unavailable: path is not an inspected run-relative file".to_owned(),
+            );
+            return AppAction::None;
+        }
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let token = self.harness_read_token;
+        let key = HarnessWorkspaceFileTabKey {
+            origin: origin.clone(),
+            path: path.clone(),
+        };
+        self.harness_file_tabs.insert(
+            key.clone(),
+            WorkspaceFileTabView {
+                editor: TextEditor::default(),
+                state: WorkspaceFileState::Loading,
+                edit_mode: false,
+                request_token: token,
+                inline_history: None,
+            },
+        );
+        self.surface.open_in_focused(SurfaceTab::HarnessFile(key));
+        self.focus = Focus::Viewport;
+        AppAction::HarnessReadWorkspaceFile { origin, path, token }
+    }
+
+    fn open_harness_workspace_git(
+        &mut self,
+        origin: HarnessRunOrigin,
+        history_path: Option<RepositoryPath>,
+        pending_diff: Option<WorkspaceGitDiffTarget>,
+    ) -> AppAction {
+        if !self.harness_kanban.workspaces.contains_key(&origin) {
+            self.notice = Some("Harness Git unavailable: run workspace is not inspected".to_owned());
+            return AppAction::None;
+        }
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let token = self.harness_read_token;
+        let key = HarnessWorkspaceGitTabKey {
+            origin: origin.clone(),
+            history_path: history_path.clone(),
+        };
+        let destination = HarnessWorkspaceGitRequestDestination::Surface(key.clone());
+        self.harness_git_tabs.insert(
+            key.clone(),
+            WorkspaceGitTabView {
+                state: WorkspaceGitState::Loading,
+                mode: if pending_diff.is_some() {
+                    WorkspaceGitPaneMode::Detail
+                } else {
+                    WorkspaceGitPaneMode::List
+                },
+                history_path: history_path.clone(),
+                commits: Vec::new(),
+                selected: 0,
+                list_scroll: 0,
+                detail_scroll: 0,
+                next_before: None,
+                has_more: false,
+                history_truncated: false,
+                diff: None,
+                diff_error: None,
+                pending_diff,
+                history_token: token,
+                diff_token: 0,
+            },
+        );
+        self.surface.open_in_focused(SurfaceTab::HarnessGit(key));
+        self.focus = Focus::Viewport;
+        AppAction::HarnessReadGitHistory {
+            origin,
+            path: history_path,
+            before: None,
+            limit: 20,
+            token,
+            destination,
+        }
+    }
+
     fn derive_agent_board_card(&self, key: AgentRowKey) -> Option<AgentBoardCard> {
         let node = self.agent_board_node(&key)?;
         let disconnected = match &node.connection {
@@ -5667,7 +5992,12 @@ impl App {
             .filter(|tab| match tab {
                 SurfaceTab::File(key) => should_prune(&key.node_id, &key.workspace_id),
                 SurfaceTab::Git(key) => should_prune(&key.node_id, &key.workspace_id),
-                SurfaceTab::AgentBoard | SurfaceTab::SessionMonitor(_) | SurfaceTab::Pty(_) | SurfaceTab::Preview(_) => false,
+                SurfaceTab::AgentBoard
+                | SurfaceTab::SessionMonitor(_)
+                | SurfaceTab::Pty(_)
+                | SurfaceTab::Preview(_)
+                | SurfaceTab::HarnessFile(_)
+                | SurfaceTab::HarnessGit(_) => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -6061,6 +6391,7 @@ impl App {
                 }) => source_node == node_id,
                 SurfaceTab::File(key) => key.node_id == node_id,
                 SurfaceTab::Git(key) => key.node_id == node_id,
+                SurfaceTab::HarnessFile(_) | SurfaceTab::HarnessGit(_) => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -7030,6 +7361,8 @@ impl App {
             SurfaceTab::Preview(key) => self.preview_tabs.contains_key(key),
             SurfaceTab::File(key) => self.file_tabs.contains_key(key),
             SurfaceTab::Git(key) => self.git_tabs.contains_key(key),
+            SurfaceTab::HarnessFile(key) => self.harness_file_tabs.contains_key(key),
+            SurfaceTab::HarnessGit(key) => self.harness_git_tabs.contains_key(key),
         };
         if !available {
             return false;
@@ -7168,6 +7501,28 @@ impl App {
                         moved,
                     },
                 ),
+                SurfaceTab::HarnessFile(key) => self.harness_file_tabs.contains_key(&key).then_some(
+                    DragState::SessionChip {
+                        source,
+                        tab: SurfaceTab::HarnessFile(key),
+                        start_column,
+                        start_row,
+                        current_column,
+                        current_row,
+                        moved,
+                    },
+                ),
+                SurfaceTab::HarnessGit(key) => self.harness_git_tabs.contains_key(&key).then_some(
+                    DragState::SessionChip {
+                        source,
+                        tab: SurfaceTab::HarnessGit(key),
+                        start_column,
+                        start_row,
+                        current_column,
+                        current_row,
+                        moved,
+                    },
+                ),
             },
             DragState::AgentSelection {
                 key,
@@ -7242,6 +7597,10 @@ impl App {
             self.file_tabs.remove(key);
         } else if let SurfaceTab::Git(key) = &tab {
             self.git_tabs.remove(key);
+        } else if let SurfaceTab::HarnessFile(key) = &tab {
+            self.harness_file_tabs.remove(key);
+        } else if let SurfaceTab::HarnessGit(key) = &tab {
+            self.harness_git_tabs.remove(key);
         }
         if let SurfaceTab::Pty(address) = &tab {
             if self
@@ -7267,6 +7626,8 @@ impl App {
             SurfaceTab::Preview(_) => "session tab closed".to_owned(),
             SurfaceTab::File(_) => "file tab closed".to_owned(),
             SurfaceTab::Git(_) => "Git tab closed".to_owned(),
+            SurfaceTab::HarnessFile(_) => "read-only Harness file tab closed".to_owned(),
+            SurfaceTab::HarnessGit(_) => "Harness Git tab closed".to_owned(),
         });
     }
 
@@ -7495,9 +7856,19 @@ impl App {
                 return AppAction::None;
             }
             Some(HitTarget::HarnessTaskDetailSection(section)) => {
+                let selected_run = self.harness_kanban.detail.as_ref()
+                    .and_then(|detail| detail.selected_run.clone());
                 if let Some(detail) = self.harness_kanban.detail.as_mut() {
                     detail.section = *section;
                     detail.scroll = 0;
+                }
+                if matches!(section, HarnessTaskDetailSection::Files | HarnessTaskDetailSection::Git) {
+                    if let Some(run_id) = selected_run {
+                        return self.open_harness_workspace_section(run_id, *section);
+                    }
+                    self.notice = Some(
+                        "Harness workspace unavailable: Task Detail has no selected run".to_owned(),
+                    );
                 }
                 return AppAction::None;
             }
@@ -7515,6 +7886,38 @@ impl App {
             }
             Some(HitTarget::HarnessTaskDetailRunMonitor(run_id)) => {
                 return self.open_harness_run_monitor(run_id.clone());
+            }
+            Some(HitTarget::HarnessTaskDetailRunFiles(run_id)) => {
+                return self.open_harness_workspace_section(
+                    run_id.clone(),
+                    HarnessTaskDetailSection::Files,
+                );
+            }
+            Some(HitTarget::HarnessTaskDetailRunGit(run_id)) => {
+                return self.open_harness_workspace_section(
+                    run_id.clone(),
+                    HarnessTaskDetailSection::Git,
+                );
+            }
+            Some(HitTarget::HarnessWorkspaceFile(origin, path)) => {
+                return self.open_harness_workspace_file(origin.clone(), path.clone());
+            }
+            Some(HitTarget::HarnessWorkspaceGitHistory(origin)) => {
+                return self.open_harness_workspace_git(origin.clone(), None, None);
+            }
+            Some(HitTarget::HarnessWorkspaceGitWorking(origin)) => {
+                return self.open_harness_workspace_git(
+                    origin.clone(),
+                    None,
+                    Some(WorkspaceGitDiffTarget::Working { path: None }),
+                );
+            }
+            Some(HitTarget::HarnessWorkspaceGitStaged(origin)) => {
+                return self.open_harness_workspace_git(
+                    origin.clone(),
+                    None,
+                    Some(WorkspaceGitDiffTarget::Staged { path: None }),
+                );
             }
             Some(HitTarget::HarnessAgentTask(task_id, run_id)) => {
                 let action = self.open_harness_task_detail(task_id.clone());
@@ -8017,6 +8420,50 @@ impl App {
                     tab.detail_scroll = 0;
                 }
             }
+            Some(HitTarget::HarnessFileHistory(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                let key = self.surface.panes.get(&pane_id)
+                    .and_then(|pane| pane.active_tab())
+                    .and_then(|tab| match tab {
+                        SurfaceTab::HarnessFile(key) => Some(key.clone()),
+                        _ => None,
+                    });
+                if let Some(key) = key {
+                    return self.open_harness_workspace_git(
+                        key.origin,
+                        Some(key.path),
+                        None,
+                    );
+                }
+            }
+            Some(HitTarget::HarnessGitCommit(pane_id, index)) => {
+                self.focus_surface_pane(pane_id);
+                let key = self.surface.panes.get(&pane_id)
+                    .and_then(|pane| pane.active_tab())
+                    .and_then(|tab| match tab {
+                        SurfaceTab::HarnessGit(key) => Some(key.clone()),
+                        _ => None,
+                    });
+                if let Some(key) = key {
+                    return self.request_harness_git_commit_diff(
+                        &HarnessWorkspaceGitRequestDestination::Surface(key),
+                        index,
+                    );
+                }
+            }
+            Some(HitTarget::HarnessGitBack(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                let key = self.surface.panes.get(&pane_id)
+                    .and_then(|pane| pane.active_tab())
+                    .and_then(|tab| match tab {
+                        SurfaceTab::HarnessGit(key) => Some(key.clone()),
+                        _ => None,
+                    });
+                if let Some(tab) = key.and_then(|key| self.harness_git_tabs.get_mut(&key)) {
+                    tab.mode = WorkspaceGitPaneMode::List;
+                    tab.detail_scroll = 0;
+                }
+            }
             Some(HitTarget::PreviewResume(pane_id)) => {
                 self.focus_surface_pane(pane_id);
                 return self.start_focused_preview_resume();
@@ -8088,6 +8535,12 @@ impl App {
                 | HitTarget::HarnessTaskDetailSection(_)
                 | HitTarget::HarnessTaskDetailRun(_)
                 | HitTarget::HarnessTaskDetailRunMonitor(_)
+                | HitTarget::HarnessTaskDetailRunFiles(_)
+                | HitTarget::HarnessTaskDetailRunGit(_)
+                | HitTarget::HarnessWorkspaceFile(_, _)
+                | HitTarget::HarnessWorkspaceGitHistory(_)
+                | HitTarget::HarnessWorkspaceGitWorking(_)
+                | HitTarget::HarnessWorkspaceGitStaged(_)
                 | HitTarget::HarnessAgentTask(_, _)
                 | HitTarget::HarnessExecutionPlan(_)
                 | HitTarget::HarnessExecutionUsePlan
@@ -8656,6 +9109,25 @@ impl App {
                     );
                 }
             }
+            DragState::HarnessFileSelection { key, viewport } => {
+                if let Some(file) = self.harness_file_tabs.get_mut(&key) {
+                    let number_width = file.editor.line_count().max(1).to_string().len().max(3)
+                        + 1
+                        + usize::from(file.editor.scroll_column() > 0);
+                    let viewport_row = row
+                        .min(viewport.bottom().saturating_sub(2))
+                        .saturating_sub(viewport.y) as usize;
+                    let viewport_column = column
+                        .saturating_sub(viewport.x)
+                        .saturating_sub(number_width.min(u16::MAX as usize) as u16)
+                        as usize;
+                    file.editor.update_drag_selection(viewport_row, viewport_column);
+                    file.editor.ensure_cursor_visible(
+                        viewport.height.saturating_sub(1) as usize,
+                        viewport.width.saturating_sub(number_width as u16) as usize,
+                    );
+                }
+            }
             DragState::FileScrollbar { key, viewport } => {
                 self.update_file_scrollbar(&key, viewport, row);
             }
@@ -8672,7 +9144,9 @@ impl App {
         };
         match &drag {
             DragState::SurfaceDivider { .. } => return AppAction::None,
-            DragState::FileSelection { .. } => return AppAction::None,
+            DragState::FileSelection { .. } | DragState::HarnessFileSelection { .. } => {
+                return AppAction::None;
+            }
             DragState::FileScrollbar { key, viewport } => {
                 let key = key.clone();
                 let viewport = *viewport;
@@ -8757,7 +9231,18 @@ impl App {
                     self.surface.open_in_focused(SurfaceTab::Git(key));
                     self.focus = Focus::Viewport;
                 }
-                SurfaceTab::File(_) | SurfaceTab::Git(_) => {}
+                SurfaceTab::HarnessFile(key) if self.harness_file_tabs.contains_key(&key) => {
+                    self.surface.open_in_focused(SurfaceTab::HarnessFile(key));
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::HarnessGit(key) if self.harness_git_tabs.contains_key(&key) => {
+                    self.surface.open_in_focused(SurfaceTab::HarnessGit(key));
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::File(_)
+                | SurfaceTab::Git(_)
+                | SurfaceTab::HarnessFile(_)
+                | SurfaceTab::HarnessGit(_) => {}
             }
             return AppAction::None;
         }
@@ -9046,6 +9531,7 @@ impl App {
             detail_scroll: 0,
             next_before: None,
             has_more: false,
+            history_truncated: false,
             diff: None,
             diff_error: None,
             pending_diff: None,
@@ -9060,6 +9546,7 @@ impl App {
         view.list_scroll = 0;
         view.next_before = None;
         view.has_more = false;
+        view.history_truncated = false;
         view.diff = None;
         view.pending_diff = pending_diff;
         view.history_token = token;
@@ -9107,6 +9594,7 @@ impl App {
             detail_scroll: 0,
             next_before: None,
             has_more: false,
+            history_truncated: false,
             diff: None,
             diff_error: None,
             pending_diff,
@@ -10769,6 +11257,26 @@ impl App {
                 file.editor.start_drag_selection(viewport_row, viewport_column);
                 self.drag_state = Some(DragState::FileSelection { key, viewport });
             }
+            SurfaceTab::HarnessFile(key) => {
+                let Some(file) = self.harness_file_tabs.get_mut(&key) else {
+                    return;
+                };
+                if !matches!(file.state, WorkspaceFileState::Ready)
+                    || row >= viewport.bottom().saturating_sub(1)
+                {
+                    return;
+                }
+                let number_width = file.editor.line_count().max(1).to_string().len().max(3)
+                    + 1
+                    + usize::from(file.editor.scroll_column() > 0);
+                let viewport_row = row.saturating_sub(viewport.y) as usize;
+                let viewport_column = column
+                    .saturating_sub(viewport.x)
+                    .saturating_sub(number_width.min(u16::MAX as usize) as u16)
+                    as usize;
+                file.editor.start_drag_selection(viewport_row, viewport_column);
+                self.drag_state = Some(DragState::HarnessFileSelection { key, viewport });
+            }
             SurfaceTab::Pty(address) => {
                 let x = column.saturating_sub(viewport.x).min(viewport.width.saturating_sub(1));
                 let y = row.saturating_sub(viewport.y).min(viewport.height.saturating_sub(1));
@@ -10780,7 +11288,9 @@ impl App {
                 });
                 self.drag_state = Some(DragState::TerminalSelection { address, viewport });
             }
-            SurfaceTab::Preview(_) | SurfaceTab::Git(_) => {}
+            SurfaceTab::Preview(_)
+            | SurfaceTab::Git(_)
+            | SurfaceTab::HarnessGit(_) => {}
         }
     }
 
@@ -10874,6 +11384,34 @@ impl App {
             }
             SurfaceTab::Git(key) => {
                 if let Some(tab) = self.git_tabs.get_mut(&key) {
+                    if tab.mode == WorkspaceGitPaneMode::Detail {
+                        tab.detail_scroll = if up {
+                            tab.detail_scroll.saturating_sub(WHEEL_SCROLL_LINES)
+                        } else {
+                            tab.detail_scroll.saturating_add(WHEEL_SCROLL_LINES)
+                        };
+                    } else {
+                        tab.list_scroll = if up {
+                            tab.list_scroll.saturating_sub(WHEEL_SCROLL_LINES)
+                        } else {
+                            tab.list_scroll.saturating_add(WHEEL_SCROLL_LINES)
+                        };
+                    }
+                }
+                return AppAction::None;
+            }
+            SurfaceTab::HarnessFile(key) => {
+                if let Some(tab) = self.harness_file_tabs.get_mut(&key) {
+                    tab.editor.scroll_vertical(if up {
+                        -(WHEEL_SCROLL_LINES as isize)
+                    } else {
+                        WHEEL_SCROLL_LINES as isize
+                    });
+                }
+                return AppAction::None;
+            }
+            SurfaceTab::HarnessGit(key) => {
+                if let Some(tab) = self.harness_git_tabs.get_mut(&key) {
                     if tab.mode == WorkspaceGitPaneMode::Detail {
                         tab.detail_scroll = if up {
                             tab.detail_scroll.saturating_sub(WHEEL_SCROLL_LINES)
@@ -11835,6 +12373,14 @@ impl App {
             let git_key = git_key.clone();
             return self.reduce_git_viewport(git_key, key);
         }
+        if let Some((file_key, _)) = self.focused_harness_file() {
+            let file_key = file_key.clone();
+            return self.reduce_harness_file_viewport(file_key, key);
+        }
+        if let Some((git_key, _)) = self.focused_harness_git() {
+            let git_key = git_key.clone();
+            return self.reduce_harness_git_viewport(git_key, key);
+        }
         if let Some((preview_key, _)) = self.focused_preview() {
             let preview_key = preview_key.clone();
             if matches!(key, UiKey::Char('r') | UiKey::Char('R') | UiKey::Enter) {
@@ -12269,6 +12815,220 @@ impl App {
         }
     }
 
+    fn reduce_harness_file_viewport(
+        &mut self,
+        key: HarnessWorkspaceFileTabKey,
+        input: UiKey,
+    ) -> AppAction {
+        let Some(tab) = self.harness_file_tabs.get_mut(&key) else {
+            return AppAction::None;
+        };
+        if tab.state != WorkspaceFileState::Ready {
+            return AppAction::None;
+        }
+        match input {
+            UiKey::Up => tab.editor.scroll_vertical(-1),
+            UiKey::Down => tab.editor.scroll_vertical(1),
+            UiKey::Left => tab.editor.scroll_horizontal(-1),
+            UiKey::Right => tab.editor.scroll_horizontal(1),
+            UiKey::PageUp => tab.editor.scroll_vertical(-(self.terminal_rows as isize)),
+            UiKey::PageDown => tab.editor.scroll_vertical(self.terminal_rows as isize),
+            UiKey::Home => tab.editor.set_scroll(0, 0),
+            UiKey::Char('d') | UiKey::Ctrl('d') => {
+                return self.open_harness_workspace_git(
+                    key.origin,
+                    Some(key.path),
+                    None,
+                );
+            }
+            UiKey::Ctrl('a') => tab.editor.select_all(),
+            UiKey::Ctrl('c') => {
+                if let Some(text) = tab.editor.selected_text() {
+                    match write_clipboard_text(text) {
+                        Ok(()) => self.notice = Some("selection copied".to_owned()),
+                        Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                    }
+                }
+            }
+            UiKey::Char('e') | UiKey::Ctrl('s') | UiKey::Ctrl('x') | UiKey::Ctrl('v') => {
+                self.notice = Some(
+                    "Harness run file is read-only; edit, save, cut, and paste are unavailable"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn harness_git_view_mut(
+        &mut self,
+        destination: &HarnessWorkspaceGitRequestDestination,
+    ) -> Option<&mut WorkspaceGitTabView> {
+        match destination {
+            HarnessWorkspaceGitRequestDestination::Surface(key) => {
+                self.harness_git_tabs.get_mut(key)
+            }
+        }
+    }
+
+    fn harness_git_view(
+        &self,
+        destination: &HarnessWorkspaceGitRequestDestination,
+    ) -> Option<&WorkspaceGitTabView> {
+        match destination {
+            HarnessWorkspaceGitRequestDestination::Surface(key) => self.harness_git_tabs.get(key),
+        }
+    }
+
+    fn reduce_harness_git_viewport(
+        &mut self,
+        key: HarnessWorkspaceGitTabKey,
+        input: UiKey,
+    ) -> AppAction {
+        let destination = HarnessWorkspaceGitRequestDestination::Surface(key);
+        let Some(tab) = self.harness_git_view(&destination) else {
+            return AppAction::None;
+        };
+        let mode = tab.mode;
+        let selected = tab.selected;
+        let last = tab.commits.len().saturating_sub(1);
+        let has_more = tab.has_more;
+        if mode == WorkspaceGitPaneMode::Detail {
+            match input {
+                UiKey::Escape | UiKey::Backspace => {
+                    if let Some(tab) = self.harness_git_view_mut(&destination) {
+                        tab.mode = WorkspaceGitPaneMode::List;
+                        tab.detail_scroll = 0;
+                    }
+                }
+                UiKey::Up => {
+                    if let Some(tab) = self.harness_git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_sub(1);
+                    }
+                }
+                UiKey::Down => {
+                    if let Some(tab) = self.harness_git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_add(1);
+                    }
+                }
+                UiKey::PageUp => {
+                    let rows = self.terminal_rows as usize;
+                    if let Some(tab) = self.harness_git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_sub(rows);
+                    }
+                }
+                UiKey::PageDown => {
+                    let rows = self.terminal_rows as usize;
+                    if let Some(tab) = self.harness_git_view_mut(&destination) {
+                        tab.detail_scroll = tab.detail_scroll.saturating_add(rows);
+                    }
+                }
+                UiKey::Left if selected > 0 => {
+                    return self.request_harness_git_commit_diff(&destination, selected - 1);
+                }
+                UiKey::Right if selected < last => {
+                    return self.request_harness_git_commit_diff(&destination, selected + 1);
+                }
+                _ => {}
+            }
+            return AppAction::None;
+        }
+        match input {
+            UiKey::Up if selected > 0 => {
+                if let Some(tab) = self.harness_git_view_mut(&destination) {
+                    tab.selected = selected - 1;
+                }
+            }
+            UiKey::Down if selected < last => {
+                if let Some(tab) = self.harness_git_view_mut(&destination) {
+                    tab.selected = selected + 1;
+                }
+            }
+            UiKey::Enter | UiKey::Char('d') => {
+                return self.request_harness_git_commit_diff(&destination, selected);
+            }
+            UiKey::Char('w') | UiKey::Char('s') => {
+                let HarnessWorkspaceGitRequestDestination::Surface(key) = &destination;
+                self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+                let token = self.harness_read_token;
+                let target = if input == UiKey::Char('w') {
+                    WorkspaceGitDiffTarget::Working { path: key.history_path.clone() }
+                } else {
+                    WorkspaceGitDiffTarget::Staged { path: key.history_path.clone() }
+                };
+                if let Some(tab) = self.harness_git_view_mut(&destination) {
+                    tab.mode = WorkspaceGitPaneMode::Detail;
+                    tab.pending_diff = Some(target.clone());
+                    tab.diff = None;
+                    tab.diff_error = None;
+                    tab.diff_token = token;
+                }
+                return AppAction::HarnessReadGitDiff {
+                    origin: key.origin.clone(),
+                    target,
+                    token,
+                    destination,
+                };
+            }
+            UiKey::Char('l') if has_more => {
+                let HarnessWorkspaceGitRequestDestination::Surface(key) = &destination;
+                let before = self.harness_git_view(&destination)
+                    .and_then(|tab| tab.next_before.clone());
+                self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+                let token = self.harness_read_token;
+                if let Some(tab) = self.harness_git_view_mut(&destination) {
+                    tab.history_token = token;
+                }
+                return AppAction::HarnessReadGitHistory {
+                    origin: key.origin.clone(),
+                    path: key.history_path.clone(),
+                    before,
+                    limit: 20,
+                    token,
+                    destination,
+                };
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn request_harness_git_commit_diff(
+        &mut self,
+        destination: &HarnessWorkspaceGitRequestDestination,
+        index: usize,
+    ) -> AppAction {
+        let HarnessWorkspaceGitRequestDestination::Surface(key) = destination;
+        let Some(commit) = self.harness_git_view(destination)
+            .and_then(|tab| tab.commits.get(index))
+            .cloned()
+        else {
+            return AppAction::None;
+        };
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let token = self.harness_read_token;
+        let target = WorkspaceGitDiffTarget::Commit {
+            revision: commit.id,
+            path: key.history_path.clone(),
+        };
+        if let Some(tab) = self.harness_git_view_mut(destination) {
+            tab.selected = index;
+            tab.mode = WorkspaceGitPaneMode::Detail;
+            tab.detail_scroll = 0;
+            tab.pending_diff = Some(target.clone());
+            tab.diff = None;
+            tab.diff_error = None;
+            tab.diff_token = token;
+        }
+        AppAction::HarnessReadGitDiff {
+            origin: key.origin.clone(),
+            target,
+            token,
+            destination: destination.clone(),
+        }
+    }
+
     fn git_view(
         &self,
         destination: &WorkspaceGitRequestDestination,
@@ -12570,6 +13330,245 @@ impl App {
             gate4agent_node_protocol::WorkspaceFileContent::TooLarge { limit_bytes } => {
                 tab.state = WorkspaceFileState::TooLarge { limit_bytes };
             }
+        }
+    }
+
+    pub fn apply_harness_workspace_inspection(
+        &mut self,
+        run: HarnessRunRef,
+        token: u64,
+        origin: HarnessRunOrigin,
+        entries: Vec<WorkspaceEntry>,
+        tree_truncated: bool,
+        git: GitSnapshot,
+    ) {
+        let Some(request) = self.harness_kanban.workspace_requests.get_mut(&run) else {
+            return;
+        };
+        if request.token != token {
+            return;
+        }
+        if origin.run != run {
+            request.state = HarnessWorkspaceRequestState::Error(HarnessReadFailure {
+                category: "origin-mismatch".to_owned(),
+                message: format!(
+                    "requested run {} r{} but Harness replied for {} r{}",
+                    run.run_id,
+                    run.run_revision.get(),
+                    origin.run.run_id,
+                    origin.run.run_revision.get(),
+                ),
+            });
+            return;
+        }
+        self.harness_kanban.workspace_requests.remove(&run);
+        self.harness_kanban.workspaces.retain(|current, _| current.run != run);
+        self.harness_kanban.workspaces.insert(
+            origin.clone(),
+            HarnessWorkspaceView {
+                origin,
+                state: HarnessWorkspaceState::Ready,
+                entries,
+                tree_truncated,
+                git: Some(git),
+                selected: 0,
+                scroll: 0,
+                request_token: token,
+            },
+        );
+    }
+
+    pub fn fail_harness_workspace_inspection(
+        &mut self,
+        run: &HarnessRunRef,
+        token: u64,
+        failure: HarnessReadFailure,
+    ) {
+        let Some(request) = self.harness_kanban.workspace_requests.get_mut(run) else {
+            return;
+        };
+        if request.token == token {
+            request.state = HarnessWorkspaceRequestState::Error(failure);
+        }
+    }
+
+    pub fn apply_harness_workspace_file_read(
+        &mut self,
+        key: &HarnessWorkspaceFileTabKey,
+        token: u64,
+        origin: HarnessRunOrigin,
+        path: RepositoryPath,
+        content: gate4agent_node_protocol::WorkspaceFileContent,
+        revision: Option<String>,
+    ) {
+        let Some(tab) = self.harness_file_tabs.get_mut(key) else {
+            return;
+        };
+        if tab.request_token != token {
+            return;
+        }
+        if origin != key.origin || path != key.path {
+            tab.state = WorkspaceFileState::Error(
+                "origin-mismatch: Harness file reply did not match the exact run origin and path"
+                    .to_owned(),
+            );
+            tab.edit_mode = false;
+            return;
+        }
+        match content {
+            gate4agent_node_protocol::WorkspaceFileContent::Utf8 { text, .. } => {
+                match TextEditor::new(text, revision) {
+                    Ok(editor) => {
+                        tab.editor = editor;
+                        tab.state = WorkspaceFileState::Ready;
+                        tab.edit_mode = false;
+                    }
+                    Err(error) => {
+                        tab.state = WorkspaceFileState::Error(format!(
+                            "projection: {error:?}",
+                        ));
+                    }
+                }
+            }
+            gate4agent_node_protocol::WorkspaceFileContent::NonUtf8 { byte_len } => {
+                tab.state = WorkspaceFileState::NonUtf8 { byte_len };
+            }
+            gate4agent_node_protocol::WorkspaceFileContent::TooLarge { limit_bytes } => {
+                tab.state = WorkspaceFileState::TooLarge { limit_bytes };
+            }
+        }
+    }
+
+    pub fn fail_harness_workspace_file(
+        &mut self,
+        key: &HarnessWorkspaceFileTabKey,
+        token: u64,
+        failure: HarnessReadFailure,
+    ) {
+        let Some(tab) = self.harness_file_tabs.get_mut(key) else {
+            return;
+        };
+        if tab.request_token == token {
+            tab.state = WorkspaceFileState::Error(failure.display());
+            tab.edit_mode = false;
+        }
+    }
+
+    pub fn apply_harness_git_history(
+        &mut self,
+        destination: &HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        origin: HarnessRunOrigin,
+        path: Option<RepositoryPath>,
+        commits: Vec<GitCommitView>,
+        next_before: Option<String>,
+        has_more: bool,
+        history_truncated: bool,
+    ) -> Option<AppAction> {
+        let HarnessWorkspaceGitRequestDestination::Surface(key) = destination;
+        let target = {
+            let Some(tab) = self.harness_git_view_mut(destination) else {
+                return None;
+            };
+            if tab.history_token != token {
+                return None;
+            }
+            if origin != key.origin || path != key.history_path {
+                tab.state = WorkspaceGitState::Error(
+                    "origin-mismatch: Harness Git history reply did not match the exact run origin and scope"
+                        .to_owned(),
+                );
+                tab.pending_diff = None;
+                return None;
+            }
+            let append = !tab.commits.is_empty() && tab.next_before.is_some();
+            if append {
+                for commit in commits {
+                    if !tab.commits.iter().any(|current| current.id == commit.id) {
+                        tab.commits.push(commit);
+                    }
+                }
+            } else {
+                tab.commits = commits;
+            }
+            tab.next_before = next_before;
+            tab.has_more = has_more;
+            if append {
+                tab.history_truncated |= history_truncated;
+            } else {
+                tab.history_truncated = history_truncated;
+            }
+            tab.state = WorkspaceGitState::Ready;
+            tab.pending_diff.clone()
+        }?;
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let diff_token = self.harness_read_token;
+        if let Some(tab) = self.harness_git_view_mut(destination) {
+            tab.diff_token = diff_token;
+        }
+        Some(AppAction::HarnessReadGitDiff {
+            origin: key.origin.clone(),
+            target,
+            token: diff_token,
+            destination: destination.clone(),
+        })
+    }
+
+    pub fn fail_harness_git_history(
+        &mut self,
+        destination: &HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        failure: HarnessReadFailure,
+    ) {
+        let Some(tab) = self.harness_git_view_mut(destination) else {
+            return;
+        };
+        if tab.history_token == token {
+            tab.state = WorkspaceGitState::Error(failure.display());
+            tab.pending_diff = None;
+        }
+    }
+
+    pub fn apply_harness_git_diff(
+        &mut self,
+        destination: &HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        origin: HarnessRunOrigin,
+        diff: WorkspaceGitDiffView,
+    ) {
+        let HarnessWorkspaceGitRequestDestination::Surface(key) = destination;
+        let Some(tab) = self.harness_git_view_mut(destination) else {
+            return;
+        };
+        if tab.diff_token != token {
+            return;
+        }
+        if origin != key.origin || tab.pending_diff.as_ref() != Some(&diff.target) {
+            tab.pending_diff = None;
+            tab.diff_error = Some(
+                "origin-mismatch: Harness Git diff reply did not match the exact run origin and mode"
+                    .to_owned(),
+            );
+            return;
+        }
+        tab.pending_diff = None;
+        tab.diff_error = None;
+        tab.diff = Some(diff);
+        tab.detail_scroll = 0;
+    }
+
+    pub fn fail_harness_git_diff(
+        &mut self,
+        destination: &HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        failure: HarnessReadFailure,
+    ) {
+        let Some(tab) = self.harness_git_view_mut(destination) else {
+            return;
+        };
+        if tab.diff_token == token {
+            tab.pending_diff = None;
+            tab.diff_error = Some(failure.display());
         }
     }
 
@@ -24653,5 +25652,143 @@ mod tests {
             Some(SurfaceTab::SessionMonitor(key))
                 if key.target == runtime_monitor_target(&base, incarnation)
         ));
+    }
+
+    fn harness_workspace_origin(run_digit: char, revision: u64) -> HarnessRunOrigin {
+        HarnessRunOrigin {
+            run: HarnessRunRef {
+                run_id: HarnessRunId::new(format!("hrun_{}", run_digit.to_string().repeat(24)))
+                    .unwrap(),
+                run_revision: HarnessRevision::new(revision).unwrap(),
+            },
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("ab".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        }
+    }
+
+    #[test]
+    fn harness_file_origin_cannot_collide_with_manual_c2_workspace_key() {
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let manual = SurfaceTab::File(WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: path.clone(),
+        });
+        let harness = SurfaceTab::HarnessFile(HarnessWorkspaceFileTabKey {
+            origin: harness_workspace_origin('a', 4),
+            path,
+        });
+        assert_ne!(manual, harness);
+    }
+
+    #[test]
+    fn stale_harness_file_reply_is_ignored_and_origin_mismatch_fails_terminally() {
+        let mut app = App::default();
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let key = HarnessWorkspaceFileTabKey {
+            origin: harness_workspace_origin('a', 4),
+            path: path.clone(),
+        };
+        app.harness_file_tabs.insert(key.clone(), WorkspaceFileTabView {
+            editor: TextEditor::default(),
+            state: WorkspaceFileState::Loading,
+            edit_mode: false,
+            request_token: 9,
+            inline_history: None,
+        });
+        app.apply_harness_workspace_file_read(
+            &key,
+            8,
+            key.origin.clone(),
+            path.clone(),
+            gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+                text: "stale".to_owned(),
+                byte_len: 5,
+            },
+            Some("a".repeat(64)),
+        );
+        assert_eq!(app.harness_file_tabs[&key].state, WorkspaceFileState::Loading);
+
+        let mut mismatched = key.origin.clone();
+        mismatched.workspace_id = HarnessSelectorV1::new("workspace-b").unwrap();
+        app.apply_harness_workspace_file_read(
+            &key,
+            9,
+            mismatched,
+            path,
+            gate4agent_node_protocol::WorkspaceFileContent::Utf8 {
+                text: "current".to_owned(),
+                byte_len: 7,
+            },
+            Some("b".repeat(64)),
+        );
+        assert!(matches!(
+            &app.harness_file_tabs[&key].state,
+            WorkspaceFileState::Error(message) if message.contains("origin-mismatch")
+        ));
+    }
+
+    #[test]
+    fn harness_workspace_failure_clears_loading_state() {
+        let mut app = App::default();
+        let run = harness_workspace_origin('b', 2).run;
+        app.harness_kanban.workspace_requests.insert(run.clone(), HarnessWorkspaceRequest {
+            token: 11,
+            state: HarnessWorkspaceRequestState::Loading,
+        });
+        app.fail_harness_workspace_inspection(
+            &run,
+            11,
+            HarnessReadFailure {
+                category: "conflict".to_owned(),
+                message: "run revision changed".to_owned(),
+            },
+        );
+        assert!(matches!(
+            &app.harness_kanban.workspace_requests[&run].state,
+            HarnessWorkspaceRequestState::Error(failure) if failure.category == "conflict"
+        ));
+    }
+
+    #[test]
+    fn harness_file_view_never_enters_edit_mode_or_emits_write() {
+        let mut app = App::default();
+        let key = HarnessWorkspaceFileTabKey {
+            origin: harness_workspace_origin('c', 3),
+            path: RepositoryPath::utf8("README.md".to_owned()).unwrap(),
+        };
+        app.harness_file_tabs.insert(key.clone(), WorkspaceFileTabView {
+            editor: TextEditor::new("read only".to_owned(), Some("c".repeat(64))).unwrap(),
+            state: WorkspaceFileState::Ready,
+            edit_mode: false,
+            request_token: 12,
+            inline_history: None,
+        });
+        app.surface.open_in_focused(SurfaceTab::HarnessFile(key.clone()));
+        app.focus = Focus::Viewport;
+        assert_eq!(app.reduce(UiKey::Char('e')), AppAction::None);
+        assert!(!app.harness_file_tabs[&key].edit_mode);
+        assert_eq!(app.reduce(UiKey::Ctrl('s')), AppAction::None);
+        assert!(!app.harness_file_tabs[&key].editor.dirty());
+
+        let pane_id = app.surface.focused;
+        let viewport = Rect::new(10, 3, 40, 8);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id,
+            frame: Rect::new(9, 1, 42, 11),
+            header: Rect::new(10, 2, 40, 1),
+            viewport,
+        }];
+        app.begin_surface_body_interaction(pane_id, 14, 3);
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::HarnessFileSelection { .. })
+        ));
+        assert!(!app.harness_file_tabs[&key].edit_mode);
+        assert_eq!(app.drag(18, 3), AppAction::None);
+        assert_eq!(app.drop_at(18, 3), AppAction::None);
+        assert_eq!(app.harness_file_tabs[&key].editor.selected_text(), Some("read"));
+        assert!(!app.harness_file_tabs[&key].editor.dirty());
     }
 }

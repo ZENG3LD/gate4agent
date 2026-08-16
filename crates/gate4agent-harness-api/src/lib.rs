@@ -54,6 +54,18 @@ pub const HARNESS_NATIVE_SESSION_CATALOG_LIMIT_MAX: u16 = 64;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX: u16 = 24;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_TEXT_MAX_BYTES: usize = 4_096;
 pub const HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX: u16 = 64;
+pub const HARNESS_REPOSITORY_PATH_MAX_BYTES: usize = 1_024;
+pub const HARNESS_WORKSPACE_FILE_MAX_BYTES: usize = 256 * 1_024;
+pub const HARNESS_WORKSPACE_TREE_ENTRIES_MAX: usize = 512;
+pub const HARNESS_GIT_STATUS_ENTRIES_MAX: usize = 128;
+pub const HARNESS_GIT_RECENT_COMMITS_MAX: usize = 12;
+pub const HARNESS_GIT_HISTORY_LIMIT_MAX: u16 = 50;
+pub const HARNESS_GIT_DIFF_MAX_BYTES: usize = 512 * 1_024;
+pub const HARNESS_GIT_COMMIT_PARENTS_MAX: usize = 32;
+pub const HARNESS_GIT_SUMMARY_MAX_BYTES: usize = 1_024;
+pub const HARNESS_GIT_IDENTITY_MAX_BYTES: usize = 512;
+pub const HARNESS_GIT_TIMESTAMP_MAX_BYTES: usize = 128;
+pub const HARNESS_GIT_SIGNER_MAX_BYTES: usize = 1_024;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -438,6 +450,471 @@ impl HarnessLaunchPlanPageV1 {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct HarnessRepositoryPathV1(String);
+
+impl HarnessRepositoryPathV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessOperatorApiError> {
+        let value = value.into();
+        validate_repository_path(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        validate_repository_path(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessRepositoryPathV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct HarnessGitObjectIdV1(String);
+
+impl HarnessGitObjectIdV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessOperatorApiError> {
+        let value = value.into();
+        validate_git_object_id(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        validate_git_object_id(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessGitObjectIdV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct HarnessWorkspaceFileRevisionV1(String);
+
+impl HarnessWorkspaceFileRevisionV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessOperatorApiError> {
+        let value = value.into();
+        if value.len() != 64 || !value.bytes().all(is_lower_hex) {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if self.0.len() != 64 || !self.0.bytes().all(is_lower_hex) {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessWorkspaceFileRevisionV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunWorkspaceOriginV1 {
+    pub run_id: HarnessRunId,
+    pub run_revision: HarnessRevision,
+    pub node_id: HarnessSelectorV1,
+    pub node_incarnation_id: HarnessNodeIncarnationV1,
+    pub workspace_id: HarnessSelectorV1,
+}
+
+impl HarnessRunWorkspaceOriginV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.run_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_incarnation_id.validate()?;
+        self.workspace_id.validate().map_err(HarnessOperatorApiError::Protocol)
+    }
+
+    pub fn validate_for(&self, run_id: &HarnessRunId) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        if &self.run_id != run_id {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceOrigin);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessWorkspaceEntryKindV1 {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessWorkspaceTreeEntryV1 {
+    pub relative_path: HarnessRepositoryPathV1,
+    pub kind: HarnessWorkspaceEntryKindV1,
+}
+
+impl HarnessWorkspaceTreeEntryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.relative_path.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessGitStatusCodeV1 {
+    Unmodified,
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Unmerged,
+    Untracked,
+    Ignored,
+    TypeChanged,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessGitStatusEntryV1 {
+    pub index_status: HarnessGitStatusCodeV1,
+    pub worktree_status: HarnessGitStatusCodeV1,
+    pub path: HarnessRepositoryPathV1,
+    pub previous_path: Option<HarnessRepositoryPathV1>,
+}
+
+impl HarnessGitStatusEntryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.path.validate()?;
+        if let Some(previous_path) = &self.previous_path {
+            previous_path.validate()?;
+            if previous_path == &self.path {
+                return Err(HarnessOperatorApiError::InvalidGitStatus);
+            }
+        }
+        let renamed_or_copied = matches!(self.index_status, HarnessGitStatusCodeV1::Renamed | HarnessGitStatusCodeV1::Copied)
+            || matches!(self.worktree_status, HarnessGitStatusCodeV1::Renamed | HarnessGitStatusCodeV1::Copied);
+        if self.previous_path.is_some() != renamed_or_copied {
+            return Err(HarnessOperatorApiError::InvalidGitStatus);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessGitCommitSummaryV1 {
+    pub id: HarnessGitObjectIdV1,
+    pub summary: String,
+}
+
+impl HarnessGitCommitSummaryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.id.validate()?;
+        validate_git_single_line(&self.summary, HARNESS_GIT_SUMMARY_MAX_BYTES, false)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessGitSummaryV1 {
+    pub is_repository: bool,
+    pub branch: Option<String>,
+    pub status: Vec<HarnessGitStatusEntryV1>,
+    pub recent_commits: Vec<HarnessGitCommitSummaryV1>,
+    pub truncated: bool,
+}
+
+impl HarnessGitSummaryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if self.status.len() > HARNESS_GIT_STATUS_ENTRIES_MAX
+            || self.recent_commits.len() > HARNESS_GIT_RECENT_COMMITS_MAX
+            || !self.is_repository && (self.branch.is_some() || !self.status.is_empty() || !self.recent_commits.is_empty() || self.truncated)
+        {
+            return Err(HarnessOperatorApiError::InvalidGitSummary);
+        }
+        if let Some(branch) = &self.branch {
+            validate_git_single_line(branch, HARNESS_REPOSITORY_PATH_MAX_BYTES, true)?;
+        }
+        for status in &self.status { status.validate()?; }
+        if self.status.windows(2).any(|entries| entries[0].path >= entries[1].path) {
+            return Err(HarnessOperatorApiError::InvalidGitStatus);
+        }
+        for commit in &self.recent_commits { commit.validate()?; }
+        if self.recent_commits.iter().enumerate().any(|(index, commit)| {
+            self.recent_commits[..index].iter().any(|existing| existing.id == commit.id)
+        }) {
+            return Err(HarnessOperatorApiError::InvalidGitSummary);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunWorkspaceInspectionV1 {
+    pub origin: HarnessRunWorkspaceOriginV1,
+    pub entries: Vec<HarnessWorkspaceTreeEntryV1>,
+    pub tree_truncated: bool,
+    pub git: HarnessGitSummaryV1,
+}
+
+impl HarnessRunWorkspaceInspectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        if self.entries.len() > HARNESS_WORKSPACE_TREE_ENTRIES_MAX {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceTree);
+        }
+        for entry in &self.entries { entry.validate()?; }
+        if self.entries.windows(2).any(|entries| entries[0].relative_path >= entries[1].relative_path) {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceTree);
+        }
+        self.git.validate()
+    }
+
+    pub fn validate_for(&self, run_id: &HarnessRunId) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(run_id)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessWorkspaceFileContentV1 {
+    Utf8 { text: String, byte_len: u32 },
+    NonUtf8 { byte_len: u32 },
+    TooLarge { limit_bytes: u32 },
+}
+
+impl HarnessWorkspaceFileContentV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::Utf8 { text, byte_len } => {
+                if text.len() > HARNESS_WORKSPACE_FILE_MAX_BYTES || usize::try_from(*byte_len).ok() != Some(text.len()) {
+                    return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+                }
+            }
+            Self::NonUtf8 { byte_len } => {
+                if usize::try_from(*byte_len).map_or(true, |length| length > HARNESS_WORKSPACE_FILE_MAX_BYTES) {
+                    return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+                }
+            }
+            Self::TooLarge { limit_bytes } => {
+                if usize::try_from(*limit_bytes).ok() != Some(HARNESS_WORKSPACE_FILE_MAX_BYTES) {
+                    return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunWorkspaceFileV1 {
+    pub origin: HarnessRunWorkspaceOriginV1,
+    pub path: HarnessRepositoryPathV1,
+    pub content: HarnessWorkspaceFileContentV1,
+    pub revision: Option<HarnessWorkspaceFileRevisionV1>,
+}
+
+impl HarnessRunWorkspaceFileV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        self.path.validate()?;
+        self.content.validate()?;
+        if let Some(revision) = &self.revision { revision.validate()?; }
+        if !matches!(&self.content, HarnessWorkspaceFileContentV1::Utf8 { .. }) && self.revision.is_some() {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+        }
+        Ok(())
+    }
+
+
+    pub fn validate_for(
+        &self,
+        run_id: &HarnessRunId,
+        path: &HarnessRepositoryPathV1,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(run_id)?;
+        if &self.path != path {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessGitSignatureStatusV1 {
+    Good,
+    Bad,
+    UnknownValidity,
+    ExpiredSignature,
+    ExpiredKey,
+    RevokedKey,
+    CannotCheck,
+    NoSignature,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessGitCommitV1 {
+    pub id: HarnessGitObjectIdV1,
+    pub parents: Vec<HarnessGitObjectIdV1>,
+    pub subject: String,
+    pub author_name: String,
+    pub authored_at: String,
+    pub committer_name: String,
+    pub committed_at: String,
+    pub signature_status: HarnessGitSignatureStatusV1,
+    pub signer: Option<String>,
+}
+
+impl HarnessGitCommitV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.id.validate()?;
+        if self.parents.len() > HARNESS_GIT_COMMIT_PARENTS_MAX {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        for parent in &self.parents { parent.validate()?; }
+        if self.parents.iter().any(|parent| parent == &self.id) {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        validate_git_single_line(&self.subject, HARNESS_GIT_SUMMARY_MAX_BYTES, false)?;
+        validate_git_single_line(&self.author_name, HARNESS_GIT_IDENTITY_MAX_BYTES, false)?;
+        validate_git_single_line(&self.authored_at, HARNESS_GIT_TIMESTAMP_MAX_BYTES, true)?;
+        validate_git_single_line(&self.committer_name, HARNESS_GIT_IDENTITY_MAX_BYTES, false)?;
+        validate_git_single_line(&self.committed_at, HARNESS_GIT_TIMESTAMP_MAX_BYTES, true)?;
+        if let Some(signer) = &self.signer {
+            validate_git_single_line(signer, HARNESS_GIT_SIGNER_MAX_BYTES, true)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunGitHistoryPageV1 {
+    pub origin: HarnessRunWorkspaceOriginV1,
+    pub path: Option<HarnessRepositoryPathV1>,
+    pub commits: Vec<HarnessGitCommitV1>,
+    pub next_before: Option<HarnessGitObjectIdV1>,
+    pub truncated: bool,
+}
+
+impl HarnessRunGitHistoryPageV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        if let Some(path) = &self.path { path.validate()?; }
+        if self.commits.len() > usize::from(HARNESS_GIT_HISTORY_LIMIT_MAX) {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        for commit in &self.commits { commit.validate()?; }
+        if self.commits.iter().enumerate().any(|(index, commit)| {
+            self.commits[..index].iter().any(|existing| existing.id == commit.id)
+        }) {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        if let Some(next_before) = &self.next_before {
+            next_before.validate()?;
+            if self.commits.last().map(|commit| &commit.id) != Some(next_before) {
+                return Err(HarnessOperatorApiError::InvalidGitHistory);
+            }
+        }
+        Ok(())
+    }
+
+
+    pub fn validate_for(
+        &self,
+        run_id: &HarnessRunId,
+        path: Option<&HarnessRepositoryPathV1>,
+        limit: u16,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(run_id)?;
+        if self.path.as_ref() != path || self.commits.len() > usize::from(limit) {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessGitDiffModeV1 {
+    Working,
+    Staged,
+    Commit { revision: HarnessGitObjectIdV1 },
+}
+
+impl HarnessGitDiffModeV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::Working | Self::Staged => Ok(()),
+            Self::Commit { revision } => revision.validate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunGitDiffV1 {
+    pub origin: HarnessRunWorkspaceOriginV1,
+    pub mode: HarnessGitDiffModeV1,
+    pub path: Option<HarnessRepositoryPathV1>,
+    pub text: String,
+    pub truncated: bool,
+}
+
+impl HarnessRunGitDiffV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        self.mode.validate()?;
+        if let Some(path) = &self.path { path.validate()?; }
+        if self.text.len() > HARNESS_GIT_DIFF_MAX_BYTES {
+            return Err(HarnessOperatorApiError::InvalidGitDiff);
+        }
+        Ok(())
+    }
+
+
+    pub fn validate_for(
+        &self,
+        run_id: &HarnessRunId,
+        mode: &HarnessGitDiffModeV1,
+        path: Option<&HarnessRepositoryPathV1>,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(run_id)?;
+        if &self.mode != mode || self.path.as_ref() != path {
+            return Err(HarnessOperatorApiError::InvalidGitDiff);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorRequestV1 {
@@ -461,6 +938,22 @@ pub enum HarnessOperatorRequestV1 {
     },
     RunGet { run_id: HarnessRunId },
     RunCorrelationGet { run_id: HarnessRunId },
+    InspectRunWorkspace { run_id: HarnessRunId },
+    ReadRunWorkspaceFile {
+        run_id: HarnessRunId,
+        path: HarnessRepositoryPathV1,
+    },
+    ReadRunGitHistory {
+        run_id: HarnessRunId,
+        path: Option<HarnessRepositoryPathV1>,
+        before: Option<HarnessGitObjectIdV1>,
+        limit: u16,
+    },
+    ReadRunGitDiff {
+        run_id: HarnessRunId,
+        mode: HarnessGitDiffModeV1,
+        path: Option<HarnessRepositoryPathV1>,
+    },
     LaunchPlansList {
         after_plan_id: Option<HarnessSelectorV1>,
         limit: u16,
@@ -528,8 +1021,29 @@ impl HarnessOperatorRequestV1 {
                 }
                 validate_operator_limit(*limit)
             }
-            Self::RunGet { run_id } | Self::RunCorrelationGet { run_id } => {
+            Self::RunGet { run_id }
+            | Self::RunCorrelationGet { run_id }
+            | Self::InspectRunWorkspace { run_id } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+            Self::ReadRunWorkspaceFile { run_id, path } => {
+                run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                path.validate()
+            }
+            Self::ReadRunGitHistory { run_id, path, before, limit } => {
+                run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                if let Some(path) = path { path.validate()?; }
+                if let Some(before) = before { before.validate()?; }
+                if !(1..=HARNESS_GIT_HISTORY_LIMIT_MAX).contains(limit) {
+                    return Err(HarnessOperatorApiError::InvalidLimit);
+                }
+                Ok(())
+            }
+            Self::ReadRunGitDiff { run_id, mode, path } => {
+                run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                mode.validate()?;
+                if let Some(path) = path { path.validate()?; }
+                Ok(())
             }
             Self::LaunchPlansList { after_plan_id, limit } => {
                 if let Some(plan_id) = after_plan_id {
@@ -627,6 +1141,10 @@ impl HarnessOperatorRequestV1 {
         matches!(
             self,
             Self::RunCorrelationGet { .. }
+                | Self::InspectRunWorkspace { .. }
+                | Self::ReadRunWorkspaceFile { .. }
+                | Self::ReadRunGitHistory { .. }
+                | Self::ReadRunGitDiff { .. }
                 | Self::LaunchPlansList { .. }
                 | Self::TaskExecutionSpecGet { .. }
                 | Self::ReplaceTaskExecutionSpec { .. }
@@ -671,6 +1189,10 @@ pub enum HarnessOperatorResponseV1 {
     Runs(RunPageV1),
     Run(RedactedRunV1),
     RunCorrelation(HarnessRunCorrelationV1),
+    RunWorkspaceInspected(HarnessRunWorkspaceInspectionV1),
+    RunWorkspaceFileRead(HarnessRunWorkspaceFileV1),
+    RunGitHistoryRead(HarnessRunGitHistoryPageV1),
+    RunGitDiffRead(HarnessRunGitDiffV1),
     LaunchPlans(HarnessLaunchPlanPageV1),
     TaskExecutionSpec(Option<HarnessTaskExecutionSpecV1>),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
@@ -693,6 +1215,10 @@ impl HarnessOperatorResponseV1 {
             Self::Runs(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Run(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::RunCorrelation(value) => value.validate(),
+            Self::RunWorkspaceInspected(value) => value.validate(),
+            Self::RunWorkspaceFileRead(value) => value.validate(),
+            Self::RunGitHistoryRead(value) => value.validate(),
+            Self::RunGitDiffRead(value) => value.validate(),
             Self::LaunchPlans(value) => value.validate(),
             Self::TaskExecutionSpec(value) => {
                 if let Some(value) = value {
@@ -2132,6 +2658,24 @@ pub enum HarnessOperatorApiError {
     InvalidRuntimeInventory,
     #[error("harness run correlation is invalid")]
     InvalidRunCorrelation,
+    #[error("harness run workspace origin is invalid")]
+    InvalidWorkspaceOrigin,
+    #[error("harness repository-relative path is invalid")]
+    InvalidRepositoryPath,
+    #[error("harness run workspace tree is invalid")]
+    InvalidWorkspaceTree,
+    #[error("harness run workspace file is invalid")]
+    InvalidWorkspaceFile,
+    #[error("harness git status is invalid")]
+    InvalidGitStatus,
+    #[error("harness git summary is invalid")]
+    InvalidGitSummary,
+    #[error("harness git object id is invalid")]
+    InvalidGitObjectId,
+    #[error("harness git history is invalid")]
+    InvalidGitHistory,
+    #[error("harness git diff is invalid")]
+    InvalidGitDiff,
     #[error("harness launch plan catalog is invalid")]
     InvalidLaunchPlans,
     #[error("harness native history value is invalid")]
@@ -2200,6 +2744,43 @@ fn valid_runtime_id(value: &str, maximum: usize) -> bool {
 
 fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+}
+
+fn validate_repository_path(value: &str) -> Result<(), HarnessOperatorApiError> {
+    if value.is_empty()
+        || value.len() > HARNESS_REPOSITORY_PATH_MAX_BYTES
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+        || value.split('/').any(|component| {
+            component.is_empty() || matches!(component, "." | "..")
+        })
+    {
+        return Err(HarnessOperatorApiError::InvalidRepositoryPath);
+    }
+    Ok(())
+}
+
+fn validate_git_object_id(value: &str) -> Result<(), HarnessOperatorApiError> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(is_lower_hex) {
+        return Err(HarnessOperatorApiError::InvalidGitObjectId);
+    }
+    Ok(())
+}
+
+fn validate_git_single_line(
+    value: &str,
+    maximum: usize,
+    required: bool,
+) -> Result<(), HarnessOperatorApiError> {
+    if value.len() > maximum
+        || required && value.is_empty()
+        || value.chars().any(char::is_control)
+    {
+        return Err(HarnessOperatorApiError::InvalidGitSummary);
+    }
+    Ok(())
 }
 
 fn validate_native_session_catalog_limit(limit: u16) -> Result<(), HarnessOperatorApiError> {
@@ -2397,6 +2978,53 @@ mod tests {
             availability: HarnessRunCorrelationAvailabilityV1::Available,
             observed_at_unix_ms: Some(100),
         }
+    }
+
+    fn run_workspace_origin() -> HarnessRunWorkspaceOriginV1 {
+        HarnessRunWorkspaceOriginV1 {
+            run_id: HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(7).unwrap(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        }
+    }
+
+    fn git_commit(id_byte: char) -> HarnessGitCommitV1 {
+        HarnessGitCommitV1 {
+            id: HarnessGitObjectIdV1::new(id_byte.to_string().repeat(40)).unwrap(),
+            parents: Vec::new(),
+            subject: "Bounded subject".to_owned(),
+            author_name: "Author".to_owned(),
+            authored_at: "2026-08-16T10:00:00Z".to_owned(),
+            committer_name: "Committer".to_owned(),
+            committed_at: "2026-08-16T10:00:00Z".to_owned(),
+            signature_status: HarnessGitSignatureStatusV1::NoSignature,
+            signer: None,
+        }
+    }
+
+    fn assert_json_has_no_forbidden_keys(encoded: &str, forbidden: &[&str]) {
+        fn visit(value: &serde_json::Value, forbidden: &[&str]) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (field, value) in fields {
+                        assert!(
+                            !forbidden.iter().any(|forbidden| field == forbidden),
+                            "response exposed structural field {field}",
+                        );
+                        visit(value, forbidden);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values { visit(value, forbidden); }
+                }
+                _ => {}
+            }
+        }
+
+        let value: serde_json::Value = serde_json::from_str(encoded).unwrap();
+        visit(&value, forbidden);
     }
 
     #[test]
@@ -2951,6 +3579,320 @@ mod tests {
             "finished_at_unix_ms":null
         }"#;
         assert!(serde_json::from_str::<RedactedOperationV1>(operation_with_grant).is_err());
+    }
+
+    #[test]
+    fn operator_v4_run_workspace_requests_are_exact_harness_only_round_trips() {
+        let run_id = run_workspace_origin().run_id;
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let object_id = HarnessGitObjectIdV1::new("a".repeat(40)).unwrap();
+        let requests = vec![
+            HarnessOperatorRequestV1::InspectRunWorkspace {
+                run_id: run_id.clone(),
+            },
+            HarnessOperatorRequestV1::ReadRunWorkspaceFile {
+                run_id: run_id.clone(),
+                path: path.clone(),
+            },
+            HarnessOperatorRequestV1::ReadRunGitHistory {
+                run_id: run_id.clone(),
+                path: Some(path.clone()),
+                before: Some(object_id.clone()),
+                limit: HARNESS_GIT_HISTORY_LIMIT_MAX,
+            },
+            HarnessOperatorRequestV1::ReadRunGitDiff {
+                run_id,
+                mode: HarnessGitDiffModeV1::Commit { revision: object_id },
+                path: Some(path),
+            },
+        ];
+        for request in requests {
+            request.validate().expect("valid V4 workspace request");
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
+            let encoded = serde_json::to_string(&request).unwrap();
+            for forbidden in [
+                "node_id",
+                "workspace_id",
+                "endpoint",
+                "root",
+                "workspace_root",
+                "worktree",
+                "worktree_path",
+                "environment",
+                "spawn_spec",
+                "provider_home",
+            ] {
+                assert!(!encoded.contains(forbidden), "request exposed {forbidden}");
+            }
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn operator_v4_workspace_replies_round_trip_without_host_or_diagnostic_fields() {
+        let origin = run_workspace_origin();
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let commit = git_commit('a');
+        let responses = vec![
+            HarnessOperatorResponseV1::RunWorkspaceInspected(
+                HarnessRunWorkspaceInspectionV1 {
+                    origin: origin.clone(),
+                    entries: vec![HarnessWorkspaceTreeEntryV1 {
+                        relative_path: path.clone(),
+                        kind: HarnessWorkspaceEntryKindV1::File,
+                    }],
+                    tree_truncated: false,
+                    git: HarnessGitSummaryV1 {
+                        is_repository: true,
+                        branch: Some("main".to_owned()),
+                        status: vec![HarnessGitStatusEntryV1 {
+                            index_status: HarnessGitStatusCodeV1::Unmodified,
+                            worktree_status: HarnessGitStatusCodeV1::Modified,
+                            path: path.clone(),
+                            previous_path: None,
+                        }],
+                        recent_commits: vec![HarnessGitCommitSummaryV1 {
+                            id: commit.id.clone(),
+                            summary: commit.subject.clone(),
+                        }],
+                        truncated: false,
+                    },
+                },
+            ),
+            HarnessOperatorResponseV1::RunWorkspaceFileRead(HarnessRunWorkspaceFileV1 {
+                origin: origin.clone(),
+                path: path.clone(),
+                content: HarnessWorkspaceFileContentV1::Utf8 {
+                    text: "fn main() {}\n".to_owned(),
+                    byte_len: 13,
+                },
+                revision: Some(HarnessWorkspaceFileRevisionV1::new("b".repeat(64)).unwrap()),
+            }),
+            HarnessOperatorResponseV1::RunGitHistoryRead(HarnessRunGitHistoryPageV1 {
+                origin: origin.clone(),
+                path: Some(path.clone()),
+                commits: vec![commit],
+                next_before: None,
+                truncated: false,
+            }),
+            HarnessOperatorResponseV1::RunGitDiffRead(HarnessRunGitDiffV1 {
+                origin,
+                mode: HarnessGitDiffModeV1::Working,
+                path: Some(path),
+                text: "diff --git a/src/lib.rs b/src/lib.rs\n".to_owned(),
+                truncated: false,
+            }),
+        ];
+        for response in responses {
+            response.validate().expect("valid V4 workspace response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert_json_has_no_forbidden_keys(&encoded, &[
+                "root",
+                "worktree",
+                "endpoint",
+                "diagnostic",
+                "author_email",
+                "committer_email",
+                "environment",
+                "spawn_spec",
+                "provider_home",
+            ]);
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn operator_v4_repository_paths_and_git_cursors_fail_closed() {
+        for value in [
+            "",
+            ".",
+            "..",
+            "../secret",
+            "src/../secret",
+            "src//lib.rs",
+            "/absolute",
+            "C:/absolute",
+            r"src\lib.rs",
+            "src/\nlib.rs",
+        ] {
+            assert!(HarnessRepositoryPathV1::new(value).is_err(), "accepted {value:?}");
+        }
+        assert!(HarnessRepositoryPathV1::new("x".repeat(HARNESS_REPOSITORY_PATH_MAX_BYTES)).is_ok());
+        assert!(HarnessRepositoryPathV1::new("x".repeat(HARNESS_REPOSITORY_PATH_MAX_BYTES + 1)).is_err());
+        assert!(HarnessGitObjectIdV1::new("a".repeat(40)).is_ok());
+        assert!(HarnessGitObjectIdV1::new("a".repeat(64)).is_ok());
+        assert!(HarnessGitObjectIdV1::new("A".repeat(40)).is_err());
+        assert!(HarnessGitObjectIdV1::new("a".repeat(39)).is_err());
+
+        let unknown_route = format!(
+            r#"{{"kind":"read-run-workspace-file","run_id":"hrun_{}","path":"src/lib.rs","workspace_id":"forbidden"}}"#,
+            "a".repeat(24),
+        );
+        assert!(serde_json::from_str::<HarnessOperatorRequestV1>(&unknown_route).is_err());
+    }
+
+    #[test]
+    fn operator_v4_workspace_payloads_enforce_exact_bounds() {
+        let origin = run_workspace_origin();
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let at_file_limit = HarnessWorkspaceFileContentV1::Utf8 {
+            text: "x".repeat(HARNESS_WORKSPACE_FILE_MAX_BYTES),
+            byte_len: HARNESS_WORKSPACE_FILE_MAX_BYTES as u32,
+        };
+        assert!(at_file_limit.validate().is_ok());
+        assert!(HarnessWorkspaceFileContentV1::Utf8 {
+            text: "x".repeat(HARNESS_WORKSPACE_FILE_MAX_BYTES + 1),
+            byte_len: (HARNESS_WORKSPACE_FILE_MAX_BYTES + 1) as u32,
+        }.validate().is_err());
+        assert!(HarnessRunGitDiffV1 {
+            origin: origin.clone(),
+            mode: HarnessGitDiffModeV1::Working,
+            path: Some(path.clone()),
+            text: "x".repeat(HARNESS_GIT_DIFF_MAX_BYTES),
+            truncated: false,
+        }.validate().is_ok());
+        assert!(HarnessRunGitDiffV1 {
+            origin: origin.clone(),
+            mode: HarnessGitDiffModeV1::Working,
+            path: Some(path.clone()),
+            text: "x".repeat(HARNESS_GIT_DIFF_MAX_BYTES + 1),
+            truncated: true,
+        }.validate().is_err());
+        assert!(HarnessOperatorRequestV1::ReadRunGitHistory {
+            run_id: origin.run_id.clone(),
+            path: Some(path.clone()),
+            before: None,
+            limit: HARNESS_GIT_HISTORY_LIMIT_MAX + 1,
+        }.validate().is_err());
+
+        let entries: Vec<_> = (0..HARNESS_WORKSPACE_TREE_ENTRIES_MAX)
+            .map(|index| HarnessWorkspaceTreeEntryV1 {
+                relative_path: HarnessRepositoryPathV1::new(format!("entry-{index:04}")).unwrap(),
+                kind: HarnessWorkspaceEntryKindV1::File,
+            })
+            .collect();
+        let empty_git = HarnessGitSummaryV1 {
+            is_repository: false,
+            branch: None,
+            status: Vec::new(),
+            recent_commits: Vec::new(),
+            truncated: false,
+        };
+        assert!(HarnessRunWorkspaceInspectionV1 {
+            origin: origin.clone(),
+            entries: entries.clone(),
+            tree_truncated: false,
+            git: empty_git.clone(),
+        }.validate().is_ok());
+        let mut too_many_entries = entries;
+        too_many_entries.push(HarnessWorkspaceTreeEntryV1 {
+            relative_path: HarnessRepositoryPathV1::new("entry-0512").unwrap(),
+            kind: HarnessWorkspaceEntryKindV1::File,
+        });
+        assert!(HarnessRunWorkspaceInspectionV1 {
+            origin: origin.clone(),
+            entries: too_many_entries,
+            tree_truncated: true,
+            git: empty_git,
+        }.validate().is_err());
+
+        let status: Vec<_> = (0..HARNESS_GIT_STATUS_ENTRIES_MAX)
+            .map(|index| HarnessGitStatusEntryV1 {
+                index_status: HarnessGitStatusCodeV1::Unmodified,
+                worktree_status: HarnessGitStatusCodeV1::Modified,
+                path: HarnessRepositoryPathV1::new(format!("status-{index:04}")).unwrap(),
+                previous_path: None,
+            })
+            .collect();
+        let recent_commits: Vec<_> = (0..HARNESS_GIT_RECENT_COMMITS_MAX)
+            .map(|index| HarnessGitCommitSummaryV1 {
+                id: HarnessGitObjectIdV1::new(format!("{index:040x}")).unwrap(),
+                summary: format!("commit {index}"),
+            })
+            .collect();
+        assert!(HarnessGitSummaryV1 {
+            is_repository: true,
+            branch: Some("main".to_owned()),
+            status: status.clone(),
+            recent_commits: recent_commits.clone(),
+            truncated: false,
+        }.validate().is_ok());
+        let mut too_many_status = status;
+        too_many_status.push(HarnessGitStatusEntryV1 {
+            index_status: HarnessGitStatusCodeV1::Unmodified,
+            worktree_status: HarnessGitStatusCodeV1::Modified,
+            path: HarnessRepositoryPathV1::new("status-0128").unwrap(),
+            previous_path: None,
+        });
+        assert!(HarnessGitSummaryV1 {
+            is_repository: true,
+            branch: Some("main".to_owned()),
+            status: too_many_status,
+            recent_commits: Vec::new(),
+            truncated: true,
+        }.validate().is_err());
+        let mut too_many_recent = recent_commits;
+        too_many_recent.push(HarnessGitCommitSummaryV1 {
+            id: HarnessGitObjectIdV1::new(format!("{:040x}", HARNESS_GIT_RECENT_COMMITS_MAX)).unwrap(),
+            summary: "one too many".to_owned(),
+        });
+        assert!(HarnessGitSummaryV1 {
+            is_repository: true,
+            branch: Some("main".to_owned()),
+            status: Vec::new(),
+            recent_commits: too_many_recent,
+            truncated: true,
+        }.validate().is_err());
+
+        let commits: Vec<_> = (0..HARNESS_GIT_HISTORY_LIMIT_MAX)
+            .map(|index| {
+                let mut commit = git_commit('a');
+                commit.id = HarnessGitObjectIdV1::new(format!("{index:040x}")).unwrap();
+                commit
+            })
+            .collect();
+        assert!(HarnessRunGitHistoryPageV1 {
+            origin: origin.clone(),
+            path: Some(path.clone()),
+            commits: commits.clone(),
+            next_before: None,
+            truncated: false,
+        }.validate().is_ok());
+        let next_before = commits.last().map(|commit| commit.id.clone());
+        assert!(HarnessRunGitHistoryPageV1 {
+            origin: origin.clone(),
+            path: Some(path.clone()),
+            commits: commits.clone(),
+            next_before: next_before.clone(),
+            truncated: false,
+        }.validate().is_ok());
+        assert!(HarnessRunGitHistoryPageV1 {
+            origin: origin.clone(),
+            path: Some(path.clone()),
+            commits: commits.clone(),
+            next_before: None,
+            truncated: true,
+        }.validate().is_ok());
+        assert!(HarnessRunGitHistoryPageV1 {
+            origin: origin.clone(),
+            path: Some(path.clone()),
+            commits: commits.clone(),
+            next_before,
+            truncated: true,
+        }.validate().is_ok());
+        let mut too_many_commits = commits;
+        let mut extra_commit = git_commit('a');
+        extra_commit.id = HarnessGitObjectIdV1::new(format!("{:040x}", HARNESS_GIT_HISTORY_LIMIT_MAX)).unwrap();
+        too_many_commits.push(extra_commit);
+        assert!(HarnessRunGitHistoryPageV1 {
+            origin,
+            path: Some(path),
+            commits: too_many_commits,
+            next_before: None,
+            truncated: false,
+        }.validate().is_err());
     }
 
     fn monitor_with_mixed_capabilities() -> SessionMonitorV1 {

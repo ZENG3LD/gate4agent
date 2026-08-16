@@ -42,7 +42,10 @@ use gate4agent_types::{
 };
 use gate4agent_harness_client::{
     HarnessExpectedExecutionSpecRevisionV1,
+    HarnessGitObjectIdV1,
     HarnessOperatorMutationOutcomeV1,
+    HarnessRepositoryPathV1, HarnessReverseAttributionSubjectV1,
+    HarnessReverseAttributionV1, HarnessReverseAttributionWorkspaceV1,
     HarnessReviewedTaskLaunchSelectionV1, HarnessReviewedWorktreeSelectionV1,
     HarnessRevision,
     HarnessNodeIncarnationV1, HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
@@ -839,6 +842,29 @@ pub enum HarnessWorkspaceRequestState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessReverseAttributionState {
+    Loading { token: u64 },
+    Ready { token: u64, value: HarnessReverseAttributionV1 },
+    Error { token: u64, message: String },
+}
+
+impl HarnessReverseAttributionState {
+    pub fn token(&self) -> u64 {
+        match self {
+            Self::Loading { token }
+            | Self::Ready { token, .. }
+            | Self::Error { token, .. } => *token,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessReverseAttributionDetail {
+    pub subject: HarnessReverseAttributionSubjectV1,
+    pub state: HarnessReverseAttributionState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HarnessWorkspaceRequest {
     pub token: u64,
     pub state: HarnessWorkspaceRequestState,
@@ -868,6 +894,7 @@ pub struct HarnessKanbanState {
     pub run_transfers: BTreeMap<HarnessRunRef, HarnessRunTransferState>,
     pub workspaces: BTreeMap<HarnessRunOrigin, HarnessWorkspaceView>,
     pub workspace_requests: BTreeMap<HarnessRunRef, HarnessWorkspaceRequest>,
+    pub reverse_attribution: Option<HarnessReverseAttributionDetail>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2284,6 +2311,10 @@ pub enum AppAction {
         token: u64,
         destination: HarnessWorkspaceGitRequestDestination,
     },
+    HarnessLoadReverseAttribution {
+        subject: HarnessReverseAttributionSubjectV1,
+        token: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2385,6 +2416,8 @@ pub enum HitTarget {
     HarnessWorkspaceGitWorking(HarnessRunOrigin),
     HarnessWorkspaceGitStaged(HarnessRunOrigin),
     HarnessAgentTask(HarnessTaskId, HarnessRunId),
+    HarnessLinks(HarnessReverseAttributionSubjectV1),
+    HarnessLinksClose,
     HarnessLaunchRefresh,
     HarnessLaunchPlan(usize),
     HarnessLaunchWorktreeExisting,
@@ -5336,6 +5369,225 @@ impl App {
         }
         self.fail_harness_refresh(token, message.clone());
         self.notice = Some(format!("Harness launch action failed: {message}"));
+    }
+
+    fn harness_reverse_attribution_workspace(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+    ) -> Option<HarnessReverseAttributionWorkspaceV1> {
+        let incarnation = self.nodes.iter()
+            .find(|node| node.node_id == node_id)?
+            .incarnation_id?;
+        Some(HarnessReverseAttributionWorkspaceV1 {
+            node_id: HarnessSelectorV1::new(node_id.to_owned()).ok()?,
+            node_incarnation_id: HarnessNodeIncarnationV1::new(
+                incarnation.to_string(),
+            ).ok()?,
+            workspace_id: HarnessSelectorV1::new(workspace_id.to_owned()).ok()?,
+        })
+    }
+
+    pub fn harness_workspace_links_subject(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+    ) -> Option<HarnessReverseAttributionSubjectV1> {
+        Some(HarnessReverseAttributionSubjectV1::Workspace {
+            workspace: self.harness_reverse_attribution_workspace(node_id, workspace_id)?,
+        })
+    }
+
+    pub fn harness_agent_links_subject(
+        &self,
+        key: &AgentRowKey,
+    ) -> Option<HarnessReverseAttributionSubjectV1> {
+        match key {
+            AgentRowKey::Managed { node_id, record_id } => {
+                let record = self.find_managed_session(key)?;
+                Some(HarnessReverseAttributionSubjectV1::ManagedRecord {
+                    workspace: self.harness_reverse_attribution_workspace(
+                        node_id,
+                        &record.workspace_id,
+                    )?,
+                    record_id: HarnessSelectorV1::new(record_id.clone()).ok()?,
+                })
+            }
+            AgentRowKey::Legacy(address) => self.harness_runtime_links_subject(address),
+        }
+    }
+
+    pub fn harness_runtime_links_subject(
+        &self,
+        address: &SessionAddress,
+    ) -> Option<HarnessReverseAttributionSubjectV1> {
+        Some(HarnessReverseAttributionSubjectV1::RuntimeSession {
+            workspace: self.harness_reverse_attribution_workspace(
+                &address.node_id,
+                &address.workspace_id,
+            )?,
+            instance_id: address.instance_id,
+            generation: address.generation,
+        })
+    }
+
+    fn harness_file_links_subject(
+        &self,
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        path: &RepositoryPath,
+    ) -> Option<HarnessReverseAttributionSubjectV1> {
+        Some(HarnessReverseAttributionSubjectV1::FileScope {
+            workspace,
+            relative_path: HarnessRepositoryPathV1::new(path.as_utf8()?.to_owned()).ok()?,
+        })
+    }
+
+    fn harness_git_links_subject(
+        &self,
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        git: &WorkspaceGitTabView,
+    ) -> Option<HarnessReverseAttributionSubjectV1> {
+        let revision = git.diff.as_ref().and_then(|diff| match &diff.target {
+            WorkspaceGitDiffTarget::Commit { revision, .. } => Some(revision.as_str()),
+            WorkspaceGitDiffTarget::Working { .. }
+            | WorkspaceGitDiffTarget::Staged { .. } => None,
+        }).or_else(|| {
+            (git.mode == WorkspaceGitPaneMode::Detail)
+                .then(|| git.commits.get(git.selected).map(|commit| commit.id.as_str()))
+                .flatten()
+        });
+        match revision {
+            Some(revision) => Some(HarnessReverseAttributionSubjectV1::CommitScope {
+                workspace,
+                object_id: HarnessGitObjectIdV1::new(revision.to_owned()).ok()?,
+            }),
+            None => Some(HarnessReverseAttributionSubjectV1::Workspace { workspace }),
+        }
+    }
+
+    pub fn harness_surface_links_subject(
+        &self,
+        tab: &SurfaceTab,
+    ) -> Option<HarnessReverseAttributionSubjectV1> {
+        match tab {
+            SurfaceTab::SessionMonitor(key) => match &key.target {
+                SessionMonitorTarget::Runtime { address, incarnation } => Some(
+                    HarnessReverseAttributionSubjectV1::RuntimeSession {
+                        workspace: HarnessReverseAttributionWorkspaceV1 {
+                            node_id: HarnessSelectorV1::new(address.node_id.clone()).ok()?,
+                            node_incarnation_id: HarnessNodeIncarnationV1::new(
+                                incarnation.to_string(),
+                            ).ok()?,
+                            workspace_id: HarnessSelectorV1::new(
+                                address.workspace_id.clone(),
+                            ).ok()?,
+                        },
+                        instance_id: address.instance_id,
+                        generation: address.generation,
+                    },
+                ),
+                SessionMonitorTarget::Managed { node_id, record_id, incarnation } => {
+                    let record = self.find_managed_session(&AgentRowKey::Managed {
+                        node_id: node_id.clone(),
+                        record_id: record_id.clone(),
+                    })?;
+                    Some(HarnessReverseAttributionSubjectV1::ManagedRecord {
+                        workspace: HarnessReverseAttributionWorkspaceV1 {
+                            node_id: HarnessSelectorV1::new(node_id.clone()).ok()?,
+                            node_incarnation_id: HarnessNodeIncarnationV1::new(
+                                incarnation.to_string(),
+                            ).ok()?,
+                            workspace_id: HarnessSelectorV1::new(
+                                record.workspace_id.clone(),
+                            ).ok()?,
+                        },
+                        record_id: HarnessSelectorV1::new(record_id.clone()).ok()?,
+                    })
+                }
+            },
+            SurfaceTab::Pty(address) => self.harness_runtime_links_subject(address),
+            SurfaceTab::File(key) => self.harness_file_links_subject(
+                self.harness_reverse_attribution_workspace(&key.node_id, &key.workspace_id)?,
+                &key.path,
+            ),
+            SurfaceTab::Git(key) => self.harness_git_links_subject(
+                self.harness_reverse_attribution_workspace(&key.node_id, &key.workspace_id)?,
+                self.git_tabs.get(key)?,
+            ),
+            SurfaceTab::HarnessFile(key) => self.harness_file_links_subject(
+                HarnessReverseAttributionWorkspaceV1 {
+                    node_id: key.origin.node_id.clone(),
+                    node_incarnation_id: key.origin.node_incarnation_id.clone(),
+                    workspace_id: key.origin.workspace_id.clone(),
+                },
+                &key.path,
+            ),
+            SurfaceTab::HarnessGit(key) => self.harness_git_links_subject(
+                HarnessReverseAttributionWorkspaceV1 {
+                    node_id: key.origin.node_id.clone(),
+                    node_incarnation_id: key.origin.node_incarnation_id.clone(),
+                    workspace_id: key.origin.workspace_id.clone(),
+                },
+                self.harness_git_tabs.get(key)?,
+            ),
+            SurfaceTab::AgentBoard | SurfaceTab::Preview(_) => None,
+        }
+    }
+
+    fn request_harness_reverse_attribution(
+        &mut self,
+        subject: HarnessReverseAttributionSubjectV1,
+    ) -> AppAction {
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let token = self.harness_read_token;
+        self.harness_kanban.reverse_attribution = Some(HarnessReverseAttributionDetail {
+            subject: subject.clone(),
+            state: HarnessReverseAttributionState::Loading { token },
+        });
+        AppAction::HarnessLoadReverseAttribution { subject, token }
+    }
+
+    pub fn apply_harness_reverse_attribution(
+        &mut self,
+        requested_subject: HarnessReverseAttributionSubjectV1,
+        token: u64,
+        value: HarnessReverseAttributionV1,
+    ) {
+        let Some(detail) = self.harness_kanban.reverse_attribution.as_mut() else {
+            return;
+        };
+        let exact = detail.subject == requested_subject
+            && detail.state.token() == token
+            && value.subject == requested_subject;
+        detail.state = if exact {
+            HarnessReverseAttributionState::Ready { token, value }
+        } else {
+            HarnessReverseAttributionState::Error {
+                token: detail.state.token(),
+                message: "Harness links response rejected: stale token or subject mismatch"
+                    .to_owned(),
+            }
+        };
+    }
+
+    pub fn fail_harness_reverse_attribution(
+        &mut self,
+        requested_subject: &HarnessReverseAttributionSubjectV1,
+        token: u64,
+        message: String,
+    ) {
+        let Some(detail) = self.harness_kanban.reverse_attribution.as_mut() else {
+            return;
+        };
+        let exact = &detail.subject == requested_subject && detail.state.token() == token;
+        detail.state = HarnessReverseAttributionState::Error {
+            token: if exact { token } else { detail.state.token() },
+            message: if exact {
+                message
+            } else {
+                "Harness links failure rejected: stale token or subject mismatch".to_owned()
+            },
+        };
     }
 
     pub fn harness_agent_run_links(
@@ -8345,6 +8597,12 @@ impl App {
             self.notice = Some("unsupported key modifier; no input sent".to_owned());
             return AppAction::None;
         }
+        if self.harness_kanban.reverse_attribution.is_some() {
+            if matches!(key, UiKey::Escape | UiKey::OperatorEscape) {
+                self.harness_kanban.reverse_attribution = None;
+            }
+            return AppAction::None;
+        }
         if self.native_session_menu.is_some() {
             return self.reduce_native_session_menu(key);
         }
@@ -8448,6 +8706,25 @@ impl App {
             .rev()
             .find(|hit| hit.rect.contains(column, row))
             .map(|hit| hit.target.clone());
+        if self.harness_kanban.reverse_attribution.is_some() {
+            return match target {
+                Some(HitTarget::HarnessLinksClose) => {
+                    self.harness_kanban.reverse_attribution = None;
+                    AppAction::None
+                }
+                Some(HitTarget::HarnessAgentTask(task_id, run_id)) => {
+                    self.harness_kanban.reverse_attribution = None;
+                    let action = self.open_harness_task_detail(task_id);
+                    if let Some(detail) = self.harness_kanban.detail.as_mut() {
+                        detail.section = HarnessTaskDetailSection::Agents;
+                        detail.selected_run = Some(run_id);
+                    }
+                    self.agent_board_mode = AgentBoardMode::HarnessKanban;
+                    action
+                }
+                _ => AppAction::None,
+            };
+        }
         if self.native_session_menu.is_some() {
             return match target {
                 Some(HitTarget::NativeSessionMenuAction(action)) => {
@@ -8497,6 +8774,9 @@ impl App {
             return self.click_create_worktree(target, column, row);
         }
         match target.as_ref() {
+            Some(HitTarget::HarnessLinks(subject)) => {
+                return self.request_harness_reverse_attribution(subject.clone());
+            }
             Some(HitTarget::AgentBoardOpen) => return self.open_agent_board(),
             Some(HitTarget::HarnessTaskCard(task_id)) => {
                 if self.harness_kanban.tasks.contains_key(task_id) {
@@ -9395,6 +9675,8 @@ impl App {
                 | HitTarget::HarnessWorkspaceGitWorking(_)
                 | HitTarget::HarnessWorkspaceGitStaged(_)
                 | HitTarget::HarnessAgentTask(_, _)
+                | HitTarget::HarnessLinks(_)
+                | HitTarget::HarnessLinksClose
                 | HitTarget::HarnessLaunchRefresh
                 | HitTarget::HarnessLaunchPlan(_)
                 | HitTarget::HarnessLaunchWorktreeExisting
@@ -27019,5 +27301,122 @@ mod tests {
         assert_eq!(app.drop_at(18, 3), AppAction::None);
         assert_eq!(app.harness_file_tabs[&key].editor.selected_text(), Some("read"));
         assert!(!app.harness_file_tabs[&key].editor.dirty());
+    }
+
+    #[test]
+    fn reverse_attribution_subjects_pin_exact_tuple_and_mismatch_is_terminal() {
+        let mut app = fixture();
+        let incarnation = NodeIncarnationId::from_bytes([0xab; 16]);
+        app.nodes[0].incarnation_id = Some(incarnation);
+        let address = active_pty_address(&app);
+        let runtime = app.harness_runtime_links_subject(&address).unwrap();
+        assert!(matches!(
+            &runtime,
+            HarnessReverseAttributionSubjectV1::RuntimeSession {
+                workspace,
+                instance_id: 7,
+                generation: 2,
+            } if workspace.node_id.as_str() == "node-a"
+                && workspace.node_incarnation_id.as_str() == "ab".repeat(16)
+                && workspace.workspace_id.as_str() == "workspace-a"
+        ));
+
+        app.nodes[0].session_records.push(ManagedSessionView {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            display_name: "managed".to_owned(),
+            provider: provider("codex"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Live,
+            workspace_id: "workspace-a".to_owned(),
+            canonical_root: None,
+            has_provider_session_identity: true,
+            bundle: None,
+            context_id: None,
+            context: None,
+            task_binding: None,
+            active_session: Some(address.clone()),
+            last_error: None,
+        });
+        let managed_key = AgentRowKey::Managed {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+        };
+        assert!(matches!(
+            app.harness_agent_links_subject(&managed_key),
+            Some(HarnessReverseAttributionSubjectV1::ManagedRecord { record_id, .. })
+                if record_id.as_str() == "record-a"
+        ));
+        assert!(matches!(
+            app.harness_workspace_links_subject("node-a", "workspace-a"),
+            Some(HarnessReverseAttributionSubjectV1::Workspace { .. })
+        ));
+
+        let file_key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("src/lib.rs"),
+        };
+        assert!(matches!(
+            app.harness_surface_links_subject(&SurfaceTab::File(file_key)),
+            Some(HarnessReverseAttributionSubjectV1::FileScope { relative_path, .. })
+                if relative_path.as_str() == "src/lib.rs"
+        ));
+        let git_key = WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: None,
+        };
+        app.git_tabs.insert(git_key.clone(), WorkspaceGitTabView {
+            state: WorkspaceGitState::Ready,
+            mode: WorkspaceGitPaneMode::Detail,
+            history_path: None,
+            commits: vec![GitCommitView {
+                id: "c".repeat(40),
+                parents: Vec::new(),
+                subject: "subject".to_owned(),
+                author_name: "author".to_owned(),
+                author_email: "author@example.invalid".to_owned(),
+                authored_at: "now".to_owned(),
+                committer_name: "committer".to_owned(),
+                committer_email: "committer@example.invalid".to_owned(),
+                committed_at: "now".to_owned(),
+                signature_status: "unknown".to_owned(),
+                signer: None,
+            }],
+            selected: 0,
+            list_scroll: 0,
+            detail_scroll: 0,
+            next_before: None,
+            has_more: false,
+            history_truncated: false,
+            diff: None,
+            diff_error: None,
+            pending_diff: None,
+            history_token: 0,
+            diff_token: 0,
+        });
+        assert!(matches!(
+            app.harness_surface_links_subject(&SurfaceTab::Git(git_key)),
+            Some(HarnessReverseAttributionSubjectV1::CommitScope { object_id, .. })
+                if object_id.as_str() == "c".repeat(40)
+        ));
+
+        let AppAction::HarnessLoadReverseAttribution { token, subject } =
+            app.request_harness_reverse_attribution(runtime.clone())
+        else {
+            panic!("typed reverse-attribution request");
+        };
+        let response = gate4agent_harness_client::HarnessReverseAttributionV1 {
+            subject: subject.clone(),
+            outcome: gate4agent_harness_client::HarnessReverseAttributionOutcomeV1::Unattributed,
+            links: Vec::new(),
+        };
+        app.apply_harness_reverse_attribution(subject, token.wrapping_add(1), response);
+        assert!(matches!(
+            app.harness_kanban.reverse_attribution.as_ref().map(|detail| &detail.state),
+            Some(HarnessReverseAttributionState::Error { message, .. })
+                if message.contains("stale token or subject mismatch")
+        ));
     }
 }

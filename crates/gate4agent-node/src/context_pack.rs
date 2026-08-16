@@ -31,6 +31,18 @@ const CONTEXT_PACK_COMMIT_SUMMARY_MAX_BYTES: usize = 512;
 struct ContextPackDocumentV1 {
     schema: String,
     source_provider: AgentId,
+    source_message_count: u64,
+    retained_messages: Vec<HistoryMessageRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository: Option<ContextPackRepositoryV1>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyContextPackDocumentV1 {
+    schema: String,
+    source_provider: AgentId,
     history_session_id: String,
     title: Option<String>,
     model: Option<String>,
@@ -342,9 +354,6 @@ impl NodeContextPack {
             let document = ContextPackDocumentV1 {
                 schema: CONTEXT_PACK_SCHEMA.to_owned(),
                 source_provider: lineage.source_provider.clone(),
-                history_session_id: history.session_id.clone(),
-                title: history.title.clone(),
-                model: history.model.clone(),
                 source_message_count: history.message_count,
                 retained_messages: retained_messages.clone(),
                 repository: repository.as_ref().map(|repository| repository.document.clone()),
@@ -389,34 +398,42 @@ impl NodeContextPack {
         {
             return Err(ContextPackError::ReceiptMismatch);
         }
-        let document: ContextPackDocumentV1 = serde_json::from_slice(&bytes)
-            .map_err(|_| ContextPackError::Serialization)?;
-        let normalized = HistorySessionRecord {
-            session_id: document.history_session_id.clone(),
-            title: document.title.clone(),
-            cwd: None,
-            model: document.model.clone(),
-            message_count: document.source_message_count,
-            completed_turn_count: None,
-            total_tokens: 0,
-            messages: document.retained_messages.clone(),
-        };
-        let (_, history_changed) = normalized_history(&normalized);
-        if document.schema != CONTEXT_PACK_SCHEMA
-            || document.source_provider != receipt.lineage.source_provider
-            || document.source_message_count != receipt.source_message_count
-            || u64::try_from(document.retained_messages.len()).ok()
-                != Some(receipt.retained_message_count)
-            || document.truncated != receipt.truncated
-            || document.retained_messages.is_empty()
-            || normalized.validate().is_err()
-            || (document.repository.is_some() && history_changed)
-            || document
-                .repository
-                .as_ref()
-                .is_some_and(|repository| repository.validate().is_err())
-        {
-            return Err(ContextPackError::ReceiptMismatch);
+        if let Ok(document) = serde_json::from_slice::<ContextPackDocumentV1>(&bytes) {
+            validate_materialized_document(
+                &receipt,
+                &document.schema,
+                &document.source_provider,
+                document.source_message_count,
+                &document.retained_messages,
+                document.repository.as_ref(),
+                document.truncated,
+                false,
+            )?;
+        } else {
+            let document: LegacyContextPackDocumentV1 = serde_json::from_slice(&bytes)
+                .map_err(|_| ContextPackError::Serialization)?;
+            let legacy_history = HistorySessionRecord {
+                session_id: document.history_session_id,
+                title: document.title,
+                cwd: None,
+                model: document.model,
+                message_count: document.source_message_count,
+                completed_turn_count: None,
+                total_tokens: 0,
+                messages: document.retained_messages.clone(),
+            };
+            let (_, legacy_metadata_or_messages_changed) = normalized_history(&legacy_history);
+            validate_materialized_document(
+                &receipt,
+                &document.schema,
+                &document.source_provider,
+                document.source_message_count,
+                &document.retained_messages,
+                document.repository.as_ref(),
+                document.truncated,
+                legacy_history.validate().is_err()
+                    || (document.repository.is_some() && legacy_metadata_or_messages_changed),
+            )?;
         }
         Ok(Self { receipt, bytes })
     }
@@ -428,6 +445,43 @@ impl NodeContextPack {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+fn validate_materialized_document(
+    receipt: &ResolvedContextPackReceipt,
+    schema: &str,
+    source_provider: &AgentId,
+    source_message_count: u64,
+    retained_messages: &[HistoryMessageRecord],
+    repository: Option<&ContextPackRepositoryV1>,
+    truncated: bool,
+    legacy_invalid: bool,
+) -> Result<(), ContextPackError> {
+    let history = HistorySessionRecord {
+        session_id: "redacted-context-source".to_owned(),
+        title: None,
+        cwd: None,
+        model: None,
+        message_count: source_message_count,
+        completed_turn_count: None,
+        total_tokens: 0,
+        messages: retained_messages.to_vec(),
+    };
+    let (_, history_changed) = normalized_history(&history);
+    if schema != CONTEXT_PACK_SCHEMA
+        || source_provider != &receipt.lineage.source_provider
+        || source_message_count != receipt.source_message_count
+        || u64::try_from(retained_messages.len()).ok() != Some(receipt.retained_message_count)
+        || truncated != receipt.truncated
+        || retained_messages.is_empty()
+        || history.validate().is_err()
+        || (repository.is_some() && history_changed)
+        || repository.is_some_and(|repository| repository.validate().is_err())
+        || legacy_invalid
+    {
+        return Err(ContextPackError::ReceiptMismatch);
+    }
+    Ok(())
 }
 
 impl ContextPackRepositoryV1 {
@@ -895,6 +949,103 @@ mod tests {
     }
 
     #[test]
+    fn export_allowlist_omits_provider_native_identity_model_and_host_metadata() {
+        let history = HistorySessionRecord {
+            session_id: "PRIVATE_NATIVE_SESSION_CANARY".to_owned(),
+            title: Some("PRIVATE_TITLE_CANARY".to_owned()),
+            cwd: Some(r"C:\private\PRIVATE_CWD_CANARY".to_owned()),
+            model: Some("PRIVATE_MODEL_CANARY".to_owned()),
+            message_count: 1,
+            completed_turn_count: Some(91),
+            total_tokens: 92,
+            messages: vec![HistoryMessageRecord {
+                role: HistoryMessageRole::Assistant,
+                text: "safe semantic result".to_owned(),
+            }],
+        };
+        let pack = NodeContextPack::export(lineage(), &history).unwrap();
+        let encoded = String::from_utf8(pack.bytes().to_vec()).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let keys = document
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let receipt = serde_json::to_string(pack.receipt()).unwrap();
+
+        assert_eq!(
+            keys,
+            [
+                "retained_messages",
+                "schema",
+                "source_message_count",
+                "source_provider",
+                "truncated",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        );
+        for private in [
+            "PRIVATE_NATIVE_SESSION_CANARY",
+            "PRIVATE_TITLE_CANARY",
+            "PRIVATE_CWD_CANARY",
+            "PRIVATE_MODEL_CANARY",
+        ] {
+            assert!(!encoded.contains(private));
+            assert!(!receipt.contains(private));
+        }
+        for private_key in [
+            "history_session_id",
+            "title",
+            "model",
+            "cwd",
+            "completed_turn_count",
+            "total_tokens",
+            "provider_auth",
+            "provider_home",
+        ] {
+            assert!(!document.as_object().unwrap().contains_key(private_key));
+        }
+        NodeContextPack::from_materialized(pack.receipt().clone(), pack.bytes().to_vec())
+            .unwrap();
+    }
+
+    #[test]
+    fn export_digest_does_not_bind_private_history_identity_or_model_metadata() {
+        let first_history = HistorySessionRecord {
+            session_id: "native-session-one".to_owned(),
+            title: Some("private title one".to_owned()),
+            cwd: Some(r"C:\private\one".to_owned()),
+            model: Some("private-model-one".to_owned()),
+            message_count: 1,
+            completed_turn_count: Some(1),
+            total_tokens: 100,
+            messages: vec![HistoryMessageRecord {
+                role: HistoryMessageRole::User,
+                text: "bounded semantic request".to_owned(),
+            }],
+        };
+        let second_history = HistorySessionRecord {
+            session_id: "native-session-two".to_owned(),
+            title: Some("private title two".to_owned()),
+            cwd: Some(r"D:\private\two".to_owned()),
+            model: Some("private-model-two".to_owned()),
+            message_count: 1,
+            completed_turn_count: Some(9),
+            total_tokens: 900,
+            messages: first_history.messages.clone(),
+        };
+
+        let first = NodeContextPack::export(lineage(), &first_history).unwrap();
+        let second = NodeContextPack::export(lineage(), &second_history).unwrap();
+
+        assert_eq!(first.bytes(), second.bytes());
+        assert_eq!(first.receipt().digest, second.receipt().digest);
+        assert_eq!(first.receipt().id, second.receipt().id);
+    }
+
+    #[test]
     fn export_drops_oldest_messages_to_the_protocol_byte_limit() {
         let messages = (0..gate4agent_types::HISTORY_MESSAGES_MAX)
             .map(|index| HistoryMessageRecord {
@@ -928,7 +1079,7 @@ mod tests {
     #[test]
     fn materialized_legacy_pack_without_repository_preserves_valid_crlf() {
         let lineage = lineage();
-        let document = ContextPackDocumentV1 {
+        let document = LegacyContextPackDocumentV1 {
             schema: CONTEXT_PACK_SCHEMA.to_owned(),
             source_provider: lineage.source_provider.clone(),
             history_session_id: "legacy-session".to_owned(),
@@ -1234,11 +1385,14 @@ mod tests {
         let pack = NodeContextPack::export(lineage(), &history).unwrap();
         let document: ContextPackDocumentV1 = serde_json::from_slice(pack.bytes()).unwrap();
 
-        assert_eq!(document.title.as_deref(), Some("review"));
         assert_eq!(
             document.retained_messages[0].text,
             "semantic result\nkept",
         );
+        let encoded = String::from_utf8(pack.bytes().to_vec()).unwrap();
+        assert!(!encoded.contains("title"));
+        assert!(!encoded.contains("model"));
+        assert!(!encoded.contains("history_session_id"));
         assert!(!pack.receipt().truncated);
         assert!(pack.receipt().is_valid());
         assert!(!String::from_utf8_lossy(pack.bytes()).contains(r"C:\private\repo"));

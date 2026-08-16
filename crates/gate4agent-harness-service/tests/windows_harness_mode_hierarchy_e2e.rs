@@ -17,8 +17,9 @@ use gate4agent_harness_api::{
     HarnessNativeSessionRouteV1, HarnessNativeSessionSelectionV1,
     HarnessOperatorActionV1, HarnessOperatorCredential, HarnessOperatorIntentV1,
     HarnessOperatorMutationOutcomeV1, HarnessOperatorRequestRefV1,
-    HarnessOperatorResponseV1, HarnessRuntimeManagedStateV1,
-    HarnessRuntimeNodeInventoryV1,
+    HarnessOperatorResponseV1, HarnessRunCorrelationAvailabilityV1,
+    HarnessRunSessionViewV1, HarnessRunWorktreeViewV1,
+    HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
 };
 use gate4agent_harness_client::HarnessOperatorClient;
 use gate4agent_harness_delivery::DeliveryCatalogV2;
@@ -481,6 +482,28 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
     assert_eq!(runtime_inventory.inventory.session_count, 1);
     assert_eq!(runtime_inventory.inventory.managed_session_count, 1);
     let runtime_record_id = runtime_inventory.inventory.managed_sessions[0].record_id.clone();
+    let runtime_binding = runtime_inventory.inventory.managed_sessions[0]
+        .active_binding.clone().expect("Running record has no exact runtime identity");
+    let correlation = tui.run_correlation_get(run_id.clone()).unwrap();
+    assert_eq!(correlation.run_id, run_id);
+    assert_eq!(correlation.task_id, task_id);
+    assert_eq!(correlation.node_id.as_str(), node_id.as_str());
+    assert_eq!(correlation.node_incarnation_id.as_str(), runtime_inventory.incarnation_id);
+    assert_eq!(correlation.workspace_id.as_str(), workspace_id.as_str());
+    assert_eq!(correlation.provider_profile.as_str(), "clean-exit");
+    assert_eq!(correlation.worktree, HarnessRunWorktreeViewV1::Existing);
+    assert_eq!(
+        correlation.availability,
+        HarnessRunCorrelationAvailabilityV1::Available,
+    );
+    let HarnessRunSessionViewV1::Managed(managed) = &correlation.session else {
+        panic!("ordinary PTY run did not expose its durable managed identity");
+    };
+    assert_eq!(managed.record_id.as_str(), runtime_record_id);
+    let active = managed.active_session.as_ref()
+        .expect("available managed correlation has no atomic runtime identity");
+    assert_eq!(active.instance_id, runtime_binding.instance_id);
+    assert_eq!(active.generation, runtime_binding.generation);
 
     drop(tui);
     assert!(!host_task.is_finished(), "dropping TUI client stopped Harness");
@@ -492,8 +515,13 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
     assert_eq!(reconnected_task.state, HarnessTaskStateV1::Running);
     assert_eq!(reconnected_task.run_ids, vec![run_id.clone()]);
     assert_eq!(
-        reconnected_tui.run_get(run_id).unwrap().lifecycle,
+        reconnected_tui.run_get(run_id.clone()).unwrap().lifecycle,
         HarnessRunLifecycleV1::Running,
+    );
+    assert_eq!(
+        reconnected_tui.run_correlation_get(run_id.clone()).unwrap(),
+        correlation,
+        "reconnecting the TUI changed the authoritative run correlation",
     );
     let reconnected_inventory = reconnected_tui.runtime_inventory_list(None, 16).unwrap();
     let reconnected_node = reconnected_inventory.nodes.iter()

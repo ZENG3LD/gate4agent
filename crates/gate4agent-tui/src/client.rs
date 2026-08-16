@@ -54,6 +54,7 @@ use gate4agent_harness_client::{
     HarnessNativeSessionSelectionV1,
     HarnessOperatorActionV1, HarnessOperatorClient, HarnessOperatorCredential,
     HarnessOperatorIntentV1, HarnessOperatorRequestRefV1, RedactedBindingStateV1, RedactedRunV1,
+    HarnessRunCorrelationV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTransportV1,
@@ -101,6 +102,7 @@ const UPDATE_QUEUE: usize = 256;
 const C2_COMMAND_ROUTE: &str = "\0c2";
 const HARNESS_COMMAND_ROUTE: &str = "\0harness";
 const HARNESS_HISTORY_COMMAND_ROUTE: &str = "\0harness-history";
+const HARNESS_DETAIL_COMMAND_ROUTE: &str = "\0harness-detail";
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
 const RAW_INPUT_COALESCE: Duration = Duration::from_millis(12);
@@ -630,6 +632,11 @@ enum WorkerUpdate {
         run_id: gate4agent_harness_client::HarnessRunId,
         message: String,
     },
+    HarnessTaskCorrelations {
+        task_id: gate4agent_harness_client::HarnessTaskId,
+        correlations: Vec<HarnessRunCorrelationV1>,
+        failures: Vec<(gate4agent_harness_client::HarnessRunId, String)>,
+    },
     Notice(String),
 }
 
@@ -1025,14 +1032,21 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             let client = HarnessOperatorClient::new(endpoint.endpoint, endpoint.credential)?;
             let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
             let (history_tx, history_rx) = mpsc::channel(COMMAND_QUEUE);
+            let (detail_tx, detail_rx) = mpsc::channel(COMMAND_QUEUE);
             commands.insert(HARNESS_COMMAND_ROUTE.to_owned(), command_tx.clone());
             commands.insert(HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx);
+            commands.insert(HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx);
             let runtime_inventory = Arc::new(Mutex::new(None));
             let harness_updates = updates_tx.clone();
             let operator_inventory = runtime_inventory.clone();
             let history_client = client.clone();
+            let detail_client = client.clone();
             tokio::task::spawn_blocking(move || {
                 harness_operator_worker(client, command_rx, harness_updates, operator_inventory)
+            });
+            let detail_updates = updates_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                harness_detail_worker(detail_client, detail_rx, detail_updates)
             });
             let history_updates = updates_tx.clone();
             tokio::task::spawn_blocking(move || {
@@ -1328,10 +1342,15 @@ fn send_operator_action(
     };
     let harness_only = commands.contains_key(HARNESS_COMMAND_ROUTE)
         && commands.contains_key(HARNESS_HISTORY_COMMAND_ROUTE)
+        && commands.contains_key(HARNESS_DETAIL_COMMAND_ROUTE)
         && !commands.contains_key(C2_COMMAND_ROUTE)
-        && commands.len() == 2;
+        && commands.len() == 3;
     let harness_native_history_read = harness_only && harness_native_history_read_action(&action);
-    if harness_only && node_id != HARNESS_COMMAND_ROUTE && !harness_native_history_read {
+    let harness_detail_read = harness_only && harness_detail_read_action(&action);
+    if harness_only && node_id != HARNESS_COMMAND_ROUTE
+        && !harness_native_history_read
+        && !harness_detail_read
+    {
         if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable") {
             app.notice = Some(
                 "Harness-owned session action unavailable: no typed Harness intent exists"
@@ -1340,7 +1359,9 @@ fn send_operator_action(
         }
         return;
     }
-    let sender = if harness_native_history_read {
+    let sender = if harness_detail_read {
+        commands.get(HARNESS_DETAIL_COMMAND_ROUTE)
+    } else if harness_native_history_read {
         commands.get(HARNESS_HISTORY_COMMAND_ROUTE)
     } else {
         commands.get(&node_id).or_else(|| commands.get(C2_COMMAND_ROUTE))
@@ -1387,6 +1408,32 @@ fn reject_harness_queue_action(
     action: &AppAction,
     rejection: HarnessQueueRejection,
 ) -> bool {
+    if let AppAction::HarnessOpenMonitor { run_id } = action {
+        let message = match rejection {
+            HarnessQueueRejection::Busy => {
+                "Harness operator busy: detail command queue is full"
+            }
+            HarnessQueueRejection::Unavailable => {
+                "Harness operator unavailable: detail command queue is closed"
+            }
+        }.to_owned();
+        app.fail_harness_monitor(run_id, message.clone());
+        app.notice = Some(message);
+        return true;
+    }
+    if let AppAction::HarnessLoadTaskCorrelations { task_id, .. } = action {
+        let message = match rejection {
+            HarnessQueueRejection::Busy => {
+                "Harness operator busy: correlation command queue is full"
+            }
+            HarnessQueueRejection::Unavailable => {
+                "Harness operator unavailable: correlation command queue is closed"
+            }
+        }.to_owned();
+        app.fail_harness_task_correlations(task_id, message.clone());
+        app.notice = Some(message);
+        return true;
+    }
     let token = match action {
         AppAction::HarnessRefresh { token }
         | AppAction::HarnessCreateTask { token, .. }
@@ -1416,6 +1463,14 @@ fn harness_native_history_read_action(action: &AppAction) -> bool {
         AppAction::CatalogNativeSessions { .. }
             | AppAction::PageNativeSessions { .. }
             | AppAction::PreviewNativeSession { .. }
+    )
+}
+
+fn harness_detail_read_action(action: &AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::HarnessOpenMonitor { .. }
+            | AppAction::HarnessLoadTaskCorrelations { .. }
     )
 }
 
@@ -1485,7 +1540,8 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessCancelTask { .. }
         | AppAction::HarnessRetryTask { .. }
         | AppAction::HarnessScheduleNext { .. }
-        | AppAction::HarnessOpenMonitor { .. } => Some(HARNESS_COMMAND_ROUTE),
+        | AppAction::HarnessOpenMonitor { .. }
+        | AppAction::HarnessLoadTaskCorrelations { .. } => Some(HARNESS_COMMAND_ROUTE),
         AppAction::None | AppAction::Quit => None,
     }
 }
@@ -2011,29 +2067,6 @@ fn harness_operator_worker(
                     true,
                 );
             }
-            AppAction::HarnessOpenMonitor { run_id } => {
-                let result = (|| {
-                    let run = client.run_get(run_id.clone())
-                        .map_err(|error| error.to_string())?;
-                    if run.binding == RedactedBindingStateV1::None {
-                        return Err("Harness run has no redacted binding".to_owned());
-                    }
-                    let monitor = client.monitor_get(run_id.clone())
-                        .map_err(|error| error.to_string())?;
-                    let timeline = client.timeline_read(run_id.clone(), None, 128)
-                        .map_err(|error| error.to_string())?;
-                    Ok((run, monitor, timeline.entries))
-                })();
-                let update = match result {
-                    Ok((run, monitor, timeline)) => {
-                        WorkerUpdate::HarnessMonitor { run, monitor, timeline }
-                    }
-                    Err(message) => WorkerUpdate::HarnessMonitorFailed { run_id, message },
-                };
-                if updates.blocking_send(update).is_err() {
-                    return;
-                }
-            }
             _ => {}
         }
     }
@@ -2104,6 +2137,58 @@ fn harness_native_history_worker(
                 message_limit,
                 token,
             ),
+            _ => {}
+        }
+    }
+}
+
+fn harness_detail_worker(
+    client: HarnessOperatorClient,
+    mut commands: mpsc::Receiver<AppAction>,
+    updates: mpsc::Sender<WorkerUpdate>,
+) {
+    while let Some(action) = commands.blocking_recv() {
+        match action {
+            AppAction::HarnessOpenMonitor { run_id } => {
+                let result = (|| {
+                    let run = client.run_get(run_id.clone())
+                        .map_err(|error| error.to_string())?;
+                    if run.binding == RedactedBindingStateV1::None {
+                        return Err("Harness run has no redacted binding".to_owned());
+                    }
+                    let monitor = client.monitor_get(run_id.clone())
+                        .map_err(|error| error.to_string())?;
+                    let timeline = client.timeline_read(run_id.clone(), None, 128)
+                        .map_err(|error| error.to_string())?;
+                    Ok((run, monitor, timeline.entries))
+                })();
+                let update = match result {
+                    Ok((run, monitor, timeline)) => {
+                        WorkerUpdate::HarnessMonitor { run, monitor, timeline }
+                    }
+                    Err(message) => WorkerUpdate::HarnessMonitorFailed { run_id, message },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessLoadTaskCorrelations { task_id, run_ids } => {
+                let mut correlations = Vec::with_capacity(run_ids.len());
+                let mut failures = Vec::new();
+                for run_id in run_ids {
+                    match client.run_correlation_get(run_id.clone()) {
+                        Ok(correlation) => correlations.push(correlation),
+                        Err(error) => failures.push((run_id, error.to_string())),
+                    }
+                }
+                if updates.blocking_send(WorkerUpdate::HarnessTaskCorrelations {
+                    task_id,
+                    correlations,
+                    failures,
+                }).is_err() {
+                    return;
+                }
+            }
             _ => {}
         }
     }
@@ -4852,7 +4937,8 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessCancelTask { .. }
         | AppAction::HarnessRetryTask { .. }
         | AppAction::HarnessScheduleNext { .. }
-        | AppAction::HarnessOpenMonitor { .. } => None,
+        | AppAction::HarnessOpenMonitor { .. }
+        | AppAction::HarnessLoadTaskCorrelations { .. } => None,
     }
 }
 
@@ -5995,6 +6081,9 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         }
         WorkerUpdate::HarnessMonitorFailed { run_id, message } => {
             app.fail_harness_monitor(&run_id, message);
+        }
+        WorkerUpdate::HarnessTaskCorrelations { task_id, correlations, failures } => {
+            app.apply_harness_task_correlations(&task_id, correlations, failures);
         }
         WorkerUpdate::Notice(notice) => app.notice = Some(notice),
     }
@@ -9592,9 +9681,11 @@ mod tests {
         let mut app = App::default();
         let (harness_tx, mut harness_rx) = mpsc::channel(1);
         let (history_tx, mut history_rx) = mpsc::channel(1);
+        let (detail_tx, mut detail_rx) = mpsc::channel(1);
         let commands = BTreeMap::from([
             (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
 
         send_action(
@@ -9613,6 +9704,10 @@ mod tests {
         ));
         assert!(matches!(
             history_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+        ));
+        assert!(matches!(
+            detail_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty),
         ));
         assert_eq!(
@@ -9681,9 +9776,11 @@ mod tests {
         let mut app = App::default();
         let (harness_tx, mut harness_rx) = mpsc::channel(2);
         let (history_tx, mut history_rx) = mpsc::channel(2);
+        let (detail_tx, mut detail_rx) = mpsc::channel(2);
         let commands = BTreeMap::from([
             (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
         let route = NativeSessionCatalogRoute::workspace(
             "workspace-a".to_owned(),
@@ -9709,6 +9806,7 @@ mod tests {
             harness_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty),
         ));
+        assert!(matches!(detail_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
 
         send_operator_action(
             &mut app,
@@ -9744,9 +9842,11 @@ mod tests {
         let (harness_tx, mut harness_rx) = mpsc::channel(1);
         harness_tx.try_send(AppAction::None).unwrap();
         let (history_tx, _history_rx) = mpsc::channel(1);
+        let (detail_tx, _detail_rx) = mpsc::channel(1);
         let commands = BTreeMap::from([
             (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
 
         send_operator_action(
@@ -9774,9 +9874,11 @@ mod tests {
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let (history_tx, _history_rx) = mpsc::channel(1);
+        let (detail_tx, _detail_rx) = mpsc::channel(1);
         let closed_commands = BTreeMap::from([
             (HARNESS_COMMAND_ROUTE.to_owned(), closed_tx),
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
         app.begin_harness_refresh(52);
         send_operator_action(
@@ -9792,13 +9894,52 @@ mod tests {
     }
 
     #[test]
-    fn harness_native_history_lane_does_not_block_create_task() {
+    fn harness_detail_queue_rejection_clears_every_pending_correlation() {
         let mut app = App::default();
-        let (harness_tx, mut harness_rx) = mpsc::channel(1);
-        let (history_tx, mut history_rx) = mpsc::channel(1);
+        let mut task = paginated_harness_task(1);
+        let run = paginated_harness_run(1);
+        task.run_ids.push(run.run_id.clone());
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![run.clone()]);
+        app.harness_kanban.correlation_pending.insert(run.run_id.clone());
+
+        let (harness_tx, _harness_rx) = mpsc::channel(1);
+        let (history_tx, _history_rx) = mpsc::channel(1);
+        let (detail_tx, mut detail_rx) = mpsc::channel(1);
+        detail_tx.try_send(AppAction::None).unwrap();
         let commands = BTreeMap::from([
             (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
+        ]);
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::HarnessLoadTaskCorrelations {
+                task_id: task.task_id.clone(),
+                run_ids: vec![run.run_id.clone()],
+            },
+        );
+
+        assert!(!app.harness_kanban.correlation_pending.contains(&run.run_id));
+        assert!(app.harness_kanban.correlation_failures.contains_key(&run.run_id));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Harness operator busy: correlation command queue is full"),
+        );
+        assert!(matches!(detail_rx.try_recv(), Ok(AppAction::None)));
+    }
+
+    #[test]
+    fn harness_read_lane_isolated_from_refresh_mutations_and_scheduler() {
+        let mut app = App::default();
+        let (harness_tx, mut harness_rx) = mpsc::channel(1);
+        let (history_tx, mut history_rx) = mpsc::channel(1);
+        let (detail_tx, mut detail_rx) = mpsc::channel(2);
+        let commands = BTreeMap::from([
+            (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
+            (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
         let route = NativeSessionCatalogRoute::workspace(
             "workspace-a".to_owned(),
@@ -9816,7 +9957,6 @@ mod tests {
         );
 
         let task = paginated_harness_task(1);
-        let run = paginated_harness_run(1);
         let mutation_actions = vec![
             AppAction::HarnessRefresh { token: 62 },
             AppAction::HarnessCreateTask {
@@ -9838,27 +9978,34 @@ mod tests {
             },
             AppAction::HarnessRetryTask {
                 token: 66,
-                task_id: task.task_id,
+                task_id: task.task_id.clone(),
                 expected_revision: task.revision,
             },
             AppAction::HarnessScheduleNext {
                 token: 67,
                 plan_id: None,
             },
-            AppAction::HarnessOpenMonitor { run_id: run.run_id },
         ];
         for action in mutation_actions {
             send_operator_action(&mut app, &commands, action.clone());
             assert_eq!(harness_rx.try_recv().unwrap(), action);
         }
+        let run = paginated_harness_run(1);
+        let monitor = AppAction::HarnessOpenMonitor { run_id: run.run_id.clone() };
+        let correlations = AppAction::HarnessLoadTaskCorrelations {
+            task_id: task.task_id.clone(),
+            run_ids: vec![run.run_id],
+        };
+        send_operator_action(&mut app, &commands, monitor.clone());
+        send_operator_action(&mut app, &commands, correlations.clone());
+        assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert!(matches!(
             history_rx.try_recv(),
             Ok(AppAction::CatalogNativeSessions { token: 61, .. }),
         ));
-        assert!(matches!(
-            history_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty),
-        ));
+        assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(detail_rx.try_recv().unwrap(), monitor);
+        assert_eq!(detail_rx.try_recv().unwrap(), correlations);
     }
 
     #[test]

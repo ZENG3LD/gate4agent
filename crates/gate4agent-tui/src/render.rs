@@ -3179,6 +3179,10 @@ fn render_harness_kanban(
         render_harness_monitor(monitor, area, buf, theme);
         return;
     }
+    if app.harness_kanban.detail.is_some() {
+        render_harness_task_detail(app, area, buf, layout, theme);
+        return;
+    }
     draw_harness_board_frame(area, buf, theme);
     let inner = Rect::new(
         area.x.saturating_add(1),
@@ -3283,17 +3287,15 @@ fn render_harness_kanban(
                 layout,
             ).saturating_add(1);
         }
-        if app.harness_selected_bound_run().is_some() {
-            let _ = render_toolbar_segment(
-                "[Run details]",
-                context_x,
-                context_area,
-                button_style,
-                Some(HitTarget::HarnessTaskMonitor),
-                buf,
-                layout,
-            );
-        }
+        let _ = render_toolbar_segment(
+            "[Open]",
+            context_x,
+            context_area,
+            button_style,
+            Some(HitTarget::HarnessTaskOpen(task.task_id.clone())),
+            buf,
+            layout,
+        );
         header_rows = header_rows.saturating_add(1);
     }
     let status = app.harness_kanban.stale_reason.as_ref()
@@ -3670,10 +3672,266 @@ fn render_harness_task_card(
             .style(Style::default().fg(theme.dim).bg(background))
             .render(Rect::new(area.x, area.y + 3, area.width, 1), buf);
     }
-    if area.height > 4 && selected && app.harness_selected_bound_run().is_some() {
-        Paragraph::new("[details]")
+    if area.height > 4 {
+        let open_width = area.width.min(6);
+        let open_rect = Rect::new(area.x, area.y + 4, open_width, 1);
+        Paragraph::new("[Open]")
             .style(Style::default().fg(theme.teal).bg(background))
-            .render(Rect::new(area.x, area.y + 4, area.width.min(9), 1), buf);
+            .render(open_rect, buf);
+        layout.hits.push(HitRegion {
+            rect: open_rect,
+            target: HitTarget::HarnessTaskOpen(task.task_id.clone()),
+        });
+    }
+}
+
+fn render_harness_task_detail(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    use crate::app::HarnessTaskDetailSection;
+    use gate4agent_harness_client::HarnessRunSessionViewV1;
+
+    let Some(detail) = app.harness_kanban.detail.as_ref() else {
+        return;
+    };
+    let Some(task) = app.harness_kanban.tasks.get(&detail.task_id) else {
+        return;
+    };
+    draw_harness_board_frame(area, buf, theme);
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let header = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+    fill_rect(header, theme.active, buf);
+    let button_style = Style::default().fg(theme.teal).bg(theme.active);
+    let back_end = render_toolbar_segment(
+        "[Back]",
+        header.x,
+        header,
+        button_style,
+        Some(HitTarget::HarnessTaskDetailBack),
+        buf,
+        layout,
+    );
+    let heading = format!("Task | {} | {:?} | rev {}", task.title, task.state, task.revision.get());
+    let heading_x = back_end.saturating_add(1);
+    Paragraph::new(truncate_cells(
+        &heading,
+        header.right().saturating_sub(heading_x) as usize,
+    ))
+        .style(Style::default().fg(theme.text).bg(theme.active).add_modifier(Modifier::BOLD))
+        .render(Rect::new(
+            heading_x,
+            header.y,
+            header.right().saturating_sub(heading_x),
+            1,
+        ), buf);
+
+    let sections = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1).min(1),
+    );
+    fill_rect(sections, theme.active, buf);
+    let mut section_x = sections.x;
+    for section in HarnessTaskDetailSection::ALL {
+        let style = if detail.section == section {
+            Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD)
+        } else {
+            button_style
+        };
+        section_x = render_toolbar_segment(
+            &format!("[{}]", section.label()),
+            section_x,
+            sections,
+            style,
+            Some(HitTarget::HarnessTaskDetailSection(section)),
+            buf,
+            layout,
+        ).saturating_add(1);
+    }
+    let divider_y = inner.y.saturating_add(2);
+    draw_harness_board_divider(area, divider_y, buf, theme);
+    let body = Rect::new(
+        inner.x,
+        divider_y.saturating_add(1),
+        inner.width,
+        area.bottom().saturating_sub(1).saturating_sub(divider_y.saturating_add(1)),
+    );
+    match detail.section {
+        HarnessTaskDetailSection::Overview => {
+            let parent = task.parent_task_id.as_ref()
+                .map(|task_id| task_id.as_str())
+                .unwrap_or("none");
+            let loaded_runs = app.harness_task_runs(&task.task_id).len();
+            let lines = [
+                format!("ID: {}", task.task_id),
+                format!("Created by: {:?} | created {} | updated {}", task.creator, task.created_at_unix_ms, task.updated_at_unix_ms),
+                format!("Parent: {parent} | dependencies: {}", task.dependency_ids.len()),
+                format!("Runs: {} linked | {loaded_runs} loaded", task.run_ids.len()),
+                format!("Results: {} | artifacts: {}", task.result_refs.len(), task.artifact_refs.len()),
+                String::new(),
+                format!("Body: {}", task.body),
+            ];
+            for (index, line) in lines.iter().take(body.height as usize).enumerate() {
+                Paragraph::new(truncate_cells(line, body.width as usize))
+                    .style(Style::default().fg(if index == 6 { theme.text } else { theme.dim }).bg(theme.surface))
+                    .render(Rect::new(body.x, body.y + index as u16, body.width, 1), buf);
+            }
+        }
+        HarnessTaskDetailSection::Runs => {
+            let runs = app.harness_task_runs(&task.task_id);
+            if body.height == 0 {
+                return;
+            }
+            Paragraph::new(truncate_cells(
+                "Run attempt | created | lifecycle | binding | exact correlation",
+                body.width as usize,
+            ))
+                .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
+                .render(Rect::new(body.x, body.y, body.width, 1), buf);
+            let capacity = body.height.saturating_sub(1) as usize;
+            let selected_index = detail.selected_run.as_ref()
+                .and_then(|selected| runs.iter().position(|run| &run.run_id == selected))
+                .unwrap_or(0);
+            let offset = detail.scroll.min(selected_index).min(runs.len().saturating_sub(capacity.max(1)));
+            for (slot, run) in runs.iter().skip(offset).take(capacity).enumerate() {
+                let row = Rect::new(body.x, body.y + 1 + slot as u16, body.width, 1);
+                let selected = detail.selected_run.as_ref() == Some(&run.run_id);
+                let background = if selected { theme.active } else { theme.surface };
+                fill_rect(row, background, buf);
+                layout.hits.push(HitRegion {
+                    rect: row,
+                    target: HitTarget::HarnessTaskDetailRun(run.run_id.clone()),
+                });
+                let correlation = if app.harness_kanban.correlation_pending.contains(&run.run_id) {
+                    "loading".to_owned()
+                } else if let Some(value) = app.harness_kanban.correlations.get(&run.run_id) {
+                    format!("{:?}", value.availability)
+                } else if app.harness_kanban.correlation_failures.contains_key(&run.run_id) {
+                    "unavailable".to_owned()
+                } else {
+                    "not loaded".to_owned()
+                };
+                let monitor_label = if run.binding == gate4agent_harness_client::RedactedBindingStateV1::None {
+                    "[Monitor unavailable]"
+                } else {
+                    "[Open monitor]"
+                };
+                let monitor_width = (cell_width(monitor_label) as u16).min(row.width);
+                let monitor_x = row.right().saturating_sub(monitor_width);
+                let main_width = monitor_x.saturating_sub(row.x).saturating_sub(1);
+                let id = run.run_id.as_str();
+                let line = format!(
+                    "{}... | {} | {:?} | {:?} | {correlation}",
+                    &id[..id.len().min(16)],
+                    run.created_at_unix_ms,
+                    run.lifecycle,
+                    run.binding,
+                );
+                Paragraph::new(truncate_cells(&line, main_width as usize))
+                    .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
+                    .render(Rect::new(row.x, row.y, main_width, 1), buf);
+                let monitor_rect = Rect::new(monitor_x, row.y, monitor_width, 1);
+                Paragraph::new(monitor_label)
+                    .style(Style::default().fg(if run.binding == gate4agent_harness_client::RedactedBindingStateV1::None { theme.muted } else { theme.teal }).bg(background))
+                    .render(monitor_rect, buf);
+                if run.binding != gate4agent_harness_client::RedactedBindingStateV1::None {
+                    layout.hits.push(HitRegion {
+                        rect: monitor_rect,
+                        target: HitTarget::HarnessTaskDetailRunMonitor(run.run_id.clone()),
+                    });
+                }
+            }
+            if runs.is_empty() && body.height > 1 {
+                Paragraph::new("No run attempts")
+                    .style(Style::default().fg(theme.muted).bg(theme.surface))
+                    .render(Rect::new(body.x, body.y + 1, body.width, 1), buf);
+            }
+        }
+        HarnessTaskDetailSection::Agents => {
+            let runs = app.harness_task_runs(&task.task_id);
+            let mut y = body.y;
+            for run in &runs {
+                if y >= body.bottom() {
+                    break;
+                }
+                let correlation = app.harness_kanban.correlations.get(&run.run_id);
+                let heading = if app.harness_kanban.correlation_pending.contains(&run.run_id) {
+                    format!("Run {} | exact correlation: loading", run.run_id)
+                } else if let Some(correlation) = correlation {
+                    format!(
+                        "Run {} | {:?} | node {} | workspace {} | profile {}",
+                        run.run_id,
+                        correlation.availability,
+                        correlation.node_id.as_str(),
+                        correlation.workspace_id.as_str(),
+                        correlation.provider_profile.as_str(),
+                    )
+                } else {
+                    format!("Run {} | exact correlation unavailable", run.run_id)
+                };
+                Paragraph::new(truncate_cells(&heading, body.width as usize))
+                    .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
+                    .render(Rect::new(body.x, y, body.width, 1), buf);
+                y = y.saturating_add(1);
+                if let Some(correlation) = correlation {
+                    if y < body.bottom() {
+                        let session = match &correlation.session {
+                            HarnessRunSessionViewV1::Managed(session) => {
+                                let runtime = session.active_session.as_ref()
+                                    .map(|active| format!("{}:{}", active.instance_id, active.generation))
+                                    .unwrap_or_else(|| "none".to_owned());
+                                format!("Managed record {} | runtime {runtime} | mode {:?} | worktree {:?}", session.record_id.as_str(), correlation.mode, correlation.worktree)
+                            }
+                            HarnessRunSessionViewV1::Inline(session) => {
+                                format!("Inline {} | mode {:?} | worktree {:?}", session.inline_ref, correlation.mode, correlation.worktree)
+                            }
+                        };
+                        Paragraph::new(truncate_cells(&session, body.width as usize))
+                            .style(Style::default().fg(theme.dim).bg(theme.surface))
+                            .render(Rect::new(body.x, y, body.width, 1), buf);
+                        y = y.saturating_add(1);
+                    }
+                } else if y < body.bottom() {
+                    let reason = app.harness_kanban.correlation_failures.get(&run.run_id)
+                        .map(String::as_str)
+                        .unwrap_or("binding is not correlated");
+                    Paragraph::new(truncate_cells(reason, body.width as usize))
+                        .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                        .render(Rect::new(body.x, y, body.width, 1), buf);
+                    y = y.saturating_add(1);
+                }
+                for unavailable in [
+                    "PTY: unavailable (Harness-mediated terminal contract pending)",
+                    "Workspace: unavailable (Harness-mediated workspace contract pending)",
+                ] {
+                    if y >= body.bottom() {
+                        break;
+                    }
+                    Paragraph::new(truncate_cells(unavailable, body.width as usize))
+                        .style(Style::default().fg(theme.muted).bg(theme.surface))
+                        .render(Rect::new(body.x, y, body.width, 1), buf);
+                    y = y.saturating_add(1);
+                }
+            }
+            if runs.is_empty() {
+                Paragraph::new("No run attempts; no agents are correlated")
+                    .style(Style::default().fg(theme.muted).bg(theme.surface))
+                    .render(body, buf);
+            }
+        }
     }
 }
 
@@ -3754,7 +4012,7 @@ fn render_agent_board_card(
         rect: area,
         target: HitTarget::AgentBoardCard(card.key.clone()),
     });
-    let (primary, secondary) = match &card.key {
+    let (primary, mut secondary) = match &card.key {
         AgentRowKey::Managed { .. } => {
             let Some(record) = app.find_managed_session(&card.key) else {
                 return;
@@ -3788,6 +4046,15 @@ fn render_agent_board_card(
             )
         }
     };
+    if let Some((task_id, run_id)) = app.harness_agent_run_links(&card.key).last() {
+        let task = task_id.as_str();
+        let run = run_id.as_str();
+        secondary.push_str(&format!(
+            " | Harness {}.../{}...",
+            &task[..task.len().min(10)],
+            &run[..run.len().min(10)],
+        ));
+    }
     let open_label = "[open]";
     let open_width = (cell_width(open_label) as u16).min(area.width);
     let open_rect = Rect::new(area.right().saturating_sub(open_width), area.y, open_width, 1);
@@ -3864,6 +4131,25 @@ fn render_agent_board_card(
                 rect: progress_rect,
                 target: HitTarget::AgentBoardCardProgress(card.key.clone()),
             });
+        }
+        if let Some((task_id, run_id)) = app.harness_agent_run_links(&card.key).last() {
+            let harness_label = "[task]";
+            let harness_width = (cell_width(harness_label) as u16).min(area.width);
+            let harness_rect = Rect::new(
+                area.right().saturating_sub(harness_width),
+                area.y + 4,
+                harness_width,
+                1,
+            );
+            if harness_rect.x > progress_x.saturating_add(progress_width) {
+                Paragraph::new(harness_label)
+                    .style(Style::default().fg(theme.teal).bg(background))
+                    .render(harness_rect, buf);
+                layout.hits.push(HitRegion {
+                    rect: harness_rect,
+                    target: HitTarget::HarnessAgentTask(task_id.clone(), run_id.clone()),
+                });
+            }
         }
     }
 }
@@ -7720,6 +8006,7 @@ mod tests {
             "[Refresh]",
             "[Run next Ready]",
             "[Move to Ready]",
+            "[Open]",
         ] {
             assert!(text.contains(label), "missing mouse-first Harness control {label}: {text}");
         }
@@ -7733,6 +8020,9 @@ mod tests {
         assert!(!text.contains("[columns >]"), "{text}");
         assert!(layout.hits.iter().any(|hit| {
             hit.target == HitTarget::HarnessTaskCard(task.task_id.clone())
+        }));
+        assert!(layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::HarnessTaskOpen(task.task_id.clone())
         }));
         for mode in [
             crate::app::AgentBoardMode::HarnessKanban,
@@ -7783,6 +8073,88 @@ mod tests {
         assert_eq!(tabs.len(), 2);
         assert!(matches!(tabs.first(), Some(SurfaceTab::Pty(_))));
         assert!(matches!(tabs.last(), Some(SurfaceTab::AgentBoard)));
+    }
+
+    #[test]
+    fn harness_task_detail_renders_internal_sections_without_new_surface_tab() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let mut task = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_aaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "three attempts".to_owned(),
+            body: "inspect the full task".to_owned(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let run = RedactedRunV1 {
+            run_id: HarnessRunId::new("hrun_bbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: Some(task.task_id.clone()),
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: HarnessRunLifecycleV1::Running,
+            binding: RedactedBindingStateV1::ManagedActive,
+            result_disposition: None,
+            failure_category: None,
+            references_redacted: false,
+            created_at_unix_ms: 2,
+            updated_at_unix_ms: 2,
+        };
+        task.run_ids.push(run.run_id.clone());
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![run.clone()]);
+        app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
+            task_id: task.task_id,
+            section: crate::app::HarnessTaskDetailSection::Overview,
+            selected_run: Some(run.run_id),
+            scroll: 0,
+        });
+
+        let mut buf = TerminalBuffer::new(120, 28);
+        let layout = render(&app, &mut buf);
+        let text = buffer_text(&buf);
+        for label in ["[Back]", "[Overview]", "[Runs]", "[Agents]", "Runs: 1 linked | 1 loaded"] {
+            assert!(text.contains(label), "missing Task Detail label {label}: {text}");
+        }
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessTaskDetailBack));
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+        assert_eq!(app.surface.all_tabs().iter().filter(|tab| ***tab == SurfaceTab::AgentBoard).count(), 1);
+
+        app.harness_kanban.detail.as_mut().unwrap().section =
+            crate::app::HarnessTaskDetailSection::Runs;
+        let mut runs_buf = TerminalBuffer::new(120, 28);
+        let runs_layout = render(&app, &mut runs_buf);
+        let runs_text = buffer_text(&runs_buf);
+        assert!(runs_text.contains("[Open monitor]"), "{runs_text}");
+        assert!(runs_layout.hits.iter().any(|hit| {
+            matches!(hit.target, HitTarget::HarnessTaskDetailRunMonitor(_))
+        }));
+
+        app.harness_kanban.detail.as_mut().unwrap().section =
+            crate::app::HarnessTaskDetailSection::Agents;
+        let mut agents_buf = TerminalBuffer::new(120, 28);
+        render(&app, &mut agents_buf);
+        let agents_text = buffer_text(&agents_buf);
+        assert!(agents_text.contains("exact correlation unavailable"), "{agents_text}");
+        assert!(agents_text.contains("PTY: unavailable"), "{agents_text}");
+        assert!(agents_text.contains("Workspace: unavailable"), "{agents_text}");
     }
 
     #[test]

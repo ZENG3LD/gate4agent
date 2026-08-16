@@ -67,9 +67,12 @@ use gate4agent_harness_client::{
     HarnessRunTransferSummaryV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
-    HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTransportV1,
+    HarnessRuntimeMouseProtocolEncodingV1, HarnessRuntimeSessionAddressV1,
+    HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTerminalFrameV1,
+    HarnessRuntimeTerminalPageV1, HarnessRuntimeTransportV1,
     RedactedTaskV1, RunPageV1, TaskPageV1,
     SessionMonitorV1 as HarnessSessionMonitorV1, TimelineEntryV1,
+    HARNESS_TERMINAL_PAGE_LIMIT_MAX,
 };
 use gate4agent_harness_protocol::HarnessSelectorV1;
 use gate4agent_observation_api::{
@@ -118,6 +121,7 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
 const RAW_INPUT_COALESCE: Duration = Duration::from_millis(12);
 const INSPECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const HARNESS_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PREFERENCES_SAVE_DEBOUNCE: Duration = Duration::from_millis(350);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DIRTY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -753,6 +757,7 @@ enum WorkerUpdate {
         token: u64,
         message: String,
     },
+    HarnessTerminalRead(HarnessRuntimeTerminalPageV1),
     Notice(String),
 }
 
@@ -941,6 +946,10 @@ impl C2ApplyState {
 
     fn record_terminal_frame(&mut self, address: SessionAddress, sequence: u64) {
         self.terminal_watermarks.insert(address, sequence);
+    }
+
+    fn terminal_watermark(&self, address: &SessionAddress) -> Option<u64> {
+        self.terminal_watermarks.get(address).copied()
     }
 
     fn reset_terminal_watermarks(&mut self, node_id: &str) {
@@ -1187,6 +1196,8 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut notice_deadline = None;
     let mut auto_inspected_route = None;
     let mut next_auto_inspection = Instant::now();
+    let mut harness_terminal_poll_address: Option<SessionAddress> = None;
+    let mut next_harness_terminal_poll = Instant::now();
     let mut preferred_color_mode = initial_preferences.color_mode;
     let mut observed_app_color_mode = app.color_mode;
     let mut observed_preferences = preferences_for_save(&app, preferred_color_mode);
@@ -1242,6 +1253,28 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             );
             next_auto_inspection = now + INSPECTION_REFRESH_INTERVAL;
             state_changed = true;
+        }
+        let focused_harness_terminal = if selected_backend.harness_worker {
+            app.focused_address().cloned()
+        } else {
+            None
+        };
+        if focused_harness_terminal != harness_terminal_poll_address {
+            harness_terminal_poll_address = focused_harness_terminal.clone();
+            next_harness_terminal_poll = now;
+        }
+        if let Some(address) = focused_harness_terminal.filter(|_| now >= next_harness_terminal_poll) {
+            next_harness_terminal_poll = now + HARNESS_TERMINAL_POLL_INTERVAL;
+            if let Some(incarnation_id) = app.nodes.iter()
+                .find(|node| node.node_id == address.node_id)
+                .and_then(|node| node.incarnation_id)
+            {
+                let action = AppAction::HarnessOpenTerminal {
+                    session: harness_terminal_session_address(&address, incarnation_id),
+                    after_sequence: c2_apply_state.terminal_watermark(&address),
+                };
+                queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
+            }
         }
         if app.notice != last_notice {
             last_notice = app.notice.clone();
@@ -1311,10 +1344,19 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             app.workspace_inspection_pending(),
             next_auto_inspection,
         );
+        let harness_terminal_deadline = harness_terminal_poll_address
+            .is_some()
+            .then_some(next_harness_terminal_poll);
         let poll_timeout = frames.poll_timeout(
             Instant::now(),
             app.has_active_animation(),
-            &[notice_deadline, preferences_deadline, raw_deadline, inspection_deadline],
+            &[
+                notice_deadline,
+                preferences_deadline,
+                raw_deadline,
+                inspection_deadline,
+                harness_terminal_deadline,
+            ],
         );
         if event::poll(poll_timeout)? {
             let mut terminal_events = vec![event::read()?];
@@ -1685,6 +1727,7 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
     matches!(
         action,
         AppAction::HarnessOpenMonitor { .. }
+            | AppAction::HarnessOpenTerminal { .. }
             | AppAction::HarnessLoadTaskCorrelations { .. }
             | AppAction::HarnessLoadTaskLaunchOptions { .. }
             | AppAction::HarnessLoadRunTransfer { .. }
@@ -1767,7 +1810,8 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessLoadTaskCorrelations { .. }
         | AppAction::HarnessSaveTaskLaunchSpec { .. }
         | AppAction::HarnessStartTaskV2 { .. } => Some(HARNESS_COMMAND_ROUTE),
-        AppAction::HarnessLoadTaskLaunchOptions { .. }
+        AppAction::HarnessOpenTerminal { .. }
+        | AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
         | AppAction::HarnessObserveRunContextSource { .. }
         | AppAction::HarnessInspectWorkspace { .. }
@@ -2568,6 +2612,17 @@ fn harness_detail_worker(
                 };
                 if updates.blocking_send(update).is_err() {
                     return;
+                }
+            }
+            AppAction::HarnessOpenTerminal { session, after_sequence } => {
+                if let Ok(page) = client.terminal_read(
+                    session,
+                    after_sequence,
+                    HARNESS_TERMINAL_PAGE_LIMIT_MAX,
+                ) {
+                    if updates.blocking_send(WorkerUpdate::HarnessTerminalRead(page)).is_err() {
+                        return;
+                    }
                 }
             }
             AppAction::HarnessLoadRunTransfer { run, token } => {
@@ -5784,6 +5839,7 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessRetryTask { .. }
         | AppAction::HarnessScheduleNext { .. }
         | AppAction::HarnessOpenMonitor { .. }
+        | AppAction::HarnessOpenTerminal { .. }
         | AppAction::HarnessLoadTaskCorrelations { .. }
         | AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
@@ -7067,6 +7123,28 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         WorkerUpdate::HarnessReverseAttributionFailed { subject, token, message } => {
             app.fail_harness_reverse_attribution(&subject, token, message);
         }
+        WorkerUpdate::HarnessTerminalRead(page) => {
+            let HarnessRuntimeTerminalPageV1 { session, frames, .. } = page;
+            if let Ok(incarnation_id) =
+                session.incarnation_id.parse::<gate4agent_node_protocol::NodeIncarnationId>()
+            {
+                let address = SessionAddress {
+                    node_id: session.node_id,
+                    workspace_id: session.workspace_id,
+                    instance_id: session.instance_id,
+                    generation: session.generation,
+                };
+                for wire_frame in frames {
+                    let frame_sequence = wire_frame.sequence;
+                    let frame = terminal_frame_from_harness(wire_frame);
+                    if c2.terminal_frame_is_new(&address, frame_sequence)
+                        && app.apply_terminal_frame(&address, incarnation_id, frame)
+                    {
+                        c2.record_terminal_frame(address.clone(), frame_sequence);
+                    }
+                }
+            }
+        }
         WorkerUpdate::Notice(notice) => app.notice = Some(notice),
     }
     follow_up
@@ -7485,6 +7563,48 @@ fn project_harness_inventory_node(entry: HarnessRuntimeNodeInventoryV1) -> Resul
         workspaces,
         session_records,
     })
+}
+
+fn harness_terminal_session_address(
+    address: &SessionAddress,
+    incarnation_id: gate4agent_node_protocol::NodeIncarnationId,
+) -> HarnessRuntimeSessionAddressV1 {
+    HarnessRuntimeSessionAddressV1 {
+        node_id: address.node_id.clone(),
+        incarnation_id: incarnation_id.to_string(),
+        workspace_id: address.workspace_id.clone(),
+        instance_id: address.instance_id,
+        generation: address.generation,
+    }
+}
+
+// Not a `From` impl: both `HarnessRuntimeTerminalFrameV1` (gate4agent-harness-api,
+// re-exported by gate4agent-harness-client) and `TerminalFrame` (gate4agent-types)
+// are foreign to this crate, so the orphan rule forbids implementing the foreign
+// `From` trait for a foreign type here (mirrors the server-side
+// `terminal_frame_to_wire` note in gate4agent-harness-service/src/terminal.rs).
+// `contents` (plain-text render) has no wire counterpart: `apply_terminal_frame`
+// (app.rs) never reads it, so it is left at the type default (empty string).
+fn terminal_frame_from_harness(frame: HarnessRuntimeTerminalFrameV1) -> TerminalFrame {
+    TerminalFrame {
+        sequence: frame.sequence,
+        size: TerminalSize {
+            rows: frame.size.rows,
+            columns: frame.size.columns,
+        },
+        cursor_row: frame.cursor_row,
+        cursor_column: frame.cursor_column,
+        contents: String::new(),
+        formatted: frame.formatted,
+        scrollback_formatted: frame.scrollback_formatted,
+        alternate_screen: frame.alternate_screen,
+        mouse_protocol_enabled: frame.mouse_protocol_enabled,
+        mouse_protocol_encoding: match frame.mouse_protocol_encoding {
+            HarnessRuntimeMouseProtocolEncodingV1::Default => TerminalMouseProtocolEncoding::Default,
+            HarnessRuntimeMouseProtocolEncodingV1::Utf8 => TerminalMouseProtocolEncoding::Utf8,
+            HarnessRuntimeMouseProtocolEncodingV1::Sgr => TerminalMouseProtocolEncoding::Sgr,
+        },
+    }
 }
 
 fn project_harness_inventory_session(

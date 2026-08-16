@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod read;
 pub mod runtime;
 mod store;
+mod terminal;
 
 use gate4agent_harness_engine::{
     HarnessApplyOutcome, HarnessEngine, HarnessEngineCheckpointV1, HarnessEngineError,

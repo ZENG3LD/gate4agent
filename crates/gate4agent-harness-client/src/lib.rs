@@ -244,6 +244,16 @@ impl HarnessOperatorClient {
         }
     }
 
+    pub fn run_correlation_get(
+        &self,
+        run_id: HarnessRunId,
+    ) -> Result<HarnessRunCorrelationV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::RunCorrelationGet { run_id })? {
+            HarnessOperatorResponseV1::RunCorrelation(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn runtime_inventory_list(
         &self,
         after_node_id: Option<String>,
@@ -382,11 +392,7 @@ impl HarnessOperatorClient {
             self.deadline
         };
         request.validate()?;
-        let version = if request.requires_v3() {
-            HARNESS_OPERATOR_WIRE_VERSION_V3
-        } else {
-            HARNESS_OPERATOR_WIRE_VERSION_V2
-        };
+        let version = request.minimum_wire_version();
         let envelope = HarnessOperatorEnvelopeV1 {
             version,
             credential: self.credential.clone(),
@@ -765,6 +771,60 @@ mod tests {
         let response = client.catalog_native_sessions(route.clone(), 16).unwrap();
         assert_eq!(response.route, route);
         assert!(response.entries.is_empty());
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_gets_v4_run_correlation_without_identity_loss() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let expected_run_id = run_id.clone();
+        let correlation = HarnessRunCorrelationV1 {
+            run_id: run_id.clone(),
+            run_revision: HarnessRevision::new(9).unwrap(),
+            task_id: HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+            worktree: HarnessRunWorktreeViewV1::Managed {
+                worktree_ref: HarnessSelectorV1::new("worktree-a").unwrap(),
+            },
+            session: HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                record_id: HarnessSelectorV1::new("record-a").unwrap(),
+                active_session: Some(HarnessRuntimeIdentityV1 {
+                    instance_id: 19,
+                    generation: 4,
+                }),
+            }),
+            availability: HarnessRunCorrelationAvailabilityV1::Available,
+            observed_at_unix_ms: Some(200),
+        };
+        let echoed = correlation.clone();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let envelope: HarnessOperatorEnvelopeV1 =
+                serde_json::from_str(request.trim_end()).expect("operator envelope");
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V4);
+            assert!(matches!(
+                envelope.request,
+                HarnessOperatorRequestV1::RunCorrelationGet { run_id }
+                    if run_id == expected_run_id,
+            ));
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::RunCorrelation(echoed),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert_eq!(client.run_correlation_get(run_id).unwrap(), correlation);
         host.join().expect("host");
     }
 

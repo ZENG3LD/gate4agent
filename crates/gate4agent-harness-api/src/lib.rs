@@ -17,8 +17,9 @@ pub use gate4agent_harness_protocol::{
     HarnessOperatorAuthorityV1, HarnessReplaceTaskRequestV1, HarnessRetryTaskRequestV1,
     HarnessScheduleNextRequestV1, HarnessScheduleOutcomeV1,
     HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResultDispositionV1,
-    HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1,
-    HarnessTaskId, HarnessTaskStateV1, HarnessValidationError, SessionGrantId,
+    HarnessInlineRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
+    HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
+    HarnessValidationError, SessionGrantId,
     HARNESS_ARTIFACTS_MAX, HARNESS_BODY_MAX_BYTES,
     HARNESS_CHILD_COUNT_MAX, HARNESS_CHILD_DEPTH_MAX, HARNESS_DEPENDENCIES_MAX,
     HARNESS_LINKS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
@@ -38,6 +39,7 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 pub const HARNESS_OPERATOR_WIRE_VERSION_V1: u16 = 1;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V2: u16 = 2;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V3: u16 = 3;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V4: u16 = 4;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -139,8 +141,10 @@ impl HarnessOperatorEnvelopeV1 {
     pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
         if !matches!(
             self.version,
-            HARNESS_OPERATOR_WIRE_VERSION_V2 | HARNESS_OPERATOR_WIRE_VERSION_V3
-        ) || self.request.requires_v3() && self.version != HARNESS_OPERATOR_WIRE_VERSION_V3
+            HARNESS_OPERATOR_WIRE_VERSION_V2
+                | HARNESS_OPERATOR_WIRE_VERSION_V3
+                | HARNESS_OPERATOR_WIRE_VERSION_V4
+        ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
         }
@@ -348,6 +352,7 @@ pub enum HarnessOperatorRequestV1 {
         limit: u16,
     },
     RunGet { run_id: HarnessRunId },
+    RunCorrelationGet { run_id: HarnessRunId },
     RuntimeInventoryList {
         after_node_id: Option<String>,
         limit: u16,
@@ -408,7 +413,7 @@ impl HarnessOperatorRequestV1 {
                 }
                 validate_operator_limit(*limit)
             }
-            Self::RunGet { run_id } => {
+            Self::RunGet { run_id } | Self::RunCorrelationGet { run_id } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)
             }
             Self::RuntimeInventoryList { after_node_id, limit } => {
@@ -484,6 +489,20 @@ impl HarnessOperatorRequestV1 {
                 | Self::SubmitIntent { .. }
         )
     }
+
+    pub fn requires_v4(&self) -> bool {
+        matches!(self, Self::RunCorrelationGet { .. })
+    }
+
+    pub fn minimum_wire_version(&self) -> u16 {
+        if self.requires_v4() {
+            HARNESS_OPERATOR_WIRE_VERSION_V4
+        } else if self.requires_v3() {
+            HARNESS_OPERATOR_WIRE_VERSION_V3
+        } else {
+            HARNESS_OPERATOR_WIRE_VERSION_V2
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -511,6 +530,7 @@ pub enum HarnessOperatorResponseV1 {
     Task(RedactedTaskV1),
     Runs(RunPageV1),
     Run(RedactedRunV1),
+    RunCorrelation(HarnessRunCorrelationV1),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
@@ -528,6 +548,7 @@ impl HarnessOperatorResponseV1 {
             Self::Task(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Runs(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Run(value) => value.validate().map_err(HarnessOperatorApiError::Read),
+            Self::RunCorrelation(value) => value.validate(),
             Self::RuntimeInventory(value) => value.validate(),
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
@@ -537,6 +558,178 @@ impl HarnessOperatorResponseV1 {
             Self::Schedule(HarnessScheduleOutcomeV1::Dispatch(value)) => {
                 value.validate().map_err(HarnessOperatorApiError::Protocol)
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct HarnessNodeIncarnationV1(HarnessSelectorV1);
+
+impl HarnessNodeIncarnationV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessOperatorApiError> {
+        let value = value.into();
+        if value.len() != 32 || !value.bytes().all(is_lower_hex) {
+            return Err(HarnessOperatorApiError::InvalidRunCorrelation);
+        }
+        HarnessSelectorV1::new(value)
+            .map(Self)
+            .map_err(HarnessOperatorApiError::Protocol)
+    }
+
+    pub fn as_str(&self) -> &str { self.0.as_str() }
+
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.0.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if self.0.as_str().len() != 32 || !self.0.as_str().bytes().all(is_lower_hex) {
+            return Err(HarnessOperatorApiError::InvalidRunCorrelation);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessNodeIncarnationV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessRunWorktreeViewV1 {
+    Existing,
+    Managed { worktree_ref: HarnessSelectorV1 },
+}
+
+impl HarnessRunWorktreeViewV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::Existing => Ok(()),
+            Self::Managed { worktree_ref } => {
+                worktree_ref.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessManagedRunSessionV1 {
+    pub record_id: HarnessSelectorV1,
+    pub active_session: Option<HarnessRuntimeIdentityV1>,
+}
+
+impl HarnessManagedRunSessionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.record_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if let Some(active_session) = &self.active_session {
+            active_session.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessInlineRunSessionV1 {
+    pub inline_ref: HarnessInlineRef,
+}
+
+impl HarnessInlineRunSessionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.inline_ref.validate().map_err(HarnessOperatorApiError::Protocol)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessRunSessionViewV1 {
+    Managed(HarnessManagedRunSessionV1),
+    Inline(HarnessInlineRunSessionV1),
+}
+
+impl HarnessRunSessionViewV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::Managed(value) => value.validate(),
+            Self::Inline(value) => value.validate(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessRunCorrelationAvailabilityV1 {
+    Available,
+    Dormant,
+    Unavailable,
+    NotObserved,
+    StaleIncarnation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunCorrelationV1 {
+    pub run_id: HarnessRunId,
+    pub run_revision: HarnessRevision,
+    pub task_id: HarnessTaskId,
+    pub node_id: HarnessSelectorV1,
+    pub node_incarnation_id: HarnessNodeIncarnationV1,
+    pub workspace_id: HarnessSelectorV1,
+    pub provider_profile: HarnessSelectorV1,
+    pub mode: HarnessExecutionModeV1,
+    pub worktree: HarnessRunWorktreeViewV1,
+    pub session: HarnessRunSessionViewV1,
+    pub availability: HarnessRunCorrelationAvailabilityV1,
+    pub observed_at_unix_ms: Option<u64>,
+}
+
+impl HarnessRunCorrelationV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.run_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_incarnation_id.validate()?;
+        self.workspace_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.provider_profile.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.worktree.validate()?;
+        self.session.validate()?;
+        if matches!(&self.session, HarnessRunSessionViewV1::Inline(_))
+            && self.mode != HarnessExecutionModeV1::Inline
+        {
+            return Err(HarnessOperatorApiError::InvalidRunCorrelation);
+        }
+        if matches!(self.availability, HarnessRunCorrelationAvailabilityV1::NotObserved)
+            != self.observed_at_unix_ms.is_none()
+            || self.observed_at_unix_ms == Some(0)
+        {
+            return Err(HarnessOperatorApiError::InvalidRunCorrelation);
+        }
+        match (&self.session, self.availability) {
+            (
+                HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                    active_session: Some(_),
+                    ..
+                }),
+                HarnessRunCorrelationAvailabilityV1::Dormant,
+            )
+            | (
+                HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                    active_session: None,
+                    ..
+                }),
+                HarnessRunCorrelationAvailabilityV1::Available,
+            )
+            | (
+                HarnessRunSessionViewV1::Inline(_),
+                HarnessRunCorrelationAvailabilityV1::Available
+                    | HarnessRunCorrelationAvailabilityV1::Dormant,
+            ) => Err(HarnessOperatorApiError::InvalidRunCorrelation),
+            _ => Ok(()),
         }
     }
 }
@@ -1783,6 +1976,8 @@ pub enum HarnessOperatorApiError {
     InvalidSubmittedAt,
     #[error("harness runtime inventory is invalid")]
     InvalidRuntimeInventory,
+    #[error("harness run correlation is invalid")]
+    InvalidRunCorrelation,
     #[error("harness native history value is invalid")]
     InvalidNativeHistory,
     #[error("harness operator response is invalid")]
@@ -2023,6 +2218,31 @@ fn validate_timestamps(created: u64, updated: u64) -> Result<(), HarnessReadApiE
 mod tests {
     use super::*;
 
+    fn managed_run_correlation() -> HarnessRunCorrelationV1 {
+        HarnessRunCorrelationV1 {
+            run_id: HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(7).unwrap(),
+            task_id: HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+            worktree: HarnessRunWorktreeViewV1::Managed {
+                worktree_ref: HarnessSelectorV1::new("worktree-a").unwrap(),
+            },
+            session: HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                record_id: HarnessSelectorV1::new("record-a").unwrap(),
+                active_session: Some(HarnessRuntimeIdentityV1 {
+                    instance_id: 41,
+                    generation: 3,
+                }),
+            }),
+            availability: HarnessRunCorrelationAvailabilityV1::Available,
+            observed_at_unix_ms: Some(100),
+        }
+    }
+
     #[test]
     fn credential_debug_and_errors_never_expose_secret() {
         let credential = HarnessReadCredential::parse(format!("g4ah2_aa.{}", "0".repeat(64)))
@@ -2137,6 +2357,111 @@ mod tests {
             &serde_json::to_vec(&v3).unwrap(),
         ).unwrap();
         assert_eq!(decoded, v3);
+    }
+
+    #[test]
+    fn operator_v4_run_correlation_is_exact_and_fails_closed_on_v3() {
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        let request = HarnessOperatorRequestV1::RunCorrelationGet {
+            run_id: HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap(),
+        };
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
+        assert!(request.requires_v4());
+        assert!(!request.requires_v3());
+        assert!(matches!(
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V3,
+                credential: credential.clone(),
+                request: request.clone(),
+            }.validate(),
+            Err(HarnessOperatorApiError::UnsupportedVersion),
+        ));
+        let envelope = HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V4,
+            credential,
+            request,
+        };
+        envelope.validate().unwrap();
+        let decoded: HarnessOperatorEnvelopeV1 = serde_json::from_slice(
+            &serde_json::to_vec(&envelope).unwrap(),
+        ).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn run_correlation_round_trip_preserves_atomic_identity_and_redacts() {
+        let correlation = managed_run_correlation();
+        correlation.validate().unwrap();
+        let response = HarnessOperatorResponseV1::RunCorrelation(correlation.clone());
+        response.validate().unwrap();
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: HarnessOperatorResponseV1 = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, response);
+        let text = String::from_utf8(encoded.clone()).unwrap();
+        for forbidden in [
+            "g4aho_",
+            "credential",
+            "provider_identity",
+            "session_id",
+            "spawn_spec",
+            "environment",
+            "C:\\\\",
+        ] {
+            assert!(!text.contains(forbidden));
+        }
+        assert!(text.contains("provider_profile"));
+        assert!(text.contains("node_incarnation_id"));
+        assert!(text.contains("active_session"));
+
+        let mut without_generation: serde_json::Value =
+            serde_json::from_slice(&encoded).unwrap();
+        without_generation["value"]["session"]["value"]["active_session"]
+            .as_object_mut().unwrap().remove("generation");
+        assert!(serde_json::from_value::<HarnessOperatorResponseV1>(
+            without_generation,
+        ).is_err());
+    }
+
+    #[test]
+    fn run_correlation_rejects_inconsistent_availability_and_unbounded_fields() {
+        let mut correlation = managed_run_correlation();
+        correlation.availability = HarnessRunCorrelationAvailabilityV1::NotObserved;
+        assert!(matches!(
+            correlation.validate(),
+            Err(HarnessOperatorApiError::InvalidRunCorrelation),
+        ));
+        correlation.observed_at_unix_ms = None;
+        correlation.validate().unwrap();
+
+        correlation.availability = HarnessRunCorrelationAvailabilityV1::Dormant;
+        correlation.observed_at_unix_ms = Some(101);
+        assert!(matches!(
+            correlation.validate(),
+            Err(HarnessOperatorApiError::InvalidRunCorrelation),
+        ));
+
+        let unknown = r#"{
+            "run_id":"hrun_aaaaaaaaaaaaaaaaaaaaaaaa",
+            "run_revision":1,
+            "task_id":"htask_bbbbbbbbbbbbbbbbbbbbbbbb",
+            "node_id":"node-a",
+            "node_incarnation_id":"07070707070707070707070707070707",
+            "workspace_id":"workspace-a",
+            "provider_profile":"codex-default",
+            "mode":"inline",
+            "worktree":{"kind":"existing"},
+            "session":{"kind":"inline","value":{"inline_ref":"hinline_cccccccccccccccccccccccc"}},
+            "availability":"not-observed",
+            "observed_at_unix_ms":null,
+            "raw_path":"C:\\\\private"
+        }"#;
+        assert!(serde_json::from_str::<HarnessRunCorrelationV1>(unknown).is_err());
+        assert!(HarnessNodeIncarnationV1::new("x".repeat(129)).is_err());
+        assert!(HarnessNodeIncarnationV1::new("0".repeat(31)).is_err());
+        assert!(HarnessNodeIncarnationV1::new("A".repeat(32)).is_err());
     }
 
     #[test]

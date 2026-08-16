@@ -32,10 +32,14 @@ use gate4agent_observation_api::{
 };
 use gate4agent_observation_service::{ObservationService, ObservationServiceError};
 use gate4agent_harness_api::{
+    HarnessInlineRunSessionV1, HarnessManagedRunSessionV1,
+    HarnessNodeIncarnationV1,
     HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorHostErrorV1,
     HarnessOperatorIntentV1,
     HarnessOperatorMutationOutcomeV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
     HarnessOperatorResponseV1, HarnessReadCredential, HarnessReadEnvelopeV1,
+    HarnessRunCorrelationAvailabilityV1, HarnessRunCorrelationV1,
+    HarnessRunSessionViewV1, HarnessRunWorktreeViewV1,
     HarnessRuntimeInventoryPageV1, HarnessRuntimeInventoryV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
@@ -49,7 +53,8 @@ use gate4agent_harness_api::{
     HARNESS_READ_RESPONSE_MAX_BYTES,
 };
 use gate4agent_harness_protocol::{
-    HarnessActorV1, HarnessDispatchIntentV1, HarnessFailureCategoryV1,
+    HarnessActorV1, HarnessDispatchIntentV1, HarnessExecutionModeV1,
+    HarnessFailureCategoryV1,
     HarnessIdempotencyRef,
     HarnessFailureV1, HarnessOperationId, HarnessOperationKindV1,
     HarnessOperationStateV1, HarnessOperationV1,
@@ -3271,6 +3276,123 @@ impl HarnessRuntimeInventoryCache {
         });
         HarnessRuntimeInventoryPageV1 { nodes, next_cursor }
     }
+
+    fn correlation_availability(
+        &self,
+        run: &gate4agent_harness_protocol::HarnessRunV1,
+        binding: &HarnessSessionBindingV1,
+    ) -> (HarnessRunCorrelationAvailabilityV1, Option<u64>) {
+        let Some(node) = self.nodes.values().find(|node| {
+            node.node_id == binding.node_id.as_str()
+        }) else {
+            return (HarnessRunCorrelationAvailabilityV1::NotObserved, None);
+        };
+        let observed_at = Some(node.observed_at_unix_ms);
+        if node.incarnation_id != binding.node_incarnation.as_str() {
+            return (
+                HarnessRunCorrelationAvailabilityV1::StaleIncarnation,
+                observed_at,
+            );
+        }
+        let HarnessSessionIdentityV1::Managed {
+            record_id,
+            active_session,
+        } = &binding.session else {
+            return (HarnessRunCorrelationAvailabilityV1::Unavailable, observed_at);
+        };
+        let Some(record) = node.inventory.managed_sessions.iter().find(|record| {
+            record.record_id == record_id.as_str()
+        }) else {
+            return (HarnessRunCorrelationAvailabilityV1::Unavailable, observed_at);
+        };
+        let expected_mode = match run.intent.mode {
+            HarnessExecutionModeV1::Pty => HarnessRuntimeManagedModeV1::Pty,
+            HarnessExecutionModeV1::Inline => HarnessRuntimeManagedModeV1::Inline,
+        };
+        if record.workspace_id != binding.workspace_id.as_str()
+            || record.mode != expected_mode
+        {
+            return (HarnessRunCorrelationAvailabilityV1::Unavailable, observed_at);
+        }
+        let exact_active = active_session.as_ref().is_some_and(|active| {
+            record.active_binding.as_ref().is_some_and(|current| {
+                current.workspace_id == binding.workspace_id.as_str()
+                    && current.instance_id == active.instance_id
+                    && current.generation == active.generation
+            })
+        });
+        if record.state == HarnessRuntimeManagedStateV1::Live && exact_active {
+            return (HarnessRunCorrelationAvailabilityV1::Available, observed_at);
+        }
+        if active_session.is_none()
+            && record.state == HarnessRuntimeManagedStateV1::Dormant
+            && record.active_binding.is_none()
+        {
+            return (HarnessRunCorrelationAvailabilityV1::Dormant, observed_at);
+        }
+        (HarnessRunCorrelationAvailabilityV1::Unavailable, observed_at)
+    }
+}
+
+fn project_operator_run_correlation(
+    harness: &HarnessService,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    run_id: &gate4agent_harness_protocol::HarnessRunId,
+) -> Result<HarnessRunCorrelationV1, HarnessOperatorHostErrorV1> {
+    let run = harness.engine().run(run_id)
+        .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
+    project_run_correlation(run, runtime_inventory)
+}
+
+fn project_run_correlation(
+    run: &gate4agent_harness_protocol::HarnessRunV1,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+) -> Result<HarnessRunCorrelationV1, HarnessOperatorHostErrorV1> {
+    run.validate().map_err(|_| HarnessOperatorHostErrorV1::NotFound)?;
+    let binding = run.binding.as_ref()
+        .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
+    let node_incarnation_id = HarnessNodeIncarnationV1::new(
+        binding.node_incarnation.as_str(),
+    ).map_err(|_| HarnessOperatorHostErrorV1::NotFound)?;
+    let worktree = match &run.intent.worktree {
+        HarnessWorktreeIntentV1::Existing => HarnessRunWorktreeViewV1::Existing,
+        HarnessWorktreeIntentV1::Managed { worktree_ref } => {
+            HarnessRunWorktreeViewV1::Managed {
+                worktree_ref: worktree_ref.clone(),
+            }
+        }
+    };
+    let session = match &binding.session {
+        HarnessSessionIdentityV1::Managed { record_id, active_session } => {
+            HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                record_id: record_id.clone(),
+                active_session: active_session.clone(),
+            })
+        }
+        HarnessSessionIdentityV1::Inline { inline_ref } => {
+            HarnessRunSessionViewV1::Inline(HarnessInlineRunSessionV1 {
+                inline_ref: inline_ref.clone(),
+            })
+        }
+    };
+    let (availability, observed_at_unix_ms) =
+        runtime_inventory.correlation_availability(run, binding);
+    let correlation = HarnessRunCorrelationV1 {
+        run_id: run.run_id.clone(),
+        run_revision: run.revision,
+        task_id: run.task_id.clone(),
+        node_id: binding.node_id.clone(),
+        node_incarnation_id,
+        workspace_id: binding.workspace_id.clone(),
+        provider_profile: run.intent.provider_profile.clone(),
+        mode: run.intent.mode,
+        worktree,
+        session,
+        availability,
+        observed_at_unix_ms,
+    };
+    correlation.validate().map_err(|_| HarnessOperatorHostErrorV1::NotFound)?;
+    Ok(correlation)
 }
 
 fn redact_runtime_inventory(
@@ -3505,6 +3627,11 @@ fn execute_operator_request(
             let run = harness.engine().run(&run_id)
                 .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
             HarnessOperatorResponseV1::Run(redact_operator_run(run))
+        }
+        HarnessOperatorRequestV1::RunCorrelationGet { run_id } => {
+            HarnessOperatorResponseV1::RunCorrelation(
+                project_operator_run_correlation(harness, runtime_inventory, &run_id)?,
+            )
         }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
             HarnessOperatorResponseV1::RuntimeInventory(
@@ -5172,6 +5299,182 @@ mod tests {
                 generation: SessionGeneration(3),
             },
         }
+    }
+
+    fn correlation_inventory(
+        route: NodeRoute,
+        snapshot: C2NodeSnapshot,
+        observed_at_unix_ms: u64,
+    ) -> HarnessRuntimeInventoryCache {
+        let resync = HarnessObservationResync::test_fixture(route, 5, snapshot);
+        let mut cache = HarnessRuntimeInventoryCache::default();
+        cache.refresh(&resync, observed_at_unix_ms);
+        cache
+    }
+
+    #[test]
+    fn run_correlation_projects_exact_stored_active_binding_and_current_availability() {
+        let (mut harness, task_id, run_id, route) = running_harness_fixture();
+        let snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::Live,
+            Some(bound_session_address()),
+            C2SessionStatus::Running,
+        );
+        let cache = correlation_inventory(route, snapshot, 20);
+        let observation_path = database_path();
+        let observation = ObservationService::open(&observation_path).unwrap();
+        let response = execute_operator_request(
+            &mut harness,
+            &observation,
+            &ObservationSupportRegistry::default(),
+            &HarnessLaunchCatalog::default(),
+            &cache,
+            HarnessOperatorRequestV1::RunCorrelationGet {
+                run_id: run_id.clone(),
+            },
+        ).unwrap();
+        let HarnessOperatorResponseV1::RunCorrelation(correlation) = response else {
+            panic!("run correlation response expected");
+        };
+        assert_eq!(correlation.run_id, run_id);
+        assert_eq!(correlation.task_id, task_id);
+        assert_eq!(correlation.run_revision, HarnessRevision::new(1).unwrap());
+        assert_eq!(correlation.node_id.as_str(), "node-a");
+        assert_eq!(correlation.workspace_id.as_str(), "workspace-a");
+        assert_eq!(correlation.provider_profile.as_str(), "profile-a");
+        assert_eq!(
+            correlation.availability,
+            HarnessRunCorrelationAvailabilityV1::Available,
+        );
+        assert_eq!(correlation.observed_at_unix_ms, Some(20));
+        assert_eq!(
+            correlation.session,
+            HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                record_id: selector("record-a"),
+                active_session: Some(HarnessRuntimeIdentityV1 {
+                    instance_id: 7,
+                    generation: 3,
+                }),
+            }),
+        );
+        correlation.validate().unwrap();
+        observation.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn run_correlation_preserves_dormant_and_inline_historical_identities() {
+        let (harness, _, run_id, route) = running_harness_fixture();
+        let mut dormant = harness.engine().run(&run_id).unwrap().clone();
+        dormant.lifecycle = HarnessRunLifecycleV1::Completed;
+        dormant.result_disposition = Some(HarnessResultDispositionV1::Detached);
+        dormant.binding.as_mut().unwrap().session = HarnessSessionIdentityV1::Managed {
+            record_id: selector("record-a"),
+            active_session: None,
+        };
+        let dormant_snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::Dormant,
+            None,
+            C2SessionStatus::Exited { exit_code: Some(0) },
+        );
+        let cache = correlation_inventory(route.clone(), dormant_snapshot, 21);
+        let dormant_view = project_run_correlation(&dormant, &cache).unwrap();
+        assert_eq!(
+            dormant_view.availability,
+            HarnessRunCorrelationAvailabilityV1::Dormant,
+        );
+        assert_eq!(
+            dormant_view.session,
+            HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                record_id: selector("record-a"),
+                active_session: None,
+            }),
+        );
+
+        let mut inline = dormant;
+        inline.intent.mode = HarnessExecutionModeV1::Inline;
+        let inline_ref = gate4agent_harness_protocol::HarnessInlineRef::new(format!(
+            "hinline_{}",
+            "c".repeat(24),
+        )).unwrap();
+        inline.binding.as_mut().unwrap().session = HarnessSessionIdentityV1::Inline {
+            inline_ref: inline_ref.clone(),
+        };
+        let inline_view = project_run_correlation(&inline, &cache).unwrap();
+        assert_eq!(
+            inline_view.session,
+            HarnessRunSessionViewV1::Inline(HarnessInlineRunSessionV1 { inline_ref }),
+        );
+        assert_eq!(
+            inline_view.availability,
+            HarnessRunCorrelationAvailabilityV1::Unavailable,
+        );
+        assert_eq!(inline_view.observed_at_unix_ms, Some(21));
+    }
+
+    #[test]
+    fn run_correlation_reports_missing_and_replaced_inventory_without_rewriting_binding() {
+        let (harness, _, run_id, route) = running_harness_fixture();
+        let stored = harness.engine().run(&run_id).unwrap();
+        let not_observed = project_run_correlation(
+            stored,
+            &HarnessRuntimeInventoryCache::default(),
+        ).unwrap();
+        assert_eq!(
+            not_observed.availability,
+            HarnessRunCorrelationAvailabilityV1::NotObserved,
+        );
+        assert_eq!(not_observed.observed_at_unix_ms, None);
+
+        let replacement_route = NodeRoute {
+            node_id: route.node_id.clone(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([8; 16]),
+        };
+        let replacement_snapshot = bound_snapshot(
+            &replacement_route.node_id,
+            ManagedSessionState::Live,
+            Some(bound_session_address()),
+            C2SessionStatus::Running,
+        );
+        let cache = correlation_inventory(replacement_route, replacement_snapshot, 22);
+        let stale = project_run_correlation(stored, &cache).unwrap();
+        assert_eq!(
+            stale.availability,
+            HarnessRunCorrelationAvailabilityV1::StaleIncarnation,
+        );
+        assert_eq!(stale.observed_at_unix_ms, Some(22));
+        assert_eq!(
+            stale.node_incarnation_id.as_str(),
+            route.expected_incarnation_id.to_string(),
+        );
+        assert_eq!(stale.provider_profile.as_str(), "profile-a");
+    }
+
+    #[test]
+    fn run_correlation_fails_closed_for_missing_or_malformed_stored_binding() {
+        let (harness, _, run_id, _) = running_harness_fixture();
+        let mut missing = harness.engine().run(&run_id).unwrap().clone();
+        missing.lifecycle = HarnessRunLifecycleV1::Requested;
+        missing.binding = None;
+        assert_eq!(
+            project_run_correlation(&missing, &HarnessRuntimeInventoryCache::default()),
+            Err(HarnessOperatorHostErrorV1::NotFound),
+        );
+
+        let mut malformed = harness.engine().run(&run_id).unwrap().clone();
+        malformed.binding.as_mut().unwrap().node_incarnation = selector("not-hex");
+        assert_eq!(
+            project_run_correlation(&malformed, &HarnessRuntimeInventoryCache::default()),
+            Err(HarnessOperatorHostErrorV1::NotFound),
+        );
     }
 
     #[test]

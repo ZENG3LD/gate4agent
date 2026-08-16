@@ -639,13 +639,18 @@ enum WorkerUpdate {
         timeline: Vec<TimelineEntryV1>,
     },
     HarnessMonitorFailed {
-        run_id: gate4agent_harness_client::HarnessRunId,
+        run: HarnessRunRef,
         message: String,
     },
     HarnessTaskCorrelations {
         task_id: gate4agent_harness_client::HarnessTaskId,
         correlations: Vec<HarnessRunCorrelationV1>,
         failures: Vec<(gate4agent_harness_client::HarnessRunId, String)>,
+    },
+    HarnessTaskObservations {
+        task_id: gate4agent_harness_client::HarnessTaskId,
+        observations: Vec<(RedactedRunV1, HarnessSessionMonitorV1)>,
+        failures: Vec<(HarnessRunRef, String)>,
     },
     HarnessTaskExecutionLoaded {
         task_id: gate4agent_harness_client::HarnessTaskId,
@@ -1518,7 +1523,7 @@ fn reject_harness_queue_action(
         }
         _ => {}
     }
-    if let AppAction::HarnessOpenMonitor { run_id } = action {
+    if let AppAction::HarnessOpenMonitor { run } = action {
         let message = match rejection {
             HarnessQueueRejection::Busy => {
                 "Harness operator busy: detail command queue is full"
@@ -1527,7 +1532,7 @@ fn reject_harness_queue_action(
                 "Harness operator unavailable: detail command queue is closed"
             }
         }.to_owned();
-        app.fail_harness_monitor(run_id, message.clone());
+        app.fail_harness_monitor(run, message.clone());
         app.notice = Some(message);
         return true;
     }
@@ -1541,6 +1546,7 @@ fn reject_harness_queue_action(
             }
         }.to_owned();
         app.fail_harness_task_correlations(task_id, message.clone());
+        app.fail_harness_task_observations(task_id, message.clone());
         app.fail_harness_task_execution(task_id, message.clone());
         app.notice = Some(message);
         return true;
@@ -2387,42 +2393,84 @@ fn harness_detail_worker(
 ) {
     while let Some(action) = commands.blocking_recv() {
         match action {
-            AppAction::HarnessOpenMonitor { run_id } => {
+            AppAction::HarnessOpenMonitor { run } => {
                 let result = (|| {
-                    let run = client.run_get(run_id.clone())
+                    let loaded = client.run_get(run.run_id.clone())
                         .map_err(|error| error.to_string())?;
-                    if run.binding == RedactedBindingStateV1::None {
+                    if loaded.revision != run.run_revision {
+                        return Err(format!(
+                            "Harness run revision changed from r{} to r{}",
+                            run.run_revision.get(),
+                            loaded.revision.get(),
+                        ));
+                    }
+                    if loaded.binding == RedactedBindingStateV1::None {
                         return Err("Harness run has no redacted binding".to_owned());
                     }
-                    let monitor = client.monitor_get(run_id.clone())
+                    let monitor = client.monitor_get(run.run_id.clone())
                         .map_err(|error| error.to_string())?;
-                    let timeline = client.timeline_read(run_id.clone(), None, 128)
+                    let timeline = client.timeline_read(run.run_id.clone(), None, 128)
                         .map_err(|error| error.to_string())?;
-                    Ok((run, monitor, timeline.entries))
+                    if timeline.run_id != run.run_id {
+                        return Err("Harness timeline referenced a different run".to_owned());
+                    }
+                    Ok((loaded, monitor, timeline.entries))
                 })();
                 let update = match result {
-                    Ok((run, monitor, timeline)) => {
-                        WorkerUpdate::HarnessMonitor { run, monitor, timeline }
+                    Ok((loaded, monitor, timeline)) => {
+                        WorkerUpdate::HarnessMonitor { run: loaded, monitor, timeline }
                     }
-                    Err(message) => WorkerUpdate::HarnessMonitorFailed { run_id, message },
+                    Err(message) => WorkerUpdate::HarnessMonitorFailed { run, message },
                 };
                 if updates.blocking_send(update).is_err() {
                     return;
                 }
             }
-            AppAction::HarnessLoadTaskCorrelations { task_id, run_ids } => {
-                let mut correlations = Vec::with_capacity(run_ids.len());
+            AppAction::HarnessLoadTaskCorrelations { task_id, runs } => {
+                let mut correlations = Vec::with_capacity(runs.len());
                 let mut failures = Vec::new();
-                for run_id in run_ids {
-                    match client.run_correlation_get(run_id.clone()) {
+                let mut observations = Vec::with_capacity(runs.len());
+                let mut observation_failures = Vec::new();
+                for run in runs {
+                    match client.run_correlation_get(run.run_id.clone()) {
                         Ok(correlation) => correlations.push(correlation),
-                        Err(error) => failures.push((run_id, error.to_string())),
+                        Err(error) => failures.push((run.run_id.clone(), error.to_string())),
+                    }
+                    let observation = (|| {
+                        let loaded = client.run_get(run.run_id.clone())
+                            .map_err(|error| error.to_string())?;
+                        if loaded.revision != run.run_revision
+                            || loaded.task_id.as_ref() != Some(&task_id)
+                        {
+                            return Err("Harness run identity changed while loading observation"
+                                .to_owned());
+                        }
+                        if loaded.binding == RedactedBindingStateV1::None {
+                            return Err("run has no Harness observation binding".to_owned());
+                        }
+                        let monitor = client.monitor_get(run.run_id.clone())
+                            .map_err(|error| error.to_string())?;
+                        if monitor.run_id != run.run_id {
+                            return Err("Harness monitor referenced a different run".to_owned());
+                        }
+                        Ok((loaded, monitor))
+                    })();
+                    match observation {
+                        Ok(observation) => observations.push(observation),
+                        Err(message) => observation_failures.push((run, message)),
                     }
                 }
                 if updates.blocking_send(WorkerUpdate::HarnessTaskCorrelations {
                     task_id: task_id.clone(),
                     correlations,
                     failures,
+                }).is_err() {
+                    return;
+                }
+                if updates.blocking_send(WorkerUpdate::HarnessTaskObservations {
+                    task_id: task_id.clone(),
+                    observations,
+                    failures: observation_failures,
                 }).is_err() {
                     return;
                 }
@@ -6643,11 +6691,14 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         WorkerUpdate::HarnessMonitor { run, monitor, timeline } => {
             app.apply_harness_monitor(run, monitor, timeline);
         }
-        WorkerUpdate::HarnessMonitorFailed { run_id, message } => {
-            app.fail_harness_monitor(&run_id, message);
+        WorkerUpdate::HarnessMonitorFailed { run, message } => {
+            app.fail_harness_monitor(&run, message);
         }
         WorkerUpdate::HarnessTaskCorrelations { task_id, correlations, failures } => {
             app.apply_harness_task_correlations(&task_id, correlations, failures);
+        }
+        WorkerUpdate::HarnessTaskObservations { task_id, observations, failures } => {
+            app.apply_harness_task_observations(&task_id, observations, failures);
         }
         WorkerUpdate::HarnessTaskExecutionLoaded { task_id, plans, execution_spec } => {
             app.apply_harness_task_execution(task_id, plans, execution_spec);
@@ -10694,7 +10745,10 @@ mod tests {
             &commands,
             AppAction::HarnessLoadTaskCorrelations {
                 task_id: task.task_id.clone(),
-                run_ids: vec![run.run_id.clone()],
+                runs: vec![HarnessRunRef {
+                    run_id: run.run_id.clone(),
+                    run_revision: run.revision,
+                }],
             },
         );
 
@@ -10768,10 +10822,18 @@ mod tests {
             assert_eq!(harness_rx.try_recv().unwrap(), action);
         }
         let run = paginated_harness_run(1);
-        let monitor = AppAction::HarnessOpenMonitor { run_id: run.run_id.clone() };
+        let monitor = AppAction::HarnessOpenMonitor {
+            run: HarnessRunRef {
+                run_id: run.run_id.clone(),
+                run_revision: run.revision,
+            },
+        };
         let correlations = AppAction::HarnessLoadTaskCorrelations {
             task_id: task.task_id.clone(),
-            run_ids: vec![run.run_id],
+            runs: vec![HarnessRunRef {
+                run_id: run.run_id,
+                run_revision: run.revision,
+            }],
         };
         send_operator_action(&mut app, &commands, monitor.clone());
         send_operator_action(&mut app, &commands, correlations.clone());
@@ -13388,6 +13450,25 @@ mod tests {
         assert!(harness_detail_read_action(&action));
         assert_eq!(action_node_id(&action), Some(HARNESS_DETAIL_COMMAND_ROUTE));
         assert!(action_to_request(action).is_none());
+    }
+
+    #[test]
+    fn harness_phase5_observation_reads_have_no_node_request_fallback() {
+        let run = HarnessRunRef {
+            run_id: HarnessRunId::new(format!("hrun_{}", "6".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(3).unwrap(),
+        };
+        let monitor = AppAction::HarnessOpenMonitor { run: run.clone() };
+        assert!(harness_detail_read_action(&monitor));
+        assert!(action_to_request(monitor).is_none());
+
+        let task = HarnessTaskId::new(format!("htask_{}", "7".repeat(24))).unwrap();
+        let task_observations = AppAction::HarnessLoadTaskCorrelations {
+            task_id: task,
+            runs: vec![run],
+        };
+        assert!(harness_detail_read_action(&task_observations));
+        assert!(action_to_request(task_observations).is_none());
     }
 
     #[test]

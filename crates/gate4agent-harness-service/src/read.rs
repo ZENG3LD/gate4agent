@@ -19,6 +19,12 @@ use gate4agent_observation_protocol::{
 };
 use gate4agent_observation_service::ObservationService;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationAudience {
+    Operator,
+    GrantBound,
+}
+
 #[cfg(test)]
 pub(crate) fn verify_and_execute_read(
     harness: &HarnessService,
@@ -102,6 +108,7 @@ pub(crate) fn execute_operator_monitor(
         support,
         HarnessMonitoringVisibilityV1::Timeline,
         run_id,
+        ObservationAudience::Operator,
     )? {
         HarnessReadResponseV1::Monitor(value) => Ok(value),
         _ => Err(HarnessReadHostErrorV1::Internal),
@@ -123,6 +130,7 @@ pub(crate) fn execute_operator_timeline(
         run_id,
         after_sequence,
         limit,
+        ObservationAudience::Operator,
     )? {
         HarnessReadResponseV1::Timeline(value) => Ok(value),
         _ => Err(HarnessReadHostErrorV1::Internal),
@@ -159,6 +167,7 @@ pub(crate) fn execute_exact_binding_read(
                 support,
                 grant.monitoring_visibility,
                 &run_id,
+                ObservationAudience::GrantBound,
             )
         }
         HarnessReadRequestV1::TimelineRead { run_id, after_sequence, limit } => {
@@ -166,7 +175,15 @@ pub(crate) fn execute_exact_binding_read(
                 return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
             }
             let run_id = authorized_monitor_run(engine, grant, binding, &visibility, run_id)?;
-            timeline(engine, observation, support, &run_id, after_sequence, limit)
+            timeline(
+                engine,
+                observation,
+                support,
+                &run_id,
+                after_sequence,
+                limit,
+                ObservationAudience::GrantBound,
+            )
         }
         HarnessReadRequestV1::TasksList { after_task_id, state, limit } => {
             let mut values = visibility.task_ids()
@@ -318,6 +335,7 @@ fn monitor(
     support: &ObservationSupportRegistry,
     visibility: HarnessMonitoringVisibilityV1,
     run_id: &HarnessRunId,
+    audience: ObservationAudience,
 ) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
     let run = engine.run(run_id).ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
     let projection = projection_for_run(observation, run)?;
@@ -338,7 +356,9 @@ fn monitor(
             | ProjectionAvailabilityV1::Partial
             | ProjectionAvailabilityV1::Frozen
     );
-    let detail = detail_allowed.then(|| monitor_detail(projection.expect("detail requires projection")));
+    let detail = detail_allowed.then(|| {
+        monitor_detail(projection.expect("detail requires projection"), audience)
+    });
     Ok(HarnessReadResponseV1::Monitor(SessionMonitorV1 {
         run_id: run_id.clone(),
         visibility,
@@ -360,6 +380,16 @@ fn monitor(
         cache_write_tokens: projection.map_or(0, |projection| projection.usage.observed_delta.cache_write_tokens),
         reasoning_tokens: projection.map_or(0, |projection| projection.usage.observed_delta.reasoning_tokens),
         context_window_tokens: projection.and_then(|projection| projection.usage.context_window),
+        history: (audience == ObservationAudience::Operator).then(|| {
+            projection.and_then(|projection| projection.history.as_ref()).map(|history| {
+                SessionMonitorHistoryV1 {
+                    message_count: history.message_count,
+                    message_count_exact: history.message_count_exact,
+                    completed_turn_count: history.completed_turn_count,
+                    total_tokens: history.total_tokens,
+                }
+            })
+        }).flatten(),
         detail,
     }))
 }
@@ -371,6 +401,7 @@ fn timeline(
     run_id: &HarnessRunId,
     after_sequence: Option<u64>,
     limit: u16,
+    audience: ObservationAudience,
 ) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
     let run = engine.run(run_id).ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
     let projection = projection_for_run(observation, run)?;
@@ -381,11 +412,12 @@ fn timeline(
     let mut entries = projection.into_iter()
         .flat_map(|projection| projection.timeline.iter())
         .filter(|entry| after_sequence.map_or(true, |after| entry.cursor.sequence > after))
-        .map(|entry| TimelineEntryV1 {
-            sequence: entry.cursor.sequence,
-            received_at_ms: entry.received_at_ms,
-            category: timeline_category(&entry.kind),
-            evidence: observation_evidence(entry.evidence),
+        .map(|entry| {
+            timeline_entry(
+                projection.expect("timeline entry requires projection"),
+                entry,
+                audience,
+            )
         })
         .take(usize::from(limit) + 1)
         .collect::<Vec<_>>();
@@ -592,7 +624,11 @@ fn redact_operation(
     }
 }
 
-fn monitor_detail(projection: &SessionProjection) -> SessionMonitorDetailV1 {
+fn monitor_detail(
+    projection: &SessionProjection,
+    audience: ObservationAudience,
+) -> SessionMonitorDetailV1 {
+    let structured = audience == ObservationAudience::Operator;
     SessionMonitorDetailV1 {
         todo_facts: projection.todos.current.as_ref().map(|todo| todo.items.iter().map(|item| {
             TodoFactV1 {
@@ -602,24 +638,43 @@ fn monitor_detail(projection: &SessionProjection) -> SessionMonitorDetailV1 {
                     ObservationTodoStateV1::Completed => TodoStateV1::Completed,
                     ObservationTodoStateV1::Unknown => TodoStateV1::Unknown,
                 },
+                todo_id: structured.then(|| item.id.clone()).flatten(),
+                label: structured.then(|| item.text.clone()),
                 evidence: observation_evidence(todo.evidence),
             }
-        }).collect()).unwrap_or_default(),
-        tool_facts: projection.tools.iter()
-            .map(|value| activity_fact(value, ActivityClassV1::Tool)).collect(),
-        subagent_facts: projection.subagents.iter()
-            .map(|value| activity_fact(value, ActivityClassV1::Subagent)).collect(),
-        interaction_facts: projection.interactions.iter().map(interaction_fact).collect(),
-        process_facts: projection.owned_processes.iter()
-            .map(|value| activity_fact(value, ActivityClassV1::OwnedProcess)).collect(),
+        }).take(HARNESS_MONITOR_FACTS_MAX).collect()).unwrap_or_default(),
+        tool_facts: projection.tools.iter().enumerate()
+            .map(|(index, value)| {
+                activity_fact(value, ActivityClassV1::Tool, index, structured)
+            })
+            .take(HARNESS_MONITOR_FACTS_MAX).collect(),
+        subagent_facts: projection.subagents.iter().enumerate()
+            .map(|(index, value)| {
+                activity_fact(value, ActivityClassV1::Subagent, index, structured)
+            })
+            .take(HARNESS_MONITOR_FACTS_MAX).collect(),
+        interaction_facts: projection.interactions.iter().enumerate()
+            .map(|(index, value)| interaction_fact(value, index, structured))
+            .take(HARNESS_MONITOR_FACTS_MAX).collect(),
+        process_facts: projection.owned_processes.iter().enumerate()
+            .map(|(index, value)| {
+                activity_fact(value, ActivityClassV1::OwnedProcess, index, structured)
+            })
+            .take(HARNESS_MONITOR_FACTS_MAX).collect(),
         file_facts: projection.files.iter().map(|value| FileFactV1 {
             action: FileActionV1::Changed,
+            relative_path: structured.then(|| value.path.clone()).flatten(),
             evidence: observation_evidence(value.evidence),
-        }).collect(),
+        }).take(HARNESS_MONITOR_FACTS_MAX).collect(),
     }
 }
 
-fn activity_fact(value: &CorrelationProjection, class: ActivityClassV1) -> ActivityFactV1 {
+fn activity_fact(
+    value: &CorrelationProjection,
+    class: ActivityClassV1,
+    index: usize,
+    structured: bool,
+) -> ActivityFactV1 {
     let state = match value.state {
         CorrelationState::Pending => ActivityStateV1::Active,
         CorrelationState::Completed { success: Some(false) }
@@ -630,10 +685,20 @@ fn activity_fact(value: &CorrelationProjection, class: ActivityClassV1) -> Activ
         | CorrelationState::OrphanResolution { .. } => ActivityStateV1::Completed,
         CorrelationState::UnknownAfterGap => ActivityStateV1::UnknownAfterGap,
     };
-    ActivityFactV1 { class, state, evidence: observation_evidence(value.evidence) }
+    ActivityFactV1 {
+        class,
+        state,
+        label: structured.then(|| value.class.clone()).flatten(),
+        correlation: structured.then(|| u16::try_from(index + 1).ok()).flatten(),
+        evidence: observation_evidence(value.evidence),
+    }
 }
 
-fn interaction_fact(value: &CorrelationProjection) -> InteractionFactV1 {
+fn interaction_fact(
+    value: &CorrelationProjection,
+    index: usize,
+    structured: bool,
+) -> InteractionFactV1 {
     let state = match value.state {
         CorrelationState::Pending => InteractionStateV1::Required,
         CorrelationState::UnknownAfterGap => InteractionStateV1::UnknownAfterGap,
@@ -651,6 +716,8 @@ fn interaction_fact(value: &CorrelationProjection) -> InteractionFactV1 {
     InteractionFactV1 {
         class: InteractionClassV1::Attention,
         state,
+        label: structured.then(|| value.class.clone()).flatten(),
+        correlation: structured.then(|| u16::try_from(index + 1).ok()).flatten(),
         evidence: observation_evidence(value.evidence),
     }
 }
@@ -686,6 +753,172 @@ fn timeline_category(kind: &ObservationKindV1) -> TimelineCategoryV1 {
         ObservationKindV1::FileChanged { .. } => TimelineCategoryV1::File,
         ObservationKindV1::HistorySnapshot { .. } => TimelineCategoryV1::History,
         _ => TimelineCategoryV1::Lifecycle,
+    }
+}
+
+fn timeline_entry(
+    projection: &SessionProjection,
+    entry: &gate4agent_observation_engine::TimelineEntry,
+    audience: ObservationAudience,
+) -> TimelineEntryV1 {
+    if audience == ObservationAudience::GrantBound {
+        return TimelineEntryV1 {
+            sequence: entry.cursor.sequence,
+            received_at_ms: entry.received_at_ms,
+            category: timeline_category(&entry.kind),
+            label: None,
+            state: TimelineStateV1::Unknown,
+            correlation: None,
+            evidence: observation_evidence(entry.evidence),
+        };
+    }
+    let (label, state, correlation) = match &entry.kind {
+        ObservationKindV1::SourceCapabilities { .. } => {
+            (Some("source-capabilities".to_owned()), TimelineStateV1::Updated, None)
+        }
+        ObservationKindV1::SessionStarted => {
+            (Some("session".to_owned()), TimelineStateV1::Started, None)
+        }
+        ObservationKindV1::Ready => {
+            (Some("session".to_owned()), TimelineStateV1::Active, None)
+        }
+        ObservationKindV1::Stopped => {
+            (Some("session".to_owned()), TimelineStateV1::Completed, None)
+        }
+        ObservationKindV1::Exited { success: Some(false) } => {
+            (Some("session".to_owned()), TimelineStateV1::Failed, None)
+        }
+        ObservationKindV1::Exited { .. } => {
+            (Some("session".to_owned()), TimelineStateV1::Completed, None)
+        }
+        ObservationKindV1::TurnStarted => {
+            (Some("turn".to_owned()), TimelineStateV1::Started, None)
+        }
+        ObservationKindV1::Working => {
+            (Some("turn".to_owned()), TimelineStateV1::Active, None)
+        }
+        ObservationKindV1::TurnCompleted => {
+            (Some("turn".to_owned()), TimelineStateV1::Completed, None)
+        }
+        ObservationKindV1::TurnInterrupted => {
+            (Some("turn".to_owned()), TimelineStateV1::Interrupted, None)
+        }
+        ObservationKindV1::ToolStarted { correlation_id, class } => (
+            Some(class.clone()),
+            TimelineStateV1::Started,
+            correlation_ordinal(&projection.tools, correlation_id),
+        ),
+        ObservationKindV1::ToolCompleted { correlation_id, class, success, .. } => (
+            correlation_label(&projection.tools, correlation_id)
+                .or_else(|| Some(class.clone())),
+            if *success { TimelineStateV1::Completed } else { TimelineStateV1::Failed },
+            correlation_ordinal(&projection.tools, correlation_id),
+        ),
+        ObservationKindV1::ApprovalRequested { correlation_id, tool_class }
+        | ObservationKindV1::QuestionRequested { correlation_id, tool_class } => (
+            Some(tool_class.clone()),
+            TimelineStateV1::Required,
+            correlation_ordinal(&projection.interactions, correlation_id),
+        ),
+        ObservationKindV1::ApprovalResolved { correlation_id, outcome }
+        | ObservationKindV1::QuestionResolved { correlation_id, outcome }
+        | ObservationKindV1::InteractionResolved { correlation_id, outcome } => (
+            correlation_label(&projection.interactions, correlation_id),
+            timeline_interaction_state(*outcome),
+            correlation_ordinal(&projection.interactions, correlation_id),
+        ),
+        ObservationKindV1::SubagentStarted { correlation_id, class } => (
+            Some(class.clone()),
+            TimelineStateV1::Started,
+            correlation_ordinal(&projection.subagents, correlation_id),
+        ),
+        ObservationKindV1::SubagentProgress { correlation_id } => (
+            correlation_label(&projection.subagents, correlation_id),
+            TimelineStateV1::Active,
+            correlation_ordinal(&projection.subagents, correlation_id),
+        ),
+        ObservationKindV1::SubagentCompleted { correlation_id, success } => (
+            correlation_label(&projection.subagents, correlation_id),
+            if *success == Some(false) {
+                TimelineStateV1::Failed
+            } else {
+                TimelineStateV1::Completed
+            },
+            correlation_ordinal(&projection.subagents, correlation_id),
+        ),
+        ObservationKindV1::TodoSnapshot { .. } => {
+            (Some("todo-snapshot".to_owned()), TimelineStateV1::Updated, None)
+        }
+        ObservationKindV1::Usage { .. } => {
+            (Some("token-usage".to_owned()), TimelineStateV1::Updated, None)
+        }
+        ObservationKindV1::ContextWindowUsage { .. } => {
+            (Some("context-window-usage".to_owned()), TimelineStateV1::Updated, None)
+        }
+        ObservationKindV1::RateLimited => {
+            (Some("rate-limit".to_owned()), TimelineStateV1::Waiting, None)
+        }
+        ObservationKindV1::OwnedProcessStarted { correlation_id, class } => (
+            Some(class.clone()),
+            TimelineStateV1::Started,
+            correlation_ordinal(&projection.owned_processes, correlation_id),
+        ),
+        ObservationKindV1::OwnedProcessExited { correlation_id, success, .. } => (
+            correlation_label(&projection.owned_processes, correlation_id),
+            if *success == Some(false) {
+                TimelineStateV1::Failed
+            } else {
+                TimelineStateV1::Completed
+            },
+            correlation_ordinal(&projection.owned_processes, correlation_id),
+        ),
+        ObservationKindV1::FileChanged { path } => {
+            (path.clone(), TimelineStateV1::Changed, None)
+        }
+        ObservationKindV1::HistorySnapshot { .. } => {
+            (Some("history".to_owned()), TimelineStateV1::Updated, None)
+        }
+        ObservationKindV1::Gap { .. } | ObservationKindV1::SourceReset => {
+            (Some("observation-gap".to_owned()), TimelineStateV1::UnknownAfterGap, None)
+        }
+        ObservationKindV1::Stale => {
+            (Some("observation".to_owned()), TimelineStateV1::Stale, None)
+        }
+        ObservationKindV1::Error { .. } => {
+            (Some("observation-error".to_owned()), TimelineStateV1::Failed, None)
+        }
+    };
+    TimelineEntryV1 {
+        sequence: entry.cursor.sequence,
+        received_at_ms: entry.received_at_ms,
+        category: timeline_category(&entry.kind),
+        label,
+        state,
+        correlation,
+        evidence: observation_evidence(entry.evidence),
+    }
+}
+
+fn correlation_ordinal(values: &[CorrelationProjection], correlation_id: &str) -> Option<u16> {
+    values.iter().position(|value| value.correlation_id == correlation_id)
+        .and_then(|index| u16::try_from(index + 1).ok())
+}
+
+fn correlation_label(values: &[CorrelationProjection], correlation_id: &str) -> Option<String> {
+    values.iter().find(|value| value.correlation_id == correlation_id)
+        .and_then(|value| value.class.clone())
+}
+
+fn timeline_interaction_state(
+    outcome: ObservationInteractionOutcomeV1,
+) -> TimelineStateV1 {
+    match outcome {
+        ObservationInteractionOutcomeV1::Approved
+        | ObservationInteractionOutcomeV1::Answered
+        | ObservationInteractionOutcomeV1::TurnEnded => TimelineStateV1::Completed,
+        ObservationInteractionOutcomeV1::Denied
+        | ObservationInteractionOutcomeV1::Superseded => TimelineStateV1::Dismissed,
+        ObservationInteractionOutcomeV1::Interrupted => TimelineStateV1::Interrupted,
     }
 }
 
@@ -807,6 +1040,14 @@ fn feature_state(
 mod tests {
     use super::*;
     use gate4agent_harness_protocol::*;
+    use gate4agent_observation_api::{
+        NodeCursor, NodeId, NodeIncarnationId, ObservationIngressEnvelope,
+        ObservationIngressPayload, ObservationTransport, SessionRecordId,
+    };
+    use gate4agent_observation_protocol::{
+        ObservationCapabilitiesV1, ObservationSourceFamilyV1, ObservationTodoItemV1,
+        ObservationV1,
+    };
     use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
     fn selector(value: &str) -> HarnessSelectorV1 {
@@ -847,6 +1088,76 @@ mod tests {
         }
     }
 
+    fn observation_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!(
+            "gate4agent-read-{label}-{}-{nonce}.sqlite",
+            std::process::id(),
+        ))
+    }
+
+    fn managed_target(record_id: &str) -> ObservationTarget {
+        ObservationTarget::Managed {
+            key: ManagedSessionKey {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([4; 16]),
+                record_id: SessionRecordId::new(record_id).unwrap(),
+            },
+        }
+    }
+
+    fn apply_observation(
+        service: &mut ObservationService,
+        record_id: &str,
+        sequence: u64,
+        evidence: SourceEvidenceV1,
+        kind: ObservationKindV1,
+    ) {
+        service.apply_ingress(ObservationIngressEnvelope {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([4; 16]),
+                sequence,
+            },
+            received_at_ms: 1_000 + sequence,
+            transport: ObservationTransport::C2,
+            payload: ObservationIngressPayload::Observation {
+                address: managed_target(record_id),
+                observation: ObservationV1 {
+                    source_sequence: sequence,
+                    observed_at_unix_ms: Some(2_000 + sequence),
+                    evidence,
+                    kind,
+                    truncated: false,
+                },
+            },
+        }).unwrap();
+    }
+
+    fn all_capabilities() -> ObservationCapabilitiesV1 {
+        ObservationCapabilitiesV1 {
+            tools: true,
+            attention: true,
+            subagents: true,
+            todo: true,
+            usage: true,
+            owned_processes: true,
+            file_changes: true,
+            history_summary: true,
+        }
+    }
+
+    fn close_observation(service: ObservationService, path: &PathBuf) {
+        service.close().unwrap();
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
     #[test]
     fn raw_host_read_scope_none_is_denied_not_empty() {
         let grant = grant();
@@ -876,6 +1187,568 @@ mod tests {
         }
         assert_eq!(authorize_request(&grant, &HarnessReadRequestV1::ContextGet), Ok(()));
         assert!(allowed_tool_ids(&grant).contains(&"g4a_context_get".to_owned()));
+    }
+
+    #[test]
+    fn operator_progress_projects_tool_subagent_and_usage_states() {
+        let path = observation_path("structured-progress");
+        let harness = HarnessService::from_engine_for_test(
+            crate::credential::tests::engine(
+                1,
+                SessionGrantStateV1::Active,
+                1,
+                HarnessRunLifecycleV1::Running,
+            ),
+        );
+        let mut observation = ObservationService::open(&path).unwrap();
+        apply_observation(
+            &mut observation,
+            "record-a",
+            1,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::ManagedHook,
+                source_adapter: "provider-adapter-private".to_owned(),
+                capabilities: all_capabilities(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            2,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ToolStarted {
+                correlation_id: "tool-private-id".to_owned(),
+                class: "Shell".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            3,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ToolCompleted {
+                correlation_id: "tool-private-id".to_owned(),
+                class: "Tool".to_owned(),
+                success: true,
+                duration_ms: Some(12),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            4,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::SubagentStarted {
+                correlation_id: "subagent-private-id".to_owned(),
+                class: "research".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            5,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::SubagentProgress {
+                correlation_id: "subagent-private-id".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            6,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::SubagentCompleted {
+                correlation_id: "subagent-private-id".to_owned(),
+                success: Some(false),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            7,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::Usage {
+                input_tokens: 20,
+                output_tokens: 8,
+                cache_read_tokens: 3,
+                cache_write_tokens: 2,
+                reasoning_tokens: 5,
+                context_window: Some(128_000),
+                is_cumulative: false,
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            8,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::TodoSnapshot {
+                revision: 1,
+                items: vec![ObservationTodoItemV1 {
+                    id: Some("todo-private-id".to_owned()),
+                    text: "verify operator projection".to_owned(),
+                    state: ObservationTodoStateV1::InProgress,
+                }],
+                complete: true,
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            9,
+            SourceEvidenceV1::WorkspaceObservation,
+            ObservationKindV1::FileChanged {
+                path: Some("src/operator.rs".to_owned()),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            10,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ApprovalRequested {
+                correlation_id: "approval-private-id".to_owned(),
+                tool_class: "Shell".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            11,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ApprovalResolved {
+                correlation_id: "approval-private-id".to_owned(),
+                outcome: ObservationInteractionOutcomeV1::Approved,
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            12,
+            SourceEvidenceV1::HistoryProjection,
+            ObservationKindV1::HistorySnapshot {
+                message_count: 42,
+                message_count_exact: true,
+                completed_turn_count: Some(7),
+                total_tokens: Some(900),
+            },
+        );
+
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let monitor = execute_operator_monitor(&harness, &observation, &support, &run_id)
+            .unwrap();
+        let detail = monitor.detail.as_ref().unwrap();
+        assert_eq!(monitor.features.tools, FeatureObservationStateV1::Observed);
+        assert_eq!(monitor.features.subagents, FeatureObservationStateV1::Observed);
+        assert_eq!(monitor.features.usage, FeatureObservationStateV1::Observed);
+        assert_eq!(monitor.features.history, FeatureObservationStateV1::Observed);
+        assert_eq!(monitor.input_tokens, 20);
+        assert_eq!(monitor.output_tokens, 8);
+        assert_eq!(
+            monitor.history,
+            Some(SessionMonitorHistoryV1 {
+                message_count: 42,
+                message_count_exact: true,
+                completed_turn_count: Some(7),
+                total_tokens: Some(900),
+            }),
+        );
+        assert_eq!(detail.tool_facts[0].label.as_deref(), Some("Shell"));
+        assert_eq!(detail.tool_facts[0].state, ActivityStateV1::Completed);
+        assert_eq!(detail.tool_facts[0].correlation, Some(1));
+        assert_eq!(detail.subagent_facts[0].label.as_deref(), Some("research"));
+        assert_eq!(detail.subagent_facts[0].state, ActivityStateV1::Failed);
+        assert_eq!(detail.subagent_facts[0].correlation, Some(1));
+        assert_eq!(detail.interaction_facts[0].label.as_deref(), Some("Shell"));
+        assert_eq!(detail.interaction_facts[0].state, InteractionStateV1::Responded);
+        assert_eq!(detail.interaction_facts[0].correlation, Some(1));
+        assert_eq!(detail.todo_facts[0].label.as_deref(), Some("verify operator projection"));
+        assert_eq!(detail.todo_facts[0].todo_id.as_deref(), Some("todo-private-id"));
+        assert_eq!(detail.file_facts[0].relative_path.as_deref(), Some("src/operator.rs"));
+
+        let timeline = execute_operator_timeline(
+            &harness,
+            &observation,
+            &support,
+            &run_id,
+            None,
+            HARNESS_TIMELINE_PAGE_LIMIT_MAX,
+        ).unwrap();
+        let by_sequence = |sequence| {
+            timeline.entries.iter().find(|entry| entry.sequence == sequence).unwrap()
+        };
+        assert_eq!(by_sequence(2).state, TimelineStateV1::Started);
+        assert_eq!(by_sequence(2).label.as_deref(), Some("Shell"));
+        assert_eq!(by_sequence(2).correlation, Some(1));
+        assert_eq!(by_sequence(3).state, TimelineStateV1::Completed);
+        assert_eq!(by_sequence(3).label.as_deref(), Some("Shell"));
+        assert_eq!(by_sequence(4).state, TimelineStateV1::Started);
+        assert_eq!(by_sequence(5).state, TimelineStateV1::Active);
+        assert_eq!(by_sequence(6).state, TimelineStateV1::Failed);
+        assert_eq!(by_sequence(7).state, TimelineStateV1::Updated);
+        assert_eq!(by_sequence(7).category, TimelineCategoryV1::Usage);
+        assert_eq!(by_sequence(10).state, TimelineStateV1::Required);
+        assert_eq!(by_sequence(10).correlation, Some(1));
+        assert_eq!(by_sequence(11).state, TimelineStateV1::Completed);
+        assert_eq!(by_sequence(12).category, TimelineCategoryV1::History);
+        assert_eq!(by_sequence(12).state, TimelineStateV1::Updated);
+
+        monitor.validate_for(&run_id).unwrap();
+        timeline.validate_for(&run_id).unwrap();
+        close_observation(observation, &path);
+    }
+
+    #[test]
+    fn grant_bound_monitor_and_timeline_keep_structured_operator_projection_private() {
+        let path = observation_path("grant-bound-redaction");
+        let mut checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        checkpoint.grants[0].monitoring_visibility = HarnessMonitoringVisibilityV1::Timeline;
+        let harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let mut observation = ObservationService::open(&path).unwrap();
+        apply_observation(
+            &mut observation,
+            "record-a",
+            1,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::ManagedHook,
+                source_adapter: "private-source-adapter".to_owned(),
+                capabilities: all_capabilities(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            2,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ToolStarted {
+                correlation_id: "private-tool-correlation".to_owned(),
+                class: "Shell".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            3,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::SubagentStarted {
+                correlation_id: "private-subagent-correlation".to_owned(),
+                class: "research".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            4,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ApprovalRequested {
+                correlation_id: "private-approval-correlation".to_owned(),
+                tool_class: "Shell".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            5,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::TodoSnapshot {
+                revision: 1,
+                items: vec![ObservationTodoItemV1 {
+                    id: Some("private-todo-id".to_owned()),
+                    text: "private todo text".to_owned(),
+                    state: ObservationTodoStateV1::InProgress,
+                }],
+                complete: true,
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            6,
+            SourceEvidenceV1::WorkspaceObservation,
+            ObservationKindV1::FileChanged {
+                path: Some("private/file.rs".to_owned()),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            7,
+            SourceEvidenceV1::HistoryProjection,
+            ObservationKindV1::HistorySnapshot {
+                message_count: 77,
+                message_count_exact: true,
+                completed_turn_count: Some(9),
+                total_tokens: Some(1_234),
+            },
+        );
+
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let binding = crate::credential::tests::binding(1, 1);
+        let support = ObservationSupportRegistry::default();
+        let HarnessReadResponseV1::Monitor(monitor) = execute_exact_binding_read(
+            &harness,
+            &observation,
+            &support,
+            &binding,
+            HarnessReadRequestV1::MonitorGet { run_id: Some(run_id.clone()) },
+        ).unwrap() else {
+            panic!("monitor response");
+        };
+        let HarnessReadResponseV1::Timeline(timeline) = execute_exact_binding_read(
+            &harness,
+            &observation,
+            &support,
+            &binding,
+            HarnessReadRequestV1::TimelineRead {
+                run_id: Some(run_id.clone()),
+                after_sequence: None,
+                limit: HARNESS_TIMELINE_PAGE_LIMIT_MAX,
+            },
+        ).unwrap() else {
+            panic!("timeline response");
+        };
+
+        let detail = monitor.detail.as_ref().unwrap();
+        assert_eq!(monitor.features.history, FeatureObservationStateV1::Observed);
+        assert!(monitor.history.is_none());
+        assert!(detail.todo_facts.iter().all(|fact| {
+            fact.todo_id.is_none() && fact.label.is_none()
+        }));
+        assert!(detail.tool_facts.iter().chain(&detail.subagent_facts).all(|fact| {
+            fact.label.is_none() && fact.correlation.is_none()
+        }));
+        assert!(detail.interaction_facts.iter().all(|fact| {
+            fact.label.is_none() && fact.correlation.is_none()
+        }));
+        assert!(detail.file_facts.iter().all(|fact| fact.relative_path.is_none()));
+        assert!(timeline.entries.iter().all(|entry| {
+            entry.label.is_none()
+                && entry.state == TimelineStateV1::Unknown
+                && entry.correlation.is_none()
+        }));
+        monitor.validate_for(&run_id).unwrap();
+        timeline.validate_for(&run_id).unwrap();
+
+        let encoded = format!(
+            "{}\n{}",
+            serde_json::to_string(&monitor).unwrap(),
+            serde_json::to_string(&timeline).unwrap(),
+        );
+        for forbidden in [
+            "private-source-adapter",
+            "private-tool-correlation",
+            "private-subagent-correlation",
+            "private-approval-correlation",
+            "private-todo-id",
+            "private todo text",
+            "private/file.rs",
+            "Shell",
+            "research",
+            "\"message_count\":77",
+            "correlation_id",
+        ] {
+            assert!(!encoded.contains(forbidden), "grant-bound serialized {forbidden}");
+        }
+        close_observation(observation, &path);
+    }
+
+    #[test]
+    fn operator_progress_isolated_by_exact_run_binding() {
+        let path = observation_path("run-isolation");
+        let harness = HarnessService::from_engine_for_test(
+            crate::credential::tests::engine(
+                1,
+                SessionGrantStateV1::Active,
+                1,
+                HarnessRunLifecycleV1::Running,
+            ),
+        );
+        let mut observation = ObservationService::open(&path).unwrap();
+        apply_observation(
+            &mut observation,
+            "record-b",
+            1,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ToolStarted {
+                correlation_id: "other-run-tool".to_owned(),
+                class: "foreign".to_owned(),
+            },
+        );
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let monitor = execute_operator_monitor(
+            &harness,
+            &observation,
+            &ObservationSupportRegistry::default(),
+            &run_id,
+        ).unwrap();
+        assert_eq!(monitor.availability, ProjectionAvailabilityV1::Unknown);
+        assert_eq!(monitor.active_tools, 0);
+        assert!(monitor.detail.is_none());
+        close_observation(observation, &path);
+    }
+
+    #[test]
+    fn operator_timeline_preserves_order_and_128_bound() {
+        let path = observation_path("timeline-bound");
+        let harness = HarnessService::from_engine_for_test(
+            crate::credential::tests::engine(
+                1,
+                SessionGrantStateV1::Active,
+                1,
+                HarnessRunLifecycleV1::Running,
+            ),
+        );
+        let mut observation = ObservationService::open(&path).unwrap();
+        for sequence in 1..=140 {
+            apply_observation(
+                &mut observation,
+                "record-a",
+                sequence,
+                SourceEvidenceV1::NodeLifecycle,
+                ObservationKindV1::Working,
+            );
+        }
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let page = execute_operator_timeline(
+            &harness,
+            &observation,
+            &ObservationSupportRegistry::default(),
+            &run_id,
+            None,
+            HARNESS_TIMELINE_PAGE_LIMIT_MAX,
+        ).unwrap();
+        assert_eq!(page.entries.len(), usize::from(HARNESS_TIMELINE_PAGE_LIMIT_MAX));
+        assert_eq!(page.entries.first().unwrap().sequence, 1);
+        assert_eq!(page.entries.last().unwrap().sequence, 128);
+        assert_eq!(page.next_cursor, Some(128));
+        assert!(page.entries.windows(2).all(|pair| {
+            pair[0].sequence < pair[1].sequence
+        }));
+        page.validate_for(&run_id).unwrap();
+        close_observation(observation, &path);
+    }
+
+    #[test]
+    fn operator_todo_and_files_are_categorical_when_unsupported() {
+        let path = observation_path("categorical-unsupported");
+        let mut observation = ObservationService::open(&path).unwrap();
+        let mut capabilities = all_capabilities();
+        capabilities.todo = false;
+        capabilities.file_changes = false;
+        apply_observation(
+            &mut observation,
+            "record-a",
+            1,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::ManagedHook,
+                source_adapter: "bounded-adapter".to_owned(),
+                capabilities,
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            2,
+            SourceEvidenceV1::NodeLifecycle,
+            ObservationKindV1::Stale,
+        );
+        let projection = observation.projection(&managed_target("record-a")).unwrap();
+        let features = monitor_feature_states(Some(projection), None);
+        assert_eq!(features.todo, FeatureObservationStateV1::NotSupportedByObservedSources);
+        assert_eq!(features.files, FeatureObservationStateV1::NotSupportedByObservedSources);
+        assert_eq!(features.tools, FeatureObservationStateV1::SupportedNotObserved);
+        assert_eq!(
+            observation_state(Some(projection), true).1,
+            ProjectionFreshnessV1::Stale,
+        );
+        let detail = monitor_detail(projection, ObservationAudience::Operator);
+        assert!(detail.todo_facts.is_empty());
+        assert!(detail.file_facts.is_empty());
+        close_observation(observation, &path);
+    }
+
+    #[test]
+    fn operator_progress_serialization_excludes_private_observation_payloads() {
+        let path = observation_path("serialization-privacy");
+        let harness = HarnessService::from_engine_for_test(
+            crate::credential::tests::engine(
+                1,
+                SessionGrantStateV1::Active,
+                1,
+                HarnessRunLifecycleV1::Running,
+            ),
+        );
+        let mut observation = ObservationService::open(&path).unwrap();
+        apply_observation(
+            &mut observation,
+            "record-a",
+            1,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::SourceCapabilities {
+                source_family: ObservationSourceFamilyV1::ManagedHook,
+                source_adapter: "private-provider-adapter".to_owned(),
+                capabilities: all_capabilities(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            2,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ToolStarted {
+                correlation_id: "private-provider-correlation".to_owned(),
+                class: "command".to_owned(),
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            3,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::Error {
+                detail: "raw-output-credential-transcript".to_owned(),
+            },
+        );
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let monitor = execute_operator_monitor(&harness, &observation, &support, &run_id)
+            .unwrap();
+        let timeline = execute_operator_timeline(
+            &harness,
+            &observation,
+            &support,
+            &run_id,
+            None,
+            HARNESS_TIMELINE_PAGE_LIMIT_MAX,
+        ).unwrap();
+        let encoded = format!(
+            "{}\n{}",
+            serde_json::to_string(&monitor).unwrap(),
+            serde_json::to_string(&timeline).unwrap(),
+        );
+        for forbidden in [
+            "private-provider-adapter",
+            "private-provider-correlation",
+            "raw-output",
+            "credential-transcript",
+            "correlation_id",
+        ] {
+            assert!(!encoded.contains(forbidden), "serialized {forbidden}");
+        }
+        assert!(encoded.contains("command"));
+        assert!(encoded.contains("\"correlation\":1"));
+        close_observation(observation, &path);
     }
 
     #[test]

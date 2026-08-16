@@ -10,6 +10,7 @@ use gate4agent_node_protocol::{
 };
 use gate4agent_observation_api::{ProjectionAvailability, ProjectionFreshness};
 use gate4agent_observation_engine::{ContextOccupancyProvenance, ContextOccupancySnapshot, CorrelationProjection, CorrelationState, SessionProjection};
+use gate4agent_harness_client::{FeatureObservationStateV1, SessionMonitorV1 as HarnessSessionMonitorV1};
 
 use crate::app::{
     compact_task_id, host_path_display, managed_state_label, repository_path_display,
@@ -3214,7 +3215,7 @@ fn render_harness_kanban(
         return;
     }
     if let Some(monitor) = app.harness_kanban.monitor.as_ref() {
-        render_harness_monitor(monitor, area, buf, layout, theme);
+        render_harness_monitor(app, monitor, area, buf, layout, theme);
         return;
     }
     if app.harness_kanban.detail.is_some() {
@@ -3723,6 +3724,287 @@ fn render_harness_task_card(
     }
 }
 
+fn harness_feature_state_label(state: FeatureObservationStateV1) -> &'static str {
+    match state {
+        FeatureObservationStateV1::Unknown => "unknown",
+        FeatureObservationStateV1::NotSupportedByObservedSources => "unsupported",
+        FeatureObservationStateV1::SupportedNotObserved => "not-observed",
+        FeatureObservationStateV1::Observed => "observed",
+    }
+}
+
+fn harness_monitor_progress_line(monitor: &HarnessSessionMonitorV1) -> String {
+    format!(
+        "Observation: availability={:?} freshness={:?}{} | progress TODO {}/{} tools {} subagents {} | usage in {} out {}",
+        monitor.availability,
+        monitor.freshness,
+        if monitor.transport_incomplete { " transport=incomplete" } else { "" },
+        monitor.todo_completed,
+        monitor.todo_total,
+        monitor.active_tools,
+        monitor.active_subagents,
+        monitor.input_tokens,
+        monitor.output_tokens,
+    )
+}
+
+fn harness_monitor_features_line(
+    monitor: &HarnessSessionMonitorV1,
+    session_history_available: bool,
+) -> String {
+    let history = monitor.history.as_ref().map(|history| {
+        format!(
+            "observed(messages {}{} turns {} tokens {})",
+            if history.message_count_exact { "" } else { ">=" },
+            history.message_count,
+            history.completed_turn_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            history.total_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+        )
+    }).unwrap_or_else(|| harness_feature_state_label(monitor.features.history).to_owned());
+    format!(
+        "Features: TODO={} tools={} subagents={} files={} history={} usage={} | session-history={}",
+        harness_feature_state_label(monitor.features.todo),
+        harness_feature_state_label(monitor.features.tools),
+        harness_feature_state_label(monitor.features.subagents),
+        harness_feature_state_label(monitor.features.files),
+        history,
+        harness_feature_state_label(monitor.features.usage),
+        if session_history_available { "exact-managed" } else { "unavailable" },
+    )
+}
+
+fn harness_history_detail_line(monitor: &HarnessSessionMonitorV1) -> String {
+    let Some(history) = monitor.history.as_ref() else {
+        return format!(
+            "History: {} | no safe summary",
+            harness_feature_state_label(monitor.features.history),
+        );
+    };
+    format!(
+        "History: messages {}{} | completed turns {} | total tokens {}",
+        if history.message_count_exact { "" } else { ">=" },
+        history.message_count,
+        history.completed_turn_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unavailable".to_owned()),
+        history.total_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unavailable".to_owned()),
+    )
+}
+
+fn harness_feature_detail_heading(
+    name: &str,
+    state: FeatureObservationStateV1,
+    count: usize,
+) -> String {
+    match state {
+        FeatureObservationStateV1::Unknown => format!("{name}: unknown"),
+        FeatureObservationStateV1::NotSupportedByObservedSources => {
+            format!("{name}: unsupported by observed sources")
+        }
+        FeatureObservationStateV1::SupportedNotObserved => {
+            format!("{name}: supported, not observed")
+        }
+        FeatureObservationStateV1::Observed if count == 0 => {
+            format!("{name}: observed, empty")
+        }
+        FeatureObservationStateV1::Observed => format!("{name}: observed {count}"),
+    }
+}
+
+fn harness_usage_detail_line(monitor: &HarnessSessionMonitorV1) -> String {
+    match monitor.features.usage {
+        FeatureObservationStateV1::Unknown => "Usage: unknown".to_owned(),
+        FeatureObservationStateV1::NotSupportedByObservedSources => {
+            "Usage: unsupported by observed sources".to_owned()
+        }
+        FeatureObservationStateV1::SupportedNotObserved => {
+            "Usage: supported, not observed".to_owned()
+        }
+        FeatureObservationStateV1::Observed => format!(
+            "Usage: input {} output {} cache-read {} cache-write {} reasoning {} context-window {}",
+            monitor.input_tokens,
+            monitor.output_tokens,
+            monitor.cache_read_tokens,
+            monitor.cache_write_tokens,
+            monitor.reasoning_tokens,
+            monitor.context_window_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+        ),
+    }
+}
+
+fn harness_monitor_section_lines(
+    app: &App,
+    view: &crate::app::HarnessRunMonitorView,
+    monitor: &HarnessSessionMonitorV1,
+    theme: Theme,
+) -> Vec<(String, Color, Option<HitTarget>)> {
+    use crate::app::HarnessRunMonitorSection;
+
+    let mut lines = Vec::new();
+    if view.section == HarnessRunMonitorSection::Summary {
+        lines.push((harness_monitor_progress_line(monitor), theme.dim, None));
+        lines.push((
+            harness_monitor_features_line(
+                monitor,
+                false,
+            ),
+            theme.muted,
+            None,
+        ));
+        lines.push((harness_usage_detail_line(monitor), theme.dim, None));
+        lines.push((harness_history_detail_line(monitor), theme.dim, None));
+        return lines;
+    }
+    let Some(detail) = monitor.detail.as_ref() else {
+        lines.push((
+            "Structured detail unavailable at current visibility/availability".to_owned(),
+            theme.yellow,
+            None,
+        ));
+        return lines;
+    };
+    if view.section == HarnessRunMonitorSection::Todos {
+        lines.push((
+            harness_feature_detail_heading("TODO", monitor.features.todo, detail.todo_facts.len()),
+            theme.text,
+            None,
+        ));
+        lines.extend(detail.todo_facts.iter().map(|fact| (
+            format!(
+                "TODO id={} | {:?} | {} | via {:?}",
+                fact.todo_id.as_deref().unwrap_or("unavailable"),
+                fact.state,
+                fact.label.as_deref().unwrap_or("label unavailable"),
+                fact.evidence,
+            ),
+            theme.dim,
+            None,
+        )));
+        return lines;
+    }
+    if view.section == HarnessRunMonitorSection::Activity {
+        for (name, state, facts) in [
+            ("Tools", monitor.features.tools, detail.tool_facts.as_slice()),
+            ("Subagents", monitor.features.subagents, detail.subagent_facts.as_slice()),
+            (
+                "Owned processes",
+                monitor.features.owned_processes,
+                detail.process_facts.as_slice(),
+            ),
+        ] {
+            lines.push((harness_feature_detail_heading(name, state, facts.len()), theme.text, None));
+            lines.extend(facts.iter().map(|fact| (
+                format!(
+                    "{:?} correlation={} | {:?} | {} | via {:?}",
+                    fact.class,
+                    fact.correlation
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unavailable".to_owned()),
+                    fact.state,
+                    fact.label.as_deref().unwrap_or("label unavailable"),
+                    fact.evidence,
+                ),
+                theme.dim,
+                None,
+            )));
+        }
+        lines.push((
+            harness_feature_detail_heading(
+                "Interactions / approvals",
+                monitor.features.interactions,
+                detail.interaction_facts.len(),
+            ),
+            theme.text,
+            None,
+        ));
+        lines.extend(detail.interaction_facts.iter().map(|fact| (
+            format!(
+                "{:?} correlation={} | {:?} | {} | via {:?}",
+                fact.class,
+                fact.correlation
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unavailable".to_owned()),
+                fact.state,
+                fact.label.as_deref().unwrap_or("label unavailable"),
+                fact.evidence,
+            ),
+            theme.dim,
+            None,
+        )));
+        return lines;
+    }
+    if view.section == HarnessRunMonitorSection::Files {
+        lines.push((
+            harness_feature_detail_heading("Files", monitor.features.files, detail.file_facts.len()),
+            theme.text,
+            None,
+        ));
+        let run = crate::app::HarnessRunRef {
+            run_id: view.run.run_id.clone(),
+            run_revision: view.run.revision,
+        };
+        for fact in &detail.file_facts {
+            let path = fact.relative_path.as_ref()
+                .and_then(|path| gate4agent_node_protocol::RepositoryPath::utf8(path.clone()).ok());
+            let target = path.as_ref().and_then(|path| {
+                let (origin, workspace) = app.harness_workspace_for_run(&run)?;
+                workspace.entries.iter().any(|entry| {
+                    entry.kind == WorkspaceEntryKind::File && entry.relative_path == *path
+                }).then(|| HitTarget::HarnessWorkspaceFile(origin.clone(), path.clone()))
+            });
+            lines.push((
+                format!(
+                    "{:?} | {} | via {:?}{}",
+                    fact.action,
+                    fact.relative_path.as_deref().unwrap_or("path unavailable"),
+                    fact.evidence,
+                    if target.is_some() { " | [Open]" } else { " | open unavailable" },
+                ),
+                theme.dim,
+                target,
+            ));
+        }
+        return lines;
+    }
+    lines.push((
+        format!(
+            "Timeline: {} run-local events, ordered oldest to newest",
+            view.timeline.len(),
+        ),
+        theme.text,
+        None,
+    ));
+    lines.extend(view.timeline.iter().map(|event| {
+        let label = event.label.as_deref().unwrap_or("label unavailable");
+        let correlation = event.correlation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        (
+            format!(
+                "#{} @{} {:?} {:?} | {} | correlation {} | via {:?}",
+                event.sequence,
+                event.received_at_ms,
+                event.category,
+                event.state,
+                label,
+                correlation,
+                event.evidence,
+            ),
+            theme.muted,
+            None,
+        )
+    }));
+    lines
+}
+
 fn render_harness_task_detail(
     app: &App,
     area: Rect,
@@ -3834,23 +4116,29 @@ fn render_harness_task_detail(
                 return;
             }
             Paragraph::new(truncate_cells(
-                "Run attempt | created | lifecycle | binding | exact correlation",
+                "Run-local observation panels | select row | mouse-first actions",
                 body.width as usize,
             ))
                 .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
                 .render(Rect::new(body.x, body.y, body.width, 1), buf);
-            let capacity = body.height.saturating_sub(1) as usize;
+            let card_height = 3usize;
+            let capacity = (body.height.saturating_sub(1) as usize / card_height).max(1);
             let selected_index = detail.selected_run.as_ref()
                 .and_then(|selected| runs.iter().position(|run| &run.run_id == selected))
                 .unwrap_or(0);
-            let offset = detail.scroll.min(selected_index).min(runs.len().saturating_sub(capacity.max(1)));
+            let offset = detail.scroll.min(selected_index).min(runs.len().saturating_sub(capacity));
             for (slot, run) in runs.iter().skip(offset).take(capacity).enumerate() {
-                let row = Rect::new(body.x, body.y + 1 + slot as u16, body.width, 1);
+                let y = body.y.saturating_add(1 + (slot * card_height) as u16);
+                let panel_height = (card_height as u16).min(body.bottom().saturating_sub(y));
+                let panel = Rect::new(body.x, y, body.width, panel_height);
+                if panel.height == 0 {
+                    break;
+                }
                 let selected = detail.selected_run.as_ref() == Some(&run.run_id);
                 let background = if selected { theme.active } else { theme.surface };
-                fill_rect(row, background, buf);
+                fill_rect(panel, background, buf);
                 layout.hits.push(HitRegion {
-                    rect: row,
+                    rect: panel,
                     target: HitTarget::HarnessTaskDetailRun(run.run_id.clone()),
                 });
                 let correlation = if app.harness_kanban.correlation_pending.contains(&run.run_id) {
@@ -3862,6 +4150,7 @@ fn render_harness_task_detail(
                 } else {
                     "not loaded".to_owned()
                 };
+                let session_history_available = false;
                 let monitor_label = if run.binding == gate4agent_harness_client::RedactedBindingStateV1::None {
                     "[Monitor unavailable]"
                 } else {
@@ -3874,11 +4163,11 @@ fn render_harness_task_detail(
                     + cell_width(git_label)
                     + 1
                     + cell_width(monitor_label)) as u16;
-                let actions_x = row.right().saturating_sub(actions_width.min(row.width));
-                let main_width = actions_x.saturating_sub(row.x).saturating_sub(1);
+                let actions_x = panel.right().saturating_sub(actions_width.min(panel.width));
+                let main_width = actions_x.saturating_sub(panel.x).saturating_sub(1);
                 let id = run.run_id.as_str();
                 let line = format!(
-                    "{}... | {} | {:?} | {:?} | {correlation}",
+                    "{}... | created {} | {:?} | {:?} | correlation={correlation}",
                     &id[..id.len().min(16)],
                     run.created_at_unix_ms,
                     run.lifecycle,
@@ -3886,9 +4175,9 @@ fn render_harness_task_detail(
                 );
                 Paragraph::new(truncate_cells(&line, main_width as usize))
                     .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
-                    .render(Rect::new(row.x, row.y, main_width, 1), buf);
+                    .render(Rect::new(panel.x, panel.y, main_width, 1), buf);
                 let files_width = cell_width(files_label) as u16;
-                let files_rect = Rect::new(actions_x, row.y, files_width, 1);
+                let files_rect = Rect::new(actions_x, panel.y, files_width, 1);
                 Paragraph::new(files_label)
                     .style(Style::default().fg(theme.teal).bg(background))
                     .render(files_rect, buf);
@@ -3898,7 +4187,7 @@ fn render_harness_task_detail(
                 });
                 let git_x = files_rect.right().saturating_add(1);
                 let git_width = cell_width(git_label) as u16;
-                let git_rect = Rect::new(git_x, row.y, git_width, 1);
+                let git_rect = Rect::new(git_x, panel.y, git_width, 1);
                 Paragraph::new(git_label)
                     .style(Style::default().fg(theme.teal).bg(background))
                     .render(git_rect, buf);
@@ -3907,8 +4196,8 @@ fn render_harness_task_detail(
                     target: HitTarget::HarnessTaskDetailRunGit(run.run_id.clone()),
                 });
                 let monitor_x = git_rect.right().saturating_add(1);
-                let monitor_width = row.right().saturating_sub(monitor_x);
-                let monitor_rect = Rect::new(monitor_x, row.y, monitor_width, 1);
+                let monitor_width = cell_width(monitor_label) as u16;
+                let monitor_rect = Rect::new(monitor_x, panel.y, monitor_width, 1);
                 Paragraph::new(monitor_label)
                     .style(Style::default().fg(if run.binding == gate4agent_harness_client::RedactedBindingStateV1::None { theme.muted } else { theme.teal }).bg(background))
                     .render(monitor_rect, buf);
@@ -3917,6 +4206,62 @@ fn render_harness_task_detail(
                         rect: monitor_rect,
                         target: HitTarget::HarnessTaskDetailRunMonitor(run.run_id.clone()),
                     });
+                }
+                let (progress, features, observation_error) = if run.binding
+                    == gate4agent_harness_client::RedactedBindingStateV1::None
+                {
+                    (
+                        "Observation: unavailable | run has no Harness binding".to_owned(),
+                        "Features: TODO=unavailable tools=unavailable subagents=unavailable files=unavailable history=unavailable usage=unavailable | session-history=unavailable".to_owned(),
+                        true,
+                    )
+                } else {
+                    match app.harness_kanban.run_observations.get(&run.run_id) {
+                        Some(crate::app::HarnessRunObservationState::Loading { run_revision })
+                            if *run_revision == run.revision =>
+                        {
+                            (
+                                format!("Observation: loading exact run revision r{}", run_revision.get()),
+                                format!("Features: loading | session-history={}", if session_history_available { "exact-managed" } else { "unavailable" }),
+                                false,
+                            )
+                        }
+                        Some(crate::app::HarnessRunObservationState::Ready {
+                            run_revision,
+                            monitor,
+                        }) if *run_revision == run.revision && monitor.run_id == run.run_id => {
+                            (
+                                harness_monitor_progress_line(monitor),
+                                harness_monitor_features_line(monitor, session_history_available),
+                                false,
+                            )
+                        }
+                        Some(crate::app::HarnessRunObservationState::Error {
+                            run_revision,
+                            message,
+                        }) if *run_revision == run.revision => {
+                            (
+                                format!("Observation error: {message}"),
+                                format!("Features: unavailable after error | session-history={}", if session_history_available { "exact-managed" } else { "unavailable" }),
+                                true,
+                            )
+                        }
+                        _ => (
+                            "Observation: not loaded for this exact run revision".to_owned(),
+                            format!("Features: unavailable | session-history={}", if session_history_available { "exact-managed" } else { "unavailable" }),
+                            true,
+                        ),
+                    }
+                };
+                if panel.height > 1 {
+                    Paragraph::new(truncate_cells(&progress, panel.width as usize))
+                        .style(Style::default().fg(if observation_error { theme.yellow } else { theme.dim }).bg(background))
+                        .render(Rect::new(panel.x, panel.y + 1, panel.width, 1), buf);
+                }
+                if panel.height > 2 {
+                    Paragraph::new(truncate_cells(&features, panel.width as usize))
+                        .style(Style::default().fg(if observation_error { theme.yellow } else { theme.muted }).bg(background))
+                        .render(Rect::new(panel.x, panel.y + 2, panel.width, 1), buf);
                 }
             }
             if runs.is_empty() && body.height > 1 {
@@ -4318,6 +4663,7 @@ fn render_harness_task_detail(
 }
 
 fn render_harness_monitor(
+    app: &App,
     view: &crate::app::HarnessRunMonitorView,
     area: Rect,
     buf: &mut TerminalBuffer,
@@ -4333,22 +4679,20 @@ fn render_harness_monitor(
     Paragraph::new(truncate_cells(&heading, area.width as usize))
         .style(Style::default().fg(theme.text).bg(theme.active).add_modifier(Modifier::BOLD))
         .render(Rect::new(area.x, area.y, area.width, 1), buf);
-    let status = if view.loading {
-        "loading authoritative run details...".to_owned()
-    } else if let Some(reason) = view.stale_reason.as_ref() {
-        format!("STALE | {reason}")
-    } else if let Some(monitor) = view.monitor.as_ref() {
+    let status = if let Some(monitor) = view.monitor.as_ref() {
         format!(
-            "availability {:?} | freshness {:?} | todos {}/{} | tools {} | subagents {}",
+            "availability {:?} | freshness {:?} | transport {} | exact run revision r{}",
             monitor.availability,
             monitor.freshness,
-            monitor.todo_completed,
-            monitor.todo_total,
-            monitor.active_tools,
-            monitor.active_subagents,
+            if monitor.transport_incomplete { "incomplete" } else { "complete" },
+            view.run.revision.get(),
         )
+    } else if view.loading {
+        "loading authoritative run details...".to_owned()
+    } else if let Some(reason) = view.stale_reason.as_ref() {
+        format!("ERROR / STALE | {reason}")
     } else {
-        "run details unavailable".to_owned()
+        "run details unavailable for this exact run".to_owned()
     };
     if area.height > 1 {
         Paragraph::new(truncate_cells(&status, area.width as usize))
@@ -4357,16 +4701,25 @@ fn render_harness_monitor(
     }
     if area.height > 2 {
         let actions = Rect::new(area.x, area.y + 2, area.width, 1);
-        let x = render_toolbar_segment(
-            "[Files]",
+        let mut x = render_toolbar_segment(
+            "[Back]",
             actions.x,
+            actions,
+            Style::default().fg(theme.teal).bg(theme.surface),
+            Some(HitTarget::HarnessRunMonitorBack),
+            buf,
+            layout,
+        );
+        x = render_toolbar_segment(
+            "[Files]",
+            x.saturating_add(1),
             actions,
             Style::default().fg(theme.teal).bg(theme.surface),
             Some(HitTarget::HarnessTaskDetailRunFiles(view.run.run_id.clone())),
             buf,
             layout,
         );
-        let _ = render_toolbar_segment(
+        x = render_toolbar_segment(
             "[Git]",
             x.saturating_add(1),
             actions,
@@ -4375,26 +4728,89 @@ fn render_harness_monitor(
             buf,
             layout,
         );
-    }
-    if area.height > 3 {
-        let tokens = view.monitor.as_ref().map(|monitor| format!(
-            "tokens in {} | out {} | cache read {} | reasoning {}",
-            monitor.input_tokens,
-            monitor.output_tokens,
-            monitor.cache_read_tokens,
-            monitor.reasoning_tokens,
-        )).unwrap_or_default();
-        Paragraph::new(truncate_cells(&tokens, area.width as usize))
-            .style(Style::default().fg(theme.dim).bg(theme.surface))
-            .render(Rect::new(area.x, area.y + 3, area.width, 1), buf);
-    }
-    for (index, event) in view.timeline.iter().rev()
-        .take(area.height.saturating_sub(5) as usize).enumerate()
-    {
-        let line = format!("#{} {:?} via {:?}", event.sequence, event.category, event.evidence);
-        Paragraph::new(truncate_cells(&line, area.width as usize))
+        let note_x = x.saturating_add(2);
+        Paragraph::new(truncate_cells(
+            "History stays in Harness [Summary]; no legacy session route",
+            actions.right().saturating_sub(note_x) as usize,
+        ))
             .style(Style::default().fg(theme.muted).bg(theme.surface))
-            .render(Rect::new(area.x, area.y + 5 + index as u16, area.width, 1), buf);
+            .render(Rect::new(note_x, actions.y, actions.right().saturating_sub(note_x), 1), buf);
+    }
+
+    let mut lines = Vec::<(String, Color, Option<HitTarget>)>::new();
+    if let Some(reason) = view.stale_reason.as_ref() {
+        lines.push((format!("Stale/error state: {reason}"), theme.yellow, None));
+    }
+    if let Some(monitor) = view.monitor.as_ref() {
+        lines.extend(harness_monitor_section_lines(app, view, monitor, theme));
+    } else if view.loading {
+        lines.push((
+            "Loading structured facts and ordered timeline...".to_owned(),
+            theme.dim,
+            None,
+        ));
+    } else if view.stale_reason.is_none() {
+        lines.push((
+            "Observation unavailable for this exact run".to_owned(),
+            theme.yellow,
+            None,
+        ));
+    }
+    let capacity = area.height.saturating_sub(4) as usize;
+    let offset = view.scroll.min(lines.len().saturating_sub(capacity.max(1)));
+    let end = offset.saturating_add(capacity).min(lines.len());
+    if area.height > 3 {
+        let sections = Rect::new(area.x, area.y + 3, area.width, 1);
+        let mut x = sections.x;
+        for section in crate::app::HarnessRunMonitorSection::ALL {
+            x = render_toolbar_segment(
+                &format!("[{}]", section.label()),
+                x,
+                sections,
+                Style::default()
+                    .fg(if section == view.section { theme.text } else { theme.teal })
+                    .bg(if section == view.section { theme.panel } else { theme.surface }),
+                Some(HitTarget::HarnessRunMonitorSection(section)),
+                buf,
+                layout,
+            ).saturating_add(1);
+        }
+        x = render_toolbar_segment(
+            "[Up]",
+            x,
+            sections,
+            Style::default().fg(if offset > 0 { theme.teal } else { theme.muted }).bg(theme.surface),
+            (offset > 0).then_some(HitTarget::HarnessRunMonitorScrollUp),
+            buf,
+            layout,
+        ).saturating_add(1);
+        let more = lines.len().saturating_sub(end);
+        x = render_toolbar_segment(
+            "[Down]",
+            x,
+            sections,
+            Style::default().fg(if more > 0 { theme.teal } else { theme.muted }).bg(theme.surface),
+            (more > 0).then_some(HitTarget::HarnessRunMonitorScrollDown),
+            buf,
+            layout,
+        ).saturating_add(1);
+        let count = format!("items {} | above {} | {} more", lines.len(), offset, more);
+        Paragraph::new(truncate_cells(&count, sections.right().saturating_sub(x) as usize))
+            .style(Style::default().fg(theme.muted).bg(theme.surface))
+            .render(Rect::new(x, sections.y, sections.right().saturating_sub(x), 1), buf);
+    }
+    for (index, (line, color, target)) in lines.into_iter()
+        .skip(offset)
+        .take(capacity)
+        .enumerate()
+    {
+        let row = Rect::new(area.x, area.y + 4 + index as u16, area.width, 1);
+        Paragraph::new(truncate_cells(&line, area.width as usize))
+            .style(Style::default().fg(color).bg(theme.surface))
+            .render(row, buf);
+        if let Some(target) = target {
+            layout.hits.push(HitRegion { rect: row, target });
+        }
     }
 }
 
@@ -8381,6 +8797,13 @@ mod tests {
         HarnessTaskId, HarnessTaskStateV1, RedactedBindingStateV1,
         RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1,
         RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
+        ActivityClassV1, ActivityFactV1, ActivityStateV1, FeatureObservationStateV1,
+        FileActionV1, FileFactV1, HarnessMonitoringVisibilityV1, InteractionClassV1,
+        InteractionFactV1, InteractionStateV1, MonitorFeatureStatesV1,
+        ObservationEvidenceV1 as HarnessObservationEvidenceV1, ProjectionAvailabilityV1,
+        ProjectionFreshnessV1, SessionMonitorDetailV1, SessionMonitorHistoryV1,
+        SessionMonitorV1 as HarnessSessionMonitorV1, TimelineCategoryV1, TimelineEntryV1,
+        TimelineStateV1, TodoFactV1, TodoStateV1,
     };
     use gate4agent_node_protocol::{
         AgentProgressCurrentV1, AgentProgressUsageV1, AgentProgressV1,
@@ -8429,6 +8852,94 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rich_harness_monitor(run_id: HarnessRunId) -> HarnessSessionMonitorV1 {
+        HarnessSessionMonitorV1 {
+            run_id,
+            visibility: HarnessMonitoringVisibilityV1::Timeline,
+            availability: ProjectionAvailabilityV1::Current,
+            freshness: ProjectionFreshnessV1::Live,
+            transport_incomplete: false,
+            features: MonitorFeatureStatesV1 {
+                todo: FeatureObservationStateV1::Observed,
+                tools: FeatureObservationStateV1::Observed,
+                subagents: FeatureObservationStateV1::Observed,
+                interactions: FeatureObservationStateV1::Observed,
+                owned_processes: FeatureObservationStateV1::Observed,
+                files: FeatureObservationStateV1::Observed,
+                usage: FeatureObservationStateV1::Observed,
+                history: FeatureObservationStateV1::Observed,
+            },
+            todo_total: 1,
+            todo_completed: 0,
+            active_tools: 2,
+            active_subagents: 1,
+            active_interactions: 1,
+            active_processes: 1,
+            input_tokens: 21,
+            output_tokens: 8,
+            cache_read_tokens: 5,
+            cache_write_tokens: 3,
+            reasoning_tokens: 2,
+            context_window_tokens: Some(128_000),
+            history: Some(SessionMonitorHistoryV1 {
+                message_count: 12,
+                message_count_exact: false,
+                completed_turn_count: Some(3),
+                total_tokens: Some(39),
+            }),
+            detail: Some(SessionMonitorDetailV1 {
+                todo_facts: vec![TodoFactV1 {
+                    state: TodoStateV1::InProgress,
+                    todo_id: Some("todo-7".to_owned()),
+                    label: Some("verify reducer".to_owned()),
+                    evidence: HarnessObservationEvidenceV1::StructuredProvider,
+                }],
+                tool_facts: vec![
+                    ActivityFactV1 {
+                        class: ActivityClassV1::Tool,
+                        state: ActivityStateV1::Active,
+                        label: Some("shell".to_owned()),
+                        correlation: Some(1),
+                        evidence: HarnessObservationEvidenceV1::StructuredProvider,
+                    },
+                    ActivityFactV1 {
+                        class: ActivityClassV1::Tool,
+                        state: ActivityStateV1::Active,
+                        label: Some("editor".to_owned()),
+                        correlation: Some(2),
+                        evidence: HarnessObservationEvidenceV1::ManagedHook,
+                    },
+                ],
+                subagent_facts: vec![ActivityFactV1 {
+                    class: ActivityClassV1::Subagent,
+                    state: ActivityStateV1::Active,
+                    label: Some("reviewer".to_owned()),
+                    correlation: Some(1),
+                    evidence: HarnessObservationEvidenceV1::StructuredProvider,
+                }],
+                interaction_facts: vec![InteractionFactV1 {
+                    class: InteractionClassV1::Approval,
+                    state: InteractionStateV1::Required,
+                    label: Some("filesystem".to_owned()),
+                    correlation: Some(1),
+                    evidence: HarnessObservationEvidenceV1::ManagedHook,
+                }],
+                process_facts: vec![ActivityFactV1 {
+                    class: ActivityClassV1::OwnedProcess,
+                    state: ActivityStateV1::Active,
+                    label: Some("cargo".to_owned()),
+                    correlation: Some(1),
+                    evidence: HarnessObservationEvidenceV1::ManagedHook,
+                }],
+                file_facts: vec![FileFactV1 {
+                    action: FileActionV1::Changed,
+                    relative_path: Some("src/lib.rs".to_owned()),
+                    evidence: HarnessObservationEvidenceV1::WorkspaceObservation,
+                }],
+            }),
+        }
     }
 
     #[test]
@@ -8525,6 +9036,8 @@ mod tests {
             },
             monitor: None,
             timeline: Vec::new(),
+            section: crate::app::HarnessRunMonitorSection::Summary,
+            scroll: 0,
             loading: true,
             stale_reason: None,
         });
@@ -8589,7 +9102,7 @@ mod tests {
         app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
             task_id: task.task_id,
             section: crate::app::HarnessTaskDetailSection::Overview,
-            selected_run: Some(run.run_id),
+            selected_run: Some(run.run_id.clone()),
             scroll: 0,
         });
 
@@ -8605,10 +9118,21 @@ mod tests {
 
         app.harness_kanban.detail.as_mut().unwrap().section =
             crate::app::HarnessTaskDetailSection::Runs;
-        let mut runs_buf = TerminalBuffer::new(120, 28);
+        app.harness_kanban.run_observations.insert(
+            run.run_id.clone(),
+            crate::app::HarnessRunObservationState::Ready {
+                run_revision: run.revision,
+                monitor: rich_harness_monitor(run.run_id.clone()),
+            },
+        );
+        let mut runs_buf = TerminalBuffer::new(220, 28);
         let runs_layout = render(&app, &mut runs_buf);
         let runs_text = buffer_text(&runs_buf);
         assert!(runs_text.contains("[Open monitor]"), "{runs_text}");
+        assert!(runs_text.contains("availability=Current"), "{runs_text}");
+        assert!(runs_text.contains("TODO=observed"), "{runs_text}");
+        assert!(runs_text.contains("history=observed(messages >=12"), "{runs_text}");
+        assert!(runs_text.contains("session-history=unavailable"), "{runs_text}");
         assert!(runs_layout.hits.iter().any(|hit| {
             matches!(hit.target, HitTarget::HarnessTaskDetailRunMonitor(_))
         }));
@@ -8690,6 +9214,287 @@ mod tests {
         assert!(loaded_agents_layout.hits.iter().any(|hit| {
             matches!(hit.target, HitTarget::HarnessTaskDetailRunGit(_))
         }));
+    }
+
+    #[test]
+    fn harness_monitor_renders_structured_run_local_facts_and_ordered_timeline() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let task_id = HarnessTaskId::new("htask_eeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+        let run = RedactedRunV1 {
+            run_id: HarnessRunId::new("hrun_ffffffffffffffffffffffff").unwrap(),
+            revision: HarnessRevision::new(4).unwrap(),
+            parent_run_id: None,
+            task_id: Some(task_id),
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: HarnessRunLifecycleV1::Running,
+            binding: RedactedBindingStateV1::ManagedActive,
+            result_disposition: None,
+            failure_category: None,
+            references_redacted: false,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        };
+        let origin = crate::app::HarnessRunOrigin {
+            run: crate::app::HarnessRunRef {
+                run_id: run.run_id.clone(),
+                run_revision: run.revision,
+            },
+            node_id: gate4agent_harness_protocol::HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id:
+                gate4agent_harness_client::HarnessNodeIncarnationV1::new("ab".repeat(16)).unwrap(),
+            workspace_id:
+                gate4agent_harness_protocol::HarnessSelectorV1::new("workspace-a").unwrap(),
+        };
+        app.harness_kanban.workspaces.insert(origin.clone(), crate::app::HarnessWorkspaceView {
+            origin: origin.clone(),
+            state: crate::app::HarnessWorkspaceState::Ready,
+            entries: vec![WorkspaceEntry {
+                relative_path: repository_path("src/lib.rs"),
+                kind: WorkspaceEntryKind::File,
+            }],
+            tree_truncated: false,
+            git: None,
+            selected: 0,
+            scroll: 0,
+            request_token: 1,
+        });
+        app.harness_kanban.monitor = Some(crate::app::HarnessRunMonitorView {
+            run: run.clone(),
+            monitor: Some(rich_harness_monitor(run.run_id.clone())),
+            timeline: vec![
+                TimelineEntryV1 {
+                    sequence: 1,
+                    received_at_ms: 10,
+                    category: TimelineCategoryV1::Todo,
+                    label: None,
+                    state: TimelineStateV1::Updated,
+                    correlation: None,
+                    evidence: HarnessObservationEvidenceV1::StructuredProvider,
+                },
+                TimelineEntryV1 {
+                    sequence: 2,
+                    received_at_ms: 11,
+                    category: TimelineCategoryV1::Tool,
+                    label: Some("shell".to_owned()),
+                    state: TimelineStateV1::Completed,
+                    correlation: Some(1),
+                    evidence: HarnessObservationEvidenceV1::StructuredProvider,
+                },
+            ],
+            section: crate::app::HarnessRunMonitorSection::Summary,
+            scroll: 0,
+            loading: false,
+            stale_reason: None,
+        });
+
+        let tabs = app.surface.all_tabs().into_iter().cloned().collect::<Vec<_>>();
+        let mut section_text = std::collections::BTreeMap::new();
+        let mut files_layout = LayoutRects::default();
+        for section in crate::app::HarnessRunMonitorSection::ALL {
+            let monitor = app.harness_kanban.monitor.as_mut().unwrap();
+            monitor.section = section;
+            monitor.scroll = 0;
+            let mut buf = TerminalBuffer::new(220, 42);
+            let layout = render(&app, &mut buf);
+            let text = buffer_text(&buf);
+            for expected in crate::app::HarnessRunMonitorSection::ALL {
+                assert!(layout.hits.iter().any(|hit| {
+                    hit.target == HitTarget::HarnessRunMonitorSection(expected)
+                }), "missing monitor section hit {expected:?}");
+            }
+            assert!(layout.hits.iter().any(|hit| {
+                hit.target == HitTarget::HarnessRunMonitorBack
+            }));
+            if section == crate::app::HarnessRunMonitorSection::Files {
+                files_layout = layout;
+            }
+            section_text.insert(section.label(), text);
+        }
+        let text = section_text.values().cloned().collect::<Vec<_>>().join("\n");
+        for value in [
+            "TODO id=todo-7",
+            "Tool correlation=1",
+            "Tool correlation=2 | Active | editor",
+            "Subagent correlation=1",
+            "OwnedProcess correlation=1",
+            "Approval correlation=1",
+            "src/lib.rs",
+            "Usage: input 21 output 8",
+            "History: messages >=12",
+            "Timeline: 2 run-local events, ordered oldest to newest",
+            "label unavailable",
+        ] {
+            assert!(text.contains(value), "missing structured monitor value {value}: {text}");
+        }
+        assert!(text.find("#1 @10").unwrap() < text.find("#2 @11").unwrap(), "{text}");
+        assert!(!text.contains("[Session history]"), "{text}");
+        assert!(text.contains("no legacy session route"), "{text}");
+        assert_eq!(app.surface.all_tabs().into_iter().cloned().collect::<Vec<_>>(), tabs);
+        assert!(files_layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::HarnessWorkspaceFile(
+                origin.clone(),
+                repository_path("src/lib.rs"),
+            )
+        }));
+    }
+
+    #[test]
+    fn harness_monitor_mouse_scroll_reaches_all_bounded_timeline_rows() {
+        let run_id = HarnessRunId::new("hrun_666666666666666666666666").unwrap();
+        let run = RedactedRunV1 {
+            run_id: run_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: None,
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: HarnessRunLifecycleV1::Running,
+            binding: RedactedBindingStateV1::ManagedActive,
+            result_disposition: None,
+            failure_category: None,
+            references_redacted: false,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let timeline = (1..=10).map(|sequence| TimelineEntryV1 {
+            sequence,
+            received_at_ms: sequence,
+            category: TimelineCategoryV1::Tool,
+            label: Some(format!("tool-{sequence}")),
+            state: TimelineStateV1::Completed,
+            correlation: Some(sequence as u16),
+            evidence: HarnessObservationEvidenceV1::StructuredProvider,
+        }).collect::<Vec<_>>();
+        let mut app = App::default();
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.harness_kanban.monitor = Some(crate::app::HarnessRunMonitorView {
+            run,
+            monitor: Some(rich_harness_monitor(run_id)),
+            timeline,
+            section: crate::app::HarnessRunMonitorSection::Timeline,
+            scroll: 0,
+            loading: false,
+            stale_reason: None,
+        });
+        let mut first = TerminalBuffer::new(140, 10);
+        let mut layout = LayoutRects::default();
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 140, 10),
+            &mut first,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let first_text = buffer_text(&first);
+        assert!(first_text.contains("5 more"), "{first_text}");
+        let down = layout.hits.iter().find(|hit| {
+            hit.target == HitTarget::HarnessRunMonitorScrollDown
+        }).unwrap().rect;
+        app.layout = layout;
+        assert_eq!(app.click(down.x, down.y), crate::app::AppAction::None);
+        assert_eq!(app.harness_kanban.monitor.as_ref().unwrap().scroll, 1);
+
+        let mut second = TerminalBuffer::new(140, 10);
+        let mut second_layout = LayoutRects::default();
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 140, 10),
+            &mut second,
+            &mut second_layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let second_text = buffer_text(&second);
+        assert!(second_text.contains("#5 @5"), "{second_text}");
+        assert!(second_layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::HarnessRunMonitorScrollUp
+        }));
+    }
+
+    #[test]
+    fn harness_monitor_distinguishes_unsupported_not_observed_and_observed_empty() {
+        let mut monitor = rich_harness_monitor(
+            HarnessRunId::new("hrun_777777777777777777777777").unwrap(),
+        );
+        monitor.features.tools = FeatureObservationStateV1::NotSupportedByObservedSources;
+        monitor.features.subagents = FeatureObservationStateV1::SupportedNotObserved;
+        monitor.features.todo = FeatureObservationStateV1::Observed;
+        let detail = monitor.detail.as_mut().unwrap();
+        detail.tool_facts.clear();
+        detail.subagent_facts.clear();
+        detail.todo_facts.clear();
+        monitor.active_tools = 0;
+        monitor.active_subagents = 0;
+        monitor.todo_total = 0;
+        monitor.todo_completed = 0;
+        let run = RedactedRunV1 {
+            run_id: monitor.run_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: None,
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: HarnessRunLifecycleV1::Running,
+            binding: RedactedBindingStateV1::ManagedActive,
+            result_disposition: None,
+            failure_category: None,
+            references_redacted: false,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let mut app = App::default();
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.harness_kanban.monitor = Some(crate::app::HarnessRunMonitorView {
+            run,
+            monitor: Some(monitor),
+            timeline: Vec::new(),
+            section: crate::app::HarnessRunMonitorSection::Todos,
+            scroll: 0,
+            loading: false,
+            stale_reason: None,
+        });
+        let mut todo_buf = TerminalBuffer::new(180, 36);
+        let mut layout = LayoutRects::default();
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 180, 36),
+            &mut todo_buf,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let todo_text = buffer_text(&todo_buf);
+        assert!(todo_text.contains("TODO: observed, empty"), "{todo_text}");
+        app.harness_kanban.monitor.as_mut().unwrap().section =
+            crate::app::HarnessRunMonitorSection::Activity;
+        let mut activity_buf = TerminalBuffer::new(180, 36);
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 180, 36),
+            &mut activity_buf,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let activity_text = buffer_text(&activity_buf);
+        assert!(activity_text.contains("Tools: unsupported by observed sources"), "{activity_text}");
+        assert!(activity_text.contains("Subagents: supported, not observed"), "{activity_text}");
     }
 
     #[test]

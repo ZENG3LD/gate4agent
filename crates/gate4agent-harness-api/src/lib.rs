@@ -40,6 +40,9 @@ pub const HARNESS_READ_LIMIT_MAX: u16 = 256;
 pub const HARNESS_ENTITY_PAGE_LIMIT_MAX: u16 = 64;
 pub const HARNESS_TIMELINE_PAGE_LIMIT_MAX: u16 = 128;
 pub const HARNESS_MONITOR_FACTS_MAX: usize = 128;
+pub const HARNESS_OBSERVATION_LABEL_MAX_BYTES: usize = 64;
+pub const HARNESS_OBSERVATION_TODO_TEXT_MAX_BYTES: usize = 256;
+pub const HARNESS_OBSERVATION_PATH_MAX_BYTES: usize = 1_024;
 pub const HARNESS_READ_CREDENTIAL_MAX_BYTES: usize = 8 * 1024;
 pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 pub const HARNESS_OPERATOR_WIRE_VERSION_V1: u16 = 1;
@@ -2220,6 +2223,8 @@ pub struct SessionMonitorV1 {
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub context_window_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<SessionMonitorHistoryV1>,
     pub detail: Option<SessionMonitorDetailV1>,
 }
 
@@ -2249,9 +2254,31 @@ impl SessionMonitorV1 {
         if let Some(detail) = &self.detail {
             detail.validate(&self.features)?;
         }
+        if self.features.history != FeatureObservationStateV1::Observed
+            && self.history.is_some()
+        {
+            return Err(HarnessReadApiError::InvalidMonitorDetail);
+        }
         validate_feature_counts(self)?;
         Ok(())
     }
+
+    pub fn validate_for(&self, run_id: &HarnessRunId) -> Result<(), HarnessReadApiError> {
+        self.validate()?;
+        if &self.run_id != run_id {
+            return Err(HarnessReadApiError::InvalidRunState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMonitorHistoryV1 {
+    pub message_count: u64,
+    pub message_count_exact: bool,
+    pub completed_turn_count: Option<u64>,
+    pub total_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2273,6 +2300,12 @@ impl SessionMonitorDetailV1 {
         validate_monitor_facts(&self.interaction_facts)?;
         validate_monitor_facts(&self.process_facts)?;
         validate_monitor_facts(&self.file_facts)?;
+        for fact in &self.todo_facts { fact.validate()?; }
+        for fact in &self.tool_facts { fact.validate()?; }
+        for fact in &self.subagent_facts { fact.validate()?; }
+        for fact in &self.interaction_facts { fact.validate()?; }
+        for fact in &self.process_facts { fact.validate()?; }
+        for fact in &self.file_facts { fact.validate()?; }
         if self.tool_facts.iter().any(|fact| fact.class != ActivityClassV1::Tool)
             || self.subagent_facts.iter().any(|fact| fact.class != ActivityClassV1::Subagent)
             || self.process_facts.iter().any(|fact| fact.class != ActivityClassV1::OwnedProcess)
@@ -2293,7 +2326,26 @@ impl SessionMonitorDetailV1 {
 #[serde(deny_unknown_fields)]
 pub struct TodoFactV1 {
     pub state: TodoStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub evidence: ObservationEvidenceV1,
+}
+
+impl TodoFactV1 {
+    fn validate(&self) -> Result<(), HarnessReadApiError> {
+        validate_optional_observation_text(
+            "todo id",
+            self.todo_id.as_deref(),
+            HARNESS_OBSERVATION_LABEL_MAX_BYTES,
+        )?;
+        validate_optional_observation_text(
+            "todo label",
+            self.label.as_deref(),
+            HARNESS_OBSERVATION_TODO_TEXT_MAX_BYTES,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2305,7 +2357,22 @@ pub enum TodoStateV1 { Pending, InProgress, Completed, Unknown }
 pub struct ActivityFactV1 {
     pub class: ActivityClassV1,
     pub state: ActivityStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<u16>,
     pub evidence: ObservationEvidenceV1,
+}
+
+impl ActivityFactV1 {
+    fn validate(&self) -> Result<(), HarnessReadApiError> {
+        validate_optional_observation_text(
+            "activity label",
+            self.label.as_deref(),
+            HARNESS_OBSERVATION_LABEL_MAX_BYTES,
+        )?;
+        validate_observation_correlation(self.correlation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2321,7 +2388,22 @@ pub enum ActivityStateV1 { Started, Active, Waiting, Completed, Failed, UnknownA
 pub struct InteractionFactV1 {
     pub class: InteractionClassV1,
     pub state: InteractionStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<u16>,
     pub evidence: ObservationEvidenceV1,
+}
+
+impl InteractionFactV1 {
+    fn validate(&self) -> Result<(), HarnessReadApiError> {
+        validate_optional_observation_text(
+            "interaction label",
+            self.label.as_deref(),
+            HARNESS_OBSERVATION_LABEL_MAX_BYTES,
+        )?;
+        validate_observation_correlation(self.correlation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2336,7 +2418,18 @@ pub enum InteractionStateV1 { Required, Responded, Dismissed, UnknownAfterGap }
 #[serde(deny_unknown_fields)]
 pub struct FileFactV1 {
     pub action: FileActionV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
     pub evidence: ObservationEvidenceV1,
+}
+
+impl FileFactV1 {
+    fn validate(&self) -> Result<(), HarnessReadApiError> {
+        if let Some(path) = self.relative_path.as_deref() {
+            validate_observation_relative_path(path)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2360,6 +2453,12 @@ pub struct TimelineEntryV1 {
     pub sequence: u64,
     pub received_at_ms: u64,
     pub category: TimelineCategoryV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub state: TimelineStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<u16>,
     pub evidence: ObservationEvidenceV1,
 }
 
@@ -2387,6 +2486,14 @@ impl TimelinePageV1 {
             && self.next_cursor != self.entries.last().map(|entry| entry.sequence)
         {
             return Err(HarnessReadApiError::InvalidCursor);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, run_id: &HarnessRunId) -> Result<(), HarnessReadApiError> {
+        self.validate()?;
+        if &self.run_id != run_id {
+            return Err(HarnessReadApiError::InvalidRunState);
         }
         Ok(())
     }
@@ -2437,8 +2544,33 @@ impl TimelineEntryV1 {
         if self.sequence == 0 || self.received_at_ms == 0 {
             return Err(HarnessReadApiError::InvalidTimelineEntry);
         }
+        validate_optional_observation_text(
+            "timeline label",
+            self.label.as_deref(),
+            HARNESS_OBSERVATION_PATH_MAX_BYTES,
+        )?;
+        validate_observation_correlation(self.correlation)?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimelineStateV1 {
+    Started,
+    Active,
+    Waiting,
+    Required,
+    Updated,
+    Changed,
+    Completed,
+    Failed,
+    Dismissed,
+    Interrupted,
+    Stale,
+    UnknownAfterGap,
+    #[default]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2879,6 +3011,41 @@ fn validate_bounded_ids_with_max<T: Ord>(
 fn validate_monitor_facts<T>(values: &[T]) -> Result<(), HarnessReadApiError> {
     if values.len() > HARNESS_MONITOR_FACTS_MAX {
         return Err(HarnessReadApiError::InvalidCollection);
+    }
+    Ok(())
+}
+
+fn validate_optional_observation_text(
+    field: &'static str,
+    value: Option<&str>,
+    maximum: usize,
+) -> Result<(), HarnessReadApiError> {
+    let Some(value) = value else { return Ok(()); };
+    if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
+        return Err(HarnessReadApiError::InvalidText(field));
+    }
+    Ok(())
+}
+
+fn validate_observation_correlation(value: Option<u16>) -> Result<(), HarnessReadApiError> {
+    if value.is_some_and(|value| value == 0 || usize::from(value) > HARNESS_MONITOR_FACTS_MAX) {
+        return Err(HarnessReadApiError::InvalidTimelineEntry);
+    }
+    Ok(())
+}
+
+fn validate_observation_relative_path(path: &str) -> Result<(), HarnessReadApiError> {
+    if path.is_empty()
+        || path.len() > HARNESS_OBSERVATION_PATH_MAX_BYTES
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.contains(':')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|component| {
+            component.is_empty() || matches!(component, "." | "..")
+        })
+    {
+        return Err(HarnessReadApiError::InvalidText("relative path"));
     }
     Ok(())
 }
@@ -3924,9 +4091,12 @@ mod tests {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             context_window_tokens: None,
+            history: None,
             detail: Some(SessionMonitorDetailV1 {
                 todo_facts: vec![TodoFactV1 {
                     state: TodoStateV1::Unknown,
+                    todo_id: Some("todo-1".to_owned()),
+                    label: Some("review result".to_owned()),
                     evidence: ObservationEvidenceV1::PtyHint,
                 }],
                 tool_facts: Vec::new(),
@@ -3935,10 +4105,13 @@ mod tests {
                 process_facts: vec![ActivityFactV1 {
                     class: ActivityClassV1::OwnedProcess,
                     state: ActivityStateV1::UnknownAfterGap,
+                    label: Some("compiler".to_owned()),
+                    correlation: Some(1),
                     evidence: ObservationEvidenceV1::ManagedHook,
                 }],
                 file_facts: vec![FileFactV1 {
                     action: FileActionV1::Changed,
+                    relative_path: Some("src/lib.rs".to_owned()),
                     evidence: ObservationEvidenceV1::StructuredProvider,
                 }],
             }),
@@ -3955,7 +4128,12 @@ mod tests {
         assert_eq!(decoded.availability, ProjectionAvailabilityV1::Frozen);
         assert_eq!(decoded.freshness, ProjectionFreshnessV1::ReplacedIncarnation);
         assert_eq!(decoded.features.tools, FeatureObservationStateV1::NotSupportedByObservedSources);
-        assert_eq!(decoded.detail.unwrap().todo_facts[0].state, TodoStateV1::Unknown);
+        let detail = decoded.detail.unwrap();
+        assert_eq!(detail.todo_facts[0].state, TodoStateV1::Unknown);
+        assert_eq!(detail.todo_facts[0].todo_id.as_deref(), Some("todo-1"));
+        assert_eq!(detail.todo_facts[0].label.as_deref(), Some("review result"));
+        assert_eq!(detail.process_facts[0].correlation, Some(1));
+        assert_eq!(detail.file_facts[0].relative_path.as_deref(), Some("src/lib.rs"));
     }
 
     #[test]
@@ -3964,6 +4142,8 @@ mod tests {
         monitor.detail.as_mut().unwrap().tool_facts.push(ActivityFactV1 {
             class: ActivityClassV1::Tool,
             state: ActivityStateV1::Active,
+            label: Some("command".to_owned()),
+            correlation: Some(1),
             evidence: ObservationEvidenceV1::StructuredProvider,
         });
         assert!(monitor.validate().is_err());
@@ -3980,5 +4160,79 @@ mod tests {
         partial.freshness = ProjectionFreshnessV1::IncompleteAfterGap;
         partial.transport_incomplete = true;
         partial.validate().expect("truthful partial gap");
+    }
+
+    #[test]
+    fn timeline_structured_fields_round_trip_without_raw_correlation_shape() {
+        let run_id = HarnessRunId::new("hrun_000000000000000000000001").unwrap();
+        let page = TimelinePageV1 {
+            run_id: run_id.clone(),
+            availability: ProjectionAvailabilityV1::Current,
+            freshness: ProjectionFreshnessV1::Live,
+            transport_incomplete: false,
+            entries: vec![TimelineEntryV1 {
+                sequence: 7,
+                received_at_ms: 10,
+                category: TimelineCategoryV1::Tool,
+                label: Some("command".to_owned()),
+                state: TimelineStateV1::Completed,
+                correlation: Some(1),
+                evidence: ObservationEvidenceV1::StructuredProvider,
+            }],
+            next_cursor: None,
+        };
+        page.validate_for(&run_id).unwrap();
+        let encoded = serde_json::to_string(&page).unwrap();
+        assert!(encoded.contains("\"label\":\"command\""));
+        assert!(encoded.contains("\"state\":\"completed\""));
+        assert!(encoded.contains("\"correlation\":1"));
+        assert!(!encoded.contains("correlation_id"));
+        assert_eq!(serde_json::from_str::<TimelinePageV1>(&encoded).unwrap(), page);
+
+        let old_entry: TimelineEntryV1 = serde_json::from_str(
+            r#"{"sequence":1,"received_at_ms":2,"category":"usage","evidence":"managed-hook"}"#,
+        ).unwrap();
+        assert_eq!(old_entry.state, TimelineStateV1::Unknown);
+        assert_eq!(old_entry.correlation, None);
+        old_entry.validate().unwrap();
+    }
+
+    #[test]
+    fn monitor_history_summary_matches_categorical_feature_state() {
+        let mut monitor = monitor_with_mixed_capabilities();
+        monitor.features.history = FeatureObservationStateV1::Observed;
+        monitor.history = Some(SessionMonitorHistoryV1 {
+            message_count: 12,
+            message_count_exact: true,
+            completed_turn_count: Some(3),
+            total_tokens: Some(800),
+        });
+        monitor.validate().unwrap();
+        let encoded = serde_json::to_string(&monitor).unwrap();
+        let decoded: SessionMonitorV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.history, monitor.history);
+
+        monitor.history = None;
+        monitor.validate().expect("redacted observed history remains valid");
+        monitor.features.history = FeatureObservationStateV1::NotSupportedByObservedSources;
+        monitor.history = Some(SessionMonitorHistoryV1 {
+            message_count: 1,
+            message_count_exact: false,
+            completed_turn_count: None,
+            total_tokens: None,
+        });
+        assert!(monitor.validate().is_err());
+    }
+
+    #[test]
+    fn structured_file_fact_rejects_absolute_or_traversing_paths() {
+        for relative_path in ["C:/private.txt", "/private.txt", "src/../private.txt", "src\\private.txt"] {
+            let fact = FileFactV1 {
+                action: FileActionV1::Changed,
+                relative_path: Some(relative_path.to_owned()),
+                evidence: ObservationEvidenceV1::WorkspaceObservation,
+            };
+            assert!(fact.validate().is_err(), "accepted {relative_path}");
+        }
     }
 }

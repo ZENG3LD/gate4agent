@@ -22,6 +22,11 @@ pub const MONITORING_PROMPT_CANARY: &str = "g4a-private-prompt-canary";
 pub const MONITORING_TOOL_INPUT_CANARY: &str = "g4a-private-tool-input-canary";
 pub const MONITORING_TOOL_OUTPUT_CANARY: &str = "g4a-private-tool-output-canary";
 pub const MONITORING_PROVIDER_SESSION_CANARY: &str = "g4a-private-provider-session-canary";
+pub const MONITORING_SUBAGENT_ID_CANARY: &str = "g4a-private-subagent-id-canary";
+pub const MONITORING_SUBAGENT_DESCRIPTION_CANARY: &str =
+    "g4a-private-subagent-description-canary";
+pub const MONITORING_PERMISSION_INPUT_CANARY: &str =
+    "g4a-private-permission-input-canary";
 
 const FIXTURE_PATH_MAX_BYTES: usize = 4_096;
 
@@ -446,7 +451,20 @@ Send-FixtureHook 'PostToolUse' 'monitoring-hook-4' @{
     tool_response = @{ stdout = 'g4a-private-tool-output-canary' }
     duration_ms = 17
 }
-Send-FixtureHook 'Stop' 'monitoring-hook-5' @{
+Send-FixtureHook 'SubagentStart' 'monitoring-hook-5' @{
+    agent_id = 'g4a-private-subagent-id-canary'
+    agent_type = 'research-agent'
+    description = 'g4a-private-subagent-description-canary'
+}
+Send-FixtureHook 'SubagentStop' 'monitoring-hook-6' @{
+    agent_id = 'g4a-private-subagent-id-canary'
+}
+Send-FixtureHook 'PermissionRequest' 'monitoring-hook-7' @{
+    tool_name = 'PowerShell'
+    tool_use_id = 'fixture-permission-1'
+    tool_input = @{ command = 'g4a-private-permission-input-canary' }
+}
+Send-FixtureHook 'Stop' 'monitoring-hook-8' @{
     last_assistant_message = 'fixture monitoring complete'
 }
 [Console]::Write('fixture-monitoring-hooks-posted')
@@ -756,5 +774,43 @@ mod tests {
         std::fs::remove_file(release_signal).unwrap();
         std::fs::remove_file(started_marker).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn monitoring_hook_fixture_posts_exact_ordered_private_provider_events() {
+        let spec = monitoring_hook_agent_spec();
+        assert!(spec.capabilities.transports.pty);
+        assert_eq!(
+            spec.capabilities.adapters.hook.as_ref().map(|binding| binding.id.as_str()),
+            Some("claude-code"),
+        );
+        let script = spec.launch.fixed_args.last().unwrap();
+        let events = [
+            "'SessionStart' 'monitoring-hook-1'",
+            "'UserPromptSubmit' 'monitoring-hook-2'",
+            "'PreToolUse' 'monitoring-hook-3'",
+            "'PostToolUse' 'monitoring-hook-4'",
+            "'SubagentStart' 'monitoring-hook-5'",
+            "'SubagentStop' 'monitoring-hook-6'",
+            "'PermissionRequest' 'monitoring-hook-7'",
+            "'Stop' 'monitoring-hook-8'",
+        ];
+        assert!(script.contains("agent_type = 'research-agent'"));
+        let positions = events.map(|event| {
+            script.find(event).unwrap_or_else(|| panic!("missing fixture event {event}"))
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        for canary in [
+            MONITORING_PROMPT_CANARY,
+            MONITORING_TOOL_INPUT_CANARY,
+            MONITORING_TOOL_OUTPUT_CANARY,
+            MONITORING_PROVIDER_SESSION_CANARY,
+            MONITORING_SUBAGENT_ID_CANARY,
+            MONITORING_SUBAGENT_DESCRIPTION_CANARY,
+            MONITORING_PERMISSION_INPUT_CANARY,
+        ] {
+            assert!(script.contains(canary));
+        }
     }
 }

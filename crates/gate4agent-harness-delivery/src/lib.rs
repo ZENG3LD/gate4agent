@@ -268,6 +268,12 @@ impl DeliveryCatalogV2 {
         self.bundles.get(id)
     }
 
+    pub fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&SpawnBundleId, &CompiledDeliveryBundleV2)> {
+        self.bundles.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.bundles.len()
     }
@@ -1429,5 +1435,52 @@ mod tests {
         ));
         let error = DeliveryCatalogV2::new([bundle.clone(), bundle]).unwrap_err();
         assert!(matches!(error, DeliveryCatalogError::DuplicateBundle(_)));
+    }
+
+    #[test]
+    fn delivery_catalog_iterator_is_exact_and_canonical_by_bundle_id() {
+        let first_root = TestRoot::new();
+        let second_root = TestRoot::new();
+        let second = compile_reviewed_delivery_bundle_v2(
+            SpawnBundleId::new("bundle-b").unwrap(),
+            SpawnBundleRevision::new("r1").unwrap(),
+            &[source(
+                second_root.write("bundle-b.txt", b"bundle b\n"),
+                None,
+                DeliveryComponentKindV2::File,
+                DeliveryScopeV2::Workspace,
+            )],
+        )
+        .unwrap();
+        let first = compile_reviewed_delivery_bundle_v2(
+            SpawnBundleId::new("bundle-a").unwrap(),
+            SpawnBundleRevision::new("r1").unwrap(),
+            &[source(
+                first_root.write("bundle-a.txt", b"bundle a\n"),
+                None,
+                DeliveryComponentKindV2::File,
+                DeliveryScopeV2::Workspace,
+            )],
+        )
+        .unwrap();
+        let catalog = DeliveryCatalogV2::new([second, first]).unwrap();
+
+        let identities = catalog
+            .iter()
+            .map(|(id, bundle)| {
+                (
+                    id.as_str().to_owned(),
+                    bundle.manifest().revision.as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            identities,
+            vec![
+                ("bundle-a".to_owned(), "r1".to_owned()),
+                ("bundle-b".to_owned(), "r1".to_owned()),
+            ],
+        );
     }
 }

@@ -374,6 +374,9 @@ impl HarnessLaunchPlanV1 {
             HarnessWorktreeIntentV1::Managed { worktree_ref } => {
                 Some(WorkspaceId::new(worktree_ref.as_str())?)
             }
+            HarnessWorktreeIntentV1::ManagedProfile { .. } => {
+                return Err(HarnessDispatchError::SpecializedDispatchUnavailable);
+            }
         };
         Ok(SpawnSpec {
             target: SpawnTarget {
@@ -852,6 +855,46 @@ pub fn deterministic_dispatch_ids(
         continuation_ref,
         continuation_receipt_ref,
         harness_mcp_reservation_id,
+    })
+}
+
+pub fn deterministic_issued_dispatch_ids(
+    operation_id: &HarnessOperationId,
+    has_delivery: bool,
+    has_continuation: bool,
+) -> Result<HarnessDerivedDispatchIdsV1, HarnessDispatchError> {
+    operation_id.validate()?;
+    let delivery_ref = has_delivery.then(|| derived_harness_id(
+        HarnessDeliveryRef::PREFIX,
+        HARNESS_DELIVERY_REF_DOMAIN,
+        operation_id,
+        HarnessDeliveryRef::new,
+    )).transpose()?;
+    let delivery_receipt_ref = has_delivery.then(|| derived_harness_id(
+        HarnessReceiptRef::PREFIX,
+        HARNESS_DELIVERY_RECEIPT_REF_DOMAIN,
+        operation_id,
+        HarnessReceiptRef::new,
+    )).transpose()?;
+    let continuation_ref = has_continuation.then(|| derived_harness_id(
+        HarnessContinuationRef::PREFIX,
+        HARNESS_CONTINUATION_REF_DOMAIN,
+        operation_id,
+        HarnessContinuationRef::new,
+    )).transpose()?;
+    let continuation_receipt_ref = has_continuation.then(|| derived_harness_id(
+        HarnessReceiptRef::PREFIX,
+        HARNESS_CONTINUATION_RECEIPT_REF_DOMAIN,
+        operation_id,
+        HarnessReceiptRef::new,
+    )).transpose()?;
+    Ok(HarnessDerivedDispatchIdsV1 {
+        run_id: deterministic_run_id(operation_id)?,
+        delivery_ref,
+        delivery_receipt_ref,
+        continuation_ref,
+        continuation_receipt_ref,
+        harness_mcp_reservation_id: None,
     })
 }
 

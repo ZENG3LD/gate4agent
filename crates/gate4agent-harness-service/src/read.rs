@@ -576,7 +576,10 @@ fn redact_run(
             mode: run.intent.mode,
             worktree: match run.intent.worktree {
                 HarnessWorktreeIntentV1::Existing => RedactedWorktreeIntentV1::Existing,
-                HarnessWorktreeIntentV1::Managed { .. } => RedactedWorktreeIntentV1::Managed,
+                HarnessWorktreeIntentV1::Managed { .. }
+                | HarnessWorktreeIntentV1::ManagedProfile { .. } => {
+                    RedactedWorktreeIntentV1::Managed
+                }
             },
             has_delivery_bundle: run.intent.delivery_bundle.is_some(),
             has_continuation: run.intent.continuation.is_some(),

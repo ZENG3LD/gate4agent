@@ -648,7 +648,7 @@ async fn schedule_next_delivery_stages_materializes_and_does_not_resend() {
                 .map(|delivery| (
                     delivery.state,
                     delivery.revision,
-                    delivery.grant_revision,
+                    delivery.authority.clone(),
                     delivery.stage_receipt.as_ref().map(|receipt| (
                         receipt.node_id.clone(),
                         receipt.node_incarnation.clone(),

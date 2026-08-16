@@ -12,9 +12,14 @@ use gate4agent_harness_engine::{
     HarnessApplyOutcome, HarnessEngine, HarnessEngineCheckpointV1, HarnessEngineError,
     HarnessMutationV1, PreparedHarnessMutation,
 };
+use gate4agent_harness_api::{
+    HarnessReplaceTaskExecutionSpecRequestV2, HarnessReviewedWorktreeSelectionV1,
+    HarnessStartTaskRequestV2, HarnessTaskLaunchOptionsV1,
+};
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessCancelTaskRequestV1, HarnessCreateTaskRequestV1,
-    HarnessContextPackLineageV1, HarnessContinuationCleanupStateV1,
+    HarnessContextPackLineageV1, HarnessContextSourceSelectionV1,
+    HarnessContinuationCleanupStateV1,
     HarnessContinuationOutcomeUnknownReasonV1,
     HarnessContinuationRef, HarnessContinuationStateV1, HarnessContinuationV1,
     HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1, HarnessDispatchIntentV1,
@@ -27,15 +32,22 @@ use gate4agent_harness_protocol::{
     HarnessRetryTaskRequestV1, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
     HarnessResolvedContextPackReceiptV1, HarnessRunV1, HarnessScheduleOutcomeV1,
     HarnessScheduledLaunchRefV2, HarnessScheduleRequestV1, HarnessSelectorV1,
+    HarnessLaunchTargetSelectionV1, HarnessLaunchWorktreeSelectionV1,
     HarnessSessionIdentityV1, HarnessStartTaskRequestV1, HarnessTaskExecutionSpecV1,
-    HarnessTaskId, HarnessTaskStartOutcomeV1, HarnessTaskStateV1, HarnessTaskV1,
-    HarnessValidationError, SessionGrantId,
+    HarnessTaskExecutionSpecV2,
+    HarnessTaskId, HarnessTaskLaunchIssuanceId, HarnessTaskLaunchIssuanceV1,
+    HarnessTaskLaunchIssuanceRefV1,
+    HarnessTaskStartOutcomeV1, HarnessTaskStateV1, HarnessTaskV1,
+    HarnessTransferAuthorityRefV1, HarnessValidationError, HarnessWorktreeIntentV1,
+    SessionGrantId,
 };
 use gate4agent_harness_delivery::{CompiledDeliveryBundleV2, DeliveryCatalogV2};
 use gate4agent_node_protocol::{
     HarnessMcpActivationDigest, HarnessMcpReservationId, ResolvedHarnessMcpProxyReceiptV1,
+    ManagedWorktreeLeaseId,
     SessionAddress, SessionMode, SessionRecordId, SpawnOverride, SpawnSpec,
     MAX_HARNESS_MCP_RESERVATION_TTL_MS,
+    WorktreeProfileId, WorktreeProfileRevision,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, BTreeSet}, path::Path};
@@ -55,6 +67,19 @@ pub const HARNESS_SERVICE_CHECKPOINT_VERSION_V1: u16 = 1;
 pub const HARNESS_DISPATCH_BASELINE_MAX: usize = 4_096;
 const HARNESS_EXECUTION_SPEC_ID_DOMAIN: &[u8] =
     b"gate4agent-harness-execution-spec-id-v1\0";
+const HARNESS_LAUNCH_ISSUANCE_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-launch-issuance-id-v1\0";
+const HARNESS_LAUNCH_POLICY_DIGEST_DOMAIN: &[u8] =
+    b"gate4agent-harness-launch-policy-digest-v1\0";
+const HARNESS_CONTEXT_SOURCE_DIGEST_DOMAIN: &[u8] =
+    b"gate4agent-harness-context-source-digest-v1\0";
+const HARNESS_LAUNCH_ISSUANCE_DIGEST_DOMAIN: &[u8] =
+    b"gate4agent-harness-launch-issuance-digest-v1\0";
+
+pub(crate) enum PreparedScheduledSpawnLease {
+    Direct(c2::PreparedSpawnDispatch),
+    Managed(c2::PreparedManagedWorktreeSpawnDispatch),
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -178,6 +203,35 @@ pub struct HarnessDispatchContextV1 {
     pub spawn_spec_fingerprint: HarnessRequestDigest,
     pub dispatched_at_unix_ms: u64,
     pub idempotency_ref: HarnessIdempotencyRef,
+    #[serde(default)]
+    pub managed_worktree_binding: Option<HarnessManagedWorktreeBindingReceiptV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessManagedWorktreeBindingReceiptV1 {
+    pub lease_id: ManagedWorktreeLeaseId,
+    pub launch_issuance: HarnessTaskLaunchIssuanceRefV1,
+    pub source_workspace_id: HarnessSelectorV1,
+    pub allocated_workspace_id: HarnessSelectorV1,
+    pub profile_id: HarnessSelectorV1,
+    pub profile_revision: HarnessSelectorV1,
+}
+
+impl HarnessManagedWorktreeBindingReceiptV1 {
+    fn validate(&self) -> Result<(), HarnessServiceError> {
+        self.launch_issuance.validate()?;
+        self.source_workspace_id.validate()?;
+        self.allocated_workspace_id.validate()?;
+        self.profile_id.validate()?;
+        self.profile_revision.validate()?;
+        if self.source_workspace_id == self.allocated_workspace_id {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "managed worktree receipt aliases its source workspace",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl HarnessDispatchContextV1 {
@@ -190,6 +244,14 @@ impl HarnessDispatchContextV1 {
         self.expected_provider.validate()?;
         self.spawn_spec_fingerprint.validate()?;
         self.idempotency_ref.validate()?;
+        if let Some(managed_worktree_binding) = &self.managed_worktree_binding {
+            managed_worktree_binding.validate()?;
+            if managed_worktree_binding.source_workspace_id != self.workspace_id {
+                return Err(HarnessServiceError::InvalidDispatchContext(
+                    "managed worktree receipt source does not match dispatch source",
+                ));
+            }
+        }
         if self.dispatched_at_unix_ms == 0 {
             return Err(HarnessServiceError::InvalidDispatchContext(
                 "dispatch timestamp must be nonzero",
@@ -228,6 +290,8 @@ struct HarnessServiceCheckpointV1 {
     operator_requests: Vec<HarnessOperatorRequestV1>,
     #[serde(default)]
     scheduled_launches: BTreeMap<HarnessOperationId, HarnessScheduledLaunchRefV1>,
+    #[serde(default)]
+    issued_launches: BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -244,6 +308,7 @@ pub struct HarnessCommittedSnapshot {
     harness_mcp_reservations: Vec<HarnessMcpReservationV1>,
     operator_requests: Vec<HarnessOperatorRequestV1>,
     scheduled_launches: BTreeMap<HarnessOperationId, HarnessScheduledLaunchRefV1>,
+    issued_launches: BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
 }
 
 impl std::fmt::Debug for HarnessCommittedSnapshot {
@@ -262,6 +327,7 @@ pub struct HarnessService {
     harness_mcp_reservations: BTreeMap<HarnessMcpReservationId, HarnessMcpReservationV1>,
     operator_requests: BTreeMap<HarnessOperationId, HarnessRequestDigest>,
     scheduled_launches: BTreeMap<HarnessOperationId, HarnessScheduledLaunchRefV1>,
+    issued_launches: BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
     poisoned: bool,
 }
 
@@ -289,6 +355,7 @@ impl HarnessService {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         }
     }
@@ -301,6 +368,7 @@ impl HarnessService {
             harness_mcp_reservations,
             operator_requests,
             scheduled_launches,
+            issued_launches,
         ) = match store.load_checkpoint()? {
             Some(encoded) => {
                 let mut checkpoint: HarnessServiceCheckpointV1 = serde_json::from_slice(&encoded)?;
@@ -358,6 +426,25 @@ impl HarnessService {
                             "invalid task execution specification",
                         )
                     })?;
+                }
+                for spec in engine.task_execution_specs_v2() {
+                    let issuance = engine.task_launch_issuance(&spec.task_id).ok_or(
+                        HarnessServiceError::Corrupt(
+                            "issued execution specification has no issuance",
+                        ),
+                    )?;
+                    validate_service_issued_execution_spec(issuance, spec).map_err(|_| {
+                        HarnessServiceError::Corrupt(
+                            "invalid issued task execution specification",
+                        )
+                    })?;
+                }
+                for issuance in engine.task_launch_issuances() {
+                    if engine.task_execution_spec_v2(&issuance.task_id).is_none() {
+                        return Err(HarnessServiceError::Corrupt(
+                            "task launch issuance has no execution specification",
+                        ));
+                    }
                 }
                 let mut contexts = BTreeMap::new();
                 for context in checkpoint.dispatch_contexts {
@@ -421,16 +508,50 @@ impl HarnessService {
                         ));
                     }
                 }
+                for (operation_id, issuance) in &checkpoint.issued_launches {
+                    let operation = engine.operation(operation_id).ok_or(
+                        HarnessServiceError::Corrupt(
+                            "issued launch operation is missing",
+                        ),
+                    )?;
+                    let run = operation.run_id.as_ref().and_then(|run_id| engine.run(run_id))
+                        .ok_or(HarnessServiceError::Corrupt(
+                            "issued launch run is missing",
+                        ))?;
+                    validate_issued_launch_snapshot(issuance, run).map_err(|_| {
+                        HarnessServiceError::Corrupt(
+                            "issued launch snapshot does not match its run",
+                        )
+                    })?;
+                }
+                for run in engine.runs().filter(|run| run.binding.is_some()) {
+                    let operation = engine.operation(&run.operation_id).ok_or(
+                        HarnessServiceError::Corrupt(
+                            "bound dispatch operation is missing",
+                        ),
+                    )?;
+                    validate_authoritative_dispatch_binding(
+                        &engine,
+                        &contexts,
+                        &checkpoint.issued_launches,
+                        run,
+                        operation,
+                    ).map_err(|_| HarnessServiceError::Corrupt(
+                        "bound dispatch binding is not authoritative",
+                    ))?;
+                }
                 (
                     engine,
                     contexts,
                     reservations,
                     operator_requests,
                     checkpoint.scheduled_launches,
+                    checkpoint.issued_launches,
                 )
             }
             None => (
                 HarnessEngine::new(),
+                BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -444,6 +565,7 @@ impl HarnessService {
             harness_mcp_reservations,
             operator_requests,
             scheduled_launches,
+            issued_launches,
             poisoned: false,
         })
     }
@@ -645,6 +767,354 @@ impl HarnessService {
         task_id: &HarnessTaskId,
     ) -> Option<&HarnessTaskExecutionSpecV1> {
         self.engine.execution_spec(task_id)
+    }
+
+    pub fn task_execution_spec_v2(
+        &self,
+        task_id: &HarnessTaskId,
+    ) -> Option<&HarnessTaskExecutionSpecV2> {
+        self.engine.task_execution_spec_v2(task_id)
+    }
+
+    pub fn operator_replace_task_execution_spec_v2(
+        &mut self,
+        options: &HarnessTaskLaunchOptionsV1,
+        request: HarnessReplaceTaskExecutionSpecRequestV2,
+    ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
+        self.ensure_healthy()?;
+        request.validate().map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
+        let command_digest = operator_command_digest(
+            "replace-task-execution-spec-v2",
+            &request,
+        )?;
+        if let Some(outcome) = self.replay_operator_request(
+            &request.authority.operation_id,
+            &command_digest,
+            HarnessOperationKindV1::MutateExecutionSpec,
+        )? {
+            return Ok(outcome);
+        }
+        let task = self.engine.task(&request.task_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(request.task_id.to_string()))?;
+        if !matches!(task.state, HarnessTaskStateV1::Backlog | HarnessTaskStateV1::Ready)
+            || self.scheduler_task_has_nonterminal_run(task)?
+        {
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        }
+        validate_current_launch_options(options, &request)?;
+        let current_spec = self.engine.task_execution_spec_v2(&request.task_id);
+        let current_issuance = self.engine.task_launch_issuance(&request.task_id);
+        let (revision, created_at_unix_ms) = match (
+            request.expected_execution_spec_revision,
+            current_spec,
+            current_issuance,
+        ) {
+            (HarnessExpectedExecutionSpecRevisionV1::Absent, None, None) => (
+                HarnessRevision::new(1)?,
+                request.authority.now_unix_ms,
+            ),
+            (
+                HarnessExpectedExecutionSpecRevisionV1::Exact(expected),
+                Some(spec),
+                Some(issuance),
+            ) if spec.revision == expected && issuance.revision == expected => (
+                next_harness_revision(expected, "issued execution spec")?,
+                spec.created_at_unix_ms,
+            ),
+            (_, spec, issuance) => {
+                return Err(HarnessServiceError::IssuedExecutionCasMismatch {
+                    expected: request.expected_execution_spec_revision,
+                    spec: spec.map(|record| record.revision),
+                    issuance: issuance.map(|record| record.revision),
+                });
+            }
+        };
+        if self.engine.execution_spec(&request.task_id).is_some() {
+            return Err(HarnessServiceError::ExecutionSpecLaunchMismatch);
+        }
+        let worktree = match &request.selection.worktree {
+            HarnessReviewedWorktreeSelectionV1::Existing => {
+                HarnessLaunchWorktreeSelectionV1::Existing
+            }
+            HarnessReviewedWorktreeSelectionV1::Managed { profile } => {
+                HarnessLaunchWorktreeSelectionV1::Managed {
+                    profile_id: profile.profile_id.clone(),
+                    expected_profile_revision: profile.profile_revision.clone(),
+                }
+            }
+        };
+        let mut issuance = HarnessTaskLaunchIssuanceV1 {
+            issuance_id: deterministic_launch_issuance_id(&request.task_id)?,
+            revision,
+            digest: HarnessRequestDigest::new("0".repeat(64))?,
+            task_id: request.task_id.clone(),
+            task_revision: request.expected_task_revision,
+            plan: request.selection.plan.plan.clone(),
+            target: HarnessLaunchTargetSelectionV1 {
+                node_id: request.selection.plan.node_id.clone(),
+                source_workspace_id: request.selection.plan.source_workspace_id.clone(),
+                worktree,
+                provider_profile: request.selection.plan.provider_profile.clone(),
+                mode: request.selection.plan.mode,
+            },
+            context_source: request.selection.context_source.clone(),
+            delivery: request.selection.delivery.clone(),
+            policy_digest: options.policy_digest.clone(),
+            created_at_unix_ms,
+            updated_at_unix_ms: request.authority.now_unix_ms,
+        };
+        issuance.digest = task_launch_issuance_digest(&issuance)?;
+        let spec = HarnessTaskExecutionSpecV2 {
+            execution_spec_id: deterministic_execution_spec_id(&request.task_id)?,
+            revision,
+            task_id: request.task_id.clone(),
+            launch_issuance: issuance.reference(),
+            review_policy: request.selection.review_policy,
+            created_at_unix_ms,
+            updated_at_unix_ms: request.authority.now_unix_ms,
+        };
+        validate_service_issued_execution_spec(&issuance, &spec)?;
+        let operation = operator_task_operation(
+            &request.authority,
+            operator_actor(&request.authority),
+            HarnessOperationKindV1::MutateExecutionSpec,
+            request.task_id,
+            Some(request.expected_task_revision),
+        )?;
+        self.commit_operator_mutation(
+            HarnessMutationV1::PutIssuedExecutionSpec {
+                operation,
+                expected_task_revision: request.expected_task_revision,
+                expected_spec_revision: request.expected_execution_spec_revision,
+                expected_issuance_revision: request.expected_execution_spec_revision,
+                issuance,
+                spec,
+            },
+            command_digest,
+        )
+    }
+
+    pub(crate) fn start_task_v2(
+        &mut self,
+        catalog: &HarnessLaunchCatalog,
+        options: &HarnessTaskLaunchOptionsV1,
+        request: HarnessStartTaskRequestV2,
+    ) -> Result<HarnessTaskStartOutcomeV1, HarnessServiceError> {
+        self.ensure_healthy()?;
+        request.validate().map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
+        let command_digest = operator_command_digest("start-task-v2", &request)?;
+        if self.replay_operator_request(
+            &request.authority.operation_id,
+            &command_digest,
+            HarnessOperationKindV1::CreateRun,
+        )?.is_some() {
+            return Ok(HarnessTaskStartOutcomeV1 {
+                dispatch: self.replayed_dispatch_intent_for_operation(
+                    &request.authority.operation_id,
+                )?,
+                replayed: true,
+            });
+        }
+        let issuance = self.engine.task_launch_issuance(&request.task_id)
+            .ok_or(HarnessServiceError::ExecutionSpecMissing)?
+            .clone();
+        let spec = self.engine.task_execution_spec_v2(&request.task_id)
+            .ok_or(HarnessServiceError::ExecutionSpecMissing)?
+            .clone();
+        validate_service_issued_execution_spec(&issuance, &spec)?;
+        validate_current_issued_launch_options(options, &issuance)?;
+        if spec.revision != request.expected_execution_spec_revision
+            || issuance.revision != request.expected_execution_spec_revision
+            || issuance.reference() != request.expected_launch_issuance
+            || issuance.task_revision != request.expected_task_revision
+        {
+            return Err(HarnessServiceError::IssuedExecutionCasMismatch {
+                expected: HarnessExpectedExecutionSpecRevisionV1::Exact(
+                    request.expected_execution_spec_revision,
+                ),
+                spec: Some(spec.revision),
+                issuance: Some(issuance.revision),
+            });
+        }
+        if self.scheduler_pending_dispatch()?.is_some() {
+            return Err(HarnessServiceError::SchedulerBusy);
+        }
+        let current_task = self.engine.scheduler_ready_task_by_id(&request.task_id)
+            .map_err(map_scheduler_error)?
+            .ok_or(HarnessServiceError::TaskNotReady)?
+            .clone();
+        if current_task.revision != request.expected_task_revision
+            || current_task.creator != operator_actor(&request.authority)
+        {
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        }
+        let plan = catalog.resolve(&issuance.plan)?;
+        if !plan.is_ordinary_dispatch()
+            || !matches!(plan.grant, HarnessGrantPolicyV1::Operator)
+            || plan.node_id != issuance.target.node_id
+            || plan.workspace_id != issuance.target.source_workspace_id
+            || plan.provider_profile != issuance.target.provider_profile
+            || plan.mode != issuance.target.mode
+        {
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        }
+        let scheduled = plan.scheduled_ref()?;
+        let ids = dispatch::deterministic_issued_dispatch_ids(
+            &request.authority.operation_id,
+            issuance.delivery.is_some(),
+            issuance.context_source.is_some(),
+        )?;
+        let worktree = match &issuance.target.worktree {
+            HarnessLaunchWorktreeSelectionV1::Existing => HarnessWorktreeIntentV1::Existing,
+            HarnessLaunchWorktreeSelectionV1::Managed {
+                profile_id,
+                expected_profile_revision,
+            } => HarnessWorktreeIntentV1::ManagedProfile {
+                profile_id: profile_id.clone(),
+                expected_profile_revision: expected_profile_revision.clone(),
+            },
+        };
+        let mut task = current_task.clone();
+        task.revision = next_harness_revision(task.revision, "task")?;
+        task.state = HarnessTaskStateV1::Running;
+        task.updated_at_unix_ms = request.authority.now_unix_ms;
+        task.run_ids.push(ids.run_id.clone());
+        task.run_ids.sort();
+        let intent = gate4agent_harness_protocol::HarnessRunIntentV1 {
+            node_id: issuance.target.node_id.clone(),
+            workspace_id: issuance.target.source_workspace_id.clone(),
+            worktree,
+            provider_profile: issuance.target.provider_profile.clone(),
+            mode: issuance.target.mode,
+            delivery_bundle: issuance.delivery.as_ref()
+                .map(|selection| selection.bundle.selector.clone()),
+            continuation: issuance.context_source.as_ref()
+                .map(|source| HarnessSelectorV1::new(source.source_run_id.as_str()))
+                .transpose()?,
+        };
+        let run = HarnessRunV1 {
+            run_id: ids.run_id.clone(),
+            revision: HarnessRevision::new(1)?,
+            parent_run_id: None,
+            task_id: task.task_id.clone(),
+            operation_id: request.authority.operation_id.clone(),
+            intent,
+            delivery_receipt: None,
+            continuation_receipt: None,
+            binding: None,
+            lifecycle: HarnessRunLifecycleV1::Requested,
+            result_disposition: None,
+            failure: None,
+            created_at_unix_ms: request.authority.now_unix_ms,
+            updated_at_unix_ms: request.authority.now_unix_ms,
+        };
+        let authority = HarnessTransferAuthorityRefV1::OperatorIssuance {
+            issuance: issuance.reference(),
+        };
+        let delivery = match (&issuance.delivery, ids.delivery_ref) {
+            (Some(selection), Some(delivery_ref)) => Some(HarnessDeliveryV1 {
+                delivery_ref,
+                revision: HarnessRevision::new(1)?,
+                authority: authority.clone(),
+                task_id: task.task_id.clone(),
+                run_id: run.run_id.clone(),
+                operation_id: request.authority.operation_id.clone(),
+                bundle: selection.bundle.clone(),
+                state: HarnessDeliveryStateV1::Prepared,
+                stage_receipt: None,
+                receipt: None,
+                created_at_unix_ms: request.authority.now_unix_ms,
+                updated_at_unix_ms: request.authority.now_unix_ms,
+            }),
+            (None, None) => None,
+            _ => return Err(HarnessServiceError::InvalidTaskLaunchSelection),
+        };
+        let continuation = match (
+            &issuance.context_source,
+            ids.continuation_ref,
+            ids.continuation_receipt_ref,
+        ) {
+            (Some(source), Some(continuation_ref), Some(receipt_ref)) => {
+                let source_run = self.engine.run(&source.source_run_id)
+                    .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                let source_binding = source_run.binding.as_ref()
+                    .filter(|binding| source_binding_matches_context_selection(binding, source))
+                    .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                let source_context = self.dispatch_contexts.get(&source_run.operation_id)
+                    .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                Some(HarnessContinuationV1 {
+                    continuation_ref,
+                    receipt_ref,
+                    revision: HarnessRevision::new(1)?,
+                    state: HarnessContinuationStateV1::Prepared,
+                    authority: authority.clone(),
+                    source_run_id: source.source_run_id.clone(),
+                    target_run_id: run.run_id.clone(),
+                    operation_id: request.authority.operation_id.clone(),
+                    node_id: source.node_id.clone(),
+                    node_incarnation: source.node_incarnation.clone(),
+                    workspace_id: source.workspace_id.clone(),
+                    source_provider: source_context.expected_provider.clone(),
+                    source_binding: source_binding.clone(),
+                    context: None,
+                    target_binding: None,
+                    prepared_at_unix_ms: request.authority.now_unix_ms,
+                    exporting_at_unix_ms: None,
+                    exported_at_unix_ms: None,
+                    bound_at_unix_ms: None,
+                    expired_at_unix_ms: None,
+                    outcome_unknown_at_unix_ms: None,
+                    outcome_unknown_reason: None,
+                    cleanup_state: HarnessContinuationCleanupStateV1::Retained,
+                    created_at_unix_ms: request.authority.now_unix_ms,
+                    updated_at_unix_ms: request.authority.now_unix_ms,
+                })
+            }
+            (None, None, None) => None,
+            _ => return Err(HarnessServiceError::InvalidTaskLaunchSelection),
+        };
+        let mut operation = HarnessOperationV1 {
+            operation_id: request.authority.operation_id.clone(),
+            revision: HarnessRevision::new(1)?,
+            actor: current_task.creator.clone(),
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Prepared,
+            task_id: Some(task.task_id.clone()),
+            run_id: Some(run.run_id.clone()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(current_task.revision),
+            request_digest: HarnessRequestDigest::new("0".repeat(64))?,
+            idempotency_ref: request.authority.idempotency_ref.clone(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: request.authority.now_unix_ms,
+            updated_at_unix_ms: request.authority.now_unix_ms,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: None,
+        };
+        let mut mutation = HarnessMutationV1::CreateIssuedRun {
+            operation: operation.clone(),
+            expected_task_revision: request.expected_task_revision,
+            expected_execution_spec_revision: request.expected_execution_spec_revision,
+            expected_issuance_revision: request.expected_launch_issuance.revision,
+            task,
+            run,
+            delivery,
+            continuation,
+        };
+        operation.request_digest = mutation_request_digest(&mutation)?;
+        *mutation.operation_mut() = operation;
+        let prepared = self.engine.prepare(mutation)?;
+        let dispatch = dispatch_intent_from_prepared(&prepared)?;
+        self.commit_operator_prepared_with_launch_and_issuance(
+            prepared,
+            command_digest,
+            Some(scheduled),
+            Some(issuance),
+        )?;
+        Ok(HarnessTaskStartOutcomeV1 { dispatch, replayed: false })
     }
 
     pub fn operator_replace_task_execution_spec(
@@ -1149,8 +1619,10 @@ impl HarnessService {
                 Some(HarnessDeliveryV1 {
                     delivery_ref,
                     revision: HarnessRevision::new(1)?,
-                    grant_id: grant_id.clone(),
-                    grant_revision,
+                    authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                        grant_id: grant_id.clone(),
+                        revision: grant_revision,
+                    },
                     task_id: task.task_id.clone(),
                     run_id: run.run_id.clone(),
                     operation_id: operation_id.clone(),
@@ -1208,8 +1680,10 @@ impl HarnessService {
                     receipt_ref,
                     revision: HarnessRevision::new(1)?,
                     state: HarnessContinuationStateV1::Prepared,
-                    grant_id: grant_id.clone(),
-                    grant_revision,
+                    authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                        grant_id: grant_id.clone(),
+                        revision: grant_revision,
+                    },
                     source_run_id: source.run_id.clone(),
                     target_run_id: run.run_id.clone(),
                     operation_id: operation_id.clone(),
@@ -1241,8 +1715,7 @@ impl HarnessService {
         let delivery_present = match (&delivery, current_delivery) {
             (Some(expected), Some(current)) => {
                 if current.delivery_ref != expected.delivery_ref
-                    || current.grant_id != expected.grant_id
-                    || current.grant_revision != expected.grant_revision
+                    || current.authority != expected.authority
                     || current.task_id != expected.task_id
                     || current.run_id != expected.run_id
                     || current.operation_id != expected.operation_id
@@ -1255,8 +1728,7 @@ impl HarnessService {
                     || current.receipt.as_ref().is_some_and(|receipt| {
                         Some(&receipt.receipt_ref) != ids.delivery_receipt_ref.as_ref()
                             || receipt.delivery_ref != expected.delivery_ref
-                            || receipt.grant_id != expected.grant_id
-                            || receipt.grant_revision != expected.grant_revision
+                            || receipt.authority != expected.authority
                             || receipt.task_id != expected.task_id
                             || receipt.run_id != expected.run_id
                             || receipt.operation_id != expected.operation_id
@@ -1280,8 +1752,7 @@ impl HarnessService {
             (Some(expected), Some(current)) => {
                 if current.continuation_ref != expected.continuation_ref
                     || current.receipt_ref != expected.receipt_ref
-                    || current.grant_id != expected.grant_id
-                    || current.grant_revision != expected.grant_revision
+                    || current.authority != expected.authority
                     || current.source_run_id != expected.source_run_id
                     || current.target_run_id != expected.target_run_id
                     || current.operation_id != expected.operation_id
@@ -1389,11 +1860,6 @@ impl HarnessService {
             .ok_or(HarnessServiceError::InvalidContinuationProof(
                 "continuation authority is missing",
             ))?;
-        let grant = self.engine.grant(&current.grant_id).ok_or(
-            HarnessServiceError::InvalidContinuationProof(
-                "continuation grant is missing at export lease issuance",
-            ),
-        )?;
         let source_run = self.engine.run(&current.source_run_id).ok_or(
             HarnessServiceError::InvalidContinuationProof(
                 "continuation source run is missing at export lease issuance",
@@ -1413,19 +1879,43 @@ impl HarnessService {
                     ..
                 }
             );
-        if grant.revision != current.grant_revision
-            || grant.state
-                != gate4agent_harness_protocol::SessionGrantStateV1::Active
-            || !grant.context_permissions.export
-            || !grant.context_permissions.restore
-            || grant.actor_run_id != current.source_run_id
-            || target_run.parent_run_id.as_ref() != Some(&current.source_run_id)
-            || !grant.allows_target(
-                &target_run.intent.node_id,
-                &target_run.intent.workspace_id,
-                &target_run.intent.provider_profile,
-                target_run.intent.mode,
-            )
+        let transfer_authorized = match &current.authority {
+            HarnessTransferAuthorityRefV1::ParentGrant { grant_id, revision } => {
+                self.engine.grant(grant_id).is_some_and(|grant| {
+                    grant.revision == *revision
+                        && grant.state
+                            == gate4agent_harness_protocol::SessionGrantStateV1::Active
+                        && grant.context_permissions.export
+                        && grant.context_permissions.restore
+                        && grant.actor_run_id == current.source_run_id
+                        && target_run.parent_run_id.as_ref() == Some(&current.source_run_id)
+                        && grant.allows_target(
+                            &target_run.intent.node_id,
+                            &target_run.intent.workspace_id,
+                            &target_run.intent.provider_profile,
+                            target_run.intent.mode,
+                        )
+                })
+            }
+            HarnessTransferAuthorityRefV1::OperatorIssuance { issuance } => {
+                self.issued_launches.get(&target_run.operation_id)
+                    .is_some_and(|current_issuance| {
+                        current_issuance.reference() == *issuance
+                            && current_issuance.context_source.as_ref().is_some_and(|source| {
+                                source.source_run_id == current.source_run_id
+                                    && source.source_run_revision == source_run.revision
+                                    && source.node_id == current.node_id
+                                    && source.node_incarnation == current.node_incarnation
+                                    && source.workspace_id == current.workspace_id
+                                    && source_binding_matches_context_selection(
+                                        &current.source_binding,
+                                        source,
+                                    )
+                            })
+                    })
+            }
+        };
+        if !transfer_authorized
             || !matches!(
                 source_run.lifecycle,
                 HarnessRunLifecycleV1::Running
@@ -1767,7 +2257,14 @@ impl HarnessService {
                 "continuation lease does not match exact operation fingerprint",
             ));
         }
-        validate_run_dispatch_seam(&self.engine, &run, &context, &spec, &fingerprint)?;
+        validate_run_dispatch_seam(
+            &self.engine,
+            &self.issued_launches,
+            &run,
+            &context,
+            &spec,
+            &fingerprint,
+        )?;
         let continuation = self.engine.continuation(continuation_ref).ok_or(
             HarnessServiceError::InvalidContinuationProof(
                 "exported continuation authority is missing",
@@ -1847,14 +2344,22 @@ impl HarnessService {
         operation: HarnessOperationV1,
         context: HarnessDispatchContextV1,
         spec: SpawnSpec,
-    ) -> Result<c2::PreparedSpawnDispatch, HarnessServiceError> {
+    ) -> Result<PreparedScheduledSpawnLease, HarnessServiceError> {
         self.ensure_healthy()?;
         let scheduled = self.scheduled_launches.get(&operation.operation_id)
             .ok_or(HarnessServiceError::InvalidDispatchContext(
                 "ordinary spawn has no durable scheduled launch reference",
             ))?;
         let plan = catalog.resolve_scheduled(scheduled)?;
-        plan.validate_intent(&run.intent)?;
+        let issued = self.issued_launches.get(&run.operation_id)
+            .filter(|issuance| issued_run_intent_matches(issuance, &run));
+        if issued.is_none() {
+            plan.validate_intent(&run.intent)?;
+        } else if plan.plan_ref()? != issued.expect("checked issued launch").plan {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "issued spawn plan changed",
+            ));
+        }
         if plan.harness_mcp != dispatch::HarnessMcpPolicyV1::Disabled {
             return Err(HarnessServiceError::HarnessMcpSpecializedTransitionRequired);
         }
@@ -1932,7 +2437,14 @@ impl HarnessService {
                 "ordinary spawn lease does not match exact operation fingerprint",
             ));
         }
-        validate_run_dispatch_seam(&self.engine, &run, &context, &spec, &fingerprint)?;
+        validate_run_dispatch_seam(
+            &self.engine,
+            &self.issued_launches,
+            &run,
+            &context,
+            &spec,
+            &fingerprint,
+        )?;
         let route = gate4agent_c2_protocol::NodeRoute {
             node_id: gate4agent_node_protocol::NodeId::new(context.node_id.as_str())
                 .map_err(|_| HarnessServiceError::InvalidDispatchContext(
@@ -1945,6 +2457,7 @@ impl HarnessService {
         };
         let prepared = prepared_scheduled_spawn_dispatch(
             &self.engine,
+            &self.issued_launches,
             plan,
             route,
             &operation,
@@ -1952,6 +2465,31 @@ impl HarnessService {
             fingerprint,
             None,
         )?;
+        let prepared = match &run.intent.worktree {
+            HarnessWorktreeIntentV1::ManagedProfile {
+                profile_id,
+                expected_profile_revision,
+            } => PreparedScheduledSpawnLease::Managed(
+                c2::PreparedManagedWorktreeSpawnDispatch::new(
+                    prepared,
+                    WorktreeProfileId::new(profile_id.as_str()).map_err(|_| {
+                        HarnessServiceError::InvalidDispatchContext(
+                            "issued managed worktree profile id is invalid",
+                        )
+                    })?,
+                    WorktreeProfileRevision::new(expected_profile_revision.as_str()).map_err(
+                        |_| HarnessServiceError::InvalidDispatchContext(
+                            "issued managed worktree profile revision is invalid",
+                        ),
+                    )?,
+                ).map_err(|_| HarnessServiceError::InvalidDispatchContext(
+                    "issued managed worktree dispatch is not sealed",
+                ))?,
+            ),
+            HarnessWorktreeIntentV1::Existing | HarnessWorktreeIntentV1::Managed { .. } => {
+                PreparedScheduledSpawnLease::Direct(prepared)
+            }
+        };
         self.begin_run_dispatch(
             expected_run_revision,
             run,
@@ -1970,6 +2508,7 @@ impl HarnessService {
             harness_mcp_reservations: self.harness_mcp_reservations.values().cloned().collect(),
             operator_requests: operator_request_records(&self.operator_requests),
             scheduled_launches: self.scheduled_launches.clone(),
+            issued_launches: self.issued_launches.clone(),
         }
     }
 
@@ -2011,8 +2550,10 @@ impl HarnessService {
         let delivery = HarnessDeliveryV1 {
             delivery_ref,
             revision: HarnessRevision::new(1)?,
-            grant_id,
-            grant_revision,
+            authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id,
+                revision: grant_revision,
+            },
             task_id,
             run_id,
             operation_id,
@@ -2067,29 +2608,40 @@ impl HarnessService {
                 "prepared delivery operation is missing",
             ),
         )?;
-        let grant = self.engine.grant(&delivery.grant_id).ok_or(
-            HarnessServiceError::InvalidStagedDeliveryProof(
-                "prepared delivery grant is missing",
-            ),
-        )?;
         let exact_bundle = delivery::compiled_bundle_identity(
             delivery.bundle.selector.clone(),
             &compiled,
         )?;
+        let transfer_authorized = match &delivery.authority {
+            HarnessTransferAuthorityRefV1::ParentGrant { grant_id, revision } => {
+                self.engine.grant(grant_id).is_some_and(|grant| {
+                    grant.revision == *revision
+                        && grant.state
+                            == gate4agent_harness_protocol::SessionGrantStateV1::Active
+                        && grant.actor_run_id
+                            == run.parent_run_id.clone().unwrap_or_else(|| run.run_id.clone())
+                        && grant.allows_delivery_bundle(&delivery.bundle.selector)
+                        && grant.allows_target(
+                            &run.intent.node_id,
+                            &run.intent.workspace_id,
+                            &run.intent.provider_profile,
+                            run.intent.mode,
+                        )
+                })
+            }
+            HarnessTransferAuthorityRefV1::OperatorIssuance { issuance } => {
+                self.issued_launches.get(&run.operation_id)
+                    .is_some_and(|current| {
+                        current.reference() == *issuance
+                            && current.delivery.as_ref().is_some_and(|selection| {
+                                selection.bundle == delivery.bundle
+                            })
+                    })
+            }
+        };
         if delivery.state != HarnessDeliveryStateV1::Prepared
-            || delivery.grant_revision != grant.revision
-            || grant.state
-                != gate4agent_harness_protocol::SessionGrantStateV1::Active
-            || grant.actor_run_id != run.parent_run_id.clone().unwrap_or_else(|| run.run_id.clone())
-            || !grant.allows_delivery_bundle(&delivery.bundle.selector)
-            || !grant.allows_target(
-                &run.intent.node_id,
-                &run.intent.workspace_id,
-                &run.intent.provider_profile,
-                run.intent.mode,
-            )
+            || !transfer_authorized
             || delivery.bundle != exact_bundle
-            || delivery.grant_id != grant.grant_id
             || delivery.task_id != run.task_id
             || run.operation_id != delivery.operation_id
             || operation.operation_id != delivery.operation_id
@@ -2224,8 +2776,16 @@ impl HarnessService {
         validate_delivery_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
             &delivery,
             &run,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
             proof,
         )?;
         let prepared = self.engine.prepare_accepted_spawn_delivery_commit(
@@ -2238,7 +2798,7 @@ impl HarnessService {
         )?;
         let outcome = prepared.outcome();
         if outcome == HarnessApplyOutcome::Applied {
-            self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
+            self.commit_prepared(prepared, accepted_contexts)?;
         }
         Ok(())
     }
@@ -2283,6 +2843,7 @@ impl HarnessService {
         validate_authoritative_dispatch_binding(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
             &run,
             &operation,
         )?;
@@ -2321,8 +2882,11 @@ impl HarnessService {
         if self.engine.run(&run.run_id) == Some(&run)
             && self.engine.operation(&operation.operation_id) == Some(&operation)
         {
-            validate_accepted_spawn_request_identity(
+            validate_committed_spawn_replay(
+                &self.engine,
                 &self.dispatch_contexts,
+                &self.issued_launches,
+                &run,
                 &operation,
                 proof,
             )?;
@@ -2331,6 +2895,14 @@ impl HarnessService {
         validate_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
             &run,
             &operation,
             proof,
@@ -2341,7 +2913,7 @@ impl HarnessService {
             expected_operation_revision,
             operation,
         )?;
-        self.commit_prepared(prepared, self.dispatch_contexts.clone())
+        self.commit_prepared(prepared, accepted_contexts)
     }
 
     pub(crate) fn commit_dispatch_outcome(
@@ -2460,6 +3032,7 @@ impl HarnessService {
             validate_committed_continuation_replay(
                 &self.engine,
                 &self.dispatch_contexts,
+                &self.issued_launches,
                 &run,
                 &operation,
                 continuation_ref,
@@ -2470,6 +3043,14 @@ impl HarnessService {
         validate_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
             &run,
             &operation,
             proof,
@@ -2519,7 +3100,7 @@ impl HarnessService {
             expected_continuation_revision,
             bound,
         )?;
-        self.commit_prepared(prepared, self.dispatch_contexts.clone())
+        self.commit_prepared(prepared, accepted_contexts)
     }
 
     pub fn transition_run_with_accepted_spawn_delivery_and_continuation(
@@ -2548,6 +3129,7 @@ impl HarnessService {
             validate_delivery_accepted_spawn_proof(
                 &self.engine,
                 &self.dispatch_contexts,
+                &self.issued_launches,
                 &delivery,
                 &run,
                 proof,
@@ -2555,6 +3137,7 @@ impl HarnessService {
             validate_committed_continuation_replay(
                 &self.engine,
                 &self.dispatch_contexts,
+                &self.issued_launches,
                 &run,
                 &operation,
                 continuation_ref,
@@ -2565,8 +3148,16 @@ impl HarnessService {
         validate_delivery_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
             &delivery,
             &run,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
             proof,
         )?;
         let continuation = bound_continuation_from_proof(
@@ -2589,7 +3180,7 @@ impl HarnessService {
                 expected_continuation_revision,
                 continuation,
             )?;
-        self.commit_prepared(prepared, self.dispatch_contexts.clone())
+        self.commit_prepared(prepared, accepted_contexts)
     }
 
     pub fn transition_run_with_accepted_harness_mcp_spawn_delivery_and_continuation(
@@ -2615,6 +3206,7 @@ impl HarnessService {
             validate_delivery_accepted_spawn_proof(
                 &self.engine,
                 &self.dispatch_contexts,
+                &self.issued_launches,
                 &delivery,
                 &run,
                 proof,
@@ -2622,6 +3214,7 @@ impl HarnessService {
             validate_committed_continuation_replay(
                 &self.engine,
                 &self.dispatch_contexts,
+                &self.issued_launches,
                 &run,
                 &operation,
                 continuation_ref,
@@ -2640,8 +3233,16 @@ impl HarnessService {
         validate_delivery_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
             &delivery,
             &run,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
             proof,
         )?;
         let continuation = bound_continuation_from_proof(
@@ -2675,7 +3276,7 @@ impl HarnessService {
             )?;
         let mut reservations = self.harness_mcp_reservations.clone();
         reservations.insert(bound_reservation.reservation_id.clone(), bound_reservation);
-        self.commit_prepared_state(prepared, self.dispatch_contexts.clone(), reservations)
+        self.commit_prepared_state(prepared, accepted_contexts, reservations)
     }
 
     pub fn transition_run_with_accepted_harness_mcp_spawn_and_continuation(
@@ -2703,6 +3304,7 @@ impl HarnessService {
             validate_committed_continuation_replay(
                 &self.engine,
                 &self.dispatch_contexts,
+                &self.issued_launches,
                 &run,
                 &operation,
                 continuation_ref,
@@ -2720,6 +3322,14 @@ impl HarnessService {
         validate_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
             &run,
             &operation,
             proof,
@@ -2748,7 +3358,7 @@ impl HarnessService {
         )?;
         let mut reservations = self.harness_mcp_reservations.clone();
         reservations.insert(bound.reservation_id.clone(), bound);
-        self.commit_prepared_state(prepared, self.dispatch_contexts.clone(), reservations)
+        self.commit_prepared_state(prepared, accepted_contexts, reservations)
     }
 
     pub fn transition_run_with_accepted_harness_mcp_spawn(
@@ -2769,6 +3379,14 @@ impl HarnessService {
         validate_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
             &run,
             &operation,
             proof,
@@ -2792,7 +3410,7 @@ impl HarnessService {
         )?;
         let mut reservations = self.harness_mcp_reservations.clone();
         reservations.insert(bound.reservation_id.clone(), bound);
-        self.commit_prepared_state(prepared, self.dispatch_contexts.clone(), reservations)
+        self.commit_prepared_state(prepared, accepted_contexts, reservations)
     }
 
     pub fn transition_run_with_accepted_harness_mcp_spawn_and_delivery(
@@ -2810,8 +3428,16 @@ impl HarnessService {
         validate_delivery_accepted_spawn_proof(
             &self.engine,
             &self.dispatch_contexts,
+            &self.issued_launches,
             &delivery,
             &run,
+            proof,
+        )?;
+        let accepted_contexts = contexts_with_accepted_spawn_binding(
+            &self.dispatch_contexts,
+            &self.issued_launches,
+            &run,
+            &operation,
             proof,
         )?;
         let proxy = proof.harness_mcp_proxy()
@@ -2836,7 +3462,7 @@ impl HarnessService {
         )?;
         let mut reservations = self.harness_mcp_reservations.clone();
         reservations.insert(bound.reservation_id.clone(), bound);
-        self.commit_prepared_state(prepared, self.dispatch_contexts.clone(), reservations)
+        self.commit_prepared_state(prepared, accepted_contexts, reservations)
     }
 
     /// Atomically publishes the Dispatching operation and the privacy-safe
@@ -2849,6 +3475,11 @@ impl HarnessService {
     ) -> Result<(), HarnessServiceError> {
         self.ensure_healthy()?;
         context.validate()?;
+        if context.managed_worktree_binding.is_some() {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "dispatch cannot predeclare a managed worktree receipt",
+            ));
+        }
         if operation.run_id.is_some() {
             return Err(HarnessServiceError::NonAtomicRunOperation);
         }
@@ -2890,10 +3521,16 @@ impl HarnessService {
     ) -> Result<(), HarnessServiceError> {
         self.ensure_healthy()?;
         context.validate()?;
+        if context.managed_worktree_binding.is_some() {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "run dispatch cannot predeclare a managed worktree receipt",
+            ));
+        }
         let actual_spawn_spec_fingerprint = c2::spawn_spec_fingerprint(spawn_spec)
             .map_err(|_| HarnessServiceError::DispatchFingerprint)?;
         validate_run_dispatch_seam(
             &self.engine,
+            &self.issued_launches,
             &run,
             &context,
             spawn_spec,
@@ -2949,9 +3586,21 @@ impl HarnessService {
     ) -> Result<PreparedHarnessMcpReservation, HarnessServiceError> {
         self.ensure_healthy()?;
         context.validate()?;
+        if context.managed_worktree_binding.is_some() {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "H3B dispatch cannot predeclare a managed worktree receipt",
+            ));
+        }
         let fingerprint = c2::spawn_spec_fingerprint(spawn_spec)
             .map_err(|_| HarnessServiceError::DispatchFingerprint)?;
-        validate_run_dispatch_seam(&self.engine, &run, &context, spawn_spec, &fingerprint)?;
+        validate_run_dispatch_seam(
+            &self.engine,
+            &self.issued_launches,
+            &run,
+            &context,
+            spawn_spec,
+            &fingerprint,
+        )?;
         validate_harness_mcp_grant(
             &self.engine,
             &run,
@@ -3114,7 +3763,14 @@ impl HarnessService {
             .ok_or(HarnessServiceError::HarnessMcpProofMismatch)?;
         let fingerprint = c2::spawn_spec_fingerprint(&spec)
             .map_err(|_| HarnessServiceError::DispatchFingerprint)?;
-        validate_run_dispatch_seam(&self.engine, run, context, &spec, &fingerprint)?;
+        validate_run_dispatch_seam(
+            &self.engine,
+            &self.issued_launches,
+            run,
+            context,
+            &spec,
+            &fingerprint,
+        )?;
         let route = gate4agent_c2_protocol::NodeRoute {
             node_id: gate4agent_node_protocol::NodeId::new(context.node_id.as_str())
                 .map_err(|_| HarnessServiceError::HarnessMcpProofMismatch)?,
@@ -3127,6 +3783,7 @@ impl HarnessService {
         armed.updated_at_unix_ms = armed_at_unix_ms;
         let prepared = prepared_scheduled_spawn_dispatch(
             &self.engine,
+            &self.issued_launches,
             plan,
             route,
             operation,
@@ -3295,6 +3952,7 @@ impl HarnessService {
 
 fn prepared_scheduled_spawn_dispatch(
     engine: &HarnessEngine,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
     plan: &dispatch::HarnessLaunchPlanV1,
     route: gate4agent_c2_protocol::NodeRoute,
     operation: &HarnessOperationV1,
@@ -3307,9 +3965,14 @@ fn prepared_scheduled_spawn_dispatch(
         .ok_or(HarnessServiceError::InvalidDispatchContext(
             "scheduled spawn run is missing",
         ))?;
-    let grant_identity = match &plan.grant {
+    let grant_authority = match &plan.grant {
         HarnessGrantPolicyV1::Operator => None,
-        HarnessGrantPolicyV1::Exact { grant_id, revision } => Some((grant_id, revision)),
+        HarnessGrantPolicyV1::Exact { grant_id, revision } => {
+            Some(HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: grant_id.clone(),
+                revision: *revision,
+            })
+        }
     };
     let mut prepared = c2::PreparedSpawnDispatch::new(
         route,
@@ -3321,14 +3984,30 @@ fn prepared_scheduled_spawn_dispatch(
         "scheduled spawn request is invalid",
     ))?;
 
-    match (&plan.delivery, engine.delivery_for_run(&run.run_id)) {
-        (None, None) => {}
-        (Some(policy), Some(delivery)) => {
+    match engine.delivery_for_run(&run.run_id) {
+        None if plan.delivery.is_none() => {}
+        Some(delivery) => {
+            let authority_matches = match &delivery.authority {
+                HarnessTransferAuthorityRefV1::ParentGrant { .. } => {
+                    grant_authority.as_ref() == Some(&delivery.authority)
+                        && plan.delivery.as_ref().is_some_and(|policy| {
+                            delivery.bundle.selector == policy.selector
+                                && delivery.bundle.bundle_id.as_str()
+                                    == policy.bundle_id.as_str()
+                        })
+                }
+                HarnessTransferAuthorityRefV1::OperatorIssuance { issuance } => {
+                    issued_launches.get(&run.operation_id).is_some_and(|current| {
+                        current.reference() == *issuance
+                            && current.delivery.as_ref().is_some_and(|selection| {
+                                selection.bundle == delivery.bundle
+                            })
+                    })
+                }
+            };
             if delivery.state != HarnessDeliveryStateV1::Staged
                 || delivery.operation_id != operation.operation_id
-                || delivery.bundle.selector != policy.selector
-                || delivery.bundle.bundle_id.as_str() != policy.bundle_id.as_str()
-                || grant_identity != Some((&delivery.grant_id, &delivery.grant_revision))
+                || !authority_matches
             {
                 return Err(HarnessServiceError::InvalidDispatchContext(
                     "scheduled delivery authority does not match exact plan and grant",
@@ -3361,15 +4040,26 @@ fn prepared_scheduled_spawn_dispatch(
         )),
     }
 
-    match (
-        plan.continuation,
-        engine.continuation_for_run(&run.run_id),
-    ) {
-        (dispatch::HarnessContinuationPolicyV1::None, None) => {}
-        (dispatch::HarnessContinuationPolicyV1::ParentRun, Some(continuation)) => {
+    match engine.continuation_for_run(&run.run_id) {
+        None if plan.continuation == dispatch::HarnessContinuationPolicyV1::None => {}
+        Some(continuation) => {
+            let authority_matches = match &continuation.authority {
+                HarnessTransferAuthorityRefV1::ParentGrant { .. } => {
+                    plan.continuation == dispatch::HarnessContinuationPolicyV1::ParentRun
+                        && grant_authority.as_ref() == Some(&continuation.authority)
+                }
+                HarnessTransferAuthorityRefV1::OperatorIssuance { issuance } => {
+                    issued_launches.get(&run.operation_id).is_some_and(|current| {
+                        current.reference() == *issuance
+                            && current.context_source.as_ref().is_some_and(|source| {
+                                source.source_run_id == continuation.source_run_id
+                            })
+                    })
+                }
+            };
             if continuation.state != HarnessContinuationStateV1::Exported
                 || continuation.operation_id != operation.operation_id
-                || grant_identity != Some((&continuation.grant_id, &continuation.grant_revision))
+                || !authority_matches
             {
                 return Err(HarnessServiceError::InvalidContinuationProof(
                     "scheduled continuation authority does not match exact plan and grant",
@@ -3399,7 +4089,10 @@ fn prepared_scheduled_spawn_dispatch(
         (dispatch::HarnessMcpPolicyV1::GrantBound, Some(reservation))
             if reservation.state == HarnessMcpReservationStateV1::Armed
                 && reservation.operation_id == operation.operation_id
-                && grant_identity == Some((&reservation.grant_id, &reservation.grant_revision)) =>
+                && grant_authority == Some(HarnessTransferAuthorityRefV1::ParentGrant {
+                    grant_id: reservation.grant_id.clone(),
+                    revision: reservation.grant_revision,
+                }) =>
         {
             prepared = prepared.with_harness_mcp(
                 reservation,
@@ -3534,11 +4227,38 @@ impl HarnessService {
         command_digest: HarnessRequestDigest,
         scheduled: Option<HarnessScheduledLaunchRefV1>,
     ) -> Result<(), HarnessServiceError> {
+        self.commit_operator_prepared_with_launch_and_issuance(
+            prepared,
+            command_digest,
+            scheduled,
+            None,
+        )
+    }
+
+    fn commit_operator_prepared_with_launch_and_issuance(
+        &mut self,
+        prepared: PreparedHarnessMutation,
+        command_digest: HarnessRequestDigest,
+        scheduled: Option<HarnessScheduledLaunchRefV1>,
+        issued_launch: Option<HarnessTaskLaunchIssuanceV1>,
+    ) -> Result<(), HarnessServiceError> {
         let mut operator_requests = self.operator_requests.clone();
         operator_requests.insert(prepared.operation().operation_id.clone(), command_digest);
         let mut scheduled_launches = self.scheduled_launches.clone();
         if let Some(scheduled) = scheduled {
             scheduled_launches.insert(prepared.operation().operation_id.clone(), scheduled);
+        }
+        let mut issued_launches = self.issued_launches.clone();
+        if let Some(issuance) = issued_launch {
+            let operation_id = prepared.operation().operation_id.clone();
+            let checkpoint = prepared.checkpoint();
+            let run = prepared.operation().run_id.as_ref()
+                .and_then(|run_id| checkpoint.runs.iter().find(|run| &run.run_id == run_id))
+                .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+            validate_issued_launch_snapshot(&issuance, run)?;
+            if issued_launches.insert(operation_id, issuance).is_some() {
+                return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            }
         }
         let reservations = reconcile_harness_mcp_reservations(
             &prepared,
@@ -3554,6 +4274,7 @@ impl HarnessService {
             harness_mcp_reservations: reservations.values().cloned().collect(),
             operator_requests: operator_request_records(&operator_requests),
             scheduled_launches: scheduled_launches.clone(),
+            issued_launches: issued_launches.clone(),
         };
         let persisted = encode_persisted_state(&checkpoint)?;
         let tail = encode_operation(prepared.operation())?;
@@ -3568,6 +4289,7 @@ impl HarnessService {
         self.harness_mcp_reservations = reservations;
         self.operator_requests = operator_requests;
         self.scheduled_launches = scheduled_launches;
+        self.issued_launches = issued_launches;
         Ok(())
     }
 
@@ -3650,6 +4372,7 @@ impl HarnessService {
             harness_mcp_reservations: reservations.values().cloned().collect(),
             operator_requests: operator_request_records(&self.operator_requests),
             scheduled_launches: self.scheduled_launches.clone(),
+            issued_launches: self.issued_launches.clone(),
         };
         let persisted = encode_persisted_state(&checkpoint)?;
         let tail = encode_operation(prepared.operation())?;
@@ -3692,6 +4415,7 @@ impl HarnessService {
             harness_mcp_reservations: reservations.values().cloned().collect(),
             operator_requests: operator_request_records(&self.operator_requests),
             scheduled_launches: self.scheduled_launches.clone(),
+            issued_launches: self.issued_launches.clone(),
         };
         let persisted = encode_persisted_state(&checkpoint)?;
         let tail = encode_operation(&operation)?;
@@ -3771,6 +4495,282 @@ fn deterministic_execution_spec_id(
         write!(&mut nonce, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(HarnessExecutionSpecId::new(format!("hespec_{nonce}"))?)
+}
+
+pub(crate) fn deterministic_launch_issuance_id(
+    task_id: &HarnessTaskId,
+) -> Result<HarnessTaskLaunchIssuanceId, HarnessServiceError> {
+    task_id.validate()?;
+    let digest = gate4agent_node_wire::local_hmac_sha256(
+        HARNESS_LAUNCH_ISSUANCE_ID_DOMAIN,
+        task_id.as_str().as_bytes(),
+    ).map_err(HarnessServiceError::MutationDigest)?;
+    let mut nonce = String::with_capacity(24);
+    for byte in &digest[..12] {
+        use std::fmt::Write as _;
+        write!(&mut nonce, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(HarnessTaskLaunchIssuanceId::new(format!("hissue_{nonce}"))?)
+}
+
+pub(crate) fn task_launch_policy_digest(
+    options: &HarnessTaskLaunchOptionsV1,
+) -> Result<HarnessRequestDigest, HarnessServiceError> {
+    #[derive(Serialize)]
+    struct CanonicalLaunchPolicy<'a> {
+        task_id: &'a HarnessTaskId,
+        task_revision: HarnessRevision,
+        plans: &'a [gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1],
+        managed_worktree_profiles:
+            Vec<gate4agent_harness_api::HarnessManagedWorktreeProfileOptionV1>,
+        context_sources: Vec<HarnessContextSourceSelectionV1>,
+        delivery_bundles:
+            &'a [gate4agent_harness_protocol::HarnessDeliveryBundleSelectionV1],
+        truncated: bool,
+    }
+
+    let managed_worktree_profiles = options.managed_worktree_profiles.iter()
+        .cloned()
+        .map(|mut profile| {
+            profile.observed_at_unix_ms = 0;
+            profile
+        })
+        .collect();
+    let context_sources = options.context_sources.iter().cloned().map(|mut source| {
+        source.observed_at_unix_ms = 0;
+        source
+    }).collect();
+    let material = CanonicalLaunchPolicy {
+        task_id: &options.task_id,
+        task_revision: options.task_revision,
+        plans: &options.plans,
+        managed_worktree_profiles,
+        context_sources,
+        delivery_bundles: &options.delivery_bundles,
+        truncated: options.truncated,
+    };
+    hmac_request_digest(HARNESS_LAUNCH_POLICY_DIGEST_DOMAIN, &material)
+}
+
+pub(crate) fn context_source_metadata_digest(
+    source: &HarnessContextSourceSelectionV1,
+) -> Result<HarnessRequestDigest, HarnessServiceError> {
+    let mut canonical = source.clone();
+    canonical.metadata_digest = HarnessRequestDigest::new("0".repeat(64))?;
+    canonical.observed_at_unix_ms = 0;
+    hmac_request_digest(HARNESS_CONTEXT_SOURCE_DIGEST_DOMAIN, &canonical)
+}
+
+pub(crate) fn task_launch_issuance_digest(
+    issuance: &HarnessTaskLaunchIssuanceV1,
+) -> Result<HarnessRequestDigest, HarnessServiceError> {
+    let mut canonical = issuance.clone();
+    canonical.digest = HarnessRequestDigest::new("0".repeat(64))?;
+    canonical.validate()?;
+    hmac_request_digest(HARNESS_LAUNCH_ISSUANCE_DIGEST_DOMAIN, &canonical)
+}
+
+fn hmac_request_digest<T: Serialize>(
+    domain: &[u8],
+    material: &T,
+) -> Result<HarnessRequestDigest, HarnessServiceError> {
+    let encoded = serde_json::to_vec(material)?;
+    let digest = gate4agent_node_wire::local_hmac_sha256(domain, &encoded)
+        .map_err(HarnessServiceError::MutationDigest)?;
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(HarnessRequestDigest::new(hex)?)
+}
+
+fn validate_current_launch_options(
+    options: &HarnessTaskLaunchOptionsV1,
+    request: &HarnessReplaceTaskExecutionSpecRequestV2,
+) -> Result<(), HarnessServiceError> {
+    options.validate_for(&request.task_id)
+        .map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
+    if options.truncated
+        || options.task_revision != request.expected_task_revision
+        || options.policy_digest != task_launch_policy_digest(options)?
+        || !options.plans.contains(&request.selection.plan)
+        || request.selection.context_source.as_ref()
+            .is_some_and(|source| !options.context_sources.iter()
+                .any(|current| context_source_semantically_matches(current, source)))
+        || request.selection.delivery.as_ref()
+            .is_some_and(|delivery| !options.delivery_bundles.contains(delivery))
+    {
+        return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+    }
+    match &request.selection.worktree {
+        HarnessReviewedWorktreeSelectionV1::Existing => {}
+        HarnessReviewedWorktreeSelectionV1::Managed { profile } => {
+            if !options.managed_worktree_profiles.iter()
+                .any(|current| managed_profile_semantically_matches(current, profile))
+                || profile.node_id != request.selection.plan.node_id
+                || profile.source_workspace_id != request.selection.plan.source_workspace_id
+            {
+                return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            }
+        }
+    }
+    if let Some(source) = &request.selection.context_source {
+        if source.metadata_digest != context_source_metadata_digest(source)? {
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_issued_launch_options(
+    options: &HarnessTaskLaunchOptionsV1,
+    issuance: &HarnessTaskLaunchIssuanceV1,
+) -> Result<(), HarnessServiceError> {
+    options.validate_for(&issuance.task_id)
+        .map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
+    if options.truncated
+        || options.task_revision != issuance.task_revision
+        || options.policy_digest != task_launch_policy_digest(options)?
+        || options.policy_digest != issuance.policy_digest
+        || !options.plans.iter().any(|plan| {
+            plan.plan == issuance.plan
+                && plan.node_id == issuance.target.node_id
+                && plan.source_workspace_id == issuance.target.source_workspace_id
+                && plan.provider_profile == issuance.target.provider_profile
+                && plan.mode == issuance.target.mode
+        })
+        || issuance.context_source.as_ref()
+            .is_some_and(|source| !options.context_sources.iter()
+                .any(|current| context_source_semantically_matches(current, source)))
+        || issuance.delivery.as_ref()
+            .is_some_and(|delivery| !options.delivery_bundles.contains(delivery))
+    {
+        return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+    }
+    if let HarnessLaunchWorktreeSelectionV1::Managed {
+        profile_id,
+        expected_profile_revision,
+    } = &issuance.target.worktree {
+        if !options.managed_worktree_profiles.iter().any(|profile| {
+            profile.node_id == issuance.target.node_id
+                && profile.source_workspace_id == issuance.target.source_workspace_id
+                && profile.profile_id == *profile_id
+                && profile.profile_revision == *expected_profile_revision
+        }) {
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        }
+    }
+    if let Some(source) = &issuance.context_source {
+        if source.metadata_digest != context_source_metadata_digest(source)? {
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        }
+    }
+    Ok(())
+}
+
+fn managed_profile_semantically_matches(
+    left: &gate4agent_harness_api::HarnessManagedWorktreeProfileOptionV1,
+    right: &gate4agent_harness_api::HarnessManagedWorktreeProfileOptionV1,
+) -> bool {
+    left.node_id == right.node_id
+        && left.node_incarnation == right.node_incarnation
+        && left.source_workspace_id == right.source_workspace_id
+        && left.profile_id == right.profile_id
+        && left.profile_revision == right.profile_revision
+        && left.retention == right.retention
+}
+
+fn context_source_semantically_matches(
+    left: &HarnessContextSourceSelectionV1,
+    right: &HarnessContextSourceSelectionV1,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.observed_at_unix_ms = 0;
+    right.observed_at_unix_ms = 0;
+    left == right
+}
+
+fn source_binding_matches_context_selection(
+    binding: &gate4agent_harness_protocol::HarnessSessionBindingV1,
+    source: &HarnessContextSourceSelectionV1,
+) -> bool {
+    binding.node_id == source.node_id
+        && binding.node_incarnation == source.node_incarnation
+        && binding.workspace_id == source.workspace_id
+        && matches!(
+            &binding.session,
+            HarnessSessionIdentityV1::Managed {
+                record_id,
+                active_session: Some(active),
+            } if record_id == &source.session_record_id
+                && active == &source.active_session
+        )
+}
+
+fn issued_run_intent_matches(
+    issuance: &HarnessTaskLaunchIssuanceV1,
+    run: &HarnessRunV1,
+) -> bool {
+    let worktree_matches = match (&issuance.target.worktree, &run.intent.worktree) {
+        (HarnessLaunchWorktreeSelectionV1::Existing, HarnessWorktreeIntentV1::Existing) => true,
+        (
+            HarnessLaunchWorktreeSelectionV1::Managed {
+                profile_id,
+                expected_profile_revision,
+            },
+            HarnessWorktreeIntentV1::ManagedProfile {
+                profile_id: actual_profile,
+                expected_profile_revision: actual_revision,
+            },
+        ) => profile_id == actual_profile && expected_profile_revision == actual_revision,
+        _ => false,
+    };
+    issuance.task_id == run.task_id
+        && issuance.target.node_id == run.intent.node_id
+        && issuance.target.source_workspace_id == run.intent.workspace_id
+        && issuance.target.provider_profile == run.intent.provider_profile
+        && issuance.target.mode == run.intent.mode
+        && worktree_matches
+        && issuance.delivery.as_ref().map(|selection| &selection.bundle.selector)
+            == run.intent.delivery_bundle.as_ref()
+        && issuance.context_source.as_ref().map(|source| source.source_run_id.as_str())
+            == run.intent.continuation.as_ref().map(|selector| selector.as_str())
+}
+
+fn validate_issued_launch_snapshot(
+    issuance: &HarnessTaskLaunchIssuanceV1,
+    run: &HarnessRunV1,
+) -> Result<(), HarnessServiceError> {
+    issuance.validate()?;
+    if issuance.issuance_id != deterministic_launch_issuance_id(&issuance.task_id)?
+        || issuance.digest != task_launch_issuance_digest(issuance)?
+        || !issued_run_intent_matches(issuance, run)
+    {
+        return Err(HarnessServiceError::ExecutionSpecLaunchMismatch);
+    }
+    Ok(())
+}
+
+fn validate_service_issued_execution_spec(
+    issuance: &HarnessTaskLaunchIssuanceV1,
+    spec: &HarnessTaskExecutionSpecV2,
+) -> Result<(), HarnessServiceError> {
+    issuance.validate()?;
+    spec.validate()?;
+    if issuance.issuance_id != deterministic_launch_issuance_id(&issuance.task_id)?
+        || issuance.digest != task_launch_issuance_digest(issuance)?
+        || spec.execution_spec_id != deterministic_execution_spec_id(&spec.task_id)?
+        || issuance.task_id != spec.task_id
+        || issuance.revision != spec.revision
+        || issuance.reference() != spec.launch_issuance
+        || issuance.created_at_unix_ms != spec.created_at_unix_ms
+        || issuance.updated_at_unix_ms != spec.updated_at_unix_ms
+    {
+        return Err(HarnessServiceError::ExecutionSpecLaunchMismatch);
+    }
+    Ok(())
 }
 
 fn validate_service_execution_spec(
@@ -4253,32 +5253,43 @@ fn validate_context_operation(
 fn validate_authoritative_dispatch_binding(
     engine: &HarnessEngine,
     contexts: &BTreeMap<HarnessOperationId, HarnessDispatchContextV1>,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
     run: &HarnessRunV1,
     operation: &HarnessOperationV1,
 ) -> Result<(), HarnessServiceError> {
-    use gate4agent_harness_protocol::HarnessRunLifecycleV1;
-
     let current = engine.run(&run.run_id)
         .ok_or_else(|| HarnessEngineError::NotFound(run.run_id.to_string()))?;
-    if current.lifecycle != HarnessRunLifecycleV1::Dispatching
-        || run.lifecycle != HarnessRunLifecycleV1::Running
-    {
-        return Ok(());
+    if current != run {
+        return Err(HarnessServiceError::InvalidDispatchContext(
+            "bound run does not match durable engine state",
+        ));
     }
     let context = contexts.get(&operation.operation_id).ok_or(
         HarnessServiceError::InvalidDispatchContext(
-            "running binding has no durable dispatch context",
+            "bound run has no durable dispatch context",
         ),
     )?;
     let binding = run.binding.as_ref().ok_or(
-        HarnessServiceError::InvalidDispatchContext("running binding is missing"),
+        HarnessServiceError::InvalidDispatchContext("bound run binding is missing"),
     )?;
+    let managed_issued = validate_managed_issued_launch(issued_launches, run)?;
+    let workspace_matches = if managed_issued {
+        context.managed_worktree_binding.as_ref().is_some_and(|receipt| {
+            receipt.source_workspace_id == context.workspace_id
+                && receipt.allocated_workspace_id == binding.workspace_id
+                && issued_launches.get(&run.operation_id).is_some_and(|issuance| {
+                    receipt.launch_issuance == issuance.reference()
+                })
+        })
+    } else {
+        binding.workspace_id == context.workspace_id
+    };
     if binding.node_id != context.node_id
-        || binding.workspace_id != context.workspace_id
         || binding.node_incarnation != context.node_incarnation_id
+        || !workspace_matches
     {
         return Err(HarnessServiceError::InvalidDispatchContext(
-            "running binding does not match durable dispatch target",
+            "bound run does not match durable dispatch target",
         ));
     }
     Ok(())
@@ -4287,6 +5298,7 @@ fn validate_authoritative_dispatch_binding(
 fn validate_accepted_spawn_proof(
     engine: &HarnessEngine,
     contexts: &BTreeMap<HarnessOperationId, HarnessDispatchContextV1>,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
     run: &HarnessRunV1,
     operation: &HarnessOperationV1,
     proof: &c2::AcceptedSpawnBindingProof,
@@ -4313,9 +5325,22 @@ fn validate_accepted_spawn_proof(
         SessionMode::Pty => HarnessExecutionModeV1::Pty,
         SessionMode::Inline => HarnessExecutionModeV1::Inline,
     };
+    let managed_accepted = validate_managed_accepted_workspace_authority(
+        issued_launches,
+        run,
+        context,
+        proof,
+    )?;
+    let proof_source_matches = if managed_accepted {
+        proof.managed_worktree().is_some_and(|managed| {
+            managed.source_workspace_id().as_str() == context.workspace_id.as_str()
+        })
+    } else {
+        proof.workspace_id().as_str() == context.workspace_id.as_str()
+    };
     if proof.node_id().as_str() != context.node_id.as_str()
         || proof.incarnation_id().to_string() != context.node_incarnation_id.as_str()
-        || proof.workspace_id().as_str() != context.workspace_id.as_str()
+        || !proof_source_matches
         || proof.provider().as_str() != context.expected_provider.as_str()
         || proof_mode != context.mode
     {
@@ -4371,9 +5396,67 @@ fn validate_accepted_spawn_request_identity<'a>(
     Ok(context)
 }
 
+fn validate_committed_spawn_replay(
+    engine: &HarnessEngine,
+    contexts: &BTreeMap<HarnessOperationId, HarnessDispatchContextV1>,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
+    run: &HarnessRunV1,
+    operation: &HarnessOperationV1,
+    proof: &c2::AcceptedSpawnBindingProof,
+) -> Result<(), HarnessServiceError> {
+    let context = validate_accepted_spawn_request_identity(contexts, operation, proof)?;
+    let managed = validate_managed_accepted_workspace_authority(
+        issued_launches,
+        run,
+        context,
+        proof,
+    )?;
+    let binding = run.binding.as_ref().ok_or(
+        HarnessServiceError::InvalidAcceptedSpawnProof(
+            "committed accepted spawn has no binding",
+        ),
+    )?;
+    let (instance_id, generation) = proof.runtime_identity();
+    let exact_session = matches!(
+        &binding.session,
+        HarnessSessionIdentityV1::Managed {
+            record_id,
+            active_session: Some(active),
+        } if record_id.as_str() == proof.record_id().as_str()
+            && active.instance_id == instance_id
+            && active.generation == generation
+    );
+    let source_matches = if managed {
+        context.managed_worktree_binding.as_ref().is_some_and(|receipt| {
+            proof.managed_worktree().is_some_and(|managed| {
+                receipt.lease_id == *managed.lease_id()
+                    && receipt.allocated_workspace_id.as_str() == proof.workspace_id().as_str()
+                    && receipt.source_workspace_id == context.workspace_id
+            })
+        })
+    } else {
+        context.managed_worktree_binding.is_none()
+            && proof.workspace_id().as_str() == context.workspace_id.as_str()
+    };
+    if engine.run(&run.run_id) != Some(run)
+        || run.lifecycle != HarnessRunLifecycleV1::Running
+        || binding.node_id.as_str() != proof.node_id().as_str()
+        || binding.node_incarnation.as_str() != proof.incarnation_id().to_string()
+        || binding.workspace_id.as_str() != proof.workspace_id().as_str()
+        || !source_matches
+        || !exact_session
+    {
+        return Err(HarnessServiceError::InvalidAcceptedSpawnProof(
+            "committed accepted spawn proof does not match durable binding",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_delivery_accepted_spawn_proof(
     engine: &HarnessEngine,
     contexts: &BTreeMap<HarnessOperationId, HarnessDispatchContextV1>,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
     delivery: &HarnessDeliveryV1,
     run: &HarnessRunV1,
     proof: &c2::AcceptedSpawnBindingProof,
@@ -4394,6 +5477,19 @@ fn validate_delivery_accepted_spawn_proof(
             "accepted spawn has no exact delivery bundle receipt",
         ),
     )?;
+    let managed_accepted = validate_managed_accepted_workspace_authority(
+        issued_launches,
+        run,
+        context,
+        proof,
+    )?;
+    let proof_source_matches = if managed_accepted {
+        proof.managed_worktree().is_some_and(|managed| {
+            managed.source_workspace_id().as_str() == stage.workspace_id.as_str()
+        })
+    } else {
+        proof.workspace_id().as_str() == stage.workspace_id.as_str()
+    };
     let (instance_id, generation) = proof.runtime_identity();
     let session_matches = matches!(
         &binding.session,
@@ -4407,7 +5503,7 @@ fn validate_delivery_accepted_spawn_proof(
     if proof.operation_id() != &delivery.operation_id
         || proof.node_id().as_str() != stage.node_id.as_str()
         || proof.incarnation_id().to_string() != stage.node_incarnation.as_str()
-        || proof.workspace_id().as_str() != stage.workspace_id.as_str()
+        || !proof_source_matches
         || proof_bundle.id.as_str() != delivery.bundle.bundle_id.as_str()
         || proof_bundle.revision.as_str() != delivery.bundle.revision.as_str()
         || proof_bundle.digest.as_str() != delivery.bundle.digest.as_str()
@@ -4416,7 +5512,7 @@ fn validate_delivery_accepted_spawn_proof(
         || context.workspace_id != stage.workspace_id
         || binding.node_id != stage.node_id
         || binding.node_incarnation != stage.node_incarnation
-        || binding.workspace_id != stage.workspace_id
+        || binding.workspace_id.as_str() != proof.workspace_id().as_str()
         || !session_matches
     {
         return Err(HarnessServiceError::InvalidAcceptedSpawnProof(
@@ -4478,6 +5574,7 @@ fn bound_continuation_from_proof(
 fn validate_committed_continuation_replay(
     engine: &HarnessEngine,
     contexts: &BTreeMap<HarnessOperationId, HarnessDispatchContextV1>,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
     run: &HarnessRunV1,
     operation: &HarnessOperationV1,
     continuation_ref: &HarnessContinuationRef,
@@ -4504,6 +5601,12 @@ fn validate_committed_continuation_replay(
             "committed continuation has no ContextPack receipt",
         ),
     )?;
+    let managed_accepted = validate_managed_accepted_workspace_authority(
+        issued_launches,
+        run,
+        context,
+        proof,
+    )?;
     let (instance_id, generation) = proof.runtime_identity();
     let exact_session = matches!(
         &binding.session,
@@ -4521,7 +5624,13 @@ fn validate_committed_continuation_replay(
         || continuation.target_binding.as_ref() != Some(binding)
         || proof.node_id().as_str() != context.node_id.as_str()
         || proof.incarnation_id().to_string() != context.node_incarnation_id.as_str()
-        || proof.workspace_id().as_str() != context.workspace_id.as_str()
+        || if managed_accepted {
+            proof.managed_worktree().is_none_or(|managed| {
+                managed.source_workspace_id().as_str() != context.workspace_id.as_str()
+            })
+        } else {
+            proof.workspace_id().as_str() != context.workspace_id.as_str()
+        }
         || proof.provider().as_str() != context.expected_provider.as_str()
         || &context_receipt_from_node(proof_context)? != expected_context
         || !exact_session
@@ -4531,6 +5640,130 @@ fn validate_committed_continuation_replay(
         ));
     }
     Ok(())
+}
+
+fn validate_managed_issued_launch(
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
+    run: &HarnessRunV1,
+) -> Result<bool, HarnessServiceError> {
+    let HarnessWorktreeIntentV1::ManagedProfile {
+        profile_id,
+        expected_profile_revision,
+    } = &run.intent.worktree else {
+        return Ok(false);
+    };
+    let issuance = issued_launches.get(&run.operation_id).ok_or(
+        HarnessServiceError::InvalidAcceptedSpawnProof(
+            "managed accepted spawn has no run-linked issuance",
+        ),
+    )?;
+    validate_issued_launch_snapshot(issuance, run)?;
+    if !matches!(
+            &issuance.target.worktree,
+            HarnessLaunchWorktreeSelectionV1::Managed {
+                profile_id: issued_profile_id,
+                expected_profile_revision: issued_profile_revision,
+            } if issued_profile_id == profile_id
+                && issued_profile_revision == expected_profile_revision
+        )
+    {
+        return Err(HarnessServiceError::InvalidAcceptedSpawnProof(
+            "managed accepted spawn does not match durable issuance",
+        ));
+    }
+    Ok(true)
+}
+
+fn contexts_with_accepted_spawn_binding(
+    contexts: &BTreeMap<HarnessOperationId, HarnessDispatchContextV1>,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
+    run: &HarnessRunV1,
+    operation: &HarnessOperationV1,
+    proof: &c2::AcceptedSpawnBindingProof,
+) -> Result<BTreeMap<HarnessOperationId, HarnessDispatchContextV1>, HarnessServiceError> {
+    let mut next = contexts.clone();
+    let context = next.get_mut(&operation.operation_id).ok_or(
+        HarnessServiceError::InvalidAcceptedSpawnProof(
+            "accepted spawn has no durable dispatch context",
+        ),
+    )?;
+    let receipt = match proof.managed_worktree() {
+        Some(managed) => {
+            let issuance = issued_launches.get(&run.operation_id).ok_or(
+                HarnessServiceError::InvalidAcceptedSpawnProof(
+                    "managed accepted spawn has no run-linked issuance",
+                ),
+            )?;
+            validate_issued_launch_snapshot(issuance, run)?;
+            Some(HarnessManagedWorktreeBindingReceiptV1 {
+                lease_id: managed.lease_id().clone(),
+                launch_issuance: issuance.reference(),
+                source_workspace_id: HarnessSelectorV1::new(
+                    managed.source_workspace_id().as_str(),
+                )?,
+                allocated_workspace_id: HarnessSelectorV1::new(
+                    managed.allocated_workspace_id().as_str(),
+                )?,
+                profile_id: HarnessSelectorV1::new(managed.profile_id().as_str())?,
+                profile_revision: HarnessSelectorV1::new(
+                    managed.profile_revision().as_str(),
+                )?,
+            })
+        }
+        None => None,
+    };
+    if context.managed_worktree_binding.is_some()
+        && context.managed_worktree_binding != receipt
+    {
+        return Err(HarnessServiceError::InvalidAcceptedSpawnProof(
+            "accepted spawn changed durable managed worktree binding",
+        ));
+    }
+    context.managed_worktree_binding = receipt;
+    context.validate()?;
+    Ok(next)
+}
+
+fn validate_managed_accepted_workspace_authority(
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
+    run: &HarnessRunV1,
+    context: &HarnessDispatchContextV1,
+    proof: &c2::AcceptedSpawnBindingProof,
+) -> Result<bool, HarnessServiceError> {
+    let managed_issued = validate_managed_issued_launch(issued_launches, run)?;
+    match (managed_issued, &run.intent.worktree, proof.managed_worktree()) {
+        (
+            true,
+            HarnessWorktreeIntentV1::ManagedProfile {
+                profile_id,
+                expected_profile_revision,
+            },
+            Some(managed),
+        ) if managed.source_workspace_id().as_str() == run.intent.workspace_id.as_str()
+            && managed.allocated_workspace_id() == proof.workspace_id()
+            && managed.source_workspace_id() != managed.allocated_workspace_id()
+            && managed.profile_id().as_str() == profile_id.as_str()
+            && managed.profile_revision().as_str() == expected_profile_revision.as_str()
+            && context.managed_worktree_binding.as_ref().is_none_or(|receipt| {
+                issued_launches.get(&run.operation_id).is_some_and(|issuance| {
+                    receipt.lease_id == *managed.lease_id()
+                        && receipt.launch_issuance == issuance.reference()
+                        && receipt.source_workspace_id.as_str()
+                            == managed.source_workspace_id().as_str()
+                        && receipt.allocated_workspace_id.as_str()
+                            == managed.allocated_workspace_id().as_str()
+                        && receipt.profile_id.as_str() == managed.profile_id().as_str()
+                        && receipt.profile_revision.as_str()
+                            == managed.profile_revision().as_str()
+                })
+            }) => Ok(true),
+        (false, HarnessWorktreeIntentV1::Existing | HarnessWorktreeIntentV1::Managed { .. }, None) => {
+            Ok(false)
+        }
+        _ => Err(HarnessServiceError::InvalidAcceptedSpawnProof(
+            "accepted spawn worktree does not match sealed durable authority",
+        )),
+    }
 }
 
 fn validate_staged_delivery_proof(
@@ -4638,6 +5871,7 @@ fn context_receipt_from_node(
 
 fn validate_run_dispatch_seam(
     engine: &HarnessEngine,
+    issued_launches: &BTreeMap<HarnessOperationId, HarnessTaskLaunchIssuanceV1>,
     run: &HarnessRunV1,
     context: &HarnessDispatchContextV1,
     spawn_spec: &SpawnSpec,
@@ -4665,22 +5899,40 @@ fn validate_run_dispatch_seam(
             spawn_spec.target.worktree_id.as_ref()
                 .is_some_and(|worktree_id| worktree_id.as_str() == worktree_ref.as_str())
         }
+        gate4agent_harness_protocol::HarnessWorktreeIntentV1::ManagedProfile { .. } => {
+            spawn_spec.target.worktree_id.is_none()
+        }
     };
     let delivery_matches = match &run.intent.delivery_bundle {
         None => engine.delivery_for_run(&run.run_id).is_none()
             && matches!(spawn_spec.overrides.bundle_id, SpawnOverride::Clear),
         Some(selector) => engine.delivery_for_run(&run.run_id).is_some_and(|delivery| {
             let Some(stage) = delivery.stage_receipt.as_ref() else { return false; };
-            let Some(grant) = engine.grant(&delivery.grant_id) else { return false; };
+            let authority_current = match &delivery.authority {
+                HarnessTransferAuthorityRefV1::ParentGrant { grant_id, revision } => {
+                    engine.grant(grant_id).is_some_and(|grant| {
+                        grant.revision == *revision
+                            && grant.allows_delivery_bundle(selector)
+                            && grant.allows_target(
+                                &run.intent.node_id,
+                                &run.intent.workspace_id,
+                                &run.intent.provider_profile,
+                                run.intent.mode,
+                            )
+                    })
+                }
+                HarnessTransferAuthorityRefV1::OperatorIssuance { issuance } => {
+                    issued_launches.get(&run.operation_id).is_some_and(|current| {
+                        current.reference() == *issuance
+                            && current.delivery.as_ref().is_some_and(|selection| {
+                                selection.bundle.selector == *selector
+                                    && selection.bundle == delivery.bundle
+                            })
+                    })
+                }
+            };
             delivery.state == HarnessDeliveryStateV1::Staged
-                && delivery.grant_revision == grant.revision
-                && grant.allows_delivery_bundle(selector)
-                && grant.allows_target(
-                    &run.intent.node_id,
-                    &run.intent.workspace_id,
-                    &run.intent.provider_profile,
-                    run.intent.mode,
-                )
+                && authority_current
                 && delivery.bundle.selector == *selector
                 && stage.bundle == delivery.bundle
                 && stage.node_id == context.node_id
@@ -4701,26 +5953,38 @@ fn validate_run_dispatch_seam(
         (Some(_), SpawnOverride::Set { value }) => engine
             .continuation_for_run(&run.run_id)
             .is_some_and(|continuation| {
-                let Some(grant) = engine.grant(&continuation.grant_id) else {
-                    return false;
+                let authority_current = match &continuation.authority {
+                    HarnessTransferAuthorityRefV1::ParentGrant { grant_id, revision } => {
+                        engine.grant(grant_id).is_some_and(|grant| {
+                            grant.revision == *revision
+                                && grant.state
+                                    == gate4agent_harness_protocol::SessionGrantStateV1::Active
+                                && grant.context_permissions.export
+                                && grant.context_permissions.restore
+                                && grant.actor_run_id == continuation.source_run_id
+                                && run.parent_run_id.as_ref() == Some(&grant.actor_run_id)
+                                && grant.allows_target(
+                                    &run.intent.node_id,
+                                    &run.intent.workspace_id,
+                                    &run.intent.provider_profile,
+                                    run.intent.mode,
+                                )
+                        })
+                    }
+                    HarnessTransferAuthorityRefV1::OperatorIssuance { issuance } => {
+                        issued_launches.get(&run.operation_id).is_some_and(|current| {
+                            current.reference() == *issuance
+                                && current.context_source.as_ref().is_some_and(|source| {
+                                    source.source_run_id == continuation.source_run_id
+                                })
+                        })
+                    }
                 };
                 continuation.state == HarnessContinuationStateV1::Exported
                     && continuation.operation_id == run.operation_id
-                    && continuation.grant_revision == grant.revision
-                    && grant.state
-                        == gate4agent_harness_protocol::SessionGrantStateV1::Active
-                    && grant.context_permissions.export
-                    && grant.context_permissions.restore
-                    && grant.actor_run_id == continuation.source_run_id
-                    && run.parent_run_id.as_ref() == Some(&grant.actor_run_id)
+                    && authority_current
                     && run.intent.continuation_source_run_id().ok().flatten().as_ref()
                         == Some(&continuation.source_run_id)
-                    && grant.allows_target(
-                        &run.intent.node_id,
-                        &run.intent.workspace_id,
-                        &run.intent.provider_profile,
-                        run.intent.mode,
-                    )
                     && continuation.node_id == context.node_id
                     && continuation.node_incarnation == context.node_incarnation_id
                     && continuation.context.as_ref()
@@ -4901,6 +6165,14 @@ pub enum HarnessServiceError {
     },
     #[error("task execution specification launch identity does not match")]
     ExecutionSpecLaunchMismatch,
+    #[error("reviewed task launch selection is stale, truncated, or not in current catalogs")]
+    InvalidTaskLaunchSelection,
+    #[error("issued execution CAS mismatch: expected {expected:?}, spec {spec:?}, issuance {issuance:?}")]
+    IssuedExecutionCasMismatch {
+        expected: HarnessExpectedExecutionSpecRevisionV1,
+        spec: Option<HarnessRevision>,
+        issuance: Option<HarnessRevision>,
+    },
     #[error("selected task is not ready with completed dependencies")]
     TaskNotReady,
     #[error("another durable scheduled dispatch is pending")]
@@ -4929,7 +6201,8 @@ mod tests {
         HarnessIdempotencyRef, HarnessMonitoringVisibilityV1, HarnessOperationKindV1,
         HarnessOperationTimeoutsV1, HarnessReadPermissionsV1,
         HarnessOperationStateV1, HarnessRunId, HarnessRunIntentV1,
-        HarnessRunLifecycleV1, HarnessRunV1, HarnessRuntimeIdentityV1,
+        HarnessResultDispositionV1, HarnessRunLifecycleV1, HarnessRunV1,
+        HarnessRuntimeIdentityV1,
         HarnessReceiptRef, HarnessSessionBindingV1, HarnessSessionIdentityV1, HarnessTaskId,
         HarnessTaskPermissionsV1, HarnessTaskStateV1, HarnessTaskV1,
         HarnessWorktreeIntentV1, SessionGrantId, SessionGrantStateV1, SessionGrantV1,
@@ -4962,6 +6235,98 @@ mod tests {
         ] {
             let _ = fs::remove_file(candidate);
         }
+    }
+
+    fn phase6_context_source(observed_at_unix_ms: u64) -> HarnessContextSourceSelectionV1 {
+        let mut source = HarnessContextSourceSelectionV1 {
+            source_run_id: HarnessRunId::new(format!("hrun_{}", "9".repeat(24))).unwrap(),
+            source_run_revision: HarnessRevision::new(7).unwrap(),
+            observed_at_unix_ms,
+            metadata_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation: HarnessSelectorV1::new("07070707070707070707070707070707")
+                .unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            session_record_id: HarnessSelectorV1::new("record-a").unwrap(),
+            active_session: HarnessRuntimeIdentityV1 {
+                instance_id: 9,
+                generation: 3,
+            },
+            message_count: 11,
+            message_count_exact: true,
+            completed_turn_count: Some(5),
+            total_tokens: Some(1_024),
+        };
+        source.metadata_digest = context_source_metadata_digest(&source).unwrap();
+        source
+    }
+
+    fn phase6_launch_options(observed_at_unix_ms: u64) -> HarnessTaskLaunchOptionsV1 {
+        let mut options = HarnessTaskLaunchOptionsV1 {
+            task_id: HarnessTaskId::new(format!("htask_{}", "8".repeat(24))).unwrap(),
+            task_revision: HarnessRevision::new(4).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans: Vec::new(),
+            managed_worktree_profiles: vec![
+                gate4agent_harness_api::HarnessManagedWorktreeProfileOptionV1 {
+                    node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                    node_incarnation: HarnessSelectorV1::new(
+                        "07070707070707070707070707070707",
+                    ).unwrap(),
+                    source_workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                    profile_id: HarnessSelectorV1::new("review-worktree").unwrap(),
+                    profile_revision: HarnessSelectorV1::new("revision-7").unwrap(),
+                    retention: gate4agent_harness_api::HarnessManagedWorktreeRetentionV1::Retain,
+                    observed_at_unix_ms,
+                },
+            ],
+            context_sources: vec![phase6_context_source(observed_at_unix_ms)],
+            delivery_bundles: Vec::new(),
+            current_issued_spec: None,
+            truncated: false,
+        };
+        options.policy_digest = task_launch_policy_digest(&options).unwrap();
+        options
+    }
+
+    #[test]
+    fn phase6_semantic_digests_ignore_observation_time_but_bind_identity_and_counts() {
+        let first = phase6_launch_options(100);
+        let refreshed = phase6_launch_options(200);
+        assert_eq!(first.policy_digest, refreshed.policy_digest);
+        assert_eq!(
+            first.context_sources[0].metadata_digest,
+            refreshed.context_sources[0].metadata_digest,
+        );
+        assert!(managed_profile_semantically_matches(
+            &first.managed_worktree_profiles[0],
+            &refreshed.managed_worktree_profiles[0],
+        ));
+        assert!(context_source_semantically_matches(
+            &first.context_sources[0],
+            &refreshed.context_sources[0],
+        ));
+
+        let mut changed_count = refreshed.clone();
+        changed_count.context_sources[0].message_count += 1;
+        changed_count.context_sources[0].metadata_digest =
+            context_source_metadata_digest(&changed_count.context_sources[0]).unwrap();
+        changed_count.policy_digest = task_launch_policy_digest(&changed_count).unwrap();
+        assert_ne!(first.policy_digest, changed_count.policy_digest);
+        assert!(!context_source_semantically_matches(
+            &first.context_sources[0],
+            &changed_count.context_sources[0],
+        ));
+
+        let mut changed_profile = refreshed;
+        changed_profile.managed_worktree_profiles[0].profile_revision =
+            HarnessSelectorV1::new("revision-8").unwrap();
+        changed_profile.policy_digest = task_launch_policy_digest(&changed_profile).unwrap();
+        assert_ne!(first.policy_digest, changed_profile.policy_digest);
+        assert!(!managed_profile_semantically_matches(
+            &first.managed_worktree_profiles[0],
+            &changed_profile.managed_worktree_profiles[0],
+        ));
     }
 
     #[cfg(windows)]
@@ -5369,6 +6734,7 @@ mod tests {
             spawn_spec_fingerprint: fingerprint,
             dispatched_at_unix_ms: 13,
             idempotency_ref: operation.idempotency_ref.clone(),
+            managed_worktree_binding: None,
         }
     }
 
@@ -5663,6 +7029,7 @@ mod tests {
             spawn_spec_fingerprint: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
             dispatched_at_unix_ms: 11,
             idempotency_ref: source_operation.idempotency_ref.clone(),
+            managed_worktree_binding: None,
         };
         let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
             version: gate4agent_harness_engine::HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
@@ -5687,8 +7054,10 @@ mod tests {
             )).unwrap(),
             revision: HarnessRevision::new(1).unwrap(),
             state: HarnessContinuationStateV1::Prepared,
-            grant_id,
-            grant_revision: HarnessRevision::new(1).unwrap(),
+            authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id,
+                revision: HarnessRevision::new(1).unwrap(),
+            },
             source_run_id,
             target_run_id: run_id(),
             operation_id: run_operation_id(),
@@ -5767,8 +7136,10 @@ mod tests {
         HarnessDeliveryV1 {
             delivery_ref: delivery_ref(),
             revision: HarnessRevision::new(1).unwrap(),
-            grant_id: SessionGrantId::new(format!("hgrant_{}", "c".repeat(24))).unwrap(),
-            grant_revision: HarnessRevision::new(1).unwrap(),
+            authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: SessionGrantId::new(format!("hgrant_{}", "c".repeat(24))).unwrap(),
+                revision: HarnessRevision::new(1).unwrap(),
+            },
             task_id: task_id(),
             run_id: run_id(),
             operation_id: run_operation_id(),
@@ -5868,6 +7239,368 @@ mod tests {
             reopened.start_task(&catalog, changed_authority),
             Err(HarnessServiceError::OperatorRequestConflict { .. }),
         ));
+        reopened.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn phase6_v2_replace_and_start_are_exact_atomic_and_replay_safe() {
+        let path = database_path("phase6-v2-start");
+        let plan = ordinary_launch_plan("phase6-ordinary");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        let plan_option = gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: plan.plan_ref().unwrap(),
+            node_id: plan.node_id.clone(),
+            source_workspace_id: plan.workspace_id.clone(),
+            provider_profile: plan.provider_profile.clone(),
+            provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+            mode: plan.mode,
+        };
+        let mut options = HarnessTaskLaunchOptionsV1 {
+            task_id: task_id(),
+            task_revision: HarnessRevision::new(1).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans: vec![plan_option.clone()],
+            managed_worktree_profiles: Vec::new(),
+            context_sources: Vec::new(),
+            delivery_bundles: Vec::new(),
+            current_issued_spec: None,
+            truncated: false,
+        };
+        options.policy_digest = task_launch_policy_digest(&options).unwrap();
+        let replace = HarnessReplaceTaskExecutionSpecRequestV2 {
+            authority: operator_authority('2', 20),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                plan: plan_option,
+                worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+                context_source: None,
+                delivery: None,
+                review_policy:
+                    gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        };
+        assert_eq!(
+            service.operator_replace_task_execution_spec_v2(&options, replace.clone()).unwrap(),
+            HarnessApplyOutcome::Applied,
+        );
+        assert_eq!(
+            service.operator_replace_task_execution_spec_v2(&options, replace.clone()).unwrap(),
+            HarnessApplyOutcome::Replayed,
+        );
+        let spec = service.task_execution_spec_v2(&task_id()).unwrap().clone();
+        let start = HarnessStartTaskRequestV2 {
+            authority: operator_authority('3', 30),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: spec.revision,
+            expected_launch_issuance: spec.launch_issuance.clone(),
+        };
+        let first = service.start_task_v2(&catalog, &options, start.clone()).unwrap();
+        assert!(!first.replayed);
+        assert_eq!(first.dispatch.intent.worktree, HarnessWorktreeIntentV1::Existing);
+        assert!(service.engine().delivery_for_run(&first.dispatch.run_id).is_none());
+        assert!(service.engine().continuation_for_run(&first.dispatch.run_id).is_none());
+        let issued_before_rejected_replace = service.engine()
+            .task_launch_issuance(&task_id()).unwrap().clone();
+        let historical_before_rejected_replace = service.issued_launches.clone();
+        let mut replace_after_start = replace;
+        replace_after_start.authority = operator_authority('4', 31);
+        replace_after_start.expected_task_revision = HarnessRevision::new(2).unwrap();
+        replace_after_start.expected_execution_spec_revision =
+            HarnessExpectedExecutionSpecRevisionV1::Exact(spec.revision);
+        assert!(matches!(
+            service.operator_replace_task_execution_spec_v2(
+                &options,
+                replace_after_start,
+            ),
+            Err(HarnessServiceError::InvalidTaskLaunchSelection),
+        ));
+        assert_eq!(
+            service.engine().task_launch_issuance(&task_id()),
+            Some(&issued_before_rejected_replace),
+        );
+        assert_eq!(service.issued_launches, historical_before_rejected_replace);
+        let replay = service.start_task_v2(&catalog, &options, start.clone()).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.dispatch, first.dispatch);
+
+        let mut changed = start;
+        changed.authority.actor_id = HarnessSelectorV1::new("other-operator").unwrap();
+        assert!(matches!(
+            service.start_task_v2(&catalog, &options, changed),
+            Err(HarnessServiceError::OperatorRequestConflict { .. }),
+        ));
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn managed_accepted_spawn_binds_source_context_to_distinct_allocated_workspace() {
+        let path = database_path("managed-accepted-source-allocated");
+        let plan = ordinary_launch_plan("phase6-managed");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        let plan_option = gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: plan.plan_ref().unwrap(),
+            node_id: plan.node_id.clone(),
+            source_workspace_id: plan.workspace_id.clone(),
+            provider_profile: plan.provider_profile.clone(),
+            provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+            mode: plan.mode,
+        };
+        let profile = gate4agent_harness_api::HarnessManagedWorktreeProfileOptionV1 {
+            node_id: plan.node_id.clone(),
+            node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+            source_workspace_id: plan.workspace_id.clone(),
+            profile_id: HarnessSelectorV1::new("review-worktree").unwrap(),
+            profile_revision: HarnessSelectorV1::new("revision-7").unwrap(),
+            retention: gate4agent_harness_api::HarnessManagedWorktreeRetentionV1::Retain,
+            observed_at_unix_ms: 15,
+        };
+        let mut options = HarnessTaskLaunchOptionsV1 {
+            task_id: task_id(),
+            task_revision: HarnessRevision::new(1).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans: vec![plan_option.clone()],
+            managed_worktree_profiles: vec![profile.clone()],
+            context_sources: Vec::new(),
+            delivery_bundles: Vec::new(),
+            current_issued_spec: None,
+            truncated: false,
+        };
+        options.policy_digest = task_launch_policy_digest(&options).unwrap();
+        service.operator_replace_task_execution_spec_v2(
+            &options,
+            HarnessReplaceTaskExecutionSpecRequestV2 {
+                authority: operator_authority('2', 20),
+                task_id: task_id(),
+                expected_task_revision: HarnessRevision::new(1).unwrap(),
+                expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+                selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                    plan: plan_option,
+                    worktree: HarnessReviewedWorktreeSelectionV1::Managed {
+                        profile: profile.clone(),
+                    },
+                    context_source: None,
+                    delivery: None,
+                    review_policy:
+                        gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+                },
+            },
+        ).unwrap();
+        let spec = service.task_execution_spec_v2(&task_id()).unwrap().clone();
+        let started = service.start_task_v2(
+            &catalog,
+            &options,
+            HarnessStartTaskRequestV2 {
+                authority: operator_authority('3', 30),
+                task_id: task_id(),
+                expected_task_revision: HarnessRevision::new(1).unwrap(),
+                expected_execution_spec_revision: spec.revision,
+                expected_launch_issuance: spec.launch_issuance,
+            },
+        ).unwrap();
+        let operation_id = started.dispatch.operation_id.clone();
+        let run_id = started.dispatch.run_id.clone();
+        let mut dispatching_run = service.engine().run(&run_id).unwrap().clone();
+        let mut dispatching_operation = service.engine().operation(&operation_id).unwrap().clone();
+        dispatching_run.revision = HarnessRevision::new(2).unwrap();
+        dispatching_run.lifecycle = HarnessRunLifecycleV1::Dispatching;
+        dispatching_run.updated_at_unix_ms = 31;
+        dispatching_operation.revision = HarnessRevision::new(2).unwrap();
+        dispatching_operation.state = HarnessOperationStateV1::Dispatching;
+        dispatching_operation.dispatched_at_unix_ms = Some(31);
+        dispatching_operation.updated_at_unix_ms = 31;
+        let spawn = spawn_spec("managed accepted proof");
+        let fingerprint = c2::spawn_spec_fingerprint(&spawn).unwrap();
+        let context = HarnessDispatchContextV1 {
+            operation_id: operation_id.clone(),
+            node_id: plan.node_id.clone(),
+            node_incarnation_id: profile.node_incarnation.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            provider_profile: plan.provider_profile.clone(),
+            expected_provider: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+            mode: plan.mode,
+            baseline_record_ids: Vec::new(),
+            spawn_spec_fingerprint: fingerprint.clone(),
+            dispatched_at_unix_ms: 31,
+            idempotency_ref: dispatching_operation.idempotency_ref.clone(),
+            managed_worktree_binding: None,
+        };
+        service.begin_run_dispatch(
+            HarnessRevision::new(1).unwrap(),
+            dispatching_run,
+            HarnessRevision::new(1).unwrap(),
+            dispatching_operation,
+            context,
+            &spawn,
+        ).unwrap();
+
+        let incarnation = NodeIncarnationId::from_bytes([7; 16]);
+        let allocated = WorkspaceId::new("workspace-managed-1").unwrap();
+        let session = SessionAddress {
+            workspace_id: allocated.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(17),
+                generation: SessionGeneration(2),
+            },
+        };
+        let direct_proof = c2::accepted_spawn_binding_proof_for_test(
+            operation_id.clone(),
+            fingerprint,
+            service.engine().operation(&operation_id).unwrap().idempotency_ref.clone(),
+            NodeId::new(plan.node_id.as_str()).unwrap(),
+            incarnation,
+            allocated.clone(),
+            plan.provider.clone(),
+            SessionMode::Pty,
+            SessionRecordId::new("record-managed-1").unwrap(),
+            session.clone(),
+            None,
+            None,
+        );
+        let proof = c2::accepted_managed_spawn_binding_proof_for_test(
+            direct_proof.clone(),
+            ManagedWorktreeLeaseId::new("lease-managed-1").unwrap(),
+            WorkspaceId::new(plan.workspace_id.as_str()).unwrap(),
+            WorktreeProfileId::new(profile.profile_id.as_str()).unwrap(),
+            WorktreeProfileRevision::new(profile.profile_revision.as_str()).unwrap(),
+        );
+        let mut running = service.engine().run(&run_id).unwrap().clone();
+        running.revision = HarnessRevision::new(3).unwrap();
+        running.lifecycle = HarnessRunLifecycleV1::Running;
+        running.binding = Some(HarnessSessionBindingV1 {
+            node_id: plan.node_id.clone(),
+            node_incarnation: profile.node_incarnation.clone(),
+            workspace_id: HarnessSelectorV1::new(allocated.as_str()).unwrap(),
+            session: HarnessSessionIdentityV1::Managed {
+                record_id: HarnessSelectorV1::new("record-managed-1").unwrap(),
+                active_session: Some(HarnessRuntimeIdentityV1 {
+                    instance_id: session.session.instance_id.0,
+                    generation: session.session.generation.0,
+                }),
+            },
+        });
+        running.updated_at_unix_ms = 32;
+        let mut succeeded = service.engine().operation(&operation_id).unwrap().clone();
+        succeeded.revision = HarnessRevision::new(3).unwrap();
+        succeeded.state = HarnessOperationStateV1::Succeeded;
+        succeeded.finished_at_unix_ms = Some(32);
+        succeeded.updated_at_unix_ms = 32;
+
+        let wrong_source = c2::accepted_managed_spawn_binding_proof_for_test(
+            direct_proof.clone(),
+            ManagedWorktreeLeaseId::new("lease-managed-1").unwrap(),
+            WorkspaceId::new("workspace-wrong-source").unwrap(),
+            WorktreeProfileId::new(profile.profile_id.as_str()).unwrap(),
+            WorktreeProfileRevision::new(profile.profile_revision.as_str()).unwrap(),
+        );
+        let wrong_profile = c2::accepted_managed_spawn_binding_proof_for_test(
+            direct_proof,
+            ManagedWorktreeLeaseId::new("lease-managed-1").unwrap(),
+            WorkspaceId::new(plan.workspace_id.as_str()).unwrap(),
+            WorktreeProfileId::new(profile.profile_id.as_str()).unwrap(),
+            WorktreeProfileRevision::new("revision-8").unwrap(),
+        );
+        let before = service.committed_snapshot();
+        for rejected in [&wrong_source, &wrong_profile] {
+            assert!(matches!(
+                service.transition_run_with_accepted_spawn(
+                    HarnessRevision::new(2).unwrap(),
+                    running.clone(),
+                    HarnessRevision::new(2).unwrap(),
+                    succeeded.clone(),
+                    rejected,
+                ),
+                Err(HarnessServiceError::InvalidAcceptedSpawnProof(_)),
+            ));
+            assert_eq!(service.committed_snapshot(), before);
+        }
+        service.transition_run_with_accepted_spawn(
+            HarnessRevision::new(2).unwrap(),
+            running,
+            HarnessRevision::new(2).unwrap(),
+            succeeded,
+            &proof,
+        ).unwrap();
+        assert_eq!(
+            service.engine().run(&run_id).unwrap().binding.as_ref().unwrap().workspace_id.as_str(),
+            allocated.as_str(),
+        );
+        service.close().unwrap();
+
+        let reopened = HarnessService::open(&path).unwrap();
+        let restored_run = reopened.engine().run(&run_id).unwrap();
+        let restored_operation = reopened.engine().operation(&operation_id).unwrap();
+        let restored_context = reopened.dispatch_context(&operation_id).unwrap();
+        assert_eq!(
+            restored_context.managed_worktree_binding.as_ref().unwrap()
+                .allocated_workspace_id.as_str(),
+            allocated.as_str(),
+        );
+        let mut tampered_contexts = reopened.dispatch_contexts.clone();
+        tampered_contexts.get_mut(&operation_id).unwrap()
+            .managed_worktree_binding.as_mut().unwrap().allocated_workspace_id =
+            HarnessSelectorV1::new("workspace-managed-tampered").unwrap();
+        assert!(validate_authoritative_dispatch_binding(
+            reopened.engine(),
+            &tampered_contexts,
+            &reopened.issued_launches,
+            restored_run,
+            restored_operation,
+        ).is_err());
+
+        let historical_issuance = reopened.issued_launches
+            .get(&operation_id).unwrap().clone();
+        let mut later_attempt_checkpoint = reopened.engine().checkpoint();
+        let later_attempt_issuance = later_attempt_checkpoint.issuances
+            .iter_mut().find(|issuance| issuance.task_id == task_id()).unwrap();
+        later_attempt_issuance.revision = HarnessRevision::new(2).unwrap();
+        later_attempt_issuance.updated_at_unix_ms = 40;
+        let HarnessLaunchWorktreeSelectionV1::Managed {
+            expected_profile_revision,
+            ..
+        } = &mut later_attempt_issuance.target.worktree else {
+            panic!("managed fixture lost managed launch selection");
+        };
+        *expected_profile_revision = HarnessSelectorV1::new("revision-8").unwrap();
+        later_attempt_issuance.digest = task_launch_issuance_digest(
+            later_attempt_issuance,
+        ).unwrap();
+        let later_attempt_spec = later_attempt_checkpoint.execution_specs_v2
+            .iter_mut().find(|spec| spec.task_id == task_id()).unwrap();
+        later_attempt_spec.revision = HarnessRevision::new(2).unwrap();
+        later_attempt_spec.launch_issuance = later_attempt_issuance.reference();
+        later_attempt_spec.updated_at_unix_ms = 40;
+        let completed_run = later_attempt_checkpoint.runs
+            .iter_mut().find(|run| run.run_id == run_id).unwrap();
+        completed_run.revision = HarnessRevision::new(4).unwrap();
+        completed_run.lifecycle = HarnessRunLifecycleV1::Completed;
+        completed_run.result_disposition = Some(HarnessResultDispositionV1::Succeeded);
+        completed_run.updated_at_unix_ms = 40;
+        let completed_task = later_attempt_checkpoint.tasks
+            .iter_mut().find(|task| task.task_id == task_id()).unwrap();
+        completed_task.revision = HarnessRevision::new(3).unwrap();
+        completed_task.state = HarnessTaskStateV1::Review;
+        completed_task.updated_at_unix_ms = 40;
+        let later_attempt_engine = HarnessEngine::restore(later_attempt_checkpoint).unwrap();
+        assert_ne!(
+            later_attempt_engine.task_launch_issuance(&task_id()).unwrap().reference(),
+            historical_issuance.reference(),
+        );
+        validate_authoritative_dispatch_binding(
+            &later_attempt_engine,
+            &reopened.dispatch_contexts,
+            &reopened.issued_launches,
+            later_attempt_engine.run(&run_id).unwrap(),
+            later_attempt_engine.operation(&operation_id).unwrap(),
+        ).unwrap();
         reopened.close().unwrap();
         remove_database(&path);
     }
@@ -6180,6 +7913,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         let prepared = prepared_delivery();
@@ -6309,6 +8043,7 @@ mod tests {
                 harness_mcp_reservations: BTreeMap::new(),
                 operator_requests: BTreeMap::new(),
                 scheduled_launches: BTreeMap::new(),
+                issued_launches: BTreeMap::new(),
                 poisoned: false,
             };
             assert_eq!(
@@ -6417,10 +8152,12 @@ mod tests {
             dispatched_at_unix_ms: 25,
             idempotency_ref: engine.operation(&run_operation_id()).unwrap()
                 .idempotency_ref.clone(),
+            managed_worktree_binding: None,
         };
         assert_ne!(source_workspace, context.workspace_id);
         assert!(validate_run_dispatch_seam(
             &engine,
+            &BTreeMap::new(),
             &run,
             &context,
             &spec,
@@ -6437,6 +8174,7 @@ mod tests {
                 HarnessSelectorV1::new(incarnation).unwrap();
             assert!(validate_run_dispatch_seam(
                 &engine,
+                &BTreeMap::new(),
                 &run,
                 &invalid_context,
                 &spec,
@@ -6512,6 +8250,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
 
@@ -6649,6 +8388,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches,
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         assert_eq!(
@@ -6722,8 +8462,10 @@ mod tests {
         checkpoint.deliveries.push(HarnessDeliveryV1 {
             delivery_ref: ids.delivery_ref.clone().unwrap(),
             revision: HarnessRevision::new(2).unwrap(),
-            grant_id: grant.grant_id.clone(),
-            grant_revision: grant.revision,
+            authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: grant.grant_id.clone(),
+                revision: grant.revision,
+            },
             task_id: target_task_id.clone(),
             run_id: run_id(),
             operation_id: run_operation_id(),
@@ -6751,6 +8493,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches,
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         let current_run = service.engine().run(&run_id()).unwrap().clone();
@@ -6780,6 +8523,7 @@ mod tests {
             spawn_spec_fingerprint: fingerprint,
             dispatched_at_unix_ms: 22,
             idempotency_ref: current_operation.idempotency_ref.clone(),
+            managed_worktree_binding: None,
         };
         let mut dispatching_run = current_run.clone();
         dispatching_run.revision = HarnessRevision::new(2).unwrap();
@@ -6938,6 +8682,7 @@ mod tests {
             spawn_spec_fingerprint: fingerprint.clone(),
             dispatched_at_unix_ms: 25,
             idempotency_ref: operation.idempotency_ref.clone(),
+            managed_worktree_binding: None,
         };
         let reservation_id = HarnessMcpReservationId::new(format!(
             "hmcpres_{}", "d".repeat(24),
@@ -6950,6 +8695,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         service.begin_run_dispatch_with_harness_mcp(
@@ -7083,6 +8829,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::from([(run_operation_id(), scheduled)]),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         service.begin_run_dispatch_with_harness_mcp(
@@ -7160,6 +8907,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         let mut run = service.engine().run(&run_id()).unwrap().clone();
@@ -7328,6 +9076,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         service.commit_reservation_only(reservation).unwrap();
@@ -7624,6 +9373,7 @@ mod tests {
                 harness_mcp_reservations: BTreeMap::new(),
                 operator_requests: BTreeMap::new(),
                 scheduled_launches: BTreeMap::new(),
+                issued_launches: BTreeMap::new(),
                 poisoned: false,
             };
             let before = service.engine.checkpoint();
@@ -7643,6 +9393,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         let before = service.engine.checkpoint();
@@ -7657,7 +9408,9 @@ mod tests {
         let path = database_path("continuation-revoke-before-lease");
         let (engine, dispatch_contexts, continuation) = continuation_fixture(true, true);
         let continuation_ref = continuation.continuation_ref.clone();
-        let grant_id = continuation.grant_id.clone();
+        let HarnessTransferAuthorityRefV1::ParentGrant { grant_id, .. } =
+            &continuation.authority else { panic!("parent grant fixture") };
+        let grant_id = grant_id.clone();
         let mut service = HarnessService {
             store: Some(HarnessStore::open(&path).unwrap()),
             engine,
@@ -7665,6 +9418,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         service.prepare_continuation(continuation).unwrap();
@@ -7682,7 +9436,9 @@ mod tests {
         let path = database_path("continuation-lease-before-revoke");
         let (engine, dispatch_contexts, continuation) = continuation_fixture(true, true);
         let continuation_ref = continuation.continuation_ref.clone();
-        let grant_id = continuation.grant_id.clone();
+        let HarnessTransferAuthorityRefV1::ParentGrant { grant_id, .. } =
+            &continuation.authority else { panic!("parent grant fixture") };
+        let grant_id = grant_id.clone();
         let mut service = HarnessService {
             store: Some(HarnessStore::open(&path).unwrap()),
             engine,
@@ -7690,6 +9446,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         service.prepare_continuation(continuation).unwrap();
@@ -7745,6 +9502,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         service.prepare_delivery_from_compiled(
@@ -7796,6 +9554,7 @@ mod tests {
             harness_mcp_reservations: BTreeMap::new(),
             operator_requests: BTreeMap::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
             poisoned: false,
         };
         assert_eq!(
@@ -8077,6 +9836,7 @@ mod tests {
             harness_mcp_reservations: Vec::new(),
             operator_requests: Vec::new(),
             scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
         };
         let persisted = encode_persisted_state(&persisted_checkpoint).unwrap();
         let target_operation = engine.operation(&run_operation_id()).unwrap().clone();
@@ -8116,6 +9876,7 @@ mod tests {
             spawn_spec_fingerprint: fingerprint.clone(),
             dispatched_at_unix_ms: 25,
             idempotency_ref: dispatching_operation.idempotency_ref.clone(),
+            managed_worktree_binding: None,
         };
         let _lease = service.issue_continuation_spawn_lease(
             HarnessRevision::new(2).unwrap(),
@@ -8199,8 +9960,7 @@ mod tests {
         committed_delivery.receipt = Some(HarnessDeliveryReceiptV1 {
             receipt_ref: delivery_receipt_ref,
             delivery_ref: committed_delivery.delivery_ref.clone(),
-            grant_id: committed_delivery.grant_id.clone(),
-            grant_revision: committed_delivery.grant_revision,
+            authority: committed_delivery.authority.clone(),
             task_id: committed_delivery.task_id.clone(),
             run_id: committed_delivery.run_id.clone(),
             operation_id: committed_delivery.operation_id.clone(),

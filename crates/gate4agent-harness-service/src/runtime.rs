@@ -5,7 +5,10 @@ use crate::{
         ContextPackExportStart, ExportContextPackOutcome, HarnessC2Adapter,
         HarnessC2Error, HarnessC2EventReceiver,
         HarnessObservationResync, PendingNativeHistoryRequest, PendingRunRead,
-        PreparedRunRead, RunReadCompletion,
+        PendingRunContextSourceObservation, PreparedRunContextSourceObservation,
+        PreparedRunRead, RunContextSourceObservationCompletion,
+        RunContextSourceProjection, RunReadCompletion,
+        ManagedWorktreeSpawnDispatchOutcome, PendingManagedWorktreeSpawnDispatch,
         SpawnDispatchOutcome, SpawnProfileRevisionProof,
         StagedDeliveryProof,
     },
@@ -15,6 +18,7 @@ use crate::{
         execute_read, verify_observation_credential_binding,
     },
     HarnessApplyOutcome, HarnessMutationV1, HarnessService, HarnessServiceError,
+    PreparedScheduledSpawnLease,
 };
 use crate::dispatch::{
     deterministic_dispatch_ids, deterministic_lifecycle_authority_ids,
@@ -40,7 +44,10 @@ use gate4agent_harness_api::{
     HarnessOperatorIntentV1,
     HarnessOperatorMutationOutcomeV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
     HarnessOperatorResponseV1, HarnessReadCredential, HarnessReadEnvelopeV1,
+    HarnessIssuedExecutionSpecSummaryV1, HarnessManagedWorktreeProfileOptionV1,
+    HarnessManagedWorktreeRetentionV1, HarnessOrdinaryLaunchPlanOptionV1,
     HarnessRunContextTransferV1, HarnessRunContinuationTransferV1,
+    HarnessRunContextSourceObservationV1,
     HarnessRunCorrelationAvailabilityV1, HarnessRunCorrelationV1,
     HarnessRunDeliveryTransferV1, HarnessRunTransferSummaryV1,
     HarnessRunSessionViewV1, HarnessRunWorktreeViewV1,
@@ -50,6 +57,11 @@ use gate4agent_harness_api::{
     HarnessRuntimeSessionBindingV1, HarnessRuntimeSessionStatusV1,
     HarnessRuntimeSessionV1, HarnessRuntimeTerminalSizeV1,
     HarnessRuntimeTransportV1, HarnessRuntimeWorkspaceV1,
+    HarnessTaskLaunchOptionsV1,
+    HarnessReverseAttributionBindingV1, HarnessReverseAttributionLinkV1,
+    HarnessReverseAttributionOutcomeV1, HarnessReverseAttributionRelationV1,
+    HarnessReverseAttributionSubjectV1, HarnessReverseAttributionV1,
+    FeatureObservationStateV1, ProjectionAvailabilityV1, ProjectionFreshnessV1,
     HarnessReadHostErrorV1, HarnessReadReplyV1, RedactedBindingStateV1,
     RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1, RedactedWorktreeIntentV1,
     RunPageV1, TaskCreatorCategoryV1, TaskPageV1,
@@ -65,6 +77,7 @@ use gate4agent_harness_protocol::{
     HarnessOutcomeUnknownReasonV1, HarnessResultDispositionV1, HarnessRevision,
     HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskStateV1,
     HarnessRuntimeIdentityV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
+    HarnessContextSourceSelectionV1, HarnessRequestDigest,
     HarnessWorktreeIntentV1,
 };
 use gate4agent_node_wire::{local_hmac_sha256, proofs_match};
@@ -96,6 +109,7 @@ const HOST_CONNECTION_LIMIT: usize = 32;
 const HOST_DEADLINE: Duration = Duration::from_secs(3);
 const HOST_NATIVE_HISTORY_RESPONSE_DEADLINE: Duration = Duration::from_secs(40);
 const HOST_RUN_READ_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
+const HOST_RUN_CONTEXT_SOURCE_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
 const HOST_CONNECTION_DEADLINE: Duration = Duration::from_secs(45);
 const OBSERVATION_RECOVERY_RETRY: Duration = Duration::from_secs(1);
 const OBSERVATION_RECOVERY_MAX_IN_FLIGHT: usize = 8;
@@ -107,6 +121,9 @@ const HARNESS_MCP_GENERAL_NETWORK_WORKERS_MAX: usize =
     HARNESS_MCP_NETWORK_WORKERS_MAX - 1;
 const NATIVE_HISTORY_WORKERS_MAX: usize = 8;
 const RUN_READ_WORKERS_MAX: usize = 8;
+const RUN_CONTEXT_SOURCE_WORKERS_MAX: usize = 8;
+const RUN_CONTEXT_SOURCE_PERSISTENCE_WAIT: Duration = Duration::from_millis(1_500);
+const RUN_CONTEXT_SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const OPERATOR_CREDENTIAL_DIGEST_DOMAIN: &[u8] = b"gate4agent-harness-operator-credential-digest-v1";
 const OPERATOR_INTENT_OPERATION_ID_DOMAIN: &[u8] =
     b"gate4agent-harness-operator-intent-operation-id-v1";
@@ -279,6 +296,10 @@ enum HostCommand {
         completion: RunReadCompletion,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
     },
+    RunContextSourceFinished {
+        completion: RunContextSourceObservationCompletion,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), HarnessRuntimeError>>,
     },
@@ -439,6 +460,18 @@ struct RunReadWorkerRegistry {
     in_flight: usize,
 }
 
+#[derive(Default)]
+struct RunContextSourceWorkerRegistry {
+    in_flight: usize,
+}
+
+struct PendingRunContextSourceReply {
+    prepared: PreparedRunContextSourceObservation,
+    projection: RunContextSourceProjection,
+    deadline: Instant,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+}
+
 impl NativeHistoryWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= NATIVE_HISTORY_WORKERS_MAX { return false; }
@@ -454,6 +487,18 @@ impl NativeHistoryWorkerRegistry {
 impl RunReadWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= RUN_READ_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl RunContextSourceWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= RUN_CONTEXT_SOURCE_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -568,9 +613,14 @@ enum CoordinatorDispatchPhase {
 enum CoordinatorPreflightStart {
     Spawn {
         route: NodeRoute,
-        pending: crate::c2::PendingSpawnDispatch,
+        pending: PendingCoordinatorSpawn,
     },
     HarnessMcpArm,
+}
+
+enum PendingCoordinatorSpawn {
+    Direct(crate::c2::PendingSpawnDispatch),
+    Managed(PendingManagedWorktreeSpawnDispatch),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -597,13 +647,11 @@ fn next_runtime_revision(revision: HarnessRevision) -> Result<HarnessRevision, H
 
 fn specialized_spawn_spec(
     harness: &HarnessService,
-    plan: &crate::dispatch::HarnessLaunchPlanV1,
+    _plan: &crate::dispatch::HarnessLaunchPlanV1,
     run_id: &gate4agent_harness_protocol::HarnessRunId,
     mut spec: gate4agent_node_protocol::SpawnSpec,
 ) -> Result<gate4agent_node_protocol::SpawnSpec, HarnessRuntimeError> {
-    if plan.delivery.is_some() {
-        let delivery = harness.engine().delivery_for_run(run_id)
-            .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+    if let Some(delivery) = harness.engine().delivery_for_run(run_id) {
         let stage = delivery.stage_receipt.as_ref()
             .ok_or(HarnessRuntimeError::DispatchPreparation)?;
         spec.overrides.bundle_id = gate4agent_node_protocol::SpawnOverride::Set {
@@ -611,9 +659,7 @@ fn specialized_spawn_spec(
                 .map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
         };
     }
-    if plan.continuation == crate::dispatch::HarnessContinuationPolicyV1::ParentRun {
-        let continuation = harness.engine().continuation_for_run(run_id)
-            .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+    if let Some(continuation) = harness.engine().continuation_for_run(run_id) {
         let context = continuation.context.as_ref()
             .ok_or(HarnessRuntimeError::DispatchPreparation)?;
         spec.overrides.context_id = gate4agent_node_protocol::SpawnOverride::Set {
@@ -1224,6 +1270,61 @@ fn start_run_read_worker(
     });
 }
 
+fn start_run_context_source_worker(
+    pending: PendingRunContextSourceObservation,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+) {
+    tokio::spawn(async move {
+        let completion = pending.finish().await;
+        let _ = commands.send(HostCommand::RunContextSourceFinished {
+            completion,
+            reply,
+        }).await;
+    });
+}
+
+fn map_run_context_source_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::RunContextSourceEnqueue(
+            gate4agent_c2_client::C2ControlError::QueueFull,
+        ) => HarnessOperatorHostErrorV1::Busy,
+        HarnessC2Error::RunContextSourceEnqueue(_)
+        | HarnessC2Error::RunContextSourceTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::RunContextSourceRouteMismatch => {
+            HarnessOperatorHostErrorV1::Conflict
+        }
+        HarnessC2Error::RunContextSourceDeadline => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::RunContextSourceRejected { code } => match code {
+            NodeFailureCode::ControllerBusy
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            NodeFailureCode::UnknownSessionRecord => HarnessOperatorHostErrorV1::NotFound,
+            NodeFailureCode::BindingMismatch
+            | NodeFailureCode::SessionRecordConflict
+            | NodeFailureCode::StaleGeneration => HarnessOperatorHostErrorV1::Conflict,
+            NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        HarnessC2Error::RunContextSourceUnbound
+        | HarnessC2Error::RunContextSourceUnsupportedBinding => {
+            HarnessOperatorHostErrorV1::Conflict
+        }
+        HarnessC2Error::InvalidRunContextSourceBinding
+        | HarnessC2Error::RunContextSourceCorrelationMismatch
+        | HarnessC2Error::RunContextSourceProjection => HarnessOperatorHostErrorV1::Internal,
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
 fn map_run_read_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidRunReadRequest => HarnessOperatorHostErrorV1::InvalidRequest,
@@ -1339,13 +1440,28 @@ fn is_run_read_request(request: &HarnessOperatorRequestV1) -> bool {
     )
 }
 
+fn is_run_context_source_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(request, HarnessOperatorRequestV1::ObserveRunContextSource { .. })
+}
+
 fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
     if is_native_history_request(request) {
         HOST_NATIVE_HISTORY_RESPONSE_DEADLINE
+    } else if is_run_context_source_request(request) {
+        HOST_RUN_CONTEXT_SOURCE_RESPONSE_DEADLINE
     } else if is_run_read_request(request) {
         HOST_RUN_READ_RESPONSE_DEADLINE
     } else {
         HOST_DEADLINE
+    }
+}
+
+fn run_context_source_run_id(
+    request: &HarnessOperatorRequestV1,
+) -> Option<&gate4agent_harness_protocol::HarnessRunId> {
+    match request {
+        HarnessOperatorRequestV1::ObserveRunContextSource { run_id } => Some(run_id),
+        _ => None,
     }
 }
 
@@ -1368,6 +1484,243 @@ fn validate_run_read_completion_origin(
         return Err(HarnessOperatorHostErrorV1::Conflict);
     }
     Ok(())
+}
+
+fn unobserved_run_context_source(
+    run: &gate4agent_harness_protocol::HarnessRunV1,
+    feature_state: FeatureObservationStateV1,
+) -> HarnessRunContextSourceObservationV1 {
+    HarnessRunContextSourceObservationV1 {
+        run_id: run.run_id.clone(),
+        run_revision: run.revision,
+        feature_state,
+        message_count: 0,
+        message_count_exact: false,
+        completed_turn_count: None,
+        total_tokens: None,
+        observed_at_unix_ms: None,
+    }
+}
+
+fn exact_context_source_record<'a>(
+    runtime_inventory: &'a HarnessRuntimeInventoryCache,
+    prepared: &PreparedRunContextSourceObservation,
+) -> Result<&'a HarnessRuntimeManagedSessionV1, HarnessOperatorHostErrorV1> {
+    let node = runtime_inventory.nodes.get(&prepared.route().node_id)
+        .ok_or(HarnessOperatorHostErrorV1::Unavailable)?;
+    if node.incarnation_id != prepared.route().expected_incarnation_id.to_string() {
+        return Err(HarnessOperatorHostErrorV1::Conflict);
+    }
+    let mut records = node.inventory.managed_sessions.iter().filter(|record| {
+        record.record_id == prepared.record_id().as_str()
+            && record.workspace_id == prepared.binding().workspace_id.as_str()
+    });
+    let record = records.next().ok_or(HarnessOperatorHostErrorV1::Conflict)?;
+    if records.next().is_some() {
+        return Err(HarnessOperatorHostErrorV1::Conflict);
+    }
+    let HarnessSessionIdentityV1::Managed { active_session, .. } =
+        &prepared.binding().session
+    else {
+        return Err(HarnessOperatorHostErrorV1::Conflict);
+    };
+    let active_matches = match (active_session, record.active_binding.as_ref()) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            actual.workspace_id == prepared.binding().workspace_id.as_str()
+                && actual.instance_id == expected.instance_id
+                && actual.generation == expected.generation
+        }
+        _ => false,
+    };
+    if !active_matches {
+        return Err(HarnessOperatorHostErrorV1::Conflict);
+    }
+    Ok(record)
+}
+
+fn prepare_run_context_source_observation(
+    run: &gate4agent_harness_protocol::HarnessRunV1,
+    observation: &ObservationService,
+    support: &ObservationSupportRegistry,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+) -> Result<
+    Result<PreparedRunContextSourceObservation, HarnessRunContextSourceObservationV1>,
+    HarnessOperatorHostErrorV1,
+> {
+    let mut prepared = PreparedRunContextSourceObservation::from_run(run)
+        .map_err(map_run_context_source_error)?;
+    let record = exact_context_source_record(runtime_inventory, &prepared)?;
+    let route_support = support.get(
+        &prepared.route().node_id,
+        prepared.route().expected_incarnation_id,
+    );
+    if !support.is_authoritative(
+        &prepared.route().node_id,
+        prepared.route().expected_incarnation_id,
+    ) {
+        return Err(HarnessOperatorHostErrorV1::Unavailable);
+    }
+    if !record.provider_identity_present
+        || !route_support.flatten().is_some_and(|support| {
+            support.events && support.managed_target
+        })
+    {
+        return Ok(Err(unobserved_run_context_source(
+            run,
+            FeatureObservationStateV1::NotSupportedByObservedSources,
+        )));
+    }
+    let eligible = run.lifecycle == HarnessRunLifecycleV1::Running
+        && matches!(
+            &prepared.binding().session,
+            HarnessSessionIdentityV1::Managed { active_session: Some(_), .. }
+        )
+        && record.state == HarnessRuntimeManagedStateV1::Live;
+    if !eligible {
+        return Ok(Err(unobserved_run_context_source(
+            run,
+            FeatureObservationStateV1::SupportedNotObserved,
+        )));
+    }
+    prepared.set_observed_after_sequence(
+        durable_cursor_for(observation, prepared.route()).unwrap_or(0),
+    );
+    Ok(Ok(prepared))
+}
+
+fn latest_matching_context_source_observed_at(
+    observation: &ObservationService,
+    prepared: &PreparedRunContextSourceObservation,
+    projection: &RunContextSourceProjection,
+) -> Result<Option<u64>, HarnessOperatorHostErrorV1> {
+    let RunContextSourceProjection::Aggregate {
+        message_count,
+        completed_turn_count,
+        total_tokens,
+    } = projection else {
+        return Ok(None);
+    };
+    let node_id = gate4agent_observation_api::NodeId::new(
+        prepared.route().node_id.as_str(),
+    ).map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+    let record_id = gate4agent_observation_api::SessionRecordId::new(
+        prepared.record_id().as_str(),
+    ).map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+    let target = ObservationTarget::Managed { key: ManagedSessionKey {
+        node_id,
+        incarnation_id: prepared.route().expected_incarnation_id,
+        record_id,
+    } };
+    let Some(session) = observation.projection(&target) else { return Ok(None); };
+    Ok(session.timeline.iter().rev().find_map(|entry| {
+        if entry.cursor.sequence <= prepared.observed_after_sequence() {
+            return None;
+        }
+        match &entry.kind {
+            gate4agent_observation_protocol::ObservationKindV1::HistorySnapshot {
+                message_count: observed_messages,
+                message_count_exact,
+                completed_turn_count: observed_turns,
+                total_tokens: observed_tokens,
+            } if observed_messages == message_count
+                && *message_count_exact
+                && observed_turns == completed_turn_count
+                && observed_tokens == total_tokens => Some(entry.received_at_ms),
+            _ => None,
+        }
+    }))
+}
+
+fn evaluate_pending_run_context_source(
+    harness: &HarnessService,
+    observation: &mut ObservationService,
+    support: &ObservationSupportRegistry,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    pending: &PendingRunContextSourceReply,
+) -> Result<Option<HarnessRunContextSourceObservationV1>, HarnessOperatorHostErrorV1> {
+    let current = harness.engine().run(pending.prepared.run_id())
+        .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
+    if current.binding.as_ref() != Some(pending.prepared.binding()) {
+        return Err(HarnessOperatorHostErrorV1::Conflict);
+    }
+    let observed_at_unix_ms = latest_matching_context_source_observed_at(
+        observation,
+        &pending.prepared,
+        &pending.projection,
+    )?;
+    let Some(observed_at_unix_ms) = observed_at_unix_ms else { return Ok(None); };
+    let Some(source) = context_source_option(
+        harness,
+        observation,
+        support,
+        runtime_inventory,
+        current,
+    )? else {
+        return Ok(None);
+    };
+    let RunContextSourceProjection::Aggregate {
+        message_count,
+        completed_turn_count,
+        total_tokens,
+    } = &pending.projection else {
+        return Ok(None);
+    };
+    if source.message_count != *message_count
+        || !source.message_count_exact
+        || source.completed_turn_count != *completed_turn_count
+        || source.total_tokens != *total_tokens
+    {
+        return Ok(None);
+    }
+    observation.flush().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+    Ok(Some(HarnessRunContextSourceObservationV1 {
+        run_id: current.run_id.clone(),
+        run_revision: current.revision,
+        feature_state: FeatureObservationStateV1::Observed,
+        message_count: *message_count,
+        message_count_exact: true,
+        completed_turn_count: *completed_turn_count,
+        total_tokens: *total_tokens,
+        observed_at_unix_ms: Some(observed_at_unix_ms),
+    }))
+}
+
+fn poll_pending_run_context_sources(
+    harness: &HarnessService,
+    observation: &mut ObservationService,
+    support: &ObservationSupportRegistry,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    pending: &mut Vec<PendingRunContextSourceReply>,
+) {
+    let now = Instant::now();
+    let mut waiting = Vec::with_capacity(pending.len());
+    for item in pending.drain(..) {
+        let result = evaluate_pending_run_context_source(
+            harness,
+            observation,
+            support,
+            runtime_inventory,
+            &item,
+        );
+        match result {
+            Ok(Some(observation)) => {
+                let _ = item.reply.send(HarnessOperatorReplyV1::Ok {
+                    response: HarnessOperatorResponseV1::RunContextSourceObserved(observation),
+                });
+            }
+            Ok(None) if now >= item.deadline => {
+                let _ = item.reply.send(HarnessOperatorReplyV1::Error {
+                    error: HarnessOperatorHostErrorV1::Unavailable,
+                });
+            }
+            Err(error) => {
+                let _ = item.reply.send(HarnessOperatorReplyV1::Error { error });
+            }
+            Ok(None) => waiting.push(item),
+        }
+    }
+    *pending = waiting;
 }
 
 fn start_delivery_stage_finish(
@@ -1509,25 +1862,29 @@ fn start_or_resume_dispatch_job(
     let plan = catalogs.launch.resolve_scheduled(scheduled)
         .map_err(|_| HarnessRuntimeError::DispatchPreparation)?
         .clone();
-    if plan.is_ordinary_dispatch() {
+    let has_delivery = harness.engine().delivery_for_run(&intent.run_id).is_some();
+    let has_continuation = harness.engine().continuation_for_run(&intent.run_id).is_some();
+    if plan.is_ordinary_dispatch() && !has_delivery && !has_continuation {
         start_dispatch_preflight(adapter, commands, intent.clone())?;
         return Ok(Some(ActiveDispatchJob::new(
             intent.operation_id,
             CoordinatorDispatchPhase::Preflight,
         )));
     }
-    harness.prepare_scheduled_specialized_authorities(
-        &catalogs.launch,
-        &catalogs.delivery,
-        &intent.operation_id,
-        unix_time_ms(),
-    )?;
-    if let Some(policy) = &plan.delivery {
-        let delivery = harness.engine().delivery_for_run(&intent.run_id)
-            .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+    if !has_delivery && !has_continuation {
+        harness.prepare_scheduled_specialized_authorities(
+            &catalogs.launch,
+            &catalogs.delivery,
+            &intent.operation_id,
+            unix_time_ms(),
+        )?;
+    }
+    if let Some(delivery) = harness.engine().delivery_for_run(&intent.run_id) {
         if delivery_needs_staging(delivery.state)? {
             let delivery_ref = delivery.delivery_ref.clone();
-            let compiled = catalogs.delivery.get(&policy.bundle_id)
+            let bundle_id = SpawnBundleId::new(delivery.bundle.bundle_id.as_str())
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+            let compiled = catalogs.delivery.get(&bundle_id)
                 .ok_or(HarnessRuntimeError::DispatchPreparation)?
                 .clone();
             let node_id = NodeId::new(intent.intent.node_id.as_str())
@@ -1551,10 +1908,7 @@ fn start_or_resume_dispatch_job(
             )));
         }
     }
-    if plan.continuation == crate::dispatch::HarnessContinuationPolicyV1::ParentRun {
-        let continuation = harness.engine().continuation_for_run(&intent.run_id)
-            .ok_or(HarnessRuntimeError::DispatchPreparation)?
-            .clone();
+    if let Some(continuation) = harness.engine().continuation_for_run(&intent.run_id).cloned() {
         match continuation_resume_action(continuation.state) {
             ContinuationResumeAction::BeginExport => {
                 let prepared = harness.begin_continuation_export(
@@ -1714,22 +2068,38 @@ fn start_dispatch_finish(
     commands: mpsc::Sender<HostCommand>,
     operation_id: HarnessOperationId,
     route: NodeRoute,
-    pending: crate::c2::PendingSpawnDispatch,
+    pending: PendingCoordinatorSpawn,
 ) {
     tokio::spawn(async move {
-        let result = match pending.finish().await {
-            Ok(SpawnDispatchOutcome::Accepted(accepted)) => {
-                match adapter.resolve_accepted_receipt(&route, &accepted).await {
-                    Ok(proof) => CoordinatorSpawnResult::Accepted(proof),
-                    Err(_) => CoordinatorSpawnResult::OutcomeUnknown,
+        let result = match pending {
+            PendingCoordinatorSpawn::Direct(pending) => match pending.finish().await {
+                Ok(SpawnDispatchOutcome::Accepted(accepted)) => {
+                    match adapter.resolve_accepted_receipt(&route, &accepted).await {
+                        Ok(proof) => CoordinatorSpawnResult::Accepted(proof),
+                        Err(_) => CoordinatorSpawnResult::OutcomeUnknown,
+                    }
                 }
-            }
-            Ok(SpawnDispatchOutcome::Rejected { code }) => {
-                CoordinatorSpawnResult::Rejected(code)
-            }
-            Ok(SpawnDispatchOutcome::OutcomeUnknown { .. }) | Err(_) => {
-                CoordinatorSpawnResult::OutcomeUnknown
-            }
+                Ok(SpawnDispatchOutcome::Rejected { code }) => {
+                    CoordinatorSpawnResult::Rejected(code)
+                }
+                Ok(SpawnDispatchOutcome::OutcomeUnknown { .. }) | Err(_) => {
+                    CoordinatorSpawnResult::OutcomeUnknown
+                }
+            },
+            PendingCoordinatorSpawn::Managed(pending) => match pending.finish().await {
+                Ok(ManagedWorktreeSpawnDispatchOutcome::Accepted(accepted)) => {
+                    match adapter.resolve_managed_accepted_receipt(&route, &accepted).await {
+                        Ok(proof) => CoordinatorSpawnResult::Accepted(proof),
+                        Err(_) => CoordinatorSpawnResult::OutcomeUnknown,
+                    }
+                }
+                Ok(ManagedWorktreeSpawnDispatchOutcome::Rejected { code }) => {
+                    CoordinatorSpawnResult::Rejected(code)
+                }
+                Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown { .. }) | Err(_) => {
+                    CoordinatorSpawnResult::OutcomeUnknown
+                }
+            },
         };
         let _ = commands.send(HostCommand::DispatchFinished { operation_id, result }).await;
     });
@@ -1828,6 +2198,8 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut harness_mcp_workers = HarnessMcpWorkerRegistry::default();
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
+        let mut run_context_source_workers = RunContextSourceWorkerRegistry::default();
+        let mut pending_run_context_sources = Vec::new();
         let (harness_mcp_rejects, harness_mcp_reject_rx) = mpsc::channel(
             MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE,
         );
@@ -1877,6 +2249,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
             OBSERVATION_RECOVERY_RETRY,
         );
         recovery_retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut run_context_source_poll = interval_at(
+            Instant::now() + RUN_CONTEXT_SOURCE_POLL_INTERVAL,
+            RUN_CONTEXT_SOURCE_POLL_INTERVAL,
+        );
+        run_context_source_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut observation_recovery = ObservationRecoveryRegistry::default();
         loop {
             tokio::select! {
@@ -1936,6 +2313,59 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             let _ = reply.send(reply_value);
                         }
                         Some(HostCommand::Operator { request, reply }) => {
+                            if is_run_context_source_request(&request) {
+                                let prepared = run_context_source_run_id(&request)
+                                    .ok_or(HarnessOperatorHostErrorV1::InvalidRequest)
+                                    .and_then(|run_id| {
+                                        harness.engine().run(run_id).cloned()
+                                            .ok_or(HarnessOperatorHostErrorV1::NotFound)
+                                    })
+                                    .and_then(|run| {
+                                        prepare_run_context_source_observation(
+                                            &run,
+                                            &observation,
+                                            &support,
+                                            &runtime_inventory,
+                                        )
+                                    });
+                                let prepared = match prepared {
+                                    Ok(Ok(prepared)) => prepared,
+                                    Ok(Err(observation)) => {
+                                        let _ = reply.send(HarnessOperatorReplyV1::Ok {
+                                            response: HarnessOperatorResponseV1::RunContextSourceObserved(
+                                                observation,
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error { error });
+                                        continue;
+                                    }
+                                };
+                                if !run_context_source_workers.try_start() {
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_run_context_source_observation(
+                                    prepared,
+                                ) {
+                                    Ok(pending) => start_run_context_source_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                    ),
+                                    Err(error) => {
+                                        run_context_source_workers.finish();
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_run_context_source_error(error),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
                             if is_run_read_request(&request) {
                                 let prepared = run_read_run_id(&request)
                                     .ok_or(HarnessOperatorHostErrorV1::InvalidRequest)
@@ -2002,6 +2432,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 &observation,
                                 &support,
                                 &catalogs.launch,
+                                &catalogs.delivery,
                                 &runtime_inventory,
                                 request,
                             );
@@ -2143,8 +2574,19 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
                             let plan = catalogs.launch.resolve_scheduled(&scheduled)
                                 .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                            let issued_dispatch = (
+                                matches!(intent.intent.worktree, HarnessWorktreeIntentV1::ManagedProfile { .. })
+                                    || harness.engine().delivery_for_run(&intent.run_id).is_some()
+                                    || harness.engine().continuation_for_run(&intent.run_id).is_some()
+                            ).then(|| {
+                                    let mut ordinary = intent.clone();
+                                    ordinary.intent.worktree = HarnessWorktreeIntentV1::Existing;
+                                    ordinary.intent.delivery_bundle = None;
+                                    ordinary.intent.continuation = None;
+                                    ordinary
+                                });
                             let spec = plan.spawn_spec(
-                                &intent,
+                                issued_dispatch.as_ref().unwrap_or(&intent),
                                 &task,
                                 profile.revision().clone(),
                             )
@@ -2179,6 +2621,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 spawn_spec_fingerprint: fingerprint,
                                 dispatched_at_unix_ms: now,
                                 idempotency_ref: intent.idempotency_ref.clone(),
+                                managed_worktree_binding: None,
                             };
                             let mut dispatching_run = run.clone();
                             dispatching_run.revision = next_runtime_revision(run.revision)?;
@@ -2250,7 +2693,21 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     context,
                                     spec,
                                 )?;
-                                let pending = adapter.start_prepared_spawn(prepared, profile)?;
+                                let pending = match prepared {
+                                    PreparedScheduledSpawnLease::Direct(prepared) => {
+                                        PendingCoordinatorSpawn::Direct(
+                                            adapter.start_prepared_spawn(prepared, profile)?,
+                                        )
+                                    }
+                                    PreparedScheduledSpawnLease::Managed(prepared) => {
+                                        PendingCoordinatorSpawn::Managed(
+                                            adapter.start_prepared_managed_worktree_spawn(
+                                                prepared,
+                                                profile,
+                                            )?,
+                                        )
+                                    }
+                                };
                                 Ok(CoordinatorPreflightStart::Spawn { route, pending })
                             }
                             })();
@@ -2461,7 +2918,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                             unix_time_ms(),
                                             spec,
                                         )?;
-                                        Ok(adapter.start_prepared_spawn(prepared, profile)?)
+                                        Ok(PendingCoordinatorSpawn::Direct(
+                                            adapter.start_prepared_spawn(prepared, profile)?,
+                                        ))
                                     })();
                                     match pending {
                                         Ok(pending) => {
@@ -2730,6 +3189,55 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             };
                             let _ = reply.send(reply_value);
                         }
+                        Some(HostCommand::RunContextSourceFinished { completion, reply }) => {
+                            run_context_source_workers.finish();
+                            let (prepared, result) = completion.into_parts();
+                            let current = harness.engine().run(prepared.run_id());
+                            let origin = match current {
+                                None => Err(HarnessOperatorHostErrorV1::NotFound),
+                                Some(run) if run.binding.as_ref() != Some(prepared.binding()) => {
+                                    Err(HarnessOperatorHostErrorV1::Conflict)
+                                }
+                                Some(run) => Ok(run),
+                            };
+                            match (origin, result) {
+                                (Err(error), _) => {
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error { error });
+                                }
+                                (_, Err(error)) => {
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: map_run_context_source_error(error),
+                                    });
+                                }
+                                (Ok(run), Ok(RunContextSourceProjection::SupportedNotObserved)) => {
+                                    let observation = unobserved_run_context_source(
+                                        run,
+                                        FeatureObservationStateV1::SupportedNotObserved,
+                                    );
+                                    let _ = reply.send(HarnessOperatorReplyV1::Ok {
+                                        response: HarnessOperatorResponseV1::RunContextSourceObserved(
+                                            observation,
+                                        ),
+                                    });
+                                }
+                                (Ok(_), Ok(projection)) => {
+                                    pending_run_context_sources.push(PendingRunContextSourceReply {
+                                        prepared,
+                                        projection,
+                                        deadline: Instant::now()
+                                            + RUN_CONTEXT_SOURCE_PERSISTENCE_WAIT,
+                                        reply,
+                                    });
+                                    poll_pending_run_context_sources(
+                                        &harness,
+                                        &mut observation,
+                                        &support,
+                                        &runtime_inventory,
+                                        &mut pending_run_context_sources,
+                                    );
+                                }
+                            }
+                        }
                         Some(HostCommand::NativeHistoryWorkerFinished) => {
                             native_history_workers.finish();
                         }
@@ -2823,6 +3331,15 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             topology_open = false;
                         }
                     }
+                }
+                _ = run_context_source_poll.tick(), if !pending_run_context_sources.is_empty() => {
+                    poll_pending_run_context_sources(
+                        &harness,
+                        &mut observation,
+                        &support,
+                        &runtime_inventory,
+                        &mut pending_run_context_sources,
+                    );
                 }
                 _ = recovery_retry.tick() => {
                     let routes = adapter.observation_routes();
@@ -3422,11 +3939,79 @@ impl HarnessOperatorCredentialAuthority {
 #[derive(Default)]
 pub(crate) struct HarnessRuntimeInventoryCache {
     nodes: BTreeMap<NodeId, HarnessRuntimeNodeInventoryV1>,
+    managed_worktree_profiles: BTreeMap<NodeId, ManagedWorktreeProfileOptionsCache>,
+}
+
+#[derive(Default)]
+struct ManagedWorktreeProfileOptionsCache {
+    node_incarnation: String,
+    profiles: Vec<HarnessManagedWorktreeProfileOptionV1>,
+    truncated: bool,
 }
 
 impl HarnessRuntimeInventoryCache {
     fn refresh(&mut self, resync: &HarnessObservationResync, observed_at_unix_ms: u64) {
         let route = resync.route();
+        let mut profiles = Vec::new();
+        for workspace in &resync.snapshot().workspaces {
+            let Some(inventory) = &workspace.managed_worktree_profiles else { continue; };
+            for profile in &inventory.profiles {
+                let projected = (|| {
+                    Some(HarnessManagedWorktreeProfileOptionV1 {
+                        node_id: HarnessSelectorV1::new(route.node_id.as_str()).ok()?,
+                        node_incarnation: HarnessSelectorV1::new(
+                            route.expected_incarnation_id.to_string(),
+                        ).ok()?,
+                        source_workspace_id: HarnessSelectorV1::new(
+                            workspace.workspace_id.as_str(),
+                        ).ok()?,
+                        profile_id: HarnessSelectorV1::new(profile.id.as_str()).ok()?,
+                        profile_revision: HarnessSelectorV1::new(
+                            profile.revision.as_str(),
+                        ).ok()?,
+                        retention: match profile.retention {
+                            gate4agent_node_protocol::ManagedWorktreeRetention::RemoveWhenReleased => {
+                                HarnessManagedWorktreeRetentionV1::RemoveWhenReleased
+                            }
+                            gate4agent_node_protocol::ManagedWorktreeRetention::Retain => {
+                                HarnessManagedWorktreeRetentionV1::Retain
+                            }
+                        },
+                        observed_at_unix_ms,
+                    })
+                })();
+                if let Some(projected) = projected { profiles.push(projected); }
+            }
+        }
+        profiles.sort_by(|left, right| {
+            (
+                &left.node_id,
+                &left.source_workspace_id,
+                &left.profile_id,
+                &left.profile_revision,
+            ).cmp(&(
+                &right.node_id,
+                &right.source_workspace_id,
+                &right.profile_id,
+                &right.profile_revision,
+            ))
+        });
+        profiles.dedup_by(|left, right| {
+            left.node_id == right.node_id
+                && left.source_workspace_id == right.source_workspace_id
+                && left.profile_id == right.profile_id
+                && left.profile_revision == right.profile_revision
+        });
+        let truncated = profiles.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+        profiles.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
+        self.managed_worktree_profiles.insert(
+            route.node_id.clone(),
+            ManagedWorktreeProfileOptionsCache {
+                node_incarnation: route.expected_incarnation_id.to_string(),
+                profiles,
+                truncated,
+            },
+        );
         self.nodes.insert(route.node_id.clone(), HarnessRuntimeNodeInventoryV1 {
             node_id: route.node_id.as_str().to_owned(),
             incarnation_id: route.expected_incarnation_id.to_string(),
@@ -3445,6 +4030,12 @@ impl HarnessRuntimeInventoryCache {
                     && route.expected_incarnation_id.to_string() == inventory.incarnation_id
             })
         });
+        self.managed_worktree_profiles.retain(|node_id, profiles| {
+            routes.iter().any(|route| {
+                &route.node_id == node_id
+                    && profiles.node_incarnation == route.expected_incarnation_id.to_string()
+            })
+        });
     }
 
     fn invalidate(&mut self, route: &NodeRoute) {
@@ -3452,6 +4043,7 @@ impl HarnessRuntimeInventoryCache {
             inventory.incarnation_id == route.expected_incarnation_id.to_string()
         }) {
             self.nodes.remove(&route.node_id);
+            self.managed_worktree_profiles.remove(&route.node_id);
         }
     }
 
@@ -3647,6 +4239,11 @@ fn project_run_correlation(
                 worktree_ref: worktree_ref.clone(),
             }
         }
+        HarnessWorktreeIntentV1::ManagedProfile { .. } => {
+            HarnessRunWorktreeViewV1::Managed {
+                worktree_ref: binding.workspace_id.clone(),
+            }
+        }
     };
     let session = match &binding.session {
         HarnessSessionIdentityV1::Managed { record_id, active_session } => {
@@ -3832,11 +4429,192 @@ fn authorize_operator_intent(
     Ok(request)
 }
 
+fn task_launch_options(
+    harness: &HarnessService,
+    observation: &ObservationService,
+    support: &ObservationSupportRegistry,
+    launch_catalog: &HarnessLaunchCatalog,
+    delivery_catalog: &DeliveryCatalogV2,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    task_id: &gate4agent_harness_protocol::HarnessTaskId,
+) -> Result<HarnessTaskLaunchOptionsV1, HarnessOperatorHostErrorV1> {
+    let task = harness.engine().task(task_id)
+        .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
+    let mut plans = launch_catalog.ordinary_plans()
+        .filter(|plan| matches!(plan.worktree, HarnessWorktreeIntentV1::Existing))
+        .map(|plan| {
+            Ok(HarnessOrdinaryLaunchPlanOptionV1 {
+                plan: plan.plan_ref()?,
+                node_id: plan.node_id.clone(),
+                source_workspace_id: plan.workspace_id.clone(),
+                provider_profile: plan.provider_profile.clone(),
+                provider_id: HarnessSelectorV1::new(plan.provider.as_str())?,
+                mode: plan.mode,
+            })
+        })
+        .collect::<Result<Vec<_>, HarnessServiceError>>()
+        .map_err(map_operator_service_error)?;
+    let mut truncated = plans.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+    plans.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
+
+    let mut managed_worktree_profiles = runtime_inventory.managed_worktree_profiles.values()
+        .flat_map(|cache| cache.profiles.iter())
+        .filter(|profile| plans.iter().any(|plan| {
+            plan.node_id == profile.node_id
+                && plan.source_workspace_id == profile.source_workspace_id
+        }))
+        .cloned()
+        .collect::<Vec<_>>();
+    managed_worktree_profiles.sort_by(|left, right| {
+        (
+            &left.node_id,
+            &left.source_workspace_id,
+            &left.profile_id,
+            &left.profile_revision,
+        ).cmp(&(
+            &right.node_id,
+            &right.source_workspace_id,
+            &right.profile_id,
+            &right.profile_revision,
+        ))
+    });
+    managed_worktree_profiles.dedup_by(|left, right| {
+        left.node_id == right.node_id
+            && left.source_workspace_id == right.source_workspace_id
+            && left.profile_id == right.profile_id
+            && left.profile_revision == right.profile_revision
+    });
+    truncated |= managed_worktree_profiles.len()
+        > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+    truncated |= runtime_inventory.managed_worktree_profiles.values()
+        .any(|cache| cache.truncated);
+    managed_worktree_profiles.truncate(
+        gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX,
+    );
+
+    let mut context_sources = Vec::new();
+    for run in harness.engine().runs() {
+        if let Some(source) = context_source_option(
+            harness,
+            observation,
+            support,
+            runtime_inventory,
+            run,
+        )? {
+            context_sources.push(source);
+        }
+    }
+    context_sources.sort_by(|left, right| {
+        (&left.source_run_id, left.source_run_revision)
+            .cmp(&(&right.source_run_id, right.source_run_revision))
+    });
+    truncated |= context_sources.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+    context_sources.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
+
+    let mut delivery_bundles = delivery_catalog.iter().map(|(bundle_id, compiled)| {
+        let selector = HarnessSelectorV1::new(bundle_id.as_str())?;
+        crate::delivery::compiled_bundle_selection(selector, compiled)
+    }).collect::<Result<Vec<_>, HarnessServiceError>>()
+        .map_err(map_operator_service_error)?;
+    truncated |= delivery_bundles.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+    delivery_bundles.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
+
+    let current_issued_spec = harness.engine().task_execution_spec_v2(task_id).map(|spec| {
+        HarnessIssuedExecutionSpecSummaryV1 {
+            task_id: spec.task_id.clone(),
+            execution_spec_id: spec.execution_spec_id.clone(),
+            revision: spec.revision,
+            launch_issuance: spec.launch_issuance.clone(),
+            review_policy: spec.review_policy,
+            created_at_unix_ms: spec.created_at_unix_ms,
+            updated_at_unix_ms: spec.updated_at_unix_ms,
+        }
+    });
+    let mut options = HarnessTaskLaunchOptionsV1 {
+        task_id: task.task_id.clone(),
+        task_revision: task.revision,
+        policy_digest: HarnessRequestDigest::new("0".repeat(64))
+            .map_err(|_| HarnessOperatorHostErrorV1::Internal)?,
+        plans,
+        managed_worktree_profiles,
+        context_sources,
+        delivery_bundles,
+        current_issued_spec,
+        truncated,
+    };
+    options.policy_digest = crate::task_launch_policy_digest(&options)
+        .map_err(map_operator_service_error)?;
+    options.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+    Ok(options)
+}
+
+fn context_source_option(
+    harness: &HarnessService,
+    observation: &ObservationService,
+    support: &ObservationSupportRegistry,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    run: &gate4agent_harness_protocol::HarnessRunV1,
+) -> Result<Option<HarnessContextSourceSelectionV1>, HarnessOperatorHostErrorV1> {
+    if run.lifecycle != HarnessRunLifecycleV1::Running { return Ok(None); }
+    let Some(binding) = &run.binding else { return Ok(None); };
+    let HarnessSessionIdentityV1::Managed {
+        record_id,
+        active_session: Some(active_session),
+    } = &binding.session else { return Ok(None); };
+    let Some(node) = runtime_inventory.nodes.values().find(|node| {
+        node.node_id == binding.node_id.as_str()
+            && node.incarnation_id == binding.node_incarnation.as_str()
+    }) else { return Ok(None); };
+    let Some(_record) = node.inventory.managed_sessions.iter().find(|record| {
+        record.record_id == record_id.as_str()
+            && record.workspace_id == binding.workspace_id.as_str()
+            && record.active_binding.as_ref().is_some_and(|active| {
+                active.workspace_id == binding.workspace_id.as_str()
+                    && active.instance_id == active_session.instance_id
+                    && active.generation == active_session.generation
+            })
+    }) else { return Ok(None); };
+    let monitor = match execute_operator_monitor(harness, observation, support, &run.run_id) {
+        Ok(monitor) => monitor,
+        Err(_) => return Ok(None),
+    };
+    if monitor.availability != ProjectionAvailabilityV1::Current
+        || monitor.freshness != ProjectionFreshnessV1::Live
+        || monitor.transport_incomplete
+        || monitor.features.history != FeatureObservationStateV1::Observed
+    {
+        return Ok(None);
+    }
+    let Some(history) = monitor.history else { return Ok(None); };
+    if history.message_count == 0 || !history.message_count_exact { return Ok(None); }
+    let mut source = HarnessContextSourceSelectionV1 {
+        source_run_id: run.run_id.clone(),
+        source_run_revision: run.revision,
+        observed_at_unix_ms: node.observed_at_unix_ms,
+        metadata_digest: HarnessRequestDigest::new("0".repeat(64))
+            .map_err(|_| HarnessOperatorHostErrorV1::Internal)?,
+        node_id: binding.node_id.clone(),
+        node_incarnation: binding.node_incarnation.clone(),
+        workspace_id: binding.workspace_id.clone(),
+        session_record_id: record_id.clone(),
+        active_session: active_session.clone(),
+        message_count: history.message_count,
+        message_count_exact: history.message_count_exact,
+        completed_turn_count: history.completed_turn_count,
+        total_tokens: history.total_tokens,
+    };
+    source.metadata_digest = crate::context_source_metadata_digest(&source)
+        .map_err(map_operator_service_error)?;
+    source.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+    Ok(Some(source))
+}
+
 fn execute_operator_request(
     harness: &mut HarnessService,
     observation: &ObservationService,
     support: &ObservationSupportRegistry,
     launch_catalog: &HarnessLaunchCatalog,
+    delivery_catalog: &DeliveryCatalogV2,
     runtime_inventory: &HarnessRuntimeInventoryCache,
     request: HarnessOperatorRequestV1,
 ) -> Result<HarnessOperatorResponseV1, HarnessOperatorHostErrorV1> {
@@ -3924,6 +4702,11 @@ fn execute_operator_request(
                 project_operator_run_transfer(harness, &run_id)?,
             )
         }
+        HarnessOperatorRequestV1::ReverseAttributionGet { subject } => {
+            HarnessOperatorResponseV1::ReverseAttribution(
+                project_reverse_attribution(harness, subject)?,
+            )
+        }
         HarnessOperatorRequestV1::LaunchPlansList { after_plan_id, limit } => {
             let mut plans = launch_catalog.ordinary_plans()
                 .filter(|plan| {
@@ -3959,6 +4742,17 @@ fn execute_operator_request(
                 harness.task_execution_spec(&task_id).cloned(),
             )
         }
+        HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id } => {
+            HarnessOperatorResponseV1::TaskLaunchOptions(task_launch_options(
+                harness,
+                observation,
+                support,
+                launch_catalog,
+                delivery_catalog,
+                runtime_inventory,
+                &task_id,
+            )?)
+        }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
             HarnessOperatorResponseV1::RuntimeInventory(
                 runtime_inventory.page(after_node_id.as_deref(), limit),
@@ -3967,6 +4761,7 @@ fn execute_operator_request(
         HarnessOperatorRequestV1::CatalogNativeSessions { .. }
         | HarnessOperatorRequestV1::PageNativeSessions { .. }
         | HarnessOperatorRequestV1::PreviewNativeSession { .. }
+        | HarnessOperatorRequestV1::ObserveRunContextSource { .. }
         | HarnessOperatorRequestV1::InspectRunWorkspace { .. }
         | HarnessOperatorRequestV1::ReadRunWorkspaceFile { .. }
         | HarnessOperatorRequestV1::ReadRunGitHistory { .. }
@@ -4013,10 +4808,144 @@ fn execute_operator_request(
                     .map_err(map_operator_service_error)?,
             )
         }
+        HarnessOperatorRequestV1::ReplaceTaskExecutionSpecV2 { request } => {
+            let options = task_launch_options(
+                harness,
+                observation,
+                support,
+                launch_catalog,
+                delivery_catalog,
+                runtime_inventory,
+                &request.task_id,
+            )?;
+            let outcome = harness.operator_replace_task_execution_spec_v2(
+                &options,
+                request,
+            ).map_err(map_operator_service_error)?;
+            HarnessOperatorResponseV1::ExecutionSpecMutation(match outcome {
+                HarnessApplyOutcome::Applied => HarnessOperatorMutationOutcomeV1::Applied,
+                HarnessApplyOutcome::Replayed => HarnessOperatorMutationOutcomeV1::Replayed,
+            })
+        }
+        HarnessOperatorRequestV1::StartTaskV2 { request } => {
+            let options = task_launch_options(
+                harness,
+                observation,
+                support,
+                launch_catalog,
+                delivery_catalog,
+                runtime_inventory,
+                &request.task_id,
+            )?;
+            HarnessOperatorResponseV1::TaskStarted(
+                harness.start_task_v2(launch_catalog, &options, request)
+                    .map_err(map_operator_service_error)?,
+            )
+        }
         HarnessOperatorRequestV1::SubmitIntent { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
     };
+    response.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+    Ok(response)
+}
+
+fn project_reverse_attribution(
+    harness: &HarnessService,
+    subject: HarnessReverseAttributionSubjectV1,
+) -> Result<HarnessReverseAttributionV1, HarnessOperatorHostErrorV1> {
+    let requested_workspace = match &subject {
+        HarnessReverseAttributionSubjectV1::ManagedRecord { workspace, .. }
+        | HarnessReverseAttributionSubjectV1::RuntimeSession { workspace, .. }
+        | HarnessReverseAttributionSubjectV1::Workspace { workspace }
+        | HarnessReverseAttributionSubjectV1::FileScope { workspace, .. }
+        | HarnessReverseAttributionSubjectV1::CommitScope { workspace, .. } => workspace,
+    };
+    let mut links = Vec::new();
+    for run in harness.engine().runs() {
+        run.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+        let task = harness.engine().task(&run.task_id)
+            .filter(|task| task.run_ids.binary_search(&run.run_id).is_ok())
+            .ok_or(HarnessOperatorHostErrorV1::Internal)?;
+        let Some(binding) = &run.binding else { continue; };
+        binding.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+        if binding.node_id != requested_workspace.node_id
+            || binding.node_incarnation.as_str()
+                != requested_workspace.node_incarnation_id.as_str()
+            || binding.workspace_id != requested_workspace.workspace_id
+        {
+            continue;
+        }
+        let projected = match (&subject, &binding.session) {
+            (
+                HarnessReverseAttributionSubjectV1::ManagedRecord { record_id, .. },
+                HarnessSessionIdentityV1::Managed {
+                    record_id: bound_record_id,
+                    active_session,
+                },
+            ) if bound_record_id == record_id => Some((
+                HarnessReverseAttributionBindingV1::ManagedRecord {
+                    workspace: requested_workspace.clone(),
+                    record_id: bound_record_id.clone(),
+                    active_instance_id: active_session.as_ref().map(|active| active.instance_id),
+                    active_generation: active_session.as_ref().map(|active| active.generation),
+                },
+                HarnessReverseAttributionRelationV1::ManagedRecordBinding,
+            )),
+            (
+                HarnessReverseAttributionSubjectV1::RuntimeSession {
+                    instance_id,
+                    generation,
+                    ..
+                },
+                HarnessSessionIdentityV1::Managed {
+                    active_session: Some(active),
+                    ..
+                },
+            ) if active.instance_id == *instance_id && active.generation == *generation => Some((
+                HarnessReverseAttributionBindingV1::RuntimeSession {
+                    workspace: requested_workspace.clone(),
+                    instance_id: active.instance_id,
+                    generation: active.generation,
+                },
+                HarnessReverseAttributionRelationV1::RuntimeSessionBinding,
+            )),
+            (HarnessReverseAttributionSubjectV1::Workspace { .. }, _) => Some((
+                HarnessReverseAttributionBindingV1::Workspace {
+                    workspace: requested_workspace.clone(),
+                },
+                HarnessReverseAttributionRelationV1::WorkspaceBinding,
+            )),
+            (
+                HarnessReverseAttributionSubjectV1::FileScope { .. }
+                    | HarnessReverseAttributionSubjectV1::CommitScope { .. },
+                _,
+            ) => Some((
+                HarnessReverseAttributionBindingV1::Workspace {
+                    workspace: requested_workspace.clone(),
+                },
+                HarnessReverseAttributionRelationV1::WorkspaceScope,
+            )),
+            _ => None,
+        };
+        let Some((binding, relation)) = projected else { continue; };
+        links.push(HarnessReverseAttributionLinkV1 {
+            task_id: task.task_id.clone(),
+            run_id: run.run_id.clone(),
+            run_revision: run.revision,
+            binding,
+            relation,
+        });
+    }
+    links.sort();
+    links.dedup();
+    links.truncate(gate4agent_harness_api::HARNESS_REVERSE_ATTRIBUTION_LINKS_MAX);
+    let outcome = if links.is_empty() {
+        HarnessReverseAttributionOutcomeV1::Unattributed
+    } else {
+        HarnessReverseAttributionOutcomeV1::Attributed
+    };
+    let response = HarnessReverseAttributionV1 { subject, outcome, links };
     response.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
     Ok(response)
 }
@@ -4035,6 +4964,9 @@ fn map_operator_service_error(error: HarnessServiceError) -> HarnessOperatorHost
     match error {
         HarnessServiceError::Validation(_) => HarnessOperatorHostErrorV1::InvalidRequest,
         HarnessServiceError::DispatchPolicy(_) => HarnessOperatorHostErrorV1::InvalidRequest,
+        HarnessServiceError::InvalidTaskLaunchSelection => {
+            HarnessOperatorHostErrorV1::Conflict
+        }
         HarnessServiceError::Engine(gate4agent_harness_engine::HarnessEngineError::NotFound(_)) => {
             HarnessOperatorHostErrorV1::NotFound
         }
@@ -4108,7 +5040,10 @@ fn redact_operator_run(
             mode: run.intent.mode,
             worktree: match run.intent.worktree {
                 HarnessWorktreeIntentV1::Existing => RedactedWorktreeIntentV1::Existing,
-                HarnessWorktreeIntentV1::Managed { .. } => RedactedWorktreeIntentV1::Managed,
+                HarnessWorktreeIntentV1::Managed { .. }
+                | HarnessWorktreeIntentV1::ManagedProfile { .. } => {
+                    RedactedWorktreeIntentV1::Managed
+                }
             },
             has_delivery_bundle: run.intent.delivery_bundle.is_some(),
             has_continuation: run.intent.continuation.is_some(),
@@ -5612,6 +6547,124 @@ mod tests {
         (harness, task_id, run_id, route)
     }
 
+    #[test]
+    fn reverse_attribution_reopens_with_exact_incarnation_and_rejects_false_attribution() {
+        let (harness, task_id, run_id, route) = running_harness_fixture();
+        let workspace = gate4agent_harness_api::HarnessReverseAttributionWorkspaceV1 {
+            node_id: selector(route.node_id.as_str()),
+            node_incarnation_id: HarnessNodeIncarnationV1::new(
+                route.expected_incarnation_id.to_string(),
+            ).unwrap(),
+            workspace_id: selector("workspace-a"),
+        };
+        let reopened = HarnessService::from_engine_for_test(
+            HarnessEngine::restore(harness.engine().checkpoint()).unwrap(),
+        );
+
+        for current in [&harness, &reopened] {
+            let managed = project_reverse_attribution(
+                current,
+                HarnessReverseAttributionSubjectV1::ManagedRecord {
+                    workspace: workspace.clone(),
+                    record_id: selector("record-a"),
+                },
+            ).unwrap();
+            assert_eq!(managed.outcome, HarnessReverseAttributionOutcomeV1::Attributed);
+            assert_eq!(managed.links.len(), 1);
+            assert_eq!(managed.links[0].task_id, task_id);
+            assert_eq!(managed.links[0].run_id, run_id);
+            assert_eq!(
+                managed.links[0].relation,
+                HarnessReverseAttributionRelationV1::ManagedRecordBinding,
+            );
+            assert_eq!(
+                managed.links[0].binding,
+                HarnessReverseAttributionBindingV1::ManagedRecord {
+                    workspace: workspace.clone(),
+                    record_id: selector("record-a"),
+                    active_instance_id: Some(7),
+                    active_generation: Some(3),
+                },
+            );
+
+            let runtime = project_reverse_attribution(
+                current,
+                HarnessReverseAttributionSubjectV1::RuntimeSession {
+                    workspace: workspace.clone(),
+                    instance_id: 7,
+                    generation: 3,
+                },
+            ).unwrap();
+            assert_eq!(runtime.outcome, HarnessReverseAttributionOutcomeV1::Attributed);
+            assert_eq!(runtime.links.len(), 1);
+            assert_eq!(
+                runtime.links[0].relation,
+                HarnessReverseAttributionRelationV1::RuntimeSessionBinding,
+            );
+
+            let workspace_attribution = project_reverse_attribution(
+                current,
+                HarnessReverseAttributionSubjectV1::Workspace {
+                    workspace: workspace.clone(),
+                },
+            ).unwrap();
+            assert_eq!(
+                workspace_attribution.links[0].relation,
+                HarnessReverseAttributionRelationV1::WorkspaceBinding,
+            );
+            for subject in [
+                HarnessReverseAttributionSubjectV1::FileScope {
+                    workspace: workspace.clone(),
+                    relative_path: gate4agent_harness_api::HarnessRepositoryPathV1::new(
+                        "src/lib.rs",
+                    ).unwrap(),
+                },
+                HarnessReverseAttributionSubjectV1::CommitScope {
+                    workspace: workspace.clone(),
+                    object_id: gate4agent_harness_api::HarnessGitObjectIdV1::new(
+                        "a".repeat(40),
+                    ).unwrap(),
+                },
+            ] {
+                let scoped = project_reverse_attribution(current, subject).unwrap();
+                assert_eq!(scoped.outcome, HarnessReverseAttributionOutcomeV1::Attributed);
+                assert_eq!(scoped.links.len(), 1);
+                assert_eq!(
+                    scoped.links[0].relation,
+                    HarnessReverseAttributionRelationV1::WorkspaceScope,
+                );
+            }
+        }
+
+        let wrong_incarnation = gate4agent_harness_api::HarnessReverseAttributionWorkspaceV1 {
+            node_incarnation_id: HarnessNodeIncarnationV1::new(
+                NodeIncarnationId::from_bytes([8; 16]).to_string(),
+            ).unwrap(),
+            ..workspace.clone()
+        };
+        for subject in [
+            HarnessReverseAttributionSubjectV1::ManagedRecord {
+                workspace: workspace.clone(),
+                record_id: selector("record-b"),
+            },
+            HarnessReverseAttributionSubjectV1::RuntimeSession {
+                workspace: workspace.clone(),
+                instance_id: 7,
+                generation: 4,
+            },
+            HarnessReverseAttributionSubjectV1::Workspace {
+                workspace: wrong_incarnation,
+            },
+        ] {
+            let unattributed = project_reverse_attribution(&reopened, subject).unwrap();
+            assert_eq!(
+                unattributed.outcome,
+                HarnessReverseAttributionOutcomeV1::Unattributed,
+            );
+            assert!(unattributed.links.is_empty());
+        }
+    }
+
     fn lifecycle_event(
         sequence: u64,
         kind: C2ControlEventKind,
@@ -5727,6 +6780,173 @@ mod tests {
     }
 
     #[test]
+    fn run_context_source_worker_is_bounded_and_rejected_failures_are_typed() {
+        let mut workers = RunContextSourceWorkerRegistry::default();
+        for _ in 0..RUN_CONTEXT_SOURCE_WORKERS_MAX {
+            assert!(workers.try_start());
+        }
+        assert!(!workers.try_start());
+        workers.finish();
+        assert!(workers.try_start());
+        assert_eq!(
+            map_run_context_source_error(HarnessC2Error::RunContextSourceDeadline),
+            HarnessOperatorHostErrorV1::Deadline,
+        );
+        assert_eq!(
+            map_run_context_source_error(HarnessC2Error::RunContextSourceRejected {
+                code: NodeFailureCode::BackendOperationFailed,
+            }),
+            HarnessOperatorHostErrorV1::Unavailable,
+        );
+        assert_eq!(
+            map_run_context_source_error(HarnessC2Error::RunContextSourceRouteMismatch),
+            HarnessOperatorHostErrorV1::Conflict,
+        );
+    }
+
+    #[test]
+    fn run_context_source_observed_waits_for_exact_durable_history_and_reopens() {
+        let (harness, _task_id, run_id, route) = running_harness_fixture();
+        let snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::Live,
+            Some(bound_session_address()),
+            C2SessionStatus::Running,
+        );
+        let runtime_inventory = correlation_inventory(route.clone(), snapshot, 20);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(
+            route.node_id.clone(),
+            route.expected_incarnation_id,
+            Some(C2ObservationSupport {
+                events: true,
+                managed_target: true,
+                workflow_detail: false,
+            }),
+        );
+        let observation_path = database_path();
+        let mut observation = ObservationService::open(&observation_path).unwrap();
+        let managed_key = ManagedSessionKey {
+            node_id: route.node_id.clone(),
+            incarnation_id: route.expected_incarnation_id,
+            record_id: SessionRecordId::new("record-a").unwrap(),
+        };
+        observation.apply_resync(ObservationResyncBatch {
+            node_id: route.node_id.clone(),
+            incarnation_id: route.expected_incarnation_id,
+            requested_after: 0,
+            high_watermark: NodeCursor {
+                incarnation_id: route.expected_incarnation_id,
+                sequence: 5,
+            },
+            oldest_available_sequence: 1,
+            records: vec![ManagedRecordLink {
+                managed: managed_key.clone(),
+                runtime: Some(RuntimeSessionKey {
+                    node_id: route.node_id.clone(),
+                    incarnation_id: route.expected_incarnation_id,
+                    workspace_id: gate4agent_node_protocol::WorkspaceId::new(
+                        "workspace-a",
+                    ).unwrap(),
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(3),
+                }),
+            }],
+            records_complete: true,
+            gaps: Vec::new(),
+            events: Vec::new(),
+        }).unwrap();
+        let run = harness.engine().run(&run_id).unwrap();
+        let prepared = prepare_run_context_source_observation(
+            run,
+            &observation,
+            &support,
+            &runtime_inventory,
+        ).unwrap().unwrap();
+        assert_eq!(prepared.observed_after_sequence(), 5);
+        let (reply, _receive) = oneshot::channel();
+        let pending = PendingRunContextSourceReply {
+            prepared,
+            projection: RunContextSourceProjection::Aggregate {
+                message_count: 7,
+                completed_turn_count: Some(3),
+                total_tokens: Some(700),
+            },
+            deadline: Instant::now() + RUN_CONTEXT_SOURCE_PERSISTENCE_WAIT,
+            reply,
+        };
+        assert_eq!(
+            evaluate_pending_run_context_source(
+                &harness,
+                &mut observation,
+                &support,
+                &runtime_inventory,
+                &pending,
+            ).unwrap(),
+            None,
+        );
+
+        apply_routed_observation_event(
+            &mut observation,
+            RoutedNodeEvent {
+                node_id: route.node_id.clone(),
+                cursor: NodeCursor {
+                    incarnation_id: route.expected_incarnation_id,
+                    sequence: 6,
+                },
+                event: C2NodeEvent::ManagedObservation {
+                    record_id: SessionRecordId::new("record-a").unwrap(),
+                    observation: ObservationV1 {
+                        source_sequence: 99,
+                        observed_at_unix_ms: Some(1_230),
+                        evidence: ObservationEvidenceV1::HistoryProjection,
+                        kind: ObservationKindV1::HistorySnapshot {
+                            message_count: 7,
+                            message_count_exact: true,
+                            completed_turn_count: Some(3),
+                            total_tokens: Some(700),
+                        },
+                        truncated: false,
+                    },
+                },
+            },
+            1_234,
+        ).unwrap();
+        let observed = evaluate_pending_run_context_source(
+            &harness,
+            &mut observation,
+            &support,
+            &runtime_inventory,
+            &pending,
+        ).unwrap().unwrap();
+        assert_eq!(observed.run_id, run_id);
+        assert_eq!(observed.feature_state, FeatureObservationStateV1::Observed);
+        assert_eq!(observed.message_count, 7);
+        assert_eq!(observed.observed_at_unix_ms, Some(1_234));
+        observed.validate().unwrap();
+
+        observation.close().unwrap();
+        let reopened = ObservationService::open(&observation_path).unwrap();
+        let source = context_source_option(
+            &harness,
+            &reopened,
+            &support,
+            &runtime_inventory,
+            harness.engine().run(&run_id).unwrap(),
+        ).unwrap().unwrap();
+        assert_eq!(source.message_count, 7);
+        assert_eq!(source.completed_turn_count, Some(3));
+        reopened.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
     fn run_correlation_projects_exact_stored_active_binding_and_current_availability() {
         let (mut harness, task_id, run_id, route) = running_harness_fixture();
         let snapshot = bound_snapshot(
@@ -5743,6 +6963,7 @@ mod tests {
             &observation,
             &ObservationSupportRegistry::default(),
             &HarnessLaunchCatalog::default(),
+            &DeliveryCatalogV2::default(),
             &cache,
             HarnessOperatorRequestV1::RunCorrelationGet {
                 run_id: run_id.clone(),
@@ -5793,6 +7014,7 @@ mod tests {
             &observation,
             &ObservationSupportRegistry::default(),
             &HarnessLaunchCatalog::default(),
+            &DeliveryCatalogV2::default(),
             &HarnessRuntimeInventoryCache::default(),
             HarnessOperatorRequestV1::RunTransferGet {
                 run_id: run_id.clone(),
@@ -5812,6 +7034,7 @@ mod tests {
             &observation,
             &ObservationSupportRegistry::default(),
             &HarnessLaunchCatalog::default(),
+            &DeliveryCatalogV2::default(),
             &HarnessRuntimeInventoryCache::default(),
             HarnessOperatorRequestV1::RunTransferGet {
                 run_id: HarnessRunId::new(format!("hrun_{}", "f".repeat(24))).unwrap(),
@@ -5852,8 +7075,10 @@ mod tests {
                 "d".repeat(24),
             )).unwrap(),
             revision: HarnessRevision::new(1).unwrap(),
-            grant_id: grant_id.clone(),
-            grant_revision: HarnessRevision::new(1).unwrap(),
+            authority: gate4agent_harness_protocol::HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: grant_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+            },
             task_id,
             run_id: run_id.clone(),
             operation_id: operation_id.clone(),
@@ -5888,8 +7113,10 @@ mod tests {
             )).unwrap(),
             revision: HarnessRevision::new(3).unwrap(),
             state: HarnessContinuationStateV1::Exported,
-            grant_id,
-            grant_revision: HarnessRevision::new(1).unwrap(),
+            authority: gate4agent_harness_protocol::HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id,
+                revision: HarnessRevision::new(1).unwrap(),
+            },
             source_run_id: source_run_id.clone(),
             target_run_id: run_id.clone(),
             operation_id,
@@ -6488,6 +7715,7 @@ mod tests {
             &observation,
             &support,
             &launch_catalog,
+            &DeliveryCatalogV2::default(),
             &runtime_inventory,
             HarnessOperatorRequestV1::CreateTask { request: request.clone() },
         ).unwrap();
@@ -6496,6 +7724,7 @@ mod tests {
             &observation,
             &support,
             &launch_catalog,
+            &DeliveryCatalogV2::default(),
             &runtime_inventory,
             HarnessOperatorRequestV1::CreateTask { request: request.clone() },
         ).unwrap();
@@ -6515,6 +7744,7 @@ mod tests {
                 &observation,
                 &support,
                 &launch_catalog,
+                &DeliveryCatalogV2::default(),
                 &runtime_inventory,
                 HarnessOperatorRequestV1::CreateTask { request: changed },
             ),
@@ -6574,6 +7804,7 @@ mod tests {
                 &observation,
                 &support,
                 &launch_catalog,
+                &DeliveryCatalogV2::default(),
                 &runtime_inventory,
                 HarnessOperatorRequestV1::SubmitIntent { intent: intent.clone() },
             ).unwrap(),
@@ -6589,6 +7820,7 @@ mod tests {
                 &observation,
                 &support,
                 &launch_catalog,
+                &DeliveryCatalogV2::default(),
                 &runtime_inventory,
                 HarnessOperatorRequestV1::SubmitIntent { intent: intent.clone() },
             ).unwrap(),
@@ -6608,6 +7840,7 @@ mod tests {
                 &observation,
                 &support,
                 &launch_catalog,
+                &DeliveryCatalogV2::default(),
                 &runtime_inventory,
                 HarnessOperatorRequestV1::SubmitIntent { intent: changed_payload },
             ),
@@ -6621,6 +7854,7 @@ mod tests {
                 &observation,
                 &support,
                 &launch_catalog,
+                &DeliveryCatalogV2::default(),
                 &runtime_inventory,
                 HarnessOperatorRequestV1::SubmitIntent { intent: changed_time },
             ),

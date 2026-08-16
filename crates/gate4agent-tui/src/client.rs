@@ -58,6 +58,7 @@ use gate4agent_harness_client::{
     HarnessOperatorResponseV1, HarnessTaskLaunchOptionsV1,
     HarnessGitDiffModeV1, HarnessGitObjectIdV1, HarnessGitStatusCodeV1,
     HarnessOperatorClientError, HarnessOperatorHostErrorV1, HarnessRepositoryPathV1,
+    HarnessReverseAttributionSubjectV1, HarnessReverseAttributionV1,
     HarnessRunGitDiffV1, HarnessRunGitHistoryPageV1, HarnessRunWorkspaceFileV1,
     HarnessRunWorkspaceInspectionV1, HarnessRunWorkspaceOriginV1,
     HarnessWorkspaceEntryKindV1, HarnessWorkspaceFileContentV1,
@@ -728,6 +729,16 @@ enum WorkerUpdate {
         destination: HarnessWorkspaceGitRequestDestination,
         token: u64,
         failure: HarnessReadFailure,
+    },
+    HarnessReverseAttributionLoaded {
+        subject: HarnessReverseAttributionSubjectV1,
+        token: u64,
+        value: HarnessReverseAttributionV1,
+    },
+    HarnessReverseAttributionFailed {
+        subject: HarnessReverseAttributionSubjectV1,
+        token: u64,
+        message: String,
     },
     Notice(String),
 }
@@ -1557,6 +1568,18 @@ fn reject_harness_queue_action(
             app.fail_harness_launch_options(task, *token, message);
             return true;
         }
+        AppAction::HarnessLoadReverseAttribution { subject, token } => {
+            let message = match rejection {
+                HarnessQueueRejection::Busy => {
+                    "Harness operator busy: reverse-attribution queue is full"
+                }
+                HarnessQueueRejection::Unavailable => {
+                    "Harness operator unavailable: reverse-attribution queue is closed"
+                }
+            }.to_owned();
+            app.fail_harness_reverse_attribution(subject, *token, message);
+            return true;
+        }
         _ => {}
     }
     if let AppAction::HarnessOpenMonitor { run } = action {
@@ -1644,6 +1667,7 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
             | AppAction::HarnessReadWorkspaceFile { .. }
             | AppAction::HarnessReadGitHistory { .. }
             | AppAction::HarnessReadGitDiff { .. }
+            | AppAction::HarnessLoadReverseAttribution { .. }
     )
 }
 
@@ -1722,7 +1746,8 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessInspectWorkspace { .. }
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
-        | AppAction::HarnessReadGitDiff { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
+        | AppAction::HarnessReadGitDiff { .. }
+        | AppAction::HarnessLoadReverseAttribution { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
         AppAction::None | AppAction::Quit => None,
     }
 }
@@ -2743,6 +2768,23 @@ fn harness_detail_worker(
                         destination,
                         token,
                         failure: project_harness_read_failure(error),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessLoadReverseAttribution { subject, token } => {
+                let update = match client.reverse_attribution_get(subject.clone()) {
+                    Ok(value) => WorkerUpdate::HarnessReverseAttributionLoaded {
+                        subject,
+                        token,
+                        value,
+                    },
+                    Err(error) => WorkerUpdate::HarnessReverseAttributionFailed {
+                        subject,
+                        token,
+                        message: error.to_string(),
                     },
                 };
                 if updates.blocking_send(update).is_err() {
@@ -5681,7 +5723,8 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessInspectWorkspace { .. }
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
-        | AppAction::HarnessReadGitDiff { .. } => None,
+        | AppAction::HarnessReadGitDiff { .. }
+        | AppAction::HarnessLoadReverseAttribution { .. } => None,
     }
 }
 
@@ -6925,6 +6968,12 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         }
         WorkerUpdate::HarnessGitDiffFailed { destination, token, failure } => {
             app.fail_harness_git_diff(&destination, token, failure);
+        }
+        WorkerUpdate::HarnessReverseAttributionLoaded { subject, token, value } => {
+            app.apply_harness_reverse_attribution(subject, token, value);
+        }
+        WorkerUpdate::HarnessReverseAttributionFailed { subject, token, message } => {
+            app.fail_harness_reverse_attribution(&subject, token, message);
         }
         WorkerUpdate::Notice(notice) => app.notice = Some(notice),
     }
@@ -13707,6 +13756,47 @@ mod tests {
         assert!(matches!(
             app.harness_kanban.launch_options.get(&task_ref),
             Some(crate::app::HarnessLaunchOptionsState::Error { token: 94, message })
+                if message.contains("queue is closed"),
+        ));
+    }
+
+    #[test]
+    fn reverse_attribution_uses_only_harness_detail_lane_and_queue_failure_is_terminal() {
+        let subject = HarnessReverseAttributionSubjectV1::RuntimeSession {
+            workspace: gate4agent_harness_client::HarnessReverseAttributionWorkspaceV1 {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                node_incarnation_id:
+                    gate4agent_harness_client::HarnessNodeIncarnationV1::new(
+                        "ab".repeat(16),
+                    ).unwrap(),
+                workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            },
+            instance_id: 7,
+            generation: 2,
+        };
+        let action = AppAction::HarnessLoadReverseAttribution {
+            subject: subject.clone(),
+            token: 95,
+        };
+        assert!(harness_detail_read_action(&action));
+        assert_eq!(action_node_id(&action), Some(HARNESS_DETAIL_COMMAND_ROUTE));
+        assert!(action_to_request(action.clone()).is_none());
+
+        let mut app = App::default();
+        app.harness_kanban.reverse_attribution = Some(
+            crate::app::HarnessReverseAttributionDetail {
+                subject: subject.clone(),
+                state: crate::app::HarnessReverseAttributionState::Loading { token: 95 },
+            },
+        );
+        assert!(reject_harness_queue_action(
+            &mut app,
+            &action,
+            HarnessQueueRejection::Unavailable,
+        ));
+        assert!(matches!(
+            app.harness_kanban.reverse_attribution.as_ref().map(|detail| &detail.state),
+            Some(crate::app::HarnessReverseAttributionState::Error { token: 95, message })
                 if message.contains("queue is closed"),
         ));
     }

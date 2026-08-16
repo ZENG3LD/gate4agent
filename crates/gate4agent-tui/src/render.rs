@@ -10,7 +10,11 @@ use gate4agent_node_protocol::{
 };
 use gate4agent_observation_api::{ProjectionAvailability, ProjectionFreshness};
 use gate4agent_observation_engine::{ContextOccupancyProvenance, ContextOccupancySnapshot, CorrelationProjection, CorrelationState, SessionProjection};
-use gate4agent_harness_client::{FeatureObservationStateV1, SessionMonitorV1 as HarnessSessionMonitorV1};
+use gate4agent_harness_client::{
+    FeatureObservationStateV1, HarnessReverseAttributionBindingV1,
+    HarnessReverseAttributionOutcomeV1, HarnessReverseAttributionRelationV1,
+    HarnessReverseAttributionSubjectV1, SessionMonitorV1 as HarnessSessionMonitorV1,
+};
 
 use crate::app::{
     compact_task_id, host_path_display, managed_state_label, repository_path_display,
@@ -24,6 +28,7 @@ use crate::app::{
     LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RosterMode, SessionView,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
+    HarnessReverseAttributionState,
     NativeSessionCatalogState, NativeSessionPreviewState, SidebarPresentation, SurfacePaneLayout,
     WorkspaceFileState, WorkspaceFileTabView, WorkspaceGitPaneMode, WorkspaceGitState,
     WorkspaceGitTabView, WorkspaceView,
@@ -337,6 +342,9 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     if app.native_session_menu.is_some() {
         render_native_session_menu(app, area, buf, &mut layout, theme);
     }
+    if app.harness_kanban.reverse_attribution.is_some() {
+        render_harness_reverse_attribution(app, area, buf, &mut layout, theme);
+    }
     render_drag_preview(app, area, buf, &layout, theme);
     if let Some(notice) = &app.notice {
         render_notice(notice, right[1], buf, theme);
@@ -564,6 +572,23 @@ fn render_space_list(
             rect: Rect::new(area.x, y + 1, area.width, 1),
             target: HitTarget::Space(index),
         });
+        if selected && app.harness_kanban.enabled {
+            if let Some(subject) = app.harness_workspace_links_subject(
+                &node.node_id,
+                &workspace.workspace_id,
+            ) {
+                let label = "[Harness links]";
+                let width = (cell_width(label) as u16).min(area.width);
+                let rect = Rect::new(area.right().saturating_sub(width), y + 1, width, 1);
+                Paragraph::new(label)
+                    .style(Style::default().fg(theme.teal).bg(background))
+                    .render(rect, buf);
+                layout.hits.push(HitRegion {
+                    rect,
+                    target: HitTarget::HarnessLinks(subject),
+                });
+            }
+        }
         layout.hits.push(HitRegion {
             rect: Rect::new(spawn_x, y, spawn_width, 1),
             target: HitTarget::SpawnSpace(index),
@@ -5274,6 +5299,236 @@ fn render_harness_monitor(
     }
 }
 
+fn render_harness_reverse_attribution(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let Some(detail) = app.harness_kanban.reverse_attribution.as_ref() else {
+        return;
+    };
+    let link_count = match &detail.state {
+        HarnessReverseAttributionState::Ready { value, .. } => value.links.len(),
+        HarnessReverseAttributionState::Loading { .. }
+        | HarnessReverseAttributionState::Error { .. } => 0,
+    };
+    let width = area.width.saturating_sub(4).min(104).max(3);
+    let height = area.height.saturating_sub(2)
+        .min(8_u16.saturating_add(link_count.min(10) as u16))
+        .max(3);
+    let modal = centered(area, width, height);
+    fill_rect(modal, theme.modal, buf);
+    Block::bordered()
+        .title(" Harness links ")
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(modal, buf);
+    if modal.width < 3 || modal.height < 3 {
+        return;
+    }
+    let inner = Rect::new(modal.x + 1, modal.y + 1, modal.width - 2, modal.height - 2);
+    let close = "[Close]";
+    let close_width = (cell_width(close) as u16).min(inner.width);
+    let close_rect = Rect::new(
+        inner.right().saturating_sub(close_width),
+        inner.y,
+        close_width,
+        1,
+    );
+    Paragraph::new(close)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(close_rect, buf);
+    layout.hits.push(HitRegion {
+        rect: close_rect,
+        target: HitTarget::HarnessLinksClose,
+    });
+
+    let subject = harness_reverse_subject_label(&detail.subject);
+    let subject_width = inner.width.saturating_sub(close_width.saturating_add(1));
+    render_modal_line(
+        truncate_cells(&subject, subject_width as usize),
+        Rect::new(inner.x, inner.y, subject_width, inner.height),
+        0,
+        Style::default().fg(theme.text).bg(theme.modal).add_modifier(Modifier::BOLD),
+        buf,
+    );
+    let workspace = harness_reverse_subject_workspace(&detail.subject);
+    render_modal_line(
+        format!(
+            "exact tuple | node {} | incarnation {} | workspace {}",
+            workspace.node_id.as_str(),
+            workspace.node_incarnation_id.as_str(),
+            workspace.workspace_id.as_str(),
+        ),
+        inner,
+        1,
+        Style::default().fg(theme.dim).bg(theme.modal),
+        buf,
+    );
+    let mut row = 2;
+    if let Some(warning) = harness_reverse_scope_warning(&detail.subject) {
+        render_modal_line(
+            warning,
+            inner,
+            row,
+            Style::default().fg(theme.yellow).bg(theme.modal),
+            buf,
+        );
+        row += 1;
+    }
+    match &detail.state {
+        HarnessReverseAttributionState::Loading { token } => {
+            render_modal_line(
+                format!("Loading exact reverse attribution | token {token}"),
+                inner,
+                row,
+                Style::default().fg(theme.dim).bg(theme.modal),
+                buf,
+            );
+        }
+        HarnessReverseAttributionState::Error { message, .. } => {
+            render_modal_line(
+                format!("Error | {message}"),
+                inner,
+                row,
+                Style::default().fg(theme.red).bg(theme.modal),
+                buf,
+            );
+        }
+        HarnessReverseAttributionState::Ready { value, .. } => {
+            let workspace_scope_only = matches!(
+                &detail.subject,
+                HarnessReverseAttributionSubjectV1::FileScope { .. }
+                    | HarnessReverseAttributionSubjectV1::CommitScope { .. }
+            );
+            let outcome = match value.outcome {
+                HarnessReverseAttributionOutcomeV1::Attributed if workspace_scope_only => {
+                    format!(
+                        "Workspace-scope links | {} exact Harness run(s)",
+                        value.links.len(),
+                    )
+                }
+                HarnessReverseAttributionOutcomeV1::Attributed => {
+                    format!("Attributed | {} exact Harness link(s)", value.links.len())
+                }
+                HarnessReverseAttributionOutcomeV1::Unattributed => {
+                    "Unattributed | No durable attribution recorded".to_owned()
+                }
+            };
+            render_modal_line(
+                outcome,
+                inner,
+                row,
+                Style::default().fg(if value.links.is_empty() { theme.yellow } else { theme.green }).bg(theme.modal),
+                buf,
+            );
+            row += 1;
+            for link in value.links.iter().take(inner.height.saturating_sub(row) as usize) {
+                let line = format!(
+                    "task {} | run {} r{} | {} | {}",
+                    link.task_id,
+                    link.run_id,
+                    link.run_revision.get(),
+                    harness_reverse_relation_label(link.relation),
+                    harness_reverse_binding_label(&link.binding),
+                );
+                let rect = Rect::new(inner.x, inner.y + row, inner.width, 1);
+                Paragraph::new(truncate_cells(&line, inner.width as usize))
+                    .style(Style::default().fg(theme.teal).bg(theme.modal))
+                    .render(rect, buf);
+                layout.hits.push(HitRegion {
+                    rect,
+                    target: HitTarget::HarnessAgentTask(
+                        link.task_id.clone(),
+                        link.run_id.clone(),
+                    ),
+                });
+                row += 1;
+            }
+        }
+    }
+}
+
+fn harness_reverse_subject_workspace(
+    subject: &HarnessReverseAttributionSubjectV1,
+) -> &gate4agent_harness_client::HarnessReverseAttributionWorkspaceV1 {
+    match subject {
+        HarnessReverseAttributionSubjectV1::ManagedRecord { workspace, .. }
+        | HarnessReverseAttributionSubjectV1::RuntimeSession { workspace, .. }
+        | HarnessReverseAttributionSubjectV1::Workspace { workspace }
+        | HarnessReverseAttributionSubjectV1::FileScope { workspace, .. }
+        | HarnessReverseAttributionSubjectV1::CommitScope { workspace, .. } => workspace,
+    }
+}
+
+fn harness_reverse_subject_label(subject: &HarnessReverseAttributionSubjectV1) -> String {
+    match subject {
+        HarnessReverseAttributionSubjectV1::ManagedRecord { record_id, .. } => {
+            format!("Managed agent | record {}", record_id.as_str())
+        }
+        HarnessReverseAttributionSubjectV1::RuntimeSession {
+            instance_id,
+            generation,
+            ..
+        } => format!("Runtime session | #{instance_id}:{generation}"),
+        HarnessReverseAttributionSubjectV1::Workspace { .. } => "Workspace".to_owned(),
+        HarnessReverseAttributionSubjectV1::FileScope { relative_path, .. } => {
+            format!("File | {}", relative_path.as_str())
+        }
+        HarnessReverseAttributionSubjectV1::CommitScope { object_id, .. } => {
+            format!("Commit | {}", object_id.as_str())
+        }
+    }
+}
+
+fn harness_reverse_scope_warning(subject: &HarnessReverseAttributionSubjectV1) -> Option<&'static str> {
+    match subject {
+        HarnessReverseAttributionSubjectV1::FileScope { .. } => Some(
+            "Workspace-scope only; never claim this file was produced or modified by a linked run.",
+        ),
+        HarnessReverseAttributionSubjectV1::CommitScope { .. } => Some(
+            "Workspace-scope only; never claim this commit was produced or modified by a linked run.",
+        ),
+        HarnessReverseAttributionSubjectV1::ManagedRecord { .. }
+        | HarnessReverseAttributionSubjectV1::RuntimeSession { .. }
+        | HarnessReverseAttributionSubjectV1::Workspace { .. } => None,
+    }
+}
+
+fn harness_reverse_relation_label(relation: HarnessReverseAttributionRelationV1) -> &'static str {
+    match relation {
+        HarnessReverseAttributionRelationV1::ManagedRecordBinding => "managed binding",
+        HarnessReverseAttributionRelationV1::RuntimeSessionBinding => "runtime binding",
+        HarnessReverseAttributionRelationV1::WorkspaceBinding => "workspace binding",
+        HarnessReverseAttributionRelationV1::WorkspaceScope => "workspace-scope only",
+    }
+}
+
+fn harness_reverse_binding_label(binding: &HarnessReverseAttributionBindingV1) -> String {
+    match binding {
+        HarnessReverseAttributionBindingV1::ManagedRecord {
+            record_id,
+            active_instance_id,
+            active_generation,
+            ..
+        } => active_instance_id.zip(*active_generation).map_or_else(
+            || format!("record {}", record_id.as_str()),
+            |(instance, generation)| format!(
+                "record {} | #{instance}:{generation}",
+                record_id.as_str(),
+            ),
+        ),
+        HarnessReverseAttributionBindingV1::RuntimeSession {
+            instance_id,
+            generation,
+            ..
+        } => format!("session #{instance_id}:{generation}"),
+        HarnessReverseAttributionBindingV1::Workspace { .. } => "workspace tuple".to_owned(),
+    }
+}
+
 fn render_agent_board_card(
     app: &App,
     card: &AgentBoardCard,
@@ -5380,6 +5635,25 @@ fn render_agent_board_card(
         Paragraph::new(truncate_cells(&summary, area.width as usize))
             .style(Style::default().fg(theme.dim).bg(background))
             .render(Rect::new(area.x, area.y + 3, area.width, 1), buf);
+        if app.harness_kanban.enabled {
+            if let Some(subject) = app.harness_agent_links_subject(&card.key) {
+                let label = "[Harness links]";
+                let width = (cell_width(label) as u16).min(area.width);
+                let rect = Rect::new(
+                    area.right().saturating_sub(width),
+                    area.y + 3,
+                    width,
+                    1,
+                );
+                Paragraph::new(label)
+                    .style(Style::default().fg(theme.teal).bg(background))
+                    .render(rect, buf);
+                layout.hits.push(HitRegion {
+                    rect,
+                    target: HitTarget::HarnessLinks(subject),
+                });
+            }
+        }
     }
     if area.height > 4 {
         let run_label = if app.agent_run_lens_key() == Some(&card.key) {
@@ -5725,6 +5999,7 @@ fn render_surface_toolbar(
                             layout,
                         );
                     }
+                    render_harness_links_toolbar(app, tab, area, buf, layout, theme);
                     return;
                 }
                 x = render_toolbar_segment(
@@ -5853,6 +6128,36 @@ fn render_surface_toolbar(
         }
         None => {}
     }
+    render_harness_links_toolbar(app, tab, area, buf, layout, theme);
+}
+
+fn render_harness_links_toolbar(
+    app: &App,
+    tab: Option<&SurfaceTab>,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if !app.harness_kanban.enabled {
+        return;
+    }
+    let Some(subject) = tab.and_then(|tab| app.harness_surface_links_subject(tab)) else {
+        return;
+    };
+    let label = "[Harness links]";
+    let width = (cell_width(label) as u16).min(area.width);
+    if width == 0 {
+        return;
+    }
+    let rect = Rect::new(area.right().saturating_sub(width), area.y, width, 1);
+    Paragraph::new(label)
+        .style(Style::default().fg(theme.teal).bg(theme.active))
+        .render(rect, buf);
+    layout.hits.push(HitRegion {
+        rect,
+        target: HitTarget::HarnessLinks(subject),
+    });
 }
 
 fn render_toolbar_segment(
@@ -15017,6 +15322,87 @@ mod tests {
             HitTarget::SessionMonitorSection(_, SessionMonitorSection::Timeline)
         ) && hit.rect.right() <= 12));
         assert!(buffer_text(&buffer).contains("Timeline"));
+    }
+
+    #[test]
+    fn reverse_attribution_detail_is_mouse_first_truthful_and_explicitly_unattributed() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([0xab; 16]));
+        let workspace = gate4agent_harness_client::HarnessReverseAttributionWorkspaceV1 {
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: gate4agent_harness_client::HarnessNodeIncarnationV1::new(
+                "ab".repeat(16),
+            ).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        };
+        let subject = HarnessReverseAttributionSubjectV1::FileScope {
+            workspace: workspace.clone(),
+            relative_path: gate4agent_harness_client::HarnessRepositoryPathV1::new(
+                "src/lib.rs",
+            ).unwrap(),
+        };
+        let task_id = HarnessTaskId::new(format!("htask_{}", "1".repeat(24))).unwrap();
+        let run_id = HarnessRunId::new(format!("hrun_{}", "2".repeat(24))).unwrap();
+        let value = gate4agent_harness_client::HarnessReverseAttributionV1 {
+            subject: subject.clone(),
+            outcome: HarnessReverseAttributionOutcomeV1::Attributed,
+            links: vec![gate4agent_harness_client::HarnessReverseAttributionLinkV1 {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                run_revision: HarnessRevision::new(3).unwrap(),
+                binding: HarnessReverseAttributionBindingV1::Workspace {
+                    workspace,
+                },
+                relation: HarnessReverseAttributionRelationV1::WorkspaceScope,
+            }],
+        };
+        app.harness_kanban.reverse_attribution = Some(
+            crate::app::HarnessReverseAttributionDetail {
+                subject: subject.clone(),
+                state: HarnessReverseAttributionState::Ready { token: 9, value },
+            },
+        );
+        let mut buffer = TerminalBuffer::new(150, 30);
+        let layout = render(&app, &mut buffer);
+        let text = buffer_text(&buffer);
+        for expected in [
+            "Harness links",
+            "exact tuple | node node-a | incarnation abababababababababababababababab",
+            "Workspace-scope only; never claim this file was produced or modified",
+            "Workspace-scope links | 1 exact Harness run(s)",
+            "workspace-scope only",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        for forbidden in ["Attributed", "ProducedBy", "ModifiedBy"] {
+            assert!(!text.contains(forbidden), "forbidden file-scope claim {forbidden}: {text}");
+        }
+        assert!(layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::HarnessLinksClose
+        }));
+        assert!(layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::HarnessAgentTask(task_id.clone(), run_id.clone())
+        }));
+
+        app.harness_kanban.reverse_attribution = Some(
+            crate::app::HarnessReverseAttributionDetail {
+                subject: subject.clone(),
+                state: HarnessReverseAttributionState::Ready {
+                    token: 10,
+                    value: gate4agent_harness_client::HarnessReverseAttributionV1 {
+                        subject,
+                        outcome: HarnessReverseAttributionOutcomeV1::Unattributed,
+                        links: Vec::new(),
+                    },
+                },
+            },
+        );
+        let mut unattributed = TerminalBuffer::new(150, 30);
+        render(&app, &mut unattributed);
+        assert!(buffer_text(&unattributed).contains(
+            "Unattributed | No durable attribution recorded"
+        ));
     }
 
     #[test]

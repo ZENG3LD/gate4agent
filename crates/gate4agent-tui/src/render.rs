@@ -4308,7 +4308,7 @@ fn render_harness_task_detail(
             ))
                 .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
                 .render(Rect::new(body.x, body.y, body.width, 1), buf);
-            let card_height = 3usize;
+            let card_height = 4usize;
             let capacity = (body.height.saturating_sub(1) as usize / card_height).max(1);
             let selected_index = detail.selected_run.as_ref()
                 .and_then(|selected| runs.iter().position(|run| &run.run_id == selected))
@@ -4343,10 +4343,21 @@ fn render_harness_task_detail(
                 } else {
                     "[Open monitor]"
                 };
+                let run_ref = crate::app::HarnessRunRef {
+                    run_id: run.run_id.clone(),
+                    run_revision: run.revision,
+                };
+                let context_loading = matches!(
+                    app.harness_kanban.run_context_sources.get(&run_ref),
+                    Some(crate::app::HarnessRunContextSourceState::Loading { .. }),
+                );
+                let observe_label = "[Observe context]";
                 let transfers_label = "[Transfers]";
                 let files_label = "[Files]";
                 let git_label = "[Git]";
-                let actions_width = (cell_width(transfers_label)
+                let actions_width = (cell_width(observe_label)
+                    + 1
+                    + cell_width(transfers_label)
                     + 1
                     + cell_width(files_label)
                     + 1
@@ -4366,8 +4377,23 @@ fn render_harness_task_detail(
                 Paragraph::new(truncate_cells(&line, main_width as usize))
                     .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
                     .render(Rect::new(panel.x, panel.y, main_width, 1), buf);
+                let observe_width = cell_width(observe_label) as u16;
+                let observe_rect = Rect::new(actions_x, panel.y, observe_width, 1);
+                let can_observe = run.binding
+                    != gate4agent_harness_client::RedactedBindingStateV1::None
+                    && !context_loading;
+                Paragraph::new(observe_label)
+                    .style(Style::default().fg(if can_observe { theme.teal } else { theme.muted }).bg(background))
+                    .render(observe_rect, buf);
+                if can_observe {
+                    layout.hits.push(HitRegion {
+                        rect: observe_rect,
+                        target: HitTarget::HarnessTaskDetailRunObserveContext(run.run_id.clone()),
+                    });
+                }
+                let transfers_x = observe_rect.right().saturating_add(1);
                 let transfers_width = cell_width(transfers_label) as u16;
-                let transfers_rect = Rect::new(actions_x, panel.y, transfers_width, 1);
+                let transfers_rect = Rect::new(transfers_x, panel.y, transfers_width, 1);
                 Paragraph::new(transfers_label)
                     .style(Style::default().fg(theme.teal).bg(background))
                     .render(transfers_rect, buf);
@@ -4462,6 +4488,42 @@ fn render_harness_task_detail(
                     Paragraph::new(truncate_cells(&features, panel.width as usize))
                         .style(Style::default().fg(if observation_error { theme.yellow } else { theme.muted }).bg(background))
                         .render(Rect::new(panel.x, panel.y + 2, panel.width, 1), buf);
+                }
+                if panel.height > 3 {
+                    let context_source = match app.harness_kanban.run_context_sources.get(&run_ref) {
+                        None => "Context source: None | click [Observe context]".to_owned(),
+                        Some(crate::app::HarnessRunContextSourceState::Loading { .. }) => {
+                            format!("Context source: Loading | exact run r{}", run.revision.get())
+                        }
+                        Some(crate::app::HarnessRunContextSourceState::Observed {
+                            observation,
+                            ..
+                        }) => format!(
+                            "Context source: Observed | messages {} exact | turns {} | tokens {} | observed {}",
+                            observation.message_count,
+                            observation.completed_turn_count
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unknown".to_owned()),
+                            observation.total_tokens
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unknown".to_owned()),
+                            observation.observed_at_unix_ms
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unknown".to_owned()),
+                        ),
+                        Some(crate::app::HarnessRunContextSourceState::Unavailable {
+                            feature_state,
+                            ..
+                        }) => format!("Context source: Unavailable | {feature_state:?}"),
+                        Some(crate::app::HarnessRunContextSourceState::Error { .. }) => {
+                            "Context source: Error | retry exact run observation".to_owned()
+                        }
+                    };
+                    let context_error = context_source.contains("Unavailable")
+                        || context_source.contains("Error");
+                    Paragraph::new(truncate_cells(&context_source, panel.width as usize))
+                        .style(Style::default().fg(if context_error { theme.yellow } else { theme.dim }).bg(background))
+                        .render(Rect::new(panel.x, panel.y + 3, panel.width, 1), buf);
                 }
             }
             if runs.is_empty() && body.height > 1 {
@@ -5077,6 +5139,22 @@ fn render_harness_task_detail(
                     .map(HitTarget::HarnessLaunchContextSource)
                     .unwrap_or(HitTarget::HarnessLaunchContextNone);
                 layout.hits.push(HitRegion { rect: row, target });
+            }
+            if view.options.context_sources.is_empty() && context_inner.height > 1 {
+                Paragraph::new(truncate_cells(
+                    "Open a source run -> Observe context",
+                    context_inner.width as usize,
+                ))
+                    .style(Style::default().fg(theme.yellow).bg(theme.surface))
+                    .render(
+                        Rect::new(
+                            context_inner.x,
+                            context_inner.y.saturating_add(1),
+                            context_inner.width,
+                            1,
+                        ),
+                        buf,
+                    );
             }
 
             let delivery_count = view.options.delivery_bundles.len().saturating_add(1);
@@ -9975,6 +10053,8 @@ mod tests {
         let runs_layout = render(&app, &mut runs_buf);
         let runs_text = buffer_text(&runs_buf);
         assert!(runs_text.contains("[Open monitor]"), "{runs_text}");
+        assert!(runs_text.contains("[Observe context]"), "{runs_text}");
+        assert!(runs_text.contains("Context source: None"), "{runs_text}");
         assert!(runs_text.contains("availability=Current"), "{runs_text}");
         assert!(runs_text.contains("TODO=observed"), "{runs_text}");
         assert!(runs_text.contains("history=observed(messages >=12"), "{runs_text}");
@@ -9988,6 +10068,84 @@ mod tests {
         assert!(runs_layout.hits.iter().any(|hit| {
             matches!(hit.target, HitTarget::HarnessTaskDetailRunGit(_))
         }));
+        assert!(runs_layout.hits.iter().any(|hit| {
+            matches!(hit.target, HitTarget::HarnessTaskDetailRunObserveContext(_))
+        }));
+
+        app.harness_kanban.run_context_sources.insert(
+            crate::app::HarnessRunRef {
+                run_id: run.run_id.clone(),
+                run_revision: run.revision,
+            },
+            crate::app::HarnessRunContextSourceState::Observed {
+                token: 18,
+                observation: gate4agent_harness_client::HarnessRunContextSourceObservationV1 {
+                    run_id: run.run_id.clone(),
+                    run_revision: run.revision,
+                    feature_state: FeatureObservationStateV1::Observed,
+                    message_count: 12,
+                    message_count_exact: true,
+                    completed_turn_count: Some(5),
+                    total_tokens: Some(4096),
+                    observed_at_unix_ms: Some(90),
+                },
+            },
+        );
+        let mut observed_buf = TerminalBuffer::new(220, 28);
+        render(&app, &mut observed_buf);
+        let observed_text = buffer_text(&observed_buf);
+        assert!(observed_text.contains(
+            "Context source: Observed | messages 12 exact | turns 5 | tokens 4096 | observed 90"
+        ), "{observed_text}");
+        for forbidden in ["RAW_TRANSCRIPT", "provider-session", "C:\\private"] {
+            assert!(!observed_text.contains(forbidden), "{observed_text}");
+        }
+
+        let context_run_ref = crate::app::HarnessRunRef {
+            run_id: run.run_id.clone(),
+            run_revision: run.revision,
+        };
+        app.harness_kanban.run_context_sources.insert(
+            context_run_ref.clone(),
+            crate::app::HarnessRunContextSourceState::Loading { token: 19 },
+        );
+        let mut loading_context_buf = TerminalBuffer::new(220, 28);
+        let loading_context_layout = render(&app, &mut loading_context_buf);
+        let loading_context_text = buffer_text(&loading_context_buf);
+        assert!(loading_context_text.contains("Context source: Loading | exact run r"));
+        assert!(!loading_context_layout.hits.iter().any(|hit| {
+            matches!(hit.target, HitTarget::HarnessTaskDetailRunObserveContext(_))
+        }));
+
+        app.harness_kanban.run_context_sources.insert(
+            context_run_ref.clone(),
+            crate::app::HarnessRunContextSourceState::Unavailable {
+                token: 19,
+                feature_state: FeatureObservationStateV1::NotSupportedByObservedSources,
+            },
+        );
+        let mut unavailable_context_buf = TerminalBuffer::new(220, 28);
+        render(&app, &mut unavailable_context_buf);
+        assert!(buffer_text(&unavailable_context_buf).contains(
+            "Context source: Unavailable | NotSupportedByObservedSources"
+        ));
+
+        app.harness_kanban.run_context_sources.insert(
+            context_run_ref,
+            crate::app::HarnessRunContextSourceState::Error {
+                token: 19,
+                message: "C:\\private\\provider-session RAW_TRANSCRIPT".to_owned(),
+            },
+        );
+        let mut error_context_buf = TerminalBuffer::new(220, 28);
+        render(&app, &mut error_context_buf);
+        let error_context_text = buffer_text(&error_context_buf);
+        assert!(error_context_text.contains(
+            "Context source: Error | retry exact run observation"
+        ));
+        for forbidden in ["RAW_TRANSCRIPT", "provider-session", "C:\\private"] {
+            assert!(!error_context_text.contains(forbidden), "{error_context_text}");
+        }
 
         app.harness_kanban.detail.as_mut().unwrap().section =
             crate::app::HarnessTaskDetailSection::Agents;
@@ -10751,6 +10909,23 @@ mod tests {
         ] {
             assert!(later_text.contains(expected), "later Launch row unreachable: {later_text}");
         }
+
+        let task_ref = app.harness_detail_task_ref().unwrap();
+        let Some(crate::app::HarnessLaunchOptionsState::Ready(view)) =
+            app.harness_kanban.launch_options.get_mut(&task_ref)
+        else {
+            panic!("exact launch options disappeared");
+        };
+        view.options.context_sources.clear();
+        view.selected_context = None;
+        view.context_offset = 0;
+        let mut empty_context_buf = TerminalBuffer::new(190, 38);
+        render(&app, &mut empty_context_buf);
+        let empty_context_text = buffer_text(&empty_context_buf);
+        assert!(
+            empty_context_text.contains("Open a source run -> Observe context"),
+            "{empty_context_text}",
+        );
     }
 
     #[test]

@@ -4005,6 +4005,121 @@ fn harness_monitor_section_lines(
     lines
 }
 
+fn short_opaque_marker(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= 22 {
+        return value.to_owned();
+    }
+    let prefix = characters.iter().take(12).collect::<String>();
+    let suffix = characters.iter().skip(characters.len() - 6).collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
+fn optional_transfer_timestamp(value: Option<u64>) -> String {
+    value.map(|timestamp| timestamp.to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn harness_transfer_lines(
+    state: Option<&crate::app::HarnessRunTransferState>,
+) -> Vec<String> {
+    let Some(state) = state else {
+        return vec!["Transfers: None | not loaded for this exact run revision".to_owned()];
+    };
+    match state {
+        crate::app::HarnessRunTransferState::Loading { .. } => {
+            vec!["Transfers: Loading exact run-local summary...".to_owned()]
+        }
+        crate::app::HarnessRunTransferState::Error { message, .. } => {
+            vec![format!("Transfers: Error | {message}")]
+        }
+        crate::app::HarnessRunTransferState::Ready(summary) => {
+            let mut lines = Vec::new();
+            match &summary.delivery {
+                None => lines.push("Delivery: None".to_owned()),
+                Some(delivery) => {
+                    lines.push(format!(
+                        "Delivery: {:?} r{} | ref {} | receipt {}",
+                        delivery.state,
+                        delivery.revision.get(),
+                        short_opaque_marker(delivery.delivery_ref.as_str()),
+                        delivery.receipt_ref.as_ref()
+                            .map(|value| short_opaque_marker(value.as_str()))
+                            .unwrap_or_else(|| "none".to_owned()),
+                    ));
+                    lines.push(format!(
+                        "Bundle: selector {} | id {} | revision {}",
+                        short_opaque_marker(delivery.selector.as_str()),
+                        short_opaque_marker(delivery.bundle_id.as_str()),
+                        short_opaque_marker(delivery.bundle_revision.as_str()),
+                    ));
+                    lines.push(format!(
+                        "Bundle markers: bundle {} | manifest {}",
+                        short_opaque_marker(delivery.bundle_digest.as_str()),
+                        short_opaque_marker(delivery.manifest_digest.as_str()),
+                    ));
+                    lines.push(format!(
+                        "Delivery timestamps: created {} | updated {} | staged {} | committed {}",
+                        delivery.created_at_unix_ms,
+                        delivery.updated_at_unix_ms,
+                        optional_transfer_timestamp(delivery.staged_at_unix_ms),
+                        optional_transfer_timestamp(delivery.committed_at_unix_ms),
+                    ));
+                }
+            }
+            match &summary.continuation {
+                None => lines.push("Continuation: None".to_owned()),
+                Some(continuation) => {
+                    lines.push(format!(
+                        "Continuation: {:?} r{} | ref {} | receipt {}",
+                        continuation.state,
+                        continuation.revision.get(),
+                        short_opaque_marker(continuation.continuation_ref.as_str()),
+                        short_opaque_marker(continuation.receipt_ref.as_str()),
+                    ));
+                    lines.push(format!(
+                        "Source: run {} | provider {} | target {}",
+                        short_opaque_marker(continuation.source_run_id.as_str()),
+                        short_opaque_marker(continuation.source_provider.as_str()),
+                        short_opaque_marker(continuation.target_run_id.as_str()),
+                    ));
+                    lines.push(format!(
+                        "Continuation timestamps: prepared {} | exporting {} | exported {} | bound {}",
+                        continuation.prepared_at_unix_ms,
+                        optional_transfer_timestamp(continuation.exporting_at_unix_ms),
+                        optional_transfer_timestamp(continuation.exported_at_unix_ms),
+                        optional_transfer_timestamp(continuation.bound_at_unix_ms),
+                    ));
+                    lines.push(format!(
+                        "Continuation terminal: expired {} | outcome-unknown {} | reason {:?}",
+                        optional_transfer_timestamp(continuation.expired_at_unix_ms),
+                        optional_transfer_timestamp(continuation.outcome_unknown_at_unix_ms),
+                        continuation.outcome_unknown_reason,
+                    ));
+                    match &continuation.context {
+                        None => lines.push("Context transfer: None".to_owned()),
+                        Some(context) => {
+                            lines.push(format!(
+                                "Context: ref {} | digest {} | messages {}/{}",
+                                short_opaque_marker(context.context_ref.as_str()),
+                                short_opaque_marker(&context.digest),
+                                context.retained_message_count,
+                                context.source_message_count,
+                            ));
+                            lines.push(format!(
+                                "Context bytes: {} | truncated {}",
+                                context.byte_len,
+                                context.truncated,
+                            ));
+                        }
+                    }
+                }
+            }
+            lines
+        }
+    }
+}
+
 fn render_harness_task_detail(
     app: &App,
     area: Rect,
@@ -4156,9 +4271,12 @@ fn render_harness_task_detail(
                 } else {
                     "[Open monitor]"
                 };
+                let transfers_label = "[Transfers]";
                 let files_label = "[Files]";
                 let git_label = "[Git]";
-                let actions_width = (cell_width(files_label)
+                let actions_width = (cell_width(transfers_label)
+                    + 1
+                    + cell_width(files_label)
                     + 1
                     + cell_width(git_label)
                     + 1
@@ -4176,8 +4294,18 @@ fn render_harness_task_detail(
                 Paragraph::new(truncate_cells(&line, main_width as usize))
                     .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
                     .render(Rect::new(panel.x, panel.y, main_width, 1), buf);
+                let transfers_width = cell_width(transfers_label) as u16;
+                let transfers_rect = Rect::new(actions_x, panel.y, transfers_width, 1);
+                Paragraph::new(transfers_label)
+                    .style(Style::default().fg(theme.teal).bg(background))
+                    .render(transfers_rect, buf);
+                layout.hits.push(HitRegion {
+                    rect: transfers_rect,
+                    target: HitTarget::HarnessTaskDetailRunTransfers(run.run_id.clone()),
+                });
+                let files_x = transfers_rect.right().saturating_add(1);
                 let files_width = cell_width(files_label) as u16;
-                let files_rect = Rect::new(actions_x, panel.y, files_width, 1);
+                let files_rect = Rect::new(files_x, panel.y, files_width, 1);
                 Paragraph::new(files_label)
                     .style(Style::default().fg(theme.teal).bg(background))
                     .render(files_rect, buf);
@@ -4371,6 +4499,86 @@ fn render_harness_task_detail(
                 Paragraph::new("No run attempts; no agents are correlated")
                     .style(Style::default().fg(theme.muted).bg(theme.surface))
                     .render(body, buf);
+            }
+        }
+        HarnessTaskDetailSection::Transfers => {
+            let runs = app.harness_task_runs(&task.task_id);
+            if body.height == 0 {
+                return;
+            }
+            let selected = detail.selected_run.as_ref()
+                .and_then(|run_id| runs.iter().find(|run| &run.run_id == run_id).copied());
+            let selected_index = selected.and_then(|run| {
+                runs.iter().position(|candidate| candidate.run_id == run.run_id)
+            });
+            let toolbar = Rect::new(body.x, body.y, body.width, 1);
+            let mut x = render_toolbar_segment(
+                "[Refresh]",
+                toolbar.x,
+                toolbar,
+                Style::default().fg(if selected.is_some() { theme.teal } else { theme.muted }).bg(theme.surface),
+                selected.is_some().then_some(HitTarget::HarnessTransferRefresh),
+                buf,
+                layout,
+            ).saturating_add(1);
+            let can_previous = selected_index.is_some_and(|index| index > 0);
+            x = render_toolbar_segment(
+                "[Up]",
+                x,
+                toolbar,
+                Style::default().fg(if can_previous { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_previous.then_some(HitTarget::HarnessTransferPreviousRun),
+                buf,
+                layout,
+            ).saturating_add(1);
+            let can_next = selected_index.is_some_and(|index| index + 1 < runs.len());
+            let _ = render_toolbar_segment(
+                "[Down]",
+                x,
+                toolbar,
+                Style::default().fg(if can_next { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_next.then_some(HitTarget::HarnessTransferNextRun),
+                buf,
+                layout,
+            );
+            let Some(run) = selected else {
+                if body.height > 1 {
+                    Paragraph::new("Transfers: None | task has no selected run")
+                        .style(Style::default().fg(theme.muted).bg(theme.surface))
+                        .render(Rect::new(body.x, body.y + 1, body.width, 1), buf);
+                }
+                return;
+            };
+            let run_ref = crate::app::HarnessRunRef {
+                run_id: run.run_id.clone(),
+                run_revision: run.revision,
+            };
+            let mut lines = vec![format!(
+                "Exact run {} | revision r{} | lifecycle {:?}",
+                short_opaque_marker(run.run_id.as_str()),
+                run.revision.get(),
+                run.lifecycle,
+            )];
+            lines.extend(harness_transfer_lines(
+                app.harness_kanban.run_transfers.get(&run_ref),
+            ));
+            for (index, line) in lines.into_iter().enumerate() {
+                let y = body.y.saturating_add(1 + index as u16);
+                if y >= body.bottom() {
+                    break;
+                }
+                let color = if line.starts_with("Transfers: Error") {
+                    theme.yellow
+                } else if index == 0 || line.starts_with("Delivery:")
+                    || line.starts_with("Continuation:")
+                {
+                    theme.text
+                } else {
+                    theme.dim
+                };
+                Paragraph::new(truncate_cells(&line, body.width as usize))
+                    .style(Style::default().fg(color).bg(theme.surface))
+                    .render(Rect::new(body.x, y, body.width, 1), buf);
             }
         }
         HarnessTaskDetailSection::Files => {
@@ -8790,9 +8998,15 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 mod tests {
     use super::*;
     use gate4agent_harness_client::{
+        HarnessContinuationRef, HarnessContinuationStateV1, HarnessDeliveryBundleDigestV1,
+        HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1,
+        HarnessDeliveryManifestDigestV2, HarnessDeliveryRef, HarnessDeliveryStateV1,
         HarnessExecutionModeV1, HarnessExecutionSpecId, HarnessLaunchAuthorityRefV1,
         HarnessLaunchPlanRefV1, HarnessLaunchPlanSummaryV1, HarnessRequestDigest,
-        HarnessRevision, HarnessRunId, HarnessRunLifecycleV1, HarnessScheduledLaunchRefV2,
+        HarnessReceiptRef, HarnessRevision, HarnessRunContextTransferV1,
+        HarnessRunContinuationTransferV1, HarnessRunDeliveryTransferV1, HarnessRunId,
+        HarnessRunLifecycleV1, HarnessRunTransferSummaryV1, HarnessScheduledLaunchRefV2,
+        HarnessSelectorV1,
         HarnessTaskExecutionSpecV1, HarnessTaskReviewPolicyV1, HarnessWorktreeIntentV1,
         HarnessTaskId, HarnessTaskStateV1, RedactedBindingStateV1,
         RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1,
@@ -8852,6 +9066,75 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rich_harness_transfer(run: &RedactedRunV1) -> HarnessRunTransferSummaryV1 {
+        HarnessRunTransferSummaryV1 {
+            run_id: run.run_id.clone(),
+            run_revision: run.revision,
+            delivery: Some(HarnessRunDeliveryTransferV1 {
+                delivery_ref: HarnessDeliveryRef::new(format!(
+                    "hdelivery_{}",
+                    "b".repeat(24),
+                )).unwrap(),
+                revision: HarnessRevision::new(3).unwrap(),
+                state: HarnessDeliveryStateV1::Committed,
+                selector: HarnessSelectorV1::new("delivery-safe").unwrap(),
+                bundle_id: HarnessDeliveryBundleIdV1::new("bundle-safe").unwrap(),
+                bundle_revision: HarnessDeliveryBundleRevisionV1::new("revision-4").unwrap(),
+                bundle_digest: HarnessDeliveryBundleDigestV1::new(format!(
+                    "sha256:{}",
+                    "c".repeat(64),
+                )).unwrap(),
+                manifest_digest: HarnessDeliveryManifestDigestV2::new(format!(
+                    "sha256:{}",
+                    "d".repeat(64),
+                )).unwrap(),
+                receipt_ref: Some(HarnessReceiptRef::new(format!(
+                    "hreceipt_{}",
+                    "e".repeat(24),
+                )).unwrap()),
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 30,
+                staged_at_unix_ms: Some(20),
+                committed_at_unix_ms: Some(30),
+            }),
+            continuation: Some(HarnessRunContinuationTransferV1 {
+                continuation_ref: HarnessContinuationRef::new(format!(
+                    "hcontinuation_{}",
+                    "f".repeat(24),
+                )).unwrap(),
+                receipt_ref: HarnessReceiptRef::new(format!(
+                    "hreceipt_{}",
+                    "0".repeat(24),
+                )).unwrap(),
+                revision: HarnessRevision::new(4).unwrap(),
+                state: HarnessContinuationStateV1::Bound,
+                source_run_id: HarnessRunId::new(format!(
+                    "hrun_{}",
+                    "1".repeat(24),
+                )).unwrap(),
+                target_run_id: run.run_id.clone(),
+                source_provider: HarnessSelectorV1::new("claude").unwrap(),
+                context: Some(HarnessRunContextTransferV1 {
+                    context_ref: HarnessSelectorV1::new("context-safe").unwrap(),
+                    digest: format!("sha256:{}", "2".repeat(64)),
+                    source_message_count: 12,
+                    retained_message_count: 8,
+                    byte_len: 4096,
+                    truncated: true,
+                }),
+                prepared_at_unix_ms: 10,
+                exporting_at_unix_ms: Some(15),
+                exported_at_unix_ms: Some(20),
+                bound_at_unix_ms: Some(25),
+                expired_at_unix_ms: None,
+                outcome_unknown_at_unix_ms: None,
+                outcome_unknown_reason: None,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 25,
+            }),
+        }
     }
 
     fn rich_harness_monitor(run_id: HarnessRunId) -> HarnessSessionMonitorV1 {
@@ -9214,6 +9497,180 @@ mod tests {
         assert!(loaded_agents_layout.hits.iter().any(|hit| {
             matches!(hit.target, HitTarget::HarnessTaskDetailRunGit(_))
         }));
+    }
+
+    #[test]
+    fn harness_task_detail_transfers_render_explicit_states_and_mouse_controls() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let task = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_121212121212121212121212").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "transfer states".to_owned(),
+            body: String::new(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let run = RedactedRunV1 {
+            run_id: HarnessRunId::new("hrun_343434343434343434343434").unwrap(),
+            revision: HarnessRevision::new(7).unwrap(),
+            parent_run_id: None,
+            task_id: Some(task.task_id.clone()),
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: true,
+                has_continuation: true,
+            },
+            lifecycle: HarnessRunLifecycleV1::Running,
+            binding: RedactedBindingStateV1::ManagedActive,
+            result_disposition: None,
+            failure_category: None,
+            references_redacted: false,
+            created_at_unix_ms: 2,
+            updated_at_unix_ms: 2,
+        };
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![run.clone()]);
+        app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
+            task_id: task.task_id,
+            section: crate::app::HarnessTaskDetailSection::Transfers,
+            selected_run: Some(run.run_id.clone()),
+            scroll: 0,
+        });
+        let run_ref = crate::app::HarnessRunRef {
+            run_id: run.run_id,
+            run_revision: run.revision,
+        };
+
+        let mut none_buf = TerminalBuffer::new(160, 28);
+        let none_layout = render(&app, &mut none_buf);
+        let none_text = buffer_text(&none_buf);
+        assert!(none_text.contains("Transfers: None | not loaded for this exact run revision"), "{none_text}");
+        assert!(none_text.contains("[Refresh] [Up] [Down]"), "{none_text}");
+        assert!(none_layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessTransferRefresh));
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+        assert_eq!(app.surface.all_tabs().iter().filter(|tab| ***tab == SurfaceTab::AgentBoard).count(), 1);
+
+        app.harness_kanban.run_transfers.insert(
+            run_ref.clone(),
+            crate::app::HarnessRunTransferState::Loading { token: 41 },
+        );
+        let mut loading_buf = TerminalBuffer::new(160, 28);
+        render(&app, &mut loading_buf);
+        let loading_text = buffer_text(&loading_buf);
+        assert!(loading_text.contains("Transfers: Loading exact run-local summary"), "{loading_text}");
+
+        app.harness_kanban.run_transfers.insert(
+            run_ref,
+            crate::app::HarnessRunTransferState::Error {
+                token: 41,
+                message: "Harness transfer unavailable".to_owned(),
+            },
+        );
+        let mut error_buf = TerminalBuffer::new(160, 28);
+        render(&app, &mut error_buf);
+        let error_text = buffer_text(&error_buf);
+        assert!(error_text.contains("Transfers: Error | Harness transfer unavailable"), "{error_text}");
+    }
+
+    #[test]
+    fn harness_task_detail_transfers_render_safe_run_local_receipts() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let mut task = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_565656565656565656565656").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "safe transfer receipt".to_owned(),
+            body: String::new(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let run = RedactedRunV1 {
+            run_id: HarnessRunId::new("hrun_787878787878787878787878").unwrap(),
+            revision: HarnessRevision::new(9).unwrap(),
+            parent_run_id: None,
+            task_id: Some(task.task_id.clone()),
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: true,
+                has_continuation: true,
+            },
+            lifecycle: HarnessRunLifecycleV1::Running,
+            binding: RedactedBindingStateV1::ManagedActive,
+            result_disposition: None,
+            failure_category: None,
+            references_redacted: false,
+            created_at_unix_ms: 2,
+            updated_at_unix_ms: 2,
+        };
+        task.run_ids.push(run.run_id.clone());
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![run.clone()]);
+        app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
+            task_id: task.task_id,
+            section: crate::app::HarnessTaskDetailSection::Transfers,
+            selected_run: Some(run.run_id.clone()),
+            scroll: 0,
+        });
+        let summary = rich_harness_transfer(&run);
+        summary.validate().unwrap();
+        app.harness_kanban.run_transfers.insert(
+            crate::app::HarnessRunRef {
+                run_id: run.run_id,
+                run_revision: run.revision,
+            },
+            crate::app::HarnessRunTransferState::Ready(summary),
+        );
+
+        let mut buf = TerminalBuffer::new(220, 32);
+        let layout = render(&app, &mut buf);
+        let text = buffer_text(&buf);
+        for expected in [
+            "Delivery: Committed r3",
+            "Bundle: selector delivery-safe | id bundle-safe | revision revision-4",
+            "Delivery timestamps: created 10 | updated 30 | staged 20 | committed 30",
+            "Continuation: Bound r4",
+            "Source: run hrun_1111111...111111 | provider claude",
+            "Continuation timestamps: prepared 10 | exporting 15 | exported 20 | bound 25",
+            "Context: ref context-safe",
+            "messages 8/12",
+            "Context bytes: 4096 | truncated true",
+        ] {
+            assert!(text.contains(expected), "missing transfer field {expected}: {text}");
+        }
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessTransferRefresh));
+        assert!(!text.contains(&format!("sha256:{}", "c".repeat(64))), "{text}");
+        for forbidden in [
+            "C:\\private\\workspace",
+            "RAW_PAYLOAD_CANARY",
+            "provider-session-secret",
+        ] {
+            assert!(!text.contains(forbidden), "private transfer field rendered: {text}");
+        }
     }
 
     #[test]

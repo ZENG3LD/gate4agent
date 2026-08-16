@@ -718,6 +718,27 @@ async fn schedule_next_delivery_stages_materializes_and_does_not_resend() {
     sleep(Duration::from_millis(300)).await;
     assert_eq!(client.run_get(run_id.clone()).unwrap().lifecycle, HarnessRunLifecycleV1::Running);
     assert_eq!(client.task_get(child_task_id()).unwrap().state, HarnessTaskStateV1::Running);
+    let transfer = client.run_transfer_get(run_id.clone()).unwrap();
+    let delivery_transfer = transfer.delivery.as_ref().expect("committed delivery transfer");
+    assert_eq!(
+        delivery_transfer.state,
+        gate4agent_harness_protocol::HarnessDeliveryStateV1::Committed,
+    );
+    assert!(delivery_transfer.receipt_ref.is_some());
+    assert!(delivery_transfer.staged_at_unix_ms.is_some());
+    assert!(delivery_transfer.committed_at_unix_ms.is_some());
+    assert!(transfer.continuation.is_none());
+    let transfer_wire = serde_json::to_string(&transfer).unwrap();
+    let workspace_display = workspace.to_string_lossy();
+    let source_display = source.to_string_lossy();
+    let skill_display = String::from_utf8_lossy(&skill);
+    for private in [
+        workspace_display.as_ref(),
+        source_display.as_ref(),
+        skill_display.as_ref(),
+    ] {
+        assert!(!transfer_wire.contains(private));
+    }
     assert_eq!(inventory(&delivery_store), before_restart_store);
     assert_eq!(fs::read_dir(&materialization).unwrap()
         .filter_map(Result::ok).filter(|entry| entry.path().is_dir()).count(), 1);

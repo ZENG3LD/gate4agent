@@ -21,7 +21,8 @@ use crate::{
     PreparedScheduledSpawnLease,
 };
 use crate::dispatch::{
-    deterministic_dispatch_ids, deterministic_lifecycle_authority_ids,
+    deterministic_dispatch_ids, deterministic_issued_dispatch_ids,
+    deterministic_lifecycle_authority_ids,
     exact_bound_control_lifecycle,
     HarnessLaunchCatalog, HarnessLifecycleEventKindV1, HarnessLifecycleProjectionV1,
 };
@@ -78,7 +79,8 @@ use gate4agent_harness_protocol::{
     HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskStateV1,
     HarnessRuntimeIdentityV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
     HarnessContextSourceSelectionV1, HarnessRequestDigest,
-    HarnessWorktreeIntentV1,
+    HarnessWorktreeIntentV1, HarnessContinuationV1, HarnessDeliveryV1,
+    HarnessTransferAuthorityRefV1,
 };
 use gate4agent_node_wire::{local_hmac_sha256, proofs_match};
 use gate4agent_node_protocol::{
@@ -623,6 +625,72 @@ enum PendingCoordinatorSpawn {
     Managed(PendingManagedWorktreeSpawnDispatch),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptedSpawnTransition {
+    Plain,
+    Delivery,
+    Continuation,
+    DeliveryAndContinuation,
+    HarnessMcp,
+    HarnessMcpDelivery,
+    HarnessMcpContinuation,
+    HarnessMcpDeliveryAndContinuation,
+}
+
+fn accepted_spawn_transition(
+    plan: &crate::dispatch::HarnessLaunchPlanV1,
+    issued_operator_transfer_authority: bool,
+    has_delivery: bool,
+    has_continuation: bool,
+) -> Result<AcceptedSpawnTransition, HarnessRuntimeError> {
+    let issued_ordinary = plan.is_ordinary_dispatch()
+        && matches!(plan.grant, crate::dispatch::HarnessGrantPolicyV1::Operator)
+        && issued_operator_transfer_authority;
+    if !issued_ordinary
+        && (plan.delivery.is_some() != has_delivery
+            || (plan.continuation
+                == crate::dispatch::HarnessContinuationPolicyV1::ParentRun)
+                != has_continuation)
+    {
+        return Err(HarnessRuntimeError::DispatchPreparation);
+    }
+    let harness_mcp = plan.harness_mcp == crate::dispatch::HarnessMcpPolicyV1::GrantBound;
+    Ok(match (harness_mcp, has_delivery, has_continuation) {
+        (false, false, false) => AcceptedSpawnTransition::Plain,
+        (false, true, false) => AcceptedSpawnTransition::Delivery,
+        (false, false, true) => AcceptedSpawnTransition::Continuation,
+        (false, true, true) => AcceptedSpawnTransition::DeliveryAndContinuation,
+        (true, false, false) => AcceptedSpawnTransition::HarnessMcp,
+        (true, true, false) => AcceptedSpawnTransition::HarnessMcpDelivery,
+        (true, false, true) => AcceptedSpawnTransition::HarnessMcpContinuation,
+        (true, true, true) => AcceptedSpawnTransition::HarnessMcpDeliveryAndContinuation,
+    })
+}
+
+fn has_issued_operator_transfer_authority(
+    delivery: Option<&HarnessDeliveryV1>,
+    continuation: Option<&HarnessContinuationV1>,
+) -> bool {
+    let mut issuance = None;
+    for authority in [
+        delivery.map(|delivery| &delivery.authority),
+        continuation.map(|continuation| &continuation.authority),
+    ].into_iter().flatten() {
+        let HarnessTransferAuthorityRefV1::OperatorIssuance {
+            issuance: candidate,
+        } = authority else {
+            return false;
+        };
+        if let Some(expected) = issuance {
+            if expected != candidate {
+                return false;
+            }
+        }
+        issuance = Some(candidate);
+    }
+    issuance.is_some()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActiveDispatchJob {
     operation_id: HarnessOperationId,
@@ -730,152 +798,33 @@ fn apply_spawn_result(
                 .ok_or(HarnessRuntimeError::DispatchPreparation)?;
             let plan = launch_catalog.resolve_scheduled(scheduled)
                 .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
-            if plan.harness_mcp == crate::dispatch::HarnessMcpPolicyV1::GrantBound {
-                let has_continuation = plan.continuation
-                    == crate::dispatch::HarnessContinuationPolicyV1::ParentRun;
-                let continuation = has_continuation.then(|| {
-                    harness.engine().continuation_for_run(run_id)
-                        .cloned()
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)
-                }).transpose()?;
-                if let Some(continuation) = &continuation {
-                    next_run.continuation_receipt = Some(continuation.receipt_ref.clone());
-                }
-                if plan.delivery.is_some() {
-                    let ids = deterministic_dispatch_ids(operation_id, plan)
-                        .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
-                    let receipt_ref = ids.delivery_receipt_ref
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
-                    next_run.delivery_receipt = Some(receipt_ref.clone());
-                    let binding = next_run.binding.clone()
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
-                    let mut delivery = harness.engine().delivery_for_run(run_id)
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?
-                        .clone();
-                    let expected_delivery_revision = delivery.revision;
-                    delivery.revision = next_runtime_revision(delivery.revision)?;
-                    delivery.state = gate4agent_harness_protocol::HarnessDeliveryStateV1::Committed;
-                    delivery.receipt = Some(crate::delivery::terminal_receipt(
-                        &delivery,
-                        receipt_ref,
-                        binding,
-                        now_unix_ms,
-                    )?);
-                    delivery.updated_at_unix_ms = now_unix_ms;
-                    if let Some(continuation) = continuation {
-                        harness.transition_run_with_accepted_harness_mcp_spawn_delivery_and_continuation(
-                            run.revision,
-                            next_run,
-                            operation.revision,
-                            next_operation,
-                            expected_delivery_revision,
-                            delivery,
-                            &continuation.continuation_ref,
-                            continuation.revision,
-                            &proof,
-                            now_unix_ms,
-                        ).map(|()| None).map_err(HarnessRuntimeError::Harness)
-                    } else {
-                        harness.transition_run_with_accepted_harness_mcp_spawn_and_delivery(
-                            run.revision,
-                            next_run,
-                            operation.revision,
-                            next_operation,
-                            expected_delivery_revision,
-                            delivery,
-                            &proof,
-                            now_unix_ms,
-                        ).map(|()| None).map_err(HarnessRuntimeError::Harness)
-                    }
-                } else if let Some(continuation) = continuation {
-                    harness.transition_run_with_accepted_harness_mcp_spawn_and_continuation(
-                        run.revision,
-                        next_run,
-                        operation.revision,
-                        next_operation,
-                        &continuation.continuation_ref,
-                        continuation.revision,
-                        &proof,
-                        now_unix_ms,
-                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
-                } else {
-                    harness.transition_run_with_accepted_harness_mcp_spawn(
-                        run.revision,
-                        next_run,
-                        operation.revision,
-                        next_operation,
-                        &proof,
-                        now_unix_ms,
-                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
-                }
-            } else if plan.continuation == crate::dispatch::HarnessContinuationPolicyV1::ParentRun
-                && plan.harness_mcp == crate::dispatch::HarnessMcpPolicyV1::Disabled
-            {
-                let continuation = harness.engine().continuation_for_run(run_id)
-                    .ok_or(HarnessRuntimeError::DispatchPreparation)?
-                    .clone();
-                let continuation_ref = continuation.continuation_ref.clone();
-                let expected_continuation_revision = continuation.revision;
+            let delivery = harness.engine().delivery_for_run(run_id).cloned();
+            let continuation = harness.engine().continuation_for_run(run_id).cloned();
+            let has_delivery = delivery.is_some();
+            let has_continuation = continuation.is_some();
+            let transition = accepted_spawn_transition(
+                plan,
+                has_issued_operator_transfer_authority(
+                    delivery.as_ref(),
+                    continuation.as_ref(),
+                ),
+                has_delivery,
+                has_continuation,
+            )?;
+            let ids = deterministic_issued_dispatch_ids(
+                operation_id,
+                has_delivery,
+                has_continuation,
+            ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+            if let Some(continuation) = &continuation {
                 next_run.continuation_receipt = Some(continuation.receipt_ref.clone());
-                if plan.delivery.is_some() {
-                    let ids = deterministic_dispatch_ids(operation_id, plan)
-                        .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
-                    let receipt_ref = ids.delivery_receipt_ref
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
-                    next_run.delivery_receipt = Some(receipt_ref.clone());
-                    let binding = next_run.binding.clone()
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
-                    let mut delivery = harness.engine().delivery_for_run(run_id)
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?
-                        .clone();
-                    let expected_delivery_revision = delivery.revision;
-                    delivery.revision = next_runtime_revision(delivery.revision)?;
-                    delivery.state = gate4agent_harness_protocol::HarnessDeliveryStateV1::Committed;
-                    delivery.receipt = Some(crate::delivery::terminal_receipt(
-                        &delivery,
-                        receipt_ref,
-                        binding,
-                        now_unix_ms,
-                    )?);
-                    delivery.updated_at_unix_ms = now_unix_ms;
-                    harness.transition_run_with_accepted_spawn_delivery_and_continuation(
-                        run.revision,
-                        next_run,
-                        operation.revision,
-                        next_operation,
-                        expected_delivery_revision,
-                        delivery,
-                        &continuation_ref,
-                        expected_continuation_revision,
-                        &proof,
-                        now_unix_ms,
-                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
-                } else {
-                    harness.transition_run_with_accepted_spawn_and_continuation(
-                        run.revision,
-                        next_run,
-                        operation.revision,
-                        next_operation,
-                        &continuation_ref,
-                        expected_continuation_revision,
-                        &proof,
-                        now_unix_ms,
-                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
-                }
-            } else if plan.delivery.is_some()
-                && plan.continuation == crate::dispatch::HarnessContinuationPolicyV1::None
-                && plan.harness_mcp == crate::dispatch::HarnessMcpPolicyV1::Disabled
-            {
-                let ids = deterministic_dispatch_ids(operation_id, plan)
-                    .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+            }
+            let committed_delivery = if let Some(mut delivery) = delivery {
                 let receipt_ref = ids.delivery_receipt_ref
                     .ok_or(HarnessRuntimeError::DispatchPreparation)?;
                 next_run.delivery_receipt = Some(receipt_ref.clone());
                 let binding = next_run.binding.clone()
                     .ok_or(HarnessRuntimeError::DispatchPreparation)?;
-                let mut delivery = harness.engine().delivery_for_run(run_id)
-                    .ok_or(HarnessRuntimeError::DispatchPreparation)?
-                    .clone();
                 let expected_delivery_revision = delivery.revision;
                 delivery.revision = next_runtime_revision(delivery.revision)?;
                 delivery.state = gate4agent_harness_protocol::HarnessDeliveryStateV1::Committed;
@@ -886,23 +835,119 @@ fn apply_spawn_result(
                     now_unix_ms,
                 )?);
                 delivery.updated_at_unix_ms = now_unix_ms;
-                harness.transition_run_with_accepted_spawn_and_delivery(
-                    run.revision,
-                    next_run,
-                    operation.revision,
-                    next_operation,
-                    expected_delivery_revision,
-                    delivery,
-                    &proof,
-                ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                Some((expected_delivery_revision, delivery))
             } else {
-                harness.transition_run_with_accepted_spawn(
+                None
+            };
+            match transition {
+                AcceptedSpawnTransition::Plain => harness.transition_run_with_accepted_spawn(
                     run.revision,
                     next_run,
                     operation.revision,
                     next_operation,
                     &proof,
-                ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                ).map(|()| None).map_err(HarnessRuntimeError::Harness),
+                AcceptedSpawnTransition::Delivery => {
+                    let (expected_delivery_revision, delivery) = committed_delivery
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    harness.transition_run_with_accepted_spawn_and_delivery(
+                        run.revision,
+                        next_run,
+                        operation.revision,
+                        next_operation,
+                        expected_delivery_revision,
+                        delivery,
+                        &proof,
+                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                }
+                AcceptedSpawnTransition::Continuation => {
+                    let continuation = continuation.as_ref()
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    harness.transition_run_with_accepted_spawn_and_continuation(
+                        run.revision,
+                        next_run,
+                        operation.revision,
+                        next_operation,
+                        &continuation.continuation_ref,
+                        continuation.revision,
+                        &proof,
+                        now_unix_ms,
+                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                }
+                AcceptedSpawnTransition::DeliveryAndContinuation => {
+                    let (expected_delivery_revision, delivery) = committed_delivery
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    let continuation = continuation.as_ref()
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    harness.transition_run_with_accepted_spawn_delivery_and_continuation(
+                        run.revision,
+                        next_run,
+                        operation.revision,
+                        next_operation,
+                        expected_delivery_revision,
+                        delivery,
+                        &continuation.continuation_ref,
+                        continuation.revision,
+                        &proof,
+                        now_unix_ms,
+                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                }
+                AcceptedSpawnTransition::HarnessMcp => {
+                    harness.transition_run_with_accepted_harness_mcp_spawn(
+                        run.revision,
+                        next_run,
+                        operation.revision,
+                        next_operation,
+                        &proof,
+                        now_unix_ms,
+                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                }
+                AcceptedSpawnTransition::HarnessMcpDelivery => {
+                    let (expected_delivery_revision, delivery) = committed_delivery
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    harness.transition_run_with_accepted_harness_mcp_spawn_and_delivery(
+                        run.revision,
+                        next_run,
+                        operation.revision,
+                        next_operation,
+                        expected_delivery_revision,
+                        delivery,
+                        &proof,
+                        now_unix_ms,
+                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                }
+                AcceptedSpawnTransition::HarnessMcpContinuation => {
+                    let continuation = continuation.as_ref()
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    harness.transition_run_with_accepted_harness_mcp_spawn_and_continuation(
+                        run.revision,
+                        next_run,
+                        operation.revision,
+                        next_operation,
+                        &continuation.continuation_ref,
+                        continuation.revision,
+                        &proof,
+                        now_unix_ms,
+                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                }
+                AcceptedSpawnTransition::HarnessMcpDeliveryAndContinuation => {
+                    let (expected_delivery_revision, delivery) = committed_delivery
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    let continuation = continuation.as_ref()
+                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    harness.transition_run_with_accepted_harness_mcp_spawn_delivery_and_continuation(
+                        run.revision,
+                        next_run,
+                        operation.revision,
+                        next_operation,
+                        expected_delivery_revision,
+                        delivery,
+                        &continuation.continuation_ref,
+                        continuation.revision,
+                        &proof,
+                        now_unix_ms,
+                    ).map(|()| None).map_err(HarnessRuntimeError::Harness)
+                }
             }
         }
         CoordinatorSpawnResult::Rejected(_) | CoordinatorSpawnResult::Failed => {
@@ -1088,6 +1133,23 @@ fn commit_lifecycle_projection(
     }
     let task = harness.engine().task(&run.task_id)
         .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+    let projected_run_lifecycle = match projection {
+        HarnessLifecycleProjectionV1::Running => HarnessRunLifecycleV1::Running,
+        HarnessLifecycleProjectionV1::Waiting => HarnessRunLifecycleV1::Waiting,
+        HarnessLifecycleProjectionV1::CompletedReview => HarnessRunLifecycleV1::Completed,
+        HarnessLifecycleProjectionV1::Failed => HarnessRunLifecycleV1::Failed,
+        HarnessLifecycleProjectionV1::Cancelled => HarnessRunLifecycleV1::Cancelled,
+    };
+    let projected_task_state = match projection {
+        HarnessLifecycleProjectionV1::Running => HarnessTaskStateV1::Running,
+        HarnessLifecycleProjectionV1::Waiting => HarnessTaskStateV1::Waiting,
+        HarnessLifecycleProjectionV1::CompletedReview => HarnessTaskStateV1::Review,
+        HarnessLifecycleProjectionV1::Failed => HarnessTaskStateV1::Failed,
+        HarnessLifecycleProjectionV1::Cancelled => HarnessTaskStateV1::Cancelled,
+    };
+    if run.lifecycle == projected_run_lifecycle && task.state == projected_task_state {
+        return Ok(());
+    }
     let ids = deterministic_lifecycle_authority_ids(
         &run.run_id,
         node_id,
@@ -1102,13 +1164,7 @@ fn commit_lifecycle_projection(
     let mut next_run = run.clone();
     next_run.revision = next_runtime_revision(run.revision)?;
     next_run.updated_at_unix_ms = committed_at;
-    next_run.lifecycle = match projection {
-        HarnessLifecycleProjectionV1::Running => HarnessRunLifecycleV1::Running,
-        HarnessLifecycleProjectionV1::Waiting => HarnessRunLifecycleV1::Waiting,
-        HarnessLifecycleProjectionV1::CompletedReview => HarnessRunLifecycleV1::Completed,
-        HarnessLifecycleProjectionV1::Failed => HarnessRunLifecycleV1::Failed,
-        HarnessLifecycleProjectionV1::Cancelled => HarnessRunLifecycleV1::Cancelled,
-    };
+    next_run.lifecycle = projected_run_lifecycle;
     match projection {
         HarnessLifecycleProjectionV1::CompletedReview => {
             next_run.result_disposition = Some(HarnessResultDispositionV1::Succeeded);
@@ -1128,13 +1184,7 @@ fn commit_lifecycle_projection(
     let mut next_task = task.clone();
     next_task.revision = next_runtime_revision(task.revision)?;
     next_task.updated_at_unix_ms = committed_at;
-    next_task.state = match projection {
-        HarnessLifecycleProjectionV1::Running => HarnessTaskStateV1::Running,
-        HarnessLifecycleProjectionV1::Waiting => HarnessTaskStateV1::Waiting,
-        HarnessLifecycleProjectionV1::CompletedReview => HarnessTaskStateV1::Review,
-        HarnessLifecycleProjectionV1::Failed => HarnessTaskStateV1::Failed,
-        HarnessLifecycleProjectionV1::Cancelled => HarnessTaskStateV1::Cancelled,
-    };
+    next_task.state = projected_task_state;
     let operation = HarnessOperationV1 {
         operation_id: ids.operation_id,
         revision: HarnessRevision::new(1)
@@ -4139,7 +4189,12 @@ impl HarnessRuntimeInventoryCache {
                     && current.generation == active.generation
             })
         });
-        if record.state == HarnessRuntimeManagedStateV1::Live && exact_active {
+        if matches!(
+            record.state,
+            HarnessRuntimeManagedStateV1::Live
+                | HarnessRuntimeManagedStateV1::IdentityPending
+        ) && exact_active
+        {
             return (HarnessRunCorrelationAvailabilityV1::Available, observed_at);
         }
         if active_session.is_none()
@@ -6348,7 +6403,8 @@ mod tests {
         HarnessEngine, HarnessEngineCheckpointV1, HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
     };
     use gate4agent_types::{
-        AgentId, AgentInstanceId, ProviderActivity, SessionGeneration, TransportKind,
+        AgentId, AgentInstanceId, ProviderActivity, SessionGeneration, TerminalSize,
+        TransportKind,
     };
 
     fn database_path() -> PathBuf {
@@ -6412,6 +6468,223 @@ mod tests {
                 continuation: None,
             },
         }
+    }
+
+    fn accepted_transition_plan(
+        has_delivery: bool,
+        has_continuation: bool,
+        harness_mcp: crate::dispatch::HarnessMcpPolicyV1,
+    ) -> crate::dispatch::HarnessLaunchPlanV1 {
+        let privileged = has_delivery
+            || has_continuation
+            || harness_mcp == crate::dispatch::HarnessMcpPolicyV1::GrantBound;
+        let plan = crate::dispatch::HarnessLaunchPlanV1 {
+            plan_id: selector("accepted-transition"),
+            revision: HarnessRevision::new(1).unwrap(),
+            node_id: selector("node-a"),
+            workspace_id: selector("workspace-a"),
+            worktree: gate4agent_harness_protocol::HarnessWorktreeIntentV1::Existing,
+            provider_profile: selector("codex-default"),
+            provider: AgentId::new("codex").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+            terminal_size: TerminalSize {
+                rows: 40,
+                columns: 120,
+            },
+            prompt_source: crate::dispatch::HarnessPromptSourceV1::TaskBody,
+            delivery: has_delivery.then(|| crate::dispatch::HarnessDeliveryPolicyV1 {
+                selector: selector("skills"),
+                bundle_id: SpawnBundleId::new("skills-bundle").unwrap(),
+            }),
+            continuation: if has_continuation {
+                crate::dispatch::HarnessContinuationPolicyV1::ParentRun
+            } else {
+                crate::dispatch::HarnessContinuationPolicyV1::None
+            },
+            grant: if privileged {
+                crate::dispatch::HarnessGrantPolicyV1::Exact {
+                    grant_id: SessionGrantId::new(format!(
+                        "hgrant_{}",
+                        "e".repeat(24),
+                    )).unwrap(),
+                    revision: HarnessRevision::new(1).unwrap(),
+                }
+            } else {
+                crate::dispatch::HarnessGrantPolicyV1::Operator
+            },
+            harness_mcp,
+            deadline_ms: 30_000,
+        };
+        plan.validate().unwrap();
+        plan
+    }
+
+    #[test]
+    fn issued_operator_transfer_authority_selects_accepted_transition() {
+        let ordinary = accepted_transition_plan(
+            false,
+            false,
+            crate::dispatch::HarnessMcpPolicyV1::Disabled,
+        );
+
+        for (has_delivery, has_continuation, expected) in [
+            (true, false, AcceptedSpawnTransition::Delivery),
+            (false, true, AcceptedSpawnTransition::Continuation),
+            (true, true, AcceptedSpawnTransition::DeliveryAndContinuation),
+        ] {
+            assert_eq!(
+                accepted_spawn_transition(
+                    &ordinary,
+                    true,
+                    has_delivery,
+                    has_continuation,
+                ).unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_accepted_transition_paths_are_unchanged_and_mismatches_fail_closed() {
+        let cases = [
+            (
+                false,
+                false,
+                crate::dispatch::HarnessMcpPolicyV1::Disabled,
+                AcceptedSpawnTransition::Plain,
+            ),
+            (
+                true,
+                false,
+                crate::dispatch::HarnessMcpPolicyV1::Disabled,
+                AcceptedSpawnTransition::Delivery,
+            ),
+            (
+                false,
+                true,
+                crate::dispatch::HarnessMcpPolicyV1::Disabled,
+                AcceptedSpawnTransition::Continuation,
+            ),
+            (
+                true,
+                true,
+                crate::dispatch::HarnessMcpPolicyV1::Disabled,
+                AcceptedSpawnTransition::DeliveryAndContinuation,
+            ),
+            (
+                false,
+                false,
+                crate::dispatch::HarnessMcpPolicyV1::GrantBound,
+                AcceptedSpawnTransition::HarnessMcp,
+            ),
+            (
+                true,
+                false,
+                crate::dispatch::HarnessMcpPolicyV1::GrantBound,
+                AcceptedSpawnTransition::HarnessMcpDelivery,
+            ),
+            (
+                false,
+                true,
+                crate::dispatch::HarnessMcpPolicyV1::GrantBound,
+                AcceptedSpawnTransition::HarnessMcpContinuation,
+            ),
+            (
+                true,
+                true,
+                crate::dispatch::HarnessMcpPolicyV1::GrantBound,
+                AcceptedSpawnTransition::HarnessMcpDeliveryAndContinuation,
+            ),
+        ];
+        for (has_delivery, has_continuation, harness_mcp, expected) in cases {
+            let plan = accepted_transition_plan(
+                has_delivery,
+                has_continuation,
+                harness_mcp,
+            );
+            assert_eq!(
+                accepted_spawn_transition(
+                    &plan,
+                    false,
+                    has_delivery,
+                    has_continuation,
+                ).unwrap(),
+                expected,
+            );
+        }
+
+        let ordinary = accepted_transition_plan(
+            false,
+            false,
+            crate::dispatch::HarnessMcpPolicyV1::Disabled,
+        );
+        for (has_delivery, has_continuation) in [
+            (false, false),
+            (true, false),
+            (false, true),
+            (true, true),
+        ] {
+            let result = accepted_spawn_transition(
+                &ordinary,
+                false,
+                has_delivery,
+                has_continuation,
+            );
+            if !has_delivery && !has_continuation {
+                assert_eq!(result.unwrap(), AcceptedSpawnTransition::Plain);
+            } else {
+                assert!(matches!(result, Err(HarnessRuntimeError::DispatchPreparation)));
+            }
+        }
+
+        let legacy_delivery = accepted_transition_plan(
+            true,
+            false,
+            crate::dispatch::HarnessMcpPolicyV1::Disabled,
+        );
+        assert!(matches!(
+            accepted_spawn_transition(&legacy_delivery, false, false, false),
+            Err(HarnessRuntimeError::DispatchPreparation),
+        ));
+        assert!(matches!(
+            accepted_spawn_transition(&legacy_delivery, false, true, true),
+            Err(HarnessRuntimeError::DispatchPreparation),
+        ));
+        let mut legacy_exact = accepted_transition_plan(
+            false,
+            false,
+            crate::dispatch::HarnessMcpPolicyV1::Disabled,
+        );
+        legacy_exact.grant = crate::dispatch::HarnessGrantPolicyV1::Exact {
+            grant_id: SessionGrantId::new(format!(
+                "hgrant_{}",
+                "f".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+        };
+        legacy_exact.validate().unwrap();
+        assert!(matches!(
+            accepted_spawn_transition(&legacy_exact, false, true, false),
+            Err(HarnessRuntimeError::DispatchPreparation),
+        ));
+    }
+
+    #[test]
+    fn issued_transfer_ids_equal_legacy_transfer_ids() {
+        let operation_id = HarnessOperationId::new(format!(
+            "hop_{}",
+            "e".repeat(24),
+        )).unwrap();
+        let legacy = accepted_transition_plan(
+            true,
+            true,
+            crate::dispatch::HarnessMcpPolicyV1::Disabled,
+        );
+
+        assert_eq!(
+            deterministic_issued_dispatch_ids(&operation_id, true, true).unwrap(),
+            deterministic_dispatch_ids(&operation_id, &legacy).unwrap(),
+        );
     }
 
     #[test]
@@ -7095,6 +7368,67 @@ mod tests {
     }
 
     #[test]
+    fn run_correlation_projects_identity_pending_exact_active_binding_as_available() {
+        let (harness, _, run_id, route) = running_harness_fixture();
+        let mut snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::IdentityPending,
+            Some(bound_session_address()),
+            C2SessionStatus::Running,
+        );
+        snapshot.session_records[0].provider_identity_present = false;
+        let cache = correlation_inventory(route.clone(), snapshot, 23);
+        let current = project_run_correlation(harness.engine().run(&run_id).unwrap(), &cache)
+            .unwrap();
+        assert_eq!(
+            current.availability,
+            HarnessRunCorrelationAvailabilityV1::Available,
+        );
+        assert_eq!(current.observed_at_unix_ms, Some(23));
+
+        let mismatched_bindings = [
+            None,
+            Some(SessionAddress {
+                workspace_id: gate4agent_node_protocol::WorkspaceId::new("workspace-b")
+                    .unwrap(),
+                ..bound_session_address()
+            }),
+            Some(SessionAddress {
+                session: gate4agent_node_protocol::SessionKey {
+                    instance_id: AgentInstanceId(8),
+                    generation: SessionGeneration(3),
+                },
+                ..bound_session_address()
+            }),
+            Some(SessionAddress {
+                session: gate4agent_node_protocol::SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(4),
+                },
+                ..bound_session_address()
+            }),
+        ];
+        for active_session in mismatched_bindings {
+            let mut snapshot = bound_snapshot(
+                &route.node_id,
+                ManagedSessionState::IdentityPending,
+                active_session,
+                C2SessionStatus::Running,
+            );
+            snapshot.session_records[0].provider_identity_present = false;
+            let cache = correlation_inventory(route.clone(), snapshot, 24);
+            let current = project_run_correlation(
+                harness.engine().run(&run_id).unwrap(),
+                &cache,
+            ).unwrap();
+            assert_eq!(
+                current.availability,
+                HarnessRunCorrelationAvailabilityV1::Unavailable,
+            );
+        }
+    }
+
+    #[test]
     fn run_transfer_reads_only_durable_records_for_the_exact_run() {
         let (mut harness, _, run_id, _) = running_harness_fixture();
         let observation_path = database_path();
@@ -7389,6 +7723,53 @@ mod tests {
         assert_eq!(
             harness.engine().run(&run_id).unwrap().result_disposition,
             Some(HarnessResultDispositionV1::Succeeded),
+        );
+    }
+
+    #[test]
+    fn distinct_running_control_is_noop_but_running_to_waiting_still_commits() {
+        let (mut harness, task_id, run_id, route) = running_harness_fixture();
+        let before_running = harness.engine().checkpoint();
+        let events = [lifecycle_event(5, C2ControlEventKind::Running)];
+
+        apply_replayed_lifecycle_events(&mut harness, &route, None, &events, 10)
+            .unwrap();
+
+        assert_eq!(
+            harness.engine().run(&run_id).unwrap().revision,
+            HarnessRevision::new(1).unwrap(),
+        );
+        assert_eq!(
+            harness.engine().task(&task_id).unwrap().revision,
+            HarnessRevision::new(1).unwrap(),
+        );
+        assert_eq!(harness.engine().checkpoint(), before_running);
+
+        let before_waiting = harness.engine().checkpoint();
+        apply_replayed_lifecycle_events(&mut harness, &route, Some(6), &[], 11)
+            .unwrap();
+
+        assert_eq!(
+            harness.engine().run(&run_id).unwrap().revision,
+            HarnessRevision::new(2).unwrap(),
+        );
+        assert_eq!(
+            harness.engine().run(&run_id).unwrap().lifecycle,
+            HarnessRunLifecycleV1::Waiting,
+        );
+        assert_eq!(
+            harness.engine().task(&task_id).unwrap().revision,
+            HarnessRevision::new(2).unwrap(),
+        );
+        assert_eq!(
+            harness.engine().task(&task_id).unwrap().state,
+            HarnessTaskStateV1::Waiting,
+        );
+        let after_waiting = harness.engine().checkpoint();
+        assert_ne!(after_waiting, before_waiting);
+        assert_eq!(
+            after_waiting.operations.len(),
+            before_waiting.operations.len() + 1,
         );
     }
 

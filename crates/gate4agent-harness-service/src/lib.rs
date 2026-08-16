@@ -9853,6 +9853,9 @@ mod tests {
         spec.overrides.context_id = SpawnOverride::Set {
             value: SpawnContextId::new("context-a").unwrap(),
         };
+        spec.overrides.terminal_size = SpawnOverride::Set {
+            value: TerminalSize { rows: 40, columns: 120 },
+        };
         let fingerprint = c2::spawn_spec_fingerprint(&spec).unwrap();
         let mut dispatching_run = service.engine().run(&run_id()).unwrap().clone();
         dispatching_run.revision = HarnessRevision::new(3).unwrap();

@@ -35,7 +35,8 @@ use gate4agent_node_protocol::{
     HarnessMcpReservationId, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
     ManagedWorktreeLeaseState,
     ManagedWorktreeSpawnRequestV2, NodeFailureCode, NodeId, NodeRequest,
-    ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedHarnessMcpProxyReceiptV1,
+    ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedEnvironmentProfileReceipt,
+    ResolvedHarnessMcpProxyReceiptV1,
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
     GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage, GitObjectId,
     GitSignatureStatus, RepositoryPath, WorkspaceEntryKind, WorkspaceFileContent,
@@ -171,7 +172,7 @@ impl HarnessC2Adapter {
         prepared: PreparedSpawnDispatch,
         profile: SpawnProfileRevisionProof,
     ) -> Result<PendingSpawnDispatch, HarnessC2Error> {
-        validate_prepared_spawn_profile(&prepared, &profile)?;
+        let prepared = bind_prepared_spawn_profile(prepared, &profile)?;
         validate_prepared_spawn(&prepared)?;
         self.ensure_current_incarnation(&prepared.route)?;
         let PreparedSpawnDispatch {
@@ -182,11 +183,13 @@ impl HarnessC2Adapter {
             fingerprint,
             expected_bundle,
             expected_context,
+            expected_environment_profile,
             harness_mcp,
         } = prepared;
         let mut cleared_spec = spec.clone();
         cleared_spec.overrides.bundle_id = SpawnOverride::Clear;
         cleared_spec.overrides.context_id = SpawnOverride::Clear;
+        cleared_spec.overrides.environment_profile_id = SpawnOverride::Clear;
         let request = match &harness_mcp {
             Some(mcp) => NodeRequest::SpawnSpecWithHarnessMcp {
                 reservation_id: mcp.reservation_id.clone(),
@@ -208,6 +211,7 @@ impl HarnessC2Adapter {
                 fingerprint,
                 expected_bundle,
                 expected_context,
+                expected_environment_profile,
                 expected_proxy: harness_mcp.map(|mcp| (
                     mcp.reservation_id,
                     mcp.activation_digest,
@@ -220,10 +224,10 @@ impl HarnessC2Adapter {
 
     pub(crate) fn start_prepared_managed_worktree_spawn(
         &self,
-        prepared: PreparedManagedWorktreeSpawnDispatch,
+        mut prepared: PreparedManagedWorktreeSpawnDispatch,
         profile: SpawnProfileRevisionProof,
     ) -> Result<PendingManagedWorktreeSpawnDispatch, HarnessC2Error> {
-        validate_prepared_spawn_profile(&prepared.inner, &profile)?;
+        prepared.inner = bind_prepared_spawn_profile(prepared.inner, &profile)?;
         validate_prepared_managed_worktree_spawn(&prepared)?;
         self.ensure_current_incarnation(&prepared.inner.route)?;
         let PreparedManagedWorktreeSpawnDispatch {
@@ -235,6 +239,7 @@ impl HarnessC2Adapter {
                 fingerprint,
                 expected_bundle,
                 expected_context,
+                expected_environment_profile,
                 harness_mcp: _,
             },
             worktree_profile_id,
@@ -243,6 +248,7 @@ impl HarnessC2Adapter {
         let mut cleared_spec = spec.clone();
         cleared_spec.overrides.bundle_id = SpawnOverride::Clear;
         cleared_spec.overrides.context_id = SpawnOverride::Clear;
+        cleared_spec.overrides.environment_profile_id = SpawnOverride::Clear;
         let request = NodeRequest::SpawnManagedWorktreeV2 {
             request: ManagedWorktreeSpawnRequestV2 {
                 spawn_spec: spec,
@@ -263,6 +269,7 @@ impl HarnessC2Adapter {
                     fingerprint,
                     expected_bundle,
                     expected_context,
+                    expected_environment_profile,
                     expected_proxy: None,
                 },
                 worktree_profile_id,
@@ -279,15 +286,16 @@ impl HarnessC2Adapter {
     ) -> Result<SpawnProfileRevisionProof, HarnessC2Error> {
         self.ensure_current_incarnation(route)?;
         let snapshot = self.snapshot(route).await?;
-        let profile_revision = snapshot.launch_inventory.as_ref()
+        let profile = snapshot.launch_inventory.as_ref()
             .and_then(|inventory| inventory.spawn_profiles.as_ref())
             .and_then(|profiles| profiles.iter().find(|profile| &profile.id == profile_id))
-            .map(|profile| profile.revision.clone())
+            .cloned()
             .ok_or_else(|| HarnessC2Error::SpawnProfileUnavailable(profile_id.clone()))?;
         Ok(SpawnProfileRevisionProof {
             route: route.clone(),
             profile_id: profile_id.clone(),
-            profile_revision,
+            profile_revision: profile.revision,
+            environment_profile: profile.environment_profile,
         })
     }
 
@@ -315,12 +323,13 @@ impl HarnessC2Adapter {
                 },
             ));
         }
-        let source_session = harness_binding_session(&authority.source_binding)?;
+        let (source_record_id, source_session, request) =
+            record_bound_context_export_request(&authority.source_binding)?;
         let source_provider = AgentId::new(authority.source_provider.as_str())
             .map_err(|_| HarnessC2Error::ContinuationAuthorityMismatch)?;
         let pending = match self.control.start_request(
             route.clone(),
-            NodeRequest::ExportContextPack { session: source_session.clone() },
+            request,
         ) {
             Ok(pending) => pending,
             Err(_) => return Ok(ContextPackExportStart::NotEnqueued(
@@ -334,6 +343,7 @@ impl HarnessC2Adapter {
             prepared,
             authority,
             route,
+            source_record_id,
             source_session,
             source_provider,
             pending: Some(pending),
@@ -751,32 +761,7 @@ impl HarnessC2Adapter {
         }
         self.ensure_current_incarnation(route)?;
         let snapshot = self.snapshot(route).await?;
-        let mut records = snapshot.session_records.iter().filter(|record| {
-            record.active_session.as_ref() == Some(&receipt.session)
-                && record.workspace_id == receipt.target.workspace_id
-                && record.provider == receipt.provider
-                && record.mode == receipt.mode
-        });
-        let record = records.next().ok_or(HarnessC2Error::AcceptedReceiptRecordMissing)?;
-        if records.next().is_some() {
-            return Err(HarnessC2Error::AcceptedReceiptRecordAmbiguous);
-        }
-        Ok(AcceptedSpawnBindingProof {
-            operation_id: accepted.operation_id.clone(),
-            spawn_spec_fingerprint: accepted.spawn_spec_fingerprint.clone(),
-            idempotency_ref: accepted.idempotency_ref.clone(),
-            node_id: receipt.target.node_id.clone(),
-            incarnation_id: receipt.incarnation_id,
-            workspace_id: receipt.target.workspace_id.clone(),
-            provider: receipt.provider.clone(),
-            mode: receipt.mode,
-            record_id: record.record_id.clone(),
-            session: receipt.session.clone(),
-            bundle: receipt.bundle.clone(),
-            context: receipt.context.clone(),
-            harness_mcp_proxy: accepted.harness_mcp_proxy.clone(),
-            managed_worktree: None,
-        })
+        resolve_accepted_receipt_in_snapshot(&snapshot, accepted)
     }
 
     /// Resolves a managed-worktree record only from the sealed V2 response
@@ -1442,6 +1427,7 @@ pub(crate) struct PreparedSpawnDispatch {
     fingerprint: HarnessRequestDigest,
     expected_bundle: Option<ResolvedBundleReceipt>,
     expected_context: Option<ResolvedContextPackReceipt>,
+    expected_environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     harness_mcp: Option<PreparedSpawnHarnessMcp>,
 }
 
@@ -1463,7 +1449,7 @@ impl PreparedManagedWorktreeSpawnDispatch {
             worktree_profile_id,
             expected_worktree_profile_revision,
         };
-        validate_prepared_managed_worktree_spawn(&prepared)?;
+        validate_prepared_managed_worktree_shape(&prepared)?;
         Ok(prepared)
     }
 }
@@ -1488,6 +1474,7 @@ impl PreparedSpawnDispatch {
             fingerprint,
             expected_bundle: None,
             expected_context: None,
+            expected_environment_profile: None,
             harness_mcp: None,
         })
     }
@@ -2446,6 +2433,7 @@ struct SpawnResponseCorrelation {
     fingerprint: HarnessRequestDigest,
     expected_bundle: Option<ResolvedBundleReceipt>,
     expected_context: Option<ResolvedContextPackReceipt>,
+    expected_environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
     expected_proxy: Option<(
         HarnessMcpReservationId,
         HarnessMcpActivationDigest,
@@ -2516,6 +2504,7 @@ fn correlate_spawn_response(
         let mut expected = explicit_spawn_resolution(
             &correlation.cleared_spec,
             correlation.profile_revision,
+            correlation.expected_environment_profile.as_ref(),
         )?;
         if let Some(bundle) = &correlation.expected_bundle {
             expected.bundle_id = Some(bundle.id.clone());
@@ -2532,6 +2521,7 @@ fn correlate_spawn_response(
             &expected,
             correlation.expected_bundle.as_ref(),
             correlation.expected_context.as_ref(),
+            correlation.expected_environment_profile.as_ref(),
             &ordinary,
         ) {
             return Ok(SpawnDispatchOutcome::OutcomeUnknown {
@@ -2589,6 +2579,7 @@ fn correlate_managed_worktree_spawn_response(
     let mut expected = explicit_spawn_resolution(
         &correlation.spawn.cleared_spec,
         correlation.spawn.profile_revision.clone(),
+        correlation.spawn.expected_environment_profile.as_ref(),
     )?;
     expected.target.worktree_id = Some(receipt.lease.workspace_id.clone());
     if let Some(bundle) = &correlation.spawn.expected_bundle {
@@ -2604,6 +2595,7 @@ fn correlate_managed_worktree_spawn_response(
         &expected,
         correlation.spawn.expected_bundle.as_ref(),
         correlation.spawn.expected_context.as_ref(),
+        correlation.spawn.expected_environment_profile.as_ref(),
         &receipt.spawn,
     ) {
         return Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown {
@@ -2650,6 +2642,7 @@ pub(crate) struct SpawnProfileRevisionProof {
     route: NodeRoute,
     profile_id: SpawnProfileId,
     profile_revision: SpawnProfileRevision,
+    environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
 }
 
 impl SpawnProfileRevisionProof {
@@ -2659,13 +2652,19 @@ impl SpawnProfileRevisionProof {
 
     pub(crate) fn bind_spec(
         &self,
-        spec: SpawnSpec,
+        mut spec: SpawnSpec,
     ) -> Result<SpawnSpec, HarnessC2Error> {
         if spec.target.node_id != self.route.node_id || spec.profile_id != self.profile_id {
             return Err(HarnessC2Error::SpawnProfileAuthorityMismatch);
         }
         if spec.expected_profile_revision != self.profile_revision {
             return Err(HarnessC2Error::SpawnProfileAuthorityMismatch);
+        }
+        if !matches!(spec.overrides.environment_profile_id, SpawnOverride::Clear) {
+            return Err(HarnessC2Error::NonAuthoritativeEnvironmentOverride);
+        }
+        if self.environment_profile.is_some() {
+            spec.overrides.environment_profile_id = SpawnOverride::Inherit;
         }
         Ok(spec)
     }
@@ -2684,6 +2683,24 @@ fn validate_prepared_spawn_profile(
     Ok(())
 }
 
+fn bind_prepared_spawn_profile(
+    mut prepared: PreparedSpawnDispatch,
+    profile: &SpawnProfileRevisionProof,
+) -> Result<PreparedSpawnDispatch, HarnessC2Error> {
+    validate_prepared_spawn_profile(&prepared, profile)?;
+    match (
+        &prepared.spec.overrides.environment_profile_id,
+        &profile.environment_profile,
+    ) {
+        (SpawnOverride::Clear, None) => {}
+        (SpawnOverride::Inherit, Some(expected)) => {
+            prepared.expected_environment_profile = Some(expected.clone());
+        }
+        _ => return Err(HarnessC2Error::NonAuthoritativeEnvironmentOverride),
+    }
+    Ok(prepared)
+}
+
 impl PendingContinuationSpawnDispatch {
     pub(crate) async fn finish(self) -> Result<SpawnDispatchOutcome, HarnessC2Error> {
         self.inner.finish().await
@@ -2699,6 +2716,7 @@ pub(crate) struct PendingContextPackExport {
     prepared: crate::PreparedContinuationExport,
     authority: gate4agent_harness_protocol::HarnessContinuationV1,
     route: NodeRoute,
+    source_record_id: SessionRecordId,
     source_session: SessionAddress,
     source_provider: AgentId,
     pending: Option<C2PendingRequest>,
@@ -2726,11 +2744,17 @@ impl PendingContextPackExport {
             });
         }
         match routed.response {
-            Ok(C2NodeResponse::ContextPackExported { context })
-                if context_export_receipt_matches(
-                    &self.route,
+            Ok(C2NodeResponse::ContextPackForSessionRecordExported {
+                record_id,
+                session,
+                context,
+            }) if record_bound_context_export_matches(
+                    &self.source_record_id,
                     &self.source_session,
+                    &self.route,
                     &self.source_provider,
+                    &record_id,
+                    &session,
                     &context,
                 ) => Ok(ExportContextPackOutcome::Exported {
                     prepared: self.prepared,
@@ -2742,7 +2766,7 @@ impl PendingContextPackExport {
                         context,
                     },
                 }),
-            Ok(C2NodeResponse::ContextPackExported { .. }) => {
+            Ok(C2NodeResponse::ContextPackForSessionRecordExported { .. }) => {
                 Ok(ExportContextPackOutcome::OutcomeUnknown {
                     prepared: self.prepared,
                     reason: ContextExportOutcomeUnknownReason::ReceiptMismatch,
@@ -3172,6 +3196,40 @@ fn matching_records(
         .collect()
 }
 
+fn resolve_accepted_receipt_in_snapshot(
+    snapshot: &C2NodeSnapshot,
+    accepted: &AuthoritativeSpawnReceipt,
+) -> Result<AcceptedSpawnBindingProof, HarnessC2Error> {
+    let receipt = &accepted.receipt;
+    let workspace_id = &receipt.session.workspace_id;
+    let mut records = snapshot.session_records.iter().filter(|record| {
+        record.active_session.as_ref() == Some(&receipt.session)
+            && &record.workspace_id == workspace_id
+            && record.provider == receipt.provider
+            && record.mode == receipt.mode
+    });
+    let record = records.next().ok_or(HarnessC2Error::AcceptedReceiptRecordMissing)?;
+    if records.next().is_some() {
+        return Err(HarnessC2Error::AcceptedReceiptRecordAmbiguous);
+    }
+    Ok(AcceptedSpawnBindingProof {
+        operation_id: accepted.operation_id.clone(),
+        spawn_spec_fingerprint: accepted.spawn_spec_fingerprint.clone(),
+        idempotency_ref: accepted.idempotency_ref.clone(),
+        node_id: receipt.target.node_id.clone(),
+        incarnation_id: receipt.incarnation_id,
+        workspace_id: workspace_id.clone(),
+        provider: receipt.provider.clone(),
+        mode: receipt.mode,
+        record_id: record.record_id.clone(),
+        session: receipt.session.clone(),
+        bundle: receipt.bundle.clone(),
+        context: receipt.context.clone(),
+        harness_mcp_proxy: accepted.harness_mcp_proxy.clone(),
+        managed_worktree: None,
+    })
+}
+
 pub fn spawn_spec_fingerprint(spec: &SpawnSpec) -> Result<HarnessRequestDigest, HarnessC2Error> {
     const DOMAIN: &[u8] = b"gate4agent-harness-spawn-spec-fingerprint-v1";
     let encoded = serde_json::to_vec(spec).map_err(HarnessC2Error::SerializeSpawnSpec)?;
@@ -3223,6 +3281,16 @@ fn validate_prepared_spawn(prepared: &PreparedSpawnDispatch) -> Result<(), Harne
         (None, SpawnOverride::Clear) => {}
         _ => return Err(HarnessC2Error::NonAuthoritativeContextOverride),
     }
+    match (
+        &prepared.expected_environment_profile,
+        &prepared.spec.overrides.environment_profile_id,
+    ) {
+        (Some(_), SpawnOverride::Inherit) => {
+            cleared.overrides.environment_profile_id = SpawnOverride::Clear;
+        }
+        (None, SpawnOverride::Clear) => {}
+        _ => return Err(HarnessC2Error::NonAuthoritativeEnvironmentOverride),
+    }
     validate_authoritative_overrides(&cleared)
 }
 
@@ -3230,6 +3298,12 @@ fn validate_prepared_managed_worktree_spawn(
     prepared: &PreparedManagedWorktreeSpawnDispatch,
 ) -> Result<(), HarnessC2Error> {
     validate_prepared_spawn(&prepared.inner)?;
+    validate_prepared_managed_worktree_shape(prepared)
+}
+
+fn validate_prepared_managed_worktree_shape(
+    prepared: &PreparedManagedWorktreeSpawnDispatch,
+) -> Result<(), HarnessC2Error> {
     if prepared.inner.spec.target.worktree_id.is_some() {
         return Err(HarnessC2Error::ManagedWorktreeTargetAlreadySelected);
     }
@@ -3283,7 +3357,7 @@ fn validate_prepared_spawn_overrides(spec: &SpawnSpec) -> Result<(), HarnessC2Er
     if matches!(spec.overrides.context_id, SpawnOverride::Inherit) {
         return Err(HarnessC2Error::NonAuthoritativeContextOverride);
     }
-    if !matches!(spec.overrides.environment_profile_id, SpawnOverride::Clear) {
+    if matches!(spec.overrides.environment_profile_id, SpawnOverride::Set { .. }) {
         return Err(HarnessC2Error::NonAuthoritativeEnvironmentOverride);
     }
     Ok(())
@@ -3292,6 +3366,7 @@ fn validate_prepared_spawn_overrides(spec: &SpawnSpec) -> Result<(), HarnessC2Er
 fn explicit_spawn_resolution(
     spec: &SpawnSpec,
     profile_revision: SpawnProfileRevision,
+    expected_environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
 ) -> Result<ResolvedSpawnSpec, HarnessC2Error> {
     let provider = match &spec.overrides.provider {
         SpawnOverride::Set { value } => value.clone(),
@@ -3337,7 +3412,8 @@ fn explicit_spawn_resolution(
         prompt,
         bundle_id: None,
         context_id: None,
-        environment_profile_id: None,
+        environment_profile_id: expected_environment_profile
+            .map(|profile| profile.profile_id.clone()),
         deadline_ms: spec.deadline_ms,
         idempotency_key: spec.idempotency_key.clone(),
         required_capabilities: spec.required_capabilities.clone(),
@@ -3348,7 +3424,11 @@ fn explicit_spawn_resolution(
             prompt: prompt_provenance,
             bundle_id: SpawnFieldProvenance::Cleared,
             context_id: SpawnFieldProvenance::Cleared,
-            environment_profile_id: SpawnFieldProvenance::Cleared,
+            environment_profile_id: if expected_environment_profile.is_some() {
+                SpawnFieldProvenance::Profile
+            } else {
+                SpawnFieldProvenance::Cleared
+            },
         },
     })
 }
@@ -3358,6 +3438,7 @@ fn validate_spawn_receipt(
     expected: &ResolvedSpawnSpec,
     expected_bundle: Option<&ResolvedBundleReceipt>,
     expected_context: Option<&ResolvedContextPackReceipt>,
+    expected_environment_profile: Option<&ResolvedEnvironmentProfileReceipt>,
     receipt: &ResolvedSpawnReceipt,
 ) -> bool {
     receipt.harness_mcp_proxy.is_none()
@@ -3373,8 +3454,7 @@ fn validate_spawn_receipt(
         && receipt.bundle.as_ref() == expected_bundle
         && receipt.context_id == expected.context_id
         && receipt.context.as_ref() == expected_context
-        && expected.environment_profile_id.is_none()
-        && receipt.environment_profile.is_none()
+        && receipt.environment_profile.as_ref() == expected_environment_profile
         && receipt.deadline_ms == expected.deadline_ms
         && receipt.idempotency_key == expected.idempotency_key
         && receipt.required_capabilities == expected.required_capabilities
@@ -3400,6 +3480,51 @@ fn harness_binding_session(
             generation: gate4agent_types::SessionGeneration(active.generation),
         },
     })
+}
+
+fn harness_binding_record_id(
+    binding: &gate4agent_harness_protocol::HarnessSessionBindingV1,
+) -> Result<SessionRecordId, HarnessC2Error> {
+    let record_id = match &binding.session {
+        gate4agent_harness_protocol::HarnessSessionIdentityV1::Managed {
+            record_id,
+            active_session: Some(_),
+        } => record_id,
+        _ => return Err(HarnessC2Error::ContinuationAuthorityMismatch),
+    };
+    SessionRecordId::new(record_id.as_str())
+        .map_err(|_| HarnessC2Error::ContinuationAuthorityMismatch)
+}
+
+fn record_bound_context_export_request(
+    binding: &gate4agent_harness_protocol::HarnessSessionBindingV1,
+) -> Result<(SessionRecordId, SessionAddress, NodeRequest), HarnessC2Error> {
+    let record_id = harness_binding_record_id(binding)?;
+    let session = harness_binding_session(binding)?;
+    let request = NodeRequest::ExportContextPackForSessionRecord {
+        record_id: record_id.clone(),
+        session: session.clone(),
+    };
+    Ok((record_id, session, request))
+}
+
+fn record_bound_context_export_matches(
+    expected_record_id: &SessionRecordId,
+    expected_session: &SessionAddress,
+    route: &NodeRoute,
+    source_provider: &AgentId,
+    actual_record_id: &SessionRecordId,
+    actual_session: &SessionAddress,
+    context: &ResolvedContextPackReceipt,
+) -> bool {
+    actual_record_id == expected_record_id
+        && actual_session == expected_session
+        && context_export_receipt_matches(
+            route,
+            expected_session,
+            source_provider,
+            context,
+        )
 }
 
 fn context_export_receipt_matches(
@@ -3742,7 +3867,7 @@ mod tests {
     }
 
     fn accepted_receipt(spec: &SpawnSpec) -> ResolvedSpawnReceipt {
-        explicit_spawn_resolution(spec, SpawnProfileRevision::new("r1").unwrap())
+        explicit_spawn_resolution(spec, SpawnProfileRevision::new("r1").unwrap(), None)
         .unwrap()
         .receipt(
             NodeIncarnationId::from_bytes([7; 16]),
@@ -3802,6 +3927,7 @@ mod tests {
         let mut expected = explicit_spawn_resolution(
             &cleared_spec,
             SpawnProfileRevision::new("r1").unwrap(),
+            None,
         ).unwrap();
         if let Some(bundle) = &bundle {
             expected.bundle_id = Some(bundle.id.clone());
@@ -3865,6 +3991,7 @@ mod tests {
                 fingerprint: HarnessRequestDigest::new("1".repeat(64)).unwrap(),
                 expected_bundle: bundle,
                 expected_context: context,
+                expected_environment_profile: None,
                 expected_proxy,
             },
             gate4agent_c2_protocol::RoutedNodeResponse {
@@ -3969,6 +4096,7 @@ mod tests {
                 fingerprint,
                 expected_bundle: None,
                 expected_context: None,
+                expected_environment_profile: None,
                 expected_proxy: None,
             },
             worktree_profile_id: worktree_profile_id.clone(),
@@ -3992,6 +4120,7 @@ mod tests {
         let mut resolved = explicit_spawn_resolution(
             &spec,
             SpawnProfileRevision::new("r1").unwrap(),
+            None,
         ).unwrap();
         resolved.target.worktree_id = Some(worktree_id.clone());
         let spawn = resolved.receipt(
@@ -4163,6 +4292,7 @@ mod tests {
             route: route.clone(),
             profile_id: spec.profile_id.clone(),
             profile_revision: SpawnProfileRevision::new("r1").unwrap(),
+            environment_profile: None,
         };
         let bound = r1.bind_spec(spec).unwrap();
         let fingerprint = spawn_spec_fingerprint(&bound).unwrap();
@@ -4177,6 +4307,7 @@ mod tests {
             route: route.clone(),
             profile_id: bound.profile_id.clone(),
             profile_revision: SpawnProfileRevision::new("r2").unwrap(),
+            environment_profile: None,
         };
         assert!(matches!(
             validate_prepared_spawn_profile(&prepared, &r2),
@@ -4196,6 +4327,7 @@ mod tests {
             fingerprint,
             expected_bundle: None,
             expected_context: None,
+            expected_environment_profile: None,
             expected_proxy: None,
         };
         let routed = gate4agent_c2_protocol::RoutedNodeResponse {
@@ -4209,6 +4341,98 @@ mod tests {
                 reason: SpawnOutcomeUnknownReason::ReceiptMismatch,
             },
         );
+    }
+
+    #[test]
+    fn spawn_profile_environment_authority_is_exact_and_fail_closed() {
+        let baseline = explicit_spec();
+        let route = NodeRoute {
+            node_id: baseline.target.node_id.clone(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+        };
+        let environment = ResolvedEnvironmentProfileReceipt {
+            profile_id: SpawnEnvironmentProfileId::new("isolated-codex").unwrap(),
+            profile_revision: SpawnEnvironmentProfileRevision::new("r3").unwrap(),
+        };
+        let proof = SpawnProfileRevisionProof {
+            route: route.clone(),
+            profile_id: baseline.profile_id.clone(),
+            profile_revision: baseline.expected_profile_revision.clone(),
+            environment_profile: Some(environment.clone()),
+        };
+        let bound = proof.bind_spec(baseline.clone()).unwrap();
+        assert!(matches!(
+            bound.overrides.environment_profile_id,
+            SpawnOverride::Inherit,
+        ));
+        let prepared = PreparedSpawnDispatch::new(
+            route.clone(),
+            HarnessOperationId::new(format!("hop_{}", "9".repeat(24))).unwrap(),
+            HarnessIdempotencyRef::new(format!("hidem_{}", "a".repeat(24))).unwrap(),
+            bound.clone(),
+            spawn_spec_fingerprint(&bound).unwrap(),
+        ).unwrap();
+        assert!(matches!(
+            validate_prepared_spawn(&prepared),
+            Err(HarnessC2Error::NonAuthoritativeEnvironmentOverride),
+        ));
+        let prepared = bind_prepared_spawn_profile(prepared, &proof).unwrap();
+        assert!(validate_prepared_spawn(&prepared).is_ok());
+
+        let mut cleared = bound;
+        cleared.overrides.environment_profile_id = SpawnOverride::Clear;
+        let expected = explicit_spawn_resolution(
+            &cleared,
+            proof.profile_revision.clone(),
+            Some(&environment),
+        ).unwrap();
+        assert_eq!(
+            expected.environment_profile_id.as_ref(),
+            Some(&environment.profile_id),
+        );
+        assert_eq!(
+            expected.provenance.environment_profile_id,
+            SpawnFieldProvenance::Profile,
+        );
+        let receipt = expected.receipt_with_environment(
+            route.expected_incarnation_id,
+            SessionAddress {
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                session: SessionKey {
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(1),
+                },
+            },
+            Some(environment.clone()),
+        );
+        assert!(validate_spawn_receipt(
+            &route,
+            &expected,
+            None,
+            None,
+            Some(&environment),
+            &receipt,
+        ));
+        let mut wrong_receipt = receipt;
+        wrong_receipt.environment_profile.as_mut().unwrap().profile_revision =
+            SpawnEnvironmentProfileRevision::new("r4").unwrap();
+        assert!(!validate_spawn_receipt(
+            &route,
+            &expected,
+            None,
+            None,
+            Some(&environment),
+            &wrong_receipt,
+        ));
+
+        let mut caller_selected = baseline;
+        caller_selected.overrides.environment_profile_id = SpawnOverride::Set {
+            value: environment.profile_id,
+        };
+        assert!(matches!(
+            proof.bind_spec(caller_selected),
+            Err(HarnessC2Error::NonAuthoritativeEnvironmentOverride),
+        ));
     }
 
     #[test]
@@ -4402,6 +4626,7 @@ mod tests {
         let expected = explicit_spawn_resolution(
             &spec,
             SpawnProfileRevision::new("r1").unwrap(),
+            None,
         )
         .unwrap();
         let receipt = accepted_receipt(&spec);
@@ -4410,12 +4635,14 @@ mod tests {
             &expected,
             None,
             None,
+            None,
             &receipt,
         ));
         let rejects = |candidate: &ResolvedSpawnReceipt| {
             assert!(!validate_spawn_receipt(
                 &route,
                 &expected,
+                None,
                 None,
                 None,
                 candidate,
@@ -4581,6 +4808,87 @@ mod tests {
     }
 
     #[test]
+    fn accepted_receipt_binding_uses_exact_session_workspace() {
+        let authority = |receipt| AuthoritativeSpawnReceipt {
+            operation_id: HarnessOperationId::new(format!("hop_{}", "a".repeat(24))).unwrap(),
+            spawn_spec_fingerprint: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(
+                format!("hidem_{}", "c".repeat(24)),
+            ).unwrap(),
+            receipt,
+            harness_mcp_proxy: None,
+        };
+        let record = |record_id: &str, workspace_id: WorkspaceId, session: SessionAddress| {
+            C2ManagedSessionRecord {
+                record_id: SessionRecordId::new(record_id).unwrap(),
+                display_name: record_id.to_owned(),
+                provider: AgentId::new("claude").unwrap(),
+                mode: SessionMode::Pty,
+                state: ManagedSessionState::Live,
+                workspace_id,
+                active_session: Some(session),
+                environment_profile: None,
+                bundle: None,
+                context_id: None,
+                context: None,
+                task_binding: None,
+                provider_identity_present: true,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 2,
+            }
+        };
+
+        let ordinary_receipt = accepted_receipt(&explicit_spec());
+        let ordinary_session = ordinary_receipt.session.clone();
+        let ordinary = authority(ordinary_receipt);
+        let mut snapshot = observation_snapshot(&NodeId::new("node-a").unwrap());
+        snapshot.session_records.push(record(
+            "record-ordinary",
+            ordinary_session.workspace_id.clone(),
+            ordinary_session.clone(),
+        ));
+        let ordinary_proof = resolve_accepted_receipt_in_snapshot(&snapshot, &ordinary).unwrap();
+        assert_eq!(ordinary_proof.workspace_id(), &ordinary.receipt.target.workspace_id);
+        assert_eq!(ordinary_proof.session(), &ordinary_session);
+        assert_eq!(ordinary_proof.record_id().as_str(), "record-ordinary");
+
+        let allocated_workspace = WorkspaceId::new("managed-allocated").unwrap();
+        let managed_session = SessionAddress {
+            workspace_id: allocated_workspace.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(11),
+                generation: SessionGeneration(3),
+            },
+        };
+        let mut managed_receipt = accepted_receipt(&explicit_spec());
+        assert_ne!(managed_receipt.target.workspace_id, allocated_workspace);
+        managed_receipt.session = managed_session.clone();
+        let managed = authority(managed_receipt);
+        snapshot.session_records = vec![record(
+            "record-managed",
+            allocated_workspace.clone(),
+            managed_session.clone(),
+        )];
+        let managed_proof = resolve_accepted_receipt_in_snapshot(&snapshot, &managed).unwrap();
+        assert_eq!(managed_proof.workspace_id(), &allocated_workspace);
+        assert_eq!(managed_proof.session(), &managed_session);
+        assert_eq!(managed_proof.record_id().as_str(), "record-managed");
+
+        snapshot.session_records[0].workspace_id = managed.receipt.target.workspace_id.clone();
+        assert!(matches!(
+            resolve_accepted_receipt_in_snapshot(&snapshot, &managed),
+            Err(HarnessC2Error::AcceptedReceiptRecordMissing),
+        ));
+        snapshot.session_records[0].workspace_id = allocated_workspace;
+        snapshot.session_records[0].active_session.as_mut().unwrap().session.generation =
+            SessionGeneration(4);
+        assert!(matches!(
+            resolve_accepted_receipt_in_snapshot(&snapshot, &managed),
+            Err(HarnessC2Error::AcceptedReceiptRecordMissing),
+        ));
+    }
+
+    #[test]
     fn continuation_export_lineage_rejects_wrong_node_session_and_provider() {
         let route = NodeRoute {
             node_id: NodeId::new("node-a").unwrap(),
@@ -4637,6 +4945,94 @@ mod tests {
             &source_session,
             &source_provider,
             &wrong_provider,
+        ));
+    }
+
+    #[test]
+    fn continuation_export_is_record_bound_and_rejects_identifier_mismatch() {
+        let binding = HarnessSessionBindingV1 {
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation: HarnessSelectorV1::new(
+                NodeIncarnationId::from_bytes([7; 16]).to_string(),
+            ).unwrap(),
+            workspace_id: HarnessSelectorV1::new("primary").unwrap(),
+            session: HarnessSessionIdentityV1::Managed {
+                record_id: HarnessSelectorV1::new("record-a").unwrap(),
+                active_session: Some(
+                    gate4agent_harness_protocol::HarnessRuntimeIdentityV1 {
+                        instance_id: 7,
+                        generation: 1,
+                    },
+                ),
+            },
+        };
+        let (record_id, source_session, request) =
+            record_bound_context_export_request(&binding).unwrap();
+        assert!(matches!(
+            request,
+            NodeRequest::ExportContextPackForSessionRecord {
+                record_id: requested_record,
+                session: requested_session,
+            } if requested_record == record_id && requested_session == source_session
+        ));
+
+        let route = NodeRoute {
+            node_id: NodeId::new("node-a").unwrap(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+        };
+        let source_provider = AgentId::new("claude").unwrap();
+        let context = ResolvedContextPackReceipt {
+            id: SpawnContextId::new("context-a").unwrap(),
+            digest: SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            lineage: ContextPackLineageReceipt {
+                source_node_id: route.node_id.clone(),
+                source_session: source_session.clone(),
+                source_provider: source_provider.clone(),
+            },
+            source_message_count: 2,
+            retained_message_count: 2,
+            byte_len: 16,
+            truncated: false,
+        };
+        assert!(record_bound_context_export_matches(
+            &record_id,
+            &source_session,
+            &route,
+            &source_provider,
+            &record_id,
+            &source_session,
+            &context,
+        ));
+        assert!(!record_bound_context_export_matches(
+            &record_id,
+            &source_session,
+            &route,
+            &source_provider,
+            &SessionRecordId::new("record-b").unwrap(),
+            &source_session,
+            &context,
+        ));
+        let mut wrong_session = source_session.clone();
+        wrong_session.session.generation = SessionGeneration(2);
+        assert!(!record_bound_context_export_matches(
+            &record_id,
+            &source_session,
+            &route,
+            &source_provider,
+            &record_id,
+            &wrong_session,
+            &context,
+        ));
+        let mut dormant = binding;
+        let HarnessSessionIdentityV1::Managed { active_session, .. } =
+            &mut dormant.session
+        else {
+            unreachable!();
+        };
+        *active_session = None;
+        assert!(matches!(
+            record_bound_context_export_request(&dormant),
+            Err(HarnessC2Error::ContinuationAuthorityMismatch),
         ));
     }
 

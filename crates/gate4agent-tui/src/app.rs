@@ -20421,10 +20421,12 @@ mod tests {
                 SpawnProfileSummary {
                     id: SpawnProfileId::new("default").unwrap(),
                     revision: SpawnProfileRevision::new("builtin-v1").unwrap(),
+                    environment_profile: None,
                 },
                 SpawnProfileSummary {
                     id: SpawnProfileId::new("review").unwrap(),
                     revision: SpawnProfileRevision::new("review-v2").unwrap(),
+                    environment_profile: None,
                 },
             ]),
             bundles: Some(vec![ResolvedBundleReceipt {

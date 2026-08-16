@@ -37,6 +37,8 @@ pub use server::{
     default_node_endpoint, default_state_path, NodeServer, NodeServerConfig, NodeServerError,
     NodeShutdownHandle, WorkspaceConfig,
 };
+#[cfg(feature = "fixture")]
+pub use server::SpawnManagedWorktreeV2FailureProbe;
 pub use gate4agent_node_protocol::WorktreeServiceMode;
 pub use bundle_catalog::{
     BundleCatalog, BundleCatalogError, NodeBundle, NodeBundleError, NodeBundleFile,

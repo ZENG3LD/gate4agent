@@ -104,7 +104,7 @@ use crate::protocol::{
     ObservationKindV1, ObservationSourceFamilyV1, ObservationV1,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
-    SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
+    SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
     WorkspaceFileContent, WorkspaceFileRevision,
     WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
     WorktreeServiceMode,
@@ -117,7 +117,7 @@ use crate::protocol::{
     NODE_PROVIDER_ID_OPEN_CAPABILITY,
     NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
     NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY, NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
-    NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+    NODE_HISTORY_CONTEXT_PACK_CAPABILITY, NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
     NODE_NATIVE_SESSION_CATALOG_CAPABILITY, NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
     NODE_NATIVE_SESSION_INDEX_CAPABILITY, NODE_NATIVE_SESSION_PREVIEW_CAPABILITY,
     NODE_AGENT_PROGRESS_SNAPSHOT_CAPABILITY,
@@ -176,7 +176,7 @@ use gate4agent_types::{
     SessionGeneration, StartRequest,
     TerminalControl, TerminalText,
     SessionStatus, TerminalFrame, TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
-    WORKING_DIRECTORY_MAX_BYTES,
+    HISTORY_DISCOVERY_LIMIT_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 #[cfg(feature = "fixture")]
@@ -1270,6 +1270,49 @@ pub struct NodeServer {
     state_path_lock: Option<session_registry::StatePathLock>,
 }
 
+#[cfg(feature = "fixture")]
+#[derive(Clone, Default)]
+pub struct SpawnManagedWorktreeV2FailureProbe {
+    latest_code: Arc<Mutex<Option<NodeFailureCode>>>,
+}
+
+#[cfg(feature = "fixture")]
+impl SpawnManagedWorktreeV2FailureProbe {
+    pub fn latest_code(&self) -> Option<NodeFailureCode> {
+        *self
+            .latest_code
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record(&self, code: Option<NodeFailureCode>) {
+        *self
+            .latest_code
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = code;
+    }
+}
+
+#[cfg(all(feature = "fixture", windows))]
+struct IsolatedCodexHomeFixtureEnvironment;
+
+#[cfg(all(feature = "fixture", windows))]
+impl gate4agent_runtime_native::NativeChildEnvironmentResolver
+    for IsolatedCodexHomeFixtureEnvironment
+{
+    fn resolve_child_environment(
+        &self,
+    ) -> Result<
+        Vec<gate4agent_catalog::EnvMutation>,
+        gate4agent_runtime_native::NativeChildEnvironmentResolveError,
+    > {
+        Ok(vec![gate4agent_catalog::EnvMutation {
+            key: OsString::from("USERPROFILE"),
+            value: None,
+        }])
+    }
+}
+
 impl NodeServer {
     pub fn new(config: NodeServerConfig) -> Result<Self, NodeServerError> {
         let catalog = active_registry()?;
@@ -1460,8 +1503,63 @@ impl NodeServer {
         config: NodeServerConfig,
         proof_path: PathBuf,
     ) -> Result<Self, NodeServerError> {
-        let catalog = Self::context_pack_fixture_catalog(proof_path, None)?;
+        let catalog = Self::context_pack_fixture_catalog(proof_path, None, false)?;
         Self::new_with_registry(config, catalog)
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    pub fn new_monitoring_context_pack_fixture(
+        config: NodeServerConfig,
+        proof_path: PathBuf,
+    ) -> Result<Self, NodeServerError> {
+        let catalog = Self::context_pack_fixture_catalog(proof_path, None, true)?;
+        let mut server = Self::new_with_registry(config, catalog)?;
+        Arc::get_mut(&mut server.shared)
+            .expect("fixture Node shared state must remain uniquely owned before run")
+            .fixture_semantic_hook_policy = true;
+        Ok(server)
+    }
+
+    #[cfg(all(feature = "fixture", windows))]
+    pub fn install_isolated_codex_home_environment_fixture(
+        &mut self,
+        profile_id: SpawnEnvironmentProfileId,
+        profile_revision: crate::protocol::SpawnEnvironmentProfileRevision,
+    ) -> Result<(), NodeServerError> {
+        let provider = AgentId::new("codex")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let native_profile = gate4agent_runtime_native::NativeLaunchProfile::new(
+            gate4agent_runtime_native::NativeLaunchProfileId::new(format!(
+                "{}-pty",
+                profile_id.as_str(),
+            ))
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?,
+            provider.clone(),
+            TransportKind::Pty,
+            vec![OsString::from("USERPROFILE")],
+            Arc::new(IsolatedCodexHomeFixtureEnvironment),
+        )
+        .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let materialization = NodeSessionMaterializationProfile::new(
+            Vec::new(),
+            vec![crate::session_environment::NodeSessionPathBinding::new(
+                "CODEX_HOME",
+                crate::session_environment::NodeSessionPathClass::ProviderHome,
+            )
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?],
+            Vec::new(),
+        )
+        .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        self.install_environment_profile(
+            NodeEnvironmentProfile::new_with_materialization(
+                profile_id,
+                profile_revision,
+                provider,
+                [native_profile],
+                Some(materialization),
+            )
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?,
+        )
     }
 
     #[cfg(all(feature = "fixture", windows))]
@@ -1475,7 +1573,11 @@ impl NodeServer {
                 "context-only proof fixture requires Kimi".to_owned(),
             ));
         }
-        let catalog = Self::context_pack_fixture_catalog(proof_path, Some(&target_provider))?;
+        let catalog = Self::context_pack_fixture_catalog(
+            proof_path,
+            Some(&target_provider),
+            false,
+        )?;
         Self::new_with_registry(config, catalog)
     }
 
@@ -1483,6 +1585,7 @@ impl NodeServer {
     fn context_pack_fixture_catalog(
         proof_path: PathBuf,
         context_only_target: Option<&AgentId>,
+        monitoring_claude_source: bool,
     ) -> Result<AgentRegistry, NodeServerError> {
         if !proof_path.is_absolute()
             || !proof_path
@@ -1509,12 +1612,21 @@ impl NodeServer {
                     "context pack fixture provider adapter is unavailable".to_owned(),
                 )
             })?;
-            let mut spec = gate4agent_testkit::interactive_agent_spec();
+            let monitored_provider =
+                monitoring_claude_source && matches!(provider_id, "claude" | "codex");
+            let mut spec = if monitored_provider {
+                gate4agent_testkit::monitoring_hook_agent_spec()
+            } else {
+                gate4agent_testkit::interactive_agent_spec()
+            };
             spec.id = agent_id.clone();
             spec.display_name = format!("Controlled {agent_id} context pack fixture");
             spec.detection.command = format!("gate4agent-{provider_id}-context-fixture.cmd");
             spec.detection.aliases.clear();
             spec.capabilities.adapters.history = provider.capabilities.adapters.history.clone();
+            if monitored_provider {
+                spec.capabilities.adapters.hook = provider.capabilities.adapters.hook.clone();
+            }
             if provider_id == "codex" {
                 let script = spec.launch.fixed_args.pop().ok_or_else(|| {
                     NodeServerError::Registry("PTY fixture script is unavailable".to_owned())
@@ -1544,17 +1656,33 @@ $cwdFull = [IO.Path]::GetFullPath($cwd).TrimEnd([IO.Path]::DirectorySeparatorCha
 $separator = [IO.Path]::DirectorySeparatorChar
 if ($contextFull.Equals($codexFull, [StringComparison]::OrdinalIgnoreCase) -or $contextFull.StartsWith($codexFull + $separator, [StringComparison]::OrdinalIgnoreCase)) { exit 99 }
 if ($contextFull.Equals($cwdFull, [StringComparison]::OrdinalIgnoreCase) -or $contextFull.StartsWith($cwdFull + $separator, [StringComparison]::OrdinalIgnoreCase)) { exit 100 }
-try { $document = [IO.File]::ReadAllText($contextPath) | ConvertFrom-Json -ErrorAction Stop } catch { exit 101 }
-if ($document.schema -cne 'g4a-context-pack-v1' -or $null -ne $document.PSObject.Properties['cwd']) { exit 102 }
-if (@('claude', 'codex', 'grok', 'kimi', 'qwen-code') -cnotcontains [string]$document.source_provider) { exit 103 }
+$rawContext = [IO.File]::ReadAllText($contextPath)
+if ($rawContext.Contains('g4a-private-provider-session-canary') -or $rawContext.Contains('private-provider-login-identity')) { exit 101 }
+try { $document = $rawContext | ConvertFrom-Json -ErrorAction Stop } catch { exit 102 }
+$allowedTopLevel = @('schema', 'source_provider', 'source_message_count', 'retained_messages', 'repository', 'truncated')
+$requiredTopLevel = @('schema', 'source_provider', 'source_message_count', 'retained_messages', 'truncated')
+foreach ($property in @($document.PSObject.Properties.Name)) {
+    if ($allowedTopLevel -cnotcontains [string]$property) { exit 103 }
+}
+foreach ($property in $requiredTopLevel) {
+    if ($null -eq $document.PSObject.Properties[$property]) { exit 104 }
+}
+if ($document.schema -cne 'g4a-context-pack-v1' -or $null -ne $document.PSObject.Properties['cwd']) { exit 105 }
+if (@('claude', 'codex', 'grok', 'kimi', 'qwen-code') -cnotcontains [string]$document.source_provider) { exit 106 }
 $messages = @($document.retained_messages)
-if ($messages.Count -eq 0) { exit 104 }
+if ($messages.Count -eq 0) { exit 107 }
 foreach ($message in $messages) {
-    if (@('user', 'assistant') -cnotcontains [string]$message.role -or [string]::IsNullOrEmpty([string]$message.text)) { exit 105 }
+    $messageProperties = @($message.PSObject.Properties.Name)
+    foreach ($property in $messageProperties) {
+        if (@('role', 'text') -cnotcontains [string]$property) { exit 108 }
+    }
+    if ($messageProperties.Count -ne 2 -or @('user', 'assistant') -cnotcontains [string]$message.role -or [string]::IsNullOrEmpty([string]$message.text)) { exit 109 }
 }
 $sha = [Security.Cryptography.SHA256]::Create()
 try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($contextPath)))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
 [IO.File]::WriteAllLines($proofPath, [string[]]@('contextual', $codexHome, $cwd, $skillHash, $contextRoot, $contextHash, [string]$document.schema, [string]$document.source_provider, [string]$messages.Count, [string]$messages[0].text, [string]$messages[$messages.Count - 1].text))
+$rawProof = [IO.File]::ReadAllText($proofPath)
+if ($rawProof.Contains('g4a-private-provider-session-canary') -or $rawProof.Contains('private-provider-login-identity')) { exit 110 }
 [Console]::Out.WriteLine('F7_CODEX_BUNDLE_CONTEXT_VALIDATED')
 "#;
                 spec.launch.fixed_args.push(format!(
@@ -2002,6 +2130,15 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         NodeShutdownHandle {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    #[cfg(feature = "fixture")]
+    pub fn spawn_managed_worktree_v2_failure_probe_fixture(
+        &self,
+    ) -> SpawnManagedWorktreeV2FailureProbe {
+        self.shared
+            .fixture_spawn_managed_worktree_v2_failure_probe
+            .clone()
     }
 
     /// Installs one immutable host-local environment profile before the server runs.
@@ -2543,6 +2680,8 @@ struct NodeShared {
     input_settle_timeout_ms: u64,
     #[cfg(feature = "fixture")]
     fixture_semantic_hook_policy: bool,
+    #[cfg(feature = "fixture")]
+    fixture_spawn_managed_worktree_v2_failure_probe: SpawnManagedWorktreeV2FailureProbe,
 }
 
 impl Drop for NodeShared {
@@ -2863,6 +3002,9 @@ impl NodeShared {
             input_settle_timeout_ms,
             #[cfg(feature = "fixture")]
             fixture_semantic_hook_policy: false,
+            #[cfg(feature = "fixture")]
+            fixture_spawn_managed_worktree_v2_failure_probe:
+                SpawnManagedWorktreeV2FailureProbe::default(),
         }
     }
 
@@ -4744,7 +4886,7 @@ impl NodeShared {
                 harness_mcp,
             )
             .await
-            .map(|session| {
+            .map(|(session, _runtime_policy)| {
                 resolved.receipt_with_materialization(
                     self.incarnation_id,
                     session,
@@ -5081,8 +5223,8 @@ impl NodeShared {
             &required_capabilities,
             None,
         ).await;
-        let session = match spawn {
-            Ok(session) => session,
+        let (session, effective_runtime_policy) = match spawn {
+            Ok(spawned) => spawned,
             Err(error) => {
                 if self
                     .cleanup_managed_worktree(&lease.lease_id, true)
@@ -5110,11 +5252,7 @@ impl NodeShared {
             let binding = bindings.get_mut(&session.session.instance_id)
                 .expect("successful spawn retains its session binding");
             binding.managed_worktree_lease_id = Some(lease.lease_id.clone());
-            if runtime_policy.provider_session_identity {
-                (binding.record_id.clone(), None)
-            } else {
-                (None, binding.record_id.clone())
-            }
+            managed_spawn_record_ownership(binding, effective_runtime_policy)
         };
         let bound = self.managed_worktrees.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6034,6 +6172,63 @@ impl NodeShared {
             return Err(failure(
                 NodeFailureCode::SessionRecordConflict,
                 "managed session changed while its preview was loading",
+            ));
+        }
+        Ok(())
+    }
+
+    fn revalidate_session_record_context_export(
+        &self,
+        expected: &ManagedSessionRecord,
+        identity: &ProviderSessionIdentity,
+        session: &SessionAddress,
+    ) -> Result<(), NodeFailure> {
+        let current = self.record(&expected.record_id)?;
+        let current_root = self.workspace_root(&current.workspace_id)?;
+        let snapshot = self.internal_session_snapshot(session)?;
+        let binding = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&session.session.instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "managed session runtime binding disappeared during context export",
+                )
+            })?;
+        if !session_record_context_export_binding_is_exact(
+            expected,
+            &current,
+            identity,
+            session,
+            &binding,
+            &snapshot.agent_id,
+            &current_root,
+        ) || !session_record_context_export_source_is_usable(&current, &snapshot.status) {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session binding changed during context export",
+            ));
+        }
+        Ok(())
+    }
+
+    fn revalidate_loaded_history(
+        &self,
+        session: &SessionAddress,
+        candidate_id: &str,
+        loaded: &HistorySessionRecord,
+    ) -> Result<(), NodeFailure> {
+        let snapshot = self.internal_session_snapshot(session)?;
+        if snapshot.history.pending.is_some()
+            || snapshot.history.loaded_candidate_id.as_deref() != Some(candidate_id)
+            || snapshot.history.loaded.as_ref() != Some(loaded)
+        {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session history changed during context export",
             ));
         }
         Ok(())
@@ -8745,6 +8940,10 @@ impl NodeShared {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let environment_profiles = self
+            .environment_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut workspaces = workspace_roots
             .iter()
             .map(|(workspace_id, canonical_root)| {
@@ -8832,12 +9031,14 @@ impl NodeShared {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .snapshots(),
             launch_inventory: Some(LaunchInventory {
-                spawn_profiles: Some(self.spawn_profiles.iter().map(|profile| {
-                    SpawnProfileSummary {
-                        id: profile.profile_id.clone(),
-                        revision: profile.revision.clone(),
-                    }
-                }).collect()),
+                spawn_profiles: Some(
+                    self.spawn_profiles
+                        .iter()
+                        .filter_map(|profile| {
+                            resolved_spawn_profile_summary(profile, &environment_profiles)
+                        })
+                        .collect(),
+                ),
                 bundles: Some(
                     self.bundle_catalog
                         .read()
@@ -9334,10 +9535,64 @@ impl NodeShared {
         })
     }
 
+    async fn export_context_pack_for_session_record(
+        &self,
+        record_id: &SessionRecordId,
+        session: &SessionAddress,
+    ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
+        let record = self.record(record_id)?;
+        let identity = record.provider_session.clone().ok_or_else(|| {
+            failure(
+                NodeFailureCode::BackendOperationFailed,
+                "managed session has no verified provider session identity",
+            )
+        })?;
+        if identity.key != ProviderSessionKey::SessionId {
+            return Err(failure(
+                NodeFailureCode::BackendOperationFailed,
+                "managed session provider identity cannot bind history exactly",
+            ));
+        }
+        self.revalidate_session_record_context_export(&record, &identity, session)?;
+        let candidates = self
+            .discover_history(session, HISTORY_DISCOVERY_LIMIT_MAX)
+            .await?;
+        let candidate_id = unique_history_candidate_for_provider_session(
+            &candidates,
+            &identity.id,
+        )?;
+        let loaded = self.load_history(session, candidate_id.clone()).await?;
+        if loaded.session_id != identity.id {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "loaded history identity does not match the managed session record",
+            ));
+        }
+        self.revalidate_session_record_context_export(&record, &identity, session)?;
+        self.revalidate_loaded_history(session, &candidate_id, &loaded)?;
+        let pack = self.materialize_context_pack(session).await?;
+        self.commit_context_pack_for_session_record(
+            &record,
+            &identity,
+            session,
+            &candidate_id,
+            &loaded,
+            pack,
+        )
+    }
+
     async fn export_context_pack(
         &self,
         address: &SessionAddress,
     ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
+        let pack = self.materialize_context_pack(address).await?;
+        self.commit_context_pack(pack)
+    }
+
+    async fn materialize_context_pack(
+        &self,
+        address: &SessionAddress,
+    ) -> Result<NodeContextPack, NodeFailure> {
         let snapshot = self.internal_session_snapshot(address)?;
         if !context_pack_source_status_is_usable(&snapshot.status) {
             return Err(failure(
@@ -9376,7 +9631,7 @@ impl NodeShared {
                 "context source changed during bounded repository capture",
             ));
         }
-        let pack = NodeContextPack::export_with_repository(
+        NodeContextPack::export_with_repository(
             ContextPackLineageReceipt {
                 source_node_id: self.node_id.clone(),
                 source_session: address.clone(),
@@ -9390,8 +9645,13 @@ impl NodeShared {
                 NodeFailureCode::ContextPackMaterializationFailed,
                 "bounded context pack export failed",
             )
-        })?;
-        let receipt = pack.receipt().clone();
+        })
+    }
+
+    fn commit_context_pack(
+        &self,
+        pack: NodeContextPack,
+    ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
         self.context_catalog
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -9401,8 +9661,98 @@ impl NodeShared {
                     NodeFailureCode::ContextPackMaterializationFailed,
                     "context pack catalog is full",
                 )
+            })
+    }
+
+    fn commit_context_pack_for_session_record(
+        &self,
+        expected: &ManagedSessionRecord,
+        identity: &ProviderSessionIdentity,
+        session: &SessionAddress,
+        candidate_id: &str,
+        loaded: &HistorySessionRecord,
+        pack: NodeContextPack,
+    ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
+        let current_root = self.workspace_root(&expected.workspace_id)?;
+        let _transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = records.records.get(&expected.record_id).ok_or_else(|| {
+            failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session record disappeared during context export",
+            )
+        })?;
+        if current != expected || current.state != ManagedSessionState::Live {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session record changed during context export",
+            ));
+        }
+        let bindings = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let binding = bindings.get(&session.session.instance_id).ok_or_else(|| {
+            failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session runtime binding disappeared during context export",
+            )
+        })?;
+        let runtime = self
+            .handle
+            .snapshot()
+            .sessions
+            .iter()
+            .find(|snapshot| {
+                snapshot.instance_id == session.session.instance_id
+                    && snapshot.generation == session.session.generation
+            })
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "managed session runtime disappeared during context export",
+                )
             })?;
-        Ok(receipt)
+        let receipt = pack.receipt();
+        if !session_record_context_export_binding_is_exact(
+            expected,
+            current,
+            identity,
+            session,
+            binding,
+            &runtime.agent_id,
+            &current_root,
+        ) || !session_record_context_export_source_is_usable(current, &runtime.status)
+            || runtime.history.pending.is_some()
+            || runtime.history.loaded_candidate_id.as_deref() != Some(candidate_id)
+            || runtime.history.loaded.as_ref() != Some(loaded)
+            || receipt.lineage.source_node_id != self.node_id
+            || receipt.lineage.source_session != *session
+            || receipt.lineage.source_provider != current.provider
+            || receipt.source_message_count != loaded.message_count
+        {
+            return Err(failure(
+                NodeFailureCode::SessionRecordConflict,
+                "managed session source changed before context catalog commit",
+            ));
+        }
+        self.context_catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(pack)
+            .map_err(|_| {
+                failure(
+                    NodeFailureCode::ContextPackMaterializationFailed,
+                    "context pack catalog is full",
+                )
+            })
     }
 
     async fn context_pack_repository(
@@ -9757,6 +10107,7 @@ impl NodeShared {
                 None,
             )
             .await
+            .map(|(session, _runtime_policy)| session)
     }
 
     async fn spawn_session_with_deadline(
@@ -9775,7 +10126,7 @@ impl NodeShared {
         deadline: Option<Instant>,
         required_capabilities: &[ProviderRuntimeCapability],
         harness_mcp: Option<&PreparedHarnessMcpSpawn>,
-    ) -> Result<SessionAddress, NodeFailure> {
+    ) -> Result<(SessionAddress, ProviderRuntimePolicy), NodeFailure> {
         let reserved_lease = self.managed_worktrees.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .lease_for_workspace(&workspace_id);
@@ -9816,15 +10167,11 @@ impl NodeShared {
         } else {
             self.admit_provider_runtime(&provider, runtime_requirement).await?
         };
-        #[cfg(feature = "fixture")]
-        let runtime_policy = if self.fixture_semantic_hook_policy {
-            ProviderRuntimePolicy::new(true, true, true, true, false)
-                .expect("monitoring Hook fixture policy is internally valid")
-        } else {
-            runtime_policy
-        };
-        let runtime_policy =
-            self.admit_qwen_sidecar_observation_policy(&provider, mode, runtime_policy);
+        let runtime_policy = self.effective_spawn_runtime_policy(
+            &provider,
+            mode,
+            runtime_policy,
+        );
         if required_capabilities
             .iter()
             .any(|capability| !runtime_policy.admits(*capability))
@@ -10074,7 +10421,7 @@ impl NodeShared {
                     if let Some(overlay) = harness_mcp_overlay.take() {
                         overlay.retain();
                     }
-                    return Ok(address);
+                    return Ok((address, runtime_policy));
                 }
             }
             if Instant::now() >= commit_deadline {
@@ -10104,6 +10451,22 @@ impl NodeShared {
             }
             sleep(Duration::from_millis(2)).await;
         }
+    }
+
+    fn effective_spawn_runtime_policy(
+        &self,
+        provider: &AgentId,
+        mode: SessionMode,
+        runtime_policy: ProviderRuntimePolicy,
+    ) -> ProviderRuntimePolicy {
+        #[cfg(feature = "fixture")]
+        let runtime_policy = if self.fixture_semantic_hook_policy {
+            ProviderRuntimePolicy::new(true, true, true, true, false)
+                .expect("monitoring Hook fixture policy is internally valid")
+        } else {
+            runtime_policy
+        };
+        self.admit_qwen_sidecar_observation_policy(provider, mode, runtime_policy)
     }
 
     fn verify_harness_mcp_before_start(
@@ -10599,6 +10962,11 @@ async fn serve_connection(
                 let ClientFrame::Request(request) = frame else {
                     return Err(NodeServerError::Handshake("hello may only be sent once".to_owned()));
                 };
+                #[cfg(feature = "fixture")]
+                let probe_spawn_managed_worktree_v2 = matches!(
+                    &request.request,
+                    NodeRequest::SpawnManagedWorktreeV2 { .. }
+                );
                 let requires_open_provider_ids =
                     request_requires_open_provider_ids(&shared, &request.request);
                 let requires_child_environment_profile =
@@ -10656,6 +11024,12 @@ async fn serve_connection(
                 } else {
                     process_request(&shared, connection_id, hello.role, request).await
                 };
+                #[cfg(feature = "fixture")]
+                if probe_spawn_managed_worktree_v2 {
+                    shared
+                        .fixture_spawn_managed_worktree_v2_failure_probe
+                        .record(reply.result.as_ref().err().map(|failure| failure.code));
+                }
                 if !include_provider_runtime_status {
                     clear_response_provider_runtime_status(&mut reply);
                 }
@@ -10879,6 +11253,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
         NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
         NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+        NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
         NODE_NATIVE_SESSION_CATALOG_CAPABILITY,
         NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
         NODE_NATIVE_SESSION_INDEX_CAPABILITY,
@@ -11216,6 +11591,7 @@ fn request_requires_child_environment_profile(
         | NodeRequest::Remove { session }
         | NodeRequest::DiscoverHistory { session, .. }
         | NodeRequest::LoadHistory { session, .. }
+        | NodeRequest::ExportContextPackForSessionRecord { session, .. }
         | NodeRequest::ExportContextPack { session } => shared
             .session_bindings
             .lock()
@@ -11301,6 +11677,7 @@ fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -
         | NodeRequest::Remove { session }
         | NodeRequest::DiscoverHistory { session, .. }
         | NodeRequest::LoadHistory { session, .. }
+        | NodeRequest::ExportContextPackForSessionRecord { session, .. }
         | NodeRequest::ExportContextPack { session } => shared
             .session_bindings
             .lock()
@@ -11442,6 +11819,7 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Shutdown => false,
@@ -11480,6 +11858,7 @@ fn request_requires_open_provider_ids_with(
         | NodeRequest::Remove { session }
         | NodeRequest::DiscoverHistory { session, .. }
         | NodeRequest::LoadHistory { session, .. }
+        | NodeRequest::ExportContextPackForSessionRecord { session, .. }
         | NodeRequest::ExportContextPack { session } => provider_for_session(session)
             .map_or(true, |provider| !provider_id_is_legacy(&provider)),
         NodeRequest::RenameSessionRecord { record_id, .. }
@@ -11545,6 +11924,15 @@ fn project_snapshot_legacy_provider_ids(snapshot: &mut NodeSnapshot) {
 fn clear_snapshot_child_environment_profiles(snapshot: &mut NodeSnapshot) {
     for record in &mut snapshot.session_records {
         record.environment_profile = None;
+    }
+    if let Some(profiles) = snapshot
+        .launch_inventory
+        .as_mut()
+        .and_then(|inventory| inventory.spawn_profiles.as_mut())
+    {
+        for profile in profiles {
+            profile.environment_profile = None;
+        }
     }
 }
 
@@ -11624,6 +12012,7 @@ fn project_response_without_child_environment_profile(reply: &mut ResponseEnvelo
         | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -11713,6 +12102,7 @@ fn project_response_without_session_bundle(reply: &mut ResponseEnvelope) {
         | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordForgotten { .. }
@@ -11819,6 +12209,7 @@ fn project_response_without_context_pack(reply: &mut ResponseEnvelope) {
         }
         Ok(NodeResponse::HistoryDiscovered { .. })
         | Ok(NodeResponse::HistoryLoaded { .. })
+        | Ok(NodeResponse::ContextPackForSessionRecordExported { .. })
         | Ok(NodeResponse::ContextPackExported { .. })
         | Ok(NodeResponse::ContextPackForgotten { .. }) => true,
         _ => false,
@@ -11940,6 +12331,7 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
         | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordUpdated { .. }
@@ -12028,6 +12420,7 @@ fn clear_response_provider_runtime_status(reply: &mut ResponseEnvelope) {
         | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::SessionRecordUpdated { .. }
@@ -13102,6 +13495,17 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
                 completed_turn_count: loaded.completed_turn_count,
             })
         }
+        NodeRequest::ExportContextPackForSessionRecord { record_id, session } => {
+            shared.require_controller(connection_id, role)?;
+            let context = shared
+                .export_context_pack_for_session_record(&record_id, &session)
+                .await?;
+            Ok(NodeResponse::ContextPackForSessionRecordExported {
+                record_id,
+                session,
+                context,
+            })
+        }
         NodeRequest::ExportContextPack { session } => {
             controlled_session(shared, connection_id, role, &session)?;
             let context = shared.export_context_pack(&session).await?;
@@ -13303,6 +13707,85 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
 fn controlled_session(shared: &NodeShared, connection_id: u64, role: ClientRole, session: &SessionAddress) -> Result<AgentId, NodeFailure> {
     shared.require_controller(connection_id, role)?;
     shared.validate_address(session)
+}
+
+fn unique_history_candidate_for_provider_session(
+    candidates: &[HistoryCandidateSummary],
+    provider_session_id: &str,
+) -> Result<String, NodeFailure> {
+    let mut matches = candidates
+        .iter()
+        .filter(|candidate| candidate.session_id_hint == provider_session_id);
+    let candidate = matches.next().ok_or_else(|| {
+        failure(
+            NodeFailureCode::SessionRecordConflict,
+            "no history candidate matches the managed provider session",
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(failure(
+            NodeFailureCode::SessionRecordConflict,
+            "history identity is ambiguous for the managed provider session",
+        ));
+    }
+    Ok(candidate.id.clone())
+}
+
+fn resolved_spawn_profile_summary(
+    profile: &SpawnProfileDefaults,
+    environment_profiles: &BTreeMap<SpawnEnvironmentProfileId, EnvironmentProfileBinding>,
+) -> Option<SpawnProfileSummary> {
+    let environment_profile = match profile.environment_profile_id.as_ref() {
+        None => None,
+        Some(profile_id) => {
+            let binding = environment_profiles.get(profile_id)?;
+            if binding.provider != profile.provider
+                || binding.native_profile_id(profile.mode).is_none()
+            {
+                return None;
+            }
+            Some(ResolvedEnvironmentProfileReceipt {
+                profile_id: binding.id.clone(),
+                profile_revision: binding.revision.clone(),
+            })
+        }
+    };
+    Some(SpawnProfileSummary {
+        id: profile.profile_id.clone(),
+        revision: profile.revision.clone(),
+        environment_profile,
+    })
+}
+
+fn session_record_context_export_binding_is_exact(
+    expected: &ManagedSessionRecord,
+    current: &ManagedSessionRecord,
+    identity: &ProviderSessionIdentity,
+    session: &SessionAddress,
+    binding: &SessionBinding,
+    provider: &AgentId,
+    current_root: &str,
+) -> bool {
+    current == expected
+        && current.provider_session.as_ref() == Some(identity)
+        && current.active_session.as_ref() == Some(session)
+        && current.workspace_id == session.workspace_id
+        && provider == &current.provider
+        && binding.workspace_id == session.workspace_id
+        && binding.generation == session.session.generation
+        && binding.record_id.as_ref() == Some(&current.record_id)
+        && platform::roots_equal(
+            current_root,
+            windows_path_text(&current.canonical_root),
+        )
+}
+
+fn session_record_context_export_source_is_usable(
+    record: &ManagedSessionRecord,
+    status: &SessionStatus,
+) -> bool {
+    record.state == ManagedSessionState::Live
+        && context_pack_source_status_is_usable(status)
 }
 
 fn prompt_framing(_agent_id: &AgentId) -> PromptFraming {
@@ -13997,6 +14480,18 @@ fn managed_worktree_record_holders(
         .filter(|record| record.provider_session.is_some())
         .map(|record| (record.record_id.clone(), record.workspace_id.clone()))
         .collect()
+}
+
+fn managed_spawn_record_ownership(
+    binding: &SessionBinding,
+    effective_runtime_policy: ProviderRuntimePolicy,
+) -> (Option<SessionRecordId>, Option<SessionRecordId>) {
+    debug_assert_eq!(binding.runtime_policy, effective_runtime_policy);
+    if effective_runtime_policy.provider_session_identity {
+        (binding.record_id.clone(), None)
+    } else {
+        (None, binding.record_id.clone())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -15350,6 +15845,28 @@ mod tests {
         terminal_test_shared_with_mode(WorktreeServiceMode::Manual)
     }
 
+    #[cfg(feature = "fixture")]
+    #[test]
+    fn managed_worktree_v2_failure_probe_keeps_only_the_latest_code() {
+        let probe = SpawnManagedWorktreeV2FailureProbe::default();
+        assert_eq!(probe.latest_code(), None);
+
+        probe.record(Some(NodeFailureCode::ManagedWorktreeOwnershipConflict));
+        assert_eq!(
+            probe.latest_code(),
+            Some(NodeFailureCode::ManagedWorktreeOwnershipConflict),
+        );
+
+        probe.record(Some(NodeFailureCode::SpawnDeadlineExceeded));
+        assert_eq!(
+            probe.latest_code(),
+            Some(NodeFailureCode::SpawnDeadlineExceeded),
+        );
+
+        probe.record(None);
+        assert_eq!(probe.latest_code(), None);
+    }
+
     #[test]
     fn launch_snapshot_is_authoritative_bounded_and_path_free() {
         let source = temporary_workspace_root("launch-inventory-source");
@@ -16274,6 +16791,63 @@ mod tests {
             reply.result.unwrap_err().code,
             NodeFailureCode::UnsupportedCapability,
         );
+    }
+
+    #[test]
+    fn spawn_profile_environment_authority_is_exact_and_legacy_safe() {
+        let (shared, _runtime, environment_profile) = environment_profile_test_shared();
+        let snapshot = shared.snapshot();
+        let profiles = snapshot
+            .launch_inventory
+            .as_ref()
+            .and_then(|inventory| inventory.spawn_profiles.as_ref())
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].environment_profile, Some(environment_profile));
+        assert!(snapshot.requires_child_environment_profile_capability());
+
+        let mut legacy = snapshot.clone();
+        clear_snapshot_child_environment_profiles(&mut legacy);
+        assert!(legacy
+            .launch_inventory
+            .as_ref()
+            .unwrap()
+            .spawn_profiles
+            .as_ref()
+            .unwrap()[0]
+            .environment_profile
+            .is_none());
+        assert!(!legacy.requires_child_environment_profile_capability());
+
+        let profile = shared.spawn_profiles.iter().next().unwrap().clone();
+        let bindings = shared
+            .environment_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut provider_mismatch = bindings.clone();
+        provider_mismatch
+            .values_mut()
+            .next()
+            .unwrap()
+            .provider = agent("codex");
+        assert!(resolved_spawn_profile_summary(&profile, &provider_mismatch).is_none());
+        let mut mode_mismatch = profile;
+        mode_mismatch.mode = SessionMode::Inline;
+        assert!(resolved_spawn_profile_summary(&mode_mismatch, &bindings).is_none());
+
+        shared
+            .environment_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        assert!(shared
+            .snapshot()
+            .launch_inventory
+            .unwrap()
+            .spawn_profiles
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -17362,6 +17936,126 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             ManagedWorktreeRegistry::from_records(vec![lease.clone()], Vec::new()).unwrap();
         lease
+    }
+
+    #[cfg(feature = "fixture")]
+    #[test]
+    fn monitoring_fixture_managed_spawn_retains_effective_record_holder_and_converges_live() {
+        let mut shared = terminal_test_shared();
+        shared.fixture_semantic_hook_policy = true;
+        let lease = install_managed_lease(&shared);
+        let address = SessionAddress {
+            workspace_id: lease.workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(206),
+                generation: SessionGeneration(1),
+            },
+        };
+        let pre_admission_policy = ProviderRuntimePolicy::raw_pty();
+        let effective_runtime_policy = shared.effective_spawn_runtime_policy(
+            &agent("claude"),
+            SessionMode::Pty,
+            pre_admission_policy,
+        );
+        assert_ne!(effective_runtime_policy, pre_admission_policy);
+        assert!(effective_runtime_policy.provider_session_identity);
+
+        let record_id = shared
+            .bind_spawn_session(
+                &address,
+                agent("claude"),
+                SessionMode::Pty,
+                effective_runtime_policy,
+                SpawnRecordPolicy::Always,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared.record(&record_id).unwrap().state,
+            ManagedSessionState::IdentityPending,
+        );
+        let (record_holder, raw_inventory_record_id) = {
+            let mut bindings = shared
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let binding = bindings.get_mut(&address.session.instance_id).unwrap();
+            binding.managed_worktree_lease_id = Some(lease.lease_id.clone());
+            managed_spawn_record_ownership(binding, effective_runtime_policy)
+        };
+        assert_eq!(record_holder.as_ref(), Some(&record_id));
+        assert!(raw_inventory_record_id.is_none());
+        let snapshot = shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bind_session(
+                &lease.lease_id,
+                ManagedWorktreeSessionHolder {
+                    incarnation_id: shared.incarnation_id,
+                    instance_id: address.session.instance_id,
+                    generation: address.session.generation,
+                },
+                record_holder,
+                unix_time_ms(),
+            )
+            .unwrap();
+        assert_eq!(snapshot.managed_record_count, 1);
+        assert_eq!(
+            shared
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&lease.lease_id)
+                .unwrap()
+                .record_holders,
+            vec![record_id.clone()],
+        );
+
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "monitoring-fixture-managed-session".to_owned(),
+            transcript_path: None,
+        };
+        shared.publish_control(ControlEvent {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            sequence: 1,
+            command_id: None,
+            instance_id: address.session.instance_id,
+            generation: address.session.generation,
+            event: ControlEventKind::ProviderEvent {
+                sequence: 1,
+                source: gate4agent_types::ProviderSource {
+                    family: AdapterFamily::Hook,
+                    binding: AdapterBinding::new(
+                        gate4agent_types::AdapterId::new("claude-code").unwrap(),
+                        "fixture/v1",
+                        gate4agent_types::AdapterVerification::SyntheticFixture,
+                    )
+                    .unwrap(),
+                },
+                source_sequence: 1,
+                event: ProviderEvent::SessionIdentityObserved {
+                    identity: identity.clone(),
+                },
+            },
+        });
+
+        let live = shared.record(&record_id).unwrap();
+        assert_eq!(live.state, ManagedSessionState::Live);
+        assert_eq!(live.provider_session.as_ref(), Some(&identity));
+        assert_eq!(live.active_session.as_ref(), Some(&address));
+        assert_eq!(
+            shared
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&lease.lease_id)
+                .unwrap()
+                .record_holders,
+            vec![record_id],
+        );
     }
 
     fn managed_v2_test_shared(
@@ -18542,6 +19236,196 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_record_context_export_selects_one_exact_history_identity() {
+        let candidates = vec![
+            HistoryCandidateSummary {
+                id: "candidate-other".to_owned(),
+                session_id_hint: "provider-other".to_owned(),
+                modified_at_unix_ms: Some(1),
+            },
+            HistoryCandidateSummary {
+                id: "candidate-exact".to_owned(),
+                session_id_hint: "provider-exact".to_owned(),
+                modified_at_unix_ms: Some(2),
+            },
+        ];
+        assert_eq!(
+            unique_history_candidate_for_provider_session(&candidates, "provider-exact")
+                .unwrap(),
+            "candidate-exact",
+        );
+    }
+
+    #[test]
+    fn session_record_context_export_rejects_missing_and_ambiguous_history_identity() {
+        let candidate = |id: &str, hint: &str| HistoryCandidateSummary {
+            id: id.to_owned(),
+            session_id_hint: hint.to_owned(),
+            modified_at_unix_ms: None,
+        };
+        let missing = unique_history_candidate_for_provider_session(
+            &[candidate("candidate-other", "provider-other")],
+            "provider-exact",
+        )
+        .unwrap_err();
+        assert_eq!(missing.code, NodeFailureCode::SessionRecordConflict);
+        let ambiguous = unique_history_candidate_for_provider_session(
+            &[
+                candidate("candidate-a", "provider-exact"),
+                candidate("candidate-b", "provider-exact"),
+            ],
+            "provider-exact",
+        )
+        .unwrap_err();
+        assert_eq!(ambiguous.code, NodeFailureCode::SessionRecordConflict);
+    }
+
+    #[test]
+    fn session_record_context_export_revalidation_rejects_record_change() {
+        let session = terminal_address(1);
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "provider-exact".to_owned(),
+            transcript_path: Some(r"C:\private\provider.jsonl".to_owned()),
+        };
+        let mut expected = record("claude", "record-context-export");
+        expected.state = ManagedSessionState::Live;
+        expected.provider_session = Some(identity.clone());
+        expected.active_session = Some(session.clone());
+        let binding = SessionBinding {
+            workspace_id: session.workspace_id.clone(),
+            generation: session.session.generation,
+            runtime_policy: ProviderRuntimePolicy::raw_pty(),
+            pending_resume: None,
+            record_id: Some(expected.record_id.clone()),
+            managed_worktree_lease_id: None,
+            environment_profile: None,
+            bundle: None,
+            context: None,
+            materialization_id: None,
+        };
+        let current_root = windows_path_text(&expected.canonical_root).to_owned();
+        assert!(session_record_context_export_binding_is_exact(
+            &expected,
+            &expected,
+            &identity,
+            &session,
+            &binding,
+            &expected.provider,
+            &current_root,
+        ));
+        let mut changed = expected.clone();
+        changed.updated_at_unix_ms += 1;
+        assert!(!session_record_context_export_binding_is_exact(
+            &expected,
+            &changed,
+            &identity,
+            &session,
+            &binding,
+            &expected.provider,
+            &current_root,
+        ));
+    }
+
+    #[test]
+    fn session_record_context_export_preflight_requires_live_usable_source() {
+        let mut source = record("claude", "record-context-export-preflight");
+        source.state = ManagedSessionState::Live;
+        assert!(session_record_context_export_source_is_usable(
+            &source,
+            &SessionStatus::Running,
+        ));
+        assert!(session_record_context_export_source_is_usable(
+            &source,
+            &SessionStatus::Exited { exit_code: Some(0) },
+        ));
+
+        source.state = ManagedSessionState::Dormant;
+        assert!(!session_record_context_export_source_is_usable(
+            &source,
+            &SessionStatus::Running,
+        ));
+        source.state = ManagedSessionState::Live;
+        assert!(!session_record_context_export_source_is_usable(
+            &source,
+            &SessionStatus::Starting,
+        ));
+    }
+
+    #[test]
+    fn session_record_context_export_final_conflict_leaves_catalog_empty() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-context-export-conflict").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        let history = HistorySessionRecord {
+            session_id: "provider-exact".to_owned(),
+            title: None,
+            cwd: None,
+            model: None,
+            message_count: 1,
+            completed_turn_count: None,
+            total_tokens: 0,
+            messages: vec![gate4agent_types::HistoryMessageRecord {
+                role: gate4agent_types::HistoryMessageRole::User,
+                text: "bounded context".to_owned(),
+            }],
+        };
+        let pack = NodeContextPack::export(
+            ContextPackLineageReceipt {
+                source_node_id: shared.node_id.clone(),
+                source_session: terminal_address(1),
+                source_provider: agent("claude"),
+            },
+            &history,
+        )
+        .unwrap();
+        let context_id = pack.receipt().id.clone();
+        let session = terminal_address(1);
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: history.session_id.clone(),
+            transcript_path: None,
+        };
+        let mut expected = record("claude", "record-context-export-final-conflict");
+        expected.state = ManagedSessionState::Live;
+        expected.provider_session = Some(identity.clone());
+        expected.active_session = Some(session.clone());
+        let mut changed = expected.clone();
+        changed.updated_at_unix_ms += 1;
+        shared.insert_record(changed).unwrap();
+
+        let error = shared
+            .commit_context_pack_for_session_record(
+                &expected,
+                &identity,
+                &session,
+                "candidate-exact",
+                &history,
+                pack,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, NodeFailureCode::SessionRecordConflict);
+        assert!(shared
+            .context_catalog
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&context_id)
+            .is_none());
+    }
+
     #[tokio::test]
     async fn session_task_binding_mints_assigns_clears_with_cas_and_persists_v9() {
         let root = temporary_workspace_root("session-task-binding");
@@ -18895,15 +19779,107 @@ mod tests {
 
     #[cfg(feature = "fixture")]
     #[test]
+    fn monitoring_context_fixture_combines_claude_and_codex_hooks_with_history() {
+        let root = temporary_workspace_root("monitoring-context-fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        let proof_path = root.join("context.proof");
+        let standard = NodeServer::context_pack_fixture_catalog(
+            proof_path.clone(),
+            None,
+            false,
+        ).unwrap();
+        let monitoring = NodeServer::context_pack_fixture_catalog(
+            proof_path.clone(),
+            None,
+            true,
+        ).unwrap();
+        let claude = AgentId::new("claude").unwrap();
+        let standard_claude = standard.get(&claude).unwrap();
+        let monitoring_claude = monitoring.get(&claude).unwrap();
+        assert_eq!(
+            monitoring_claude.capabilities.adapters.hook.as_ref().unwrap().id.as_str(),
+            "claude-code",
+        );
+        assert_eq!(
+            monitoring_claude.capabilities.adapters.history,
+            standard_claude.capabilities.adapters.history,
+        );
+        assert_ne!(monitoring_claude.launch, standard_claude.launch);
+        let codex = AgentId::new("codex").unwrap();
+        let standard_codex = standard.get(&codex).unwrap();
+        let monitoring_codex = monitoring.get(&codex).unwrap();
+        assert_eq!(
+            monitoring_codex
+                .capabilities
+                .adapters
+                .hook
+                .as_ref()
+                .unwrap()
+                .id
+                .as_str(),
+            "codex",
+        );
+        assert_eq!(
+            monitoring_codex.capabilities.adapters.history,
+            standard_codex.capabilities.adapters.history,
+        );
+        assert_ne!(monitoring_codex.launch, standard_codex.launch);
+        let codex_validation = monitoring_codex.launch.fixed_args.iter()
+            .find(|argument| argument.contains("F7_CODEX_BUNDLE_CONTEXT_VALIDATED"))
+            .unwrap();
+        for required in [
+            "$allowedTopLevel = @('schema', 'source_provider', 'source_message_count', 'retained_messages', 'repository', 'truncated')",
+            "$requiredTopLevel = @('schema', 'source_provider', 'source_message_count', 'retained_messages', 'truncated')",
+            "@('role', 'text')",
+            "g4a-private-provider-session-canary",
+            "private-provider-login-identity",
+            "$rawProof",
+            "$env:GATE4AGENT_HOOK_URL",
+            "g4a-private-provider-session-canary",
+        ] {
+            assert!(codex_validation.contains(required), "missing privacy validation: {required}");
+        }
+        for provider in ["grok", "kimi", "qwen-code"] {
+            let provider = AgentId::new(provider).unwrap();
+            assert_eq!(monitoring.get(&provider), standard.get(&provider));
+        }
+
+        let config = NodeServerConfig::new(
+            format!(
+                r"\\.\pipe\gate4agent-monitoring-context-fixture-{}",
+                std::process::id(),
+            ),
+            "fixture-token",
+            NodeId::new("monitoring-context-fixture-node").unwrap(),
+            [WorkspaceConfig::new(
+                WorkspaceId::new("primary").unwrap(),
+                std::env::current_dir().unwrap(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let server = NodeServer::new_monitoring_context_pack_fixture(config, proof_path).unwrap();
+        assert!(server.shared.fixture_semantic_hook_policy);
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "fixture")]
+    #[test]
     fn kimi_context_only_fixture_is_bounded_and_preserves_codex_validation() {
         let root = temporary_workspace_root("kimi-context-only-fixture");
         std::fs::create_dir_all(&root).unwrap();
         let proof_path = root.join("context.proof");
-        let standard = NodeServer::context_pack_fixture_catalog(proof_path.clone(), None).unwrap();
+        let standard = NodeServer::context_pack_fixture_catalog(
+            proof_path.clone(),
+            None,
+            false,
+        ).unwrap();
         let kimi = AgentId::new("kimi").unwrap();
         let context_only = NodeServer::context_pack_fixture_catalog(
             proof_path,
             Some(&kimi),
+            false,
         )
         .unwrap();
 

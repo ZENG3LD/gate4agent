@@ -68,6 +68,8 @@ pub const NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
 pub const NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
     "session-bundle-materialization-v1";
 pub const NODE_HISTORY_CONTEXT_PACK_CAPABILITY: &str = "history-context-pack-v1";
+pub const NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY: &str =
+    "session-record-context-export-v1";
 pub const NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY: &str =
     "standalone-workspace-lifecycle-v1";
 pub const NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY: &str =
@@ -1274,6 +1276,8 @@ pub struct ResolvedBundleReceipt {
 pub struct SpawnProfileSummary {
     pub id: SpawnProfileId,
     pub revision: SpawnProfileRevision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_profile: Option<ResolvedEnvironmentProfileReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3457,6 +3461,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
             NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
             NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+            NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
             NODE_NATIVE_SESSION_CATALOG_CAPABILITY,
             NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
             NODE_NATIVE_SESSION_INDEX_CAPABILITY,
@@ -4480,6 +4485,13 @@ impl NodeSnapshot {
         self.session_records
             .iter()
             .any(|record| record.environment_profile.is_some())
+            || self.launch_inventory.as_ref().is_some_and(|inventory| {
+                inventory.spawn_profiles.as_ref().is_some_and(|profiles| {
+                    profiles
+                        .iter()
+                        .any(|profile| profile.environment_profile.is_some())
+                })
+            })
     }
 
     pub fn requires_session_bundle_materialization_capability(&self) -> bool {
@@ -5597,6 +5609,10 @@ pub enum NodeRequest {
         #[serde(deserialize_with = "deserialize_history_candidate_id")]
         candidate_id: String,
     },
+    ExportContextPackForSessionRecord {
+        record_id: SessionRecordId,
+        session: SessionAddress,
+    },
     ExportContextPack {
         session: SessionAddress,
     },
@@ -5763,6 +5779,7 @@ impl NodeRequest {
             | Self::PageNativeSessions { .. }
             | Self::PreviewNativeSession { .. }
             | Self::PreviewSessionRecord { .. }
+            | Self::ExportContextPackForSessionRecord { .. }
             | Self::ExportContextPack { .. }
             | Self::ForgetContextPack { .. }
             | Self::Prompt { .. }
@@ -5824,6 +5841,9 @@ impl NodeRequest {
             }
             Self::SpawnManagedWorktreeV2 { .. } => {
                 Some(NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY)
+            }
+            Self::ExportContextPackForSessionRecord { .. } => {
+                Some(NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY)
             }
             Self::DiscoverHistory { .. }
             | Self::LoadHistory { .. }
@@ -5925,6 +5945,7 @@ impl NodeRequest {
         match self {
             Self::DiscoverHistory { .. }
             | Self::LoadHistory { .. }
+            | Self::ExportContextPackForSessionRecord { .. }
             | Self::ExportContextPack { .. }
             | Self::ForgetContextPack { .. } => true,
             Self::SpawnSpec { spec } => {
@@ -6119,6 +6140,11 @@ pub enum NodeResponse {
     ContextPackExported {
         context: ResolvedContextPackReceipt,
     },
+    ContextPackForSessionRecordExported {
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        context: ResolvedContextPackReceipt,
+    },
     ContextPackForgotten {
         context_id: SpawnContextId,
     },
@@ -6144,6 +6170,10 @@ pub enum NodeResponse {
 }
 
 impl NodeResponse {
+    pub fn requires_session_record_context_export_capability(&self) -> bool {
+        matches!(self, Self::ContextPackForSessionRecordExported { .. })
+    }
+
     pub fn requires_harness_mcp_proxy_capability(&self) -> bool {
         matches!(self,
             Self::Armed { .. }
@@ -6299,6 +6329,7 @@ impl NodeResponse {
             | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
+            | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
@@ -6358,6 +6389,7 @@ impl NodeResponse {
             | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
+            | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
@@ -6398,6 +6430,7 @@ impl NodeResponse {
             }
             Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
+            | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. } => true,
             Self::Armed { .. }
@@ -8087,6 +8120,67 @@ mod tests {
     }
 
     #[test]
+    fn session_record_context_export_wire_is_exact_private_and_capability_bound() {
+        assert_eq!(
+            NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
+            "session-record-context-export-v1",
+        );
+        let capability =
+            CapabilityId::new(NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY).unwrap();
+        assert!(production_node_client_compatibility_offer()
+            .capabilities
+            .contains(&capability));
+        let session = session_address("primary", 19);
+        let record_id = SessionRecordId::new("record-19").unwrap();
+        let request = NodeRequest::ExportContextPackForSessionRecord {
+            record_id: record_id.clone(),
+            session: session.clone(),
+        };
+        assert_eq!(
+            request.required_capability(),
+            Some(NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY),
+        );
+        assert!(request.requires_history_context_pack_capability());
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<NodeRequest>(&request_json).unwrap(), request);
+        for private in [
+            "candidate_id",
+            "session_id_hint",
+            "provider_session",
+            "working_directory",
+            "path",
+            "model",
+            "messages",
+        ] {
+            assert!(!request_json.contains(private), "request leaked {private}");
+        }
+
+        let response = NodeResponse::ContextPackForSessionRecordExported {
+            record_id,
+            session: session.clone(),
+            context: context_receipt("context-record-19", session),
+        };
+        assert!(response.requires_history_context_pack_capability());
+        assert!(response.requires_session_record_context_export_capability());
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<NodeResponse>(&response_json).unwrap(),
+            response,
+        );
+        for private in [
+            "candidate_id",
+            "session_id_hint",
+            "provider_session",
+            "working_directory",
+            "path",
+            "model",
+            "messages",
+        ] {
+            assert!(!response_json.contains(private), "response leaked {private}");
+        }
+    }
+
+    #[test]
     fn native_session_catalog_wire_is_bounded_metadata_only() {
         assert_eq!(NODE_NATIVE_SESSION_CATALOG_CAPABILITY, "native-session-catalog-v2");
         let route = NativeSessionCatalogRoute::workspace(
@@ -8601,6 +8695,47 @@ mod tests {
         assert!(serde_json::to_string(&current_workspace)
             .unwrap()
             .contains(r#""managed_worktree_profiles":[]"#));
+    }
+
+    #[test]
+    fn spawn_profile_environment_authority_is_optional_safe_and_capability_bound() {
+        let environment_profile = ResolvedEnvironmentProfileReceipt {
+            profile_id: SpawnEnvironmentProfileId::new("local-claude").unwrap(),
+            profile_revision: SpawnEnvironmentProfileRevision::new("local-claude-r1").unwrap(),
+        };
+        let summary = SpawnProfileSummary {
+            id: SpawnProfileId::new("default").unwrap(),
+            revision: SpawnProfileRevision::new("v1").unwrap(),
+            environment_profile: Some(environment_profile.clone()),
+        };
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"id":"default","revision":"v1","environment_profile":{"profile_id":"local-claude","profile_revision":"local-claude-r1"}}"#,
+        );
+        assert!(!encoded.contains("provider"));
+        assert!(!encoded.contains("mode"));
+        let legacy = serde_json::from_str::<SpawnProfileSummary>(
+            r#"{"id":"default","revision":"v1"}"#,
+        )
+        .unwrap();
+        assert!(legacy.environment_profile.is_none());
+
+        let snapshot = serde_json::from_value::<NodeSnapshot>(serde_json::json!({
+            "node_id": "fixture-node",
+            "enabled_providers": [],
+            "workspaces": [],
+            "launch_inventory": {
+                "spawn_profiles": [summary],
+            },
+        }))
+        .unwrap();
+        assert!(snapshot.requires_child_environment_profile_capability());
+        assert_eq!(
+            snapshot.launch_inventory.unwrap().spawn_profiles.unwrap()[0]
+                .environment_profile,
+            Some(environment_profile),
+        );
     }
 
     #[test]

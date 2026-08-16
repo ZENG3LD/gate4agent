@@ -1,7 +1,8 @@
 use crate::protocol::{
     C2ErrorCategory, C2NodeEvent, C2NodeFailure, C2NodeResponse, C2ObservationSupport, C2RelayFailure, C2RelayFailureCode, GapKind, HealthResponse, NodeCursor, NodeFreshness, NodeGap, NodeId,
     NodeIncarnationId, NodeRequest, ResolvedSpawnReceipt, RoutedNodeEvent, RoutedNodeResponse,
-    ManagedWorktreeLeaseState, ManagedWorktreeSpawnRequest, SpawnOverride, SpawnSpec,
+    ManagedWorktreeLeaseState, ManagedWorktreeSpawnRequest, ManagedWorktreeSpawnRequestV2,
+    SpawnOverride, SpawnSpec,
     NodeTransportState, ObservedNode, ProviderAdapterContractSupport, ProviderContractSupport,
     ReadyResponse, SanitizedError, SlimNodeInventory, StatusResponse,
     C2_API_VERSION, C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY,
@@ -890,13 +891,7 @@ async fn handle_relay_command(
     match command {
         RelayCommand::Request { operator_connection_id, expected_incarnation_id, request, reply } => {
             let relay_deadline = relay_request_deadline(&request, Instant::now());
-            let expected_spawn = match &request {
-                NodeRequest::SpawnSpec { spec } => Some(ExpectedSpawnRequest::Spec(spec.clone())),
-                NodeRequest::SpawnManagedWorktree { request } => {
-                    Some(ExpectedSpawnRequest::Managed(request.clone()))
-                }
-                _ => None,
-            };
+            let expected_spawn = expected_spawn_request(&request);
             let expected_provider_session_index = matches!(
                 &request,
                 NodeRequest::IndexProviderSession { .. }
@@ -1221,7 +1216,21 @@ fn validate_workspace_content_response(
 
 enum ExpectedSpawnRequest {
     Spec(SpawnSpec),
-    Managed(ManagedWorktreeSpawnRequest),
+    ManagedV1(ManagedWorktreeSpawnRequest),
+    ManagedV2(ManagedWorktreeSpawnRequestV2),
+}
+
+fn expected_spawn_request(request: &NodeRequest) -> Option<ExpectedSpawnRequest> {
+    match request {
+        NodeRequest::SpawnSpec { spec } => Some(ExpectedSpawnRequest::Spec(spec.clone())),
+        NodeRequest::SpawnManagedWorktree { request } => {
+            Some(ExpectedSpawnRequest::ManagedV1(request.clone()))
+        }
+        NodeRequest::SpawnManagedWorktreeV2 { request } => {
+            Some(ExpectedSpawnRequest::ManagedV2(request.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn validate_provider_session_index_response(
@@ -1320,9 +1329,29 @@ fn validate_spawn_spec_response(
             validate_spawn_receipt(spec, receipt, relay_incarnation_id)
         }
         (
-            Some(ExpectedSpawnRequest::Managed(request)),
+            Some(ExpectedSpawnRequest::ManagedV1(request)),
             Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt }),
-        ) => validate_managed_spawn_receipt(request, receipt, relay_incarnation_id),
+        ) => validate_managed_spawn_receipt(
+            &request.spawn_spec,
+            &request.worktree_profile_id,
+            receipt,
+            relay_incarnation_id,
+        ),
+        (
+            Some(ExpectedSpawnRequest::ManagedV2(request)),
+            Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt }),
+        ) if receipt.lease.profile_revision == request.expected_profile_revision => {
+            validate_managed_spawn_receipt(
+                &request.spawn_spec,
+                &request.worktree_profile_id,
+                receipt,
+                relay_incarnation_id,
+            )
+        }
+        (
+            Some(ExpectedSpawnRequest::ManagedV2(_)),
+            Ok(NodeResponse::ManagedWorktreeSpawnAccepted { .. }),
+        ) => Err("managed spawn receipt profile revision does not match routed request"),
         (Some(_), Ok(_)) => return Err("spawn spec request returned a different response"),
         (Some(_), Err(_)) => return Ok(()),
         (None, Ok(NodeResponse::SpawnSpecAccepted { .. }
@@ -1334,23 +1363,24 @@ fn validate_spawn_spec_response(
 }
 
 fn validate_managed_spawn_receipt(
-    request: &ManagedWorktreeSpawnRequest,
+    spawn_spec: &SpawnSpec,
+    worktree_profile_id: &gate4agent_node_protocol::WorktreeProfileId,
     receipt: &gate4agent_node_protocol::ManagedWorktreeSpawnReceipt,
     relay_incarnation_id: NodeIncarnationId,
 ) -> Result<(), &'static str> {
-    if receipt.lease.source_workspace_id != request.spawn_spec.target.workspace_id
-        || receipt.lease.profile_id != request.worktree_profile_id
+    if receipt.lease.source_workspace_id != spawn_spec.target.workspace_id
+        || &receipt.lease.profile_id != worktree_profile_id
         || receipt.lease.state != ManagedWorktreeLeaseState::InUse
         || receipt.lease.cleanup_failure.is_some()
         || receipt.lease.active_session_count != 1
-        || receipt.spawn.target.node_id != request.spawn_spec.target.node_id
-        || receipt.spawn.target.workspace_id != request.spawn_spec.target.workspace_id
+        || receipt.spawn.target.node_id != spawn_spec.target.node_id
+        || receipt.spawn.target.workspace_id != spawn_spec.target.workspace_id
         || receipt.spawn.target.worktree_id.as_ref() != Some(&receipt.lease.workspace_id)
         || receipt.spawn.session.workspace_id != receipt.lease.workspace_id
     {
         return Err("managed spawn receipt does not match routed request");
     }
-    let mut resolved_spec = request.spawn_spec.clone();
+    let mut resolved_spec = spawn_spec.clone();
     resolved_spec.target.worktree_id = Some(receipt.lease.workspace_id.clone());
     validate_spawn_receipt(&resolved_spec, &receipt.spawn, relay_incarnation_id)
 }
@@ -2746,7 +2776,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_spawn_receipt_correlation_rejects_non_in_use_or_mismatched_leases() {
+    fn managed_spawn_receipt_correlation_covers_legacy_and_v2_requests() {
         let incarnation_id = NodeIncarnationId::from_bytes([7; 16]);
         let spec = SpawnSpec {
             target: SpawnTarget {
@@ -2814,7 +2844,7 @@ mod tests {
                 ManagedWorktreeLeaseState::InUse,
             ),
         };
-        let expected = ExpectedSpawnRequest::Managed(managed);
+        let expected = ExpectedSpawnRequest::ManagedV1(managed.clone());
         let response = |receipt| Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt });
         assert!(validate_spawn_spec_response(
             Some(&expected),
@@ -2848,6 +2878,54 @@ mod tests {
             )
             .is_err());
         }
+
+        let mut legacy_revision = receipt.clone();
+        legacy_revision.lease.profile_revision =
+            WorktreeProfileRevision::new("review.r2").unwrap();
+        assert!(validate_spawn_spec_response(
+            Some(&expected),
+            &response(legacy_revision),
+            incarnation_id,
+        )
+        .is_ok());
+
+        let v2_request = ManagedWorktreeSpawnRequestV2 {
+            spawn_spec: managed.spawn_spec,
+            worktree_profile_id: managed.worktree_profile_id,
+            expected_profile_revision: WorktreeProfileRevision::new("review.r1").unwrap(),
+        };
+        let routed = NodeRequest::SpawnManagedWorktreeV2 {
+            request: v2_request.clone(),
+        };
+        let captured_expected = expected_spawn_request(&routed).unwrap();
+        let ExpectedSpawnRequest::ManagedV2(captured_request) = &captured_expected else {
+            panic!("V2 managed spawn request was not captured separately");
+        };
+        assert_eq!(captured_request, &v2_request);
+        assert!(validate_spawn_spec_response(
+            Some(&captured_expected),
+            &response(receipt.clone()),
+            incarnation_id,
+        )
+        .is_ok());
+
+        let mut wrong_revision = receipt.clone();
+        wrong_revision.lease.profile_revision =
+            WorktreeProfileRevision::new("review.r2").unwrap();
+        assert!(validate_spawn_spec_response(
+            Some(&ExpectedSpawnRequest::ManagedV2(v2_request.clone())),
+            &response(wrong_revision),
+            incarnation_id,
+        )
+        .is_err());
+        assert!(validate_spawn_spec_response(
+            Some(&ExpectedSpawnRequest::ManagedV2(v2_request)),
+            &Ok(NodeResponse::SpawnSpecAccepted {
+                receipt: receipt.spawn,
+            }),
+            incarnation_id,
+        )
+        .is_err());
     }
 
     #[test]

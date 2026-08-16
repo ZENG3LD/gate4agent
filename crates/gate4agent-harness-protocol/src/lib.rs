@@ -1431,7 +1431,6 @@ impl HarnessContinuationV1 {
         if let Some(binding) = &self.target_binding {
             if binding.node_id != self.node_id
                 || binding.node_incarnation != self.node_incarnation
-                || binding.workspace_id != self.workspace_id
             {
                 return Err(HarnessValidationError::InvalidContinuationLink);
             }
@@ -2689,6 +2688,101 @@ mod tests {
         assert_eq!(
             run.validate(),
             Err(HarnessValidationError::BindingIntentMismatch),
+        );
+    }
+
+    #[test]
+    fn bound_continuation_allows_exact_managed_target_workspace() {
+        let source_binding = HarnessSessionBindingV1 {
+            node_id: selector("node-a"),
+            node_incarnation: selector("incarnation-a"),
+            workspace_id: selector("workspace-a"),
+            session: HarnessSessionIdentityV1::Managed {
+                record_id: selector("record-source"),
+                active_session: Some(HarnessRuntimeIdentityV1 {
+                    instance_id: 1,
+                    generation: 1,
+                }),
+            },
+        };
+        let mut continuation = HarnessContinuationV1 {
+            continuation_ref: HarnessContinuationRef::new(format!(
+                "hcontinuation_{}",
+                "a".repeat(24),
+            )).unwrap(),
+            receipt_ref: HarnessReceiptRef::new(format!(
+                "hreceipt_{}",
+                "b".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(4).unwrap(),
+            state: HarnessContinuationStateV1::Bound,
+            authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: grant_id('3'),
+                revision: HarnessRevision::new(1).unwrap(),
+            },
+            source_run_id: run_id('4'),
+            target_run_id: run_id('5'),
+            operation_id: operation_id('6'),
+            node_id: selector("node-a"),
+            node_incarnation: selector("incarnation-a"),
+            workspace_id: selector("workspace-a"),
+            source_provider: selector("claude"),
+            source_binding,
+            context: Some(HarnessResolvedContextPackReceiptV1 {
+                id: selector("context-a"),
+                digest: format!("sha256:{}", "c".repeat(64)),
+                lineage: HarnessContextPackLineageV1 {
+                    source_node_id: selector("node-a"),
+                    source_workspace_id: selector("workspace-a"),
+                    source_instance_id: 1,
+                    source_generation: 1,
+                    source_provider: selector("claude"),
+                },
+                source_message_count: 2,
+                retained_message_count: 2,
+                byte_len: 64,
+                truncated: false,
+            }),
+            target_binding: Some(HarnessSessionBindingV1 {
+                node_id: selector("node-a"),
+                node_incarnation: selector("incarnation-a"),
+                workspace_id: selector("workspace-a"),
+                session: HarnessSessionIdentityV1::Managed {
+                    record_id: selector("record-target"),
+                    active_session: Some(HarnessRuntimeIdentityV1 {
+                        instance_id: 2,
+                        generation: 1,
+                    }),
+                },
+            }),
+            prepared_at_unix_ms: 1_000,
+            exporting_at_unix_ms: Some(1_100),
+            exported_at_unix_ms: Some(1_200),
+            bound_at_unix_ms: Some(1_300),
+            expired_at_unix_ms: None,
+            outcome_unknown_at_unix_ms: None,
+            outcome_unknown_reason: None,
+            cleanup_state: HarnessContinuationCleanupStateV1::Retained,
+            created_at_unix_ms: 1_000,
+            updated_at_unix_ms: 1_300,
+        };
+
+        continuation.validate().unwrap();
+        continuation.target_binding.as_mut().unwrap().workspace_id =
+            selector("workspace-allocated");
+        continuation.validate().unwrap();
+
+        continuation.target_binding.as_mut().unwrap().node_id = selector("node-b");
+        assert_eq!(
+            continuation.validate(),
+            Err(HarnessValidationError::InvalidContinuationLink),
+        );
+        continuation.target_binding.as_mut().unwrap().node_id = selector("node-a");
+        continuation.target_binding.as_mut().unwrap().node_incarnation =
+            selector("incarnation-b");
+        assert_eq!(
+            continuation.validate(),
+            Err(HarnessValidationError::InvalidContinuationLink),
         );
     }
 

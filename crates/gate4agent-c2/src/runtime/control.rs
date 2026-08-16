@@ -10,6 +10,7 @@ use crate::protocol::{
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     C2_HISTORY_CONTEXT_PACK_CAPABILITY,
+    C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
     C2_NATIVE_SESSION_CATALOG_CAPABILITY, C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
     C2_NATIVE_SESSION_INDEX_CAPABILITY, C2_NATIVE_SESSION_PREVIEW_CAPABILITY,
     C2_HOST_DIRECTORY_BROWSE_CAPABILITY,
@@ -76,6 +77,7 @@ struct NegotiatedPathCapabilities {
     child_environment_profile: bool,
     session_bundle_materialization: bool,
     history_context_pack: bool,
+    session_record_context_export: bool,
     native_session_catalog: bool,
     native_session_catalog_paging: bool,
     native_session_index: bool,
@@ -603,6 +605,12 @@ async fn control_writer<W>(
             budget.fetch_sub(queued.bytes, Ordering::AcqRel);
             break;
         }
+        if !path_capabilities.session_record_context_export
+            && server_frame_contains_session_record_context_export(&frame)
+        {
+            budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+            break;
+        }
         if !path_capabilities.session_task_correlation {
             strip_session_task_bindings_from_server_frame(&mut frame);
         }
@@ -824,6 +832,8 @@ fn negotiated_path_capabilities(
         session_bundle_materialization:
             selected_has(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY),
         history_context_pack: selected_has(C2_HISTORY_CONTEXT_PACK_CAPABILITY),
+        session_record_context_export:
+            selected_has(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY),
         native_session_catalog: selected_has(C2_NATIVE_SESSION_CATALOG_CAPABILITY),
         native_session_catalog_paging:
             selected_has(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY),
@@ -893,6 +903,7 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
                     | C2NodeResponse::SessionRecordPreviewed { .. }
                     | C2NodeResponse::HistoryDiscovered { .. }
                     | C2NodeResponse::HistoryLoaded { .. }
+                    | C2NodeResponse::ContextPackForSessionRecordExported { .. }
                     | C2NodeResponse::ContextPackExported { .. }
                     | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
@@ -949,6 +960,21 @@ fn server_frame_contains_harness_mcp_proxy(frame: &C2ServerFrame) -> bool {
         C2ServerFrame::Event(event) => event.event.requires_harness_mcp_proxy_capability(),
         C2ServerFrame::Challenge(_)
         | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => false,
+    }
+}
+
+fn server_frame_contains_session_record_context_export(frame: &C2ServerFrame) -> bool {
+    match frame {
+        C2ServerFrame::Reply(reply) => reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(
+                C2NodeResponse::requires_session_record_context_export_capability,
+            )
+        }),
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Event(_)
         | C2ServerFrame::Topology(_)
         | C2ServerFrame::Rejected(_) => false,
     }
@@ -1012,6 +1038,9 @@ fn unnegotiated_request_failure(
             capabilities.managed_worktree_spawn_v2
         }
         Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => capabilities.history_context_pack,
+        Some(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY) => {
+            capabilities.session_record_context_export
+        }
         Some(C2_NATIVE_SESSION_CATALOG_CAPABILITY) => capabilities.native_session_catalog,
         Some(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY) => {
             capabilities.native_session_catalog_paging
@@ -1210,6 +1239,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
@@ -1344,6 +1374,7 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                     | C2NodeResponse::SessionRecordPreviewed { .. }
                     | C2NodeResponse::HistoryDiscovered { .. }
                     | C2NodeResponse::HistoryLoaded { .. }
+                    | C2NodeResponse::ContextPackForSessionRecordExported { .. }
                     | C2NodeResponse::ContextPackExported { .. }
                     | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
@@ -1678,6 +1709,7 @@ fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bo
         }
         C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. } => false,
         C2NodeResponse::Armed { .. }
@@ -1862,6 +1894,7 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -2112,6 +2145,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_NATIVE_SESSION_CATALOG_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY)
@@ -2209,6 +2244,10 @@ fn request_targets_unavailable_provider(
         NodeRequest::ActivateHarnessMcpReservation { record_id, session, .. }
         | NodeRequest::PutHarnessMcpReplyChunk { record_id, session, .. }
         | NodeRequest::RejectHarnessMcpCall { record_id, session, .. } => {
+            !status_address_is_legacy(status, node_id, session)
+                || !status_record_is_legacy(status, node_id, record_id)
+        }
+        NodeRequest::ExportContextPackForSessionRecord { record_id, session } => {
             !status_address_is_legacy(status, node_id, session)
                 || !status_record_is_legacy(status, node_id, record_id)
         }
@@ -2468,7 +2507,8 @@ fn project_legacy_response(
         C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
             project_legacy_spawn_provider(&mut receipt.spawn)
         }
-        C2NodeResponse::ContextPackExported { context } => {
+        C2NodeResponse::ContextPackExported { context }
+        | C2NodeResponse::ContextPackForSessionRecordExported { context, .. } => {
             context_receipt_provider_is_legacy(context)
         }
         C2NodeResponse::NativeSessionsCataloged { route, .. }
@@ -2657,6 +2697,7 @@ fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
         | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
@@ -3521,6 +3562,7 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            session_record_context_export: true,
             native_session_catalog: true,
             native_session_catalog_paging: true,
             native_session_index: true,
@@ -3794,6 +3836,41 @@ mod tests {
     }
 
     #[test]
+    fn c2_session_record_context_export_requires_new_and_history_capabilities() {
+        let request = NodeRequest::ExportContextPackForSessionRecord {
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            session: address(7),
+        };
+        let mut capabilities = NegotiatedPathCapabilities {
+            history_context_pack: true,
+            session_record_context_export: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "request capability was not negotiated with C2"
+        ));
+
+        capabilities.session_record_context_export = true;
+        capabilities.history_context_pack = false;
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ref message,
+                ..
+            }) if message == "history context pack capability was not negotiated with C2"
+        ));
+
+        capabilities.history_context_pack = true;
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+    }
+
+    #[test]
     fn managed_worktree_partial_capability_intersections_fail_closed() {
         let request = NodeRequest::SpawnManagedWorktree {
             request: crate::protocol::ManagedWorktreeSpawnRequest {
@@ -3817,6 +3894,7 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            session_record_context_export: true,
             native_session_catalog: true,
             native_session_catalog_paging: true,
             native_session_index: true,
@@ -4452,6 +4530,7 @@ mod tests {
             spawn_profiles: Some(vec![crate::protocol::SpawnProfileSummary {
                 id: SpawnProfileId::new("default").unwrap(),
                 revision: SpawnProfileRevision::new("v1").unwrap(),
+                environment_profile: None,
             }]),
             bundles: Some(vec![crate::protocol::ResolvedBundleReceipt {
                 id: crate::protocol::SpawnBundleId::new("review").unwrap(),
@@ -5103,6 +5182,7 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            session_record_context_export: true,
             native_session_catalog: true,
             native_session_catalog_paging: true,
             native_session_index: true,

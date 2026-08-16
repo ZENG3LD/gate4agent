@@ -9,6 +9,7 @@ use gate4agent_c2_protocol::{
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     C2_HISTORY_CONTEXT_PACK_CAPABILITY,
+    C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
     C2_NATIVE_SESSION_CATALOG_CAPABILITY,
     C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
     C2_NATIVE_SESSION_INDEX_CAPABILITY, C2_NATIVE_SESSION_PREVIEW_CAPABILITY,
@@ -92,6 +93,8 @@ const SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED: &str =
     "session bundle materialization requires negotiated C2 capability";
 const HISTORY_CONTEXT_PACK_NOT_NEGOTIATED: &str =
     "history context packs require negotiated C2 capability";
+const SESSION_RECORD_CONTEXT_EXPORT_NOT_NEGOTIATED: &str =
+    "session-record context export requires negotiated C2 capability";
 const HOST_DIRECTORY_BROWSE_NOT_NEGOTIATED: &str =
     "host directory browsing requires negotiated C2 capability";
 const STANDALONE_WORKSPACE_LIFECYCLE_NOT_NEGOTIATED: &str =
@@ -123,6 +126,7 @@ struct NegotiatedPathCapabilities {
     child_environment_profile: bool,
     session_bundle_materialization: bool,
     history_context_pack: bool,
+    session_record_context_export: bool,
     native_session_catalog: bool,
     native_session_catalog_paging: bool,
     native_session_index: bool,
@@ -262,6 +266,7 @@ fn control_request_deadline(request: &NodeRequest) -> Duration {
         NodeRequest::PreviewNativeSession { .. }
         | NodeRequest::IndexNativeSession { .. }
         | NodeRequest::PreviewSessionRecord { .. } => NATIVE_SESSION_RELAY_DEADLINE,
+        NodeRequest::ExportContextPackForSessionRecord { .. } => Duration::from_secs(45),
         NodeRequest::CreateWorktree { .. }
         | NodeRequest::CreateStandaloneWorkspace { .. }
         | NodeRequest::RemoveWorktree { .. }
@@ -526,6 +531,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_NATIVE_SESSION_CATALOG_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY)
@@ -638,6 +645,8 @@ fn negotiated_path_capabilities(
         session_bundle_materialization:
             selected_has(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY),
         history_context_pack: selected_has(C2_HISTORY_CONTEXT_PACK_CAPABILITY),
+        session_record_context_export:
+            selected_has(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY),
         native_session_catalog: selected_has(C2_NATIVE_SESSION_CATALOG_CAPABILITY),
         native_session_catalog_paging:
             selected_has(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY),
@@ -726,6 +735,9 @@ fn reject_unnegotiated_outbound_path(
             capabilities.managed_worktree_spawn_v2
         }
         Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => capabilities.history_context_pack,
+        Some(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY) => {
+            capabilities.session_record_context_export
+        }
         Some(C2_NATIVE_SESSION_CATALOG_CAPABILITY) => capabilities.native_session_catalog,
         Some(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY) => {
             capabilities.native_session_catalog_paging
@@ -762,6 +774,9 @@ fn reject_unnegotiated_outbound_path(
                 }
                 Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => {
                     HISTORY_CONTEXT_PACK_NOT_NEGOTIATED.to_owned()
+                }
+                Some(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY) => {
+                    SESSION_RECORD_CONTEXT_EXPORT_NOT_NEGOTIATED.to_owned()
                 }
                 Some(C2_HOST_DIRECTORY_BROWSE_CAPABILITY) => {
                     HOST_DIRECTORY_BROWSE_NOT_NEGOTIATED.to_owned()
@@ -926,6 +941,7 @@ fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
@@ -995,6 +1011,7 @@ fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
@@ -1145,6 +1162,35 @@ fn validate_provider_session_index_response(
         (_, Ok(C2NodeResponse::ProviderSessionIndexed { .. })) => {
             Err("C2 returned an unexpected provider session index response")
         }
+        _ => Ok(()),
+    }
+}
+
+fn validate_session_record_context_export_response(
+    expected: &NodeRequest,
+    response: &Result<RoutedNodeResponse, C2RelayFailure>,
+) -> Result<(), &'static str> {
+    let Ok(routed) = response else {
+        return Ok(());
+    };
+    match (expected, &routed.response) {
+        (
+            NodeRequest::ExportContextPackForSessionRecord { record_id, session },
+            Ok(C2NodeResponse::ContextPackForSessionRecordExported {
+                record_id: echoed_record_id,
+                session: echoed_session,
+                context,
+            }),
+        ) if record_id == echoed_record_id && session == echoed_session && context.is_valid() => {
+            Ok(())
+        }
+        (NodeRequest::ExportContextPackForSessionRecord { .. }, Err(_)) => Ok(()),
+        (NodeRequest::ExportContextPackForSessionRecord { .. }, Ok(_)) => Err(
+            "C2 session-record context export response does not match the routed request",
+        ),
+        (_, Ok(C2NodeResponse::ContextPackForSessionRecordExported { .. })) => Err(
+            "C2 returned an unexpected session-record context export response",
+        ),
         _ => Ok(()),
     }
 }
@@ -1413,6 +1459,7 @@ fn c2_node_response_has_terminal_frame_event(response: &C2NodeResponse) -> bool 
         | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
@@ -1506,6 +1553,7 @@ fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -1573,6 +1621,7 @@ fn c2_node_response_has_unix_repository_path(response: &C2NodeResponse) -> bool 
         | C2NodeResponse::SessionRecordPreviewed { .. }
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
@@ -1963,7 +2012,8 @@ fn c2_node_response_has_open_provider_id(response: &C2NodeResponse) -> bool {
                     .as_ref()
                     .is_some_and(context_receipt_has_open_provider_id)
         }
-        C2NodeResponse::ContextPackExported { context } => {
+        C2NodeResponse::ContextPackExported { context }
+        | C2NodeResponse::ContextPackForSessionRecordExported { context, .. } => {
             context_receipt_has_open_provider_id(context)
         }
         C2NodeResponse::NativeSessionsCataloged { route, .. }
@@ -2132,6 +2182,15 @@ async fn control_owner<E>(
                             break;
                         }
                         if let Err(message) = validate_provider_session_index_response(
+                            &expected_request,
+                            &reply.result,
+                        ) {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                message.to_owned(),
+                            )));
+                            break;
+                        }
+                        if let Err(message) = validate_session_record_context_export_response(
                             &expected_request,
                             &reply.result,
                         ) {
@@ -2396,6 +2455,18 @@ async fn control_owner<E>(
                         {
                             let _ = waiter.send(Err(C2ControlError::Protocol(
                                 HISTORY_CONTEXT_PACK_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
+                        if !path_capabilities.session_record_context_export
+                            && reply.result.as_ref().is_ok_and(|routed| {
+                                routed.response.as_ref().is_ok_and(
+                                    C2NodeResponse::requires_session_record_context_export_capability,
+                                )
+                            })
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                SESSION_RECORD_CONTEXT_EXPORT_NOT_NEGOTIATED.to_owned(),
                             )));
                             break;
                         }
@@ -2971,6 +3042,7 @@ mod tests {
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
+            session_record_context_export: true,
             native_session_catalog: true,
             native_session_catalog_paging: true,
             native_session_index: true,
@@ -2982,6 +3054,74 @@ mod tests {
             observation_workflow_detail: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn session_record_context_export_requires_both_capabilities_and_exact_echo() {
+        let session = gate4agent_node_protocol::SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(3),
+            },
+        };
+        let record_id = gate4agent_node_protocol::SessionRecordId::new(
+            "record-context-41",
+        )
+        .unwrap();
+        let request = NodeRequest::ExportContextPackForSessionRecord {
+            record_id: record_id.clone(),
+            session: session.clone(),
+        };
+        let mut capabilities = NegotiatedPathCapabilities {
+            session_record_context_export: true,
+            ..NegotiatedPathCapabilities::default()
+        };
+        assert!(reject_unnegotiated_outbound_path(&request, capabilities).is_err());
+        capabilities.history_context_pack = true;
+        capabilities.session_record_context_export = false;
+        assert!(reject_unnegotiated_outbound_path(&request, capabilities).is_err());
+        capabilities.session_record_context_export = true;
+        assert!(reject_unnegotiated_outbound_path(&request, capabilities).is_ok());
+
+        let context = gate4agent_node_protocol::ResolvedContextPackReceipt {
+            id: gate4agent_node_protocol::SpawnContextId::new("context-record-41").unwrap(),
+            digest: gate4agent_node_protocol::SpawnContextDigest::new(format!(
+                "sha256:{}",
+                "a".repeat(64),
+            ))
+            .unwrap(),
+            lineage: gate4agent_node_protocol::ContextPackLineageReceipt {
+                source_node_id: NodeId::new("node-a").unwrap(),
+                source_session: session.clone(),
+                source_provider: gate4agent_types::AgentId::new("claude").unwrap(),
+            },
+            source_message_count: 2,
+            retained_message_count: 2,
+            byte_len: 64,
+            truncated: false,
+        };
+        let response = Ok(RoutedNodeResponse {
+            node_id: NodeId::new("node-a").unwrap(),
+            incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            response: Ok(C2NodeResponse::ContextPackForSessionRecordExported {
+                record_id: record_id.clone(),
+                session: session.clone(),
+                context: context.clone(),
+            }),
+        });
+        assert!(validate_session_record_context_export_response(&request, &response).is_ok());
+        let mismatch = Ok(RoutedNodeResponse {
+            node_id: NodeId::new("node-a").unwrap(),
+            incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            response: Ok(C2NodeResponse::ContextPackForSessionRecordExported {
+                record_id: gate4agent_node_protocol::SessionRecordId::new("record-other")
+                    .unwrap(),
+                session,
+                context,
+            }),
+        });
+        assert!(validate_session_record_context_export_response(&request, &mismatch).is_err());
     }
 
     #[test]

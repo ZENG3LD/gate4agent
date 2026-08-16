@@ -17,6 +17,7 @@ pub const HARNESS_READ_DEADLINE: Duration = Duration::from_secs(3);
 pub const HARNESS_OPERATOR_DEADLINE: Duration = Duration::from_secs(3);
 pub const HARNESS_RUN_WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(14);
 pub const HARNESS_NATIVE_HISTORY_DEADLINE: Duration = Duration::from_secs(42);
+pub const HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from_secs(14);
 
 #[derive(Clone, Debug)]
 pub struct HarnessReadClient {
@@ -299,6 +300,20 @@ impl HarnessOperatorClient {
         match self.send(HarnessOperatorRequestV1::ReverseAttributionGet { subject })? {
             HarnessOperatorResponseV1::ReverseAttribution(value) => {
                 value.validate_for(&expected_subject)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn observe_run_context_source(
+        &self,
+        run_id: HarnessRunId,
+    ) -> Result<HarnessRunContextSourceObservationV1, HarnessOperatorClientError> {
+        let expected_run_id = run_id.clone();
+        match self.send(HarnessOperatorRequestV1::ObserveRunContextSource { run_id })? {
+            HarnessOperatorResponseV1::RunContextSourceObserved(value) => {
+                value.validate_for(&expected_run_id)?;
                 Ok(value)
             }
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
@@ -600,6 +615,11 @@ impl HarnessOperatorClient {
     ) -> Result<HarnessOperatorResponseV1, HarnessOperatorClientError> {
         let response_deadline = if matches!(
             &request,
+            HarnessOperatorRequestV1::ObserveRunContextSource { .. }
+        ) {
+            HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE
+        } else if matches!(
+            &request,
             HarnessOperatorRequestV1::CatalogNativeSessions { .. }
                 | HarnessOperatorRequestV1::PageNativeSessions { .. }
                 | HarnessOperatorRequestV1::PreviewNativeSession { .. }
@@ -832,6 +852,21 @@ mod tests {
             run_revision: HarnessRevision::new(5).unwrap(),
             delivery: None,
             continuation: None,
+        }
+    }
+
+    fn context_source_observation(
+        run_id: HarnessRunId,
+    ) -> HarnessRunContextSourceObservationV1 {
+        HarnessRunContextSourceObservationV1 {
+            run_id,
+            run_revision: HarnessRevision::new(8).unwrap(),
+            feature_state: FeatureObservationStateV1::Observed,
+            message_count: 17,
+            message_count_exact: true,
+            completed_turn_count: Some(6),
+            total_tokens: Some(4_096),
+            observed_at_unix_ms: Some(1_000),
         }
     }
 
@@ -1886,6 +1921,98 @@ mod tests {
             read_operator_bounded_line(&mut reader, HARNESS_OPERATOR_RESPONSE_MAX_BYTES),
             Err(HarnessOperatorClientError::ResponseTooLarge),
         ));
+    }
+
+    #[test]
+    fn operator_client_round_trips_exact_v8_context_source_observation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let run_id = HarnessRunId::new(format!("hrun_{}", "8".repeat(24))).unwrap();
+        let response = context_source_observation(run_id.clone());
+        let expected_run_id = run_id.clone();
+        let expected_response = response.clone();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            assert_eq!(request.matches('\n').count(), 1);
+            for forbidden in [
+                "authority",
+                "operation_id",
+                "idempotency_ref",
+                "provider_session",
+                "provider_home",
+                "auth",
+                "model",
+            ] {
+                assert!(!request.contains(forbidden), "request exposed {forbidden}");
+            }
+            let envelope: HarnessOperatorEnvelopeV1 =
+                serde_json::from_str(request.trim_end()).expect("operator envelope");
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V8);
+            assert!(matches!(
+                envelope.request,
+                HarnessOperatorRequestV1::ObserveRunContextSource { run_id }
+                    if run_id == expected_run_id,
+            ));
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::RunContextSourceObserved(
+                    expected_response,
+                ),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert_eq!(client.observe_run_context_source(run_id).unwrap(), response);
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_rejects_mismatched_v8_context_source_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let requested_run_id =
+            HarnessRunId::new(format!("hrun_{}", "8".repeat(24))).unwrap();
+        let other_run_id = HarnessRunId::new(format!("hrun_{}", "9".repeat(24))).unwrap();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::RunContextSourceObserved(
+                    context_source_observation(other_run_id),
+                ),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert!(matches!(
+            client.observe_run_context_source(requested_run_id),
+            Err(HarnessOperatorClientError::Api(
+                HarnessOperatorApiError::InvalidRunContextSourceObservation,
+            )),
+        ));
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn context_source_observation_deadline_exceeds_host_and_c2_floors() {
+        const HOST_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from_secs(12);
+        const C2_CONTEXT_SOURCE_OBSERVATION_FLOOR: Duration = Duration::from_secs(10);
+        assert!(
+            HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE
+                > HOST_CONTEXT_SOURCE_OBSERVATION_DEADLINE,
+        );
+        assert!(
+            HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE
+                > C2_CONTEXT_SOURCE_OBSERVATION_FLOOR,
+        );
     }
 
 }

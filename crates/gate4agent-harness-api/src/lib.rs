@@ -62,6 +62,7 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V4: u16 = 4;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V5: u16 = 5;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V6: u16 = 6;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V7: u16 = 7;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V8: u16 = 8;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -184,6 +185,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V5
                 | HARNESS_OPERATOR_WIRE_VERSION_V6
                 | HARNESS_OPERATOR_WIRE_VERSION_V7
+                | HARNESS_OPERATOR_WIRE_VERSION_V8
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -1527,6 +1529,7 @@ pub enum HarnessOperatorRequestV1 {
     RunCorrelationGet { run_id: HarnessRunId },
     RunTransferGet { run_id: HarnessRunId },
     ReverseAttributionGet { subject: HarnessReverseAttributionSubjectV1 },
+    ObserveRunContextSource { run_id: HarnessRunId },
     InspectRunWorkspace { run_id: HarnessRunId },
     ReadRunWorkspaceFile {
         run_id: HarnessRunId,
@@ -1616,6 +1619,7 @@ impl HarnessOperatorRequestV1 {
             Self::RunGet { run_id }
             | Self::RunCorrelationGet { run_id }
             | Self::RunTransferGet { run_id }
+            | Self::ObserveRunContextSource { run_id }
             | Self::InspectRunWorkspace { run_id } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)
             }
@@ -1766,8 +1770,14 @@ impl HarnessOperatorRequestV1 {
         matches!(self, Self::ReverseAttributionGet { .. })
     }
 
+    pub fn requires_v8(&self) -> bool {
+        matches!(self, Self::ObserveRunContextSource { .. })
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v7() {
+        if self.requires_v8() {
+            HARNESS_OPERATOR_WIRE_VERSION_V8
+        } else if self.requires_v7() {
             HARNESS_OPERATOR_WIRE_VERSION_V7
         } else if self.requires_v6() {
             HARNESS_OPERATOR_WIRE_VERSION_V6
@@ -1811,6 +1821,7 @@ pub enum HarnessOperatorResponseV1 {
     RunCorrelation(HarnessRunCorrelationV1),
     RunTransfer(HarnessRunTransferSummaryV1),
     ReverseAttribution(HarnessReverseAttributionV1),
+    RunContextSourceObserved(HarnessRunContextSourceObservationV1),
     RunWorkspaceInspected(HarnessRunWorkspaceInspectionV1),
     RunWorkspaceFileRead(HarnessRunWorkspaceFileV1),
     RunGitHistoryRead(HarnessRunGitHistoryPageV1),
@@ -1840,6 +1851,7 @@ impl HarnessOperatorResponseV1 {
             Self::RunCorrelation(value) => value.validate(),
             Self::RunTransfer(value) => value.validate(),
             Self::ReverseAttribution(value) => value.validate(),
+            Self::RunContextSourceObserved(value) => value.validate(),
             Self::RunWorkspaceInspected(value) => value.validate(),
             Self::RunWorkspaceFileRead(value) => value.validate(),
             Self::RunGitHistoryRead(value) => value.validate(),
@@ -2273,6 +2285,48 @@ impl HarnessRunTransferSummaryV1 {
         self.validate()?;
         if &self.run_id != run_id {
             return Err(HarnessOperatorApiError::InvalidRunTransfer);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunContextSourceObservationV1 {
+    pub run_id: HarnessRunId,
+    pub run_revision: HarnessRevision,
+    pub feature_state: FeatureObservationStateV1,
+    pub message_count: u64,
+    pub message_count_exact: bool,
+    pub completed_turn_count: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub observed_at_unix_ms: Option<u64>,
+}
+
+impl HarnessRunContextSourceObservationV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.run_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        let observed = self.feature_state == FeatureObservationStateV1::Observed;
+        let observed_fields_valid = self.message_count > 0
+            && self.message_count_exact
+            && self.observed_at_unix_ms.is_some_and(|timestamp| timestamp > 0)
+            && self.completed_turn_count.map_or(true, |count| count <= self.message_count);
+        let unobserved_fields_empty = self.message_count == 0
+            && !self.message_count_exact
+            && self.completed_turn_count.is_none()
+            && self.total_tokens.is_none()
+            && self.observed_at_unix_ms.is_none();
+        if observed && !observed_fields_valid || !observed && !unobserved_fields_empty {
+            return Err(HarnessOperatorApiError::InvalidRunContextSourceObservation);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, run_id: &HarnessRunId) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        if &self.run_id != run_id {
+            return Err(HarnessOperatorApiError::InvalidRunContextSourceObservation);
         }
         Ok(())
     }
@@ -3655,6 +3709,8 @@ pub enum HarnessOperatorApiError {
     InvalidRunTransfer,
     #[error("harness reverse attribution is invalid")]
     InvalidReverseAttribution,
+    #[error("harness run context source observation is invalid")]
+    InvalidRunContextSourceObservation,
     #[error("harness run workspace origin is invalid")]
     InvalidWorkspaceOrigin,
     #[error("harness repository-relative path is invalid")]
@@ -5741,5 +5797,137 @@ mod tests {
             active_generation: None,
         };
         assert!(invalid_active_pair.validate().is_err());
+    }
+
+    #[test]
+    fn operator_v8_context_source_observation_is_exact_private_and_fails_closed_on_v7() {
+        let run_id = HarnessRunId::new(format!("hrun_{}", "8".repeat(24))).unwrap();
+        let request = HarnessOperatorRequestV1::ObserveRunContextSource {
+            run_id: run_id.clone(),
+        };
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V8);
+        request.validate().unwrap();
+        let request_json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            request_json,
+            serde_json::json!({
+                "kind": "observe-run-context-source",
+                "run_id": run_id,
+            }),
+        );
+        for forbidden in ["authority", "operation_id", "idempotency_ref", "task_id"] {
+            assert!(!request_json.to_string().contains(forbidden), "leaked {forbidden}");
+        }
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        assert!(matches!(
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V7,
+                credential: credential.clone(),
+                request: request.clone(),
+            }.validate(),
+            Err(HarnessOperatorApiError::UnsupportedVersion),
+        ));
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V8,
+            credential,
+            request,
+        }.validate().unwrap();
+
+        let response = HarnessRunContextSourceObservationV1 {
+            run_id: HarnessRunId::new(format!("hrun_{}", "8".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(9).unwrap(),
+            feature_state: FeatureObservationStateV1::Observed,
+            message_count: 17,
+            message_count_exact: true,
+            completed_turn_count: Some(6),
+            total_tokens: Some(4_096),
+            observed_at_unix_ms: Some(1_000),
+        };
+        response.validate().unwrap();
+        let response_json = serde_json::to_value(
+            HarnessOperatorResponseV1::RunContextSourceObserved(response),
+        ).unwrap();
+        assert_eq!(
+            response_json,
+            serde_json::json!({
+                "kind": "run-context-source-observed",
+                "value": {
+                    "run_id": format!("hrun_{}", "8".repeat(24)),
+                    "run_revision": 9,
+                    "feature_state": "observed",
+                    "message_count": 17,
+                    "message_count_exact": true,
+                    "completed_turn_count": 6,
+                    "total_tokens": 4096,
+                    "observed_at_unix_ms": 1000,
+                }
+            }),
+        );
+        let response_json = response_json.to_string();
+        for forbidden in [
+            "transcript",
+            "message_text",
+            "provider_session",
+            "provider_profile",
+            "provider_home",
+            "credential",
+            "auth",
+            "path",
+            "model",
+        ] {
+            assert!(!response_json.contains(forbidden), "leaked {forbidden}");
+        }
+
+        let mut unknown = request_json;
+        unknown["provider_session_id"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<HarnessOperatorRequestV1>(unknown).is_err());
+    }
+
+    #[test]
+    fn context_source_observation_rejects_inexact_or_mismatched_eligibility_claims() {
+        let run_id = HarnessRunId::new(format!("hrun_{}", "8".repeat(24))).unwrap();
+        let observed = HarnessRunContextSourceObservationV1 {
+            run_id: run_id.clone(),
+            run_revision: HarnessRevision::new(9).unwrap(),
+            feature_state: FeatureObservationStateV1::Observed,
+            message_count: 17,
+            message_count_exact: true,
+            completed_turn_count: Some(6),
+            total_tokens: Some(4_096),
+            observed_at_unix_ms: Some(1_000),
+        };
+        observed.validate_for(&run_id).unwrap();
+
+        let mut inexact = observed.clone();
+        inexact.message_count_exact = false;
+        assert!(inexact.validate().is_err());
+        let mut empty = observed.clone();
+        empty.message_count = 0;
+        assert!(empty.validate().is_err());
+        let mut impossible_turns = observed.clone();
+        impossible_turns.completed_turn_count = Some(18);
+        assert!(impossible_turns.validate().is_err());
+        let unobserved = HarnessRunContextSourceObservationV1 {
+            feature_state: FeatureObservationStateV1::SupportedNotObserved,
+            message_count: 0,
+            message_count_exact: false,
+            completed_turn_count: None,
+            total_tokens: None,
+            observed_at_unix_ms: None,
+            ..observed.clone()
+        };
+        unobserved.validate().unwrap();
+        let mut leaked_count = unobserved;
+        leaked_count.total_tokens = Some(1);
+        assert!(leaked_count.validate().is_err());
+
+        let other_run_id = HarnessRunId::new(format!("hrun_{}", "9".repeat(24))).unwrap();
+        assert!(matches!(
+            observed.validate_for(&other_run_id),
+            Err(HarnessOperatorApiError::InvalidRunContextSourceObservation),
+        ));
     }
 }

@@ -21,6 +21,7 @@ use gate4agent_node_protocol::{
     NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+    NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
     NODE_HARNESS_MCP_READ_PROXY_CAPABILITY,
     NODE_NATIVE_SESSION_CATALOG_CAPABILITY, NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
     NODE_NATIVE_SESSION_INDEX_CAPABILITY, NODE_NATIVE_SESSION_PREVIEW_CAPABILITY,
@@ -1316,6 +1317,9 @@ fn ensure_server_frame_required_capability_for_request(
             | Ok(NodeResponse::SessionRecordPreviewed { .. }) => {
                 Some(NODE_NATIVE_SESSION_PREVIEW_CAPABILITY)
             }
+            Ok(NodeResponse::ContextPackForSessionRecordExported { .. }) => {
+                Some(NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY)
+            }
             Ok(NodeResponse::SessionRecordUpdated { .. })
                 if matches!(expected_request, Some(NodeRequest::SetSessionTask { .. })) => {
                 Some(NODE_SESSION_TASK_CORRELATION_CAPABILITY)
@@ -1901,6 +1905,7 @@ fn ensure_node_request_provider_capability(
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
@@ -2031,6 +2036,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
@@ -2086,7 +2092,8 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
         NodeResponse::ManagedWorktreeSpawnAccepted { receipt } => {
             resolved_spawn_receipt_contains_open_provider_id(&receipt.spawn)
         }
-        NodeResponse::ContextPackExported { context } => {
+        NodeResponse::ContextPackExported { context }
+        | NodeResponse::ContextPackForSessionRecordExported { context, .. } => {
             context_pack_contains_open_provider_id(context)
         }
         NodeResponse::NativeSessionsCataloged { route, .. }
@@ -2240,6 +2247,7 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::DiscoverHistory { .. }
         | NodeRequest::LoadHistory { .. }
+        | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::Prompt { .. }
@@ -2327,6 +2335,7 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
         | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
@@ -2404,6 +2413,7 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         | NodeResponse::SessionRecordPreviewed { .. }
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
+        | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
@@ -2450,6 +2460,13 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, NodeClientEr
         })?;
     if !offer.capabilities.contains(&history_context_pack) {
         offer.capabilities.push(history_context_pack);
+    }
+    let session_record_context_export =
+        CapabilityId::new(NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY).map_err(|error| {
+            NodeClientError::Protocol(error.to_string())
+        })?;
+    if !offer.capabilities.contains(&session_record_context_export) {
+        offer.capabilities.push(session_record_context_export);
     }
     Ok(offer)
 }

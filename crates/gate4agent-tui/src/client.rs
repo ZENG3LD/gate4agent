@@ -5025,7 +5025,8 @@ async fn publish_c2_response_for_request(
             )
             .await;
         }
-        C2NodeResponse::ContextPackExported { context } => {
+        C2NodeResponse::ContextPackExported { context }
+        | C2NodeResponse::ContextPackForSessionRecordExported { context, .. } => {
             send_update(updates, WorkerUpdate::ContextExported(context)).await;
         }
         C2NodeResponse::ContextPackForgotten { context_id } => {
@@ -8719,6 +8720,7 @@ mod tests {
             spawn_profiles: Some(vec![SpawnProfileSummary {
                 id: SpawnProfileId::new("review-default").unwrap(),
                 revision: SpawnProfileRevision::new("review-default.r3").unwrap(),
+                environment_profile: None,
             }]),
             bundles: Some(vec![ResolvedBundleReceipt {
                 id: SpawnBundleId::new("review-tools").unwrap(),

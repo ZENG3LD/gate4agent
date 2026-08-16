@@ -31,6 +31,7 @@ pub use gate4agent_node_protocol::{
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+    NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
     NODE_NATIVE_SESSION_CATALOG_CAPABILITY,
     NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY,
     NODE_NATIVE_SESSION_INDEX_CAPABILITY,
@@ -111,6 +112,8 @@ pub const C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
 pub const C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY;
 pub const C2_HISTORY_CONTEXT_PACK_CAPABILITY: &str = NODE_HISTORY_CONTEXT_PACK_CAPABILITY;
+pub const C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY: &str =
+    NODE_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY;
 pub const C2_NATIVE_SESSION_CATALOG_CAPABILITY: &str = NODE_NATIVE_SESSION_CATALOG_CAPABILITY;
 pub const C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY: &str =
     NODE_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY;
@@ -655,6 +658,13 @@ impl C2NodeSnapshot {
         self.session_records
             .iter()
             .any(|record| record.environment_profile.is_some())
+            || self.launch_inventory.as_ref().is_some_and(|inventory| {
+                inventory.spawn_profiles.as_ref().is_some_and(|profiles| {
+                    profiles
+                        .iter()
+                        .any(|profile| profile.environment_profile.is_some())
+                })
+            })
     }
 
     pub fn requires_session_bundle_materialization_capability(&self) -> bool {
@@ -1419,6 +1429,11 @@ pub enum C2NodeResponse {
         completed_turn_count: Option<u64>,
     },
     ContextPackExported { context: ResolvedContextPackReceipt },
+    ContextPackForSessionRecordExported {
+        record_id: SessionRecordId,
+        session: SessionAddress,
+        context: ResolvedContextPackReceipt,
+    },
     ContextPackForgotten { context_id: SpawnContextId },
     WorkspaceRegistered {
         workspace: C2WorkspaceSnapshot,
@@ -1653,6 +1668,15 @@ impl From<&NodeResponse> for C2NodeResponse {
             NodeResponse::ContextPackExported { context } => Self::ContextPackExported {
                 context: context.clone(),
             },
+            NodeResponse::ContextPackForSessionRecordExported {
+                record_id,
+                session,
+                context,
+            } => Self::ContextPackForSessionRecordExported {
+                record_id: record_id.clone(),
+                session: session.clone(),
+                context: context.clone(),
+            },
             NodeResponse::ContextPackForgotten { context_id } => Self::ContextPackForgotten {
                 context_id: context_id.clone(),
             },
@@ -1682,6 +1706,10 @@ impl From<&NodeResponse> for C2NodeResponse {
 }
 
 impl C2NodeResponse {
+    pub fn requires_session_record_context_export_capability(&self) -> bool {
+        matches!(self, Self::ContextPackForSessionRecordExported { .. })
+    }
+
     pub fn requires_harness_mcp_proxy_capability(&self) -> bool {
         matches!(self,
             Self::Armed { .. }
@@ -1841,6 +1869,7 @@ impl C2NodeResponse {
             | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
+            | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
@@ -1900,6 +1929,7 @@ impl C2NodeResponse {
             | Self::SessionRecordPreviewed { .. }
             | Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
+            | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::WorkspaceRegistered { .. }
@@ -1940,6 +1970,7 @@ impl C2NodeResponse {
             }
             Self::HistoryDiscovered { .. }
             | Self::HistoryLoaded { .. }
+            | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. } => true,
             Self::Armed { .. }
@@ -4121,6 +4152,59 @@ mod tests {
     }
 
     #[test]
+    fn c2_session_record_context_export_is_exact_correlated_and_private() {
+        assert_eq!(
+            C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY,
+            "session-record-context-export-v1",
+        );
+        let session = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(3),
+            },
+        };
+        let record_id = SessionRecordId::new("record-context-41").unwrap();
+        let request = NodeRequest::ExportContextPackForSessionRecord {
+            record_id: record_id.clone(),
+            session: session.clone(),
+        };
+        assert_eq!(
+            request.required_capability(),
+            Some(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY),
+        );
+        assert!(request.requires_history_context_pack_capability());
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<NodeRequest>(&request_json).unwrap(), request);
+
+        let response = C2NodeResponse::from(
+            &NodeResponse::ContextPackForSessionRecordExported {
+                record_id,
+                session,
+                context: context_pack_receipt(),
+            },
+        );
+        assert!(response.requires_history_context_pack_capability());
+        assert!(response.requires_session_record_context_export_capability());
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<C2NodeResponse>(&response_json).unwrap(),
+            response,
+        );
+        for private in [
+            "candidate_id",
+            "session_id_hint",
+            "provider_session",
+            "messages",
+            "model",
+            "path",
+        ] {
+            assert!(!request_json.contains(private), "request leaked {private}");
+            assert!(!response_json.contains(private), "response leaked {private}");
+        }
+    }
+
+    #[test]
     fn c2_context_metadata_projects_through_records_snapshots_events_and_responses() {
         let context = context_pack_receipt();
         let mut source = private_session_record();
@@ -4680,6 +4764,7 @@ mod tests {
             spawn_profiles: Some(vec![SpawnProfileSummary {
                 id: SpawnProfileId::new("default").unwrap(),
                 revision: SpawnProfileRevision::new("v1").unwrap(),
+                environment_profile: None,
             }]),
             bundles: Some(vec![ResolvedBundleReceipt {
                 id: SpawnBundleId::new("review").unwrap(),

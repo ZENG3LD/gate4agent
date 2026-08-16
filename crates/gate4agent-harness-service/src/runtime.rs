@@ -40,7 +40,9 @@ use gate4agent_harness_api::{
     HarnessOperatorIntentV1,
     HarnessOperatorMutationOutcomeV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
     HarnessOperatorResponseV1, HarnessReadCredential, HarnessReadEnvelopeV1,
+    HarnessRunContextTransferV1, HarnessRunContinuationTransferV1,
     HarnessRunCorrelationAvailabilityV1, HarnessRunCorrelationV1,
+    HarnessRunDeliveryTransferV1, HarnessRunTransferSummaryV1,
     HarnessRunSessionViewV1, HarnessRunWorktreeViewV1,
     HarnessRuntimeInventoryPageV1, HarnessRuntimeInventoryV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
@@ -3541,6 +3543,93 @@ fn project_operator_run_correlation(
     project_run_correlation(run, runtime_inventory)
 }
 
+fn project_operator_run_transfer(
+    harness: &HarnessService,
+    run_id: &gate4agent_harness_protocol::HarnessRunId,
+) -> Result<HarnessRunTransferSummaryV1, HarnessOperatorHostErrorV1> {
+    let run = harness.engine().run(run_id)
+        .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
+    project_run_transfer(
+        run,
+        harness.engine().delivery_for_run(run_id),
+        harness.engine().continuation_for_run(run_id),
+    )
+}
+
+fn project_run_transfer(
+    run: &gate4agent_harness_protocol::HarnessRunV1,
+    delivery: Option<&gate4agent_harness_protocol::HarnessDeliveryV1>,
+    continuation: Option<&gate4agent_harness_protocol::HarnessContinuationV1>,
+) -> Result<HarnessRunTransferSummaryV1, HarnessOperatorHostErrorV1> {
+    run.validate().map_err(|_| HarnessOperatorHostErrorV1::NotFound)?;
+    let delivery = delivery.map(|delivery| {
+        delivery.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+        if delivery.run_id != run.run_id || delivery.task_id != run.task_id {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
+        Ok(HarnessRunDeliveryTransferV1 {
+            delivery_ref: delivery.delivery_ref.clone(),
+            revision: delivery.revision,
+            state: delivery.state,
+            selector: delivery.bundle.selector.clone(),
+            bundle_id: delivery.bundle.bundle_id.clone(),
+            bundle_revision: delivery.bundle.revision.clone(),
+            bundle_digest: delivery.bundle.digest.clone(),
+            manifest_digest: delivery.bundle.manifest_digest.clone(),
+            receipt_ref: delivery.receipt.as_ref().map(|receipt| receipt.receipt_ref.clone()),
+            created_at_unix_ms: delivery.created_at_unix_ms,
+            updated_at_unix_ms: delivery.updated_at_unix_ms,
+            staged_at_unix_ms: delivery.stage_receipt.as_ref()
+                .map(|receipt| receipt.staged_at_unix_ms),
+            committed_at_unix_ms: delivery.receipt.as_ref()
+                .map(|receipt| receipt.committed_at_unix_ms),
+        })
+    }).transpose()?;
+    let continuation = continuation.map(|continuation| {
+        continuation.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+        if continuation.target_run_id != run.run_id {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
+        let context = continuation.context.as_ref().map(|context| {
+            HarnessRunContextTransferV1 {
+                context_ref: context.id.clone(),
+                digest: context.digest.clone(),
+                source_message_count: context.source_message_count,
+                retained_message_count: context.retained_message_count,
+                byte_len: context.byte_len,
+                truncated: context.truncated,
+            }
+        });
+        Ok(HarnessRunContinuationTransferV1 {
+            continuation_ref: continuation.continuation_ref.clone(),
+            receipt_ref: continuation.receipt_ref.clone(),
+            revision: continuation.revision,
+            state: continuation.state,
+            source_run_id: continuation.source_run_id.clone(),
+            target_run_id: continuation.target_run_id.clone(),
+            source_provider: continuation.source_provider.clone(),
+            context,
+            prepared_at_unix_ms: continuation.prepared_at_unix_ms,
+            exporting_at_unix_ms: continuation.exporting_at_unix_ms,
+            exported_at_unix_ms: continuation.exported_at_unix_ms,
+            bound_at_unix_ms: continuation.bound_at_unix_ms,
+            expired_at_unix_ms: continuation.expired_at_unix_ms,
+            outcome_unknown_at_unix_ms: continuation.outcome_unknown_at_unix_ms,
+            outcome_unknown_reason: continuation.outcome_unknown_reason,
+            created_at_unix_ms: continuation.created_at_unix_ms,
+            updated_at_unix_ms: continuation.updated_at_unix_ms,
+        })
+    }).transpose()?;
+    let transfer = HarnessRunTransferSummaryV1 {
+        run_id: run.run_id.clone(),
+        run_revision: run.revision,
+        delivery,
+        continuation,
+    };
+    transfer.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+    Ok(transfer)
+}
+
 fn project_run_correlation(
     run: &gate4agent_harness_protocol::HarnessRunV1,
     runtime_inventory: &HarnessRuntimeInventoryCache,
@@ -3828,6 +3917,11 @@ fn execute_operator_request(
         HarnessOperatorRequestV1::RunCorrelationGet { run_id } => {
             HarnessOperatorResponseV1::RunCorrelation(
                 project_operator_run_correlation(harness, runtime_inventory, &run_id)?,
+            )
+        }
+        HarnessOperatorRequestV1::RunTransferGet { run_id } => {
+            HarnessOperatorResponseV1::RunTransfer(
+                project_operator_run_transfer(harness, &run_id)?,
             )
         }
         HarnessOperatorRequestV1::LaunchPlansList { after_plan_id, limit } => {
@@ -5274,8 +5368,15 @@ mod tests {
     };
     use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
     use gate4agent_harness_protocol::{
-        HarnessCreateTaskRequestV1, HarnessExecutionModeV1, HarnessIdempotencyRef,
+        HarnessContextPackLineageV1, HarnessContinuationCleanupStateV1,
+        HarnessContinuationRef, HarnessContinuationStateV1, HarnessContinuationV1,
+        HarnessCreateTaskRequestV1, HarnessDeliveryBundleDigestV1,
+        HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1,
+        HarnessDeliveryBundleV1, HarnessDeliveryManifestDigestV2,
+        HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1,
+        HarnessExecutionModeV1, HarnessIdempotencyRef,
         HarnessOperationId, HarnessOperatorAuthorityV1, HarnessRequestDigest,
+        HarnessReceiptRef, HarnessResolvedContextPackReceiptV1,
         HarnessRevision, HarnessRunId, HarnessRunIntentV1, HarnessRunV1,
         HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
         HarnessTaskV1,
@@ -5498,6 +5599,8 @@ mod tests {
             grants: Vec::new(),
             operations: vec![create_operation],
             execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap();
@@ -5678,6 +5781,167 @@ mod tests {
         ] {
             let _ = fs::remove_file(candidate);
         }
+    }
+
+    #[test]
+    fn run_transfer_reads_only_durable_records_for_the_exact_run() {
+        let (mut harness, _, run_id, _) = running_harness_fixture();
+        let observation_path = database_path();
+        let observation = ObservationService::open(&observation_path).unwrap();
+        let response = execute_operator_request(
+            &mut harness,
+            &observation,
+            &ObservationSupportRegistry::default(),
+            &HarnessLaunchCatalog::default(),
+            &HarnessRuntimeInventoryCache::default(),
+            HarnessOperatorRequestV1::RunTransferGet {
+                run_id: run_id.clone(),
+            },
+        ).unwrap();
+        let HarnessOperatorResponseV1::RunTransfer(transfer) = response else {
+            panic!("run transfer response expected");
+        };
+        assert_eq!(transfer.run_id, run_id);
+        assert_eq!(transfer.run_revision, HarnessRevision::new(1).unwrap());
+        assert_eq!(transfer.delivery, None);
+        assert_eq!(transfer.continuation, None);
+        transfer.validate().unwrap();
+
+        let missing = execute_operator_request(
+            &mut harness,
+            &observation,
+            &ObservationSupportRegistry::default(),
+            &HarnessLaunchCatalog::default(),
+            &HarnessRuntimeInventoryCache::default(),
+            HarnessOperatorRequestV1::RunTransferGet {
+                run_id: HarnessRunId::new(format!("hrun_{}", "f".repeat(24))).unwrap(),
+            },
+        );
+        assert_eq!(missing, Err(HarnessOperatorHostErrorV1::NotFound));
+        observation.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn run_transfer_projects_only_bounded_delivery_and_context_receipt_facts() {
+        let (harness, task_id, run_id, route) = running_harness_fixture();
+        let grant_id = SessionGrantId::new(format!("hgrant_{}", "d".repeat(24))).unwrap();
+        let operation_id = HarnessOperationId::new(format!("hop_{}", "e".repeat(24))).unwrap();
+        let bundle = HarnessDeliveryBundleV1 {
+            selector: selector("reviewed-skill-bundle"),
+            bundle_id: HarnessDeliveryBundleIdV1::new("bundle-a").unwrap(),
+            revision: HarnessDeliveryBundleRevisionV1::new("r7").unwrap(),
+            digest: HarnessDeliveryBundleDigestV1::new(format!(
+                "sha256:{}",
+                "a".repeat(64),
+            )).unwrap(),
+            manifest_digest: HarnessDeliveryManifestDigestV2::new(format!(
+                "sha256:{}",
+                "b".repeat(64),
+            )).unwrap(),
+        };
+        let delivery = HarnessDeliveryV1 {
+            delivery_ref: HarnessDeliveryRef::new(format!(
+                "hdelivery_{}",
+                "d".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            grant_id: grant_id.clone(),
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            task_id,
+            run_id: run_id.clone(),
+            operation_id: operation_id.clone(),
+            bundle,
+            state: HarnessDeliveryStateV1::Prepared,
+            stage_receipt: None,
+            receipt: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        };
+        let source_run_id = HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap();
+        let source_binding = HarnessSessionBindingV1 {
+            node_id: selector(route.node_id.as_str()),
+            node_incarnation: selector(&route.expected_incarnation_id.to_string()),
+            workspace_id: selector("workspace-a"),
+            session: HarnessSessionIdentityV1::Managed {
+                record_id: selector("source-record"),
+                active_session: Some(HarnessRuntimeIdentityV1 {
+                    instance_id: 9,
+                    generation: 2,
+                }),
+            },
+        };
+        let continuation = HarnessContinuationV1 {
+            continuation_ref: HarnessContinuationRef::new(format!(
+                "hcontinuation_{}",
+                "e".repeat(24),
+            )).unwrap(),
+            receipt_ref: HarnessReceiptRef::new(format!(
+                "hreceipt_{}",
+                "e".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(3).unwrap(),
+            state: HarnessContinuationStateV1::Exported,
+            grant_id,
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            source_run_id: source_run_id.clone(),
+            target_run_id: run_id.clone(),
+            operation_id,
+            node_id: source_binding.node_id.clone(),
+            node_incarnation: source_binding.node_incarnation.clone(),
+            workspace_id: source_binding.workspace_id.clone(),
+            source_provider: selector("claude"),
+            source_binding,
+            context: Some(HarnessResolvedContextPackReceiptV1 {
+                id: selector("context-a"),
+                digest: format!("sha256:{}", "c".repeat(64)),
+                lineage: HarnessContextPackLineageV1 {
+                    source_node_id: selector(route.node_id.as_str()),
+                    source_workspace_id: selector("workspace-a"),
+                    source_instance_id: 9,
+                    source_generation: 2,
+                    source_provider: selector("claude"),
+                },
+                source_message_count: 7,
+                retained_message_count: 5,
+                byte_len: 4096,
+                truncated: true,
+            }),
+            target_binding: None,
+            prepared_at_unix_ms: 10,
+            exporting_at_unix_ms: Some(11),
+            exported_at_unix_ms: Some(12),
+            bound_at_unix_ms: None,
+            expired_at_unix_ms: None,
+            outcome_unknown_at_unix_ms: None,
+            outcome_unknown_reason: None,
+            cleanup_state: HarnessContinuationCleanupStateV1::Retained,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 12,
+        };
+        let transfer = project_run_transfer(
+            harness.engine().run(&run_id).unwrap(),
+            Some(&delivery),
+            Some(&continuation),
+        ).unwrap();
+        assert_eq!(transfer.delivery.as_ref().unwrap().selector.as_str(), "reviewed-skill-bundle");
+        let context = transfer.continuation.as_ref().unwrap().context.as_ref().unwrap();
+        assert_eq!(context.source_message_count, 7);
+        assert_eq!(context.retained_message_count, 5);
+        assert_eq!(context.byte_len, 4096);
+        assert!(context.truncated);
+        assert_eq!(transfer.continuation.as_ref().unwrap().source_run_id, source_run_id);
+        let encoded = serde_json::to_string(&transfer).unwrap();
+        for private in ["source-record", "private-prompt", "provider-session-id", "C:\\\\private"] {
+            assert!(!encoded.contains(private), "private field leaked: {private}");
+        }
+        transfer.validate().unwrap();
     }
 
     #[test]

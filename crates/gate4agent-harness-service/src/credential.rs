@@ -342,6 +342,8 @@ pub(crate) mod tests {
             grants: vec![grant],
             operations: vec![operation],
             execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap()

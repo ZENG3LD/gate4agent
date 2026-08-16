@@ -62,6 +62,7 @@ use gate4agent_harness_client::{
     HarnessRunWorkspaceInspectionV1, HarnessRunWorkspaceOriginV1,
     HarnessWorkspaceEntryKindV1, HarnessWorkspaceFileContentV1,
     HarnessTaskStartOutcomeV1, RedactedBindingStateV1, RedactedRunV1, HarnessRunCorrelationV1,
+    HarnessRunTransferSummaryV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTransportV1,
@@ -640,6 +641,16 @@ enum WorkerUpdate {
     },
     HarnessMonitorFailed {
         run: HarnessRunRef,
+        message: String,
+    },
+    HarnessRunTransfer {
+        run: HarnessRunRef,
+        token: u64,
+        summary: HarnessRunTransferSummaryV1,
+    },
+    HarnessRunTransferFailed {
+        run: HarnessRunRef,
+        token: u64,
         message: String,
     },
     HarnessTaskCorrelations {
@@ -1521,6 +1532,18 @@ fn reject_harness_queue_action(
             app.fail_harness_git_diff(destination, *token, detail_failure());
             return true;
         }
+        AppAction::HarnessLoadRunTransfer { run, token } => {
+            let message = match rejection {
+                HarnessQueueRejection::Busy => {
+                    "Harness operator busy: transfer command queue is full"
+                }
+                HarnessQueueRejection::Unavailable => {
+                    "Harness operator unavailable: transfer command queue is closed"
+                }
+            }.to_owned();
+            app.fail_harness_run_transfer(run, *token, message);
+            return true;
+        }
         _ => {}
     }
     if let AppAction::HarnessOpenMonitor { run } = action {
@@ -1602,6 +1625,7 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
         action,
         AppAction::HarnessOpenMonitor { .. }
             | AppAction::HarnessLoadTaskCorrelations { .. }
+            | AppAction::HarnessLoadRunTransfer { .. }
             | AppAction::HarnessInspectWorkspace { .. }
             | AppAction::HarnessReadWorkspaceFile { .. }
             | AppAction::HarnessReadGitHistory { .. }
@@ -1679,7 +1703,8 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessLoadTaskCorrelations { .. }
         | AppAction::HarnessUseLaunchPlan { .. }
         | AppAction::HarnessStartTask { .. } => Some(HARNESS_COMMAND_ROUTE),
-        AppAction::HarnessInspectWorkspace { .. }
+        AppAction::HarnessLoadRunTransfer { .. }
+        | AppAction::HarnessInspectWorkspace { .. }
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
         | AppAction::HarnessReadGitDiff { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
@@ -2421,6 +2446,34 @@ fn harness_detail_worker(
                         WorkerUpdate::HarnessMonitor { run: loaded, monitor, timeline }
                     }
                     Err(message) => WorkerUpdate::HarnessMonitorFailed { run, message },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessLoadRunTransfer { run, token } => {
+                let update = match client.run_transfer_get(run.run_id.clone()) {
+                    Ok(summary) if summary.run_revision == run.run_revision => {
+                        WorkerUpdate::HarnessRunTransfer {
+                            run,
+                            token,
+                            summary,
+                        }
+                    }
+                    Ok(summary) => WorkerUpdate::HarnessRunTransferFailed {
+                        run: run.clone(),
+                        token,
+                        message: format!(
+                            "Harness run revision changed from r{} to r{}",
+                            run.run_revision.get(),
+                            summary.run_revision.get(),
+                        ),
+                    },
+                    Err(error) => WorkerUpdate::HarnessRunTransferFailed {
+                        run,
+                        token,
+                        message: error.to_string(),
+                    },
                 };
                 if updates.blocking_send(update).is_err() {
                     return;
@@ -5545,6 +5598,7 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessScheduleNext { .. }
         | AppAction::HarnessOpenMonitor { .. }
         | AppAction::HarnessLoadTaskCorrelations { .. }
+        | AppAction::HarnessLoadRunTransfer { .. }
         | AppAction::HarnessUseLaunchPlan { .. }
         | AppAction::HarnessStartTask { .. }
         | AppAction::HarnessInspectWorkspace { .. }
@@ -6693,6 +6747,12 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         }
         WorkerUpdate::HarnessMonitorFailed { run, message } => {
             app.fail_harness_monitor(&run, message);
+        }
+        WorkerUpdate::HarnessRunTransfer { run, token, summary } => {
+            app.apply_harness_run_transfer(run, token, summary);
+        }
+        WorkerUpdate::HarnessRunTransferFailed { run, token, message } => {
+            app.fail_harness_run_transfer(&run, token, message);
         }
         WorkerUpdate::HarnessTaskCorrelations { task_id, correlations, failures } => {
             app.apply_harness_task_correlations(&task_id, correlations, failures);
@@ -7899,6 +7959,9 @@ fn safe_node_failure_code(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::UnknownManagedWorktreeLease => "managed worktree lease unavailable",
         NodeFailureCode::ManagedWorktreeBusy => "managed worktree is busy",
         NodeFailureCode::ManagedWorktreeOwnershipConflict => "managed worktree ownership conflicts",
+        NodeFailureCode::ManagedWorktreeProfileRevisionMismatch => {
+            "managed worktree profile revision mismatch"
+        }
         NodeFailureCode::ManagedWorktreeRecoveryRequired => "managed worktree requires recovery",
         NodeFailureCode::UnknownSpawnProfile => "spawn profile unavailable",
         NodeFailureCode::SpawnProfileRevisionMismatch => "spawn profile revision mismatch",
@@ -13469,6 +13532,37 @@ mod tests {
         };
         assert!(harness_detail_read_action(&task_observations));
         assert!(action_to_request(task_observations).is_none());
+    }
+
+    #[test]
+    fn harness_run_transfer_reads_use_only_detail_route_and_queue_failure_is_terminal() {
+        let run = HarnessRunRef {
+            run_id: HarnessRunId::new(format!("hrun_{}", "8".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(4).unwrap(),
+        };
+        let action = AppAction::HarnessLoadRunTransfer {
+            run: run.clone(),
+            token: 73,
+        };
+        assert!(harness_detail_read_action(&action));
+        assert_eq!(action_node_id(&action), Some(HARNESS_DETAIL_COMMAND_ROUTE));
+        assert!(action_to_request(action.clone()).is_none());
+
+        let mut app = App::default();
+        app.harness_kanban.run_transfers.insert(
+            run.clone(),
+            crate::app::HarnessRunTransferState::Loading { token: 73 },
+        );
+        assert!(reject_harness_queue_action(
+            &mut app,
+            &action,
+            HarnessQueueRejection::Unavailable,
+        ));
+        assert!(matches!(
+            app.harness_kanban.run_transfers.get(&run),
+            Some(crate::app::HarnessRunTransferState::Error { token: 73, message })
+                if message.contains("queue is closed"),
+        ));
     }
 
     #[test]

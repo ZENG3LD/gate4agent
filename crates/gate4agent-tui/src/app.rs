@@ -44,6 +44,7 @@ use gate4agent_harness_client::{
     HarnessExpectedExecutionSpecRevisionV1, HarnessLaunchPlanSummaryV1,
     HarnessOperatorMutationOutcomeV1, HarnessRequestDigest, HarnessRevision,
     HarnessNodeIncarnationV1, HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
+    HarnessRunTransferSummaryV1,
     HarnessTaskExecutionSpecInputV1, HarnessTaskExecutionSpecV1, HarnessTaskId,
     HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
     HarnessTaskStateV1, RedactedBindingStateV1, RedactedRunV1, RedactedTaskV1,
@@ -635,16 +636,18 @@ pub enum HarnessTaskDetailSection {
     Overview,
     Runs,
     Agents,
+    Transfers,
     Files,
     Git,
     Execution,
 }
 
 impl HarnessTaskDetailSection {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Overview,
         Self::Runs,
         Self::Agents,
+        Self::Transfers,
         Self::Files,
         Self::Git,
         Self::Execution,
@@ -655,11 +658,19 @@ impl HarnessTaskDetailSection {
             Self::Overview => "Overview",
             Self::Runs => "Runs",
             Self::Agents => "Agents",
+            Self::Transfers => "Transfers",
             Self::Files => "Files",
             Self::Git => "Git",
             Self::Execution => "Execution",
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessRunTransferState {
+    Loading { token: u64 },
+    Ready(HarnessRunTransferSummaryV1),
+    Error { token: u64, message: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -782,6 +793,7 @@ pub struct HarnessKanbanState {
     pub last_start: Option<HarnessTaskStartOutcomeV1>,
     pub monitor: Option<HarnessRunMonitorView>,
     pub run_observations: BTreeMap<HarnessRunId, HarnessRunObservationState>,
+    pub run_transfers: BTreeMap<HarnessRunRef, HarnessRunTransferState>,
     pub workspaces: BTreeMap<HarnessRunOrigin, HarnessWorkspaceView>,
     pub workspace_requests: BTreeMap<HarnessRunRef, HarnessWorkspaceRequest>,
 }
@@ -2155,6 +2167,10 @@ pub enum AppAction {
         task_id: HarnessTaskId,
         runs: Vec<HarnessRunRef>,
     },
+    HarnessLoadRunTransfer {
+        run: HarnessRunRef,
+        token: u64,
+    },
     HarnessUseLaunchPlan {
         token: u64,
         task_id: HarnessTaskId,
@@ -2278,6 +2294,10 @@ pub enum HitTarget {
     HarnessTaskDetailSection(HarnessTaskDetailSection),
     HarnessTaskDetailRun(HarnessRunId),
     HarnessTaskDetailRunMonitor(HarnessRunId),
+    HarnessTaskDetailRunTransfers(HarnessRunId),
+    HarnessTransferRefresh,
+    HarnessTransferPreviousRun,
+    HarnessTransferNextRun,
     HarnessRunMonitorBack,
     HarnessRunMonitorSection(HarnessRunMonitorSection),
     HarnessRunMonitorScrollUp,
@@ -4585,6 +4605,19 @@ impl App {
                 run.revision == observation.run_revision()
             })
         });
+        self.harness_kanban.run_transfers.retain(|run_ref, state| {
+            self.harness_kanban.runs.get(&run_ref.run_id).is_some_and(|run| {
+                run.revision == run_ref.run_revision
+                    && match state {
+                        HarnessRunTransferState::Ready(summary) => {
+                            summary.run_id == run_ref.run_id
+                                && summary.run_revision == run_ref.run_revision
+                        }
+                        HarnessRunTransferState::Loading { .. }
+                        | HarnessRunTransferState::Error { .. } => true,
+                    }
+            })
+        });
         self.harness_kanban.execution_specs.retain(|task_id, _| {
             self.harness_kanban.tasks.contains_key(task_id)
         });
@@ -4769,6 +4802,51 @@ impl App {
             self.harness_kanban.correlation_pending.remove(&run_id);
             self.harness_kanban.correlation_failures
                 .insert(run_id, message.clone());
+        }
+    }
+
+    pub fn apply_harness_run_transfer(
+        &mut self,
+        run: HarnessRunRef,
+        token: u64,
+        summary: HarnessRunTransferSummaryV1,
+    ) {
+        let exact_loaded_run = self.harness_kanban.runs.get(&run.run_id)
+            .is_some_and(|loaded| loaded.revision == run.run_revision);
+        let exact_pending = self.harness_kanban.run_transfers.get(&run)
+            .is_some_and(|state| {
+                matches!(state, HarnessRunTransferState::Loading { token: pending }
+                    if *pending == token)
+            });
+        if !exact_loaded_run
+            || !exact_pending
+            || summary.run_id != run.run_id
+            || summary.run_revision != run.run_revision
+        {
+            return;
+        }
+        self.harness_kanban.run_transfers.insert(
+            run,
+            HarnessRunTransferState::Ready(summary),
+        );
+    }
+
+    pub fn fail_harness_run_transfer(
+        &mut self,
+        run: &HarnessRunRef,
+        token: u64,
+        message: String,
+    ) {
+        let exact_pending = self.harness_kanban.run_transfers.get(run)
+            .is_some_and(|state| {
+                matches!(state, HarnessRunTransferState::Loading { token: pending }
+                    if *pending == token)
+            });
+        if exact_pending {
+            self.harness_kanban.run_transfers.insert(
+                run.clone(),
+                HarnessRunTransferState::Error { token, message },
+            );
         }
     }
 
@@ -5279,6 +5357,65 @@ impl App {
         }
     }
 
+    fn open_harness_run_transfers(
+        &mut self,
+        run_id: HarnessRunId,
+        refresh: bool,
+    ) -> AppAction {
+        let Some(detail) = self.harness_kanban.detail.as_ref() else {
+            return AppAction::None;
+        };
+        let Some(run) = self.harness_kanban.runs.get(&run_id).cloned()
+            .filter(|run| run.task_id.as_ref() == Some(&detail.task_id))
+        else {
+            self.notice = Some(
+                "Harness transfers unavailable: run does not belong to this task".to_owned(),
+            );
+            return AppAction::None;
+        };
+        let run_ref = HarnessRunRef {
+            run_id: run.run_id.clone(),
+            run_revision: run.revision,
+        };
+        if let Some(detail) = self.harness_kanban.detail.as_mut() {
+            detail.section = HarnessTaskDetailSection::Transfers;
+            detail.selected_run = Some(run.run_id);
+            detail.scroll = 0;
+        }
+        if !refresh && self.harness_kanban.run_transfers.contains_key(&run_ref) {
+            return AppAction::None;
+        }
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let token = self.harness_read_token;
+        self.harness_kanban.run_transfers.insert(
+            run_ref.clone(),
+            HarnessRunTransferState::Loading { token },
+        );
+        AppAction::HarnessLoadRunTransfer { run: run_ref, token }
+    }
+
+    fn move_harness_transfer_selection(&mut self, previous: bool) -> AppAction {
+        let Some(detail) = self.harness_kanban.detail.as_ref() else {
+            return AppAction::None;
+        };
+        let runs = self.harness_task_runs(&detail.task_id)
+            .into_iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        if runs.is_empty() {
+            return AppAction::None;
+        }
+        let current = detail.selected_run.as_ref()
+            .and_then(|selected| runs.iter().position(|run_id| run_id == selected))
+            .unwrap_or(0);
+        let next = if previous {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(runs.len() - 1)
+        };
+        self.open_harness_run_transfers(runs[next].clone(), false)
+    }
+
     pub fn harness_run_ref(&self, run_id: &HarnessRunId) -> Option<HarnessRunRef> {
         let run = self.harness_kanban.runs.get(run_id)?;
         Some(HarnessRunRef {
@@ -5741,6 +5878,13 @@ impl App {
                 };
                 detail.section = HarnessTaskDetailSection::ALL[next];
                 detail.scroll = 0;
+                if detail.section == HarnessTaskDetailSection::Transfers {
+                    let selected_run = detail.selected_run.clone();
+                    self.harness_kanban.detail = Some(detail);
+                    return selected_run.map_or(AppAction::None, |run_id| {
+                        self.open_harness_run_transfers(run_id, false)
+                    });
+                }
             }
             UiKey::Up | UiKey::Down
                 if detail.section == HarnessTaskDetailSection::Runs =>
@@ -5767,6 +5911,21 @@ impl App {
                     self.harness_kanban.detail = Some(detail);
                     return self.open_harness_run_monitor(run_id);
                 }
+            }
+            UiKey::Up | UiKey::Down
+                if detail.section == HarnessTaskDetailSection::Transfers =>
+            {
+                self.harness_kanban.detail = Some(detail);
+                return self.move_harness_transfer_selection(key == UiKey::Up);
+            }
+            UiKey::Char('r') | UiKey::Char('R')
+                if detail.section == HarnessTaskDetailSection::Transfers =>
+            {
+                let selected_run = detail.selected_run.clone();
+                self.harness_kanban.detail = Some(detail);
+                return selected_run.map_or(AppAction::None, |run_id| {
+                    self.open_harness_run_transfers(run_id, true)
+                });
             }
             UiKey::Char('r') | UiKey::Char('R') => {
                 let runs = self.harness_task_runs(&detail.task_id)
@@ -8107,6 +8266,14 @@ impl App {
                         "Harness workspace unavailable: Task Detail has no selected run".to_owned(),
                     );
                 }
+                if *section == HarnessTaskDetailSection::Transfers {
+                    if let Some(run_id) = selected_run {
+                        return self.open_harness_run_transfers(run_id, false);
+                    }
+                    self.notice = Some(
+                        "Harness transfers unavailable: Task Detail has no selected run".to_owned(),
+                    );
+                }
                 return AppAction::None;
             }
             Some(HitTarget::HarnessTaskDetailRun(run_id)) => {
@@ -8123,6 +8290,22 @@ impl App {
             }
             Some(HitTarget::HarnessTaskDetailRunMonitor(run_id)) => {
                 return self.open_harness_run_monitor(run_id.clone());
+            }
+            Some(HitTarget::HarnessTaskDetailRunTransfers(run_id)) => {
+                return self.open_harness_run_transfers(run_id.clone(), false);
+            }
+            Some(HitTarget::HarnessTransferRefresh) => {
+                let selected_run = self.harness_kanban.detail.as_ref()
+                    .and_then(|detail| detail.selected_run.clone());
+                return selected_run.map_or(AppAction::None, |run_id| {
+                    self.open_harness_run_transfers(run_id, true)
+                });
+            }
+            Some(HitTarget::HarnessTransferPreviousRun) => {
+                return self.move_harness_transfer_selection(true);
+            }
+            Some(HitTarget::HarnessTransferNextRun) => {
+                return self.move_harness_transfer_selection(false);
             }
             Some(HitTarget::HarnessTaskDetailRunFiles(run_id)) => {
                 return self.open_harness_workspace_section(
@@ -8776,6 +8959,10 @@ impl App {
                 | HitTarget::HarnessTaskDetailSection(_)
                 | HitTarget::HarnessTaskDetailRun(_)
                 | HitTarget::HarnessTaskDetailRunMonitor(_)
+                | HitTarget::HarnessTaskDetailRunTransfers(_)
+                | HitTarget::HarnessTransferRefresh
+                | HitTarget::HarnessTransferPreviousRun
+                | HitTarget::HarnessTransferNextRun
                 | HitTarget::HarnessTaskDetailRunFiles(_)
                 | HitTarget::HarnessTaskDetailRunGit(_)
                 | HitTarget::HarnessWorkspaceFile(_, _)
@@ -18492,6 +18679,87 @@ mod tests {
         let monitor = app.harness_kanban.monitor.as_ref().unwrap();
         assert_eq!(monitor.section, HarnessRunMonitorSection::Summary);
         assert_eq!(monitor.scroll, 0);
+    }
+
+    #[test]
+    fn harness_run_transfers_are_run_local_and_reject_stale_responses() {
+        let mut app = App::default();
+        let task = harness_task('6', HarnessTaskStateV1::Running, 1);
+        let first = harness_run('4', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        let second = harness_run('5', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![first.clone(), second.clone()]);
+        app.harness_kanban.detail = Some(HarnessTaskDetailState {
+            task_id: task.task_id,
+            section: HarnessTaskDetailSection::Transfers,
+            selected_run: Some(first.run_id.clone()),
+            scroll: 0,
+        });
+        let action = app.open_harness_run_transfers(first.run_id.clone(), true);
+        let AppAction::HarnessLoadRunTransfer { run, token } = action else {
+            panic!("exact transfer read was not requested");
+        };
+        let stale = HarnessRunTransferSummaryV1 {
+            run_id: first.run_id.clone(),
+            run_revision: HarnessRevision::new(first.revision.get() + 1).unwrap(),
+            delivery: None,
+            continuation: None,
+        };
+        app.apply_harness_run_transfer(run.clone(), token, stale);
+        assert!(matches!(
+            app.harness_kanban.run_transfers.get(&run),
+            Some(HarnessRunTransferState::Loading { token: pending }) if *pending == token,
+        ));
+        let exact = HarnessRunTransferSummaryV1 {
+            run_id: first.run_id.clone(),
+            run_revision: first.revision,
+            delivery: None,
+            continuation: None,
+        };
+        app.apply_harness_run_transfer(run.clone(), token.saturating_add(1), exact.clone());
+        assert!(matches!(
+            app.harness_kanban.run_transfers.get(&run),
+            Some(HarnessRunTransferState::Loading { .. }),
+        ));
+        app.apply_harness_run_transfer(run.clone(), token, exact.clone());
+        assert_eq!(
+            app.harness_kanban.run_transfers.get(&run),
+            Some(&HarnessRunTransferState::Ready(exact)),
+        );
+        let second_ref = HarnessRunRef {
+            run_id: second.run_id,
+            run_revision: second.revision,
+        };
+        assert!(!app.harness_kanban.run_transfers.contains_key(&second_ref));
+    }
+
+    #[test]
+    fn harness_transfer_mouse_controls_request_only_exact_selected_run() {
+        let mut app = App::default();
+        let task = harness_task('7', HarnessTaskStateV1::Running, 1);
+        let run = harness_run('8', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![run.clone()]);
+        app.harness_kanban.detail = Some(HarnessTaskDetailState {
+            task_id: task.task_id,
+            section: HarnessTaskDetailSection::Runs,
+            selected_run: Some(run.run_id.clone()),
+            scroll: 0,
+        });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 20, 1),
+            target: HitTarget::HarnessTaskDetailRunTransfers(run.run_id.clone()),
+        }];
+        let AppAction::HarnessLoadRunTransfer { run: requested, token } = app.click(1, 0) else {
+            panic!("mouse transfer control did not request Harness detail read");
+        };
+        assert_eq!(requested.run_id, run.run_id);
+        assert_eq!(requested.run_revision, run.revision);
+        assert!(token > 0);
+        assert_eq!(
+            app.harness_kanban.detail.as_ref().map(|detail| detail.section),
+            Some(HarnessTaskDetailSection::Transfers),
+        );
     }
     use gate4agent_node_protocol::{
         AgentProgressAttentionKindV1, AgentProgressAttentionV1, AgentProgressUsageV1,

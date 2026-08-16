@@ -15,6 +15,10 @@ pub use gate4agent_harness_protocol::{
     HarnessOperationKindV1, HarnessOperationStateV1, HarnessOutcomeUnknownReasonV1,
     HarnessCancelTaskRequestV1, HarnessCreateTaskRequestV1, HarnessDispatchIntentV1,
     HarnessExpectedExecutionSpecRevisionV1, HarnessExecutionSpecId,
+    HarnessContinuationOutcomeUnknownReasonV1, HarnessContinuationRef,
+    HarnessContinuationStateV1, HarnessDeliveryBundleDigestV1,
+    HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1,
+    HarnessDeliveryManifestDigestV2, HarnessDeliveryRef, HarnessDeliveryStateV1,
     HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1, HarnessMoveTaskRequestV1,
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
     HarnessReplaceTaskRequestV1, HarnessRequestDigest, HarnessRetryTaskRequestV1,
@@ -22,12 +26,13 @@ pub use gate4agent_harness_protocol::{
     HarnessStartTaskRequestV1, HarnessTaskExecutionSpecInputV1,
     HarnessTaskExecutionSpecV1, HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
     HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResultDispositionV1,
-    HarnessInlineRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
+    HarnessInlineRef, HarnessReceiptRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
     HarnessRunLifecycleV1,
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     HarnessValidationError, HarnessWorktreeIntentV1, SessionGrantId,
     HARNESS_ARTIFACTS_MAX, HARNESS_BODY_MAX_BYTES,
     HARNESS_CHILD_COUNT_MAX, HARNESS_CHILD_DEPTH_MAX, HARNESS_DEPENDENCIES_MAX,
+    HARNESS_CONTEXT_PACK_MAX_BYTES, HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX,
     HARNESS_LINKS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -49,6 +54,7 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V1: u16 = 1;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V2: u16 = 2;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V3: u16 = 3;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V4: u16 = 4;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V5: u16 = 5;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -166,6 +172,7 @@ impl HarnessOperatorEnvelopeV1 {
             HARNESS_OPERATOR_WIRE_VERSION_V2
                 | HARNESS_OPERATOR_WIRE_VERSION_V3
                 | HARNESS_OPERATOR_WIRE_VERSION_V4
+                | HARNESS_OPERATOR_WIRE_VERSION_V5
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -941,6 +948,7 @@ pub enum HarnessOperatorRequestV1 {
     },
     RunGet { run_id: HarnessRunId },
     RunCorrelationGet { run_id: HarnessRunId },
+    RunTransferGet { run_id: HarnessRunId },
     InspectRunWorkspace { run_id: HarnessRunId },
     ReadRunWorkspaceFile {
         run_id: HarnessRunId,
@@ -1026,6 +1034,7 @@ impl HarnessOperatorRequestV1 {
             }
             Self::RunGet { run_id }
             | Self::RunCorrelationGet { run_id }
+            | Self::RunTransferGet { run_id }
             | Self::InspectRunWorkspace { run_id } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)
             }
@@ -1155,8 +1164,14 @@ impl HarnessOperatorRequestV1 {
         ) || matches!(self, Self::SubmitIntent { intent } if intent.action.requires_v4())
     }
 
+    pub fn requires_v5(&self) -> bool {
+        matches!(self, Self::RunTransferGet { .. })
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v4() {
+        if self.requires_v5() {
+            HARNESS_OPERATOR_WIRE_VERSION_V5
+        } else if self.requires_v4() {
             HARNESS_OPERATOR_WIRE_VERSION_V4
         } else if self.requires_v3() {
             HARNESS_OPERATOR_WIRE_VERSION_V3
@@ -1192,6 +1207,7 @@ pub enum HarnessOperatorResponseV1 {
     Runs(RunPageV1),
     Run(RedactedRunV1),
     RunCorrelation(HarnessRunCorrelationV1),
+    RunTransfer(HarnessRunTransferSummaryV1),
     RunWorkspaceInspected(HarnessRunWorkspaceInspectionV1),
     RunWorkspaceFileRead(HarnessRunWorkspaceFileV1),
     RunGitHistoryRead(HarnessRunGitHistoryPageV1),
@@ -1218,6 +1234,7 @@ impl HarnessOperatorResponseV1 {
             Self::Runs(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Run(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::RunCorrelation(value) => value.validate(),
+            Self::RunTransfer(value) => value.validate(),
             Self::RunWorkspaceInspected(value) => value.validate(),
             Self::RunWorkspaceFileRead(value) => value.validate(),
             Self::RunGitHistoryRead(value) => value.validate(),
@@ -1414,6 +1431,244 @@ impl HarnessRunCorrelationV1 {
             ) => Err(HarnessOperatorApiError::InvalidRunCorrelation),
             _ => Ok(()),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunDeliveryTransferV1 {
+    pub delivery_ref: HarnessDeliveryRef,
+    pub revision: HarnessRevision,
+    pub state: HarnessDeliveryStateV1,
+    pub selector: HarnessSelectorV1,
+    pub bundle_id: HarnessDeliveryBundleIdV1,
+    pub bundle_revision: HarnessDeliveryBundleRevisionV1,
+    pub bundle_digest: HarnessDeliveryBundleDigestV1,
+    pub manifest_digest: HarnessDeliveryManifestDigestV2,
+    pub receipt_ref: Option<HarnessReceiptRef>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+    pub staged_at_unix_ms: Option<u64>,
+    pub committed_at_unix_ms: Option<u64>,
+}
+
+impl HarnessRunDeliveryTransferV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.delivery_ref.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.selector.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.bundle_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.bundle_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.bundle_digest.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.manifest_digest.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if let Some(receipt_ref) = &self.receipt_ref {
+            receipt_ref.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        }
+        if !valid_transfer_timestamps(
+            self.created_at_unix_ms,
+            self.updated_at_unix_ms,
+            [self.staged_at_unix_ms, self.committed_at_unix_ms],
+        ) {
+            return Err(HarnessOperatorApiError::InvalidRunTransfer);
+        }
+        let state_fields = match self.state {
+            HarnessDeliveryStateV1::Prepared => {
+                self.staged_at_unix_ms.is_none()
+                    && self.committed_at_unix_ms.is_none()
+                    && self.receipt_ref.is_none()
+            }
+            HarnessDeliveryStateV1::Staged => {
+                self.staged_at_unix_ms.is_some()
+                    && self.committed_at_unix_ms.is_none()
+                    && self.receipt_ref.is_none()
+            }
+            HarnessDeliveryStateV1::Committed => {
+                self.staged_at_unix_ms.is_some()
+                    && self.committed_at_unix_ms.is_some()
+                    && self.receipt_ref.is_some()
+            }
+        };
+        if !state_fields
+            || matches!(
+                (self.staged_at_unix_ms, self.committed_at_unix_ms),
+                (Some(staged), Some(committed)) if committed < staged
+            )
+        {
+            return Err(HarnessOperatorApiError::InvalidRunTransfer);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunContextTransferV1 {
+    pub context_ref: HarnessSelectorV1,
+    pub digest: String,
+    pub source_message_count: u64,
+    pub retained_message_count: u64,
+    pub byte_len: u32,
+    pub truncated: bool,
+}
+
+impl HarnessRunContextTransferV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.context_ref.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        let valid_digest = self.digest.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(is_lower_hex)
+        });
+        if !valid_digest
+            || self.source_message_count == 0
+            || self.retained_message_count == 0
+            || self.retained_message_count > self.source_message_count
+            || self.retained_message_count > HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX
+            || self.byte_len == 0
+            || self.byte_len > HARNESS_CONTEXT_PACK_MAX_BYTES
+            || self.truncated != (self.source_message_count > self.retained_message_count)
+        {
+            return Err(HarnessOperatorApiError::InvalidRunTransfer);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunContinuationTransferV1 {
+    pub continuation_ref: HarnessContinuationRef,
+    pub receipt_ref: HarnessReceiptRef,
+    pub revision: HarnessRevision,
+    pub state: HarnessContinuationStateV1,
+    pub source_run_id: HarnessRunId,
+    pub target_run_id: HarnessRunId,
+    pub source_provider: HarnessSelectorV1,
+    pub context: Option<HarnessRunContextTransferV1>,
+    pub prepared_at_unix_ms: u64,
+    pub exporting_at_unix_ms: Option<u64>,
+    pub exported_at_unix_ms: Option<u64>,
+    pub bound_at_unix_ms: Option<u64>,
+    pub expired_at_unix_ms: Option<u64>,
+    pub outcome_unknown_at_unix_ms: Option<u64>,
+    pub outcome_unknown_reason: Option<HarnessContinuationOutcomeUnknownReasonV1>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+impl HarnessRunContinuationTransferV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.continuation_ref.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.receipt_ref.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.source_run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.target_run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.source_provider.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if let Some(context) = &self.context { context.validate()?; }
+        if self.source_run_id == self.target_run_id
+            || self.prepared_at_unix_ms != self.created_at_unix_ms
+            || !valid_transfer_timestamps(
+                self.created_at_unix_ms,
+                self.updated_at_unix_ms,
+                [
+                    Some(self.prepared_at_unix_ms),
+                    self.exporting_at_unix_ms,
+                    self.exported_at_unix_ms,
+                    self.bound_at_unix_ms,
+                    self.expired_at_unix_ms,
+                    self.outcome_unknown_at_unix_ms,
+                ],
+            )
+        {
+            return Err(HarnessOperatorApiError::InvalidRunTransfer);
+        }
+        let ordered = self.exporting_at_unix_ms
+            .is_none_or(|value| value >= self.prepared_at_unix_ms)
+            && self.exported_at_unix_ms.is_none_or(|value| {
+                self.exporting_at_unix_ms.is_some_and(|started| value >= started)
+            })
+            && self.bound_at_unix_ms.is_none_or(|value| {
+                self.exported_at_unix_ms.is_some_and(|exported| value >= exported)
+            })
+            && self.outcome_unknown_at_unix_ms.is_none_or(|value| {
+                self.exporting_at_unix_ms.is_some_and(|started| value >= started)
+            })
+            && self.expired_at_unix_ms
+                .is_none_or(|value| value >= self.prepared_at_unix_ms);
+        let state_fields = match self.state {
+            HarnessContinuationStateV1::Prepared => self.context.is_none()
+                && self.exporting_at_unix_ms.is_none()
+                && self.exported_at_unix_ms.is_none()
+                && self.bound_at_unix_ms.is_none()
+                && self.expired_at_unix_ms.is_none()
+                && self.outcome_unknown_at_unix_ms.is_none()
+                && self.outcome_unknown_reason.is_none(),
+            HarnessContinuationStateV1::Exporting => self.context.is_none()
+                && self.exporting_at_unix_ms.is_some()
+                && self.exported_at_unix_ms.is_none()
+                && self.bound_at_unix_ms.is_none()
+                && self.expired_at_unix_ms.is_none()
+                && self.outcome_unknown_at_unix_ms.is_none()
+                && self.outcome_unknown_reason.is_none(),
+            HarnessContinuationStateV1::Exported => self.context.is_some()
+                && self.exporting_at_unix_ms.is_some()
+                && self.exported_at_unix_ms.is_some()
+                && self.bound_at_unix_ms.is_none()
+                && self.expired_at_unix_ms.is_none()
+                && self.outcome_unknown_at_unix_ms.is_none()
+                && self.outcome_unknown_reason.is_none(),
+            HarnessContinuationStateV1::Bound => self.context.is_some()
+                && self.exporting_at_unix_ms.is_some()
+                && self.exported_at_unix_ms.is_some()
+                && self.bound_at_unix_ms.is_some()
+                && self.expired_at_unix_ms.is_none()
+                && self.outcome_unknown_at_unix_ms.is_none()
+                && self.outcome_unknown_reason.is_none(),
+            HarnessContinuationStateV1::OutcomeUnknown => self.exporting_at_unix_ms.is_some()
+                && self.exported_at_unix_ms.is_none()
+                && self.bound_at_unix_ms.is_none()
+                && self.expired_at_unix_ms.is_none()
+                && self.outcome_unknown_at_unix_ms.is_some()
+                && self.outcome_unknown_reason.is_some(),
+            HarnessContinuationStateV1::Expired => self.bound_at_unix_ms.is_none()
+                && self.expired_at_unix_ms.is_some()
+                && self.outcome_unknown_at_unix_ms.is_none()
+                && self.outcome_unknown_reason.is_none(),
+        };
+        if !ordered || !state_fields {
+            return Err(HarnessOperatorApiError::InvalidRunTransfer);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunTransferSummaryV1 {
+    pub run_id: HarnessRunId,
+    pub run_revision: HarnessRevision,
+    pub delivery: Option<HarnessRunDeliveryTransferV1>,
+    pub continuation: Option<HarnessRunContinuationTransferV1>,
+}
+
+impl HarnessRunTransferSummaryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.run_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if let Some(delivery) = &self.delivery { delivery.validate()?; }
+        if let Some(continuation) = &self.continuation {
+            continuation.validate()?;
+            if continuation.target_run_id != self.run_id {
+                return Err(HarnessOperatorApiError::InvalidRunTransfer);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, run_id: &HarnessRunId) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        if &self.run_id != run_id {
+            return Err(HarnessOperatorApiError::InvalidRunTransfer);
+        }
+        Ok(())
     }
 }
 
@@ -2790,6 +3045,8 @@ pub enum HarnessOperatorApiError {
     InvalidRuntimeInventory,
     #[error("harness run correlation is invalid")]
     InvalidRunCorrelation,
+    #[error("harness run transfer summary is invalid")]
+    InvalidRunTransfer,
     #[error("harness run workspace origin is invalid")]
     InvalidWorkspaceOrigin,
     #[error("harness repository-relative path is invalid")]
@@ -3118,6 +3375,18 @@ fn validate_timestamps(created: u64, updated: u64) -> Result<(), HarnessReadApiE
     Ok(())
 }
 
+fn valid_transfer_timestamps<const N: usize>(
+    created: u64,
+    updated: u64,
+    optional: [Option<u64>; N],
+) -> bool {
+    created != 0
+        && updated >= created
+        && optional.into_iter().flatten().all(|timestamp| {
+            timestamp >= created && timestamp <= updated
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3144,6 +3413,76 @@ mod tests {
             }),
             availability: HarnessRunCorrelationAvailabilityV1::Available,
             observed_at_unix_ms: Some(100),
+        }
+    }
+
+    fn run_transfer_summary() -> HarnessRunTransferSummaryV1 {
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        HarnessRunTransferSummaryV1 {
+            run_id: run_id.clone(),
+            run_revision: HarnessRevision::new(9).unwrap(),
+            delivery: Some(HarnessRunDeliveryTransferV1 {
+                delivery_ref: HarnessDeliveryRef::new(format!(
+                    "hdelivery_{}",
+                    "b".repeat(24),
+                )).unwrap(),
+                revision: HarnessRevision::new(3).unwrap(),
+                state: HarnessDeliveryStateV1::Committed,
+                selector: HarnessSelectorV1::new("delivery-safe").unwrap(),
+                bundle_id: HarnessDeliveryBundleIdV1::new("bundle-safe").unwrap(),
+                bundle_revision: HarnessDeliveryBundleRevisionV1::new("revision-4").unwrap(),
+                bundle_digest: HarnessDeliveryBundleDigestV1::new(format!(
+                    "sha256:{}",
+                    "c".repeat(64),
+                )).unwrap(),
+                manifest_digest: HarnessDeliveryManifestDigestV2::new(format!(
+                    "sha256:{}",
+                    "d".repeat(64),
+                )).unwrap(),
+                receipt_ref: Some(HarnessReceiptRef::new(format!(
+                    "hreceipt_{}",
+                    "e".repeat(24),
+                )).unwrap()),
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 30,
+                staged_at_unix_ms: Some(20),
+                committed_at_unix_ms: Some(30),
+            }),
+            continuation: Some(HarnessRunContinuationTransferV1 {
+                continuation_ref: HarnessContinuationRef::new(format!(
+                    "hcontinuation_{}",
+                    "f".repeat(24),
+                )).unwrap(),
+                receipt_ref: HarnessReceiptRef::new(format!(
+                    "hreceipt_{}",
+                    "0".repeat(24),
+                )).unwrap(),
+                revision: HarnessRevision::new(4).unwrap(),
+                state: HarnessContinuationStateV1::Bound,
+                source_run_id: HarnessRunId::new(format!(
+                    "hrun_{}",
+                    "1".repeat(24),
+                )).unwrap(),
+                target_run_id: run_id,
+                source_provider: HarnessSelectorV1::new("claude").unwrap(),
+                context: Some(HarnessRunContextTransferV1 {
+                    context_ref: HarnessSelectorV1::new("context-safe").unwrap(),
+                    digest: format!("sha256:{}", "2".repeat(64)),
+                    source_message_count: 12,
+                    retained_message_count: 8,
+                    byte_len: 4096,
+                    truncated: true,
+                }),
+                prepared_at_unix_ms: 10,
+                exporting_at_unix_ms: Some(15),
+                exported_at_unix_ms: Some(20),
+                bound_at_unix_ms: Some(25),
+                expired_at_unix_ms: None,
+                outcome_unknown_at_unix_ms: None,
+                outcome_unknown_reason: None,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 25,
+            }),
         }
     }
 
@@ -3340,6 +3679,80 @@ mod tests {
             &serde_json::to_vec(&envelope).unwrap(),
         ).unwrap();
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn operator_v5_run_transfer_is_exact_private_and_fails_closed_on_v4() {
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        let summary = run_transfer_summary();
+        summary.validate().unwrap();
+        let request = HarnessOperatorRequestV1::RunTransferGet {
+            run_id: summary.run_id.clone(),
+        };
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V5);
+        assert!(request.requires_v5());
+        assert!(!request.requires_v4());
+        assert!(matches!(
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V4,
+                credential: credential.clone(),
+                request: request.clone(),
+            }.validate(),
+            Err(HarnessOperatorApiError::UnsupportedVersion),
+        ));
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V5,
+            credential,
+            request,
+        }.validate().unwrap();
+
+        let response = HarnessOperatorResponseV1::RunTransfer(summary.clone());
+        response.validate().unwrap();
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
+        for forbidden in [
+            "provider_home",
+            "provider_native",
+            "session_id",
+            "source_root",
+            "component_path",
+            "component_name",
+            "blob_bytes",
+            "prompt",
+            "node_store",
+            "credential",
+            "auth",
+            "C:\\\\",
+        ] {
+            assert!(!encoded.contains(forbidden), "response exposed {forbidden}");
+        }
+
+        let mut wrong_target = summary.clone();
+        wrong_target.continuation.as_mut().unwrap().target_run_id =
+            HarnessRunId::new(format!("hrun_{}", "9".repeat(24))).unwrap();
+        assert!(matches!(
+            wrong_target.validate(),
+            Err(HarnessOperatorApiError::InvalidRunTransfer),
+        ));
+
+        let mut invalid_delivery = summary.clone();
+        invalid_delivery.delivery.as_mut().unwrap().committed_at_unix_ms = None;
+        assert!(matches!(
+            invalid_delivery.validate(),
+            Err(HarnessOperatorApiError::InvalidRunTransfer),
+        ));
+
+        let mut invalid_context = summary;
+        invalid_context.continuation.as_mut().unwrap()
+            .context.as_mut().unwrap().truncated = false;
+        assert!(matches!(
+            invalid_context.validate(),
+            Err(HarnessOperatorApiError::InvalidRunTransfer),
+        ));
     }
 
     fn ordinary_launch_plan(plan_id: &str, digest: char) -> HarnessLaunchPlanSummaryV1 {

@@ -277,6 +277,20 @@ impl HarnessOperatorClient {
         }
     }
 
+    pub fn run_transfer_get(
+        &self,
+        run_id: HarnessRunId,
+    ) -> Result<HarnessRunTransferSummaryV1, HarnessOperatorClientError> {
+        let expected_run_id = run_id.clone();
+        match self.send(HarnessOperatorRequestV1::RunTransferGet { run_id })? {
+            HarnessOperatorResponseV1::RunTransfer(value) => {
+                value.validate_for(&expected_run_id)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn inspect_run_workspace(
         &self,
         run_id: HarnessRunId,
@@ -751,6 +765,15 @@ mod tests {
             .expect("operator credential")
     }
 
+    fn run_transfer_summary(run_id: HarnessRunId) -> HarnessRunTransferSummaryV1 {
+        HarnessRunTransferSummaryV1 {
+            run_id,
+            run_revision: HarnessRevision::new(5).unwrap(),
+            delivery: None,
+            continuation: None,
+        }
+    }
+
     fn empty_monitor(run_id: HarnessRunId) -> SessionMonitorV1 {
         SessionMonitorV1 {
             run_id,
@@ -1037,6 +1060,70 @@ mod tests {
         let client = HarnessOperatorClient::new(endpoint, operator_credential())
             .expect("operator client");
         assert_eq!(client.run_correlation_get(run_id).unwrap(), correlation);
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_gets_exact_v5_run_transfer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let expected_run_id = run_id.clone();
+        let summary = run_transfer_summary(run_id.clone());
+        let echoed = summary.clone();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let envelope: HarnessOperatorEnvelopeV1 =
+                serde_json::from_str(request.trim_end()).expect("operator envelope");
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V5);
+            assert!(matches!(
+                envelope.request,
+                HarnessOperatorRequestV1::RunTransferGet { run_id }
+                    if run_id == expected_run_id,
+            ));
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::RunTransfer(echoed),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert_eq!(client.run_transfer_get(run_id).unwrap(), summary);
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_rejects_mismatched_v5_run_transfer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let requested_run_id =
+            HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let other_run_id = HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::RunTransfer(
+                    run_transfer_summary(other_run_id),
+                ),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert!(matches!(
+            client.run_transfer_get(requested_run_id),
+            Err(HarnessOperatorClientError::Api(
+                HarnessOperatorApiError::InvalidRunTransfer,
+            )),
+        ));
         host.join().expect("host");
     }
 

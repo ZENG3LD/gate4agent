@@ -929,6 +929,32 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
         target_client.run_get(target_dispatch.run_id.clone()).unwrap().lifecycle,
         HarnessRunLifecycleV1::Running,
     );
+    let transfer_before = target_client
+        .run_transfer_get(target_dispatch.run_id.clone())
+        .unwrap();
+    assert!(transfer_before.delivery.is_none());
+    let continuation_transfer = transfer_before.continuation.as_ref()
+        .expect("bound continuation transfer");
+    assert_eq!(
+        continuation_transfer.state,
+        gate4agent_harness_protocol::HarnessContinuationStateV1::Bound,
+    );
+    assert_eq!(&continuation_transfer.source_run_id, &source_dispatch.run_id);
+    let context_transfer = continuation_transfer.context.as_ref()
+        .expect("exported context transfer");
+    assert_eq!(context_transfer.source_message_count, 2);
+    assert_eq!(context_transfer.retained_message_count, 2);
+    assert!(!context_transfer.truncated);
+    let transfer_wire = serde_json::to_string(&transfer_before).unwrap();
+    let workspace_display = fixture.workspace.to_string_lossy();
+    for private in [
+        workspace_display.as_ref(),
+        CONTEXT_USER,
+        CONTEXT_ASSISTANT,
+        "private qwen thought",
+    ] {
+        assert!(!transfer_wire.contains(private));
+    }
     target_host.shutdown().await.unwrap();
     timeout(Duration::from_secs(5), target_host_task)
         .await
@@ -1045,6 +1071,15 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
     .await
     .unwrap();
     sleep(Duration::from_millis(500)).await;
+    let restarted_client = HarnessOperatorClient::new(
+        restarted_host.endpoint().socket_addr(),
+        operator_credential.clone(),
+    )
+    .unwrap();
+    let transfer_after = restarted_client
+        .run_transfer_get(target_dispatch.run_id.clone())
+        .unwrap();
+    assert_eq!(transfer_after, transfer_before);
     restarted_host.shutdown().await.unwrap();
     timeout(Duration::from_secs(5), restarted_host_task)
         .await

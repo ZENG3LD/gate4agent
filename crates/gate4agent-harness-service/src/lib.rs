@@ -20,7 +20,7 @@ use gate4agent_harness_protocol::{
     HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1, HarnessDispatchIntentV1,
     HarnessExecutionModeV1, HarnessExecutionSpecId,
     HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef,
-    HarnessLaunchAuthorityRefV1, HarnessMoveTaskRequestV1,
+    HarnessMoveTaskRequestV1,
     HarnessOperationId, HarnessOperationKindV1, HarnessOperationStateV1, HarnessOperationV1,
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
     HarnessReplaceTaskRequestV1, HarnessRequestDigest,
@@ -5486,6 +5486,8 @@ mod tests {
             grants: vec![grant],
             operations: vec![operation],
             execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap()
@@ -5669,6 +5671,8 @@ mod tests {
             grants: vec![grant],
             operations: vec![target_operation, source_operation],
             execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap();
@@ -5947,7 +5951,8 @@ mod tests {
                 task_id(),
                 HarnessScheduledLaunchRefV2 {
                     plan: plan.plan_ref().unwrap(),
-                    authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+                    authority:
+                        gate4agent_harness_protocol::HarnessLaunchAuthorityRefV1::OrdinaryOperator,
                 },
             );
             assert!(matches!(

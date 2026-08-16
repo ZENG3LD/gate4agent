@@ -24,6 +24,7 @@ use crate::protocol::{
     C2_HARNESS_MCP_READ_PROXY_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+    C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
     C2_SPAWN_PROFILE_REVISION_CAPABILITY,
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
@@ -71,6 +72,7 @@ struct NegotiatedPathCapabilities {
     spawn_profile_revision: bool,
     worktree_selection: bool,
     managed_worktree_lifecycle: bool,
+    managed_worktree_spawn_v2: bool,
     child_environment_profile: bool,
     session_bundle_materialization: bool,
     history_context_pack: bool,
@@ -815,6 +817,8 @@ fn negotiated_path_capabilities(
         worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
         managed_worktree_lifecycle:
             selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
+        managed_worktree_spawn_v2:
+            selected_has(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY),
         child_environment_profile:
             selected_has(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY),
         session_bundle_materialization:
@@ -1004,6 +1008,9 @@ fn unnegotiated_request_failure(
         Some(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY) => {
             capabilities.managed_worktree_lifecycle
         }
+        Some(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY) => {
+            capabilities.managed_worktree_spawn_v2
+        }
         Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => capabilities.history_context_pack,
         Some(C2_NATIVE_SESSION_CATALOG_CAPABILITY) => capabilities.native_session_catalog,
         Some(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY) => {
@@ -1126,6 +1133,7 @@ fn c2_request_requires_child_environment_profile_capability(request: &NodeReques
     let spec = match request {
         NodeRequest::SpawnSpec { spec } => spec,
         NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
+        NodeRequest::SpawnManagedWorktreeV2 { request } => &request.spawn_spec,
         _ => return false,
     };
     !matches!(
@@ -1140,6 +1148,7 @@ fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
         NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. }
         | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. } => spec,
         NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
+        NodeRequest::SpawnManagedWorktreeV2 { request } => &request.spawn_spec,
         _ => return false,
     };
     match &spec.overrides.provider {
@@ -1186,6 +1195,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
@@ -1961,6 +1971,8 @@ fn dispatch_start(
         if spec.target.node_id != request.route.node_id)
         || matches!(&request.request, NodeRequest::SpawnManagedWorktree { request: managed }
             if managed.spawn_spec.target.node_id != request.route.node_id)
+        || matches!(&request.request, NodeRequest::SpawnManagedWorktreeV2 { request: managed }
+            if managed.spawn_spec.target.node_id != request.route.node_id)
     {
         return DispatchStart::Immediate(Err(relay_failure(
             C2RelayFailureCode::RequestForbidden,
@@ -2091,6 +2103,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
             CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
@@ -2259,6 +2273,7 @@ fn request_targets_unavailable_provider(
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Shutdown => false,
     }
@@ -3001,6 +3016,7 @@ mod tests {
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
@@ -3016,6 +3032,8 @@ mod tests {
                 CapabilityId::new(C2_OBSERVATION_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_OBSERVATION_MANAGED_TARGET_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_HARNESS_MCP_READ_PROXY_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -3499,6 +3517,7 @@ mod tests {
             spawn_profile_revision: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            managed_worktree_spawn_v2: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
@@ -3836,6 +3855,44 @@ mod tests {
     }
 
     #[test]
+    fn managed_worktree_v2_is_advertised_and_rejected_without_exact_capability() {
+        let support = c2_control_compatibility_support().unwrap();
+        assert!(support.capabilities.iter().any(|capability| {
+            capability.as_str() == C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY
+        }));
+        let request = NodeRequest::SpawnManagedWorktreeV2 {
+            request: crate::protocol::ManagedWorktreeSpawnRequestV2 {
+                spawn_spec: spawn_spec("node-a"),
+                worktree_profile_id:
+                    crate::protocol::WorktreeProfileId::new("review").unwrap(),
+                expected_profile_revision:
+                    crate::protocol::WorktreeProfileRevision::new("wr1").unwrap(),
+            },
+        };
+        let mut capabilities = NegotiatedPathCapabilities {
+            provider_ids_open: true,
+            spawn_spec_defaults_overrides: true,
+            spawn_profile_revision: true,
+            worktree_selection: true,
+            managed_worktree_lifecycle: true,
+            managed_worktree_spawn_v2: true,
+            child_environment_profile: true,
+            session_bundle_materialization: true,
+            history_context_pack: true,
+            ..Default::default()
+        };
+        assert!(unnegotiated_request_failure(&request, capabilities).is_none());
+        capabilities.managed_worktree_spawn_v2 = false;
+        assert!(matches!(
+            unnegotiated_request_failure(&request, capabilities),
+            Some(C2RelayFailure {
+                code: C2RelayFailureCode::RequestForbidden,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn spawn_spec_route_target_mismatch_is_rejected_before_relay_lookup() {
         let incarnation_id = NodeIncarnationId::from_bytes([7; 16]);
         let (_status_tx, status_rx) = watch::channel(Arc::new(status(
@@ -3856,6 +3913,32 @@ mod tests {
             &status_rx,
         ) else {
             panic!("route mismatch reached relay lookup");
+        };
+        assert_eq!(failure.code, C2RelayFailureCode::RequestForbidden);
+        assert_eq!(failure.message, "spawn target node does not match C2 route");
+
+        let request = crate::protocol::RoutedNodeRequest {
+            route: crate::protocol::NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: incarnation_id,
+            },
+            request: NodeRequest::SpawnManagedWorktreeV2 {
+                request: crate::protocol::ManagedWorktreeSpawnRequestV2 {
+                    spawn_spec: spawn_spec("node-b"),
+                    worktree_profile_id:
+                        crate::protocol::WorktreeProfileId::new("review").unwrap(),
+                    expected_profile_revision:
+                        crate::protocol::WorktreeProfileRevision::new("wr1").unwrap(),
+                },
+            },
+        };
+        let DispatchStart::Immediate(Err(failure)) = dispatch_start(
+            1,
+            request,
+            &BTreeMap::new(),
+            &status_rx,
+        ) else {
+            panic!("managed V2 route mismatch reached relay lookup");
         };
         assert_eq!(failure.code, C2RelayFailureCode::RequestForbidden);
         assert_eq!(failure.message, "spawn target node does not match C2 route");
@@ -5016,6 +5099,7 @@ mod tests {
             spawn_profile_revision: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            managed_worktree_spawn_v2: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,

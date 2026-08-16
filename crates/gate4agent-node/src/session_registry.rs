@@ -1,13 +1,15 @@
 use crate::protocol::{
-    AgentId, ManagedSessionRecord, ManagedSessionState, NodeId, OpaqueHostPath,
+    AgentId, ManagedSessionRecord, ManagedSessionState, ManagedWorktreeLeaseId,
+    ManagedWorktreeSpawnReceipt, NodeId, NodeIncarnationId, OpaqueHostPath,
     ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedEnvironmentProfileReceipt,
     SessionAddress, SessionMode,
-    SessionRecordId, WorkspaceId,
+    SessionRecordId, SpawnIdempotencyKey, WorktreeProfileId,
+    WorktreeProfileRevision, WorkspaceId,
     MAX_NODE_TEXT_BYTES, MAX_SESSION_DISPLAY_NAME_BYTES, MAX_WORKSPACE_ROOT_BYTES,
     NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V2, NODE_STATE_SCHEMA_V3, NODE_STATE_SCHEMA_V4,
     NODE_STATE_SCHEMA_V5,
     NODE_STATE_SCHEMA_V6, NODE_STATE_SCHEMA_V7, NODE_STATE_SCHEMA_V8,
-    NODE_STATE_SCHEMA_V9,
+    NODE_STATE_SCHEMA_V9, NODE_STATE_SCHEMA_V10,
 };
 use crate::worktree_service::ManagedWorktreeLeaseRecord;
 use crate::session_environment::{
@@ -31,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PERSISTED_WORKSPACES: usize = 256;
 const MAX_PERSISTED_MANAGED_WORKTREE_BRANCH_BYTES: usize = 512;
+pub(crate) const MAX_MANAGED_WORKTREE_SPAWN_REPLAYS: usize = 256;
 pub(crate) const MAX_MANAGED_SESSION_RECORDS: usize = 4_096;
 const BACKUP_ROTATION_WARNING: &str = "durable-state-backup-rotation-failed";
 const CORRUPT_PRIMARY_PRESERVED_WARNING: &str = "durable-state-corrupt-primary-preserved";
@@ -195,6 +198,7 @@ pub(crate) struct LoadedNodeState {
     pub managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
     pub managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
     pub materializations: Vec<MaterializationOwnershipRecord>,
+    pub managed_spawn_replays: Vec<ManagedWorktreeSpawnReplayRecordV10>,
     pub warning: Option<String>,
 }
 
@@ -206,6 +210,7 @@ impl LoadedNodeState {
             managed_worktrees: Vec::new(),
             managed_worktree_tombstones: Vec::new(),
             materializations: Vec::new(),
+            managed_spawn_replays: Vec::new(),
             warning: None,
         }
     }
@@ -220,6 +225,7 @@ impl fmt::Debug for LoadedNodeState {
             .field("managed_worktree_count", &self.managed_worktrees.len())
             .field("managed_worktree_tombstone_count", &self.managed_worktree_tombstones.len())
             .field("materialization_count", &self.materializations.len())
+            .field("managed_spawn_replay_count", &self.managed_spawn_replays.len())
             .field("warning", &self.warning)
             .finish()
     }
@@ -304,6 +310,45 @@ struct PersistedNodeStateV8 {
 
 type PersistedNodeStateV9 = PersistedNodeStateV8;
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedNodeStateV10 {
+    version: u16,
+    node_id: NodeId,
+    workspaces: Vec<PersistedWorkspaceV2>,
+    session_records: Vec<ManagedSessionRecord>,
+    managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
+    managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
+    materializations: Vec<PersistedMaterializationRecordV8>,
+    managed_spawn_replays: Vec<ManagedWorktreeSpawnReplayRecordV10>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedWorktreeSpawnReplayRecordV10 {
+    pub idempotency_key: SpawnIdempotencyKey,
+    pub request_digest: String,
+    pub source_workspace_id: WorkspaceId,
+    pub profile_id: WorktreeProfileId,
+    pub expected_profile_revision: WorktreeProfileRevision,
+    pub state: ManagedWorktreeSpawnReplayStateV10,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum ManagedWorktreeSpawnReplayStateV10 {
+    Pending {
+        owner_incarnation_id: NodeIncarnationId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_id: Option<ManagedWorktreeLeaseId>,
+    },
+    Committed {
+        receipt: ManagedWorktreeSpawnReceipt,
+    },
+}
+
 struct DecodedNodeState {
     node_id: NodeId,
     workspaces: Vec<(WorkspaceId, String)>,
@@ -311,6 +356,7 @@ struct DecodedNodeState {
     managed_worktrees: Vec<ManagedWorktreeLeaseRecord>,
     managed_worktree_tombstones: Vec<ManagedWorktreeLeaseRecord>,
     materializations: Vec<MaterializationOwnershipRecord>,
+    managed_spawn_replays: Vec<ManagedWorktreeSpawnReplayRecordV10>,
 }
 
 #[derive(Deserialize)]
@@ -653,6 +699,7 @@ fn load_one(path: &Path, expected_node_id: &NodeId) -> io::Result<LoadedNodeStat
         managed_worktrees: state.managed_worktrees,
         managed_worktree_tombstones: state.managed_worktree_tombstones,
         materializations: state.materializations,
+        managed_spawn_replays: state.managed_spawn_replays,
         warning: None,
     })
 }
@@ -706,6 +753,11 @@ fn decode_persisted_state(bytes: &[u8]) -> io::Result<DecodedNodeState> {
                 .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
             decode_v9_state(state)
         }
+        NODE_STATE_SCHEMA_V10 => {
+            let state: PersistedNodeStateV10 = serde_json::from_slice(bytes)
+                .map_err(|error| invalid_data(format!("durable state JSON is invalid: {error}")))?;
+            decode_v10_state(state)
+        }
         version => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             StateLoadRefusalError::UnsupportedSchema(version),
@@ -752,6 +804,7 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
         managed_worktrees: Vec::new(),
         managed_worktree_tombstones: Vec::new(),
         materializations: Vec::new(),
+        managed_spawn_replays: Vec::new(),
     })
 }
 
@@ -797,6 +850,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
         managed_worktrees: Vec::new(),
         managed_worktree_tombstones: Vec::new(),
         materializations: Vec::new(),
+        managed_spawn_replays: Vec::new(),
     })
 }
 
@@ -842,6 +896,7 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
         managed_worktrees: Vec::new(),
         managed_worktree_tombstones: Vec::new(),
         materializations: Vec::new(),
+        managed_spawn_replays: Vec::new(),
     })
 }
 
@@ -865,6 +920,7 @@ fn decode_v4_state(state: PersistedNodeStateV4) -> io::Result<DecodedNodeState> 
         managed_worktrees: state.managed_worktrees,
         managed_worktree_tombstones: state.managed_worktree_tombstones,
         materializations: Vec::new(),
+        managed_spawn_replays: Vec::new(),
     })
 }
 
@@ -992,6 +1048,7 @@ fn decode_v7_state(state: PersistedNodeStateV7) -> io::Result<DecodedNodeState> 
         managed_worktrees: state.managed_worktrees,
         managed_worktree_tombstones: state.managed_worktree_tombstones,
         materializations,
+        managed_spawn_replays: Vec::new(),
     })
 }
 
@@ -1042,7 +1099,105 @@ fn decode_v9_state(state: PersistedNodeStateV9) -> io::Result<DecodedNodeState> 
         managed_worktrees: state.managed_worktrees,
         managed_worktree_tombstones: state.managed_worktree_tombstones,
         materializations,
+        managed_spawn_replays: Vec::new(),
     })
+}
+
+fn decode_v10_state(state: PersistedNodeStateV10) -> io::Result<DecodedNodeState> {
+    validate_managed_spawn_replays(
+        &state.managed_spawn_replays,
+        &state.managed_worktrees,
+        &state.managed_worktree_tombstones,
+    )?;
+    let mut decoded = decode_v9_state(PersistedNodeStateV9 {
+        version: NODE_STATE_SCHEMA_V9,
+        node_id: state.node_id,
+        workspaces: state.workspaces,
+        session_records: state.session_records,
+        managed_worktrees: state.managed_worktrees,
+        managed_worktree_tombstones: state.managed_worktree_tombstones,
+        materializations: state.materializations,
+    })?;
+    decoded.managed_spawn_replays = state.managed_spawn_replays;
+    Ok(decoded)
+}
+
+fn validate_managed_spawn_replays(
+    records: &[ManagedWorktreeSpawnReplayRecordV10],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+) -> io::Result<()> {
+    if records.len() > MAX_MANAGED_WORKTREE_SPAWN_REPLAYS {
+        return Err(invalid_data("durable state contains too many managed spawn replays"));
+    }
+    let mut keys = BTreeSet::new();
+    for record in records {
+        let digest = record.request_digest.strip_prefix("sha256:").ok_or_else(|| {
+            invalid_data("durable managed spawn replay request digest is invalid")
+        })?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(invalid_data(
+                "durable managed spawn replay request digest is invalid",
+            ));
+        }
+        if record.updated_at_unix_ms < record.created_at_unix_ms {
+            return Err(invalid_data(
+                "durable managed spawn replay update precedes creation",
+            ));
+        }
+        let (lease_id, receipt) = match &record.state {
+            ManagedWorktreeSpawnReplayStateV10::Pending { lease_id, .. } => {
+                (lease_id.as_ref(), None)
+            }
+            ManagedWorktreeSpawnReplayStateV10::Committed { receipt } => {
+                if receipt.spawn.idempotency_key != record.idempotency_key {
+                    return Err(invalid_data(
+                        "durable managed spawn replay receipt is not linked to its idempotency key",
+                    ));
+                }
+                if receipt.lease.source_workspace_id != record.source_workspace_id
+                    || receipt.lease.profile_id != record.profile_id
+                    || receipt.lease.profile_revision != record.expected_profile_revision
+                {
+                    return Err(invalid_data(
+                        "durable managed spawn replay receipt is not linked to its reservation",
+                    ));
+                }
+                (Some(&receipt.lease.lease_id), Some(receipt))
+            }
+        };
+        if let Some(lease_id) = lease_id {
+            let durable_lease = managed_worktrees
+                .iter()
+                .chain(managed_worktree_tombstones)
+                .find(|lease| &lease.lease_id == lease_id);
+            match durable_lease {
+                Some(durable_lease)
+                    if durable_lease.source_workspace_id == record.source_workspace_id
+                        && durable_lease.profile_id == record.profile_id
+                        && durable_lease.profile_revision == record.expected_profile_revision
+                        && receipt.map_or(true, |receipt| {
+                            durable_lease.workspace_id == receipt.lease.workspace_id
+                        }) => {}
+                None if receipt.is_none() => {}
+                _ => {
+                    return Err(invalid_data(
+                        "durable managed spawn replay lease identity is inconsistent",
+                    ));
+                }
+            }
+        }
+        if !keys.insert(record.idempotency_key.clone()) {
+            return Err(invalid_data(
+                "durable state contains duplicate managed spawn replay keys",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_materialization_records(
@@ -1610,10 +1765,12 @@ pub(crate) fn save_v8(
         managed_worktrees,
         managed_worktree_tombstones,
         materializations,
+        &[],
         NODE_STATE_SCHEMA_V8,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn save_v9(
     path: Option<&Path>,
     node_id: &NodeId,
@@ -1631,7 +1788,31 @@ pub(crate) fn save_v9(
         managed_worktrees,
         managed_worktree_tombstones,
         materializations,
+        &[],
         NODE_STATE_SCHEMA_V9,
+    )
+}
+
+pub(crate) fn save_v10(
+    path: Option<&Path>,
+    node_id: &NodeId,
+    workspaces: &BTreeMap<WorkspaceId, String>,
+    records: &[ManagedSessionRecord],
+    managed_worktrees: &[ManagedWorktreeLeaseRecord],
+    managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
+    materializations: &[MaterializationOwnershipRecord],
+    managed_spawn_replays: &[ManagedWorktreeSpawnReplayRecordV10],
+) -> io::Result<Option<String>> {
+    save_current(
+        path,
+        node_id,
+        workspaces,
+        records,
+        managed_worktrees,
+        managed_worktree_tombstones,
+        materializations,
+        managed_spawn_replays,
+        NODE_STATE_SCHEMA_V10,
     )
 }
 
@@ -1643,6 +1824,7 @@ fn save_current(
     managed_worktrees: &[ManagedWorktreeLeaseRecord],
     managed_worktree_tombstones: &[ManagedWorktreeLeaseRecord],
     materializations: &[MaterializationOwnershipRecord],
+    managed_spawn_replays: &[ManagedWorktreeSpawnReplayRecordV10],
     version: u16,
 ) -> io::Result<Option<String>> {
     let Some(path) = path else {
@@ -1666,6 +1848,17 @@ fn save_current(
         managed_worktrees,
         managed_worktree_tombstones,
     )?;
+    if version == NODE_STATE_SCHEMA_V10 {
+        validate_managed_spawn_replays(
+            managed_spawn_replays,
+            managed_worktrees,
+            managed_worktree_tombstones,
+        )?;
+    } else if !managed_spawn_replays.is_empty() {
+        return Err(invalid_data(
+            "refusing to persist managed spawn replays in a legacy durable state",
+        ));
+    }
     let mut persisted_records = Vec::with_capacity(records.len());
     let mut provider_sessions = BTreeSet::new();
     for record in records {
@@ -1686,21 +1879,15 @@ fn save_current(
         };
         persisted_records.push(persisted);
     }
-    let state = PersistedNodeStateV9 {
-        version,
-        node_id: node_id.clone(),
-        workspaces: workspaces.iter().map(|(workspace_id, canonical_root)| {
+    let persisted_workspaces = workspaces.iter().map(|(workspace_id, canonical_root)| {
             Ok(PersistedWorkspaceV2 {
                 workspace_id: workspace_id.clone(),
                 canonical_root: OpaqueHostPath::utf8(canonical_root.clone()).map_err(|error| {
                     invalid_data(format!("refusing to persist an invalid workspace path: {error}"))
                 })?,
             })
-        }).collect::<io::Result<_>>()?,
-        session_records: persisted_records,
-        managed_worktrees: managed_worktrees.to_vec(),
-        managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
-        materializations: materializations.iter().map(|record| {
+        }).collect::<io::Result<Vec<_>>>()?;
+    let persisted_materializations = materializations.iter().map(|record| {
             Ok(PersistedMaterializationRecordV8 {
                 materialization_id: record.id().clone(),
                 environment_profile: record.environment_profile().cloned(),
@@ -1717,10 +1904,32 @@ fn save_current(
                 created_at_unix_ms: record.created_at_unix_ms(),
                 updated_at_unix_ms: record.updated_at_unix_ms(),
             })
-        }).collect::<io::Result<Vec<_>>>()?,
+        }).collect::<io::Result<Vec<_>>>()?;
+    let bytes = if version == NODE_STATE_SCHEMA_V10 {
+        serde_json::to_vec_pretty(&PersistedNodeStateV10 {
+            version,
+            node_id: node_id.clone(),
+            workspaces: persisted_workspaces,
+            session_records: persisted_records,
+            managed_worktrees: managed_worktrees.to_vec(),
+            managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
+            materializations: persisted_materializations,
+            managed_spawn_replays: managed_spawn_replays.to_vec(),
+        })
+    } else {
+        serde_json::to_vec_pretty(&PersistedNodeStateV9 {
+            version,
+            node_id: node_id.clone(),
+            workspaces: persisted_workspaces,
+            session_records: persisted_records,
+            managed_worktrees: managed_worktrees.to_vec(),
+            managed_worktree_tombstones: managed_worktree_tombstones.to_vec(),
+            materializations: persisted_materializations,
+        })
     };
-    let bytes = serde_json::to_vec_pretty(&state)
-        .map_err(|error| invalid_data(format!("durable state encoding failed: {error}")))?;
+    let bytes = bytes.map_err(|error| {
+        invalid_data(format!("durable state encoding failed: {error}"))
+    })?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err(invalid_data("refusing to persist oversized durable state"));
     }
@@ -3673,6 +3882,31 @@ mod tests {
         assert_eq!(loaded.records[0].context_id.as_ref(), Some(&context.id));
         assert_eq!(loaded.records[0].context.as_ref(), Some(&context));
         assert!(loaded.materializations == vec![ownership]);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v9_roundtrip_loads_with_an_empty_managed_spawn_replay_ledger() {
+        let path = temp_path("v9-managed-spawn-migration");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (node_id, workspaces, record) = fixture(&path);
+
+        save_v9(
+            Some(&path),
+            &node_id,
+            &workspaces,
+            &[record],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let header: PersistedNodeStateHeader = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(header.version, NODE_STATE_SCHEMA_V9);
+        let loaded = load(Some(&path), &node_id).unwrap();
+        assert!(loaded.managed_spawn_replays.is_empty());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

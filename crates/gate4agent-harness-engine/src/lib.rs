@@ -2192,7 +2192,6 @@ impl HarnessEngine {
             || operation.run_id.as_ref() != Some(&continuation.target_run_id)
             || source.intent.node_id != continuation.node_id
             || source.intent.workspace_id != continuation.workspace_id
-            || source.intent.provider_profile != continuation.source_provider
             || target.intent.node_id != continuation.node_id
         {
             return Err(HarnessEngineError::InvalidContinuationLink);
@@ -4381,7 +4380,7 @@ mod tests {
     }
 
     #[test]
-    fn create_issued_run_prepares_exact_operator_continuation_atomically() {
+    fn create_issued_run_accepts_concrete_continuation_provider_and_rejects_wrong_route() {
         let mut engine = HarnessEngine::new();
         let (task_id, _) = create_task(&mut engine);
         engine.tasks.get_mut(&task_id).unwrap().state = HarnessTaskStateV1::Ready;
@@ -4401,6 +4400,7 @@ mod tests {
         source_run.task_id = source_task_id.clone();
         source_run.run_id = source_run_id.clone();
         source_run.operation_id = source_operation_id.clone();
+        source_run.intent.provider_profile = HarnessSelectorV1::new("source-claude").unwrap();
         let source_binding = source_run.binding.clone().unwrap();
         engine.tasks.insert(source_task_id, source_task);
         engine.operations.insert(source_operation_id, source_operation);
@@ -4467,7 +4467,7 @@ mod tests {
             node_id: source_binding.node_id.clone(),
             node_incarnation: source_binding.node_incarnation.clone(),
             workspace_id: source_binding.workspace_id.clone(),
-            source_provider: source_run.intent.provider_profile.clone(),
+            source_provider: HarnessSelectorV1::new("claude").unwrap(),
             source_binding,
             context: None,
             target_binding: None,
@@ -4482,8 +4482,7 @@ mod tests {
             created_at_unix_ms: 20,
             updated_at_unix_ms: 20,
         };
-        let before = engine.checkpoint();
-        let prepared = engine.prepare(HarnessMutationV1::CreateIssuedRun {
+        let mutation = HarnessMutationV1::CreateIssuedRun {
             operation,
             expected_task_revision: revision(1),
             expected_execution_spec_revision: revision(1),
@@ -4492,7 +4491,23 @@ mod tests {
             run: requested_run.clone(),
             delivery: None,
             continuation: Some(continuation.clone()),
-        }).unwrap();
+        };
+        let mut wrong_route = mutation.clone();
+        if let HarnessMutationV1::CreateIssuedRun {
+            continuation: Some(continuation),
+            ..
+        } = &mut wrong_route
+        {
+            continuation.node_id = HarnessSelectorV1::new("node-b").unwrap();
+            continuation.source_binding.node_id = continuation.node_id.clone();
+        }
+        assert!(matches!(
+            engine.prepare(wrong_route),
+            Err(HarnessEngineError::InvalidContinuationLink),
+        ));
+
+        let before = engine.checkpoint();
+        let prepared = engine.prepare(mutation).unwrap();
         assert_eq!(engine.checkpoint(), before);
         engine.accept(prepared);
         assert_eq!(

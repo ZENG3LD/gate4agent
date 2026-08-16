@@ -61,6 +61,7 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V3: u16 = 3;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V4: u16 = 4;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V5: u16 = 5;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V6: u16 = 6;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V7: u16 = 7;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -82,6 +83,7 @@ pub const HARNESS_GIT_SUMMARY_MAX_BYTES: usize = 1_024;
 pub const HARNESS_GIT_IDENTITY_MAX_BYTES: usize = 512;
 pub const HARNESS_GIT_TIMESTAMP_MAX_BYTES: usize = 128;
 pub const HARNESS_GIT_SIGNER_MAX_BYTES: usize = 1_024;
+pub const HARNESS_REVERSE_ATTRIBUTION_LINKS_MAX: usize = 64;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -181,6 +183,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V4
                 | HARNESS_OPERATOR_WIRE_VERSION_V5
                 | HARNESS_OPERATOR_WIRE_VERSION_V6
+                | HARNESS_OPERATOR_WIRE_VERSION_V7
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -1232,6 +1235,273 @@ impl HarnessRunGitDiffV1 {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessReverseAttributionWorkspaceV1 {
+    pub node_id: HarnessSelectorV1,
+    pub node_incarnation_id: HarnessNodeIncarnationV1,
+    pub workspace_id: HarnessSelectorV1,
+}
+
+impl HarnessReverseAttributionWorkspaceV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.node_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_incarnation_id.validate()?;
+        self.workspace_id.validate().map_err(HarnessOperatorApiError::Protocol)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessReverseAttributionSubjectV1 {
+    ManagedRecord {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        record_id: HarnessSelectorV1,
+    },
+    RuntimeSession {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        instance_id: u64,
+        generation: u64,
+    },
+    Workspace {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+    },
+    FileScope {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        relative_path: HarnessRepositoryPathV1,
+    },
+    CommitScope {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        object_id: HarnessGitObjectIdV1,
+    },
+}
+
+impl HarnessReverseAttributionSubjectV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        let workspace = match self {
+            Self::ManagedRecord { workspace, record_id } => {
+                record_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                workspace
+            }
+            Self::RuntimeSession { workspace, instance_id, generation } => {
+                if *instance_id == 0 || *generation == 0 {
+                    return Err(HarnessOperatorApiError::InvalidReverseAttribution);
+                }
+                workspace
+            }
+            Self::Workspace { workspace } => workspace,
+            Self::FileScope { workspace, relative_path } => {
+                relative_path.validate()?;
+                workspace
+            }
+            Self::CommitScope { workspace, object_id } => {
+                object_id.validate()?;
+                workspace
+            }
+        };
+        workspace.validate()
+    }
+
+    fn workspace(&self) -> &HarnessReverseAttributionWorkspaceV1 {
+        match self {
+            Self::ManagedRecord { workspace, .. }
+            | Self::RuntimeSession { workspace, .. }
+            | Self::Workspace { workspace }
+            | Self::FileScope { workspace, .. }
+            | Self::CommitScope { workspace, .. } => workspace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessReverseAttributionRelationV1 {
+    ManagedRecordBinding,
+    RuntimeSessionBinding,
+    WorkspaceBinding,
+    WorkspaceScope,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessReverseAttributionBindingV1 {
+    ManagedRecord {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        record_id: HarnessSelectorV1,
+        active_instance_id: Option<u64>,
+        active_generation: Option<u64>,
+    },
+    RuntimeSession {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+        instance_id: u64,
+        generation: u64,
+    },
+    Workspace {
+        workspace: HarnessReverseAttributionWorkspaceV1,
+    },
+}
+
+impl HarnessReverseAttributionBindingV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        let workspace = match self {
+            Self::ManagedRecord {
+                workspace,
+                record_id,
+                active_instance_id,
+                active_generation,
+            } => {
+                record_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                if active_instance_id.is_some() != active_generation.is_some()
+                    || active_instance_id == &Some(0)
+                    || active_generation == &Some(0)
+                {
+                    return Err(HarnessOperatorApiError::InvalidReverseAttribution);
+                }
+                workspace
+            }
+            Self::RuntimeSession { workspace, instance_id, generation } => {
+                if *instance_id == 0 || *generation == 0 {
+                    return Err(HarnessOperatorApiError::InvalidReverseAttribution);
+                }
+                workspace
+            }
+            Self::Workspace { workspace } => workspace,
+        };
+        workspace.validate()
+    }
+
+    fn workspace(&self) -> &HarnessReverseAttributionWorkspaceV1 {
+        match self {
+            Self::ManagedRecord { workspace, .. }
+            | Self::RuntimeSession { workspace, .. }
+            | Self::Workspace { workspace } => workspace,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessReverseAttributionLinkV1 {
+    pub task_id: HarnessTaskId,
+    pub run_id: HarnessRunId,
+    pub run_revision: HarnessRevision,
+    pub binding: HarnessReverseAttributionBindingV1,
+    pub relation: HarnessReverseAttributionRelationV1,
+}
+
+impl HarnessReverseAttributionLinkV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.run_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.binding.validate()?;
+        let relation_matches = matches!(
+            (&self.relation, &self.binding),
+            (
+                HarnessReverseAttributionRelationV1::ManagedRecordBinding,
+                HarnessReverseAttributionBindingV1::ManagedRecord { .. },
+            ) | (
+                HarnessReverseAttributionRelationV1::RuntimeSessionBinding,
+                HarnessReverseAttributionBindingV1::RuntimeSession { .. },
+            ) | (
+                HarnessReverseAttributionRelationV1::WorkspaceBinding
+                    | HarnessReverseAttributionRelationV1::WorkspaceScope,
+                HarnessReverseAttributionBindingV1::Workspace { .. },
+            )
+        );
+        if !relation_matches {
+            return Err(HarnessOperatorApiError::InvalidReverseAttribution);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessReverseAttributionOutcomeV1 {
+    Attributed,
+    Unattributed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessReverseAttributionV1 {
+    pub subject: HarnessReverseAttributionSubjectV1,
+    pub outcome: HarnessReverseAttributionOutcomeV1,
+    pub links: Vec<HarnessReverseAttributionLinkV1>,
+}
+
+impl HarnessReverseAttributionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.subject.validate()?;
+        if self.links.len() > HARNESS_REVERSE_ATTRIBUTION_LINKS_MAX
+            || matches!(self.outcome, HarnessReverseAttributionOutcomeV1::Attributed)
+                != !self.links.is_empty()
+            || self.links.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(HarnessOperatorApiError::InvalidReverseAttribution);
+        }
+        for link in &self.links {
+            link.validate()?;
+            if link.binding.workspace() != self.subject.workspace()
+                || !self.link_matches_subject(link)
+            {
+                return Err(HarnessOperatorApiError::InvalidReverseAttribution);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        subject: &HarnessReverseAttributionSubjectV1,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        if &self.subject != subject {
+            return Err(HarnessOperatorApiError::InvalidReverseAttribution);
+        }
+        Ok(())
+    }
+
+    fn link_matches_subject(&self, link: &HarnessReverseAttributionLinkV1) -> bool {
+        match (&self.subject, &link.relation, &link.binding) {
+            (
+                HarnessReverseAttributionSubjectV1::ManagedRecord { record_id, .. },
+                HarnessReverseAttributionRelationV1::ManagedRecordBinding,
+                HarnessReverseAttributionBindingV1::ManagedRecord {
+                    record_id: binding_record_id,
+                    ..
+                },
+            ) => record_id == binding_record_id,
+            (
+                HarnessReverseAttributionSubjectV1::RuntimeSession {
+                    instance_id,
+                    generation,
+                    ..
+                },
+                HarnessReverseAttributionRelationV1::RuntimeSessionBinding,
+                HarnessReverseAttributionBindingV1::RuntimeSession {
+                    instance_id: binding_instance_id,
+                    generation: binding_generation,
+                    ..
+                },
+            ) => instance_id == binding_instance_id && generation == binding_generation,
+            (
+                HarnessReverseAttributionSubjectV1::Workspace { .. },
+                HarnessReverseAttributionRelationV1::WorkspaceBinding,
+                HarnessReverseAttributionBindingV1::Workspace { .. },
+            )
+            | (
+                HarnessReverseAttributionSubjectV1::FileScope { .. }
+                    | HarnessReverseAttributionSubjectV1::CommitScope { .. },
+                HarnessReverseAttributionRelationV1::WorkspaceScope,
+                HarnessReverseAttributionBindingV1::Workspace { .. },
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorRequestV1 {
@@ -1256,6 +1526,7 @@ pub enum HarnessOperatorRequestV1 {
     RunGet { run_id: HarnessRunId },
     RunCorrelationGet { run_id: HarnessRunId },
     RunTransferGet { run_id: HarnessRunId },
+    ReverseAttributionGet { subject: HarnessReverseAttributionSubjectV1 },
     InspectRunWorkspace { run_id: HarnessRunId },
     ReadRunWorkspaceFile {
         run_id: HarnessRunId,
@@ -1348,6 +1619,7 @@ impl HarnessOperatorRequestV1 {
             | Self::InspectRunWorkspace { run_id } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)
             }
+            Self::ReverseAttributionGet { subject } => subject.validate(),
             Self::ReadRunWorkspaceFile { run_id, path } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
                 path.validate()
@@ -1490,8 +1762,14 @@ impl HarnessOperatorRequestV1 {
         ) || matches!(self, Self::SubmitIntent { intent } if intent.action.requires_v6())
     }
 
+    pub fn requires_v7(&self) -> bool {
+        matches!(self, Self::ReverseAttributionGet { .. })
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v6() {
+        if self.requires_v7() {
+            HARNESS_OPERATOR_WIRE_VERSION_V7
+        } else if self.requires_v6() {
             HARNESS_OPERATOR_WIRE_VERSION_V6
         } else if self.requires_v5() {
             HARNESS_OPERATOR_WIRE_VERSION_V5
@@ -1532,6 +1810,7 @@ pub enum HarnessOperatorResponseV1 {
     Run(RedactedRunV1),
     RunCorrelation(HarnessRunCorrelationV1),
     RunTransfer(HarnessRunTransferSummaryV1),
+    ReverseAttribution(HarnessReverseAttributionV1),
     RunWorkspaceInspected(HarnessRunWorkspaceInspectionV1),
     RunWorkspaceFileRead(HarnessRunWorkspaceFileV1),
     RunGitHistoryRead(HarnessRunGitHistoryPageV1),
@@ -1560,6 +1839,7 @@ impl HarnessOperatorResponseV1 {
             Self::Run(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::RunCorrelation(value) => value.validate(),
             Self::RunTransfer(value) => value.validate(),
+            Self::ReverseAttribution(value) => value.validate(),
             Self::RunWorkspaceInspected(value) => value.validate(),
             Self::RunWorkspaceFileRead(value) => value.validate(),
             Self::RunGitHistoryRead(value) => value.validate(),
@@ -3373,6 +3653,8 @@ pub enum HarnessOperatorApiError {
     InvalidRunCorrelation,
     #[error("harness run transfer summary is invalid")]
     InvalidRunTransfer,
+    #[error("harness reverse attribution is invalid")]
+    InvalidReverseAttribution,
     #[error("harness run workspace origin is invalid")]
     InvalidWorkspaceOrigin,
     #[error("harness repository-relative path is invalid")]
@@ -3823,6 +4105,27 @@ mod tests {
             node_id: HarnessSelectorV1::new("node-a").unwrap(),
             node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
             workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        }
+    }
+
+    fn reverse_attribution_workspace() -> HarnessReverseAttributionWorkspaceV1 {
+        HarnessReverseAttributionWorkspaceV1 {
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        }
+    }
+
+    fn reverse_attribution_link(run_byte: char) -> HarnessReverseAttributionLinkV1 {
+        HarnessReverseAttributionLinkV1 {
+            task_id: HarnessTaskId::new(format!("htask_{}", "1".repeat(24))).unwrap(),
+            run_id: HarnessRunId::new(format!("hrun_{}", run_byte.to_string().repeat(24)))
+                .unwrap(),
+            run_revision: HarnessRevision::new(3).unwrap(),
+            binding: HarnessReverseAttributionBindingV1::Workspace {
+                workspace: reverse_attribution_workspace(),
+            },
+            relation: HarnessReverseAttributionRelationV1::WorkspaceScope,
         }
     }
 
@@ -5233,5 +5536,210 @@ mod tests {
             };
             assert!(fact.validate().is_err(), "accepted {relative_path}");
         }
+    }
+
+    #[test]
+    fn operator_v7_reverse_attribution_is_exact_private_and_fails_closed_on_v6() {
+        let subject = HarnessReverseAttributionSubjectV1::FileScope {
+            workspace: reverse_attribution_workspace(),
+            relative_path: HarnessRepositoryPathV1::new("src/lib.rs").unwrap(),
+        };
+        let request = HarnessOperatorRequestV1::ReverseAttributionGet {
+            subject: subject.clone(),
+        };
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V7);
+        request.validate().unwrap();
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        assert!(matches!(
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V6,
+                credential: credential.clone(),
+                request: request.clone(),
+            }.validate(),
+            Err(HarnessOperatorApiError::UnsupportedVersion),
+        ));
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V7,
+            credential,
+            request,
+        }.validate().unwrap();
+
+        let response = HarnessReverseAttributionV1 {
+            subject,
+            outcome: HarnessReverseAttributionOutcomeV1::Attributed,
+            links: vec![reverse_attribution_link('2')],
+        };
+        response.validate().unwrap();
+        let encoded = serde_json::to_value(
+            HarnessOperatorResponseV1::ReverseAttribution(response),
+        ).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "kind": "reverse-attribution",
+                "value": {
+                    "subject": {
+                        "kind": "file-scope",
+                        "workspace": {
+                            "node_id": "node-a",
+                            "node_incarnation_id": "07070707070707070707070707070707",
+                            "workspace_id": "workspace-a"
+                        },
+                        "relative_path": "src/lib.rs"
+                    },
+                    "outcome": "attributed",
+                    "links": [{
+                        "task_id": "htask_111111111111111111111111",
+                        "run_id": "hrun_222222222222222222222222",
+                        "run_revision": 3,
+                        "binding": {
+                            "kind": "workspace",
+                            "workspace": {
+                                "node_id": "node-a",
+                                "node_incarnation_id": "07070707070707070707070707070707",
+                                "workspace_id": "workspace-a"
+                            }
+                        },
+                        "relation": "workspace-scope"
+                    }]
+                }
+            }),
+        );
+        let encoded = encoded.to_string();
+        for forbidden in [
+            "produced-by",
+            "modified-by",
+            "provider_session",
+            "provider_profile",
+            "provider_home",
+            "credential",
+            "auth",
+            "canonical_root",
+            "display_root",
+            "source_path",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+
+        let mut unknown = serde_json::to_value(HarnessOperatorRequestV1::ReverseAttributionGet {
+            subject: HarnessReverseAttributionSubjectV1::Workspace {
+                workspace: reverse_attribution_workspace(),
+            },
+        }).unwrap();
+        unknown["subject"]["provider_session_id"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<HarnessOperatorRequestV1>(unknown).is_err());
+    }
+
+    #[test]
+    fn reverse_attribution_is_bounded_canonical_and_exactly_correlated() {
+        let subject = HarnessReverseAttributionSubjectV1::FileScope {
+            workspace: reverse_attribution_workspace(),
+            relative_path: HarnessRepositoryPathV1::new("src/lib.rs").unwrap(),
+        };
+        let first = reverse_attribution_link('2');
+        let second = reverse_attribution_link('3');
+        let exact = HarnessReverseAttributionV1 {
+            subject: subject.clone(),
+            outcome: HarnessReverseAttributionOutcomeV1::Attributed,
+            links: vec![first.clone(), second.clone()],
+        };
+        exact.validate_for(&subject).unwrap();
+
+        let mut noncanonical = exact.clone();
+        noncanonical.links.reverse();
+        assert!(matches!(
+            noncanonical.validate(),
+            Err(HarnessOperatorApiError::InvalidReverseAttribution),
+        ));
+        let duplicate = HarnessReverseAttributionV1 {
+            links: vec![first.clone(), first],
+            ..exact.clone()
+        };
+        assert!(duplicate.validate().is_err());
+        let over_limit = HarnessReverseAttributionV1 {
+            links: (0..=HARNESS_REVERSE_ATTRIBUTION_LINKS_MAX)
+                .map(|index| HarnessReverseAttributionLinkV1 {
+                    task_id: HarnessTaskId::new(format!("htask_{index:024x}")).unwrap(),
+                    ..reverse_attribution_link('4')
+                })
+                .collect(),
+            ..exact.clone()
+        };
+        assert!(over_limit.validate().is_err());
+
+        let unattributed = HarnessReverseAttributionV1 {
+            subject: subject.clone(),
+            outcome: HarnessReverseAttributionOutcomeV1::Unattributed,
+            links: Vec::new(),
+        };
+        unattributed.validate().unwrap();
+        let attributed_empty = HarnessReverseAttributionV1 {
+            outcome: HarnessReverseAttributionOutcomeV1::Attributed,
+            ..unattributed.clone()
+        };
+        assert!(attributed_empty.validate().is_err());
+        let unattributed_linked = HarnessReverseAttributionV1 {
+            outcome: HarnessReverseAttributionOutcomeV1::Unattributed,
+            links: vec![second],
+            ..exact.clone()
+        };
+        assert!(unattributed_linked.validate().is_err());
+
+        let other_subject = HarnessReverseAttributionSubjectV1::FileScope {
+            workspace: reverse_attribution_workspace(),
+            relative_path: HarnessRepositoryPathV1::new("src/other.rs").unwrap(),
+        };
+        assert!(matches!(
+            exact.validate_for(&other_subject),
+            Err(HarnessOperatorApiError::InvalidReverseAttribution),
+        ));
+    }
+
+    #[test]
+    fn reverse_attribution_relations_reject_false_file_and_binding_claims() {
+        let file_subject = HarnessReverseAttributionSubjectV1::FileScope {
+            workspace: reverse_attribution_workspace(),
+            relative_path: HarnessRepositoryPathV1::new("src/lib.rs").unwrap(),
+        };
+        let mut wrong_relation = reverse_attribution_link('2');
+        wrong_relation.relation = HarnessReverseAttributionRelationV1::WorkspaceBinding;
+        assert!(HarnessReverseAttributionV1 {
+            subject: file_subject,
+            outcome: HarnessReverseAttributionOutcomeV1::Attributed,
+            links: vec![wrong_relation],
+        }.validate().is_err());
+
+        let managed_subject = HarnessReverseAttributionSubjectV1::ManagedRecord {
+            workspace: reverse_attribution_workspace(),
+            record_id: HarnessSelectorV1::new("record-a").unwrap(),
+        };
+        let mismatched_record = HarnessReverseAttributionLinkV1 {
+            task_id: HarnessTaskId::new(format!("htask_{}", "1".repeat(24))).unwrap(),
+            run_id: HarnessRunId::new(format!("hrun_{}", "2".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(3).unwrap(),
+            binding: HarnessReverseAttributionBindingV1::ManagedRecord {
+                workspace: reverse_attribution_workspace(),
+                record_id: HarnessSelectorV1::new("record-b").unwrap(),
+                active_instance_id: Some(41),
+                active_generation: Some(3),
+            },
+            relation: HarnessReverseAttributionRelationV1::ManagedRecordBinding,
+        };
+        assert!(HarnessReverseAttributionV1 {
+            subject: managed_subject,
+            outcome: HarnessReverseAttributionOutcomeV1::Attributed,
+            links: vec![mismatched_record],
+        }.validate().is_err());
+
+        let invalid_active_pair = HarnessReverseAttributionBindingV1::ManagedRecord {
+            workspace: reverse_attribution_workspace(),
+            record_id: HarnessSelectorV1::new("record-a").unwrap(),
+            active_instance_id: Some(41),
+            active_generation: None,
+        };
+        assert!(invalid_active_pair.validate().is_err());
     }
 }

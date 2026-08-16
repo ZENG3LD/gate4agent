@@ -291,6 +291,20 @@ impl HarnessOperatorClient {
         }
     }
 
+    pub fn reverse_attribution_get(
+        &self,
+        subject: HarnessReverseAttributionSubjectV1,
+    ) -> Result<HarnessReverseAttributionV1, HarnessOperatorClientError> {
+        let expected_subject = subject.clone();
+        match self.send(HarnessOperatorRequestV1::ReverseAttributionGet { subject })? {
+            HarnessOperatorResponseV1::ReverseAttribution(value) => {
+                value.validate_for(&expected_subject)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn inspect_run_workspace(
         &self,
         run_id: HarnessRunId,
@@ -818,6 +832,14 @@ mod tests {
             run_revision: HarnessRevision::new(5).unwrap(),
             delivery: None,
             continuation: None,
+        }
+    }
+
+    fn reverse_attribution_workspace() -> HarnessReverseAttributionWorkspaceV1 {
+        HarnessReverseAttributionWorkspaceV1 {
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
         }
     }
 
@@ -1746,6 +1768,105 @@ mod tests {
             client.read_run_workspace_file(requested_run_id, requested_path),
             Err(HarnessOperatorClientError::Api(
                 HarnessOperatorApiError::InvalidWorkspaceOrigin,
+            )),
+        ));
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_round_trips_exact_v7_reverse_attribution() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let subject = HarnessReverseAttributionSubjectV1::CommitScope {
+            workspace: reverse_attribution_workspace(),
+            object_id: HarnessGitObjectIdV1::new("b".repeat(40)).unwrap(),
+        };
+        let response = HarnessReverseAttributionV1 {
+            subject: subject.clone(),
+            outcome: HarnessReverseAttributionOutcomeV1::Attributed,
+            links: vec![HarnessReverseAttributionLinkV1 {
+                task_id: HarnessTaskId::new(format!("htask_{}", "1".repeat(24))).unwrap(),
+                run_id: HarnessRunId::new(format!("hrun_{}", "2".repeat(24))).unwrap(),
+                run_revision: HarnessRevision::new(3).unwrap(),
+                binding: HarnessReverseAttributionBindingV1::Workspace {
+                    workspace: reverse_attribution_workspace(),
+                },
+                relation: HarnessReverseAttributionRelationV1::WorkspaceScope,
+            }],
+        };
+        let expected_subject = subject.clone();
+        let expected_response = response.clone();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            for forbidden in [
+                "provider_session",
+                "provider_profile",
+                "provider_home",
+                "canonical_root",
+                "display_root",
+                "credential_path",
+            ] {
+                assert!(!request.contains(forbidden), "request exposed {forbidden}");
+            }
+            let envelope: HarnessOperatorEnvelopeV1 =
+                serde_json::from_str(request.trim_end()).expect("operator envelope");
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V7);
+            match envelope.request {
+                HarnessOperatorRequestV1::ReverseAttributionGet { subject } => {
+                    assert_eq!(subject, expected_subject);
+                }
+                _ => panic!("unexpected V7 request"),
+            }
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::ReverseAttribution(expected_response),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert_eq!(client.reverse_attribution_get(subject).unwrap(), response);
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_rejects_mismatched_v7_reverse_attribution_subject() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let requested = HarnessReverseAttributionSubjectV1::Workspace {
+            workspace: reverse_attribution_workspace(),
+        };
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::ReverseAttribution(
+                    HarnessReverseAttributionV1 {
+                        subject: HarnessReverseAttributionSubjectV1::Workspace {
+                            workspace: HarnessReverseAttributionWorkspaceV1 {
+                                workspace_id: HarnessSelectorV1::new("workspace-other").unwrap(),
+                                ..reverse_attribution_workspace()
+                            },
+                        },
+                        outcome: HarnessReverseAttributionOutcomeV1::Unattributed,
+                        links: Vec::new(),
+                    },
+                ),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert!(matches!(
+            client.reverse_attribution_get(requested),
+            Err(HarnessOperatorClientError::Api(
+                HarnessOperatorApiError::InvalidReverseAttribution,
             )),
         ));
         host.join().expect("host");

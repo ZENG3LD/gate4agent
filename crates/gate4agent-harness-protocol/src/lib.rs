@@ -365,6 +365,10 @@ pub enum HarnessExecutionModeV1 {
 pub enum HarnessWorktreeIntentV1 {
     Existing,
     Managed { worktree_ref: HarnessSelectorV1 },
+    ManagedProfile {
+        profile_id: HarnessSelectorV1,
+        expected_profile_revision: HarnessSelectorV1,
+    },
 }
 
 impl HarnessWorktreeIntentV1 {
@@ -372,6 +376,13 @@ impl HarnessWorktreeIntentV1 {
         match self {
             Self::Existing => Ok(()),
             Self::Managed { worktree_ref } => worktree_ref.validate(),
+            Self::ManagedProfile {
+                profile_id,
+                expected_profile_revision,
+            } => {
+                profile_id.validate()?;
+                expected_profile_revision.validate()
+            }
         }
     }
 }
@@ -519,6 +530,30 @@ impl HarnessTaskLaunchIssuanceRefV1 {
         self.issuance_id.validate()?;
         self.revision.validate()?;
         self.digest.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessTransferAuthorityRefV1 {
+    ParentGrant {
+        grant_id: SessionGrantId,
+        revision: HarnessRevision,
+    },
+    OperatorIssuance {
+        issuance: HarnessTaskLaunchIssuanceRefV1,
+    },
+}
+
+impl HarnessTransferAuthorityRefV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::ParentGrant { grant_id, revision } => {
+                grant_id.validate()?;
+                revision.validate()
+            }
+            Self::OperatorIssuance { issuance } => issuance.validate(),
+        }
     }
 }
 
@@ -1133,12 +1168,11 @@ impl HarnessDeliveryStageReceiptV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "HarnessDeliveryReceiptV1Wire", into = "HarnessDeliveryReceiptV1Wire")]
 pub struct HarnessDeliveryReceiptV1 {
     pub receipt_ref: HarnessReceiptRef,
     pub delivery_ref: HarnessDeliveryRef,
-    pub grant_id: SessionGrantId,
-    pub grant_revision: HarnessRevision,
+    pub authority: HarnessTransferAuthorityRefV1,
     pub task_id: HarnessTaskId,
     pub run_id: HarnessRunId,
     pub operation_id: HarnessOperationId,
@@ -1151,8 +1185,7 @@ impl HarnessDeliveryReceiptV1 {
     pub fn validate(&self) -> Result<(), HarnessValidationError> {
         self.receipt_ref.validate()?;
         self.delivery_ref.validate()?;
-        self.grant_id.validate()?;
-        self.grant_revision.validate()?;
+        self.authority.validate()?;
         self.task_id.validate()?;
         self.run_id.validate()?;
         self.operation_id.validate()?;
@@ -1166,12 +1199,11 @@ impl HarnessDeliveryReceiptV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "HarnessDeliveryV1Wire", into = "HarnessDeliveryV1Wire")]
 pub struct HarnessDeliveryV1 {
     pub delivery_ref: HarnessDeliveryRef,
     pub revision: HarnessRevision,
-    pub grant_id: SessionGrantId,
-    pub grant_revision: HarnessRevision,
+    pub authority: HarnessTransferAuthorityRefV1,
     pub task_id: HarnessTaskId,
     pub run_id: HarnessRunId,
     pub operation_id: HarnessOperationId,
@@ -1261,14 +1293,13 @@ impl HarnessResolvedContextPackReceiptV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "HarnessContinuationV1Wire", into = "HarnessContinuationV1Wire")]
 pub struct HarnessContinuationV1 {
     pub continuation_ref: HarnessContinuationRef,
     pub receipt_ref: HarnessReceiptRef,
     pub revision: HarnessRevision,
     pub state: HarnessContinuationStateV1,
-    pub grant_id: SessionGrantId,
-    pub grant_revision: HarnessRevision,
+    pub authority: HarnessTransferAuthorityRefV1,
     pub source_run_id: HarnessRunId,
     pub target_run_id: HarnessRunId,
     pub operation_id: HarnessOperationId,
@@ -1296,8 +1327,7 @@ impl HarnessContinuationV1 {
         self.continuation_ref.validate()?;
         self.receipt_ref.validate()?;
         self.revision.validate()?;
-        self.grant_id.validate()?;
-        self.grant_revision.validate()?;
+        self.authority.validate()?;
         self.source_run_id.validate()?;
         self.target_run_id.validate()?;
         self.operation_id.validate()?;
@@ -1414,8 +1444,7 @@ impl HarnessDeliveryV1 {
     pub fn validate(&self) -> Result<(), HarnessValidationError> {
         self.delivery_ref.validate()?;
         self.revision.validate()?;
-        self.grant_id.validate()?;
-        self.grant_revision.validate()?;
+        self.authority.validate()?;
         self.task_id.validate()?;
         self.run_id.validate()?;
         self.operation_id.validate()?;
@@ -1450,8 +1479,7 @@ impl HarnessDeliveryV1 {
                 .map(|stage| stage.staged_at_unix_ms)
                 .ok_or(HarnessValidationError::InvalidDeliveryLink)?;
             if receipt.delivery_ref != self.delivery_ref
-                || receipt.grant_id != self.grant_id
-                || receipt.grant_revision != self.grant_revision
+                || receipt.authority != self.authority
                 || receipt.task_id != self.task_id
                 || receipt.run_id != self.run_id
                 || receipt.operation_id != self.operation_id
@@ -1464,6 +1492,254 @@ impl HarnessDeliveryV1 {
             }
         }
         Ok(())
+    }
+}
+
+fn migrate_transfer_authority(
+    authority: Option<HarnessTransferAuthorityRefV1>,
+    grant_id: Option<SessionGrantId>,
+    grant_revision: Option<HarnessRevision>,
+) -> Result<HarnessTransferAuthorityRefV1, String> {
+    match (authority, grant_id, grant_revision) {
+        (Some(authority), None, None) => Ok(authority),
+        (None, Some(grant_id), Some(revision)) => {
+            Ok(HarnessTransferAuthorityRefV1::ParentGrant { grant_id, revision })
+        }
+        _ => Err("transfer authority must be exactly one canonical authority or one legacy grant pair".to_owned()),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessDeliveryReceiptV1Wire {
+    receipt_ref: HarnessReceiptRef,
+    delivery_ref: HarnessDeliveryRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority: Option<HarnessTransferAuthorityRefV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_id: Option<SessionGrantId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_revision: Option<HarnessRevision>,
+    task_id: HarnessTaskId,
+    run_id: HarnessRunId,
+    operation_id: HarnessOperationId,
+    binding: HarnessSessionBindingV1,
+    bundle: HarnessDeliveryBundleV1,
+    committed_at_unix_ms: u64,
+}
+
+impl TryFrom<HarnessDeliveryReceiptV1Wire> for HarnessDeliveryReceiptV1 {
+    type Error = String;
+
+    fn try_from(wire: HarnessDeliveryReceiptV1Wire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            receipt_ref: wire.receipt_ref,
+            delivery_ref: wire.delivery_ref,
+            authority: migrate_transfer_authority(
+                wire.authority,
+                wire.grant_id,
+                wire.grant_revision,
+            )?,
+            task_id: wire.task_id,
+            run_id: wire.run_id,
+            operation_id: wire.operation_id,
+            binding: wire.binding,
+            bundle: wire.bundle,
+            committed_at_unix_ms: wire.committed_at_unix_ms,
+        })
+    }
+}
+
+impl From<HarnessDeliveryReceiptV1> for HarnessDeliveryReceiptV1Wire {
+    fn from(value: HarnessDeliveryReceiptV1) -> Self {
+        Self {
+            receipt_ref: value.receipt_ref,
+            delivery_ref: value.delivery_ref,
+            authority: Some(value.authority),
+            grant_id: None,
+            grant_revision: None,
+            task_id: value.task_id,
+            run_id: value.run_id,
+            operation_id: value.operation_id,
+            binding: value.binding,
+            bundle: value.bundle,
+            committed_at_unix_ms: value.committed_at_unix_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessDeliveryV1Wire {
+    delivery_ref: HarnessDeliveryRef,
+    revision: HarnessRevision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority: Option<HarnessTransferAuthorityRefV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_id: Option<SessionGrantId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_revision: Option<HarnessRevision>,
+    task_id: HarnessTaskId,
+    run_id: HarnessRunId,
+    operation_id: HarnessOperationId,
+    bundle: HarnessDeliveryBundleV1,
+    state: HarnessDeliveryStateV1,
+    stage_receipt: Option<HarnessDeliveryStageReceiptV1>,
+    receipt: Option<HarnessDeliveryReceiptV1>,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+}
+
+impl TryFrom<HarnessDeliveryV1Wire> for HarnessDeliveryV1 {
+    type Error = String;
+
+    fn try_from(wire: HarnessDeliveryV1Wire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            delivery_ref: wire.delivery_ref,
+            revision: wire.revision,
+            authority: migrate_transfer_authority(
+                wire.authority,
+                wire.grant_id,
+                wire.grant_revision,
+            )?,
+            task_id: wire.task_id,
+            run_id: wire.run_id,
+            operation_id: wire.operation_id,
+            bundle: wire.bundle,
+            state: wire.state,
+            stage_receipt: wire.stage_receipt,
+            receipt: wire.receipt,
+            created_at_unix_ms: wire.created_at_unix_ms,
+            updated_at_unix_ms: wire.updated_at_unix_ms,
+        })
+    }
+}
+
+impl From<HarnessDeliveryV1> for HarnessDeliveryV1Wire {
+    fn from(value: HarnessDeliveryV1) -> Self {
+        Self {
+            delivery_ref: value.delivery_ref,
+            revision: value.revision,
+            authority: Some(value.authority),
+            grant_id: None,
+            grant_revision: None,
+            task_id: value.task_id,
+            run_id: value.run_id,
+            operation_id: value.operation_id,
+            bundle: value.bundle,
+            state: value.state,
+            stage_receipt: value.stage_receipt,
+            receipt: value.receipt,
+            created_at_unix_ms: value.created_at_unix_ms,
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessContinuationV1Wire {
+    continuation_ref: HarnessContinuationRef,
+    receipt_ref: HarnessReceiptRef,
+    revision: HarnessRevision,
+    state: HarnessContinuationStateV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority: Option<HarnessTransferAuthorityRefV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_id: Option<SessionGrantId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_revision: Option<HarnessRevision>,
+    source_run_id: HarnessRunId,
+    target_run_id: HarnessRunId,
+    operation_id: HarnessOperationId,
+    node_id: HarnessSelectorV1,
+    node_incarnation: HarnessSelectorV1,
+    workspace_id: HarnessSelectorV1,
+    source_provider: HarnessSelectorV1,
+    source_binding: HarnessSessionBindingV1,
+    context: Option<HarnessResolvedContextPackReceiptV1>,
+    target_binding: Option<HarnessSessionBindingV1>,
+    prepared_at_unix_ms: u64,
+    exporting_at_unix_ms: Option<u64>,
+    exported_at_unix_ms: Option<u64>,
+    bound_at_unix_ms: Option<u64>,
+    expired_at_unix_ms: Option<u64>,
+    outcome_unknown_at_unix_ms: Option<u64>,
+    outcome_unknown_reason: Option<HarnessContinuationOutcomeUnknownReasonV1>,
+    cleanup_state: HarnessContinuationCleanupStateV1,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+}
+
+impl TryFrom<HarnessContinuationV1Wire> for HarnessContinuationV1 {
+    type Error = String;
+
+    fn try_from(wire: HarnessContinuationV1Wire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            continuation_ref: wire.continuation_ref,
+            receipt_ref: wire.receipt_ref,
+            revision: wire.revision,
+            state: wire.state,
+            authority: migrate_transfer_authority(
+                wire.authority,
+                wire.grant_id,
+                wire.grant_revision,
+            )?,
+            source_run_id: wire.source_run_id,
+            target_run_id: wire.target_run_id,
+            operation_id: wire.operation_id,
+            node_id: wire.node_id,
+            node_incarnation: wire.node_incarnation,
+            workspace_id: wire.workspace_id,
+            source_provider: wire.source_provider,
+            source_binding: wire.source_binding,
+            context: wire.context,
+            target_binding: wire.target_binding,
+            prepared_at_unix_ms: wire.prepared_at_unix_ms,
+            exporting_at_unix_ms: wire.exporting_at_unix_ms,
+            exported_at_unix_ms: wire.exported_at_unix_ms,
+            bound_at_unix_ms: wire.bound_at_unix_ms,
+            expired_at_unix_ms: wire.expired_at_unix_ms,
+            outcome_unknown_at_unix_ms: wire.outcome_unknown_at_unix_ms,
+            outcome_unknown_reason: wire.outcome_unknown_reason,
+            cleanup_state: wire.cleanup_state,
+            created_at_unix_ms: wire.created_at_unix_ms,
+            updated_at_unix_ms: wire.updated_at_unix_ms,
+        })
+    }
+}
+
+impl From<HarnessContinuationV1> for HarnessContinuationV1Wire {
+    fn from(value: HarnessContinuationV1) -> Self {
+        Self {
+            continuation_ref: value.continuation_ref,
+            receipt_ref: value.receipt_ref,
+            revision: value.revision,
+            state: value.state,
+            authority: Some(value.authority),
+            grant_id: None,
+            grant_revision: None,
+            source_run_id: value.source_run_id,
+            target_run_id: value.target_run_id,
+            operation_id: value.operation_id,
+            node_id: value.node_id,
+            node_incarnation: value.node_incarnation,
+            workspace_id: value.workspace_id,
+            source_provider: value.source_provider,
+            source_binding: value.source_binding,
+            context: value.context,
+            target_binding: value.target_binding,
+            prepared_at_unix_ms: value.prepared_at_unix_ms,
+            exporting_at_unix_ms: value.exporting_at_unix_ms,
+            exported_at_unix_ms: value.exported_at_unix_ms,
+            bound_at_unix_ms: value.bound_at_unix_ms,
+            expired_at_unix_ms: value.expired_at_unix_ms,
+            outcome_unknown_at_unix_ms: value.outcome_unknown_at_unix_ms,
+            outcome_unknown_reason: value.outcome_unknown_reason,
+            cleanup_state: value.cleanup_state,
+            created_at_unix_ms: value.created_at_unix_ms,
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        }
     }
 }
 
@@ -2500,8 +2776,10 @@ mod tests {
                 "e".repeat(24),
             )).unwrap(),
             delivery_ref: delivery_ref.clone(),
-            grant_id: grant_id('4'),
-            grant_revision: HarnessRevision::new(2).unwrap(),
+            authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: grant_id('4'),
+                revision: HarnessRevision::new(2).unwrap(),
+            },
             task_id: task_id('1'),
             run_id: run_id('2'),
             operation_id: operation_id('3'),
@@ -2523,8 +2801,10 @@ mod tests {
         let delivery = HarnessDeliveryV1 {
             delivery_ref,
             revision: HarnessRevision::new(3).unwrap(),
-            grant_id: grant_id('4'),
-            grant_revision: HarnessRevision::new(2).unwrap(),
+            authority: HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: grant_id('4'),
+                revision: HarnessRevision::new(2).unwrap(),
+            },
             task_id: task_id('1'),
             run_id: run_id('2'),
             operation_id: operation_id('3'),
@@ -2543,9 +2823,56 @@ mod tests {
         };
         delivery.validate().unwrap();
         let wire = serde_json::to_string(&delivery).unwrap();
+        assert!(wire.contains("\"authority\""));
+        let canonical = serde_json::to_value(&delivery).unwrap();
+        let canonical_object = canonical.as_object().unwrap();
+        assert!(!canonical_object.contains_key("grant_id"));
+        assert!(!canonical_object.contains_key("grant_revision"));
+        let canonical_receipt = canonical_object.get("receipt").unwrap()
+            .as_object().unwrap();
+        assert!(!canonical_receipt.contains_key("grant_id"));
+        assert!(!canonical_receipt.contains_key("grant_revision"));
         for sentinel in ["prompt", "transcript", "bearer", "credential", "provider_home"] {
             assert!(!wire.contains(sentinel));
         }
+
+        let mut legacy = serde_json::to_value(&delivery).unwrap();
+        let delivery_object = legacy.as_object_mut().unwrap();
+        delivery_object.remove("authority");
+        delivery_object.insert(
+            "grant_id".to_owned(),
+            serde_json::to_value(grant_id('4')).unwrap(),
+        );
+        delivery_object.insert(
+            "grant_revision".to_owned(),
+            serde_json::to_value(HarnessRevision::new(2).unwrap()).unwrap(),
+        );
+        let receipt_object = delivery_object.get_mut("receipt").unwrap()
+            .as_object_mut().unwrap();
+        receipt_object.remove("authority");
+        receipt_object.insert(
+            "grant_id".to_owned(),
+            serde_json::to_value(grant_id('4')).unwrap(),
+        );
+        receipt_object.insert(
+            "grant_revision".to_owned(),
+            serde_json::to_value(HarnessRevision::new(2).unwrap()).unwrap(),
+        );
+        let migrated: HarnessDeliveryV1 = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(migrated, delivery);
+        let migrated_wire = serde_json::to_string(&migrated).unwrap();
+        assert!(migrated_wire.contains("\"authority\""));
+        let migrated_value = serde_json::to_value(&migrated).unwrap();
+        assert!(!migrated_value.as_object().unwrap().contains_key("grant_id"));
+
+        legacy.as_object_mut().unwrap().insert(
+            "authority".to_owned(),
+            serde_json::to_value(HarnessTransferAuthorityRefV1::ParentGrant {
+                grant_id: grant_id('4'),
+                revision: HarnessRevision::new(2).unwrap(),
+            }).unwrap(),
+        );
+        assert!(serde_json::from_value::<HarnessDeliveryV1>(legacy).is_err());
 
         let mut changed = delivery;
         changed.receipt.as_mut().unwrap().bundle.manifest_digest =

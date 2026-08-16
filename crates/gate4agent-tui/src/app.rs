@@ -41,6 +41,7 @@ use gate4agent_types::{
     TerminalMouseProtocolEncoding, PROVIDER_EVENT_ID_MAX_BYTES, TERMINAL_INPUT_MAX_BYTES,
 };
 use gate4agent_harness_client::{
+    FeatureObservationStateV1, HarnessRunContextSourceObservationV1,
     HarnessExpectedExecutionSpecRevisionV1,
     HarnessGitObjectIdV1,
     HarnessOperatorMutationOutcomeV1,
@@ -686,6 +687,20 @@ pub enum HarnessRunTransferState {
     Error { token: u64, message: String },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessRunContextSourceState {
+    Loading { token: u64 },
+    Observed {
+        token: u64,
+        observation: HarnessRunContextSourceObservationV1,
+    },
+    Unavailable {
+        token: u64,
+        feature_state: FeatureObservationStateV1,
+    },
+    Error { token: u64, message: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HarnessExecutionMutationKind {
     SaveSpec,
@@ -892,6 +907,7 @@ pub struct HarnessKanbanState {
     pub monitor: Option<HarnessRunMonitorView>,
     pub run_observations: BTreeMap<HarnessRunId, HarnessRunObservationState>,
     pub run_transfers: BTreeMap<HarnessRunRef, HarnessRunTransferState>,
+    pub run_context_sources: BTreeMap<HarnessRunRef, HarnessRunContextSourceState>,
     pub workspaces: BTreeMap<HarnessRunOrigin, HarnessWorkspaceView>,
     pub workspace_requests: BTreeMap<HarnessRunRef, HarnessWorkspaceRequest>,
     pub reverse_attribution: Option<HarnessReverseAttributionDetail>,
@@ -2271,6 +2287,11 @@ pub enum AppAction {
         run: HarnessRunRef,
         token: u64,
     },
+    HarnessObserveRunContextSource {
+        run: HarnessRunRef,
+        task: HarnessTaskRef,
+        token: u64,
+    },
     HarnessLoadTaskLaunchOptions {
         task: HarnessTaskRef,
         token: u64,
@@ -2402,6 +2423,7 @@ pub enum HitTarget {
     HarnessTaskDetailRun(HarnessRunId),
     HarnessTaskDetailRunMonitor(HarnessRunId),
     HarnessTaskDetailRunTransfers(HarnessRunId),
+    HarnessTaskDetailRunObserveContext(HarnessRunId),
     HarnessTransferRefresh,
     HarnessTransferPreviousRun,
     HarnessTransferNextRun,
@@ -4736,6 +4758,20 @@ impl App {
                     }
             })
         });
+        self.harness_kanban.run_context_sources.retain(|run_ref, state| {
+            self.harness_kanban.runs.get(&run_ref.run_id).is_some_and(|run| {
+                run.revision == run_ref.run_revision
+                    && match state {
+                        HarnessRunContextSourceState::Observed { observation, .. } => {
+                            observation.run_id == run_ref.run_id
+                                && observation.run_revision == run_ref.run_revision
+                        }
+                        HarnessRunContextSourceState::Loading { .. }
+                        | HarnessRunContextSourceState::Unavailable { .. }
+                        | HarnessRunContextSourceState::Error { .. } => true,
+                    }
+            })
+        });
         self.harness_kanban.launch_options.retain(|task_ref, state| {
             self.harness_kanban.tasks.get(&task_ref.task_id).is_some_and(|task| {
                 task.revision == task_ref.task_revision
@@ -4976,6 +5012,103 @@ impl App {
                 run.clone(),
                 HarnessRunTransferState::Error { token, message },
             );
+        }
+    }
+
+    pub fn apply_harness_context_source_observation(
+        &mut self,
+        run: HarnessRunRef,
+        task: HarnessTaskRef,
+        token: u64,
+        observation: HarnessRunContextSourceObservationV1,
+        launch_options: Result<HarnessTaskLaunchOptionsV1, String>,
+    ) -> AppAction {
+        let exact_pending = self.harness_kanban.run_context_sources.get(&run)
+            .is_some_and(|state| {
+                matches!(state, HarnessRunContextSourceState::Loading { token: pending }
+                    if *pending == token)
+            });
+        let exact_run = self.harness_kanban.runs.get(&run.run_id).is_some_and(|loaded| {
+            loaded.revision == run.run_revision
+                && loaded.task_id.as_ref() == Some(&task.task_id)
+        });
+        let exact_task = self.harness_kanban.tasks.get(&task.task_id)
+            .is_some_and(|loaded| loaded.revision == task.task_revision);
+        if !exact_pending || !exact_run || !exact_task
+            || observation.run_id != run.run_id
+            || observation.run_revision != run.run_revision
+        {
+            return AppAction::None;
+        }
+        let observed = observation.feature_state == FeatureObservationStateV1::Observed;
+        let feature_state = observation.feature_state;
+        if observed {
+            self.harness_kanban.run_context_sources.insert(
+                run,
+                HarnessRunContextSourceState::Observed { token, observation },
+            );
+            match launch_options {
+                Ok(options) if options.task_id == task.task_id
+                    && options.task_revision == task.task_revision =>
+                {
+                    self.harness_kanban.launch_options.insert(
+                        task,
+                        HarnessLaunchOptionsState::Ready(
+                            HarnessLaunchOptionsView::from_options(options),
+                        ),
+                    );
+                }
+                Ok(options) => {
+                    self.harness_kanban.launch_options.insert(
+                        task,
+                        HarnessLaunchOptionsState::Error {
+                            token,
+                            message: format!(
+                                "Harness launch options changed to task {} r{} after context observation",
+                                options.task_id,
+                                options.task_revision.get(),
+                            ),
+                        },
+                    );
+                }
+                Err(message) => {
+                    self.harness_kanban.launch_options.insert(
+                        task,
+                        HarnessLaunchOptionsState::Error { token, message },
+                    );
+                }
+            }
+            self.notice = Some("Harness context source observed; authoritative task state is refreshing".to_owned());
+            return self.request_harness_refresh();
+        }
+        self.harness_kanban.run_context_sources.insert(
+            run,
+            HarnessRunContextSourceState::Unavailable { token, feature_state },
+        );
+        self.notice = Some(format!(
+            "Harness context source unavailable: {:?}",
+            feature_state,
+        ));
+        AppAction::None
+    }
+
+    pub fn fail_harness_context_source_observation(
+        &mut self,
+        run: &HarnessRunRef,
+        token: u64,
+        message: String,
+    ) {
+        let exact_pending = self.harness_kanban.run_context_sources.get(run)
+            .is_some_and(|state| {
+                matches!(state, HarnessRunContextSourceState::Loading { token: pending }
+                    if *pending == token)
+            });
+        if exact_pending {
+            self.harness_kanban.run_context_sources.insert(
+                run.clone(),
+                HarnessRunContextSourceState::Error { token, message: message.clone() },
+            );
+            self.notice = Some("Harness context observation failed; retry from the exact run".to_owned());
         }
     }
 
@@ -5945,6 +6078,55 @@ impl App {
             HarnessRunTransferState::Loading { token },
         );
         AppAction::HarnessLoadRunTransfer { run: run_ref, token }
+    }
+
+    fn observe_harness_run_context_source(
+        &mut self,
+        run_id: HarnessRunId,
+    ) -> AppAction {
+        let Some(detail) = self.harness_kanban.detail.as_ref() else {
+            return AppAction::None;
+        };
+        let Some(task) = self.harness_kanban.tasks.get(&detail.task_id) else {
+            return AppAction::None;
+        };
+        let task_ref = HarnessTaskRef {
+            task_id: task.task_id.clone(),
+            task_revision: task.revision,
+        };
+        let Some(run) = self.harness_kanban.runs.get(&run_id)
+            .filter(|run| run.task_id.as_ref() == Some(&task_ref.task_id))
+        else {
+            self.notice = Some(
+                "Harness context observation unavailable: run does not belong to this task"
+                    .to_owned(),
+            );
+            return AppAction::None;
+        };
+        if run.binding == RedactedBindingStateV1::None {
+            self.notice = Some(
+                "Harness context observation unavailable: run has no Harness binding".to_owned(),
+            );
+            return AppAction::None;
+        }
+        let run_ref = HarnessRunRef {
+            run_id: run.run_id.clone(),
+            run_revision: run.revision,
+        };
+        self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
+        let token = self.harness_read_token;
+        self.harness_kanban.run_context_sources.insert(
+            run_ref.clone(),
+            HarnessRunContextSourceState::Loading { token },
+        );
+        if let Some(detail) = self.harness_kanban.detail.as_mut() {
+            detail.selected_run = Some(run_id);
+        }
+        AppAction::HarnessObserveRunContextSource {
+            run: run_ref,
+            task: task_ref,
+            token,
+        }
     }
 
     fn move_harness_transfer_selection(&mut self, previous: bool) -> AppAction {
@@ -8893,6 +9075,9 @@ impl App {
             Some(HitTarget::HarnessTaskDetailRunTransfers(run_id)) => {
                 return self.open_harness_run_transfers(run_id.clone(), false);
             }
+            Some(HitTarget::HarnessTaskDetailRunObserveContext(run_id)) => {
+                return self.observe_harness_run_context_source(run_id.clone());
+            }
             Some(HitTarget::HarnessTransferRefresh) => {
                 let selected_run = self.harness_kanban.detail.as_ref()
                     .and_then(|detail| detail.selected_run.clone());
@@ -9665,6 +9850,7 @@ impl App {
                 | HitTarget::HarnessTaskDetailRun(_)
                 | HitTarget::HarnessTaskDetailRunMonitor(_)
                 | HitTarget::HarnessTaskDetailRunTransfers(_)
+                | HitTarget::HarnessTaskDetailRunObserveContext(_)
                 | HitTarget::HarnessTransferRefresh
                 | HitTarget::HarnessTransferPreviousRun
                 | HitTarget::HarnessTransferNextRun
@@ -19588,6 +19774,92 @@ mod tests {
             app.harness_kanban.detail.as_ref().map(|detail| detail.section),
             Some(HarnessTaskDetailSection::Transfers),
         );
+    }
+
+    #[test]
+    fn harness_context_observation_is_mouse_first_exact_and_refreshes_launch_options() {
+        let mut app = App::default();
+        app.harness_kanban.enabled = true;
+        let task = harness_task('c', HarnessTaskStateV1::Running, 3);
+        let run = harness_run('d', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![run.clone()]);
+        app.harness_kanban.detail = Some(HarnessTaskDetailState {
+            task_id: task.task_id.clone(),
+            section: HarnessTaskDetailSection::Runs,
+            selected_run: Some(run.run_id.clone()),
+            scroll: 0,
+        });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 24, 1),
+            target: HitTarget::HarnessTaskDetailRunObserveContext(run.run_id.clone()),
+        }];
+        let AppAction::HarnessObserveRunContextSource {
+            run: requested,
+            task: requested_task,
+            token,
+        } = app.click(1, 0) else {
+            panic!("mouse context control did not request Harness detail observation");
+        };
+        assert_eq!(requested.run_id, run.run_id);
+        assert_eq!(requested.run_revision, run.revision);
+        assert_eq!(requested_task.task_id, task.task_id);
+        assert_eq!(requested_task.task_revision, task.revision);
+        assert!(matches!(
+            app.harness_kanban.run_context_sources.get(&requested),
+            Some(HarnessRunContextSourceState::Loading { token: pending })
+                if *pending == token,
+        ));
+
+        let observation = HarnessRunContextSourceObservationV1 {
+            run_id: run.run_id.clone(),
+            run_revision: run.revision,
+            feature_state: FeatureObservationStateV1::Observed,
+            message_count: 9,
+            message_count_exact: true,
+            completed_turn_count: Some(4),
+            total_tokens: Some(700),
+            observed_at_unix_ms: Some(11),
+        };
+        let options = harness_launch_options(&task, false);
+        assert_eq!(
+            app.apply_harness_context_source_observation(
+                requested.clone(),
+                requested_task.clone(),
+                token.saturating_add(1),
+                observation.clone(),
+                Ok(options.clone()),
+            ),
+            AppAction::None,
+        );
+        assert!(matches!(
+            app.harness_kanban.run_context_sources.get(&requested),
+            Some(HarnessRunContextSourceState::Loading { .. }),
+        ));
+
+        let AppAction::HarnessRefresh { token: refresh_token } =
+            app.apply_harness_context_source_observation(
+                requested.clone(),
+                requested_task.clone(),
+                token,
+                observation.clone(),
+                Ok(options.clone()),
+            )
+        else {
+            panic!("observed context did not request an authoritative Harness refresh");
+        };
+        assert!(refresh_token > 0);
+        assert!(matches!(
+            app.harness_kanban.run_context_sources.get(&requested),
+            Some(HarnessRunContextSourceState::Observed {
+                token: observed_token,
+                observation: exact,
+            }) if *observed_token == token && exact == &observation,
+        ));
+        assert!(matches!(
+            app.harness_kanban.launch_options.get(&requested_task),
+            Some(HarnessLaunchOptionsState::Ready(view)) if view.options == options,
+        ));
     }
     use gate4agent_node_protocol::{
         AgentProgressAttentionKindV1, AgentProgressAttentionV1, AgentProgressUsageV1,

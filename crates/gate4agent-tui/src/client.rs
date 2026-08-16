@@ -56,6 +56,7 @@ use gate4agent_harness_client::{
     HarnessOperatorActionV1, HarnessOperatorClient, HarnessOperatorCredential,
     HarnessOperatorIntentV1, HarnessOperatorMutationOutcomeV1, HarnessOperatorRequestRefV1,
     HarnessOperatorResponseV1, HarnessTaskLaunchOptionsV1,
+    HarnessRunContextSourceObservationV1,
     HarnessGitDiffModeV1, HarnessGitObjectIdV1, HarnessGitStatusCodeV1,
     HarnessOperatorClientError, HarnessOperatorHostErrorV1, HarnessRepositoryPathV1,
     HarnessReverseAttributionSubjectV1, HarnessReverseAttributionV1,
@@ -648,6 +649,18 @@ enum WorkerUpdate {
         summary: HarnessRunTransferSummaryV1,
     },
     HarnessRunTransferFailed {
+        run: HarnessRunRef,
+        token: u64,
+        message: String,
+    },
+    HarnessRunContextSourceObserved {
+        run: HarnessRunRef,
+        task: crate::app::HarnessTaskRef,
+        token: u64,
+        observation: HarnessRunContextSourceObservationV1,
+        launch_options: Result<HarnessTaskLaunchOptionsV1, String>,
+    },
+    HarnessRunContextSourceObservationFailed {
         run: HarnessRunRef,
         token: u64,
         message: String,
@@ -1556,6 +1569,18 @@ fn reject_harness_queue_action(
             app.fail_harness_run_transfer(run, *token, message);
             return true;
         }
+        AppAction::HarnessObserveRunContextSource { run, token, .. } => {
+            let message = match rejection {
+                HarnessQueueRejection::Busy => {
+                    "Harness operator busy: context-observation queue is full"
+                }
+                HarnessQueueRejection::Unavailable => {
+                    "Harness operator unavailable: context-observation queue is closed"
+                }
+            }.to_owned();
+            app.fail_harness_context_source_observation(run, *token, message);
+            return true;
+        }
         AppAction::HarnessLoadTaskLaunchOptions { task, token } => {
             let message = match rejection {
                 HarnessQueueRejection::Busy => {
@@ -1663,6 +1688,7 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
             | AppAction::HarnessLoadTaskCorrelations { .. }
             | AppAction::HarnessLoadTaskLaunchOptions { .. }
             | AppAction::HarnessLoadRunTransfer { .. }
+            | AppAction::HarnessObserveRunContextSource { .. }
             | AppAction::HarnessInspectWorkspace { .. }
             | AppAction::HarnessReadWorkspaceFile { .. }
             | AppAction::HarnessReadGitHistory { .. }
@@ -1743,6 +1769,7 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessStartTaskV2 { .. } => Some(HARNESS_COMMAND_ROUTE),
         AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
+        | AppAction::HarnessObserveRunContextSource { .. }
         | AppAction::HarnessInspectWorkspace { .. }
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
@@ -2562,6 +2589,47 @@ fn harness_detail_worker(
                         ),
                     },
                     Err(error) => WorkerUpdate::HarnessRunTransferFailed {
+                        run,
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessObserveRunContextSource { run, task, token } => {
+                let update = match client.observe_run_context_source(run.run_id.clone()) {
+                    Ok(observation) if observation.run_revision == run.run_revision => {
+                        let launch_options = if observation.feature_state
+                            == gate4agent_harness_client::FeatureObservationStateV1::Observed
+                        {
+                            client.task_launch_options_get(task.task_id.clone())
+                                .map_err(|error| error.to_string())
+                        } else {
+                            Err(format!(
+                                "context source is {:?}",
+                                observation.feature_state,
+                            ))
+                        };
+                        WorkerUpdate::HarnessRunContextSourceObserved {
+                            run,
+                            task,
+                            token,
+                            observation,
+                            launch_options,
+                        }
+                    }
+                    Ok(observation) => WorkerUpdate::HarnessRunContextSourceObservationFailed {
+                        run: run.clone(),
+                        token,
+                        message: format!(
+                            "Harness context observation changed run revision from r{} to r{}",
+                            run.run_revision.get(),
+                            observation.run_revision.get(),
+                        ),
+                    },
+                    Err(error) => WorkerUpdate::HarnessRunContextSourceObservationFailed {
                         run,
                         token,
                         message: error.to_string(),
@@ -5718,6 +5786,7 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessLoadTaskCorrelations { .. }
         | AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
+        | AppAction::HarnessObserveRunContextSource { .. }
         | AppAction::HarnessSaveTaskLaunchSpec { .. }
         | AppAction::HarnessStartTaskV2 { .. }
         | AppAction::HarnessInspectWorkspace { .. }
@@ -6873,6 +6942,28 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         }
         WorkerUpdate::HarnessRunTransferFailed { run, token, message } => {
             app.fail_harness_run_transfer(&run, token, message);
+        }
+        WorkerUpdate::HarnessRunContextSourceObserved {
+            run,
+            task,
+            token,
+            observation,
+            launch_options,
+        } => {
+            follow_up = app.apply_harness_context_source_observation(
+                run,
+                task,
+                token,
+                observation,
+                launch_options,
+            );
+        }
+        WorkerUpdate::HarnessRunContextSourceObservationFailed {
+            run,
+            token,
+            message,
+        } => {
+            app.fail_harness_context_source_observation(&run, token, message);
         }
         WorkerUpdate::HarnessTaskCorrelations { task_id, correlations, failures } => {
             app.apply_harness_task_correlations(&task_id, correlations, failures);
@@ -13757,6 +13848,42 @@ mod tests {
             app.harness_kanban.launch_options.get(&task_ref),
             Some(crate::app::HarnessLaunchOptionsState::Error { token: 94, message })
                 if message.contains("queue is closed"),
+        ));
+    }
+
+    #[test]
+    fn harness_context_observation_uses_only_detail_lane_and_queue_failure_is_terminal() {
+        let task = paginated_harness_task(18);
+        let task_ref = harness_task_ref(&task);
+        let run = HarnessRunRef {
+            run_id: HarnessRunId::new(format!("hrun_{}", "9".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(6).unwrap(),
+        };
+        let action = AppAction::HarnessObserveRunContextSource {
+            run: run.clone(),
+            task: task_ref,
+            token: 96,
+        };
+        assert!(harness_detail_read_action(&action));
+        assert_eq!(action_node_id(&action), Some(HARNESS_DETAIL_COMMAND_ROUTE));
+        assert!(action_to_request(action.clone()).is_none());
+
+        let mut app = App::default();
+        app.harness_kanban.run_context_sources.insert(
+            run.clone(),
+            crate::app::HarnessRunContextSourceState::Loading { token: 96 },
+        );
+        assert!(reject_harness_queue_action(
+            &mut app,
+            &action,
+            HarnessQueueRejection::Unavailable,
+        ));
+        assert!(matches!(
+            app.harness_kanban.run_context_sources.get(&run),
+            Some(crate::app::HarnessRunContextSourceState::Error {
+                token: 96,
+                message,
+            }) if message.contains("queue is closed"),
         ));
     }
 

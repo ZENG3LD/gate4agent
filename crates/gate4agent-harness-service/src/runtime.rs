@@ -33,6 +33,7 @@ use gate4agent_observation_api::{
 use gate4agent_observation_service::{ObservationService, ObservationServiceError};
 use gate4agent_harness_api::{
     HarnessInlineRunSessionV1, HarnessManagedRunSessionV1,
+    HarnessLaunchPlanPageV1, HarnessLaunchPlanSummaryV1,
     HarnessNodeIncarnationV1,
     HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorHostErrorV1,
     HarnessOperatorIntentV1,
@@ -1829,16 +1830,8 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 &runtime_inventory,
                                 request,
                             );
-                            let scheduled_dispatch = response.as_ref().ok().and_then(|response| {
-                                match response {
-                                    HarnessOperatorResponseV1::Schedule(
-                                        gate4agent_harness_protocol::HarnessScheduleOutcomeV1::Dispatch(
-                                            intent,
-                                        ),
-                                    ) => Some(intent.clone()),
-                                    _ => None,
-                                }
-                            });
+                            let scheduled_dispatch = response.as_ref().ok()
+                                .and_then(scheduled_dispatch_from_operator_response);
                             let reply_value = match response {
                                 Ok(response) => HarnessOperatorReplyV1::Ok { response },
                                 Err(error) => HarnessOperatorReplyV1::Error { error },
@@ -2712,6 +2705,20 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         }
     });
     Ok((handle, task))
+}
+
+fn scheduled_dispatch_from_operator_response(
+    response: &HarnessOperatorResponseV1,
+) -> Option<HarnessDispatchIntentV1> {
+    match response {
+        HarnessOperatorResponseV1::Schedule(
+            gate4agent_harness_protocol::HarnessScheduleOutcomeV1::Dispatch(intent),
+        ) => Some(intent.clone()),
+        HarnessOperatorResponseV1::TaskStarted(outcome) if !outcome.replayed => {
+            Some(outcome.dispatch.clone())
+        }
+        _ => None,
+    }
 }
 
 async fn execute_harness_mcp_reconcile(
@@ -3633,6 +3640,41 @@ fn execute_operator_request(
                 project_operator_run_correlation(harness, runtime_inventory, &run_id)?,
             )
         }
+        HarnessOperatorRequestV1::LaunchPlansList { after_plan_id, limit } => {
+            let mut plans = launch_catalog.ordinary_plans()
+                .filter(|plan| {
+                    after_plan_id.as_ref().map_or(true, |after| &plan.plan_id > after)
+                })
+                .take(usize::from(limit) + 1)
+                .map(|plan| {
+                    Ok(HarnessLaunchPlanSummaryV1 {
+                        scheduled_launch: plan.ordinary_scheduled_ref()?,
+                        node_id: plan.node_id.clone(),
+                        workspace_id: plan.workspace_id.clone(),
+                        worktree: plan.worktree.clone(),
+                        provider_profile: plan.provider_profile.clone(),
+                        provider_id: HarnessSelectorV1::new(plan.provider.as_str())?,
+                        mode: plan.mode,
+                    })
+                })
+                .collect::<Result<Vec<_>, HarnessServiceError>>()
+                .map_err(map_operator_service_error)?;
+            let has_more = plans.len() > usize::from(limit);
+            if has_more { plans.pop(); }
+            let next_plan_id = has_more.then(|| {
+                plans.last().expect("nonzero launch plan page limit")
+                    .scheduled_launch.plan.plan_id.clone()
+            });
+            HarnessOperatorResponseV1::LaunchPlans(HarnessLaunchPlanPageV1 {
+                plans,
+                next_plan_id,
+            })
+        }
+        HarnessOperatorRequestV1::TaskExecutionSpecGet { task_id } => {
+            HarnessOperatorResponseV1::TaskExecutionSpec(
+                harness.task_execution_spec(&task_id).cloned(),
+            )
+        }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
             HarnessOperatorResponseV1::RuntimeInventory(
                 runtime_inventory.page(after_node_id.as_deref(), limit),
@@ -3667,6 +3709,22 @@ fn execute_operator_request(
                 ).map_err(map_operator_service_error)?,
             )
         }
+        HarnessOperatorRequestV1::ReplaceTaskExecutionSpec { request } => {
+            let outcome = harness.operator_replace_task_execution_spec(
+                launch_catalog,
+                request,
+            ).map_err(map_operator_service_error)?;
+            HarnessOperatorResponseV1::ExecutionSpecMutation(match outcome {
+                HarnessApplyOutcome::Applied => HarnessOperatorMutationOutcomeV1::Applied,
+                HarnessApplyOutcome::Replayed => HarnessOperatorMutationOutcomeV1::Replayed,
+            })
+        }
+        HarnessOperatorRequestV1::StartTask { request } => {
+            HarnessOperatorResponseV1::TaskStarted(
+                harness.start_task(launch_catalog, request)
+                    .map_err(map_operator_service_error)?,
+            )
+        }
         HarnessOperatorRequestV1::SubmitIntent { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
@@ -3692,6 +3750,8 @@ fn map_operator_service_error(error: HarnessServiceError) -> HarnessOperatorHost
         HarnessServiceError::Engine(gate4agent_harness_engine::HarnessEngineError::NotFound(_)) => {
             HarnessOperatorHostErrorV1::NotFound
         }
+        HarnessServiceError::ExecutionSpecMissing => HarnessOperatorHostErrorV1::NotFound,
+        HarnessServiceError::SchedulerBusy => HarnessOperatorHostErrorV1::Busy,
         HarnessServiceError::Poisoned
         | HarnessServiceError::Store(_)
         | HarnessServiceError::Json(_)
@@ -5073,6 +5133,66 @@ mod tests {
         }
     }
 
+    fn task_start_dispatch_intent() -> HarnessDispatchIntentV1 {
+        HarnessDispatchIntentV1 {
+            task_id: HarnessTaskId::new(format!("htask_{}", "d".repeat(24))).unwrap(),
+            task_revision: HarnessRevision::new(2).unwrap(),
+            run_id: HarnessRunId::new(format!("hrun_{}", "d".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(1).unwrap(),
+            operation_id: HarnessOperationId::new(format!(
+                "hop_{}",
+                "d".repeat(24),
+            )).unwrap(),
+            operation_revision: HarnessRevision::new(1).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                "d".repeat(24),
+            )).unwrap(),
+            parent_run_id: None,
+            intent: HarnessRunIntentV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                worktree: gate4agent_harness_protocol::HarnessWorktreeIntentV1::Existing,
+                provider_profile: selector("codex-default"),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+        }
+    }
+
+    #[test]
+    fn task_started_replay_reply_does_not_schedule_or_start_dispatch_again() {
+        let dispatch = task_start_dispatch_intent();
+        let applied = HarnessOperatorResponseV1::TaskStarted(
+            gate4agent_harness_protocol::HarnessTaskStartOutcomeV1 {
+                dispatch: dispatch.clone(),
+                replayed: false,
+            },
+        );
+        let replay = HarnessOperatorResponseV1::TaskStarted(
+            gate4agent_harness_protocol::HarnessTaskStartOutcomeV1 {
+                dispatch: dispatch.clone(),
+                replayed: true,
+            },
+        );
+        let schedule_next = HarnessOperatorResponseV1::Schedule(
+            gate4agent_harness_protocol::HarnessScheduleOutcomeV1::Dispatch(
+                dispatch.clone(),
+            ),
+        );
+
+        assert_eq!(
+            scheduled_dispatch_from_operator_response(&applied),
+            Some(dispatch.clone()),
+        );
+        assert_eq!(scheduled_dispatch_from_operator_response(&replay), None);
+        assert_eq!(
+            scheduled_dispatch_from_operator_response(&schedule_next),
+            Some(dispatch),
+        );
+    }
+
     fn operator_create_intent(
         body: &str,
         submitted_at_unix_ms: u64,
@@ -5187,6 +5307,7 @@ mod tests {
             runs: vec![run],
             grants: Vec::new(),
             operations: vec![create_operation],
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap();

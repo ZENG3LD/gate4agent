@@ -13,13 +13,19 @@ pub use gate4agent_harness_protocol::{
     HarnessFailureCategoryV1, HarnessIdempotencyRef, HarnessMonitoringVisibilityV1,
     HarnessOperationId,
     HarnessOperationKindV1, HarnessOperationStateV1, HarnessOutcomeUnknownReasonV1,
-    HarnessCancelTaskRequestV1, HarnessCreateTaskRequestV1, HarnessMoveTaskRequestV1,
-    HarnessOperatorAuthorityV1, HarnessReplaceTaskRequestV1, HarnessRetryTaskRequestV1,
-    HarnessScheduleNextRequestV1, HarnessScheduleOutcomeV1,
+    HarnessCancelTaskRequestV1, HarnessCreateTaskRequestV1, HarnessDispatchIntentV1,
+    HarnessExpectedExecutionSpecRevisionV1, HarnessExecutionSpecId,
+    HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1, HarnessMoveTaskRequestV1,
+    HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
+    HarnessReplaceTaskRequestV1, HarnessRequestDigest, HarnessRetryTaskRequestV1,
+    HarnessScheduledLaunchRefV2, HarnessScheduleNextRequestV1, HarnessScheduleOutcomeV1,
+    HarnessStartTaskRequestV1, HarnessTaskExecutionSpecInputV1,
+    HarnessTaskExecutionSpecV1, HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
     HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResultDispositionV1,
-    HarnessInlineRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
+    HarnessInlineRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
+    HarnessRunLifecycleV1,
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
-    HarnessValidationError, SessionGrantId,
+    HarnessValidationError, HarnessWorktreeIntentV1, SessionGrantId,
     HARNESS_ARTIFACTS_MAX, HARNESS_BODY_MAX_BYTES,
     HARNESS_CHILD_COUNT_MAX, HARNESS_CHILD_DEPTH_MAX, HARNESS_DEPENDENCIES_MAX,
     HARNESS_LINKS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
@@ -47,6 +53,7 @@ pub const HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX: u16 = 64;
 pub const HARNESS_NATIVE_SESSION_CATALOG_LIMIT_MAX: u16 = 64;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX: u16 = 24;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_TEXT_MAX_BYTES: usize = 4_096;
+pub const HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX: u16 = 64;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -251,6 +258,18 @@ pub enum HarnessOperatorActionV1 {
     ScheduleNext {
         plan_id: Option<HarnessSelectorV1>,
     },
+    ReplaceTaskExecutionSpec {
+        task_id: HarnessTaskId,
+        expected_task_revision: HarnessRevision,
+        expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1,
+        spec: HarnessTaskExecutionSpecInputV1,
+    },
+    StartTask {
+        task_id: HarnessTaskId,
+        expected_task_revision: HarnessRevision,
+        expected_execution_spec_revision: HarnessRevision,
+        expected_scheduled_launch_digest: HarnessRequestDigest,
+    },
 }
 
 impl HarnessOperatorActionV1 {
@@ -326,7 +345,96 @@ impl HarnessOperatorActionV1 {
             Self::ScheduleNext { plan_id } => HarnessOperatorRequestV1::ScheduleNext {
                 request: HarnessScheduleNextRequestV1 { authority, plan_id },
             },
+            Self::ReplaceTaskExecutionSpec {
+                task_id,
+                expected_task_revision,
+                expected_execution_spec_revision,
+                spec,
+            } => HarnessOperatorRequestV1::ReplaceTaskExecutionSpec {
+                request: HarnessReplaceTaskExecutionSpecRequestV1 {
+                    authority,
+                    task_id,
+                    expected_task_revision,
+                    expected_execution_spec_revision,
+                    spec,
+                },
+            },
+            Self::StartTask {
+                task_id,
+                expected_task_revision,
+                expected_execution_spec_revision,
+                expected_scheduled_launch_digest,
+            } => HarnessOperatorRequestV1::StartTask {
+                request: HarnessStartTaskRequestV1 {
+                    authority,
+                    task_id,
+                    expected_task_revision,
+                    expected_execution_spec_revision,
+                    expected_scheduled_launch_digest,
+                },
+            },
         }
+    }
+
+    pub fn requires_v4(&self) -> bool {
+        matches!(
+            self,
+            Self::ReplaceTaskExecutionSpec { .. } | Self::StartTask { .. }
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessLaunchPlanSummaryV1 {
+    pub scheduled_launch: HarnessScheduledLaunchRefV2,
+    pub node_id: HarnessSelectorV1,
+    pub workspace_id: HarnessSelectorV1,
+    pub worktree: HarnessWorktreeIntentV1,
+    pub provider_profile: HarnessSelectorV1,
+    pub provider_id: HarnessSelectorV1,
+    pub mode: HarnessExecutionModeV1,
+}
+
+impl HarnessLaunchPlanSummaryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.scheduled_launch.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.workspace_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.worktree.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.provider_profile.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.provider_id.validate().map_err(HarnessOperatorApiError::Protocol)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessLaunchPlanPageV1 {
+    pub plans: Vec<HarnessLaunchPlanSummaryV1>,
+    pub next_plan_id: Option<HarnessSelectorV1>,
+}
+
+impl HarnessLaunchPlanPageV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if self.plans.len() > usize::from(HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX) {
+            return Err(HarnessOperatorApiError::InvalidLaunchPlans);
+        }
+        for plan in &self.plans { plan.validate()?; }
+        if self.plans.windows(2).any(|plans| {
+            plans[0].scheduled_launch.plan.plan_id.as_str()
+                >= plans[1].scheduled_launch.plan.plan_id.as_str()
+        }) {
+            return Err(HarnessOperatorApiError::InvalidLaunchPlans);
+        }
+        if let Some(next_plan_id) = &self.next_plan_id {
+            next_plan_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+            if self.plans.last().map(|plan| &plan.scheduled_launch.plan.plan_id)
+                != Some(next_plan_id)
+            {
+                return Err(HarnessOperatorApiError::InvalidLaunchPlans);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -353,6 +461,11 @@ pub enum HarnessOperatorRequestV1 {
     },
     RunGet { run_id: HarnessRunId },
     RunCorrelationGet { run_id: HarnessRunId },
+    LaunchPlansList {
+        after_plan_id: Option<HarnessSelectorV1>,
+        limit: u16,
+    },
+    TaskExecutionSpecGet { task_id: HarnessTaskId },
     RuntimeInventoryList {
         after_node_id: Option<String>,
         limit: u16,
@@ -379,6 +492,8 @@ pub enum HarnessOperatorRequestV1 {
     CancelTask { request: HarnessCancelTaskRequestV1 },
     RetryTask { request: HarnessRetryTaskRequestV1 },
     ScheduleNext { request: HarnessScheduleNextRequestV1 },
+    ReplaceTaskExecutionSpec { request: HarnessReplaceTaskExecutionSpecRequestV1 },
+    StartTask { request: HarnessStartTaskRequestV1 },
     SubmitIntent { intent: HarnessOperatorIntentV1 },
 }
 
@@ -415,6 +530,18 @@ impl HarnessOperatorRequestV1 {
             }
             Self::RunGet { run_id } | Self::RunCorrelationGet { run_id } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+            Self::LaunchPlansList { after_plan_id, limit } => {
+                if let Some(plan_id) = after_plan_id {
+                    plan_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                if !(1..=HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX).contains(limit) {
+                    return Err(HarnessOperatorApiError::InvalidLimit);
+                }
+                Ok(())
+            }
+            Self::TaskExecutionSpecGet { task_id } => {
+                task_id.validate().map_err(HarnessOperatorApiError::Protocol)
             }
             Self::RuntimeInventoryList { after_node_id, limit } => {
                 if !(1..=HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX).contains(limit) {
@@ -475,6 +602,12 @@ impl HarnessOperatorRequestV1 {
             Self::ScheduleNext { request } => {
                 request.validate().map_err(HarnessOperatorApiError::Protocol)
             }
+            Self::ReplaceTaskExecutionSpec { request } => {
+                request.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+            Self::StartTask { request } => {
+                request.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
             Self::SubmitIntent { intent } => intent.validate(),
         }
     }
@@ -491,7 +624,14 @@ impl HarnessOperatorRequestV1 {
     }
 
     pub fn requires_v4(&self) -> bool {
-        matches!(self, Self::RunCorrelationGet { .. })
+        matches!(
+            self,
+            Self::RunCorrelationGet { .. }
+                | Self::LaunchPlansList { .. }
+                | Self::TaskExecutionSpecGet { .. }
+                | Self::ReplaceTaskExecutionSpec { .. }
+                | Self::StartTask { .. }
+        ) || matches!(self, Self::SubmitIntent { intent } if intent.action.requires_v4())
     }
 
     pub fn minimum_wire_version(&self) -> u16 {
@@ -531,12 +671,16 @@ pub enum HarnessOperatorResponseV1 {
     Runs(RunPageV1),
     Run(RedactedRunV1),
     RunCorrelation(HarnessRunCorrelationV1),
+    LaunchPlans(HarnessLaunchPlanPageV1),
+    TaskExecutionSpec(Option<HarnessTaskExecutionSpecV1>),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
     NativeSessionPreviewed(HarnessNativeSessionPreviewedV1),
     Mutation(HarnessOperatorMutationOutcomeV1),
+    ExecutionSpecMutation(HarnessOperatorMutationOutcomeV1),
     Schedule(HarnessScheduleOutcomeV1),
+    TaskStarted(HarnessTaskStartOutcomeV1),
 }
 
 impl HarnessOperatorResponseV1 {
@@ -549,13 +693,23 @@ impl HarnessOperatorResponseV1 {
             Self::Runs(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Run(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::RunCorrelation(value) => value.validate(),
+            Self::LaunchPlans(value) => value.validate(),
+            Self::TaskExecutionSpec(value) => {
+                if let Some(value) = value {
+                    value.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                Ok(())
+            }
             Self::RuntimeInventory(value) => value.validate(),
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
             Self::NativeSessionPreviewed(value) => value.validate(),
-            Self::Mutation(_) => Ok(()),
+            Self::Mutation(_) | Self::ExecutionSpecMutation(_) => Ok(()),
             Self::Schedule(HarnessScheduleOutcomeV1::Idle) => Ok(()),
             Self::Schedule(HarnessScheduleOutcomeV1::Dispatch(value)) => {
+                value.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+            Self::TaskStarted(value) => {
                 value.validate().map_err(HarnessOperatorApiError::Protocol)
             }
         }
@@ -1978,6 +2132,8 @@ pub enum HarnessOperatorApiError {
     InvalidRuntimeInventory,
     #[error("harness run correlation is invalid")]
     InvalidRunCorrelation,
+    #[error("harness launch plan catalog is invalid")]
+    InvalidLaunchPlans,
     #[error("harness native history value is invalid")]
     InvalidNativeHistory,
     #[error("harness operator response is invalid")]
@@ -2389,6 +2545,182 @@ mod tests {
             &serde_json::to_vec(&envelope).unwrap(),
         ).unwrap();
         assert_eq!(decoded, envelope);
+    }
+
+    fn ordinary_launch_plan(plan_id: &str, digest: char) -> HarnessLaunchPlanSummaryV1 {
+        HarnessLaunchPlanSummaryV1 {
+            scheduled_launch: HarnessScheduledLaunchRefV2 {
+                plan: HarnessLaunchPlanRefV1 {
+                    plan_id: HarnessSelectorV1::new(plan_id).unwrap(),
+                    revision: HarnessRevision::new(2).unwrap(),
+                    digest: HarnessRequestDigest::new(digest.to_string().repeat(64)).unwrap(),
+                },
+                authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+            },
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            worktree: HarnessWorktreeIntentV1::Managed {
+                worktree_ref: HarnessSelectorV1::new("worktree-a").unwrap(),
+            },
+            provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+            provider_id: HarnessSelectorV1::new("codex").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+        }
+    }
+
+    #[test]
+    fn operator_v4_execution_requests_are_exact_and_fail_closed_on_v3() {
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        let authority = HarnessOperatorAuthorityV1 {
+            operation_id: HarnessOperationId::new(format!("hop_{}", "4".repeat(24))).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                "5".repeat(24),
+            )).unwrap(),
+            actor_id: HarnessSelectorV1::new("operator").unwrap(),
+            now_unix_ms: 40,
+        };
+        let task_id = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
+        let requests = [
+            HarnessOperatorRequestV1::LaunchPlansList {
+                after_plan_id: Some(HarnessSelectorV1::new("plan-a").unwrap()),
+                limit: HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX,
+            },
+            HarnessOperatorRequestV1::TaskExecutionSpecGet {
+                task_id: task_id.clone(),
+            },
+            HarnessOperatorRequestV1::ReplaceTaskExecutionSpec {
+                request: HarnessReplaceTaskExecutionSpecRequestV1 {
+                    authority: authority.clone(),
+                    task_id: task_id.clone(),
+                    expected_task_revision: HarnessRevision::new(3).unwrap(),
+                    expected_execution_spec_revision:
+                        HarnessExpectedExecutionSpecRevisionV1::Absent,
+                    spec: HarnessTaskExecutionSpecInputV1 {
+                        scheduled_launch: ordinary_launch_plan("plan-a", 'c').scheduled_launch,
+                        review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+                    },
+                },
+            },
+            HarnessOperatorRequestV1::StartTask {
+                request: HarnessStartTaskRequestV1 {
+                    authority,
+                    task_id,
+                    expected_task_revision: HarnessRevision::new(3).unwrap(),
+                    expected_execution_spec_revision: HarnessRevision::new(1).unwrap(),
+                    expected_scheduled_launch_digest: HarnessRequestDigest::new(
+                        "d".repeat(64),
+                    ).unwrap(),
+                },
+            },
+        ];
+        for request in requests {
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
+            assert!(request.validate().is_ok());
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V3,
+                    credential: credential.clone(),
+                    request,
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+        }
+
+        assert!(matches!(
+            HarnessOperatorRequestV1::LaunchPlansList {
+                after_plan_id: None,
+                limit: HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX + 1,
+            }.validate(),
+            Err(HarnessOperatorApiError::InvalidLimit),
+        ));
+    }
+
+    #[test]
+    fn launch_plan_page_is_bounded_canonical_and_redacted() {
+        let first = ordinary_launch_plan("plan-a", 'a');
+        let second = ordinary_launch_plan("plan-b", 'b');
+        let page = HarnessLaunchPlanPageV1 {
+            plans: vec![first.clone(), second.clone()],
+            next_plan_id: Some(second.scheduled_launch.plan.plan_id.clone()),
+        };
+        page.validate().unwrap();
+        let encoded = serde_json::to_string(&page).unwrap();
+        for sentinel in [
+            "delivery",
+            "continuation",
+            "harness_mcp",
+            "spawn_spec",
+            "environment",
+            "provider_home",
+            "credential",
+            "raw_path",
+        ] {
+            assert!(!encoded.contains(sentinel));
+        }
+        assert_eq!(serde_json::from_str::<HarnessLaunchPlanPageV1>(&encoded).unwrap(), page);
+
+        assert!(matches!(
+            HarnessLaunchPlanPageV1 {
+                plans: vec![second, first],
+                next_plan_id: None,
+            }.validate(),
+            Err(HarnessOperatorApiError::InvalidLaunchPlans),
+        ));
+    }
+
+    #[test]
+    fn execution_spec_and_start_intents_are_authority_free_v4() {
+        let intent = HarnessOperatorIntentV1 {
+            request_ref: HarnessOperatorRequestRefV1::new(format!(
+                "hireq_{}",
+                "1".repeat(24),
+            )).unwrap(),
+            submitted_at_unix_ms: 50,
+            action: HarnessOperatorActionV1::StartTask {
+                task_id: HarnessTaskId::new(format!("htask_{}", "2".repeat(24))).unwrap(),
+                expected_task_revision: HarnessRevision::new(7).unwrap(),
+                expected_execution_spec_revision: HarnessRevision::new(3).unwrap(),
+                expected_scheduled_launch_digest: HarnessRequestDigest::new(
+                    "c".repeat(64),
+                ).unwrap(),
+            },
+        };
+        intent.validate().unwrap();
+        let request = HarnessOperatorRequestV1::SubmitIntent { intent };
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(!encoded.contains("authority"));
+        assert!(!encoded.contains("operation_id"));
+        assert!(!encoded.contains("idempotency_ref"));
+
+        let replace = HarnessOperatorRequestV1::SubmitIntent {
+            intent: HarnessOperatorIntentV1 {
+                request_ref: HarnessOperatorRequestRefV1::new(format!(
+                    "hireq_{}",
+                    "3".repeat(24),
+                )).unwrap(),
+                submitted_at_unix_ms: 51,
+                action: HarnessOperatorActionV1::ReplaceTaskExecutionSpec {
+                    task_id: HarnessTaskId::new(format!(
+                        "htask_{}",
+                        "4".repeat(24),
+                    )).unwrap(),
+                    expected_task_revision: HarnessRevision::new(2).unwrap(),
+                    expected_execution_spec_revision:
+                        HarnessExpectedExecutionSpecRevisionV1::Absent,
+                    spec: HarnessTaskExecutionSpecInputV1 {
+                        scheduled_launch: ordinary_launch_plan("plan-a", 'd').scheduled_launch,
+                        review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+                    },
+                },
+            },
+        };
+        replace.validate().unwrap();
+        assert_eq!(replace.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
     }
 
     #[test]

@@ -41,8 +41,11 @@ use gate4agent_types::{
     TerminalMouseProtocolEncoding, PROVIDER_EVENT_ID_MAX_BYTES, TERMINAL_INPUT_MAX_BYTES,
 };
 use gate4agent_harness_client::{
-    HarnessRevision, HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
-    HarnessTaskId,
+    HarnessExpectedExecutionSpecRevisionV1, HarnessLaunchPlanSummaryV1,
+    HarnessOperatorMutationOutcomeV1, HarnessRequestDigest, HarnessRevision,
+    HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
+    HarnessTaskExecutionSpecInputV1, HarnessTaskExecutionSpecV1, HarnessTaskId,
+    HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
     HarnessTaskStateV1, RedactedBindingStateV1, RedactedRunV1, RedactedTaskV1,
     SessionMonitorV1 as HarnessSessionMonitorV1, TimelineEntryV1,
     HARNESS_BODY_MAX_BYTES, HARNESS_TITLE_MAX_BYTES,
@@ -50,9 +53,12 @@ use gate4agent_harness_client::{
 use gate4agent_harness_protocol::HarnessSelectorV1;
 #[cfg(test)]
 use gate4agent_harness_client::{
-    HarnessExecutionModeV1, HarnessManagedRunSessionV1, HarnessNodeIncarnationV1,
+    HarnessDispatchIntentV1, HarnessExecutionModeV1, HarnessExecutionSpecId,
+    HarnessIdempotencyRef, HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1,
+    HarnessManagedRunSessionV1, HarnessNodeIncarnationV1, HarnessOperationId,
+    HarnessRunIntentV1, HarnessScheduledLaunchRefV2,
     HarnessRunCorrelationAvailabilityV1, HarnessRunLifecycleV1, HarnessRuntimeIdentityV1,
-    HarnessRunWorktreeViewV1, RedactedRunIntentV1,
+    HarnessRunWorktreeViewV1, HarnessWorktreeIntentV1, RedactedRunIntentV1,
     RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
 };
 use uzor_tui::Rect;
@@ -572,18 +578,33 @@ pub enum HarnessTaskDetailSection {
     Overview,
     Runs,
     Agents,
+    Execution,
 }
 
 impl HarnessTaskDetailSection {
-    pub const ALL: [Self; 3] = [Self::Overview, Self::Runs, Self::Agents];
+    pub const ALL: [Self; 4] = [Self::Overview, Self::Runs, Self::Agents, Self::Execution];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
             Self::Runs => "Runs",
             Self::Agents => "Agents",
+            Self::Execution => "Execution",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarnessExecutionMutationKind {
+    SaveSpec,
+    StartTask,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessExecutionMutationState {
+    pub token: u64,
+    pub task_id: HarnessTaskId,
+    pub kind: HarnessExecutionMutationKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -610,6 +631,13 @@ pub struct HarnessKanbanState {
     pub correlations: BTreeMap<HarnessRunId, HarnessRunCorrelationV1>,
     pub correlation_pending: BTreeSet<HarnessRunId>,
     pub correlation_failures: BTreeMap<HarnessRunId, String>,
+    pub launch_plans: BTreeMap<HarnessSelectorV1, HarnessLaunchPlanSummaryV1>,
+    pub selected_launch_plan: Option<HarnessSelectorV1>,
+    pub execution_specs: BTreeMap<HarnessTaskId, Option<HarnessTaskExecutionSpecV1>>,
+    pub execution_detail_pending: BTreeSet<HarnessTaskId>,
+    pub execution_detail_failures: BTreeMap<HarnessTaskId, String>,
+    pub execution_mutation: Option<HarnessExecutionMutationState>,
+    pub last_start: Option<HarnessTaskStartOutcomeV1>,
     pub monitor: Option<HarnessRunMonitorView>,
 }
 
@@ -1952,6 +1980,20 @@ pub enum AppAction {
         task_id: HarnessTaskId,
         run_ids: Vec<HarnessRunId>,
     },
+    HarnessUseLaunchPlan {
+        token: u64,
+        task_id: HarnessTaskId,
+        expected_task_revision: HarnessRevision,
+        expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1,
+        spec: HarnessTaskExecutionSpecInputV1,
+    },
+    HarnessStartTask {
+        token: u64,
+        task_id: HarnessTaskId,
+        expected_task_revision: HarnessRevision,
+        expected_execution_spec_revision: HarnessRevision,
+        expected_scheduled_launch_digest: HarnessRequestDigest,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2039,6 +2081,9 @@ pub enum HitTarget {
     HarnessTaskDetailRun(HarnessRunId),
     HarnessTaskDetailRunMonitor(HarnessRunId),
     HarnessAgentTask(HarnessTaskId, HarnessRunId),
+    HarnessExecutionPlan(HarnessSelectorV1),
+    HarnessExecutionUsePlan,
+    HarnessExecutionStartSelected,
     HarnessBoardMode(AgentBoardMode),
     SessionMonitorSection(PaneId, SessionMonitorSection),
     ContextUsageSegment(ContextUsageSegmentHit),
@@ -4288,6 +4333,15 @@ impl App {
         self.harness_kanban.correlation_failures.retain(|run_id, _| {
             self.harness_kanban.runs.contains_key(run_id)
         });
+        self.harness_kanban.execution_specs.retain(|task_id, _| {
+            self.harness_kanban.tasks.contains_key(task_id)
+        });
+        self.harness_kanban.execution_detail_pending.retain(|task_id| {
+            self.harness_kanban.tasks.contains_key(task_id)
+        });
+        self.harness_kanban.execution_detail_failures.retain(|task_id, _| {
+            self.harness_kanban.tasks.contains_key(task_id)
+        });
         self.reconcile_harness_kanban();
     }
 
@@ -4384,6 +4438,203 @@ impl App {
             self.harness_kanban.correlation_failures
                 .insert(run_id, message.clone());
         }
+    }
+
+    pub fn apply_harness_task_execution(
+        &mut self,
+        task_id: HarnessTaskId,
+        plans: Vec<HarnessLaunchPlanSummaryV1>,
+        execution_spec: Option<HarnessTaskExecutionSpecV1>,
+    ) {
+        if execution_spec.as_ref().is_some_and(|spec| spec.task_id != task_id) {
+            return;
+        }
+        self.harness_kanban.execution_detail_pending.remove(&task_id);
+        self.harness_kanban.execution_detail_failures.remove(&task_id);
+        self.harness_kanban.launch_plans = plans.into_iter()
+            .map(|plan| (plan.scheduled_launch.plan.plan_id.clone(), plan))
+            .collect();
+        let saved_plan = execution_spec.as_ref()
+            .map(|spec| spec.scheduled_launch.plan.plan_id.clone());
+        self.harness_kanban.execution_specs.insert(task_id, execution_spec);
+        self.harness_kanban.selected_launch_plan = saved_plan
+            .filter(|plan_id| self.harness_kanban.launch_plans.contains_key(plan_id))
+            .or_else(|| self.harness_kanban.selected_launch_plan.clone()
+                .filter(|plan_id| self.harness_kanban.launch_plans.contains_key(plan_id)))
+            .or_else(|| self.harness_kanban.launch_plans.keys().next().cloned());
+    }
+
+    pub fn fail_harness_task_execution(&mut self, task_id: &HarnessTaskId, message: String) {
+        self.harness_kanban.execution_detail_pending.remove(task_id);
+        self.harness_kanban.execution_detail_failures.insert(task_id.clone(), message);
+    }
+
+    pub fn harness_selected_launch_plan(&self) -> Option<&HarnessLaunchPlanSummaryV1> {
+        self.harness_kanban.selected_launch_plan.as_ref()
+            .and_then(|plan_id| self.harness_kanban.launch_plans.get(plan_id))
+    }
+
+    pub fn harness_detail_execution_spec(&self) -> Option<&HarnessTaskExecutionSpecV1> {
+        let task_id = &self.harness_kanban.detail.as_ref()?.task_id;
+        self.harness_kanban.execution_specs.get(task_id)?.as_ref()
+    }
+
+    pub fn harness_selected_plan_is_saved(&self) -> bool {
+        let Some(plan) = self.harness_selected_launch_plan() else {
+            return false;
+        };
+        let Some(spec) = self.harness_detail_execution_spec() else {
+            return false;
+        };
+        spec.scheduled_launch == plan.scheduled_launch
+    }
+
+    pub fn harness_start_selected_enabled(&self) -> bool {
+        self.harness_detail_task().is_some_and(|task| task.state == HarnessTaskStateV1::Ready)
+            && self.harness_selected_plan_is_saved()
+            && self.harness_kanban.execution_mutation.is_none()
+    }
+
+    fn harness_use_selected_launch_plan(&mut self) -> AppAction {
+        if self.harness_kanban.execution_mutation.is_some() {
+            return AppAction::None;
+        }
+        let Some(task) = self.harness_detail_task().cloned() else {
+            return AppAction::None;
+        };
+        let Some(plan) = self.harness_selected_launch_plan().cloned() else {
+            self.notice = Some("Execution plan unavailable: select an ordinary launch plan".to_owned());
+            return AppAction::None;
+        };
+        let Some(current) = self.harness_kanban.execution_specs.get(&task.task_id) else {
+            self.notice = Some("Execution spec unavailable: Task Detail is still loading".to_owned());
+            return AppAction::None;
+        };
+        let expected_execution_spec_revision = current.as_ref()
+            .map(|spec| HarnessExpectedExecutionSpecRevisionV1::Exact(spec.revision))
+            .unwrap_or(HarnessExpectedExecutionSpecRevisionV1::Absent);
+        let token = self.begin_harness_mutation_refresh();
+        self.harness_kanban.execution_mutation = Some(HarnessExecutionMutationState {
+            token,
+            task_id: task.task_id.clone(),
+            kind: HarnessExecutionMutationKind::SaveSpec,
+        });
+        AppAction::HarnessUseLaunchPlan {
+            token,
+            task_id: task.task_id,
+            expected_task_revision: task.revision,
+            expected_execution_spec_revision,
+            spec: HarnessTaskExecutionSpecInputV1 {
+                scheduled_launch: plan.scheduled_launch,
+                review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        }
+    }
+
+    fn harness_start_selected_task(&mut self) -> AppAction {
+        if !self.harness_start_selected_enabled() {
+            self.notice = Some(
+                "Start selected unavailable: task must be Ready with the selected plan saved exactly"
+                    .to_owned(),
+            );
+            return AppAction::None;
+        }
+        let task = self.harness_detail_task().cloned()
+            .expect("enabled start has a task");
+        let spec = self.harness_detail_execution_spec().cloned()
+            .expect("enabled start has an exact saved spec");
+        let token = self.begin_harness_mutation_refresh();
+        self.harness_kanban.execution_mutation = Some(HarnessExecutionMutationState {
+            token,
+            task_id: task.task_id.clone(),
+            kind: HarnessExecutionMutationKind::StartTask,
+        });
+        AppAction::HarnessStartTask {
+            token,
+            task_id: task.task_id,
+            expected_task_revision: task.revision,
+            expected_execution_spec_revision: spec.revision,
+            expected_scheduled_launch_digest: spec.scheduled_launch_digest,
+        }
+    }
+
+    pub fn apply_harness_execution_spec_saved(
+        &mut self,
+        token: u64,
+        task_id: HarnessTaskId,
+        execution_spec: HarnessTaskExecutionSpecV1,
+        outcome: HarnessOperatorMutationOutcomeV1,
+    ) {
+        let matches = self.harness_kanban.execution_mutation.as_ref().is_some_and(|pending| {
+            pending.token == token
+                && pending.task_id == task_id
+                && pending.kind == HarnessExecutionMutationKind::SaveSpec
+        });
+        if !matches {
+            return;
+        }
+        if execution_spec.task_id != task_id {
+            self.fail_harness_execution_mutation(
+                token,
+                &task_id,
+                "Harness execution-spec response referenced a different task".to_owned(),
+            );
+            return;
+        }
+        self.harness_kanban.execution_mutation = None;
+        self.harness_kanban.selected_launch_plan =
+            Some(execution_spec.scheduled_launch.plan.plan_id.clone());
+        self.harness_kanban.execution_specs.insert(task_id, Some(execution_spec));
+        self.notice = Some(format!(
+            "Execution spec saved ({outcome:?}); task not started",
+        ));
+    }
+
+    pub fn apply_harness_task_started(
+        &mut self,
+        token: u64,
+        task_id: &HarnessTaskId,
+        outcome: HarnessTaskStartOutcomeV1,
+    ) {
+        let matches = self.harness_kanban.execution_mutation.as_ref().is_some_and(|pending| {
+            pending.token == token
+                && &pending.task_id == task_id
+                && pending.kind == HarnessExecutionMutationKind::StartTask
+        });
+        if !matches {
+            return;
+        }
+        if &outcome.dispatch.task_id != task_id {
+            self.fail_harness_execution_mutation(
+                token,
+                task_id,
+                "Harness start response referenced a different task".to_owned(),
+            );
+            return;
+        }
+        self.harness_kanban.execution_mutation = None;
+        self.notice = Some(format!(
+            "Task started: run {}{}",
+            outcome.dispatch.run_id,
+            if outcome.replayed { " (replayed)" } else { "" },
+        ));
+        self.harness_kanban.last_start = Some(outcome);
+    }
+
+    pub fn fail_harness_execution_mutation(
+        &mut self,
+        token: u64,
+        task_id: &HarnessTaskId,
+        message: String,
+    ) {
+        if !self.harness_kanban.execution_mutation.as_ref().is_some_and(|pending| {
+            pending.token == token && &pending.task_id == task_id
+        }) {
+            return;
+        }
+        self.harness_kanban.execution_mutation = None;
+        self.fail_harness_refresh(token, message.clone());
+        self.notice = Some(format!("Harness execution action failed: {message}"));
     }
 
     pub fn harness_agent_run_links(
@@ -4625,6 +4876,8 @@ impl App {
             scroll: 0,
         });
         self.harness_kanban.monitor = None;
+        self.harness_kanban.execution_detail_pending.insert(task_id.clone());
+        self.harness_kanban.execution_detail_failures.remove(&task_id);
         self.focus = Focus::Viewport;
         self.request_harness_task_correlations(task_id, run_ids)
     }
@@ -7272,6 +7525,18 @@ impl App {
                 self.agent_board_mode = AgentBoardMode::HarnessKanban;
                 return action;
             }
+            Some(HitTarget::HarnessExecutionPlan(plan_id)) => {
+                if self.harness_kanban.launch_plans.contains_key(plan_id) {
+                    self.harness_kanban.selected_launch_plan = Some(plan_id.clone());
+                }
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessExecutionUsePlan) => {
+                return self.harness_use_selected_launch_plan();
+            }
+            Some(HitTarget::HarnessExecutionStartSelected) => {
+                return self.harness_start_selected_task();
+            }
             Some(HitTarget::HarnessBoardMode(mode)) => {
                 if self.agent_board_mode == *mode {
                     return AppAction::None;
@@ -7824,6 +8089,9 @@ impl App {
                 | HitTarget::HarnessTaskDetailRun(_)
                 | HitTarget::HarnessTaskDetailRunMonitor(_)
                 | HitTarget::HarnessAgentTask(_, _)
+                | HitTarget::HarnessExecutionPlan(_)
+                | HitTarget::HarnessExecutionUsePlan
+                | HitTarget::HarnessExecutionStartSelected
                 | HitTarget::HarnessBoardMode(_)
                 | HitTarget::SessionMonitorSection(_, _)
                 | HitTarget::ContextUsageSegment(_)
@@ -16303,6 +16571,72 @@ mod tests {
         }
     }
 
+    fn harness_launch_plan(plan_id: &str, digest: char) -> HarnessLaunchPlanSummaryV1 {
+        HarnessLaunchPlanSummaryV1 {
+            scheduled_launch: HarnessScheduledLaunchRefV2 {
+                plan: HarnessLaunchPlanRefV1 {
+                    plan_id: HarnessSelectorV1::new(plan_id).unwrap(),
+                    revision: HarnessRevision::new(2).unwrap(),
+                    digest: HarnessRequestDigest::new(digest.to_string().repeat(64)).unwrap(),
+                },
+                authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+            },
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            worktree: HarnessWorktreeIntentV1::Existing,
+            provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+            provider_id: HarnessSelectorV1::new("codex").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+        }
+    }
+
+    fn harness_execution_spec(
+        task_id: HarnessTaskId,
+        plan: &HarnessLaunchPlanSummaryV1,
+    ) -> HarnessTaskExecutionSpecV1 {
+        HarnessTaskExecutionSpecV1 {
+            execution_spec_id: HarnessExecutionSpecId::new(format!(
+                "hespec_{}",
+                "e".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(3).unwrap(),
+            task_id,
+            scheduled_launch: plan.scheduled_launch.clone(),
+            scheduled_launch_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 20,
+        }
+    }
+
+    fn harness_start_outcome(task_id: HarnessTaskId) -> HarnessTaskStartOutcomeV1 {
+        HarnessTaskStartOutcomeV1 {
+            dispatch: HarnessDispatchIntentV1 {
+                task_id,
+                task_revision: HarnessRevision::new(6).unwrap(),
+                run_id: HarnessRunId::new(format!("hrun_{}", "f".repeat(24))).unwrap(),
+                run_revision: HarnessRevision::new(1).unwrap(),
+                operation_id: HarnessOperationId::new(format!("hop_{}", "1".repeat(24))).unwrap(),
+                operation_revision: HarnessRevision::new(1).unwrap(),
+                idempotency_ref: HarnessIdempotencyRef::new(format!(
+                    "hidem_{}",
+                    "2".repeat(24),
+                )).unwrap(),
+                parent_run_id: None,
+                intent: HarnessRunIntentV1 {
+                    node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                    workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                    worktree: HarnessWorktreeIntentV1::Existing,
+                    provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+                    mode: HarnessExecutionModeV1::Pty,
+                    delivery_bundle: None,
+                    continuation: None,
+                },
+            },
+            replayed: false,
+        }
+    }
+
     #[test]
     fn harness_kanban_columns_are_the_exact_protocol_states() {
         let expected = [
@@ -16339,6 +16673,114 @@ mod tests {
 
         app.harness_schedule_plan = None;
         assert_eq!(app.harness_schedule_next(), AppAction::None);
+    }
+
+    #[test]
+    fn task_detail_use_plan_saves_exact_spec_without_starting_task() {
+        let mut app = App::default();
+        let task = harness_task('1', HarnessTaskStateV1::Ready, 6);
+        let plan = harness_launch_plan("ordinary-codex", 'a');
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
+        let _ = app.open_harness_task_detail(task.task_id.clone());
+        app.apply_harness_task_execution(task.task_id.clone(), vec![plan.clone()], None);
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 12, 1),
+            target: HitTarget::HarnessExecutionUsePlan,
+        }];
+
+        let AppAction::HarnessUseLaunchPlan {
+            token,
+            task_id,
+            expected_task_revision,
+            expected_execution_spec_revision,
+            spec,
+        } = app.click(1, 0) else {
+            panic!("Use plan must create only an exact execution-spec mutation");
+        };
+        assert_eq!(task_id, task.task_id);
+        assert_eq!(expected_task_revision, task.revision);
+        assert_eq!(expected_execution_spec_revision, HarnessExpectedExecutionSpecRevisionV1::Absent);
+        assert_eq!(spec.scheduled_launch, plan.scheduled_launch);
+        assert_eq!(spec.review_policy, HarnessTaskReviewPolicyV1::OperatorReview);
+        assert_eq!(
+            app.harness_kanban.execution_mutation.as_ref().map(|pending| pending.kind),
+            Some(HarnessExecutionMutationKind::SaveSpec),
+        );
+
+        let saved = harness_execution_spec(task.task_id.clone(), &plan);
+        app.apply_harness_execution_spec_saved(
+            token,
+            task.task_id.clone(),
+            saved.clone(),
+            HarnessOperatorMutationOutcomeV1::Applied,
+        );
+        assert!(app.harness_kanban.execution_mutation.is_none());
+        assert_eq!(app.harness_detail_execution_spec(), Some(&saved));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Execution spec saved (Applied); task not started"),
+        );
+        assert_eq!(app.harness_kanban.tasks[&task.task_id].state, HarnessTaskStateV1::Ready);
+    }
+
+    #[test]
+    fn task_detail_start_requires_ready_saved_exact_spec_and_resolves_outcome() {
+        let mut app = App::default();
+        let task = harness_task('2', HarnessTaskStateV1::Ready, 6);
+        let plan = harness_launch_plan("ordinary-codex", 'b');
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
+        let _ = app.open_harness_task_detail(task.task_id.clone());
+        app.apply_harness_task_execution(task.task_id.clone(), vec![plan.clone()], None);
+        assert!(!app.harness_start_selected_enabled());
+
+        let saved = harness_execution_spec(task.task_id.clone(), &plan);
+        app.apply_harness_task_execution(
+            task.task_id.clone(),
+            vec![plan.clone()],
+            Some(saved.clone()),
+        );
+        assert_ne!(
+            saved.scheduled_launch_digest,
+            plan.scheduled_launch.plan.digest,
+            "the persisted whole scheduled-launch digest is not the plan payload digest",
+        );
+        assert!(app.harness_start_selected_enabled());
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 18, 1),
+            target: HitTarget::HarnessExecutionStartSelected,
+        }];
+        let AppAction::HarnessStartTask {
+            token,
+            task_id,
+            expected_task_revision,
+            expected_execution_spec_revision,
+            expected_scheduled_launch_digest,
+        } = app.click(1, 0) else {
+            panic!("Start selected must carry exact task/spec revisions and plan digest");
+        };
+        assert_eq!(task_id, task.task_id);
+        assert_eq!(expected_task_revision, task.revision);
+        assert_eq!(expected_execution_spec_revision, saved.revision);
+        assert_eq!(expected_scheduled_launch_digest, saved.scheduled_launch_digest);
+        assert_eq!(
+            app.harness_kanban.execution_mutation.as_ref().map(|pending| pending.kind),
+            Some(HarnessExecutionMutationKind::StartTask),
+        );
+
+        let outcome = harness_start_outcome(task.task_id.clone());
+        let run_id = outcome.dispatch.run_id.clone();
+        app.apply_harness_task_started(token, &task.task_id, outcome);
+        assert!(app.harness_kanban.execution_mutation.is_none());
+        assert_eq!(app.harness_kanban.last_start.as_ref().map(|value| &value.dispatch.run_id), Some(&run_id));
+        let expected_notice = format!("Task started: run {run_id}");
+        assert_eq!(app.notice.as_deref(), Some(expected_notice.as_str()));
+
+        let moved = harness_task('2', HarnessTaskStateV1::Running, 7);
+        app.begin_harness_refresh(3);
+        app.apply_harness_snapshot(3, vec![moved], Vec::new());
+        assert!(!app.harness_start_selected_enabled());
     }
 
     #[test]

@@ -3,9 +3,11 @@
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessContinuationRef, HarnessContinuationStateV1,
     HarnessContinuationV1, HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1,
-    HarnessEntityReadScopeV1, HarnessOperationId, HarnessOperationKindV1,
+    HarnessEntityReadScopeV1, HarnessExpectedExecutionSpecRevisionV1,
+    HarnessOperationId, HarnessOperationKindV1,
     HarnessOperationStateV1, HarnessOperationV1, HarnessRevision, HarnessRunId,
-    HarnessRunLifecycleV1, HarnessRunV1, HarnessTaskId, HarnessTaskStateV1, HarnessTaskV1,
+    HarnessRunLifecycleV1, HarnessRunV1, HarnessTaskExecutionSpecV1,
+    HarnessTaskId, HarnessTaskStateV1, HarnessTaskV1,
     HarnessValidationError, SessionGrantId, SessionGrantStateV1, SessionGrantV1,
     HARNESS_CHILD_DEPTH_MAX, HARNESS_CONTINUATIONS_MAX, HARNESS_DELIVERIES_MAX,
     HARNESS_SCHEDULER_SCAN_MAX,
@@ -35,6 +37,12 @@ pub enum HarnessMutationV1 {
         expected_revision: HarnessRevision,
         task: HarnessTaskV1,
     },
+    PutExecutionSpec {
+        operation: HarnessOperationV1,
+        expected_task_revision: HarnessRevision,
+        expected_spec_revision: HarnessExpectedExecutionSpecRevisionV1,
+        spec: HarnessTaskExecutionSpecV1,
+    },
     CreateRun {
         operation: HarnessOperationV1,
         expected_task_revision: HarnessRevision,
@@ -62,6 +70,7 @@ impl HarnessMutationV1 {
         match self {
             Self::CreateTask { operation, .. }
             | Self::ReplaceTask { operation, .. }
+            | Self::PutExecutionSpec { operation, .. }
             | Self::CreateRun { operation, .. }
             | Self::ReplaceRun { operation, .. }
             | Self::CreateGrant { operation, .. }
@@ -73,6 +82,7 @@ impl HarnessMutationV1 {
         match self {
             Self::CreateTask { operation, .. }
             | Self::ReplaceTask { operation, .. }
+            | Self::PutExecutionSpec { operation, .. }
             | Self::CreateRun { operation, .. }
             | Self::ReplaceRun { operation, .. }
             | Self::CreateGrant { operation, .. }
@@ -89,6 +99,16 @@ impl HarnessMutationV1 {
             Self::ReplaceTask { expected_revision, task, .. } => {
                 expected_revision.validate()?;
                 task.validate()?;
+            }
+            Self::PutExecutionSpec {
+                expected_task_revision,
+                expected_spec_revision,
+                spec,
+                ..
+            } => {
+                expected_task_revision.validate()?;
+                expected_spec_revision.validate()?;
+                spec.validate()?;
             }
             Self::CreateRun {
                 expected_task_revision,
@@ -123,6 +143,8 @@ pub struct HarnessEngineCheckpointV1 {
     pub grants: Vec<SessionGrantV1>,
     pub operations: Vec<HarnessOperationV1>,
     #[serde(default)]
+    pub execution_specs: Vec<HarnessTaskExecutionSpecV1>,
+    #[serde(default)]
     pub deliveries: Vec<HarnessDeliveryV1>,
     #[serde(default)]
     pub continuations: Vec<HarnessContinuationV1>,
@@ -134,6 +156,7 @@ pub struct HarnessEngine {
     runs: BTreeMap<HarnessRunId, HarnessRunV1>,
     grants: BTreeMap<SessionGrantId, SessionGrantV1>,
     operations: BTreeMap<HarnessOperationId, HarnessOperationV1>,
+    execution_specs: BTreeMap<HarnessTaskId, HarnessTaskExecutionSpecV1>,
     deliveries: BTreeMap<HarnessDeliveryRef, HarnessDeliveryV1>,
     continuations: BTreeMap<HarnessContinuationRef, HarnessContinuationV1>,
 }
@@ -237,6 +260,19 @@ impl HarnessEngine {
         self.operations.get(operation_id)
     }
 
+    pub fn execution_spec(
+        &self,
+        task_id: &HarnessTaskId,
+    ) -> Option<&HarnessTaskExecutionSpecV1> {
+        self.execution_specs.get(task_id)
+    }
+
+    pub fn execution_specs(
+        &self,
+    ) -> impl Iterator<Item = &HarnessTaskExecutionSpecV1> {
+        self.execution_specs.values()
+    }
+
     pub fn delivery(&self, delivery_ref: &HarnessDeliveryRef) -> Option<&HarnessDeliveryV1> {
         self.deliveries.get(delivery_ref)
     }
@@ -331,20 +367,36 @@ impl HarnessEngine {
     pub fn scheduler_ready_task(&self) -> Result<Option<&HarnessTaskV1>, HarnessEngineError> {
         self.validate_scheduler_bound()?;
         for task in self.tasks.values().filter(|task| task.state == HarnessTaskStateV1::Ready) {
-            let dependencies_done = task.dependencies.iter().all(|dependency_id| {
-                self.tasks.get(dependency_id)
-                    .map(|dependency| dependency.state == HarnessTaskStateV1::Done)
-                    .unwrap_or(false)
-            });
-            if !dependencies_done {
-                continue;
+            if self.scheduler_task_is_eligible(task)? {
+                return Ok(Some(task));
             }
-            if self.task_has_nonterminal_run(task)? {
-                continue;
-            }
-            return Ok(Some(task));
         }
         Ok(None)
+    }
+
+    pub fn scheduler_ready_task_by_id(
+        &self,
+        task_id: &HarnessTaskId,
+    ) -> Result<Option<&HarnessTaskV1>, HarnessEngineError> {
+        self.validate_scheduler_bound()?;
+        let task = self.tasks.get(task_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(task_id.to_string()))?;
+        if task.state != HarnessTaskStateV1::Ready || !self.scheduler_task_is_eligible(task)? {
+            return Ok(None);
+        }
+        Ok(Some(task))
+    }
+
+    fn scheduler_task_is_eligible(
+        &self,
+        task: &HarnessTaskV1,
+    ) -> Result<bool, HarnessEngineError> {
+        let dependencies_done = task.dependencies.iter().all(|dependency_id| {
+            self.tasks.get(dependency_id)
+                .map(|dependency| dependency.state == HarnessTaskStateV1::Done)
+                .unwrap_or(false)
+        });
+        Ok(dependencies_done && !self.task_has_nonterminal_run(task)?)
     }
 
     pub fn task_has_nonterminal_run(
@@ -453,6 +505,7 @@ impl HarnessEngine {
             runs: self.runs.values().cloned().collect(),
             grants: self.grants.values().cloned().collect(),
             operations: self.operations.values().cloned().collect(),
+            execution_specs: self.execution_specs.values().cloned().collect(),
             deliveries: self.deliveries.values().cloned().collect(),
             continuations: self.continuations.values().cloned().collect(),
         }
@@ -491,6 +544,15 @@ impl HarnessEngine {
             let operation_id = operation.operation_id.clone();
             if engine.operations.insert(operation_id.clone(), operation).is_some() {
                 return Err(HarnessEngineError::DuplicateCheckpointId(operation_id.to_string()));
+            }
+        }
+        for spec in checkpoint.execution_specs {
+            validate_execution_spec_identity(&spec)?;
+            let task_id = spec.task_id.clone();
+            if engine.execution_specs.insert(task_id.clone(), spec).is_some() {
+                return Err(HarnessEngineError::DuplicateCheckpointId(
+                    task_id.to_string(),
+                ));
             }
         }
         if checkpoint.deliveries.len() > HARNESS_DELIVERIES_MAX {
@@ -582,6 +644,72 @@ impl HarnessEngine {
                 }
                 next.validate_task_links(&task)?;
                 next.tasks.insert(task.task_id.clone(), task);
+                next.operations.insert(operation.operation_id.clone(), operation.clone());
+                next.finish(operation, HarnessApplyOutcome::Applied)
+            }
+            HarnessMutationV1::PutExecutionSpec {
+                operation,
+                expected_task_revision,
+                expected_spec_revision,
+                spec,
+            } => {
+                require_kind(
+                    operation.kind,
+                    HarnessOperationKindV1::MutateExecutionSpec,
+                )?;
+                require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
+                require_operation_expected(&operation, expected_task_revision)?;
+                validate_execution_spec_identity(&spec)?;
+                require_same_id(operation.task_id.as_ref(), &spec.task_id, "task")?;
+                let task = next.tasks.get(&spec.task_id)
+                    .ok_or_else(|| HarnessEngineError::NotFound(spec.task_id.to_string()))?;
+                if task.revision != expected_task_revision {
+                    return Err(HarnessEngineError::ExpectedRevisionMismatch {
+                        entity: "task",
+                        expected: expected_task_revision.get(),
+                        actual: Some(task.revision.get()),
+                    });
+                }
+                match (
+                    expected_spec_revision,
+                    next.execution_specs.get(&spec.task_id),
+                ) {
+                    (HarnessExpectedExecutionSpecRevisionV1::Absent, None) => {
+                        require_first_revision(spec.revision, "execution spec")?;
+                    }
+                    (HarnessExpectedExecutionSpecRevisionV1::Exact(expected), Some(current)) => {
+                        validate_replacement(
+                            "execution spec",
+                            current.revision,
+                            expected,
+                            spec.revision,
+                            current.created_at_unix_ms,
+                            spec.created_at_unix_ms,
+                        )?;
+                        if current.execution_spec_id != spec.execution_spec_id
+                            || current.task_id != spec.task_id
+                        {
+                            return Err(HarnessEngineError::MismatchedIdentity(
+                                "immutable execution spec identity",
+                            ));
+                        }
+                    }
+                    (HarnessExpectedExecutionSpecRevisionV1::Absent, Some(current)) => {
+                        return Err(HarnessEngineError::ExpectedRevisionMismatch {
+                            entity: "execution spec",
+                            expected: 0,
+                            actual: Some(current.revision.get()),
+                        });
+                    }
+                    (HarnessExpectedExecutionSpecRevisionV1::Exact(expected), current) => {
+                        return Err(HarnessEngineError::ExpectedRevisionMismatch {
+                            entity: "execution spec",
+                            expected: expected.get(),
+                            actual: current.map(|spec| spec.revision.get()),
+                        });
+                    }
+                }
+                next.execution_specs.insert(spec.task_id.clone(), spec);
                 next.operations.insert(operation.operation_id.clone(), operation.clone());
                 next.finish(operation, HarnessApplyOutcome::Applied)
             }
@@ -1473,6 +1601,12 @@ impl HarnessEngine {
             self.validate_actor(&operation.actor)?;
             self.validate_operation_links(operation)?;
         }
+        for spec in self.execution_specs.values() {
+            validate_execution_spec_identity(spec)?;
+            if !self.tasks.contains_key(&spec.task_id) {
+                return Err(HarnessEngineError::NotFound(spec.task_id.to_string()));
+            }
+        }
         for delivery in self.deliveries.values() {
             self.validate_delivery_links(delivery)?;
         }
@@ -2062,6 +2196,13 @@ fn require_first_revision(
     if revision.get() != 1 {
         return Err(HarnessEngineError::InvalidNextRevision { entity });
     }
+    Ok(())
+}
+
+fn validate_execution_spec_identity(
+    spec: &HarnessTaskExecutionSpecV1,
+) -> Result<(), HarnessEngineError> {
+    spec.validate()?;
     Ok(())
 }
 
@@ -2715,7 +2856,8 @@ mod tests {
         HarnessDeliveryBundleRevisionV1, HarnessDeliveryBundleV1,
         HarnessDeliveryManifestDigestV2,
         HarnessDeliveryReceiptV1, HarnessDeliveryRef, HarnessDeliveryStageReceiptV1,
-        HarnessExecutionModeV1, HarnessFailureCategoryV1, HarnessFailureV1,
+        HarnessExecutionModeV1, HarnessExecutionSpecId, HarnessFailureCategoryV1,
+        HarnessFailureV1, HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1,
         HarnessGrantTargetV1, HarnessIdempotencyRef,
         HarnessMonitoringVisibilityV1, HarnessOutcomeUnknownReasonV1,
         HarnessReadPermissionsV1,
@@ -2723,6 +2865,7 @@ mod tests {
         HarnessReceiptRef, HarnessRequestDigest, HarnessResolvedContextPackReceiptV1,
         HarnessResultDispositionV1,
         HarnessRunIntentV1, HarnessRunLifecycleV1, HarnessRuntimeIdentityV1,
+        HarnessScheduledLaunchRefV2, HarnessTaskReviewPolicyV1,
         HarnessSelectorV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
         HarnessTaskPermissionsV1, HarnessTaskStateV1, HarnessWorktreeIntentV1,
         SessionGrantStateV1,
@@ -2870,6 +3013,29 @@ mod tests {
         }).unwrap();
         engine.accept(prepared);
         (id, operation)
+    }
+
+    fn execution_spec(task_id: HarnessTaskId, revision_value: u64) -> HarnessTaskExecutionSpecV1 {
+        HarnessTaskExecutionSpecV1 {
+            execution_spec_id: HarnessExecutionSpecId::new(format!(
+                "hespec_{}",
+                "e".repeat(24),
+            )).unwrap(),
+            revision: revision(revision_value),
+            task_id,
+            scheduled_launch: HarnessScheduledLaunchRefV2 {
+                plan: HarnessLaunchPlanRefV1 {
+                    plan_id: HarnessSelectorV1::new("ordinary").unwrap(),
+                    revision: revision(1),
+                    digest: HarnessRequestDigest::new("a".repeat(64)).unwrap(),
+                },
+                authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+            },
+            scheduled_launch_digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            created_at_unix_ms: 20,
+            updated_at_unix_ms: 20 + revision_value,
+        }
     }
 
     fn run(lifecycle: HarnessRunLifecycleV1, revision_value: u64) -> HarnessRunV1 {
@@ -3203,6 +3369,96 @@ mod tests {
     }
 
     #[test]
+    fn harness_execution_spec_cas_replays_and_restores_from_checkpoint() {
+        let mut engine = HarnessEngine::new();
+        let (task_id, _) = create_task(&mut engine);
+        let mut operation = task_operation(
+            operation_id('b'),
+            task_id.clone(),
+            'b',
+            Some(revision(1)),
+        );
+        operation.kind = HarnessOperationKindV1::MutateExecutionSpec;
+        let first_spec = execution_spec(task_id.clone(), 1);
+        let first = HarnessMutationV1::PutExecutionSpec {
+            operation: operation.clone(),
+            expected_task_revision: revision(1),
+            expected_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            spec: first_spec.clone(),
+        };
+        let prepared = engine.prepare(first.clone()).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        engine.accept(prepared);
+        assert_eq!(
+            engine.prepare(first).unwrap().outcome(),
+            HarnessApplyOutcome::Replayed,
+        );
+
+        let before = engine.checkpoint();
+        let mut stale_operation = task_operation(
+            operation_id('c'),
+            task_id.clone(),
+            'c',
+            Some(revision(1)),
+        );
+        stale_operation.kind = HarnessOperationKindV1::MutateExecutionSpec;
+        assert!(matches!(
+            engine.prepare(HarnessMutationV1::PutExecutionSpec {
+                operation: stale_operation,
+                expected_task_revision: revision(1),
+                expected_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+                spec: first_spec.clone(),
+            }),
+            Err(HarnessEngineError::ExpectedRevisionMismatch {
+                entity: "execution spec",
+                ..
+            }),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+
+        let mut replacement = first_spec;
+        replacement.revision = revision(2);
+        replacement.updated_at_unix_ms = 22;
+        let mut replace_operation = task_operation(
+            operation_id('d'),
+            task_id.clone(),
+            'd',
+            Some(revision(1)),
+        );
+        replace_operation.kind = HarnessOperationKindV1::MutateExecutionSpec;
+        let prepared = engine.prepare(HarnessMutationV1::PutExecutionSpec {
+            operation: replace_operation,
+            expected_task_revision: revision(1),
+            expected_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Exact(revision(1)),
+            spec: replacement.clone(),
+        }).unwrap();
+        engine.accept(prepared);
+        let restored = HarnessEngine::restore(engine.checkpoint()).unwrap();
+        assert_eq!(restored.execution_spec(&task_id), Some(&replacement));
+    }
+
+    #[test]
+    fn harness_scheduler_exact_id_selects_b_while_a_sorts_first() {
+        let mut engine = HarnessEngine::new();
+        let mut task_a = task(numbered_task_id(1), 1, "a");
+        task_a.state = HarnessTaskStateV1::Ready;
+        let mut task_b = task(numbered_task_id(2), 1, "b");
+        task_b.state = HarnessTaskStateV1::Ready;
+        engine.tasks.insert(task_a.task_id.clone(), task_a.clone());
+        engine.tasks.insert(task_b.task_id.clone(), task_b.clone());
+        assert_eq!(
+            engine.scheduler_ready_task().unwrap().map(|task| &task.task_id),
+            Some(&task_a.task_id),
+        );
+        assert_eq!(
+            engine.scheduler_ready_task_by_id(&task_b.task_id)
+                .unwrap()
+                .map(|task| &task.task_id),
+            Some(&task_b.task_id),
+        );
+    }
+
+    #[test]
     fn harness_scheduler_selects_lowest_ready_task_with_done_dependencies() {
         let mut engine = HarnessEngine::new();
         let mut dependency = task(numbered_task_id(1), 1, "dependency");
@@ -3335,6 +3591,7 @@ mod tests {
             runs: Vec::new(),
             grants: Vec::new(),
             operations: Vec::new(),
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         };
@@ -3421,6 +3678,7 @@ mod tests {
                 runs: vec![current_run.clone()],
                 grants: Vec::new(),
                 operations: vec![create_run],
+                execution_specs: Vec::new(),
                 deliveries: Vec::new(),
                 continuations: Vec::new(),
             }).unwrap();
@@ -3535,6 +3793,7 @@ mod tests {
                 runs: vec![current_run],
                 grants: Vec::new(),
                 operations: vec![current_operation.clone()],
+                execution_specs: Vec::new(),
                 deliveries: Vec::new(),
                 continuations: Vec::new(),
             }).unwrap();
@@ -3748,6 +4007,7 @@ mod tests {
             runs: vec![orphan],
             grants: Vec::new(),
             operations: vec![original_run_operation(HarnessOperationStateV1::Prepared)],
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         };
@@ -3762,6 +4022,7 @@ mod tests {
             runs: vec![requested],
             grants: Vec::new(),
             operations: vec![original_run_operation(HarnessOperationStateV1::Dispatching)],
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         };
@@ -3781,6 +4042,7 @@ mod tests {
             runs: Vec::new(),
             grants: Vec::new(),
             operations: Vec::new(),
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         };
@@ -4109,6 +4371,7 @@ mod tests {
             runs: vec![target_run, source_run],
             grants: vec![active_grant],
             operations: vec![target_operation, source_operation],
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: vec![exporting.clone()],
         }).unwrap();

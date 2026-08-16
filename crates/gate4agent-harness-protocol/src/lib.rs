@@ -87,6 +87,7 @@ opaque_id!(HarnessInlineRef, "hinline_", "inline reference");
 opaque_id!(HarnessIdempotencyRef, "hidem_", "idempotency reference");
 opaque_id!(HarnessDeliveryRef, "hdelivery_", "delivery reference");
 opaque_id!(HarnessContinuationRef, "hcontinuation_", "continuation reference");
+opaque_id!(HarnessExecutionSpecId, "hespec_", "execution specification id");
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -442,6 +443,140 @@ impl HarnessScheduleNextRequestV1 {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessLaunchPlanRefV1 {
+    pub plan_id: HarnessSelectorV1,
+    pub revision: HarnessRevision,
+    pub digest: HarnessRequestDigest,
+}
+
+impl HarnessLaunchPlanRefV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.plan_id.validate()?;
+        self.revision.validate()?;
+        self.digest.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessLaunchAuthorityRefV1 {
+    OrdinaryOperator,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessScheduledLaunchRefV2 {
+    pub plan: HarnessLaunchPlanRefV1,
+    pub authority: HarnessLaunchAuthorityRefV1,
+}
+
+impl HarnessScheduledLaunchRefV2 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.plan.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessTaskReviewPolicyV1 {
+    OperatorReview,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskExecutionSpecInputV1 {
+    pub scheduled_launch: HarnessScheduledLaunchRefV2,
+    pub review_policy: HarnessTaskReviewPolicyV1,
+}
+
+impl HarnessTaskExecutionSpecInputV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.scheduled_launch.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskExecutionSpecV1 {
+    pub execution_spec_id: HarnessExecutionSpecId,
+    pub revision: HarnessRevision,
+    pub task_id: HarnessTaskId,
+    pub scheduled_launch: HarnessScheduledLaunchRefV2,
+    pub scheduled_launch_digest: HarnessRequestDigest,
+    pub review_policy: HarnessTaskReviewPolicyV1,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+impl HarnessTaskExecutionSpecV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.execution_spec_id.validate()?;
+        self.revision.validate()?;
+        self.task_id.validate()?;
+        self.scheduled_launch.validate()?;
+        self.scheduled_launch_digest.validate()?;
+        validate_timestamps(self.created_at_unix_ms, self.updated_at_unix_ms)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "revision", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessExpectedExecutionSpecRevisionV1 {
+    Absent,
+    Exact(HarnessRevision),
+}
+
+impl HarnessExpectedExecutionSpecRevisionV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::Absent => Ok(()),
+            Self::Exact(revision) => revision.validate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessReplaceTaskExecutionSpecRequestV1 {
+    pub authority: HarnessOperatorAuthorityV1,
+    pub task_id: HarnessTaskId,
+    pub expected_task_revision: HarnessRevision,
+    pub expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1,
+    pub spec: HarnessTaskExecutionSpecInputV1,
+}
+
+impl HarnessReplaceTaskExecutionSpecRequestV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.authority.validate()?;
+        self.task_id.validate()?;
+        self.expected_task_revision.validate()?;
+        self.expected_execution_spec_revision.validate()?;
+        self.spec.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessStartTaskRequestV1 {
+    pub authority: HarnessOperatorAuthorityV1,
+    pub task_id: HarnessTaskId,
+    pub expected_task_revision: HarnessRevision,
+    pub expected_execution_spec_revision: HarnessRevision,
+    pub expected_scheduled_launch_digest: HarnessRequestDigest,
+}
+
+impl HarnessStartTaskRequestV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.authority.validate()?;
+        self.task_id.validate()?;
+        self.expected_task_revision.validate()?;
+        self.expected_execution_spec_revision.validate()?;
+        self.expected_scheduled_launch_digest.validate()
+    }
+}
+
 impl HarnessScheduleRequestV1 {
     pub fn validate(&self) -> Result<(), HarnessValidationError> {
         self.operation_id.validate()?;
@@ -500,6 +635,19 @@ impl HarnessDispatchIntentV1 {
 pub enum HarnessScheduleOutcomeV1 {
     Idle,
     Dispatch(HarnessDispatchIntentV1),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskStartOutcomeV1 {
+    pub dispatch: HarnessDispatchIntentV1,
+    pub replayed: bool,
+}
+
+impl HarnessTaskStartOutcomeV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.dispatch.validate()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1354,6 +1502,7 @@ impl SessionGrantV1 {
 pub enum HarnessOperationKindV1 {
     CreateTask,
     MutateTask,
+    MutateExecutionSpec,
     CreateRun,
     BindRun,
     MutateRun,
@@ -1484,7 +1633,7 @@ impl HarnessOperationV1 {
     fn validate_kind_targets(&self) -> Result<(), HarnessValidationError> {
         let valid = match self.kind {
             HarnessOperationKindV1::CreateTask => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
-            HarnessOperationKindV1::MutateTask => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
+            HarnessOperationKindV1::MutateTask | HarnessOperationKindV1::MutateExecutionSpec => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::CreateRun => self.task_id.is_some() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::BindRun | HarnessOperationKindV1::MutateRun => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::CreateGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
@@ -2120,5 +2269,99 @@ mod tests {
                 "f".repeat(64),
             )).unwrap();
         assert_eq!(changed.validate(), Err(HarnessValidationError::InvalidDeliveryLink));
+    }
+
+    #[test]
+    fn ordinary_operator_execution_spec_round_trip_is_exact_and_private() {
+        let scheduled_launch = HarnessScheduledLaunchRefV2 {
+            plan: HarnessLaunchPlanRefV1 {
+                plan_id: selector("ordinary-codex"),
+                revision: HarnessRevision::new(3).unwrap(),
+                digest: HarnessRequestDigest::new("a".repeat(64)).unwrap(),
+            },
+            authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+        };
+        let spec = HarnessTaskExecutionSpecV1 {
+            execution_spec_id: HarnessExecutionSpecId::new(format!(
+                "hespec_{}",
+                "b".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(2).unwrap(),
+            task_id: task_id('1'),
+            scheduled_launch: scheduled_launch.clone(),
+            scheduled_launch_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 20,
+        };
+        spec.validate().unwrap();
+        let encoded = serde_json::to_string(&spec).unwrap();
+        for sentinel in [
+            "delivery",
+            "continuation",
+            "harness_mcp",
+            "provider_home",
+            "credential",
+            "environment",
+            "raw_path",
+        ] {
+            assert!(!encoded.contains(sentinel));
+        }
+        assert_eq!(serde_json::from_str::<HarnessTaskExecutionSpecV1>(&encoded).unwrap(), spec);
+
+        let replace = HarnessReplaceTaskExecutionSpecRequestV1 {
+            authority: HarnessOperatorAuthorityV1 {
+                operation_id: operation_id('4'),
+                idempotency_ref: HarnessIdempotencyRef::new(format!(
+                    "hidem_{}",
+                    "5".repeat(24),
+                )).unwrap(),
+                actor_id: selector("operator"),
+                now_unix_ms: 30,
+            },
+            task_id: task_id('1'),
+            expected_task_revision: HarnessRevision::new(7).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            spec: HarnessTaskExecutionSpecInputV1 {
+                scheduled_launch,
+                review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        };
+        replace.validate().unwrap();
+        let mut wire = serde_json::to_value(replace).unwrap();
+        wire.as_object_mut().unwrap().insert(
+            "spawn_spec".to_owned(),
+            serde_json::json!({"environment":{"TOKEN":"secret"}}),
+        );
+        assert!(serde_json::from_value::<HarnessReplaceTaskExecutionSpecRequestV1>(wire).is_err());
+    }
+
+    #[test]
+    fn exact_start_request_pins_task_spec_and_scheduled_digest() {
+        let request = HarnessStartTaskRequestV1 {
+            authority: HarnessOperatorAuthorityV1 {
+                operation_id: operation_id('6'),
+                idempotency_ref: HarnessIdempotencyRef::new(format!(
+                    "hidem_{}",
+                    "7".repeat(24),
+                )).unwrap(),
+                actor_id: selector("operator"),
+                now_unix_ms: 40,
+            },
+            task_id: task_id('1'),
+            expected_task_revision: HarnessRevision::new(8).unwrap(),
+            expected_execution_spec_revision: HarnessRevision::new(2).unwrap(),
+            expected_scheduled_launch_digest: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+        };
+        request.validate().unwrap();
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(serde_json::from_slice::<HarnessStartTaskRequestV1>(&encoded).unwrap(), request);
+
+        let mut invalid = serde_json::to_value(request).unwrap();
+        invalid.as_object_mut().unwrap().insert(
+            "expected_scheduled_launch_digest".to_owned(),
+            serde_json::json!("D".repeat(64)),
+        );
+        assert!(serde_json::from_value::<HarnessStartTaskRequestV1>(invalid).is_err());
     }
 }

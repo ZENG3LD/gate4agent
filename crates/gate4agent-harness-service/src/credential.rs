@@ -341,6 +341,7 @@ pub(crate) mod tests {
             runs: vec![run],
             grants: vec![grant],
             operations: vec![operation],
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap()

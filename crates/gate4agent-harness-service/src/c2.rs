@@ -1550,6 +1550,7 @@ pub(crate) struct PreparedRunContextSourceObservation {
     route: NodeRoute,
     record_id: SessionRecordId,
     observed_after_sequence: u64,
+    started_at: Instant,
 }
 
 impl PreparedRunContextSourceObservation {
@@ -1575,6 +1576,7 @@ impl PreparedRunContextSourceObservation {
             route,
             record_id,
             observed_after_sequence: 0,
+            started_at: Instant::now(),
         })
     }
 
@@ -1593,6 +1595,8 @@ impl PreparedRunContextSourceObservation {
     pub(crate) fn observed_after_sequence(&self) -> u64 {
         self.observed_after_sequence
     }
+
+    pub(crate) fn started_at(&self) -> Instant { self.started_at }
 
     fn wire_request(&self) -> NodeRequest {
         NodeRequest::PreviewSessionRecord {

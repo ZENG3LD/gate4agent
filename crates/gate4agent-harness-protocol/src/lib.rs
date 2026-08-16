@@ -27,6 +27,8 @@ pub const HARNESS_CONTINUATIONS_MAX: usize = 4_096;
 pub const HARNESS_CONTEXT_PACK_MAX_BYTES: u32 = 256 * 1024;
 pub const HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX: u64 = 256;
 pub const HARNESS_SCHEDULER_SCAN_MAX: usize = 8_192;
+pub const HARNESS_DELIVERY_COMPONENT_KINDS_MAX: usize = 9;
+pub const HARNESS_DELIVERY_COMPONENTS_MAX: u32 = 4_096;
 
 macro_rules! opaque_id {
     ($name:ident, $prefix:literal, $label:literal) => {
@@ -88,6 +90,7 @@ opaque_id!(HarnessIdempotencyRef, "hidem_", "idempotency reference");
 opaque_id!(HarnessDeliveryRef, "hdelivery_", "delivery reference");
 opaque_id!(HarnessContinuationRef, "hcontinuation_", "continuation reference");
 opaque_id!(HarnessExecutionSpecId, "hespec_", "execution specification id");
+opaque_id!(HarnessTaskLaunchIssuanceId, "hissue_", "task launch issuance id");
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -459,10 +462,32 @@ impl HarnessLaunchPlanRefV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessLaunchAuthorityRefV1 {
     OrdinaryOperator,
+    OperatorIssuance {
+        issuance_id: HarnessTaskLaunchIssuanceId,
+        revision: HarnessRevision,
+        digest: HarnessRequestDigest,
+    },
+}
+
+impl HarnessLaunchAuthorityRefV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::OrdinaryOperator => Ok(()),
+            Self::OperatorIssuance {
+                issuance_id,
+                revision,
+                digest,
+            } => {
+                issuance_id.validate()?;
+                revision.validate()?;
+                digest.validate()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -474,7 +499,228 @@ pub struct HarnessScheduledLaunchRefV2 {
 
 impl HarnessScheduledLaunchRefV2 {
     pub fn validate(&self) -> Result<(), HarnessValidationError> {
-        self.plan.validate()
+        self.plan.validate()?;
+        self.authority.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskLaunchIssuanceRefV1 {
+    pub issuance_id: HarnessTaskLaunchIssuanceId,
+    pub revision: HarnessRevision,
+    /// Supplied by the service's canonical issuance encoder. This protocol
+    /// validates the digest shape; the engine enforces exact reference equality.
+    pub digest: HarnessRequestDigest,
+}
+
+impl HarnessTaskLaunchIssuanceRefV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.issuance_id.validate()?;
+        self.revision.validate()?;
+        self.digest.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessLaunchWorktreeSelectionV1 {
+    Existing,
+    Managed {
+        profile_id: HarnessSelectorV1,
+        expected_profile_revision: HarnessSelectorV1,
+    },
+}
+
+impl HarnessLaunchWorktreeSelectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::Existing => Ok(()),
+            Self::Managed {
+                profile_id,
+                expected_profile_revision,
+            } => {
+                profile_id.validate()?;
+                expected_profile_revision.validate()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessLaunchTargetSelectionV1 {
+    pub node_id: HarnessSelectorV1,
+    pub source_workspace_id: HarnessSelectorV1,
+    pub worktree: HarnessLaunchWorktreeSelectionV1,
+    pub provider_profile: HarnessSelectorV1,
+    pub mode: HarnessExecutionModeV1,
+}
+
+impl HarnessLaunchTargetSelectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.node_id.validate()?;
+        self.source_workspace_id.validate()?;
+        self.worktree.validate()?;
+        self.provider_profile.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessContextSourceSelectionV1 {
+    pub source_run_id: HarnessRunId,
+    pub source_run_revision: HarnessRevision,
+    pub observed_at_unix_ms: u64,
+    pub metadata_digest: HarnessRequestDigest,
+    pub node_id: HarnessSelectorV1,
+    pub node_incarnation: HarnessSelectorV1,
+    pub workspace_id: HarnessSelectorV1,
+    pub session_record_id: HarnessSelectorV1,
+    pub active_session: HarnessRuntimeIdentityV1,
+    pub message_count: u64,
+    pub message_count_exact: bool,
+    pub completed_turn_count: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl HarnessContextSourceSelectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.source_run_id.validate()?;
+        self.source_run_revision.validate()?;
+        if self.observed_at_unix_ms == 0 {
+            return Err(HarnessValidationError::InvalidTimestamps);
+        }
+        self.metadata_digest.validate()?;
+        self.node_id.validate()?;
+        self.node_incarnation.validate()?;
+        self.workspace_id.validate()?;
+        self.session_record_id.validate()?;
+        self.active_session.validate()?;
+        if self.message_count == 0
+            || self.completed_turn_count.is_some_and(|count| count > self.message_count)
+        {
+            return Err(HarnessValidationError::InvalidContextSourceCounts);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessDeliveryComponentKindV1 {
+    Skill,
+    PluginManifest,
+    Prompt,
+    Instructions,
+    AgentDefinition,
+    Command,
+    File,
+    Template,
+    McpDeclaration,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessDeliveryComponentCountV1 {
+    pub kind: HarnessDeliveryComponentKindV1,
+    pub workspace_count: u32,
+    pub session_count: u32,
+}
+
+impl HarnessDeliveryComponentCountV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        let count = self.workspace_count.checked_add(self.session_count)
+            .ok_or(HarnessValidationError::InvalidDeliveryComponentCount)?;
+        if count == 0 || count > HARNESS_DELIVERY_COMPONENTS_MAX {
+            return Err(HarnessValidationError::InvalidDeliveryComponentCount);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessDeliveryBundleSelectionV1 {
+    pub bundle: HarnessDeliveryBundleV1,
+    pub component_counts: Vec<HarnessDeliveryComponentCountV1>,
+}
+
+impl HarnessDeliveryBundleSelectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.bundle.validate()?;
+        if self.component_counts.is_empty() {
+            return Err(HarnessValidationError::InvalidDeliveryComponentCount);
+        }
+        if self.component_counts.len() > HARNESS_DELIVERY_COMPONENT_KINDS_MAX {
+            return Err(HarnessValidationError::CollectionTooLarge {
+                field: "delivery component counts",
+                maximum: HARNESS_DELIVERY_COMPONENT_KINDS_MAX,
+            });
+        }
+        if self.component_counts.windows(2).any(|pair| pair[0].kind >= pair[1].kind) {
+            return Err(HarnessValidationError::CollectionNotCanonical {
+                field: "delivery component counts",
+            });
+        }
+        let mut total = 0_u32;
+        for component in &self.component_counts {
+            component.validate()?;
+            total = total.checked_add(component.workspace_count)
+                .and_then(|count| count.checked_add(component.session_count))
+                .ok_or(HarnessValidationError::InvalidDeliveryComponentCount)?;
+        }
+        if total > HARNESS_DELIVERY_COMPONENTS_MAX {
+            return Err(HarnessValidationError::InvalidDeliveryComponentCount);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskLaunchIssuanceV1 {
+    pub issuance_id: HarnessTaskLaunchIssuanceId,
+    pub revision: HarnessRevision,
+    /// Supplied by the service after canonical encoding of the bounded issuance.
+    /// No provider data or unbounded content participates in this record.
+    pub digest: HarnessRequestDigest,
+    pub task_id: HarnessTaskId,
+    pub task_revision: HarnessRevision,
+    pub plan: HarnessLaunchPlanRefV1,
+    pub target: HarnessLaunchTargetSelectionV1,
+    pub context_source: Option<HarnessContextSourceSelectionV1>,
+    pub delivery: Option<HarnessDeliveryBundleSelectionV1>,
+    pub policy_digest: HarnessRequestDigest,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+impl HarnessTaskLaunchIssuanceV1 {
+    pub fn reference(&self) -> HarnessTaskLaunchIssuanceRefV1 {
+        HarnessTaskLaunchIssuanceRefV1 {
+            issuance_id: self.issuance_id.clone(),
+            revision: self.revision,
+            digest: self.digest.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.issuance_id.validate()?;
+        self.revision.validate()?;
+        self.digest.validate()?;
+        self.task_id.validate()?;
+        self.task_revision.validate()?;
+        self.plan.validate()?;
+        self.target.validate()?;
+        if let Some(context_source) = &self.context_source {
+            context_source.validate()?;
+        }
+        if let Some(delivery) = &self.delivery {
+            delivery.validate()?;
+        }
+        self.policy_digest.validate()?;
+        validate_timestamps(self.created_at_unix_ms, self.updated_at_unix_ms)
     }
 }
 
@@ -508,6 +754,41 @@ pub struct HarnessTaskExecutionSpecV1 {
     pub review_policy: HarnessTaskReviewPolicyV1,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskExecutionSpecInputV2 {
+    pub launch_issuance: HarnessTaskLaunchIssuanceRefV1,
+    pub review_policy: HarnessTaskReviewPolicyV1,
+}
+
+impl HarnessTaskExecutionSpecInputV2 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.launch_issuance.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskExecutionSpecV2 {
+    pub execution_spec_id: HarnessExecutionSpecId,
+    pub revision: HarnessRevision,
+    pub task_id: HarnessTaskId,
+    pub launch_issuance: HarnessTaskLaunchIssuanceRefV1,
+    pub review_policy: HarnessTaskReviewPolicyV1,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+impl HarnessTaskExecutionSpecV2 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.execution_spec_id.validate()?;
+        self.revision.validate()?;
+        self.task_id.validate()?;
+        self.launch_issuance.validate()?;
+        validate_timestamps(self.created_at_unix_ms, self.updated_at_unix_ms)
+    }
 }
 
 impl HarnessTaskExecutionSpecV1 {
@@ -1794,6 +2075,8 @@ pub enum HarnessValidationError {
     InvalidDeliveryResource { field: &'static str },
     #[error("delivery bundle digest must be sha256 followed by lowercase hexadecimal")]
     InvalidDeliveryDigest,
+    #[error("delivery component count is zero, overflowing, or outside the fixed bundle bound")]
+    InvalidDeliveryComponentCount,
     #[error("delivery state does not match staged and committed receipt fields")]
     InvalidDeliveryStateFields,
     #[error("delivery receipt does not match its immutable authority")]
@@ -1802,6 +2085,8 @@ pub enum HarnessValidationError {
     InvalidContextPackDigest,
     #[error("context pack receipt is empty, inconsistent, or exceeds protocol limits")]
     InvalidContextPackReceipt,
+    #[error("context source counts are inconsistent with the observed message count")]
+    InvalidContextSourceCounts,
     #[error("continuation authority has invalid state fields or exact links")]
     InvalidContinuationLink,
 }
@@ -2334,6 +2619,150 @@ mod tests {
             serde_json::json!({"environment":{"TOKEN":"secret"}}),
         );
         assert!(serde_json::from_value::<HarnessReplaceTaskExecutionSpecRequestV1>(wire).is_err());
+    }
+
+    #[test]
+    fn task_launch_issuance_is_bounded_exact_and_context_requires_messages() {
+        let bundle = HarnessDeliveryBundleV1 {
+            selector: selector("review-kit"),
+            bundle_id: HarnessDeliveryBundleIdV1::new("bundle.review-kit").unwrap(),
+            revision: HarnessDeliveryBundleRevisionV1::new("rev-7").unwrap(),
+            digest: HarnessDeliveryBundleDigestV1::new(format!(
+                "sha256:{}",
+                "d".repeat(64),
+            )).unwrap(),
+            manifest_digest: HarnessDeliveryManifestDigestV2::new(format!(
+                "sha256:{}",
+                "e".repeat(64),
+            )).unwrap(),
+        };
+        let context_source = HarnessContextSourceSelectionV1 {
+            source_run_id: run_id('2'),
+            source_run_revision: HarnessRevision::new(4).unwrap(),
+            observed_at_unix_ms: 30,
+            metadata_digest: HarnessRequestDigest::new("4".repeat(64)).unwrap(),
+            node_id: selector("node-a"),
+            node_incarnation: selector("incarnation-a"),
+            workspace_id: selector("workspace-a"),
+            session_record_id: selector("record-a"),
+            active_session: HarnessRuntimeIdentityV1 {
+                instance_id: 7,
+                generation: 3,
+            },
+            message_count: 12,
+            message_count_exact: true,
+            completed_turn_count: Some(5),
+            total_tokens: Some(900),
+        };
+        context_source.validate().unwrap();
+        let issuance = HarnessTaskLaunchIssuanceV1 {
+            issuance_id: HarnessTaskLaunchIssuanceId::new(format!(
+                "hissue_{}",
+                "1".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            digest: HarnessRequestDigest::new("1".repeat(64)).unwrap(),
+            task_id: task_id('1'),
+            task_revision: HarnessRevision::new(7).unwrap(),
+            plan: HarnessLaunchPlanRefV1 {
+                plan_id: selector("managed-review"),
+                revision: HarnessRevision::new(2).unwrap(),
+                digest: HarnessRequestDigest::new("2".repeat(64)).unwrap(),
+            },
+            target: HarnessLaunchTargetSelectionV1 {
+                node_id: selector("node-a"),
+                source_workspace_id: selector("workspace-a"),
+                worktree: HarnessLaunchWorktreeSelectionV1::Managed {
+                    profile_id: selector("review-tree"),
+                    expected_profile_revision: selector("revision-7"),
+                },
+                provider_profile: selector("claude"),
+                mode: HarnessExecutionModeV1::Pty,
+            },
+            context_source: Some(context_source.clone()),
+            delivery: Some(HarnessDeliveryBundleSelectionV1 {
+                bundle,
+                component_counts: vec![
+                    HarnessDeliveryComponentCountV1 {
+                        kind: HarnessDeliveryComponentKindV1::Skill,
+                        workspace_count: 2,
+                        session_count: 0,
+                    },
+                    HarnessDeliveryComponentCountV1 {
+                        kind: HarnessDeliveryComponentKindV1::Prompt,
+                        workspace_count: 0,
+                        session_count: 1,
+                    },
+                ],
+            }),
+            policy_digest: HarnessRequestDigest::new("3".repeat(64)).unwrap(),
+            created_at_unix_ms: 40,
+            updated_at_unix_ms: 40,
+        };
+        issuance.validate().unwrap();
+        let spec = HarnessTaskExecutionSpecV2 {
+            execution_spec_id: HarnessExecutionSpecId::new(format!(
+                "hespec_{}",
+                "5".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            task_id: task_id('1'),
+            launch_issuance: issuance.reference(),
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            created_at_unix_ms: 40,
+            updated_at_unix_ms: 40,
+        };
+        spec.validate().unwrap();
+        let encoded = serde_json::to_string(&(issuance, spec)).unwrap();
+        for sentinel in ["raw_path", "prompt_body", "credential", "provider_home"] {
+            assert!(!encoded.contains(sentinel));
+        }
+
+        let mut empty_context = context_source;
+        empty_context.message_count = 0;
+        empty_context.completed_turn_count = Some(0);
+        empty_context.total_tokens = Some(0);
+        assert_eq!(
+            empty_context.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+    }
+
+    #[test]
+    fn delivery_component_counts_are_scope_preserving_and_canonical() {
+        let bundle = HarnessDeliveryBundleV1 {
+            selector: selector("review-kit"),
+            bundle_id: HarnessDeliveryBundleIdV1::new("bundle.review-kit").unwrap(),
+            revision: HarnessDeliveryBundleRevisionV1::new("rev-7").unwrap(),
+            digest: HarnessDeliveryBundleDigestV1::new(format!(
+                "sha256:{}",
+                "d".repeat(64),
+            )).unwrap(),
+            manifest_digest: HarnessDeliveryManifestDigestV2::new(format!(
+                "sha256:{}",
+                "e".repeat(64),
+            )).unwrap(),
+        };
+        let mut selection = HarnessDeliveryBundleSelectionV1 {
+            bundle,
+            component_counts: vec![HarnessDeliveryComponentCountV1 {
+                kind: HarnessDeliveryComponentKindV1::Skill,
+                workspace_count: 1,
+                session_count: 2,
+            }],
+        };
+        selection.validate().unwrap();
+        selection.component_counts[0].workspace_count = 0;
+        selection.component_counts[0].session_count = 0;
+        assert_eq!(
+            selection.validate(),
+            Err(HarnessValidationError::InvalidDeliveryComponentCount),
+        );
+        selection.component_counts.clear();
+        assert_eq!(
+            selection.validate(),
+            Err(HarnessValidationError::InvalidDeliveryComponentCount),
+        );
     }
 
     #[test]

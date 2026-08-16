@@ -4020,6 +4020,53 @@ fn optional_transfer_timestamp(value: Option<u64>) -> String {
         .unwrap_or_else(|| "none".to_owned())
 }
 
+fn render_harness_launch_pager(
+    inner: Rect,
+    panel: crate::app::HarnessLaunchOptionPanel,
+    offset: usize,
+    count: usize,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) -> Rect {
+    if inner.height == 0 {
+        return inner;
+    }
+    let header = Rect::new(inner.x, inner.y, inner.width, 1);
+    let can_previous = offset > 0;
+    let mut x = render_toolbar_segment(
+        "[<]",
+        header.x,
+        header,
+        Style::default().fg(if can_previous { theme.teal } else { theme.muted }).bg(theme.surface),
+        can_previous.then_some(HitTarget::HarnessLaunchPanelPrevious(panel)),
+        buf,
+        layout,
+    ).saturating_add(1);
+    let can_next = offset.saturating_add(1) < count;
+    x = render_toolbar_segment(
+        "[>]",
+        x,
+        header,
+        Style::default().fg(if can_next { theme.teal } else { theme.muted }).bg(theme.surface),
+        can_next.then_some(HitTarget::HarnessLaunchPanelNext(panel)),
+        buf,
+        layout,
+    ).saturating_add(1);
+    let position = if count == 0 { "0/0".to_owned() } else { format!("{}/{}", offset + 1, count) };
+    if x < header.right() {
+        Paragraph::new(position)
+            .style(Style::default().fg(theme.muted).bg(theme.surface))
+            .render(Rect::new(x, header.y, header.right() - x, 1), buf);
+    }
+    Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    )
+}
+
 fn harness_transfer_lines(
     state: Option<&crate::app::HarnessRunTransferState>,
 ) -> Vec<String> {
@@ -4755,116 +4802,321 @@ fn render_harness_task_detail(
                     .render(Rect::new(body.x, y, body.width, 1), buf);
             }
         }
-        HarnessTaskDetailSection::Execution => {
-            let loading = app.harness_kanban.execution_detail_pending.contains(&task.task_id);
-            let failure = app.harness_kanban.execution_detail_failures.get(&task.task_id);
+        HarnessTaskDetailSection::Launch => {
             let pending = app.harness_kanban.execution_mutation.as_ref()
-                .filter(|pending| pending.task_id == task.task_id);
-            let status = if let Some(pending) = pending {
-                format!("Applying {:?}...", pending.kind)
-            } else if loading {
-                "Loading ordinary launch plans and saved execution spec...".to_owned()
-            } else if let Some(failure) = failure {
-                format!("Execution data unavailable: {failure}")
-            } else if let Some(spec) = app.harness_detail_execution_spec() {
-                format!(
-                    "Saved exact spec rev {} | plan {} rev {} | review {:?}",
-                    spec.revision.get(),
-                    spec.scheduled_launch.plan.plan_id.as_str(),
-                    spec.scheduled_launch.plan.revision.get(),
-                    spec.review_policy,
-                )
-            } else {
-                "No execution spec saved; choose a plan and use [Use plan]".to_owned()
+                .filter(|pending| pending.task.task_id == task.task_id
+                    && pending.task.task_revision == task.revision);
+            let status = match (pending, app.harness_launch_state()) {
+                (Some(pending), _) => format!("Launch mutation: {:?} | exact task r{}", pending.kind, task.revision.get()),
+                (_, None) => "Launch options: None | not loaded for this exact task revision".to_owned(),
+                (_, Some(crate::app::HarnessLaunchOptionsState::Loading { .. })) => {
+                    format!("Launch options: Loading exact task r{}...", task.revision.get())
+                }
+                (_, Some(crate::app::HarnessLaunchOptionsState::Error { message, .. })) => {
+                    format!("Launch options: Error | {message}")
+                }
+                (_, Some(crate::app::HarnessLaunchOptionsState::Ready(view))) => format!(
+                    "Launch options: Ready | plans {} | worktrees {} | contexts {} | deliveries {}{}",
+                    view.options.plans.len(),
+                    view.options.managed_worktree_profiles.len(),
+                    view.options.context_sources.len(),
+                    view.options.delivery_bundles.len(),
+                    if view.options.truncated { " | catalog truncated" } else { "" },
+                ),
             };
             if body.height > 0 {
                 Paragraph::new(truncate_cells(&status, body.width as usize))
-                    .style(Style::default().fg(if failure.is_some() { theme.yellow } else { theme.dim }).bg(theme.surface))
+                    .style(Style::default().fg(if status.contains("Error") { theme.yellow } else { theme.dim }).bg(theme.surface))
                     .render(Rect::new(body.x, body.y, body.width, 1), buf);
             }
-            let actions = Rect::new(
-                body.x,
-                body.y.saturating_add(1),
-                body.width,
-                body.height.saturating_sub(1).min(1),
-            );
-            let can_use = app.harness_selected_launch_plan().is_some()
-                && app.harness_kanban.execution_specs.contains_key(&task.task_id)
-                && pending.is_none();
+            let actions = Rect::new(body.x, body.y.saturating_add(1), body.width, body.height.saturating_sub(1).min(1));
+            let can_refresh = pending.is_none();
             let mut action_x = render_toolbar_segment(
-                "[Use plan]",
+                "[Refresh options]",
                 actions.x,
                 actions,
-                Style::default().fg(if can_use { theme.teal } else { theme.muted }).bg(theme.surface),
-                can_use.then_some(HitTarget::HarnessExecutionUsePlan),
+                Style::default().fg(if can_refresh { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_refresh.then_some(HitTarget::HarnessLaunchRefresh),
                 buf,
                 layout,
             ).saturating_add(1);
-            let can_start = app.harness_start_selected_enabled();
+            let can_save = app.harness_launch_save_enabled();
             action_x = render_toolbar_segment(
-                "[Start selected]",
+                "[Save spec]",
+                action_x,
+                actions,
+                Style::default().fg(if can_save { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_save.then_some(HitTarget::HarnessLaunchSave),
+                buf,
+                layout,
+            ).saturating_add(1);
+            let can_start = app.harness_launch_start_enabled();
+            let _ = render_toolbar_segment(
+                "[Start task]",
                 action_x,
                 actions,
                 Style::default().fg(if can_start { theme.teal } else { theme.muted }).bg(theme.surface),
-                can_start.then_some(HitTarget::HarnessExecutionStartSelected),
-                buf,
-                layout,
-            ).saturating_add(2);
-            let _ = render_toolbar_segment(
-                "[Run next Ready (global)]",
-                action_x,
-                actions,
-                Style::default().fg(theme.yellow).bg(theme.surface),
-                Some(HitTarget::HarnessScheduleNext),
+                can_start.then_some(HitTarget::HarnessLaunchStart),
                 buf,
                 layout,
             );
-            let header_y = body.y.saturating_add(3);
-            if header_y < body.bottom() {
-                Paragraph::new("Ordinary launch plans | node | workspace | profile | mode")
-                    .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
-                    .render(Rect::new(body.x, header_y, body.width, 1), buf);
+
+            let panels_area = Rect::new(
+                body.x,
+                body.y.saturating_add(2),
+                body.width,
+                body.height.saturating_sub(2),
+            );
+            let panels = split(
+                panels_area,
+                Direction::Vertical,
+                &[
+                    Constraint::Fixed(5),
+                    Constraint::Fixed(5),
+                    Constraint::Fixed(5),
+                    Constraint::Fixed(5),
+                    Constraint::Min(4),
+                ],
+            );
+            for (panel, title) in panels.iter().zip([
+                " Plan ",
+                " Worktree ",
+                " Context ",
+                " Delivery ",
+                " Current issuance ",
+            ]) {
+                Block::bordered()
+                    .title(title)
+                    .border_style(Style::default().fg(theme.border))
+                    .style(Style::default().bg(theme.surface))
+                    .render(*panel, buf);
             }
-            let mut y = header_y.saturating_add(1);
-            for (plan_id, plan) in &app.harness_kanban.launch_plans {
-                if y >= body.bottom() {
-                    break;
-                }
-                let selected = app.harness_kanban.selected_launch_plan.as_ref() == Some(plan_id);
-                let saved = app.harness_detail_execution_spec().is_some_and(|spec| {
-                    spec.scheduled_launch == plan.scheduled_launch
-                });
-                let background = if selected { theme.active } else { theme.surface };
-                let row = Rect::new(body.x, y, body.width, 1);
-                fill_rect(row, background, buf);
-                let marker = match (selected, saved) {
-                    (true, true) => "> saved",
-                    (true, false) => "> selected",
-                    (false, true) => "  saved",
-                    (false, false) => " ",
+            let inners = panels.iter().map(|panel| Rect::new(
+                panel.x.saturating_add(1),
+                panel.y.saturating_add(1),
+                panel.width.saturating_sub(2),
+                panel.height.saturating_sub(2),
+            )).collect::<Vec<_>>();
+            let Some(view) = app.harness_launch_view() else {
+                let label = match app.harness_launch_state() {
+                    None => "None",
+                    Some(crate::app::HarnessLaunchOptionsState::Loading { .. }) => "Loading",
+                    Some(crate::app::HarnessLaunchOptionsState::Error { .. }) => "Error",
+                    Some(crate::app::HarnessLaunchOptionsState::Ready(_)) => unreachable!(),
                 };
+                for inner in inners {
+                    if inner.height > 0 {
+                        Paragraph::new(label)
+                            .style(Style::default().fg(theme.muted).bg(theme.surface))
+                            .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
+                    }
+                }
+                return;
+            };
+
+            let plan_inner = render_harness_launch_pager(
+                inners[0],
+                crate::app::HarnessLaunchOptionPanel::Plan,
+                view.plan_offset,
+                view.options.plans.len(),
+                buf,
+                layout,
+                theme,
+            );
+            for (index, plan) in view.options.plans.iter()
+                .enumerate()
+                .skip(view.plan_offset)
+                .take(plan_inner.height as usize)
+            {
+                let selected = view.selected_plan == Some(index);
+                let visible = index.saturating_sub(view.plan_offset);
+                let row = Rect::new(plan_inner.x, plan_inner.y + visible as u16, plan_inner.width, 1);
+                let background = if selected { theme.active } else { theme.surface };
+                fill_rect(row, background, buf);
                 let line = format!(
-                    "{marker} {} r{} | {} | {} | {} | {:?}",
-                    plan_id.as_str(),
-                    plan.scheduled_launch.plan.revision.get(),
+                    "{} {} r{} | node {} | workspace {} | profile {} | {:?}",
+                    if selected { ">" } else { " " },
+                    plan.plan.plan_id.as_str(),
+                    plan.plan.revision.get(),
                     plan.node_id.as_str(),
-                    plan.workspace_id.as_str(),
+                    plan.source_workspace_id.as_str(),
                     plan.provider_profile.as_str(),
                     plan.mode,
                 );
                 Paragraph::new(truncate_cells(&line, row.width as usize))
                     .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
                     .render(row, buf);
-                layout.hits.push(HitRegion {
-                    rect: row,
-                    target: HitTarget::HarnessExecutionPlan(plan_id.clone()),
-                });
-                y = y.saturating_add(1);
+                layout.hits.push(HitRegion { rect: row, target: HitTarget::HarnessLaunchPlan(index) });
             }
-            if app.harness_kanban.launch_plans.is_empty() && y < body.bottom() {
-                Paragraph::new(if loading { "Loading plans..." } else { "No ordinary launch plans available" })
+            if view.options.plans.is_empty() && plan_inner.height > 0 {
+                Paragraph::new("No ordinary launch plans available")
                     .style(Style::default().fg(theme.muted).bg(theme.surface))
-                    .render(Rect::new(body.x, y, body.width, 1), buf);
+                    .render(Rect::new(plan_inner.x, plan_inner.y, plan_inner.width, 1), buf);
+            }
+
+            let selected_plan = view.selected_plan.and_then(|index| view.options.plans.get(index));
+            let compatible_profiles = view.options.managed_worktree_profiles.iter()
+                .enumerate()
+                .filter(|(_, profile)| selected_plan.is_some_and(|plan| {
+                    plan.node_id == profile.node_id
+                        && plan.source_workspace_id == profile.source_workspace_id
+                }))
+                .map(|(index, profile)| (Some(index), profile))
+                .collect::<Vec<_>>();
+            let worktree_count = compatible_profiles.len().saturating_add(1);
+            let worktree_inner = render_harness_launch_pager(
+                inners[1],
+                crate::app::HarnessLaunchOptionPanel::Worktree,
+                view.worktree_offset,
+                worktree_count,
+                buf,
+                layout,
+                theme,
+            );
+            for virtual_index in view.worktree_offset
+                ..worktree_count.min(view.worktree_offset.saturating_add(worktree_inner.height as usize))
+            {
+                let visible = virtual_index - view.worktree_offset;
+                let profile = virtual_index.checked_sub(1)
+                    .and_then(|index| compatible_profiles.get(index));
+                let selected = match profile {
+                    None => view.worktree == crate::app::HarnessLaunchWorktreeChoice::Existing,
+                    Some((Some(index), _)) => {
+                        view.worktree == crate::app::HarnessLaunchWorktreeChoice::Managed(*index)
+                    }
+                    Some((None, _)) => false,
+                };
+                let row = Rect::new(worktree_inner.x, worktree_inner.y + visible as u16, worktree_inner.width, 1);
+                let line = match profile {
+                    None => if selected { "> Existing workspace".to_owned() } else { "  Existing workspace".to_owned() },
+                    Some((_, profile)) => format!(
+                        "{} Managed {} r{} | {:?}",
+                        if selected { ">" } else { " " },
+                        profile.profile_id.as_str(),
+                        profile.profile_revision.as_str(),
+                        profile.retention,
+                    ),
+                };
+                let background = if selected { theme.active } else { theme.surface };
+                fill_rect(row, background, buf);
+                Paragraph::new(truncate_cells(&line, row.width as usize))
+                    .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
+                    .render(row, buf);
+                let target = match profile {
+                    None => HitTarget::HarnessLaunchWorktreeExisting,
+                    Some((Some(index), _)) => HitTarget::HarnessLaunchWorktreeProfile(*index),
+                    Some((None, _)) => continue,
+                };
+                layout.hits.push(HitRegion { rect: row, target });
+            }
+
+            let context_count = view.options.context_sources.len().saturating_add(1);
+            let context_inner = render_harness_launch_pager(
+                inners[2],
+                crate::app::HarnessLaunchOptionPanel::Context,
+                view.context_offset,
+                context_count,
+                buf,
+                layout,
+                theme,
+            );
+            for virtual_index in view.context_offset
+                ..context_count.min(view.context_offset.saturating_add(context_inner.height as usize))
+            {
+                let visible = virtual_index - view.context_offset;
+                let source = virtual_index.checked_sub(1)
+                    .and_then(|index| view.options.context_sources.get(index));
+                let selected = match source {
+                    None => view.selected_context.is_none(),
+                    Some(_) => view.selected_context == virtual_index.checked_sub(1),
+                };
+                let row = Rect::new(context_inner.x, context_inner.y + visible as u16, context_inner.width, 1);
+                let line = source.map(|source| format!(
+                        "{} run {} r{} | messages {}{} | turns {} | tokens {} | digest {}",
+                        if selected { ">" } else { " " },
+                        short_opaque_marker(source.source_run_id.as_str()),
+                        source.source_run_revision.get(),
+                        source.message_count,
+                        if source.message_count_exact { " exact" } else { "+" },
+                        source.completed_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned()),
+                        source.total_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned()),
+                        short_opaque_marker(source.metadata_digest.as_str()),
+                    ))
+                    .unwrap_or_else(|| if selected { "> None".to_owned() } else { "  None".to_owned() });
+                let background = if selected { theme.active } else { theme.surface };
+                fill_rect(row, background, buf);
+                Paragraph::new(truncate_cells(&line, row.width as usize))
+                    .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
+                    .render(row, buf);
+                let target = virtual_index.checked_sub(1)
+                    .map(HitTarget::HarnessLaunchContextSource)
+                    .unwrap_or(HitTarget::HarnessLaunchContextNone);
+                layout.hits.push(HitRegion { rect: row, target });
+            }
+
+            let delivery_count = view.options.delivery_bundles.len().saturating_add(1);
+            let delivery_inner = render_harness_launch_pager(
+                inners[3],
+                crate::app::HarnessLaunchOptionPanel::Delivery,
+                view.delivery_offset,
+                delivery_count,
+                buf,
+                layout,
+                theme,
+            );
+            for virtual_index in view.delivery_offset
+                ..delivery_count.min(view.delivery_offset.saturating_add(delivery_inner.height as usize))
+            {
+                let visible = virtual_index - view.delivery_offset;
+                let delivery = virtual_index.checked_sub(1)
+                    .and_then(|index| view.options.delivery_bundles.get(index));
+                let selected = match delivery {
+                    None => view.selected_delivery.is_none(),
+                    Some(_) => view.selected_delivery == virtual_index.checked_sub(1),
+                };
+                let row = Rect::new(delivery_inner.x, delivery_inner.y + visible as u16, delivery_inner.width, 1);
+                let line = delivery.map(|delivery| {
+                    let counts = delivery.component_counts.iter().map(|count| format!(
+                        "{:?} w{} s{}",
+                        count.kind,
+                        count.workspace_count,
+                        count.session_count,
+                    )).collect::<Vec<_>>().join(", ");
+                    format!(
+                        "{} {} | {} r{} | digest {} | {}",
+                        if selected { ">" } else { " " },
+                        delivery.bundle.selector.as_str(),
+                        delivery.bundle.bundle_id.as_str(),
+                        delivery.bundle.revision.as_str(),
+                        short_opaque_marker(delivery.bundle.digest.as_str()),
+                        counts,
+                    )
+                }).unwrap_or_else(|| if selected { "> None".to_owned() } else { "  None".to_owned() });
+                let background = if selected { theme.active } else { theme.surface };
+                fill_rect(row, background, buf);
+                Paragraph::new(truncate_cells(&line, row.width as usize))
+                    .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
+                    .render(row, buf);
+                let target = virtual_index.checked_sub(1)
+                    .map(HitTarget::HarnessLaunchDeliveryBundle)
+                    .unwrap_or(HitTarget::HarnessLaunchDeliveryNone);
+                layout.hits.push(HitRegion { rect: row, target });
+            }
+
+            let issuance_inner = inners[4];
+            if issuance_inner.height > 0 {
+                let line = view.options.current_issued_spec.as_ref().map(|spec| format!(
+                    "spec {} r{} | issuance {} r{} | digest {} | review {:?}",
+                    short_opaque_marker(spec.execution_spec_id.as_str()),
+                    spec.revision.get(),
+                    short_opaque_marker(spec.launch_issuance.issuance_id.as_str()),
+                    spec.launch_issuance.revision.get(),
+                    short_opaque_marker(spec.launch_issuance.digest.as_str()),
+                    spec.review_policy,
+                )).unwrap_or_else(|| "None | save an exact reviewed selection before start".to_owned());
+                Paragraph::new(truncate_cells(&line, issuance_inner.width as usize))
+                    .style(Style::default().fg(theme.dim).bg(theme.surface))
+                    .render(Rect::new(issuance_inner.x, issuance_inner.y, issuance_inner.width, 1), buf);
             }
         }
     }
@@ -8998,16 +9250,22 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 mod tests {
     use super::*;
     use gate4agent_harness_client::{
+        HarnessContextSourceSelectionV1,
         HarnessContinuationRef, HarnessContinuationStateV1, HarnessDeliveryBundleDigestV1,
-        HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1,
+        HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1, HarnessDeliveryBundleV1,
+        HarnessDeliveryBundleSelectionV1,
+        HarnessDeliveryComponentCountV1, HarnessDeliveryComponentKindV1,
         HarnessDeliveryManifestDigestV2, HarnessDeliveryRef, HarnessDeliveryStateV1,
-        HarnessExecutionModeV1, HarnessExecutionSpecId, HarnessLaunchAuthorityRefV1,
-        HarnessLaunchPlanRefV1, HarnessLaunchPlanSummaryV1, HarnessRequestDigest,
+        HarnessExecutionModeV1, HarnessExecutionSpecId, HarnessIssuedExecutionSpecSummaryV1,
+        HarnessLaunchPlanRefV1, HarnessManagedWorktreeProfileOptionV1,
+        HarnessManagedWorktreeRetentionV1, HarnessOrdinaryLaunchPlanOptionV1,
+        HarnessRequestDigest,
         HarnessReceiptRef, HarnessRevision, HarnessRunContextTransferV1,
         HarnessRunContinuationTransferV1, HarnessRunDeliveryTransferV1, HarnessRunId,
-        HarnessRunLifecycleV1, HarnessRunTransferSummaryV1, HarnessScheduledLaunchRefV2,
+        HarnessRunLifecycleV1, HarnessRunTransferSummaryV1,
         HarnessSelectorV1,
-        HarnessTaskExecutionSpecV1, HarnessTaskReviewPolicyV1, HarnessWorktreeIntentV1,
+        HarnessTaskLaunchIssuanceId, HarnessTaskLaunchIssuanceRefV1,
+        HarnessTaskLaunchOptionsV1, HarnessTaskReviewPolicyV1,
         HarnessTaskId, HarnessTaskStateV1, RedactedBindingStateV1,
         RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1,
         RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
@@ -9039,7 +9297,7 @@ mod tests {
         TerminalMouseProtocolEncoding, TerminalSize,
     };
     use crate::app::{
-        AgentMenuAction, AgentMenuState, CreateWorkspaceEntryDialog, CreateWorktreeDialog,
+        AgentMenuAction, AgentMenuState, AppAction, CreateWorkspaceEntryDialog, CreateWorktreeDialog,
         DragSource, FolderBrowserDialog, HistoryDialog, LoadedHistoryView, ManagedSessionView,
         NativeSessionMenuAction, NativeSessionMenuState, NodeView, Provider, ProviderInventory,
         SessionAddress, SessionView, SpawnDialog, WorkspaceView,
@@ -9955,7 +10213,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_task_detail_execution_is_mouse_first_and_keeps_global_scheduler_distinct() {
+    fn harness_task_detail_launch_is_bordered_mouse_first_and_private() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.harness_kanban.enabled = true;
         app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
@@ -9976,71 +10234,290 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         };
-        let scheduled_launch = HarnessScheduledLaunchRefV2 {
+        let plan = HarnessOrdinaryLaunchPlanOptionV1 {
             plan: HarnessLaunchPlanRefV1 {
                 plan_id: gate4agent_harness_protocol::HarnessSelectorV1::new("ordinary-codex").unwrap(),
                 revision: HarnessRevision::new(4).unwrap(),
                 digest: HarnessRequestDigest::new("a".repeat(64)).unwrap(),
             },
-            authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
-        };
-        let plan = HarnessLaunchPlanSummaryV1 {
-            scheduled_launch: scheduled_launch.clone(),
             node_id: gate4agent_harness_protocol::HarnessSelectorV1::new("node-a").unwrap(),
-            workspace_id: gate4agent_harness_protocol::HarnessSelectorV1::new("workspace-a").unwrap(),
-            worktree: HarnessWorktreeIntentV1::Existing,
+            source_workspace_id: gate4agent_harness_protocol::HarnessSelectorV1::new("workspace-a").unwrap(),
             provider_profile: gate4agent_harness_protocol::HarnessSelectorV1::new("codex-default").unwrap(),
             provider_id: gate4agent_harness_protocol::HarnessSelectorV1::new("codex").unwrap(),
             mode: HarnessExecutionModeV1::Pty,
         };
-        let spec = HarnessTaskExecutionSpecV1 {
-            execution_spec_id: HarnessExecutionSpecId::new(format!(
-                "hespec_{}",
-                "d".repeat(24),
+        let issuance = HarnessTaskLaunchIssuanceRefV1 {
+            issuance_id: HarnessTaskLaunchIssuanceId::new(format!(
+                "hissue_{}",
+                "1".repeat(24),
             )).unwrap(),
             revision: HarnessRevision::new(2).unwrap(),
-            task_id: task.task_id.clone(),
-            scheduled_launch: scheduled_launch.clone(),
-            scheduled_launch_digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
-            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 2,
+            digest: HarnessRequestDigest::new("2".repeat(64)).unwrap(),
         };
-        assert_ne!(
-            spec.scheduled_launch_digest,
-            scheduled_launch.plan.digest,
-            "render gate must not equate the whole scheduled-launch digest with plan.digest",
-        );
+        let mut options = HarnessTaskLaunchOptionsV1 {
+            task_id: task.task_id.clone(),
+            task_revision: task.revision,
+            policy_digest: HarnessRequestDigest::new("3".repeat(64)).unwrap(),
+            plans: vec![plan],
+            managed_worktree_profiles: vec![HarnessManagedWorktreeProfileOptionV1 {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+                source_workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                profile_id: HarnessSelectorV1::new("review").unwrap(),
+                profile_revision: HarnessSelectorV1::new("review.r7").unwrap(),
+                retention: HarnessManagedWorktreeRetentionV1::RemoveWhenReleased,
+                observed_at_unix_ms: 90,
+            }],
+            context_sources: vec![HarnessContextSourceSelectionV1 {
+                source_run_id: HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap(),
+                source_run_revision: HarnessRevision::new(7).unwrap(),
+                observed_at_unix_ms: 90,
+                metadata_digest: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+                workspace_id: HarnessSelectorV1::new("source-workspace").unwrap(),
+                session_record_id: HarnessSelectorV1::new("record-private").unwrap(),
+                active_session: gate4agent_harness_client::HarnessRuntimeIdentityV1 {
+                    instance_id: 41,
+                    generation: 3,
+                },
+                message_count: 12,
+                message_count_exact: true,
+                completed_turn_count: Some(5),
+                total_tokens: Some(4096),
+            }],
+            delivery_bundles: vec![HarnessDeliveryBundleSelectionV1 {
+                bundle: HarnessDeliveryBundleV1 {
+                    selector: HarnessSelectorV1::new("review-kit").unwrap(),
+                    bundle_id: HarnessDeliveryBundleIdV1::new("bundle.review-kit").unwrap(),
+                    revision: HarnessDeliveryBundleRevisionV1::new("revision-7").unwrap(),
+                    digest: HarnessDeliveryBundleDigestV1::new(format!("sha256:{}", "e".repeat(64))).unwrap(),
+                    manifest_digest: HarnessDeliveryManifestDigestV2::new(format!("sha256:{}", "f".repeat(64))).unwrap(),
+                },
+                component_counts: vec![HarnessDeliveryComponentCountV1 {
+                    kind: HarnessDeliveryComponentKindV1::Skill,
+                    workspace_count: 2,
+                    session_count: 1,
+                }],
+            }],
+            current_issued_spec: Some(HarnessIssuedExecutionSpecSummaryV1 {
+                task_id: task.task_id.clone(),
+                execution_spec_id: HarnessExecutionSpecId::new(format!("hespec_{}", "4".repeat(24))).unwrap(),
+                revision: issuance.revision,
+                launch_issuance: issuance,
+                review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+                created_at_unix_ms: 80,
+                updated_at_unix_ms: 90,
+            }),
+            truncated: false,
+        };
+        for index in 2..=3 {
+            let mut extra_plan = options.plans[0].clone();
+            extra_plan.plan.plan_id = HarnessSelectorV1::new(format!(
+                "ordinary-codex-{index}",
+            )).unwrap();
+            extra_plan.plan.revision = HarnessRevision::new(3 + index).unwrap();
+            options.plans.push(extra_plan);
+
+            let mut extra_profile = options.managed_worktree_profiles[0].clone();
+            extra_profile.profile_id = HarnessSelectorV1::new(format!("review-{index}")).unwrap();
+            extra_profile.profile_revision = HarnessSelectorV1::new(format!("review.r{index}")).unwrap();
+            options.managed_worktree_profiles.push(extra_profile);
+
+            let mut extra_context = options.context_sources[0].clone();
+            let run_character = if index == 2 { "d" } else { "e" };
+            extra_context.source_run_id = HarnessRunId::new(format!(
+                "hrun_{}",
+                run_character.repeat(24),
+            )).unwrap();
+            extra_context.source_run_revision = HarnessRevision::new(7 + index).unwrap();
+            options.context_sources.push(extra_context);
+
+            let mut extra_delivery = options.delivery_bundles[0].clone();
+            extra_delivery.bundle.bundle_id = HarnessDeliveryBundleIdV1::new(format!(
+                "bundle.review-kit-{index}",
+            )).unwrap();
+            extra_delivery.bundle.revision = HarnessDeliveryBundleRevisionV1::new(format!(
+                "revision-{index}",
+            )).unwrap();
+            options.delivery_bundles.push(extra_delivery);
+        }
+        options.validate().unwrap();
         app.begin_harness_refresh(1);
         app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
         app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
             task_id: task.task_id.clone(),
-            section: crate::app::HarnessTaskDetailSection::Execution,
+            section: crate::app::HarnessTaskDetailSection::Launch,
             selected_run: None,
             scroll: 0,
         });
-        app.apply_harness_task_execution(task.task_id, vec![plan.clone()], Some(spec));
+        app.harness_kanban.launch_options.insert(
+            crate::app::HarnessTaskRef {
+                task_id: task.task_id,
+                task_revision: task.revision,
+            },
+            crate::app::HarnessLaunchOptionsState::Ready(
+                crate::app::HarnessLaunchOptionsView {
+                    options,
+                    selected_plan: Some(0),
+                    worktree: crate::app::HarnessLaunchWorktreeChoice::Existing,
+                    selected_context: None,
+                    selected_delivery: None,
+                    plan_offset: 0,
+                    worktree_offset: 0,
+                    context_offset: 0,
+                    delivery_offset: 0,
+                },
+            ),
+        );
 
-        let mut buf = TerminalBuffer::new(120, 28);
+        let mut buf = TerminalBuffer::new(190, 38);
         let layout = render(&app, &mut buf);
         let text = buffer_text(&buf);
         for label in [
-            "[Execution]",
-            "[Use plan]",
-            "[Start selected]",
-            "[Run next Ready (global)]",
-            "Ordinary launch plans",
+            "[Launch]",
+            "[Refresh options]",
+            "[Save spec]",
+            "[Start task]",
+            "Plan",
+            "Worktree",
+            "Context",
+            "Delivery",
+            "Current issuance",
             "ordinary-codex",
-            "saved",
+            "Managed review rreview.r7",
+            "messages 12 exact",
+            "Skill w2 s1",
+            "issuance hissue_11111...111111 r2",
         ] {
-            assert!(text.contains(label), "missing execution control {label}: {text}");
+            assert!(text.contains(label), "missing Launch control {label}: {text}");
         }
-        assert!(layout.hits.iter().any(|hit| {
-            hit.target == HitTarget::HarnessExecutionPlan(plan.scheduled_launch.plan.plan_id.clone())
-        }));
-        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessExecutionUsePlan));
-        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessExecutionStartSelected));
-        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessScheduleNext));
+        for target in [
+            HitTarget::HarnessLaunchRefresh,
+            HitTarget::HarnessLaunchPlan(0),
+            HitTarget::HarnessLaunchWorktreeExisting,
+            HitTarget::HarnessLaunchWorktreeProfile(0),
+            HitTarget::HarnessLaunchContextNone,
+            HitTarget::HarnessLaunchContextSource(0),
+            HitTarget::HarnessLaunchDeliveryNone,
+            HitTarget::HarnessLaunchDeliveryBundle(0),
+            HitTarget::HarnessLaunchSave,
+            HitTarget::HarnessLaunchStart,
+        ] {
+            assert!(layout.hits.iter().any(|hit| hit.target == target), "missing hit {target:?}");
+        }
+        assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessScheduleNext));
+        for forbidden in [
+            "record-private",
+            "instance_id",
+            "C:\\private\\workspace",
+            "RAW_PAYLOAD_CANARY",
+        ] {
+            assert!(!text.contains(forbidden), "private Launch field rendered: {text}");
+        }
+        assert!(!text.contains(&format!("sha256:{}", "e".repeat(64))), "{text}");
+        assert_eq!(app.surface.all_tabs().iter().filter(|tab| ***tab == SurfaceTab::AgentBoard).count(), 1);
+
+        app.layout = layout;
+        for panel in [
+            crate::app::HarnessLaunchOptionPanel::Plan,
+            crate::app::HarnessLaunchOptionPanel::Worktree,
+            crate::app::HarnessLaunchOptionPanel::Context,
+            crate::app::HarnessLaunchOptionPanel::Delivery,
+        ] {
+            let target = HitTarget::HarnessLaunchPanelNext(panel);
+            let rect = app.layout.hits.iter().find(|hit| hit.target == target).unwrap().rect;
+            assert_eq!(app.click(rect.x, rect.y), AppAction::None);
+            assert_eq!(app.click(rect.x, rect.y), AppAction::None);
+        }
+        let view = app.harness_launch_view().unwrap();
+        assert_eq!(view.selected_plan, Some(2));
+        assert_eq!(view.worktree, crate::app::HarnessLaunchWorktreeChoice::Managed(1));
+        assert_eq!(view.selected_context, Some(1));
+        assert_eq!(view.selected_delivery, Some(1));
+        let mut later_buf = TerminalBuffer::new(190, 38);
+        render(&app, &mut later_buf);
+        let later_text = buffer_text(&later_buf);
+        for expected in [
+            "ordinary-codex-3",
+            "Managed review-2 rreview.r2",
+            "hrun_ddddddd...dddddd",
+            "bundle.review-kit-2",
+        ] {
+            assert!(later_text.contains(expected), "later Launch row unreachable: {later_text}");
+        }
+    }
+
+    #[test]
+    fn harness_task_detail_launch_renders_none_loading_and_terminal_error() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let tab_count = app.surface.all_tabs().len();
+        let task = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_919191919191919191919191").unwrap(),
+            revision: HarnessRevision::new(5).unwrap(),
+            title: "launch states".to_owned(),
+            body: String::new(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Ready,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
+        app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
+            task_id: task.task_id.clone(),
+            section: crate::app::HarnessTaskDetailSection::Launch,
+            selected_run: None,
+            scroll: 0,
+        });
+        let task_ref = crate::app::HarnessTaskRef {
+            task_id: task.task_id,
+            task_revision: task.revision,
+        };
+
+        let mut none_buf = TerminalBuffer::new(150, 34);
+        render(&app, &mut none_buf);
+        assert!(buffer_text(&none_buf).contains(
+            "Launch options: None | not loaded for this exact task revision"
+        ));
+
+        app.harness_kanban.launch_options.insert(
+            task_ref.clone(),
+            crate::app::HarnessLaunchOptionsState::Loading { token: 17 },
+        );
+        let mut loading_buf = TerminalBuffer::new(150, 34);
+        render(&app, &mut loading_buf);
+        assert!(buffer_text(&loading_buf).contains("Launch options: Loading exact task r5"));
+
+        app.harness_kanban.launch_options.insert(
+            task_ref,
+            crate::app::HarnessLaunchOptionsState::Error {
+                token: 17,
+                message: "conflict: task revision changed".to_owned(),
+            },
+        );
+        let mut error_buf = TerminalBuffer::new(150, 34);
+        let layout = render(&app, &mut error_buf);
+        assert!(buffer_text(&error_buf).contains(
+            "Launch options: Error | conflict: task revision changed"
+        ));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessLaunchRefresh));
+        assert_eq!(app.surface.all_tabs().len(), tab_count);
+        assert_eq!(
+            app.surface.all_tabs().iter()
+                .filter(|tab| ***tab == SurfaceTab::AgentBoard)
+                .count(),
+            1,
+        );
     }
 
     #[test]

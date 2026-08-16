@@ -18,33 +18,47 @@ use std::{
 
 const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
 const OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
+const USAGE: &str = "usage: gate4agent-harness --harness-db ABSOLUTE_PATH --observation-db ABSOLUTE_PATH --c2-endpoint LOCAL_ENDPOINT --read-bind 127.0.0.1:PORT [--launch-plan-json JSON]... [--delivery-bundle-json JSON]...\n\
+     operator credential env: GATE4AGENT_HARNESS_OPERATOR_TOKEN\n\
+     c2 control token env: GATE4AGENT_C2_TOKEN";
 
 #[tokio::main]
 async fn main() {
-    if run().await.is_err() {
-        eprintln!("gate4agent harness failed");
-        std::process::exit(1);
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments.iter().any(|argument| argument == "--help" || argument == "-h") {
+        println!("{USAGE}");
+        return;
+    }
+    if let Err(error) = run(arguments).await {
+        fail(&error);
     }
 }
 
-async fn run() -> Result<(), ()> {
-    let config = Config::parse(env::args().skip(1))?;
+async fn run(arguments: Vec<String>) -> Result<(), String> {
+    let config = Config::parse(arguments.into_iter())?;
     if database_paths_alias(&config.harness_db, &config.observation_db) {
-        return Err(());
+        return Err(
+            "--harness-db and --observation-db resolve to the same SQLite file family".to_owned(),
+        );
     }
     let operator_token = take_required_env(OPERATOR_TOKEN_ENV)?;
-    let operator_credential = HarnessOperatorCredential::parse(operator_token).map_err(|_| ())?;
-    let token = take_required_env(C2_TOKEN_ENV)?;
+    let operator_credential = HarnessOperatorCredential::parse(operator_token)
+        .map_err(|error| format!("{OPERATOR_TOKEN_ENV} is malformed: {error}"))?;
+    let c2_token = take_required_env(C2_TOKEN_ENV)?;
     let launch = HarnessLaunchCatalog::from_json_arguments(config.launch_plan_json)
-        .map_err(|_| ())?;
+        .map_err(|error| format!("--launch-plan-json is invalid: {error}"))?;
     let delivery = compile_delivery_catalog_from_json_arguments(config.delivery_bundle_json)
-        .map_err(|_| ())?;
-    let catalogs = HarnessRuntimeCatalogs::new(launch, delivery).map_err(|_| ())?;
-    let harness = HarnessService::open(&config.harness_db).map_err(|_| ())?;
-    let observation = ObservationService::open(&config.observation_db).map_err(|_| ())?;
-    let (adapter, events) = HarnessC2Adapter::connect(&config.c2_endpoint, &token)
-        .await.map_err(|_| ())?;
-    drop(token);
+        .map_err(|error| format!("--delivery-bundle-json is invalid: {error}"))?;
+    let catalogs = HarnessRuntimeCatalogs::new(launch, delivery)
+        .map_err(|error| format!("launch catalog does not match delivery catalog: {error}"))?;
+    let harness = HarnessService::open(&config.harness_db)
+        .map_err(|error| format!("--harness-db failed to open: {error}"))?;
+    let observation = ObservationService::open(&config.observation_db)
+        .map_err(|error| format!("--observation-db failed to open: {error}"))?;
+    let (adapter, events) = HarnessC2Adapter::connect(&config.c2_endpoint, &c2_token)
+        .await
+        .map_err(|error| format!("--c2-endpoint connect failed: {error}"))?;
+    drop(c2_token);
     let (host, task) = start_harness_host_with_operator_and_catalogs(
         harness,
         observation,
@@ -53,19 +67,37 @@ async fn run() -> Result<(), ()> {
         config.read_bind,
         Some(operator_credential),
         catalogs,
-    ).await.map_err(|_| ())?;
+    )
+        .await
+        .map_err(|error| format!("harness host failed to start: {error}"))?;
     let endpoint = host.endpoint().socket_addr();
     println!("HARNESS_READ_ENDPOINT={endpoint}");
     println!("GATE4AGENT_HARNESS_OPERATOR_ENDPOINT={endpoint}");
-    tokio::signal::ctrl_c().await.map_err(|_| ())?;
-    host.shutdown().await.map_err(|_| ())?;
-    task.await.map_err(|_| ())?.map_err(|_| ())
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|error| format!("Ctrl-C signal wait failed: {error}"))?;
+    host.shutdown()
+        .await
+        .map_err(|error| format!("harness host shutdown failed: {error}"))?;
+    task.await
+        .map_err(|error| format!("harness host task panicked: {error}"))?
+        .map_err(|error| format!("harness host stopped with an error: {error}"))
 }
 
-fn take_required_env(name: &str) -> Result<String, ()> {
-    let value = env::var(name).map_err(|_| ())?;
+fn fail(message: &str) -> ! {
+    eprintln!("gate4agent-harness: {message}");
+    std::process::exit(2)
+}
+
+fn take_required_env(name: &str) -> Result<String, String> {
+    let value = env::var(name)
+        .map_err(|_| format!("{name} is required and must be valid Unicode"))?;
     env::remove_var(name);
     Ok(value)
+}
+
+fn required_value(flag: &str, value: Option<String>) -> Result<String, String> {
+    value.ok_or_else(|| format!("{flag} requires a value"))
 }
 
 struct Config {
@@ -78,7 +110,7 @@ struct Config {
 }
 
 impl Config {
-    fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, ()> {
+    fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut harness_db = None;
         let mut observation_db = None;
         let mut c2_endpoint = None;
@@ -87,30 +119,54 @@ impl Config {
         let mut delivery_bundle_json = Vec::new();
         let mut arguments = arguments;
         while let Some(flag) = arguments.next() {
-            let value = arguments.next().ok_or(())?;
             match flag.as_str() {
-                "--harness-db" if harness_db.is_none() => harness_db = Some(PathBuf::from(value)),
-                "--observation-db" if observation_db.is_none() => {
-                    observation_db = Some(PathBuf::from(value));
-                }
-                "--c2-endpoint" if c2_endpoint.is_none() => c2_endpoint = Some(value),
-                "--read-bind" if read_bind.is_none() => {
-                    let address: SocketAddr = value.parse().map_err(|_| ())?;
-                    if address.ip() != std::net::Ipv4Addr::LOCALHOST {
-                        return Err(());
+                "--harness-db" => {
+                    let value = required_value("--harness-db", arguments.next())?;
+                    if harness_db.replace(PathBuf::from(value)).is_some() {
+                        return Err("--harness-db may only be supplied once".to_owned());
                     }
-                    read_bind = Some(address);
                 }
-                "--launch-plan-json" => launch_plan_json.push(value),
-                "--delivery-bundle-json" => delivery_bundle_json.push(value),
-                _ => return Err(()),
+                "--observation-db" => {
+                    let value = required_value("--observation-db", arguments.next())?;
+                    if observation_db.replace(PathBuf::from(value)).is_some() {
+                        return Err("--observation-db may only be supplied once".to_owned());
+                    }
+                }
+                "--c2-endpoint" => {
+                    let value = required_value("--c2-endpoint", arguments.next())?;
+                    if c2_endpoint.replace(value).is_some() {
+                        return Err("--c2-endpoint may only be supplied once".to_owned());
+                    }
+                }
+                "--read-bind" => {
+                    let value = required_value("--read-bind", arguments.next())?;
+                    let address: SocketAddr = value
+                        .parse()
+                        .map_err(|_| "--read-bind must be an IP socket address".to_owned())?;
+                    if address.ip() != std::net::Ipv4Addr::LOCALHOST {
+                        return Err("--read-bind must be a loopback IPv4 socket address".to_owned());
+                    }
+                    if read_bind.replace(address).is_some() {
+                        return Err("--read-bind may only be supplied once".to_owned());
+                    }
+                }
+                "--launch-plan-json" => {
+                    launch_plan_json.push(required_value("--launch-plan-json", arguments.next())?);
+                }
+                "--delivery-bundle-json" => {
+                    delivery_bundle_json.push(
+                        required_value("--delivery-bundle-json", arguments.next())?,
+                    );
+                }
+                unknown => return Err(format!("unknown argument: {unknown}")),
             }
         }
         Ok(Self {
-            harness_db: harness_db.ok_or(())?,
-            observation_db: observation_db.ok_or(())?,
-            c2_endpoint: c2_endpoint.ok_or(())?,
-            read_bind: read_bind.ok_or(())?,
+            harness_db: harness_db.ok_or_else(|| "--harness-db is required".to_owned())?,
+            observation_db: observation_db
+                .ok_or_else(|| "--observation-db is required".to_owned())?,
+            c2_endpoint: c2_endpoint.ok_or_else(|| "--c2-endpoint is required".to_owned())?,
+            read_bind: read_bind.ok_or_else(|| "--read-bind is required".to_owned())?,
             launch_plan_json,
             delivery_bundle_json,
         })

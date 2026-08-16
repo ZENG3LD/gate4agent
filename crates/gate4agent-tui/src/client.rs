@@ -26,7 +26,8 @@ use gate4agent_c2_protocol::{
     NodeTransportState, C2WorkspaceInspection,
 };
 use gate4agent_node_protocol::{
-    AgentProgressV1, CapabilityId, ControllerState, GitCommitDetails, GitDiff, GitDiffMode,
+    AgentProgressV1, CapabilityId, ControllerState, GitCommitDetails, GitCommitSummary, GitDiff, GitDiffMode,
+    GitSnapshot, GitStatusEntry,
     GitDiffRequest, GitHistoryPage, GitObjectId, HostDirectoryListing, ManagedSessionRecord,
     ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeSpawnReceipt,
     ManagedWorktreeSpawnRequest,
@@ -39,7 +40,7 @@ use gate4agent_node_protocol::{
     SpawnContextId, SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides,
     SpawnProfileId, SpawnProfileRevision, SpawnPrompt, SpawnRequiredCapabilities, SpawnSpec,
     SpawnTarget,
-    RepositoryPath, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFileRead,
+    RepositoryPath, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead,
     WorkspaceFileRevision, WorkspaceId,
     WorktreeProfileId, MAX_NODE_TEXT_BYTES,
     NODE_OBSERVATION_EVENTS_CAPABILITY, NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
@@ -55,6 +56,11 @@ use gate4agent_harness_client::{
     HarnessOperatorActionV1, HarnessOperatorClient, HarnessOperatorCredential,
     HarnessOperatorIntentV1, HarnessOperatorMutationOutcomeV1, HarnessOperatorRequestRefV1,
     HarnessOperatorResponseV1, HarnessLaunchPlanSummaryV1, HarnessTaskExecutionSpecV1,
+    HarnessGitDiffModeV1, HarnessGitObjectIdV1, HarnessGitStatusCodeV1,
+    HarnessOperatorClientError, HarnessOperatorHostErrorV1, HarnessRepositoryPathV1,
+    HarnessRunGitDiffV1, HarnessRunGitHistoryPageV1, HarnessRunWorkspaceFileV1,
+    HarnessRunWorkspaceInspectionV1, HarnessRunWorkspaceOriginV1,
+    HarnessWorkspaceEntryKindV1, HarnessWorkspaceFileContentV1,
     HarnessTaskStartOutcomeV1, RedactedBindingStateV1, RedactedRunV1, HarnessRunCorrelationV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
@@ -86,7 +92,8 @@ use crate::app::{
     host_path_display, App, AppAction, ConnectionState, NodeView, Provider, ProviderInventory, PtyColorMode,
     ManagedSessionView, NativeSessionCatalogRoute, NativeSessionCatalogRowView, NativeSessionPreviewMessageView,
     NativeSessionPreviewView, SessionAddress, SessionView, UiKey, GitCommitView,
-    WorkspaceFileTabKey, WorkspaceGitDiffTarget, WorkspaceGitDiffView,
+    HarnessReadFailure, HarnessRunOrigin, HarnessRunRef, HarnessWorkspaceFileTabKey,
+    HarnessWorkspaceGitRequestDestination, WorkspaceFileTabKey, WorkspaceGitDiffTarget, WorkspaceGitDiffView,
     SessionMonitorSupport, WorkspaceGitRequestDestination, WorkspaceView,
 };
 #[cfg(test)]
@@ -664,6 +671,46 @@ enum WorkerUpdate {
         token: u64,
         task_id: gate4agent_harness_client::HarnessTaskId,
         message: String,
+    },
+    HarnessWorkspaceInspected {
+        run: HarnessRunRef,
+        token: u64,
+        inspection: HarnessRunWorkspaceInspectionV1,
+    },
+    HarnessWorkspaceInspectionFailed {
+        run: HarnessRunRef,
+        token: u64,
+        failure: HarnessReadFailure,
+    },
+    HarnessWorkspaceFileRead {
+        key: HarnessWorkspaceFileTabKey,
+        token: u64,
+        file: HarnessRunWorkspaceFileV1,
+    },
+    HarnessWorkspaceFileFailed {
+        key: HarnessWorkspaceFileTabKey,
+        token: u64,
+        failure: HarnessReadFailure,
+    },
+    HarnessGitHistoryRead {
+        destination: HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        page: HarnessRunGitHistoryPageV1,
+    },
+    HarnessGitHistoryFailed {
+        destination: HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        failure: HarnessReadFailure,
+    },
+    HarnessGitDiffRead {
+        destination: HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        diff: HarnessRunGitDiffV1,
+    },
+    HarnessGitDiffFailed {
+        destination: HarnessWorkspaceGitRequestDestination,
+        token: u64,
+        failure: HarnessReadFailure,
     },
     Notice(String),
 }
@@ -1438,6 +1485,39 @@ fn reject_harness_queue_action(
     action: &AppAction,
     rejection: HarnessQueueRejection,
 ) -> bool {
+    let detail_failure = || HarnessReadFailure {
+        category: match rejection {
+            HarnessQueueRejection::Busy => "busy",
+            HarnessQueueRejection::Unavailable => "unavailable",
+        }.to_owned(),
+        message: match rejection {
+            HarnessQueueRejection::Busy => "Harness detail/read command queue is full",
+            HarnessQueueRejection::Unavailable => "Harness detail/read command queue is closed",
+        }.to_owned(),
+    };
+    match action {
+        AppAction::HarnessInspectWorkspace { run, token } => {
+            app.fail_harness_workspace_inspection(run, *token, detail_failure());
+            return true;
+        }
+        AppAction::HarnessReadWorkspaceFile { origin, path, token } => {
+            app.fail_harness_workspace_file(
+                &HarnessWorkspaceFileTabKey { origin: origin.clone(), path: path.clone() },
+                *token,
+                detail_failure(),
+            );
+            return true;
+        }
+        AppAction::HarnessReadGitHistory { destination, token, .. } => {
+            app.fail_harness_git_history(destination, *token, detail_failure());
+            return true;
+        }
+        AppAction::HarnessReadGitDiff { destination, token, .. } => {
+            app.fail_harness_git_diff(destination, *token, detail_failure());
+            return true;
+        }
+        _ => {}
+    }
     if let AppAction::HarnessOpenMonitor { run_id } = action {
         let message = match rejection {
             HarnessQueueRejection::Busy => {
@@ -1516,6 +1596,10 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
         action,
         AppAction::HarnessOpenMonitor { .. }
             | AppAction::HarnessLoadTaskCorrelations { .. }
+            | AppAction::HarnessInspectWorkspace { .. }
+            | AppAction::HarnessReadWorkspaceFile { .. }
+            | AppAction::HarnessReadGitHistory { .. }
+            | AppAction::HarnessReadGitDiff { .. }
     )
 }
 
@@ -1589,6 +1673,10 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessLoadTaskCorrelations { .. }
         | AppAction::HarnessUseLaunchPlan { .. }
         | AppAction::HarnessStartTask { .. } => Some(HARNESS_COMMAND_ROUTE),
+        AppAction::HarnessInspectWorkspace { .. }
+        | AppAction::HarnessReadWorkspaceFile { .. }
+        | AppAction::HarnessReadGitHistory { .. }
+        | AppAction::HarnessReadGitDiff { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
         AppAction::None | AppAction::Quit => None,
     }
 }
@@ -2354,8 +2442,282 @@ fn harness_detail_worker(
                     return;
                 }
             }
+            AppAction::HarnessInspectWorkspace { run, token } => {
+                let update = match client.inspect_run_workspace(run.run_id.clone()) {
+                    Ok(inspection) => WorkerUpdate::HarnessWorkspaceInspected {
+                        run,
+                        token,
+                        inspection,
+                    },
+                    Err(error) => WorkerUpdate::HarnessWorkspaceInspectionFailed {
+                        run,
+                        token,
+                        failure: project_harness_read_failure(error),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessReadWorkspaceFile { origin, path, token } => {
+                let key = HarnessWorkspaceFileTabKey {
+                    origin: origin.clone(),
+                    path: path.clone(),
+                };
+                let result = project_harness_repository_path(&path)
+                    .and_then(|path| {
+                        client.read_run_workspace_file(origin.run.run_id.clone(), path)
+                    });
+                let update = match result {
+                    Ok(file) => WorkerUpdate::HarnessWorkspaceFileRead { key, token, file },
+                    Err(error) => WorkerUpdate::HarnessWorkspaceFileFailed {
+                        key,
+                        token,
+                        failure: project_harness_read_failure(error),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessReadGitHistory {
+                origin,
+                path,
+                before,
+                limit,
+                token,
+                destination,
+            } => {
+                let result = (|| {
+                    let path = path.as_ref().map(project_harness_repository_path).transpose()?;
+                    let before = before.map(HarnessGitObjectIdV1::new).transpose()
+                        .map_err(HarnessOperatorClientError::Api)?;
+                    client.read_run_git_history(
+                        origin.run.run_id.clone(),
+                        path,
+                        before,
+                        limit,
+                    )
+                })();
+                let update = match result {
+                    Ok(page) => WorkerUpdate::HarnessGitHistoryRead {
+                        destination,
+                        token,
+                        page,
+                    },
+                    Err(error) => WorkerUpdate::HarnessGitHistoryFailed {
+                        destination,
+                        token,
+                        failure: project_harness_read_failure(error),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessReadGitDiff {
+                origin,
+                target,
+                token,
+                destination,
+            } => {
+                let result = (|| {
+                    let (mode, path) = project_harness_git_diff_target(&target)?;
+                    client.read_run_git_diff(origin.run.run_id.clone(), mode, path)
+                })();
+                let update = match result {
+                    Ok(diff) => WorkerUpdate::HarnessGitDiffRead {
+                        destination,
+                        token,
+                        diff,
+                    },
+                    Err(error) => WorkerUpdate::HarnessGitDiffFailed {
+                        destination,
+                        token,
+                        failure: project_harness_read_failure(error),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
             _ => {}
         }
+    }
+}
+
+fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessReadFailure {
+    let category = match &error {
+        HarnessOperatorClientError::Host(host) => match host {
+            HarnessOperatorHostErrorV1::InvalidRequest => "invalid-request",
+            HarnessOperatorHostErrorV1::Unauthorized => "unauthorized",
+            HarnessOperatorHostErrorV1::NotFound => "not-found",
+            HarnessOperatorHostErrorV1::Conflict => "conflict",
+            HarnessOperatorHostErrorV1::TooLarge => "too-large",
+            HarnessOperatorHostErrorV1::Deadline => "deadline",
+            HarnessOperatorHostErrorV1::Busy => "busy",
+            HarnessOperatorHostErrorV1::Unavailable => "unavailable",
+            HarnessOperatorHostErrorV1::Internal => "internal",
+        },
+        HarnessOperatorClientError::Api(_) => "validation",
+        HarnessOperatorClientError::Deadline => "deadline",
+        HarnessOperatorClientError::Unavailable
+        | HarnessOperatorClientError::ConnectionClosed => "unavailable",
+        HarnessOperatorClientError::RequestTooLarge
+        | HarnessOperatorClientError::ResponseTooLarge => "too-large",
+        HarnessOperatorClientError::InvalidResponse
+        | HarnessOperatorClientError::IncompleteResponse
+        | HarnessOperatorClientError::UnexpectedResponse
+        | HarnessOperatorClientError::Encoding => "invalid-response",
+        HarnessOperatorClientError::NonLoopbackEndpoint
+        | HarnessOperatorClientError::Transport => "transport",
+    };
+    HarnessReadFailure {
+        category: category.to_owned(),
+        message: error.to_string(),
+    }
+}
+
+fn project_harness_repository_path(
+    path: &RepositoryPath,
+) -> Result<HarnessRepositoryPathV1, HarnessOperatorClientError> {
+    let value = path.as_utf8().ok_or_else(|| {
+        HarnessOperatorClientError::Api(
+            gate4agent_harness_client::HarnessOperatorApiError::InvalidRepositoryPath,
+        )
+    })?;
+    HarnessRepositoryPathV1::new(value.to_owned()).map_err(HarnessOperatorClientError::Api)
+}
+
+fn project_harness_git_diff_target(
+    target: &WorkspaceGitDiffTarget,
+) -> Result<(HarnessGitDiffModeV1, Option<HarnessRepositoryPathV1>), HarnessOperatorClientError> {
+    let (mode, path) = match target {
+        WorkspaceGitDiffTarget::Working { path } => (HarnessGitDiffModeV1::Working, path),
+        WorkspaceGitDiffTarget::Staged { path } => (HarnessGitDiffModeV1::Staged, path),
+        WorkspaceGitDiffTarget::Commit { revision, path } => (
+            HarnessGitDiffModeV1::Commit {
+                revision: HarnessGitObjectIdV1::new(revision.clone())
+                    .map_err(HarnessOperatorClientError::Api)?,
+            },
+            path,
+        ),
+    };
+    Ok((mode, path.as_ref().map(project_harness_repository_path).transpose()?))
+}
+
+fn project_harness_origin(origin: HarnessRunWorkspaceOriginV1) -> HarnessRunOrigin {
+    HarnessRunOrigin {
+        run: HarnessRunRef {
+            run_id: origin.run_id,
+            run_revision: origin.run_revision,
+        },
+        node_id: origin.node_id,
+        node_incarnation_id: origin.node_incarnation_id,
+        workspace_id: origin.workspace_id,
+    }
+}
+
+fn project_harness_path(path: HarnessRepositoryPathV1) -> RepositoryPath {
+    RepositoryPath::utf8(path.as_str().to_owned())
+        .expect("validated Harness repository path is a valid Node repository path")
+}
+
+fn project_harness_git_status_code(code: HarnessGitStatusCodeV1) -> String {
+    match code {
+        HarnessGitStatusCodeV1::Unmodified => " ",
+        HarnessGitStatusCodeV1::Added => "A",
+        HarnessGitStatusCodeV1::Modified => "M",
+        HarnessGitStatusCodeV1::Deleted => "D",
+        HarnessGitStatusCodeV1::Renamed => "R",
+        HarnessGitStatusCodeV1::Copied => "C",
+        HarnessGitStatusCodeV1::Unmerged => "U",
+        HarnessGitStatusCodeV1::Untracked => "?",
+        HarnessGitStatusCodeV1::Ignored => "!",
+        HarnessGitStatusCodeV1::TypeChanged => "T",
+    }.to_owned()
+}
+
+fn project_harness_workspace_inspection(
+    inspection: HarnessRunWorkspaceInspectionV1,
+) -> (HarnessRunOrigin, Vec<WorkspaceEntry>, bool, GitSnapshot) {
+    let origin = project_harness_origin(inspection.origin);
+    let entries = inspection.entries.into_iter().map(|entry| WorkspaceEntry {
+        relative_path: project_harness_path(entry.relative_path),
+        kind: match entry.kind {
+            HarnessWorkspaceEntryKindV1::File => WorkspaceEntryKind::File,
+            HarnessWorkspaceEntryKindV1::Directory => WorkspaceEntryKind::Directory,
+        },
+    }).collect();
+    let git = GitSnapshot {
+        is_repository: inspection.git.is_repository,
+        branch: inspection.git.branch,
+        status: inspection.git.status.into_iter().map(|entry| GitStatusEntry {
+            index_status: project_harness_git_status_code(entry.index_status),
+            worktree_status: project_harness_git_status_code(entry.worktree_status),
+            path: project_harness_path(entry.path),
+            previous_path: entry.previous_path.map(project_harness_path),
+        }).collect(),
+        recent_commits: inspection.git.recent_commits.into_iter().map(|commit| GitCommitSummary {
+            id: commit.id.as_str().to_owned(),
+            summary: commit.summary,
+        }).collect(),
+        worktrees: Vec::new(),
+        managed_worktree: None,
+        truncated: inspection.git.truncated,
+        diagnostic: None,
+    };
+    (origin, entries, inspection.tree_truncated, git)
+}
+
+fn project_harness_file_content(content: HarnessWorkspaceFileContentV1) -> WorkspaceFileContent {
+    match content {
+        HarnessWorkspaceFileContentV1::Utf8 { text, byte_len } => {
+            WorkspaceFileContent::Utf8 { text, byte_len }
+        }
+        HarnessWorkspaceFileContentV1::NonUtf8 { byte_len } => {
+            WorkspaceFileContent::NonUtf8 { byte_len }
+        }
+        HarnessWorkspaceFileContentV1::TooLarge { limit_bytes } => {
+            WorkspaceFileContent::TooLarge { limit_bytes }
+        }
+    }
+}
+
+fn project_harness_git_commit(
+    commit: gate4agent_harness_client::HarnessGitCommitV1,
+) -> GitCommitView {
+    GitCommitView {
+        id: commit.id.as_str().to_owned(),
+        parents: commit.parents.into_iter().map(|parent| parent.as_str().to_owned()).collect(),
+        subject: commit.subject,
+        author_name: commit.author_name,
+        author_email: String::new(),
+        authored_at: commit.authored_at,
+        committer_name: commit.committer_name,
+        committer_email: String::new(),
+        committed_at: commit.committed_at,
+        signature_status: format!("{:?}", commit.signature_status),
+        signer: commit.signer,
+    }
+}
+
+fn harness_git_history_has_more(page: &HarnessRunGitHistoryPageV1) -> bool {
+    page.next_before.is_some()
+}
+
+fn project_harness_git_diff_target_from_response(
+    mode: HarnessGitDiffModeV1,
+    path: Option<HarnessRepositoryPathV1>,
+) -> WorkspaceGitDiffTarget {
+    let path = path.map(project_harness_path);
+    match mode {
+        HarnessGitDiffModeV1::Working => WorkspaceGitDiffTarget::Working { path },
+        HarnessGitDiffModeV1::Staged => WorkspaceGitDiffTarget::Staged { path },
+        HarnessGitDiffModeV1::Commit { revision } => WorkspaceGitDiffTarget::Commit {
+            revision: revision.as_str().to_owned(),
+            path,
+        },
     }
 }
 
@@ -5136,7 +5498,11 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessOpenMonitor { .. }
         | AppAction::HarnessLoadTaskCorrelations { .. }
         | AppAction::HarnessUseLaunchPlan { .. }
-        | AppAction::HarnessStartTask { .. } => None,
+        | AppAction::HarnessStartTask { .. }
+        | AppAction::HarnessInspectWorkspace { .. }
+        | AppAction::HarnessReadWorkspaceFile { .. }
+        | AppAction::HarnessReadGitHistory { .. }
+        | AppAction::HarnessReadGitDiff { .. } => None,
     }
 }
 
@@ -6307,6 +6673,70 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         }
         WorkerUpdate::HarnessExecutionMutationFailed { token, task_id, message } => {
             app.fail_harness_execution_mutation(token, &task_id, message);
+        }
+        WorkerUpdate::HarnessWorkspaceInspected { run, token, inspection } => {
+            let (origin, entries, tree_truncated, git) =
+                project_harness_workspace_inspection(inspection);
+            app.apply_harness_workspace_inspection(
+                run,
+                token,
+                origin,
+                entries,
+                tree_truncated,
+                git,
+            );
+        }
+        WorkerUpdate::HarnessWorkspaceInspectionFailed { run, token, failure } => {
+            app.fail_harness_workspace_inspection(&run, token, failure);
+        }
+        WorkerUpdate::HarnessWorkspaceFileRead { key, token, file } => {
+            app.apply_harness_workspace_file_read(
+                &key,
+                token,
+                project_harness_origin(file.origin),
+                project_harness_path(file.path),
+                project_harness_file_content(file.content),
+                file.revision.map(|revision| revision.as_str().to_owned()),
+            );
+        }
+        WorkerUpdate::HarnessWorkspaceFileFailed { key, token, failure } => {
+            app.fail_harness_workspace_file(&key, token, failure);
+        }
+        WorkerUpdate::HarnessGitHistoryRead { destination, token, page } => {
+            let has_more = harness_git_history_has_more(&page);
+            let history_truncated = page.truncated;
+            follow_up = app.apply_harness_git_history(
+                &destination,
+                token,
+                project_harness_origin(page.origin),
+                page.path.map(project_harness_path),
+                page.commits.into_iter().map(project_harness_git_commit).collect(),
+                page.next_before.map(|cursor| cursor.as_str().to_owned()),
+                has_more,
+                history_truncated,
+            ).unwrap_or(AppAction::None);
+        }
+        WorkerUpdate::HarnessGitHistoryFailed { destination, token, failure } => {
+            app.fail_harness_git_history(&destination, token, failure);
+        }
+        WorkerUpdate::HarnessGitDiffRead { destination, token, diff } => {
+            let origin = project_harness_origin(diff.origin);
+            let text_len = diff.text.len().min(u32::MAX as usize) as u32;
+            let target = project_harness_git_diff_target_from_response(diff.mode, diff.path);
+            app.apply_harness_git_diff(
+                &destination,
+                token,
+                origin,
+                WorkspaceGitDiffView {
+                    target,
+                    text: diff.text,
+                    byte_len: text_len,
+                    truncated: diff.truncated,
+                },
+            );
+        }
+        WorkerUpdate::HarnessGitDiffFailed { destination, token, failure } => {
+            app.fail_harness_git_diff(&destination, token, failure);
         }
         WorkerUpdate::Notice(notice) => app.notice = Some(notice),
     }
@@ -12935,5 +13365,58 @@ mod tests {
             after_sequence: 13,
         });
         assert!(matches!(app.notice.as_deref(), Some(notice) if notice.contains("cursor collision")));
+    }
+
+    #[test]
+    fn harness_workspace_reads_have_only_the_harness_detail_route_and_no_node_fallback() {
+        let origin = HarnessRunOrigin {
+            run: HarnessRunRef {
+                run_id: HarnessRunId::new(format!("hrun_{}", "d".repeat(24))).unwrap(),
+                run_revision: HarnessRevision::new(5).unwrap(),
+            },
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: gate4agent_harness_client::HarnessNodeIncarnationV1::new(
+                "cd".repeat(16),
+            ).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        };
+        let action = AppAction::HarnessReadWorkspaceFile {
+            origin,
+            path: RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap(),
+            token: 41,
+        };
+        assert!(harness_detail_read_action(&action));
+        assert_eq!(action_node_id(&action), Some(HARNESS_DETAIL_COMMAND_ROUTE));
+        assert!(action_to_request(action).is_none());
+    }
+
+    #[test]
+    fn harness_git_load_more_depends_only_on_next_cursor() {
+        let origin = HarnessRunWorkspaceOriginV1 {
+            run_id: HarnessRunId::new(format!("hrun_{}", "e".repeat(24))).unwrap(),
+            run_revision: HarnessRevision::new(1).unwrap(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: gate4agent_harness_client::HarnessNodeIncarnationV1::new(
+                "ef".repeat(16),
+            ).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        };
+        let truncated_without_cursor = HarnessRunGitHistoryPageV1 {
+            origin: origin.clone(),
+            path: None,
+            commits: Vec::new(),
+            next_before: None,
+            truncated: true,
+        };
+        assert!(!harness_git_history_has_more(&truncated_without_cursor));
+
+        let cursor_without_truncation = HarnessRunGitHistoryPageV1 {
+            origin,
+            path: None,
+            commits: Vec::new(),
+            next_before: Some(HarnessGitObjectIdV1::new("a".repeat(40)).unwrap()),
+            truncated: false,
+        };
+        assert!(harness_git_history_has_more(&cursor_without_truncation));
     }
 }

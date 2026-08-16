@@ -11899,7 +11899,7 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
     let log_limit = (GIT_COMMIT_MAX_ENTRIES + 1).to_string();
     match run_git_bounded(
         root,
-        &["log", "-n", &log_limit, "--pretty=format:%h%x1f%s", "--", "."],
+        &["log", "-n", &log_limit, "--pretty=format:%H%x1f%s", "--", "."],
         16 * 1_024,
     )
     .await
@@ -20698,6 +20698,12 @@ mod tests {
                 .and_then(RepositoryPath::as_utf8),
             Some("previous name.rs"),
         );
+        assert!(snapshot.recent_commits.iter().all(|commit| {
+            matches!(commit.id.len(), 40 | 64)
+                && commit.id.bytes().all(|byte| {
+                    byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                })
+        }));
         assert!(!snapshot.truncated, "{:?}", snapshot.diagnostic);
 
         std::fs::remove_dir_all(root).unwrap();

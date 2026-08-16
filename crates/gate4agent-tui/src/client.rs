@@ -55,7 +55,7 @@ use gate4agent_harness_client::{
     HarnessNativeSessionSelectionV1,
     HarnessOperatorActionV1, HarnessOperatorClient, HarnessOperatorCredential,
     HarnessOperatorIntentV1, HarnessOperatorMutationOutcomeV1, HarnessOperatorRequestRefV1,
-    HarnessOperatorResponseV1, HarnessLaunchPlanSummaryV1, HarnessTaskExecutionSpecV1,
+    HarnessOperatorResponseV1, HarnessTaskLaunchOptionsV1,
     HarnessGitDiffModeV1, HarnessGitObjectIdV1, HarnessGitStatusCodeV1,
     HarnessOperatorClientError, HarnessOperatorHostErrorV1, HarnessRepositoryPathV1,
     HarnessRunGitDiffV1, HarnessRunGitHistoryPageV1, HarnessRunWorkspaceFileV1,
@@ -132,8 +132,6 @@ const HARNESS_RUNTIME_INVENTORY_PAGE_BUDGET: usize = 64;
 const HARNESS_RUNTIME_INVENTORY_ENTITY_BUDGET: usize = 4_096;
 const HARNESS_RUNTIME_INVENTORY_RETRY_BUDGET: usize = 20;
 const HARNESS_RUNTIME_INVENTORY_RETRY_DELAY: Duration = Duration::from_millis(100);
-const HARNESS_LAUNCH_PLAN_PAGE_BUDGET: usize = 16;
-const HARNESS_LAUNCH_PLAN_ENTITY_BUDGET: usize = 1_024;
 
 #[derive(Debug)]
 enum ObservationWriterCommand {
@@ -663,29 +661,32 @@ enum WorkerUpdate {
         observations: Vec<(RedactedRunV1, HarnessSessionMonitorV1)>,
         failures: Vec<(HarnessRunRef, String)>,
     },
-    HarnessTaskExecutionLoaded {
-        task_id: gate4agent_harness_client::HarnessTaskId,
-        plans: Vec<HarnessLaunchPlanSummaryV1>,
-        execution_spec: Option<HarnessTaskExecutionSpecV1>,
+    HarnessLaunchOptionsLoaded {
+        task: crate::app::HarnessTaskRef,
+        token: u64,
+        options: HarnessTaskLaunchOptionsV1,
     },
-    HarnessTaskExecutionLoadFailed {
-        task_id: gate4agent_harness_client::HarnessTaskId,
+    HarnessLaunchOptionsLoadFailed {
+        task: crate::app::HarnessTaskRef,
+        token: u64,
         message: String,
     },
-    HarnessExecutionSpecSaved {
+    HarnessLaunchSpecSaved {
         token: u64,
-        task_id: gate4agent_harness_client::HarnessTaskId,
-        execution_spec: HarnessTaskExecutionSpecV1,
+        task: crate::app::HarnessTaskRef,
+        options: HarnessTaskLaunchOptionsV1,
         outcome: HarnessOperatorMutationOutcomeV1,
     },
-    HarnessTaskStarted {
+    HarnessTaskStartedV2 {
         token: u64,
-        task_id: gate4agent_harness_client::HarnessTaskId,
+        task: crate::app::HarnessTaskRef,
         outcome: HarnessTaskStartOutcomeV1,
+        options: HarnessTaskLaunchOptionsV1,
+        transfer: Result<HarnessRunTransferSummaryV1, String>,
     },
     HarnessExecutionMutationFailed {
         token: u64,
-        task_id: gate4agent_harness_client::HarnessTaskId,
+        task: crate::app::HarnessTaskRef,
         message: String,
     },
     HarnessWorkspaceInspected {
@@ -1544,6 +1545,18 @@ fn reject_harness_queue_action(
             app.fail_harness_run_transfer(run, *token, message);
             return true;
         }
+        AppAction::HarnessLoadTaskLaunchOptions { task, token } => {
+            let message = match rejection {
+                HarnessQueueRejection::Busy => {
+                    "Harness operator busy: launch-options queue is full"
+                }
+                HarnessQueueRejection::Unavailable => {
+                    "Harness operator unavailable: launch-options queue is closed"
+                }
+            }.to_owned();
+            app.fail_harness_launch_options(task, *token, message);
+            return true;
+        }
         _ => {}
     }
     if let AppAction::HarnessOpenMonitor { run } = action {
@@ -1559,7 +1572,7 @@ fn reject_harness_queue_action(
         app.notice = Some(message);
         return true;
     }
-    if let AppAction::HarnessLoadTaskCorrelations { task_id, .. } = action {
+    if let AppAction::HarnessLoadTaskCorrelations { task, launch_token, .. } = action {
         let message = match rejection {
             HarnessQueueRejection::Busy => {
                 "Harness operator busy: correlation command queue is full"
@@ -1568,14 +1581,14 @@ fn reject_harness_queue_action(
                 "Harness operator unavailable: correlation command queue is closed"
             }
         }.to_owned();
-        app.fail_harness_task_correlations(task_id, message.clone());
-        app.fail_harness_task_observations(task_id, message.clone());
-        app.fail_harness_task_execution(task_id, message.clone());
+        app.fail_harness_task_correlations(&task.task_id, message.clone());
+        app.fail_harness_task_observations(&task.task_id, message.clone());
+        app.fail_harness_launch_options(task, *launch_token, message.clone());
         app.notice = Some(message);
         return true;
     }
-    if let AppAction::HarnessUseLaunchPlan { token, task_id, .. }
-        | AppAction::HarnessStartTask { token, task_id, .. } = action
+    if let AppAction::HarnessSaveTaskLaunchSpec { token, task, .. }
+        | AppAction::HarnessStartTaskV2 { token, task, .. } = action
     {
         let message = match rejection {
             HarnessQueueRejection::Busy => {
@@ -1585,7 +1598,7 @@ fn reject_harness_queue_action(
                 "Harness operator unavailable: execution mutation queue is closed"
             }
         }.to_owned();
-        app.fail_harness_execution_mutation(*token, task_id, message);
+        app.fail_harness_execution_mutation(*token, task, message);
         return true;
     }
     let token = match action {
@@ -1625,6 +1638,7 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
         action,
         AppAction::HarnessOpenMonitor { .. }
             | AppAction::HarnessLoadTaskCorrelations { .. }
+            | AppAction::HarnessLoadTaskLaunchOptions { .. }
             | AppAction::HarnessLoadRunTransfer { .. }
             | AppAction::HarnessInspectWorkspace { .. }
             | AppAction::HarnessReadWorkspaceFile { .. }
@@ -1701,9 +1715,10 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessScheduleNext { .. }
         | AppAction::HarnessOpenMonitor { .. }
         | AppAction::HarnessLoadTaskCorrelations { .. }
-        | AppAction::HarnessUseLaunchPlan { .. }
-        | AppAction::HarnessStartTask { .. } => Some(HARNESS_COMMAND_ROUTE),
-        AppAction::HarnessLoadRunTransfer { .. }
+        | AppAction::HarnessSaveTaskLaunchSpec { .. }
+        | AppAction::HarnessStartTaskV2 { .. } => Some(HARNESS_COMMAND_ROUTE),
+        AppAction::HarnessLoadTaskLaunchOptions { .. }
+        | AppAction::HarnessLoadRunTransfer { .. }
         | AppAction::HarnessInspectWorkspace { .. }
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
@@ -2233,39 +2248,73 @@ fn harness_operator_worker(
                     true,
                 );
             }
-            AppAction::HarnessUseLaunchPlan {
+            AppAction::HarnessSaveTaskLaunchSpec {
                 token,
-                task_id,
-                expected_task_revision,
+                task,
                 expected_execution_spec_revision,
-                spec,
+                selection,
+                refresh_run,
             } => {
                 let result = (|| {
                     let intent = intent_factory.next_intent(
-                        HarnessOperatorActionV1::ReplaceTaskExecutionSpec {
-                            task_id: task_id.clone(),
-                            expected_task_revision,
+                        HarnessOperatorActionV1::ReplaceTaskExecutionSpecV2 {
+                            task_id: task.task_id.clone(),
+                            expected_task_revision: task.task_revision,
                             expected_execution_spec_revision,
-                            spec,
+                            selection,
                         },
                     )?;
                     let outcome = match client.submit_intent(intent)
                         .map_err(|error| error.to_string())?
                     {
                         HarnessOperatorResponseV1::ExecutionSpecMutation(outcome) => outcome,
-                        _ => return Err("Harness execution-spec mutation returned an unexpected response".to_owned()),
+                        _ => return Err("Harness V6 launch-spec mutation returned an unexpected response".to_owned()),
                     };
-                    let execution_spec = client.task_execution_spec_get(task_id.clone())
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| "Harness execution spec was not readable after save".to_owned())?;
-                    Ok((outcome, execution_spec))
+                    let options = client.task_launch_options_get(task.task_id.clone())
+                        .map_err(|error| error.to_string())?;
+                    if options.task_revision != task.task_revision {
+                        return Err(format!(
+                            "Harness task revision changed from r{} to r{} while saving launch spec",
+                            task.task_revision.get(),
+                            options.task_revision.get(),
+                        ));
+                    }
+                    Ok((outcome, options))
                 })();
                 match result {
-                    Ok((outcome, execution_spec)) => {
-                        if updates.blocking_send(WorkerUpdate::HarnessExecutionSpecSaved {
+                    Ok((outcome, options)) => {
+                        if let Some(run) = refresh_run {
+                            let transfer = match client.run_transfer_get(run.run_id.clone()) {
+                                Ok(summary) if summary.run_revision == run.run_revision => {
+                                    WorkerUpdate::HarnessRunTransfer {
+                                        run,
+                                        token,
+                                        summary,
+                                    }
+                                }
+                                Ok(summary) => WorkerUpdate::HarnessRunTransferFailed {
+                                    run: run.clone(),
+                                    token,
+                                    message: format!(
+                                        "Harness run revision changed from r{} to r{}",
+                                        run.run_revision.get(),
+                                        summary.run_revision.get(),
+                                    ),
+                                },
+                                Err(error) => WorkerUpdate::HarnessRunTransferFailed {
+                                    run,
+                                    token,
+                                    message: error.to_string(),
+                                },
+                            };
+                            if updates.blocking_send(transfer).is_err() {
+                                return;
+                            }
+                        }
+                        if updates.blocking_send(WorkerUpdate::HarnessLaunchSpecSaved {
                             token,
-                            task_id: task_id.clone(),
-                            execution_spec,
+                            task: task.clone(),
+                            options,
                             outcome,
                         }).is_err() {
                             return;
@@ -2281,7 +2330,7 @@ fn harness_operator_worker(
                     Err(message) => {
                         if updates.blocking_send(WorkerUpdate::HarnessExecutionMutationFailed {
                             token,
-                            task_id,
+                            task,
                             message,
                         }).is_err() {
                             return;
@@ -2289,31 +2338,49 @@ fn harness_operator_worker(
                     }
                 }
             }
-            AppAction::HarnessStartTask {
+            AppAction::HarnessStartTaskV2 {
                 token,
-                task_id,
-                expected_task_revision,
+                task,
                 expected_execution_spec_revision,
-                expected_scheduled_launch_digest,
+                expected_launch_issuance,
             } => {
                 let result = (|| {
-                    let intent = intent_factory.next_intent(HarnessOperatorActionV1::StartTask {
-                        task_id: task_id.clone(),
-                        expected_task_revision,
+                    let intent = intent_factory.next_intent(HarnessOperatorActionV1::StartTaskV2 {
+                        task_id: task.task_id.clone(),
+                        expected_task_revision: task.task_revision,
                         expected_execution_spec_revision,
-                        expected_scheduled_launch_digest,
+                        expected_launch_issuance,
                     })?;
-                    match client.submit_intent(intent).map_err(|error| error.to_string())? {
-                        HarnessOperatorResponseV1::TaskStarted(outcome) => Ok(outcome),
-                        _ => Err("Harness start-task returned an unexpected response".to_owned()),
+                    let outcome = match client.submit_intent(intent)
+                        .map_err(|error| error.to_string())?
+                    {
+                        HarnessOperatorResponseV1::TaskStarted(outcome) => outcome,
+                        _ => return Err("Harness V6 start-task returned an unexpected response".to_owned()),
+                    };
+                    let options = client.task_launch_options_get(task.task_id.clone())
+                        .map_err(|error| error.to_string())?;
+                    if options.task_revision != outcome.dispatch.task_revision {
+                        return Err("Harness launch options did not match started task revision".to_owned());
                     }
+                    let transfer = client.run_transfer_get(outcome.dispatch.run_id.clone())
+                        .map_err(|error| error.to_string())
+                        .and_then(|summary| {
+                            if summary.run_revision == outcome.dispatch.run_revision {
+                                Ok(summary)
+                            } else {
+                                Err("Harness transfer did not match started run revision".to_owned())
+                            }
+                        });
+                    Ok((outcome, options, transfer))
                 })();
                 match result {
-                    Ok(outcome) => {
-                        if updates.blocking_send(WorkerUpdate::HarnessTaskStarted {
+                    Ok((outcome, options, transfer)) => {
+                        if updates.blocking_send(WorkerUpdate::HarnessTaskStartedV2 {
                             token,
-                            task_id: task_id.clone(),
+                            task: task.clone(),
                             outcome,
+                            options,
+                            transfer,
                         }).is_err() {
                             return;
                         }
@@ -2328,7 +2395,7 @@ fn harness_operator_worker(
                     Err(message) => {
                         if updates.blocking_send(WorkerUpdate::HarnessExecutionMutationFailed {
                             token,
-                            task_id,
+                            task,
                             message,
                         }).is_err() {
                             return;
@@ -2479,7 +2546,36 @@ fn harness_detail_worker(
                     return;
                 }
             }
-            AppAction::HarnessLoadTaskCorrelations { task_id, runs } => {
+            AppAction::HarnessLoadTaskLaunchOptions { task, token } => {
+                let update = match client.task_launch_options_get(task.task_id.clone()) {
+                    Ok(options) if options.task_revision == task.task_revision => {
+                        WorkerUpdate::HarnessLaunchOptionsLoaded {
+                            task,
+                            token,
+                            options,
+                        }
+                    }
+                    Ok(options) => WorkerUpdate::HarnessLaunchOptionsLoadFailed {
+                        task: task.clone(),
+                        token,
+                        message: format!(
+                            "Harness task revision changed from r{} to r{}",
+                            task.task_revision.get(),
+                            options.task_revision.get(),
+                        ),
+                    },
+                    Err(error) => WorkerUpdate::HarnessLaunchOptionsLoadFailed {
+                        task,
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessLoadTaskCorrelations { task, launch_token, runs } => {
+                let task_id = task.task_id.clone();
                 let mut correlations = Vec::with_capacity(runs.len());
                 let mut failures = Vec::new();
                 let mut observations = Vec::with_capacity(runs.len());
@@ -2527,16 +2623,27 @@ fn harness_detail_worker(
                 }).is_err() {
                     return;
                 }
-                let execution = load_harness_task_execution(&client, task_id.clone());
-                let update = match execution {
-                    Ok((plans, execution_spec)) => WorkerUpdate::HarnessTaskExecutionLoaded {
-                        task_id,
-                        plans,
-                        execution_spec,
+                let update = match client.task_launch_options_get(task_id) {
+                    Ok(options) if options.task_revision == task.task_revision => {
+                        WorkerUpdate::HarnessLaunchOptionsLoaded {
+                            task,
+                            token: launch_token,
+                            options,
+                        }
+                    }
+                    Ok(options) => WorkerUpdate::HarnessLaunchOptionsLoadFailed {
+                        task: task.clone(),
+                        token: launch_token,
+                        message: format!(
+                            "Harness task revision changed from r{} to r{}",
+                            task.task_revision.get(),
+                            options.task_revision.get(),
+                        ),
                     },
-                    Err(message) => WorkerUpdate::HarnessTaskExecutionLoadFailed {
-                        task_id,
-                        message,
+                    Err(error) => WorkerUpdate::HarnessLaunchOptionsLoadFailed {
+                        task,
+                        token: launch_token,
+                        message: error.to_string(),
                     },
                 };
                 if updates.blocking_send(update).is_err() {
@@ -2820,37 +2927,6 @@ fn project_harness_git_diff_target_from_response(
             path,
         },
     }
-}
-
-fn load_harness_task_execution(
-    client: &HarnessOperatorClient,
-    task_id: gate4agent_harness_client::HarnessTaskId,
-) -> Result<(Vec<HarnessLaunchPlanSummaryV1>, Option<HarnessTaskExecutionSpecV1>), String> {
-    let mut plans = Vec::new();
-    let mut cursor = None;
-    for _ in 0..HARNESS_LAUNCH_PLAN_PAGE_BUDGET {
-        let page = client.launch_plans_list(cursor.clone(), HARNESS_SNAPSHOT_PAGE_SIZE)
-            .map_err(|error| error.to_string())?;
-        if let Some(previous) = cursor.as_ref() {
-            if page.plans.first().is_some_and(|plan| {
-                &plan.scheduled_launch.plan.plan_id <= previous
-            }) || page.next_plan_id.as_ref().is_some_and(|next| next <= previous)
-            {
-                return Err("Harness launch-plan cursor did not advance".to_owned());
-            }
-        }
-        if plans.len().saturating_add(page.plans.len()) > HARNESS_LAUNCH_PLAN_ENTITY_BUDGET {
-            return Err("Harness launch-plan catalog exceeded entity budget".to_owned());
-        }
-        cursor = page.next_plan_id;
-        plans.extend(page.plans);
-        if cursor.is_none() {
-            let execution_spec = client.task_execution_spec_get(task_id)
-                .map_err(|error| error.to_string())?;
-            return Ok((plans, execution_spec));
-        }
-    }
-    Err("Harness launch-plan catalog exceeded page budget".to_owned())
 }
 
 fn load_harness_snapshot(
@@ -5598,9 +5674,10 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessScheduleNext { .. }
         | AppAction::HarnessOpenMonitor { .. }
         | AppAction::HarnessLoadTaskCorrelations { .. }
+        | AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
-        | AppAction::HarnessUseLaunchPlan { .. }
-        | AppAction::HarnessStartTask { .. }
+        | AppAction::HarnessSaveTaskLaunchSpec { .. }
+        | AppAction::HarnessStartTaskV2 { .. }
         | AppAction::HarnessInspectWorkspace { .. }
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
@@ -6760,30 +6837,30 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         WorkerUpdate::HarnessTaskObservations { task_id, observations, failures } => {
             app.apply_harness_task_observations(&task_id, observations, failures);
         }
-        WorkerUpdate::HarnessTaskExecutionLoaded { task_id, plans, execution_spec } => {
-            app.apply_harness_task_execution(task_id, plans, execution_spec);
+        WorkerUpdate::HarnessLaunchOptionsLoaded { task, token, options } => {
+            app.apply_harness_launch_options(task, token, options);
         }
-        WorkerUpdate::HarnessTaskExecutionLoadFailed { task_id, message } => {
-            app.fail_harness_task_execution(&task_id, message);
+        WorkerUpdate::HarnessLaunchOptionsLoadFailed { task, token, message } => {
+            app.fail_harness_launch_options(&task, token, message);
         }
-        WorkerUpdate::HarnessExecutionSpecSaved {
+        WorkerUpdate::HarnessLaunchSpecSaved {
             token,
-            task_id,
-            execution_spec,
+            task,
+            options,
             outcome,
         } => {
-            app.apply_harness_execution_spec_saved(
+            app.apply_harness_launch_spec_saved(
                 token,
-                task_id,
-                execution_spec,
+                task,
+                options,
                 outcome,
             );
         }
-        WorkerUpdate::HarnessTaskStarted { token, task_id, outcome } => {
-            app.apply_harness_task_started(token, &task_id, outcome);
+        WorkerUpdate::HarnessTaskStartedV2 { token, task, outcome, options, transfer } => {
+            app.apply_harness_task_started_v2(token, task, outcome, options, transfer);
         }
-        WorkerUpdate::HarnessExecutionMutationFailed { token, task_id, message } => {
-            app.fail_harness_execution_mutation(token, &task_id, message);
+        WorkerUpdate::HarnessExecutionMutationFailed { token, task, message } => {
+            app.fail_harness_execution_mutation(token, &task, message);
         }
         WorkerUpdate::HarnessWorkspaceInspected { run, token, inspection } => {
             let (origin, entries, tree_truncated, git) =
@@ -8106,9 +8183,11 @@ mod tests {
     use super::*;
     use gate4agent_harness_client::{
         HarnessExpectedExecutionSpecRevisionV1, HarnessExecutionModeV1,
-        HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1, HarnessRequestDigest,
-        HarnessRevision, HarnessRunId, HarnessRunLifecycleV1, HarnessScheduledLaunchRefV2,
-        HarnessTaskExecutionSpecInputV1, HarnessTaskReviewPolicyV1,
+        HarnessLaunchPlanRefV1, HarnessOrdinaryLaunchPlanOptionV1, HarnessRequestDigest,
+        HarnessReviewedTaskLaunchSelectionV1, HarnessReviewedWorktreeSelectionV1,
+        HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
+        HarnessTaskLaunchIssuanceId, HarnessTaskLaunchIssuanceRefV1,
+        HarnessTaskReviewPolicyV1,
         HarnessTaskId, HarnessTaskStateV1, RedactedRunIntentV1,
         RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
     };
@@ -8121,7 +8200,7 @@ mod tests {
     };
     use crate::app::{
         ContextUsageSegment, ContextUsageSegmentHit, ControlSection, DragState, Focus, HitRegion, HitTarget, LaunchContextMode, LaunchField,
-        HarnessTaskComposerField, LaunchTarget, MenuPlacement, PtyColorMode, RosterMode, SidebarPresentation, SpawnDialog,
+        HarnessTaskComposerField, HarnessTaskRef, LaunchTarget, MenuPlacement, PtyColorMode, RosterMode, SidebarPresentation, SpawnDialog,
         SurfacePaneLayout,
     };
     use crate::surface::PaneId;
@@ -8178,6 +8257,45 @@ mod tests {
             artifact_refs: Vec::new(),
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+        }
+    }
+
+    fn harness_task_ref(task: &RedactedTaskV1) -> HarnessTaskRef {
+        HarnessTaskRef {
+            task_id: task.task_id.clone(),
+            task_revision: task.revision,
+        }
+    }
+
+    fn reviewed_launch_selection() -> HarnessReviewedTaskLaunchSelectionV1 {
+        HarnessReviewedTaskLaunchSelectionV1 {
+            plan: HarnessOrdinaryLaunchPlanOptionV1 {
+                plan: HarnessLaunchPlanRefV1 {
+                    plan_id: HarnessSelectorV1::new("ordinary-codex").unwrap(),
+                    revision: HarnessRevision::new(2).unwrap(),
+                    digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+                },
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                source_workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+                provider_id: HarnessSelectorV1::new("codex").unwrap(),
+                mode: HarnessExecutionModeV1::Pty,
+            },
+            worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+            context_source: None,
+            delivery: None,
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+        }
+    }
+
+    fn launch_issuance_ref() -> HarnessTaskLaunchIssuanceRefV1 {
+        HarnessTaskLaunchIssuanceRefV1 {
+            issuance_id: HarnessTaskLaunchIssuanceId::new(format!(
+                "hissue_{}",
+                "c".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            digest: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
         }
     }
 
@@ -10519,8 +10637,9 @@ mod tests {
         app.begin_harness_refresh(81);
         app.harness_kanban.execution_mutation = Some(crate::app::HarnessExecutionMutationState {
             token: 81,
-            task_id: task.task_id.clone(),
+            task: harness_task_ref(&task),
             kind: crate::app::HarnessExecutionMutationKind::StartTask,
+            refresh_run: None,
         });
         let (c2_tx, mut c2_rx) = mpsc::channel(1);
         let commands = BTreeMap::from([(C2_COMMAND_ROUTE.to_owned(), c2_tx)]);
@@ -10528,12 +10647,11 @@ mod tests {
         send_operator_action(
             &mut app,
             &commands,
-            AppAction::HarnessStartTask {
+            AppAction::HarnessStartTaskV2 {
                 token: 81,
-                task_id: task.task_id,
-                expected_task_revision: HarnessRevision::new(1).unwrap(),
+                task: harness_task_ref(&task),
                 expected_execution_spec_revision: HarnessRevision::new(1).unwrap(),
-                expected_scheduled_launch_digest: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+                expected_launch_issuance: launch_issuance_ref(),
             },
         );
 
@@ -10542,12 +10660,12 @@ mod tests {
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
             app.notice.as_deref(),
-            Some("Harness execution action failed: Harness operator unavailable: execution mutation queue is closed"),
+            Some("Harness launch action failed: Harness operator unavailable: execution mutation queue is closed"),
         );
     }
 
     #[test]
-    fn harness_execution_mutations_use_serial_mutation_lane_not_detail_or_history() {
+    fn harness_v6_launch_mutations_use_serial_lane_without_node_fallback() {
         let mut app = App::default();
         let (mutation_tx, mut mutation_rx) = mpsc::channel(2);
         let (history_tx, mut history_rx) = mpsc::channel(1);
@@ -10557,31 +10675,22 @@ mod tests {
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
             (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
-        let task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
-        let scheduled_launch = HarnessScheduledLaunchRefV2 {
-            plan: HarnessLaunchPlanRefV1 {
-                plan_id: HarnessSelectorV1::new("ordinary-codex").unwrap(),
-                revision: HarnessRevision::new(2).unwrap(),
-                digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
-            },
-            authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+        let task = HarnessTaskRef {
+            task_id: HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap(),
+            task_revision: HarnessRevision::new(4).unwrap(),
         };
-        let save = AppAction::HarnessUseLaunchPlan {
+        let save = AppAction::HarnessSaveTaskLaunchSpec {
             token: 70,
-            task_id: task_id.clone(),
-            expected_task_revision: HarnessRevision::new(4).unwrap(),
+            task: task.clone(),
             expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
-            spec: HarnessTaskExecutionSpecInputV1 {
-                scheduled_launch: scheduled_launch.clone(),
-                review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
-            },
+            selection: reviewed_launch_selection(),
+            refresh_run: None,
         };
-        let start = AppAction::HarnessStartTask {
+        let start = AppAction::HarnessStartTaskV2 {
             token: 71,
-            task_id,
-            expected_task_revision: HarnessRevision::new(4).unwrap(),
+            task,
             expected_execution_spec_revision: HarnessRevision::new(1).unwrap(),
-            expected_scheduled_launch_digest: scheduled_launch.plan.digest,
+            expected_launch_issuance: launch_issuance_ref(),
         };
 
         send_operator_action(&mut app, &commands, save.clone());
@@ -10590,6 +10699,8 @@ mod tests {
         assert_eq!(mutation_rx.try_recv().unwrap(), start);
         assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert!(matches!(detail_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(action_to_request(save).is_none());
+        assert!(action_to_request(start).is_none());
     }
 
     #[test]
@@ -10600,8 +10711,9 @@ mod tests {
         app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
         app.harness_kanban.execution_mutation = Some(crate::app::HarnessExecutionMutationState {
             token: 72,
-            task_id: task.task_id.clone(),
+            task: harness_task_ref(&task),
             kind: crate::app::HarnessExecutionMutationKind::StartTask,
+            refresh_run: None,
         });
         app.begin_harness_refresh(72);
         let (mutation_tx, _mutation_rx) = mpsc::channel(1);
@@ -10616,12 +10728,11 @@ mod tests {
         send_operator_action(
             &mut app,
             &commands,
-            AppAction::HarnessStartTask {
+            AppAction::HarnessStartTaskV2 {
                 token: 72,
-                task_id: task.task_id,
-                expected_task_revision: HarnessRevision::new(1).unwrap(),
+                task: harness_task_ref(&task),
                 expected_execution_spec_revision: HarnessRevision::new(1).unwrap(),
-                expected_scheduled_launch_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
+                expected_launch_issuance: launch_issuance_ref(),
             },
         );
 
@@ -10629,7 +10740,7 @@ mod tests {
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
             app.notice.as_deref(),
-            Some("Harness execution action failed: Harness operator busy: execution mutation queue is full"),
+            Some("Harness launch action failed: Harness operator busy: execution mutation queue is full"),
         );
     }
 
@@ -10807,7 +10918,8 @@ mod tests {
             &mut app,
             &commands,
             AppAction::HarnessLoadTaskCorrelations {
-                task_id: task.task_id.clone(),
+                task: harness_task_ref(&task),
+                launch_token: 91,
                 runs: vec![HarnessRunRef {
                     run_id: run.run_id.clone(),
                     run_revision: run.revision,
@@ -10892,7 +11004,8 @@ mod tests {
             },
         };
         let correlations = AppAction::HarnessLoadTaskCorrelations {
-            task_id: task.task_id.clone(),
+            task: harness_task_ref(&task),
+            launch_token: 92,
             runs: vec![HarnessRunRef {
                 run_id: run.run_id,
                 run_revision: run.revision,
@@ -13527,7 +13640,11 @@ mod tests {
 
         let task = HarnessTaskId::new(format!("htask_{}", "7".repeat(24))).unwrap();
         let task_observations = AppAction::HarnessLoadTaskCorrelations {
-            task_id: task,
+            task: HarnessTaskRef {
+                task_id: task,
+                task_revision: HarnessRevision::new(5).unwrap(),
+            },
+            launch_token: 93,
             runs: vec![run],
         };
         assert!(harness_detail_read_action(&task_observations));
@@ -13561,6 +13678,35 @@ mod tests {
         assert!(matches!(
             app.harness_kanban.run_transfers.get(&run),
             Some(crate::app::HarnessRunTransferState::Error { token: 73, message })
+                if message.contains("queue is closed"),
+        ));
+    }
+
+    #[test]
+    fn harness_launch_options_read_uses_detail_lane_and_queue_failure_is_terminal() {
+        let task = paginated_harness_task(17);
+        let task_ref = harness_task_ref(&task);
+        let action = AppAction::HarnessLoadTaskLaunchOptions {
+            task: task_ref.clone(),
+            token: 94,
+        };
+        assert!(harness_detail_read_action(&action));
+        assert_eq!(action_node_id(&action), Some(HARNESS_DETAIL_COMMAND_ROUTE));
+        assert!(action_to_request(action.clone()).is_none());
+
+        let mut app = App::default();
+        app.harness_kanban.launch_options.insert(
+            task_ref.clone(),
+            crate::app::HarnessLaunchOptionsState::Loading { token: 94 },
+        );
+        assert!(reject_harness_queue_action(
+            &mut app,
+            &action,
+            HarnessQueueRejection::Unavailable,
+        ));
+        assert!(matches!(
+            app.harness_kanban.launch_options.get(&task_ref),
+            Some(crate::app::HarnessLaunchOptionsState::Error { token: 94, message })
                 if message.contains("queue is closed"),
         ));
     }

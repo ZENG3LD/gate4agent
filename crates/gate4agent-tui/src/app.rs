@@ -568,8 +568,65 @@ pub struct HarnessRunMonitorView {
     pub run: RedactedRunV1,
     pub monitor: Option<HarnessSessionMonitorV1>,
     pub timeline: Vec<TimelineEntryV1>,
+    pub section: HarnessRunMonitorSection,
+    pub scroll: usize,
     pub loading: bool,
     pub stale_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HarnessRunMonitorSection {
+    #[default]
+    Summary,
+    Todos,
+    Activity,
+    Files,
+    Timeline,
+}
+
+impl HarnessRunMonitorSection {
+    pub const ALL: [Self; 5] = [
+        Self::Summary,
+        Self::Todos,
+        Self::Activity,
+        Self::Files,
+        Self::Timeline,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Summary => "Summary",
+            Self::Todos => "Todos",
+            Self::Activity => "Activity",
+            Self::Files => "Files",
+            Self::Timeline => "Timeline",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessRunObservationState {
+    Loading {
+        run_revision: HarnessRevision,
+    },
+    Ready {
+        run_revision: HarnessRevision,
+        monitor: HarnessSessionMonitorV1,
+    },
+    Error {
+        run_revision: HarnessRevision,
+        message: String,
+    },
+}
+
+impl HarnessRunObservationState {
+    pub fn run_revision(&self) -> HarnessRevision {
+        match self {
+            Self::Loading { run_revision }
+            | Self::Ready { run_revision, .. }
+            | Self::Error { run_revision, .. } => *run_revision,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -724,6 +781,7 @@ pub struct HarnessKanbanState {
     pub execution_mutation: Option<HarnessExecutionMutationState>,
     pub last_start: Option<HarnessTaskStartOutcomeV1>,
     pub monitor: Option<HarnessRunMonitorView>,
+    pub run_observations: BTreeMap<HarnessRunId, HarnessRunObservationState>,
     pub workspaces: BTreeMap<HarnessRunOrigin, HarnessWorkspaceView>,
     pub workspace_requests: BTreeMap<HarnessRunRef, HarnessWorkspaceRequest>,
 }
@@ -2091,11 +2149,11 @@ pub enum AppAction {
         plan_id: Option<HarnessSelectorV1>,
     },
     HarnessOpenMonitor {
-        run_id: HarnessRunId,
+        run: HarnessRunRef,
     },
     HarnessLoadTaskCorrelations {
         task_id: HarnessTaskId,
-        run_ids: Vec<HarnessRunId>,
+        runs: Vec<HarnessRunRef>,
     },
     HarnessUseLaunchPlan {
         token: u64,
@@ -2220,6 +2278,10 @@ pub enum HitTarget {
     HarnessTaskDetailSection(HarnessTaskDetailSection),
     HarnessTaskDetailRun(HarnessRunId),
     HarnessTaskDetailRunMonitor(HarnessRunId),
+    HarnessRunMonitorBack,
+    HarnessRunMonitorSection(HarnessRunMonitorSection),
+    HarnessRunMonitorScrollUp,
+    HarnessRunMonitorScrollDown,
     HarnessTaskDetailRunFiles(HarnessRunId),
     HarnessTaskDetailRunGit(HarnessRunId),
     HarnessWorkspaceFile(HarnessRunOrigin, RepositoryPath),
@@ -4518,6 +4580,11 @@ impl App {
         self.harness_kanban.correlation_failures.retain(|run_id, _| {
             self.harness_kanban.runs.contains_key(run_id)
         });
+        self.harness_kanban.run_observations.retain(|run_id, observation| {
+            self.harness_kanban.runs.get(run_id).is_some_and(|run| {
+                run.revision == observation.run_revision()
+            })
+        });
         self.harness_kanban.execution_specs.retain(|task_id, _| {
             self.harness_kanban.tasks.contains_key(task_id)
         });
@@ -4545,29 +4612,109 @@ impl App {
         monitor: HarnessSessionMonitorV1,
         timeline: Vec<TimelineEntryV1>,
     ) {
-        if run.binding == RedactedBindingStateV1::None || monitor.run_id != run.run_id {
-            return;
-        }
-        if !self.harness_kanban.monitor.as_ref()
-            .is_some_and(|view| view.run.run_id == run.run_id)
+        if run.binding == RedactedBindingStateV1::None
+            || monitor.run_id != run.run_id
+            || timeline.windows(2).any(|pair| pair[0].sequence >= pair[1].sequence)
         {
             return;
         }
+        if !self.harness_kanban.monitor.as_ref()
+            .is_some_and(|view| {
+                view.run.run_id == run.run_id && view.run.revision == run.revision
+            })
+        {
+            return;
+        }
+        self.harness_kanban.run_observations.insert(
+            run.run_id.clone(),
+            HarnessRunObservationState::Ready {
+                run_revision: run.revision,
+                monitor: monitor.clone(),
+            },
+        );
+        let (section, scroll) = self.harness_kanban.monitor.as_ref()
+            .map(|view| (view.section, view.scroll))
+            .unwrap_or_default();
         self.harness_kanban.monitor = Some(HarnessRunMonitorView {
             run,
             monitor: Some(monitor),
             timeline,
+            section,
+            scroll,
             loading: false,
             stale_reason: None,
         });
     }
 
-    pub fn fail_harness_monitor(&mut self, run_id: &HarnessRunId, message: String) {
+    pub fn fail_harness_monitor(&mut self, run: &HarnessRunRef, message: String) {
         if let Some(view) = self.harness_kanban.monitor.as_mut()
-            .filter(|view| &view.run.run_id == run_id)
+            .filter(|view| {
+                view.run.run_id == run.run_id && view.run.revision == run.run_revision
+            })
         {
             view.loading = false;
             view.stale_reason = Some(message);
+        }
+    }
+
+    pub fn apply_harness_task_observations(
+        &mut self,
+        task_id: &HarnessTaskId,
+        observations: Vec<(RedactedRunV1, HarnessSessionMonitorV1)>,
+        failures: Vec<(HarnessRunRef, String)>,
+    ) {
+        for (run, monitor) in observations {
+            let exact = self.harness_kanban.runs.get(&run.run_id).is_some_and(|loaded| {
+                loaded.revision == run.revision
+                    && loaded.task_id.as_ref() == Some(task_id)
+                    && run.task_id.as_ref() == Some(task_id)
+                    && monitor.run_id == run.run_id
+            });
+            if exact {
+                self.harness_kanban.run_observations.insert(
+                    run.run_id.clone(),
+                    HarnessRunObservationState::Ready {
+                        run_revision: run.revision,
+                        monitor,
+                    },
+                );
+            }
+        }
+        for (run, message) in failures {
+            let exact = self.harness_kanban.runs.get(&run.run_id).is_some_and(|loaded| {
+                loaded.revision == run.run_revision
+                    && loaded.task_id.as_ref() == Some(task_id)
+            });
+            if exact {
+                self.harness_kanban.run_observations.insert(
+                    run.run_id,
+                    HarnessRunObservationState::Error {
+                        run_revision: run.run_revision,
+                        message,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn fail_harness_task_observations(
+        &mut self,
+        task_id: &HarnessTaskId,
+        message: String,
+    ) {
+        let run_ids = self.harness_task_runs(task_id)
+            .into_iter()
+            .filter(|run| run.binding != RedactedBindingStateV1::None)
+            .map(|run| (run.run_id.clone(), run.revision))
+            .collect::<Vec<_>>();
+        for (run_id, run_revision) in run_ids {
+            self.harness_kanban.run_observations.insert(
+                run_id,
+                HarnessRunObservationState::Error {
+                    run_revision,
+                    message: message.clone(),
+                },
+            );
         }
     }
 
@@ -4854,6 +5001,7 @@ impl App {
         links
     }
 
+
     pub fn harness_tasks(&self) -> Vec<&RedactedTaskV1> {
         self.harness_kanban.tasks.values().collect()
     }
@@ -5032,12 +5180,19 @@ impl App {
             run: run.clone(),
             monitor: None,
             timeline: Vec::new(),
+            section: HarnessRunMonitorSection::Summary,
+            scroll: 0,
             loading: true,
             stale_reason: None,
         });
         self.surface.open_in_focused(SurfaceTab::AgentBoard);
         self.focus = Focus::Viewport;
-        AppAction::HarnessOpenMonitor { run_id: run.run_id }
+        AppAction::HarnessOpenMonitor {
+            run: HarnessRunRef {
+                run_id: run.run_id,
+                run_revision: run.revision,
+            },
+        }
     }
 
     fn open_harness_task_detail(&mut self, task_id: HarnessTaskId) -> AppAction {
@@ -5045,15 +5200,18 @@ impl App {
             return AppAction::None;
         }
         self.harness_kanban.selected = Some(task_id.clone());
-        let run_ids = self.harness_task_runs(&task_id)
+        let runs = self.harness_task_runs(&task_id)
             .into_iter()
-            .map(|run| run.run_id.clone())
+            .map(|run| HarnessRunRef {
+                run_id: run.run_id.clone(),
+                run_revision: run.revision,
+            })
             .collect::<Vec<_>>();
         let selected_run = self.harness_kanban.detail.as_ref()
             .filter(|detail| detail.task_id == task_id)
             .and_then(|detail| detail.selected_run.clone())
-            .filter(|run_id| run_ids.contains(run_id))
-            .or_else(|| run_ids.last().cloned());
+            .filter(|run_id| runs.iter().any(|run| &run.run_id == run_id))
+            .or_else(|| runs.last().map(|run| run.run_id.clone()));
         self.harness_kanban.detail = Some(HarnessTaskDetailState {
             task_id: task_id.clone(),
             section: HarnessTaskDetailSection::Overview,
@@ -5064,19 +5222,31 @@ impl App {
         self.harness_kanban.execution_detail_pending.insert(task_id.clone());
         self.harness_kanban.execution_detail_failures.remove(&task_id);
         self.focus = Focus::Viewport;
-        self.request_harness_task_correlations(task_id, run_ids)
+        self.request_harness_task_correlations(task_id, runs)
     }
 
     fn request_harness_task_correlations(
         &mut self,
         task_id: HarnessTaskId,
-        run_ids: Vec<HarnessRunId>,
+        runs: Vec<HarnessRunRef>,
     ) -> AppAction {
-        for run_id in &run_ids {
-            self.harness_kanban.correlation_pending.insert(run_id.clone());
-            self.harness_kanban.correlation_failures.remove(run_id);
+        for run in &runs {
+            self.harness_kanban.correlation_pending.insert(run.run_id.clone());
+            self.harness_kanban.correlation_failures.remove(&run.run_id);
+            if self.harness_kanban.runs.get(&run.run_id)
+                .is_some_and(|loaded| loaded.binding != RedactedBindingStateV1::None)
+            {
+                self.harness_kanban.run_observations.insert(
+                    run.run_id.clone(),
+                    HarnessRunObservationState::Loading {
+                        run_revision: run.run_revision,
+                    },
+                );
+            } else {
+                self.harness_kanban.run_observations.remove(&run.run_id);
+            }
         }
-        AppAction::HarnessLoadTaskCorrelations { task_id, run_ids }
+        AppAction::HarnessLoadTaskCorrelations { task_id, runs }
     }
 
     fn open_harness_run_monitor(&mut self, run_id: HarnessRunId) -> AppAction {
@@ -5096,10 +5266,17 @@ impl App {
             run: run.clone(),
             monitor: None,
             timeline: Vec::new(),
+            section: HarnessRunMonitorSection::Summary,
+            scroll: 0,
             loading: true,
             stale_reason: None,
         });
-        AppAction::HarnessOpenMonitor { run_id }
+        AppAction::HarnessOpenMonitor {
+            run: HarnessRunRef {
+                run_id,
+                run_revision: run.revision,
+            },
+        }
     }
 
     pub fn harness_run_ref(&self, run_id: &HarnessRunId) -> Option<HarnessRunRef> {
@@ -5592,13 +5769,16 @@ impl App {
                 }
             }
             UiKey::Char('r') | UiKey::Char('R') => {
-                let run_ids = self.harness_task_runs(&detail.task_id)
+                let runs = self.harness_task_runs(&detail.task_id)
                     .into_iter()
-                    .map(|run| run.run_id.clone())
+                    .map(|run| HarnessRunRef {
+                        run_id: run.run_id.clone(),
+                        run_revision: run.revision,
+                    })
                     .collect::<Vec<_>>();
                 let task_id = detail.task_id.clone();
                 self.harness_kanban.detail = Some(detail);
-                return self.request_harness_task_correlations(task_id, run_ids);
+                return self.request_harness_task_correlations(task_id, runs);
             }
             _ => {}
         }
@@ -5618,7 +5798,41 @@ impl App {
                         .expect("inline Harness details are present");
                     view.loading = true;
                     view.stale_reason = None;
-                    AppAction::HarnessOpenMonitor { run_id: view.run.run_id.clone() }
+                    AppAction::HarnessOpenMonitor {
+                        run: HarnessRunRef {
+                            run_id: view.run.run_id.clone(),
+                            run_revision: view.run.revision,
+                        },
+                    }
+                }
+                UiKey::Left | UiKey::Right | UiKey::Tab | UiKey::BackTab => {
+                    let view = self.harness_kanban.monitor.as_mut()
+                        .expect("inline Harness details are present");
+                    let current = HarnessRunMonitorSection::ALL.iter()
+                        .position(|section| *section == view.section)
+                        .unwrap_or(0);
+                    let previous = matches!(key, UiKey::Left | UiKey::BackTab);
+                    let next = if previous {
+                        current.checked_sub(1)
+                            .unwrap_or(HarnessRunMonitorSection::ALL.len() - 1)
+                    } else {
+                        (current + 1) % HarnessRunMonitorSection::ALL.len()
+                    };
+                    view.section = HarnessRunMonitorSection::ALL[next];
+                    view.scroll = 0;
+                    AppAction::None
+                }
+                UiKey::Up | UiKey::PageUp => {
+                    let view = self.harness_kanban.monitor.as_mut()
+                        .expect("inline Harness details are present");
+                    view.scroll = view.scroll.saturating_sub(if key == UiKey::PageUp { 10 } else { 1 });
+                    AppAction::None
+                }
+                UiKey::Down | UiKey::PageDown => {
+                    let view = self.harness_kanban.monitor.as_mut()
+                        .expect("inline Harness details are present");
+                    view.scroll = view.scroll.saturating_add(if key == UiKey::PageDown { 10 } else { 1 });
+                    AppAction::None
                 }
                 _ => AppAction::None,
             };
@@ -7850,6 +8064,29 @@ impl App {
             Some(HitTarget::HarnessTaskCancel) => return self.harness_cancel_selected(),
             Some(HitTarget::HarnessTaskRetry) => return self.harness_retry_selected(),
             Some(HitTarget::HarnessTaskMonitor) => return self.open_selected_harness_monitor(),
+            Some(HitTarget::HarnessRunMonitorBack) => {
+                self.harness_kanban.monitor = None;
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessRunMonitorSection(section)) => {
+                if let Some(view) = self.harness_kanban.monitor.as_mut() {
+                    view.section = *section;
+                    view.scroll = 0;
+                }
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessRunMonitorScrollUp) => {
+                if let Some(view) = self.harness_kanban.monitor.as_mut() {
+                    view.scroll = view.scroll.saturating_sub(1);
+                }
+                return AppAction::None;
+            }
+            Some(HitTarget::HarnessRunMonitorScrollDown) => {
+                if let Some(view) = self.harness_kanban.monitor.as_mut() {
+                    view.scroll = view.scroll.saturating_add(1);
+                }
+                return AppAction::None;
+            }
             Some(HitTarget::HarnessTaskDetailBack) => {
                 self.harness_kanban.monitor = None;
                 self.harness_kanban.detail = None;
@@ -8531,6 +8768,10 @@ impl App {
                 | HitTarget::HarnessTaskCancel
                 | HitTarget::HarnessTaskRetry
                 | HitTarget::HarnessTaskMonitor
+                | HitTarget::HarnessRunMonitorBack
+                | HitTarget::HarnessRunMonitorSection(_)
+                | HitTarget::HarnessRunMonitorScrollUp
+                | HitTarget::HarnessRunMonitorScrollDown
                 | HitTarget::HarnessTaskDetailBack
                 | HitTarget::HarnessTaskDetailSection(_)
                 | HitTarget::HarnessTaskDetailRun(_)
@@ -17523,6 +17764,11 @@ fn validate_session_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_harness_client::{
+        FeatureObservationStateV1, HarnessMonitoringVisibilityV1, MonitorFeatureStatesV1,
+        ObservationEvidenceV1 as HarnessObservationEvidenceV1, ProjectionAvailabilityV1,
+        ProjectionFreshnessV1, TimelineCategoryV1, TimelineStateV1,
+    };
 
     fn harness_task(id_digit: char, state: HarnessTaskStateV1, revision: u64) -> RedactedTaskV1 {
         RedactedTaskV1 {
@@ -17567,6 +17813,40 @@ mod tests {
             references_redacted: false,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+        }
+    }
+
+    fn harness_monitor(run_id: HarnessRunId) -> HarnessSessionMonitorV1 {
+        HarnessSessionMonitorV1 {
+            run_id,
+            visibility: HarnessMonitoringVisibilityV1::Detail,
+            availability: ProjectionAvailabilityV1::Current,
+            freshness: ProjectionFreshnessV1::Live,
+            transport_incomplete: false,
+            features: MonitorFeatureStatesV1 {
+                todo: FeatureObservationStateV1::SupportedNotObserved,
+                tools: FeatureObservationStateV1::SupportedNotObserved,
+                subagents: FeatureObservationStateV1::SupportedNotObserved,
+                interactions: FeatureObservationStateV1::SupportedNotObserved,
+                owned_processes: FeatureObservationStateV1::SupportedNotObserved,
+                files: FeatureObservationStateV1::SupportedNotObserved,
+                usage: FeatureObservationStateV1::SupportedNotObserved,
+                history: FeatureObservationStateV1::SupportedNotObserved,
+            },
+            todo_total: 0,
+            todo_completed: 0,
+            active_tools: 0,
+            active_subagents: 0,
+            active_interactions: 0,
+            active_processes: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            context_window_tokens: None,
+            history: None,
+            detail: None,
         }
     }
 
@@ -17950,7 +18230,12 @@ mod tests {
         app.begin_harness_refresh(2);
         app.apply_harness_snapshot(2, vec![task], vec![bound]);
         let action = app.open_selected_harness_monitor();
-        assert_eq!(action, AppAction::HarnessOpenMonitor { run_id: run_id.clone() });
+        assert_eq!(action, AppAction::HarnessOpenMonitor {
+            run: HarnessRunRef {
+                run_id: run_id.clone(),
+                run_revision: HarnessRevision::new(1).unwrap(),
+            },
+        });
         assert_eq!(
             app.harness_kanban.monitor.as_ref().map(|view| &view.run.run_id),
             Some(&run_id),
@@ -17993,10 +18278,11 @@ mod tests {
             target: HitTarget::HarnessTaskOpen(task.task_id.clone()),
         }];
 
-        let AppAction::HarnessLoadTaskCorrelations { task_id, run_ids } = app.click(5, 4) else {
+        let AppAction::HarnessLoadTaskCorrelations { task_id, runs } = app.click(5, 4) else {
             panic!("explicit Open target must enter Task Detail and request correlations");
         };
         assert_eq!(task_id, task.task_id);
+        let run_ids = runs.iter().map(|run| run.run_id.clone()).collect::<Vec<_>>();
         assert_eq!(run_ids, vec![second.run_id.clone(), first.run_id.clone(), third.run_id.clone()]);
         assert_eq!(app.harness_detail_runs().into_iter().map(|run| run.run_id.clone()).collect::<Vec<_>>(), run_ids);
         assert_eq!(app.harness_kanban.detail.as_ref().and_then(|detail| detail.selected_run.as_ref()), Some(&third.run_id));
@@ -18025,9 +18311,111 @@ mod tests {
 
         assert_eq!(
             app.click(2, 1),
-            AppAction::HarnessOpenMonitor { run_id: run.run_id.clone() },
+            AppAction::HarnessOpenMonitor {
+                run: HarnessRunRef {
+                    run_id: run.run_id.clone(),
+                    run_revision: run.revision,
+                },
+            },
         );
         assert_eq!(app.harness_kanban.monitor.as_ref().map(|view| &view.run.run_id), Some(&run.run_id));
+    }
+
+    #[test]
+    fn harness_task_observation_reducer_never_mixes_runs_or_revisions() {
+        let mut app = App::default();
+        let mut task = harness_task('e', HarnessTaskStateV1::Running, 1);
+        let first = harness_run('1', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        let second = harness_run('2', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        task.run_ids = vec![first.run_id.clone(), second.run_id.clone()];
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![first.clone(), second.clone()]);
+        let _ = app.open_harness_task_detail(task.task_id.clone());
+
+        app.apply_harness_task_observations(
+            &task.task_id,
+            vec![(first.clone(), harness_monitor(second.run_id.clone()))],
+            Vec::new(),
+        );
+        assert!(matches!(
+            app.harness_kanban.run_observations.get(&first.run_id),
+            Some(HarnessRunObservationState::Loading { .. })
+        ));
+        app.apply_harness_task_observations(
+            &task.task_id,
+            vec![(first.clone(), harness_monitor(first.run_id.clone()))],
+            vec![(
+                HarnessRunRef {
+                    run_id: second.run_id.clone(),
+                    run_revision: second.revision,
+                },
+                "not observed".to_owned(),
+            )],
+        );
+        assert!(matches!(
+            app.harness_kanban.run_observations.get(&first.run_id),
+            Some(HarnessRunObservationState::Ready { monitor, .. })
+                if monitor.run_id == first.run_id
+        ));
+        assert!(matches!(
+            app.harness_kanban.run_observations.get(&second.run_id),
+            Some(HarnessRunObservationState::Error { message, .. })
+                if message == "not observed"
+        ));
+
+        let mut revised = first.clone();
+        revised.revision = HarnessRevision::new(2).unwrap();
+        app.begin_harness_refresh(2);
+        app.apply_harness_snapshot(2, vec![task.clone()], vec![revised.clone(), second]);
+        app.apply_harness_task_observations(
+            &task.task_id,
+            Vec::new(),
+            vec![(
+                HarnessRunRef {
+                    run_id: first.run_id.clone(),
+                    run_revision: first.revision,
+                },
+                "stale response".to_owned(),
+            )],
+        );
+        assert!(!app.harness_kanban.run_observations.contains_key(&first.run_id));
+    }
+
+    #[test]
+    fn harness_monitor_reducer_requires_ordered_run_local_timeline() {
+        let mut app = App::default();
+        let mut task = harness_task('f', HarnessTaskStateV1::Running, 1);
+        let run = harness_run('3', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        task.run_ids.push(run.run_id.clone());
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![run.clone()]);
+        let _ = app.open_harness_task_detail(task.task_id);
+        let _ = app.open_harness_run_monitor(run.run_id.clone());
+        let entry = |sequence| TimelineEntryV1 {
+            sequence,
+            received_at_ms: sequence,
+            category: TimelineCategoryV1::Tool,
+            label: Some("shell".to_owned()),
+            state: TimelineStateV1::Completed,
+            correlation: Some(1),
+            evidence: HarnessObservationEvidenceV1::StructuredProvider,
+        };
+        app.apply_harness_monitor(
+            run.clone(),
+            harness_monitor(run.run_id.clone()),
+            vec![entry(2), entry(1)],
+        );
+        assert!(app.harness_kanban.monitor.as_ref().unwrap().loading);
+        app.apply_harness_monitor(
+            run.clone(),
+            harness_monitor(run.run_id.clone()),
+            vec![entry(1), entry(2)],
+        );
+        assert_eq!(
+            app.harness_kanban.monitor.as_ref().unwrap().timeline
+                .iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
+            vec![1, 2],
+        );
     }
 
     #[test]
@@ -18077,6 +18465,33 @@ mod tests {
             app.harness_kanban.detail.as_ref().map(|detail| (detail.section, detail.selected_run.clone())),
             Some((HarnessTaskDetailSection::Agents, Some(run.run_id))),
         );
+    }
+
+    #[test]
+    fn harness_history_summary_control_never_routes_to_legacy_history() {
+        let mut app = App::default();
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let task = harness_task('6', HarnessTaskStateV1::Running, 1);
+        let run = harness_run('4', task.task_id, RedactedBindingStateV1::ManagedActive);
+        app.harness_kanban.monitor = Some(HarnessRunMonitorView {
+            run,
+            monitor: None,
+            timeline: Vec::new(),
+            section: HarnessRunMonitorSection::Timeline,
+            scroll: 7,
+            loading: true,
+            stale_reason: None,
+        });
+        let tabs = app.surface.all_tabs().into_iter().cloned().collect::<Vec<_>>();
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 20, 1),
+            target: HitTarget::HarnessRunMonitorSection(HarnessRunMonitorSection::Summary),
+        }];
+        assert_eq!(app.click(1, 0), AppAction::None);
+        assert_eq!(app.surface.all_tabs().into_iter().cloned().collect::<Vec<_>>(), tabs);
+        let monitor = app.harness_kanban.monitor.as_ref().unwrap();
+        assert_eq!(monitor.section, HarnessRunMonitorSection::Summary);
+        assert_eq!(monitor.scroll, 0);
     }
     use gate4agent_node_protocol::{
         AgentProgressAttentionKindV1, AgentProgressAttentionV1, AgentProgressUsageV1,

@@ -47,8 +47,14 @@ impl HarnessReadClient {
         &self,
         run_id: Option<HarnessRunId>,
     ) -> Result<SessionMonitorV1, HarnessReadClientError> {
+        let expected_run_id = run_id.clone();
         match self.send(HarnessReadRequestV1::MonitorGet { run_id })? {
-            HarnessReadResponseV1::Monitor(value) => Ok(value),
+            HarnessReadResponseV1::Monitor(value) => {
+                if let Some(expected_run_id) = expected_run_id.as_ref() {
+                    value.validate_for(expected_run_id)?;
+                }
+                Ok(value)
+            }
             _ => Err(HarnessReadClientError::UnexpectedResponse),
         }
     }
@@ -59,8 +65,14 @@ impl HarnessReadClient {
         after_sequence: Option<u64>,
         limit: u16,
     ) -> Result<TimelinePageV1, HarnessReadClientError> {
+        let expected_run_id = run_id.clone();
         match self.send(HarnessReadRequestV1::TimelineRead { run_id, after_sequence, limit })? {
-            HarnessReadResponseV1::Timeline(value) => Ok(value),
+            HarnessReadResponseV1::Timeline(value) => {
+                if let Some(expected_run_id) = expected_run_id.as_ref() {
+                    value.validate_for(expected_run_id)?;
+                }
+                Ok(value)
+            }
             _ => Err(HarnessReadClientError::UnexpectedResponse),
         }
     }
@@ -169,8 +181,13 @@ impl HarnessOperatorClient {
         &self,
         run_id: HarnessRunId,
     ) -> Result<SessionMonitorV1, HarnessOperatorClientError> {
+        let expected_run_id = run_id.clone();
         match self.send(HarnessOperatorRequestV1::MonitorGet { run_id })? {
-            HarnessOperatorResponseV1::Monitor(value) => Ok(value),
+            HarnessOperatorResponseV1::Monitor(value) => {
+                value.validate_for(&expected_run_id)
+                    .map_err(HarnessOperatorApiError::Read)?;
+                Ok(value)
+            }
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
     }
@@ -181,12 +198,17 @@ impl HarnessOperatorClient {
         after_sequence: Option<u64>,
         limit: u16,
     ) -> Result<TimelinePageV1, HarnessOperatorClientError> {
+        let expected_run_id = run_id.clone();
         match self.send(HarnessOperatorRequestV1::TimelineRead {
             run_id,
             after_sequence,
             limit,
         })? {
-            HarnessOperatorResponseV1::Timeline(value) => Ok(value),
+            HarnessOperatorResponseV1::Timeline(value) => {
+                value.validate_for(&expected_run_id)
+                    .map_err(HarnessOperatorApiError::Read)?;
+                Ok(value)
+            }
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
     }
@@ -729,6 +751,40 @@ mod tests {
             .expect("operator credential")
     }
 
+    fn empty_monitor(run_id: HarnessRunId) -> SessionMonitorV1 {
+        SessionMonitorV1 {
+            run_id,
+            visibility: HarnessMonitoringVisibilityV1::Timeline,
+            availability: ProjectionAvailabilityV1::Unknown,
+            freshness: ProjectionFreshnessV1::Unavailable,
+            transport_incomplete: false,
+            features: MonitorFeatureStatesV1 {
+                todo: FeatureObservationStateV1::Unknown,
+                tools: FeatureObservationStateV1::Unknown,
+                subagents: FeatureObservationStateV1::Unknown,
+                interactions: FeatureObservationStateV1::Unknown,
+                owned_processes: FeatureObservationStateV1::Unknown,
+                files: FeatureObservationStateV1::Unknown,
+                usage: FeatureObservationStateV1::Unknown,
+                history: FeatureObservationStateV1::Unknown,
+            },
+            todo_total: 0,
+            todo_completed: 0,
+            active_tools: 0,
+            active_subagents: 0,
+            active_interactions: 0,
+            active_processes: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            context_window_tokens: None,
+            history: None,
+            detail: None,
+        }
+    }
+
     #[test]
     fn client_uses_one_bounded_ndjson_request_per_loopback_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
@@ -791,6 +847,34 @@ mod tests {
             Err(HarnessOperatorClientError::Host(
                 HarnessOperatorHostErrorV1::Conflict,
             )),
+        ));
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_rejects_monitor_for_a_different_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let requested_run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let other_run_id = HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let reply = HarnessOperatorReplyV1::Ok {
+                response: HarnessOperatorResponseV1::Monitor(empty_monitor(other_run_id)),
+            };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert!(matches!(
+            client.monitor_get(requested_run_id),
+            Err(HarnessOperatorClientError::Api(HarnessOperatorApiError::Read(
+                HarnessReadApiError::InvalidRunState,
+            ))),
         ));
         host.join().expect("host");
     }

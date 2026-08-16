@@ -3932,6 +3932,118 @@ fn render_harness_task_detail(
                     .render(body, buf);
             }
         }
+        HarnessTaskDetailSection::Execution => {
+            let loading = app.harness_kanban.execution_detail_pending.contains(&task.task_id);
+            let failure = app.harness_kanban.execution_detail_failures.get(&task.task_id);
+            let pending = app.harness_kanban.execution_mutation.as_ref()
+                .filter(|pending| pending.task_id == task.task_id);
+            let status = if let Some(pending) = pending {
+                format!("Applying {:?}...", pending.kind)
+            } else if loading {
+                "Loading ordinary launch plans and saved execution spec...".to_owned()
+            } else if let Some(failure) = failure {
+                format!("Execution data unavailable: {failure}")
+            } else if let Some(spec) = app.harness_detail_execution_spec() {
+                format!(
+                    "Saved exact spec rev {} | plan {} rev {} | review {:?}",
+                    spec.revision.get(),
+                    spec.scheduled_launch.plan.plan_id.as_str(),
+                    spec.scheduled_launch.plan.revision.get(),
+                    spec.review_policy,
+                )
+            } else {
+                "No execution spec saved; choose a plan and use [Use plan]".to_owned()
+            };
+            if body.height > 0 {
+                Paragraph::new(truncate_cells(&status, body.width as usize))
+                    .style(Style::default().fg(if failure.is_some() { theme.yellow } else { theme.dim }).bg(theme.surface))
+                    .render(Rect::new(body.x, body.y, body.width, 1), buf);
+            }
+            let actions = Rect::new(
+                body.x,
+                body.y.saturating_add(1),
+                body.width,
+                body.height.saturating_sub(1).min(1),
+            );
+            let can_use = app.harness_selected_launch_plan().is_some()
+                && app.harness_kanban.execution_specs.contains_key(&task.task_id)
+                && pending.is_none();
+            let mut action_x = render_toolbar_segment(
+                "[Use plan]",
+                actions.x,
+                actions,
+                Style::default().fg(if can_use { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_use.then_some(HitTarget::HarnessExecutionUsePlan),
+                buf,
+                layout,
+            ).saturating_add(1);
+            let can_start = app.harness_start_selected_enabled();
+            action_x = render_toolbar_segment(
+                "[Start selected]",
+                action_x,
+                actions,
+                Style::default().fg(if can_start { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_start.then_some(HitTarget::HarnessExecutionStartSelected),
+                buf,
+                layout,
+            ).saturating_add(2);
+            let _ = render_toolbar_segment(
+                "[Run next Ready (global)]",
+                action_x,
+                actions,
+                Style::default().fg(theme.yellow).bg(theme.surface),
+                Some(HitTarget::HarnessScheduleNext),
+                buf,
+                layout,
+            );
+            let header_y = body.y.saturating_add(3);
+            if header_y < body.bottom() {
+                Paragraph::new("Ordinary launch plans | node | workspace | profile | mode")
+                    .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
+                    .render(Rect::new(body.x, header_y, body.width, 1), buf);
+            }
+            let mut y = header_y.saturating_add(1);
+            for (plan_id, plan) in &app.harness_kanban.launch_plans {
+                if y >= body.bottom() {
+                    break;
+                }
+                let selected = app.harness_kanban.selected_launch_plan.as_ref() == Some(plan_id);
+                let saved = app.harness_detail_execution_spec().is_some_and(|spec| {
+                    spec.scheduled_launch == plan.scheduled_launch
+                });
+                let background = if selected { theme.active } else { theme.surface };
+                let row = Rect::new(body.x, y, body.width, 1);
+                fill_rect(row, background, buf);
+                let marker = match (selected, saved) {
+                    (true, true) => "> saved",
+                    (true, false) => "> selected",
+                    (false, true) => "  saved",
+                    (false, false) => " ",
+                };
+                let line = format!(
+                    "{marker} {} r{} | {} | {} | {} | {:?}",
+                    plan_id.as_str(),
+                    plan.scheduled_launch.plan.revision.get(),
+                    plan.node_id.as_str(),
+                    plan.workspace_id.as_str(),
+                    plan.provider_profile.as_str(),
+                    plan.mode,
+                );
+                Paragraph::new(truncate_cells(&line, row.width as usize))
+                    .style(Style::default().fg(if selected { theme.text } else { theme.dim }).bg(background))
+                    .render(row, buf);
+                layout.hits.push(HitRegion {
+                    rect: row,
+                    target: HitTarget::HarnessExecutionPlan(plan_id.clone()),
+                });
+                y = y.saturating_add(1);
+            }
+            if app.harness_kanban.launch_plans.is_empty() && y < body.bottom() {
+                Paragraph::new(if loading { "Loading plans..." } else { "No ordinary launch plans available" })
+                    .style(Style::default().fg(theme.muted).bg(theme.surface))
+                    .render(Rect::new(body.x, y, body.width, 1), buf);
+            }
+        }
     }
 }
 
@@ -7911,7 +8023,10 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 mod tests {
     use super::*;
     use gate4agent_harness_client::{
-        HarnessExecutionModeV1, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
+        HarnessExecutionModeV1, HarnessExecutionSpecId, HarnessLaunchAuthorityRefV1,
+        HarnessLaunchPlanRefV1, HarnessLaunchPlanSummaryV1, HarnessRequestDigest,
+        HarnessRevision, HarnessRunId, HarnessRunLifecycleV1, HarnessScheduledLaunchRefV2,
+        HarnessTaskExecutionSpecV1, HarnessTaskReviewPolicyV1, HarnessWorktreeIntentV1,
         HarnessTaskId, HarnessTaskStateV1, RedactedBindingStateV1,
         RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1,
         RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
@@ -8155,6 +8270,95 @@ mod tests {
         assert!(agents_text.contains("exact correlation unavailable"), "{agents_text}");
         assert!(agents_text.contains("PTY: unavailable"), "{agents_text}");
         assert!(agents_text.contains("Workspace: unavailable"), "{agents_text}");
+    }
+
+    #[test]
+    fn harness_task_detail_execution_is_mouse_first_and_keeps_global_scheduler_distinct() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let task = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_cccccccccccccccccccccccc").unwrap(),
+            revision: HarnessRevision::new(7).unwrap(),
+            title: "ready task".to_owned(),
+            body: String::new(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Ready,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let scheduled_launch = HarnessScheduledLaunchRefV2 {
+            plan: HarnessLaunchPlanRefV1 {
+                plan_id: gate4agent_harness_protocol::HarnessSelectorV1::new("ordinary-codex").unwrap(),
+                revision: HarnessRevision::new(4).unwrap(),
+                digest: HarnessRequestDigest::new("a".repeat(64)).unwrap(),
+            },
+            authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+        };
+        let plan = HarnessLaunchPlanSummaryV1 {
+            scheduled_launch: scheduled_launch.clone(),
+            node_id: gate4agent_harness_protocol::HarnessSelectorV1::new("node-a").unwrap(),
+            workspace_id: gate4agent_harness_protocol::HarnessSelectorV1::new("workspace-a").unwrap(),
+            worktree: HarnessWorktreeIntentV1::Existing,
+            provider_profile: gate4agent_harness_protocol::HarnessSelectorV1::new("codex-default").unwrap(),
+            provider_id: gate4agent_harness_protocol::HarnessSelectorV1::new("codex").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+        };
+        let spec = HarnessTaskExecutionSpecV1 {
+            execution_spec_id: HarnessExecutionSpecId::new(format!(
+                "hespec_{}",
+                "d".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(2).unwrap(),
+            task_id: task.task_id.clone(),
+            scheduled_launch: scheduled_launch.clone(),
+            scheduled_launch_digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        };
+        assert_ne!(
+            spec.scheduled_launch_digest,
+            scheduled_launch.plan.digest,
+            "render gate must not equate the whole scheduled-launch digest with plan.digest",
+        );
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
+        app.harness_kanban.detail = Some(crate::app::HarnessTaskDetailState {
+            task_id: task.task_id.clone(),
+            section: crate::app::HarnessTaskDetailSection::Execution,
+            selected_run: None,
+            scroll: 0,
+        });
+        app.apply_harness_task_execution(task.task_id, vec![plan.clone()], Some(spec));
+
+        let mut buf = TerminalBuffer::new(120, 28);
+        let layout = render(&app, &mut buf);
+        let text = buffer_text(&buf);
+        for label in [
+            "[Execution]",
+            "[Use plan]",
+            "[Start selected]",
+            "[Run next Ready (global)]",
+            "Ordinary launch plans",
+            "ordinary-codex",
+            "saved",
+        ] {
+            assert!(text.contains(label), "missing execution control {label}: {text}");
+        }
+        assert!(layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::HarnessExecutionPlan(plan.scheduled_launch.plan.plan_id.clone())
+        }));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessExecutionUsePlan));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessExecutionStartSelected));
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::HarnessScheduleNext));
     }
 
     #[test]

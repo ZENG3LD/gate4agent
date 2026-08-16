@@ -254,6 +254,30 @@ impl HarnessOperatorClient {
         }
     }
 
+    pub fn launch_plans_list(
+        &self,
+        after_plan_id: Option<HarnessSelectorV1>,
+        limit: u16,
+    ) -> Result<HarnessLaunchPlanPageV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::LaunchPlansList {
+            after_plan_id,
+            limit,
+        })? {
+            HarnessOperatorResponseV1::LaunchPlans(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn task_execution_spec_get(
+        &self,
+        task_id: HarnessTaskId,
+    ) -> Result<Option<HarnessTaskExecutionSpecV1>, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::TaskExecutionSpecGet { task_id })? {
+            HarnessOperatorResponseV1::TaskExecutionSpec(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn runtime_inventory_list(
         &self,
         after_node_id: Option<String>,
@@ -363,6 +387,26 @@ impl HarnessOperatorClient {
     ) -> Result<HarnessScheduleOutcomeV1, HarnessOperatorClientError> {
         match self.send(HarnessOperatorRequestV1::ScheduleNext { request })? {
             HarnessOperatorResponseV1::Schedule(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn replace_task_execution_spec(
+        &self,
+        request: HarnessReplaceTaskExecutionSpecRequestV1,
+    ) -> Result<HarnessOperatorMutationOutcomeV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ReplaceTaskExecutionSpec { request })? {
+            HarnessOperatorResponseV1::ExecutionSpecMutation(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn start_task(
+        &self,
+        request: HarnessStartTaskRequestV1,
+    ) -> Result<HarnessTaskStartOutcomeV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::StartTask { request })? {
+            HarnessOperatorResponseV1::TaskStarted(value) => Ok(value),
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
     }
@@ -825,6 +869,152 @@ mod tests {
         let client = HarnessOperatorClient::new(endpoint, operator_credential())
             .expect("operator client");
         assert_eq!(client.run_correlation_get(run_id).unwrap(), correlation);
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_round_trips_v4_execution_spec_and_exact_start() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let task_id = HarnessTaskId::new(format!("htask_{}", "1".repeat(24))).unwrap();
+        let scheduled_launch = HarnessScheduledLaunchRefV2 {
+            plan: HarnessLaunchPlanRefV1 {
+                plan_id: HarnessSelectorV1::new("ordinary-codex").unwrap(),
+                revision: HarnessRevision::new(4).unwrap(),
+                digest: HarnessRequestDigest::new("a".repeat(64)).unwrap(),
+            },
+            authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+        };
+        let summary = HarnessLaunchPlanSummaryV1 {
+            scheduled_launch: scheduled_launch.clone(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            worktree: HarnessWorktreeIntentV1::Existing,
+            provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+            provider_id: HarnessSelectorV1::new("codex").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+        };
+        let page = HarnessLaunchPlanPageV1 {
+            plans: vec![summary],
+            next_plan_id: None,
+        };
+        let spec = HarnessTaskExecutionSpecV1 {
+            execution_spec_id: HarnessExecutionSpecId::new(format!(
+                "hespec_{}",
+                "2".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(2).unwrap(),
+            task_id: task_id.clone(),
+            scheduled_launch: scheduled_launch.clone(),
+            scheduled_launch_digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 20,
+        };
+        let outcome = HarnessTaskStartOutcomeV1 {
+            dispatch: HarnessDispatchIntentV1 {
+                task_id: task_id.clone(),
+                task_revision: HarnessRevision::new(8).unwrap(),
+                run_id: HarnessRunId::new(format!("hrun_{}", "3".repeat(24))).unwrap(),
+                run_revision: HarnessRevision::new(1).unwrap(),
+                operation_id: HarnessOperationId::new(format!(
+                    "hop_{}",
+                    "4".repeat(24),
+                )).unwrap(),
+                operation_revision: HarnessRevision::new(1).unwrap(),
+                idempotency_ref: HarnessIdempotencyRef::new(format!(
+                    "hidem_{}",
+                    "5".repeat(24),
+                )).unwrap(),
+                parent_run_id: None,
+                intent: HarnessRunIntentV1 {
+                    node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                    workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                    worktree: HarnessWorktreeIntentV1::Existing,
+                    provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+                    mode: HarnessExecutionModeV1::Pty,
+                    delivery_bundle: None,
+                    continuation: None,
+                },
+            },
+            replayed: false,
+        };
+        let expected_page = page.clone();
+        let expected_spec = spec.clone();
+        let expected_outcome = outcome.clone();
+        let host = thread::spawn(move || {
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = String::new();
+                stream.read_to_string(&mut request).expect("request");
+                for forbidden in ["provider_home", "environment", "spawn_spec"] {
+                    assert!(!request.contains(forbidden));
+                }
+                let envelope: HarnessOperatorEnvelopeV1 =
+                    serde_json::from_str(request.trim_end()).expect("operator envelope");
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V4);
+                let response = match (index, envelope.request) {
+                    (0, HarnessOperatorRequestV1::LaunchPlansList { limit: 16, .. }) => {
+                        HarnessOperatorResponseV1::LaunchPlans(expected_page.clone())
+                    }
+                    (1, HarnessOperatorRequestV1::TaskExecutionSpecGet { .. }) => {
+                        HarnessOperatorResponseV1::TaskExecutionSpec(Some(expected_spec.clone()))
+                    }
+                    (2, HarnessOperatorRequestV1::ReplaceTaskExecutionSpec { .. }) => {
+                        HarnessOperatorResponseV1::ExecutionSpecMutation(
+                            HarnessOperatorMutationOutcomeV1::Replayed,
+                        )
+                    }
+                    (3, HarnessOperatorRequestV1::StartTask { .. }) => {
+                        HarnessOperatorResponseV1::TaskStarted(expected_outcome.clone())
+                    }
+                    _ => panic!("unexpected V4 request"),
+                };
+                let reply = HarnessOperatorReplyV1::Ok { response };
+                let mut encoded = serde_json::to_vec(&reply).expect("reply");
+                encoded.push(b'\n');
+                stream.write_all(&encoded).expect("write reply");
+            }
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert_eq!(client.launch_plans_list(None, 16).unwrap(), page);
+        assert_eq!(client.task_execution_spec_get(task_id.clone()).unwrap(), Some(spec.clone()));
+        let authority = HarnessOperatorAuthorityV1 {
+            operation_id: HarnessOperationId::new(format!("hop_{}", "6".repeat(24))).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                "7".repeat(24),
+            )).unwrap(),
+            actor_id: HarnessSelectorV1::new("operator").unwrap(),
+            now_unix_ms: 30,
+        };
+        assert_eq!(
+            client.replace_task_execution_spec(HarnessReplaceTaskExecutionSpecRequestV1 {
+                authority: authority.clone(),
+                task_id: task_id.clone(),
+                expected_task_revision: HarnessRevision::new(7).unwrap(),
+                expected_execution_spec_revision:
+                    HarnessExpectedExecutionSpecRevisionV1::Absent,
+                spec: HarnessTaskExecutionSpecInputV1 {
+                    scheduled_launch,
+                    review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+                },
+            }).unwrap(),
+            HarnessOperatorMutationOutcomeV1::Replayed,
+        );
+        assert_eq!(
+            client.start_task(HarnessStartTaskRequestV1 {
+                authority,
+                task_id,
+                expected_task_revision: HarnessRevision::new(7).unwrap(),
+                expected_execution_spec_revision: HarnessRevision::new(2).unwrap(),
+                expected_scheduled_launch_digest: HarnessRequestDigest::new(
+                    "b".repeat(64),
+                ).unwrap(),
+            }).unwrap(),
+            outcome,
+        );
         host.join().expect("host");
     }
 

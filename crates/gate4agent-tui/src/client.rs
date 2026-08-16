@@ -53,8 +53,9 @@ use gate4agent_harness_client::{
     HarnessNativeSessionPreviewV1, HarnessNativeSessionRouteV1,
     HarnessNativeSessionSelectionV1,
     HarnessOperatorActionV1, HarnessOperatorClient, HarnessOperatorCredential,
-    HarnessOperatorIntentV1, HarnessOperatorRequestRefV1, RedactedBindingStateV1, RedactedRunV1,
-    HarnessRunCorrelationV1,
+    HarnessOperatorIntentV1, HarnessOperatorMutationOutcomeV1, HarnessOperatorRequestRefV1,
+    HarnessOperatorResponseV1, HarnessLaunchPlanSummaryV1, HarnessTaskExecutionSpecV1,
+    HarnessTaskStartOutcomeV1, RedactedBindingStateV1, RedactedRunV1, HarnessRunCorrelationV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTransportV1,
@@ -123,6 +124,8 @@ const HARNESS_RUNTIME_INVENTORY_PAGE_BUDGET: usize = 64;
 const HARNESS_RUNTIME_INVENTORY_ENTITY_BUDGET: usize = 4_096;
 const HARNESS_RUNTIME_INVENTORY_RETRY_BUDGET: usize = 20;
 const HARNESS_RUNTIME_INVENTORY_RETRY_DELAY: Duration = Duration::from_millis(100);
+const HARNESS_LAUNCH_PLAN_PAGE_BUDGET: usize = 16;
+const HARNESS_LAUNCH_PLAN_ENTITY_BUDGET: usize = 1_024;
 
 #[derive(Debug)]
 enum ObservationWriterCommand {
@@ -636,6 +639,31 @@ enum WorkerUpdate {
         task_id: gate4agent_harness_client::HarnessTaskId,
         correlations: Vec<HarnessRunCorrelationV1>,
         failures: Vec<(gate4agent_harness_client::HarnessRunId, String)>,
+    },
+    HarnessTaskExecutionLoaded {
+        task_id: gate4agent_harness_client::HarnessTaskId,
+        plans: Vec<HarnessLaunchPlanSummaryV1>,
+        execution_spec: Option<HarnessTaskExecutionSpecV1>,
+    },
+    HarnessTaskExecutionLoadFailed {
+        task_id: gate4agent_harness_client::HarnessTaskId,
+        message: String,
+    },
+    HarnessExecutionSpecSaved {
+        token: u64,
+        task_id: gate4agent_harness_client::HarnessTaskId,
+        execution_spec: HarnessTaskExecutionSpecV1,
+        outcome: HarnessOperatorMutationOutcomeV1,
+    },
+    HarnessTaskStarted {
+        token: u64,
+        task_id: gate4agent_harness_client::HarnessTaskId,
+        outcome: HarnessTaskStartOutcomeV1,
+    },
+    HarnessExecutionMutationFailed {
+        token: u64,
+        task_id: gate4agent_harness_client::HarnessTaskId,
+        message: String,
     },
     Notice(String),
 }
@@ -1363,6 +1391,8 @@ fn send_operator_action(
         commands.get(HARNESS_DETAIL_COMMAND_ROUTE)
     } else if harness_native_history_read {
         commands.get(HARNESS_HISTORY_COMMAND_ROUTE)
+    } else if node_id == HARNESS_COMMAND_ROUTE {
+        commands.get(HARNESS_COMMAND_ROUTE)
     } else {
         commands.get(&node_id).or_else(|| commands.get(C2_COMMAND_ROUTE))
     };
@@ -1431,7 +1461,22 @@ fn reject_harness_queue_action(
             }
         }.to_owned();
         app.fail_harness_task_correlations(task_id, message.clone());
+        app.fail_harness_task_execution(task_id, message.clone());
         app.notice = Some(message);
+        return true;
+    }
+    if let AppAction::HarnessUseLaunchPlan { token, task_id, .. }
+        | AppAction::HarnessStartTask { token, task_id, .. } = action
+    {
+        let message = match rejection {
+            HarnessQueueRejection::Busy => {
+                "Harness operator busy: execution mutation queue is full"
+            }
+            HarnessQueueRejection::Unavailable => {
+                "Harness operator unavailable: execution mutation queue is closed"
+            }
+        }.to_owned();
+        app.fail_harness_execution_mutation(*token, task_id, message);
         return true;
     }
     let token = match action {
@@ -1541,7 +1586,9 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessRetryTask { .. }
         | AppAction::HarnessScheduleNext { .. }
         | AppAction::HarnessOpenMonitor { .. }
-        | AppAction::HarnessLoadTaskCorrelations { .. } => Some(HARNESS_COMMAND_ROUTE),
+        | AppAction::HarnessLoadTaskCorrelations { .. }
+        | AppAction::HarnessUseLaunchPlan { .. }
+        | AppAction::HarnessStartTask { .. } => Some(HARNESS_COMMAND_ROUTE),
         AppAction::None | AppAction::Quit => None,
     }
 }
@@ -2067,6 +2114,109 @@ fn harness_operator_worker(
                     true,
                 );
             }
+            AppAction::HarnessUseLaunchPlan {
+                token,
+                task_id,
+                expected_task_revision,
+                expected_execution_spec_revision,
+                spec,
+            } => {
+                let result = (|| {
+                    let intent = intent_factory.next_intent(
+                        HarnessOperatorActionV1::ReplaceTaskExecutionSpec {
+                            task_id: task_id.clone(),
+                            expected_task_revision,
+                            expected_execution_spec_revision,
+                            spec,
+                        },
+                    )?;
+                    let outcome = match client.submit_intent(intent)
+                        .map_err(|error| error.to_string())?
+                    {
+                        HarnessOperatorResponseV1::ExecutionSpecMutation(outcome) => outcome,
+                        _ => return Err("Harness execution-spec mutation returned an unexpected response".to_owned()),
+                    };
+                    let execution_spec = client.task_execution_spec_get(task_id.clone())
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "Harness execution spec was not readable after save".to_owned())?;
+                    Ok((outcome, execution_spec))
+                })();
+                match result {
+                    Ok((outcome, execution_spec)) => {
+                        if updates.blocking_send(WorkerUpdate::HarnessExecutionSpecSaved {
+                            token,
+                            task_id: task_id.clone(),
+                            execution_spec,
+                            outcome,
+                        }).is_err() {
+                            return;
+                        }
+                        publish_harness_snapshot(
+                            &client,
+                            token,
+                            &updates,
+                            &runtime_inventory,
+                            false,
+                        );
+                    }
+                    Err(message) => {
+                        if updates.blocking_send(WorkerUpdate::HarnessExecutionMutationFailed {
+                            token,
+                            task_id,
+                            message,
+                        }).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            AppAction::HarnessStartTask {
+                token,
+                task_id,
+                expected_task_revision,
+                expected_execution_spec_revision,
+                expected_scheduled_launch_digest,
+            } => {
+                let result = (|| {
+                    let intent = intent_factory.next_intent(HarnessOperatorActionV1::StartTask {
+                        task_id: task_id.clone(),
+                        expected_task_revision,
+                        expected_execution_spec_revision,
+                        expected_scheduled_launch_digest,
+                    })?;
+                    match client.submit_intent(intent).map_err(|error| error.to_string())? {
+                        HarnessOperatorResponseV1::TaskStarted(outcome) => Ok(outcome),
+                        _ => Err("Harness start-task returned an unexpected response".to_owned()),
+                    }
+                })();
+                match result {
+                    Ok(outcome) => {
+                        if updates.blocking_send(WorkerUpdate::HarnessTaskStarted {
+                            token,
+                            task_id: task_id.clone(),
+                            outcome,
+                        }).is_err() {
+                            return;
+                        }
+                        publish_harness_snapshot(
+                            &client,
+                            token,
+                            &updates,
+                            &runtime_inventory,
+                            true,
+                        );
+                    }
+                    Err(message) => {
+                        if updates.blocking_send(WorkerUpdate::HarnessExecutionMutationFailed {
+                            token,
+                            task_id,
+                            message,
+                        }).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2182,16 +2332,62 @@ fn harness_detail_worker(
                     }
                 }
                 if updates.blocking_send(WorkerUpdate::HarnessTaskCorrelations {
-                    task_id,
+                    task_id: task_id.clone(),
                     correlations,
                     failures,
                 }).is_err() {
+                    return;
+                }
+                let execution = load_harness_task_execution(&client, task_id.clone());
+                let update = match execution {
+                    Ok((plans, execution_spec)) => WorkerUpdate::HarnessTaskExecutionLoaded {
+                        task_id,
+                        plans,
+                        execution_spec,
+                    },
+                    Err(message) => WorkerUpdate::HarnessTaskExecutionLoadFailed {
+                        task_id,
+                        message,
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
                     return;
                 }
             }
             _ => {}
         }
     }
+}
+
+fn load_harness_task_execution(
+    client: &HarnessOperatorClient,
+    task_id: gate4agent_harness_client::HarnessTaskId,
+) -> Result<(Vec<HarnessLaunchPlanSummaryV1>, Option<HarnessTaskExecutionSpecV1>), String> {
+    let mut plans = Vec::new();
+    let mut cursor = None;
+    for _ in 0..HARNESS_LAUNCH_PLAN_PAGE_BUDGET {
+        let page = client.launch_plans_list(cursor.clone(), HARNESS_SNAPSHOT_PAGE_SIZE)
+            .map_err(|error| error.to_string())?;
+        if let Some(previous) = cursor.as_ref() {
+            if page.plans.first().is_some_and(|plan| {
+                &plan.scheduled_launch.plan.plan_id <= previous
+            }) || page.next_plan_id.as_ref().is_some_and(|next| next <= previous)
+            {
+                return Err("Harness launch-plan cursor did not advance".to_owned());
+            }
+        }
+        if plans.len().saturating_add(page.plans.len()) > HARNESS_LAUNCH_PLAN_ENTITY_BUDGET {
+            return Err("Harness launch-plan catalog exceeded entity budget".to_owned());
+        }
+        cursor = page.next_plan_id;
+        plans.extend(page.plans);
+        if cursor.is_none() {
+            let execution_spec = client.task_execution_spec_get(task_id)
+                .map_err(|error| error.to_string())?;
+            return Ok((plans, execution_spec));
+        }
+    }
+    Err("Harness launch-plan catalog exceeded page budget".to_owned())
 }
 
 fn load_harness_snapshot(
@@ -4938,7 +5134,9 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessRetryTask { .. }
         | AppAction::HarnessScheduleNext { .. }
         | AppAction::HarnessOpenMonitor { .. }
-        | AppAction::HarnessLoadTaskCorrelations { .. } => None,
+        | AppAction::HarnessLoadTaskCorrelations { .. }
+        | AppAction::HarnessUseLaunchPlan { .. }
+        | AppAction::HarnessStartTask { .. } => None,
     }
 }
 
@@ -6084,6 +6282,31 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         }
         WorkerUpdate::HarnessTaskCorrelations { task_id, correlations, failures } => {
             app.apply_harness_task_correlations(&task_id, correlations, failures);
+        }
+        WorkerUpdate::HarnessTaskExecutionLoaded { task_id, plans, execution_spec } => {
+            app.apply_harness_task_execution(task_id, plans, execution_spec);
+        }
+        WorkerUpdate::HarnessTaskExecutionLoadFailed { task_id, message } => {
+            app.fail_harness_task_execution(&task_id, message);
+        }
+        WorkerUpdate::HarnessExecutionSpecSaved {
+            token,
+            task_id,
+            execution_spec,
+            outcome,
+        } => {
+            app.apply_harness_execution_spec_saved(
+                token,
+                task_id,
+                execution_spec,
+                outcome,
+            );
+        }
+        WorkerUpdate::HarnessTaskStarted { token, task_id, outcome } => {
+            app.apply_harness_task_started(token, &task_id, outcome);
+        }
+        WorkerUpdate::HarnessExecutionMutationFailed { token, task_id, message } => {
+            app.fail_harness_execution_mutation(token, &task_id, message);
         }
         WorkerUpdate::Notice(notice) => app.notice = Some(notice),
     }
@@ -7338,7 +7561,10 @@ fn c2_status_label(status: &C2SessionStatus) -> String {
 mod tests {
     use super::*;
     use gate4agent_harness_client::{
-        HarnessExecutionModeV1, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
+        HarnessExpectedExecutionSpecRevisionV1, HarnessExecutionModeV1,
+        HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1, HarnessRequestDigest,
+        HarnessRevision, HarnessRunId, HarnessRunLifecycleV1, HarnessScheduledLaunchRefV2,
+        HarnessTaskExecutionSpecInputV1, HarnessTaskReviewPolicyV1,
         HarnessTaskId, HarnessTaskStateV1, RedactedRunIntentV1,
         RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
     };
@@ -9740,6 +9966,127 @@ mod tests {
             c2_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty),
         ));
+    }
+
+    #[test]
+    fn missing_harness_sender_never_falls_back_to_c2_and_rolls_back_pending() {
+        let mut app = App::default();
+        let task = paginated_harness_task(2);
+        app.begin_harness_refresh(81);
+        app.harness_kanban.execution_mutation = Some(crate::app::HarnessExecutionMutationState {
+            token: 81,
+            task_id: task.task_id.clone(),
+            kind: crate::app::HarnessExecutionMutationKind::StartTask,
+        });
+        let (c2_tx, mut c2_rx) = mpsc::channel(1);
+        let commands = BTreeMap::from([(C2_COMMAND_ROUTE.to_owned(), c2_tx)]);
+
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::HarnessStartTask {
+                token: 81,
+                task_id: task.task_id,
+                expected_task_revision: HarnessRevision::new(1).unwrap(),
+                expected_execution_spec_revision: HarnessRevision::new(1).unwrap(),
+                expected_scheduled_launch_digest: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+            },
+        );
+
+        assert!(matches!(c2_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(app.harness_kanban.execution_mutation.is_none());
+        assert_eq!(app.harness_kanban.pending_refresh, None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Harness execution action failed: Harness operator unavailable: execution mutation queue is closed"),
+        );
+    }
+
+    #[test]
+    fn harness_execution_mutations_use_serial_mutation_lane_not_detail_or_history() {
+        let mut app = App::default();
+        let (mutation_tx, mut mutation_rx) = mpsc::channel(2);
+        let (history_tx, mut history_rx) = mpsc::channel(1);
+        let (detail_tx, mut detail_rx) = mpsc::channel(1);
+        let commands = BTreeMap::from([
+            (HARNESS_COMMAND_ROUTE.to_owned(), mutation_tx),
+            (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
+        ]);
+        let task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let scheduled_launch = HarnessScheduledLaunchRefV2 {
+            plan: HarnessLaunchPlanRefV1 {
+                plan_id: HarnessSelectorV1::new("ordinary-codex").unwrap(),
+                revision: HarnessRevision::new(2).unwrap(),
+                digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+            },
+            authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+        };
+        let save = AppAction::HarnessUseLaunchPlan {
+            token: 70,
+            task_id: task_id.clone(),
+            expected_task_revision: HarnessRevision::new(4).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            spec: HarnessTaskExecutionSpecInputV1 {
+                scheduled_launch: scheduled_launch.clone(),
+                review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        };
+        let start = AppAction::HarnessStartTask {
+            token: 71,
+            task_id,
+            expected_task_revision: HarnessRevision::new(4).unwrap(),
+            expected_execution_spec_revision: HarnessRevision::new(1).unwrap(),
+            expected_scheduled_launch_digest: scheduled_launch.plan.digest,
+        };
+
+        send_operator_action(&mut app, &commands, save.clone());
+        send_operator_action(&mut app, &commands, start.clone());
+        assert_eq!(mutation_rx.try_recv().unwrap(), save);
+        assert_eq!(mutation_rx.try_recv().unwrap(), start);
+        assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(detail_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn rejected_execution_mutation_clears_pending_state() {
+        let mut app = App::default();
+        let task = paginated_harness_task(3);
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
+        app.harness_kanban.execution_mutation = Some(crate::app::HarnessExecutionMutationState {
+            token: 72,
+            task_id: task.task_id.clone(),
+            kind: crate::app::HarnessExecutionMutationKind::StartTask,
+        });
+        app.begin_harness_refresh(72);
+        let (mutation_tx, _mutation_rx) = mpsc::channel(1);
+        mutation_tx.try_send(AppAction::None).unwrap();
+        let (history_tx, _history_rx) = mpsc::channel(1);
+        let (detail_tx, _detail_rx) = mpsc::channel(1);
+        let commands = BTreeMap::from([
+            (HARNESS_COMMAND_ROUTE.to_owned(), mutation_tx),
+            (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
+        ]);
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::HarnessStartTask {
+                token: 72,
+                task_id: task.task_id,
+                expected_task_revision: HarnessRevision::new(1).unwrap(),
+                expected_execution_spec_revision: HarnessRevision::new(1).unwrap(),
+                expected_scheduled_launch_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
+            },
+        );
+
+        assert!(app.harness_kanban.execution_mutation.is_none());
+        assert_eq!(app.harness_kanban.pending_refresh, None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Harness execution action failed: Harness operator busy: execution mutation queue is full"),
+        );
     }
 
     #[test]

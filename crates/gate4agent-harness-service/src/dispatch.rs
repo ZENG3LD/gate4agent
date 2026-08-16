@@ -1,8 +1,10 @@
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessContinuationRef, HarnessDeliveryRef, HarnessDispatchIntentV1,
-    HarnessExecutionModeV1, HarnessIdempotencyRef, HarnessOperationId, HarnessOperatorAuthorityV1, HarnessReceiptRef,
+    HarnessExecutionModeV1, HarnessIdempotencyRef, HarnessLaunchAuthorityRefV1,
+    HarnessLaunchPlanRefV1, HarnessOperationId, HarnessOperatorAuthorityV1, HarnessReceiptRef,
     HarnessRequestDigest, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
-    HarnessScheduleRequestV1, HarnessSelectorV1, HarnessSessionIdentityV1, HarnessTaskStateV1, HarnessTaskV1, HarnessWorktreeIntentV1,
+    HarnessScheduledLaunchRefV2, HarnessScheduleRequestV1, HarnessSelectorV1,
+    HarnessSessionIdentityV1, HarnessTaskStateV1, HarnessTaskV1, HarnessWorktreeIntentV1,
     SessionGrantId,
 };
 use gate4agent_c2_protocol::{C2ControlEventKind, C2NodeEvent, RoutedNodeEvent};
@@ -258,6 +260,21 @@ impl HarnessLaunchPlanV1 {
         Ok(HarnessScheduledLaunchRefV1 { plan: self.plan_ref()?, grant })
     }
 
+    pub fn ordinary_scheduled_ref(
+        &self,
+    ) -> Result<HarnessScheduledLaunchRefV2, HarnessDispatchError> {
+        self.validate()?;
+        if !self.is_ordinary_dispatch()
+            || !matches!(self.grant, HarnessGrantPolicyV1::Operator)
+        {
+            return Err(HarnessDispatchError::OperatorPrivilegedFlow);
+        }
+        Ok(HarnessScheduledLaunchRefV2 {
+            plan: self.plan_ref()?,
+            authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+        })
+    }
+
     pub fn validate_intent(
         &self,
         intent: &HarnessRunIntentV1,
@@ -384,14 +401,6 @@ impl HarnessLaunchPlanV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct HarnessLaunchPlanRefV1 {
-    pub plan_id: HarnessSelectorV1,
-    pub revision: HarnessRevision,
-    pub digest: HarnessRequestDigest,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct HarnessScheduledLaunchRefV1 {
     pub plan: HarnessLaunchPlanRefV1,
     pub grant: Option<HarnessExactGrantRefV1>,
@@ -401,15 +410,6 @@ impl HarnessScheduledLaunchRefV1 {
     pub fn validate(&self) -> Result<(), HarnessDispatchError> {
         self.plan.validate()?;
         if let Some(grant) = &self.grant { grant.validate()?; }
-        Ok(())
-    }
-}
-
-impl HarnessLaunchPlanRefV1 {
-    pub fn validate(&self) -> Result<(), HarnessDispatchError> {
-        self.plan_id.validate()?;
-        self.revision.validate()?;
-        self.digest.validate()?;
         Ok(())
     }
 }
@@ -459,6 +459,15 @@ impl HarnessLaunchCatalog {
 
     pub fn supports_ordinary_coordinator(&self) -> bool {
         self.plans.values().all(HarnessLaunchPlanV1::is_ordinary_dispatch)
+    }
+
+    pub(crate) fn ordinary_plans(
+        &self,
+    ) -> impl Iterator<Item = &HarnessLaunchPlanV1> {
+        self.plans.values().filter(|plan| {
+            plan.is_ordinary_dispatch()
+                && matches!(plan.grant, HarnessGrantPolicyV1::Operator)
+        })
     }
 
     pub fn validate_delivery_catalog(
@@ -528,6 +537,21 @@ impl HarnessLaunchCatalog {
         let plan = self.resolve(&scheduled.plan)?;
         let current = plan.scheduled_ref()?;
         if &current != scheduled {
+            return Err(HarnessDispatchError::PlanIdentityMismatch);
+        }
+        Ok(plan)
+    }
+
+    pub fn resolve_ordinary_scheduled(
+        &self,
+        scheduled: &HarnessScheduledLaunchRefV2,
+    ) -> Result<&HarnessLaunchPlanV1, HarnessDispatchError> {
+        scheduled.validate()?;
+        if scheduled.authority != HarnessLaunchAuthorityRefV1::OrdinaryOperator {
+            return Err(HarnessDispatchError::OperatorPrivilegedFlow);
+        }
+        let plan = self.resolve(&scheduled.plan)?;
+        if plan.ordinary_scheduled_ref()? != *scheduled {
             return Err(HarnessDispatchError::PlanIdentityMismatch);
         }
         Ok(plan)

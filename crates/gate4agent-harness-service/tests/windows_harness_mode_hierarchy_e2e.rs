@@ -13,6 +13,7 @@ use gate4agent_c2::protocol::C2RelayFailureCode;
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::{connect_local, C2Client, C2ControlError};
 use gate4agent_harness_api::{
+    HarnessExpectedExecutionSpecRevisionV1, HarnessLaunchAuthorityRefV1,
     HarnessNativeSessionCatalogScopeV1, HarnessNativeSessionPreviewRoleV1,
     HarnessNativeSessionRouteV1, HarnessNativeSessionSelectionV1,
     HarnessOperatorActionV1, HarnessOperatorCredential, HarnessOperatorIntentV1,
@@ -20,13 +21,13 @@ use gate4agent_harness_api::{
     HarnessOperatorResponseV1, HarnessRunCorrelationAvailabilityV1,
     HarnessRunSessionViewV1, HarnessRunWorktreeViewV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
+    HarnessTaskExecutionSpecInputV1, HarnessTaskReviewPolicyV1,
 };
 use gate4agent_harness_client::HarnessOperatorClient;
 use gate4agent_harness_delivery::DeliveryCatalogV2;
 use gate4agent_harness_protocol::{
     HarnessExecutionModeV1, HarnessRevision, HarnessRunLifecycleV1,
-    HarnessScheduleOutcomeV1, HarnessSelectorV1, HarnessTaskStateV1,
-    HarnessWorktreeIntentV1,
+    HarnessSelectorV1, HarnessTaskStateV1, HarnessWorktreeIntentV1,
 };
 use gate4agent_harness_service::{
     c2::HarnessC2Adapter,
@@ -437,24 +438,109 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
     let task_title = "Harness mode hierarchy";
     assert_eq!(
         tui.submit_intent(intent('a', HarnessOperatorActionV1::CreateTask {
-            title: task_title.to_owned(),
-            body: "TUI skin delegates workflow ownership to Harness".to_owned(),
+            title: format!("{task_title} candidate one"),
+            body: "First Ready task remains unselected by the TUI skin".to_owned(),
             parent_task_id: None,
             dependencies: Vec::new(),
             initial_state: HarnessTaskStateV1::Ready,
         })).unwrap(),
         HarnessOperatorResponseV1::Mutation(HarnessOperatorMutationOutcomeV1::Applied),
     );
-    let task_id = tui.tasks_list(None, None, 10).unwrap().tasks.into_iter()
-        .find(|task| task.title == task_title)
-        .expect("Harness did not materialize the submitted V3 create intent")
-        .task_id;
-    assert!(matches!(
-        tui.submit_intent(intent('b', HarnessOperatorActionV1::ScheduleNext {
-            plan_id: Some(selector("default")),
+    assert_eq!(
+        tui.submit_intent(intent('b', HarnessOperatorActionV1::CreateTask {
+            title: format!("{task_title} candidate two"),
+            body: "Second Ready task is selected explicitly by the TUI skin".to_owned(),
+            parent_task_id: None,
+            dependencies: Vec::new(),
+            initial_state: HarnessTaskStateV1::Ready,
         })).unwrap(),
-        HarnessOperatorResponseV1::Schedule(HarnessScheduleOutcomeV1::Dispatch(_)),
-    ));
+        HarnessOperatorResponseV1::Mutation(HarnessOperatorMutationOutcomeV1::Applied),
+    );
+    let mut ready_tasks = tui.tasks_list(
+        None,
+        Some(HarnessTaskStateV1::Ready),
+        10,
+    ).unwrap().tasks;
+    ready_tasks.retain(|task| task.title.starts_with(task_title));
+    ready_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    assert_eq!(ready_tasks.len(), 2, "Harness did not materialize both Ready tasks");
+    let task_a = ready_tasks[0].clone();
+    let task_b = ready_tasks[1].clone();
+    assert!(task_a.task_id < task_b.task_id);
+    assert!(task_a.run_ids.is_empty());
+    assert!(task_b.run_ids.is_empty());
+
+    let plans = tui.launch_plans_list(None, 16).unwrap();
+    assert_eq!(plans.plans.len(), 1);
+    assert_eq!(plans.next_plan_id, None);
+    let ordinary_plan = &plans.plans[0];
+    assert_eq!(ordinary_plan.scheduled_launch.authority,
+        HarnessLaunchAuthorityRefV1::OrdinaryOperator);
+    assert_eq!(ordinary_plan.scheduled_launch.plan.plan_id, selector("default"));
+    assert_eq!(ordinary_plan.node_id.as_str(), node_id.as_str());
+    assert_eq!(ordinary_plan.workspace_id.as_str(), workspace_id.as_str());
+    assert_eq!(ordinary_plan.worktree, HarnessWorktreeIntentV1::Existing);
+    assert_eq!(ordinary_plan.provider_profile, selector("clean-exit"));
+    assert_eq!(ordinary_plan.provider_id, selector("claude"));
+    assert_eq!(ordinary_plan.mode, HarnessExecutionModeV1::Pty);
+    assert_eq!(
+        tui.task_execution_spec_get(task_a.task_id.clone()).unwrap(),
+        None,
+    );
+    assert_eq!(
+        tui.task_execution_spec_get(task_b.task_id.clone()).unwrap(),
+        None,
+    );
+    assert_eq!(
+        tui.submit_intent(intent(
+            'c',
+            HarnessOperatorActionV1::ReplaceTaskExecutionSpec {
+                task_id: task_b.task_id.clone(),
+                expected_task_revision: task_b.revision,
+                expected_execution_spec_revision:
+                    HarnessExpectedExecutionSpecRevisionV1::Absent,
+                spec: HarnessTaskExecutionSpecInputV1 {
+                    scheduled_launch: ordinary_plan.scheduled_launch.clone(),
+                    review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+                },
+            },
+        )).unwrap(),
+        HarnessOperatorResponseV1::ExecutionSpecMutation(
+            HarnessOperatorMutationOutcomeV1::Applied,
+        ),
+    );
+    assert_eq!(
+        tui.task_execution_spec_get(task_a.task_id.clone()).unwrap(),
+        None,
+    );
+    let execution_spec = tui.task_execution_spec_get(task_b.task_id.clone()).unwrap()
+        .expect("selected Ready task did not retain its execution spec");
+    assert_eq!(execution_spec.task_id, task_b.task_id);
+    assert_eq!(execution_spec.scheduled_launch, ordinary_plan.scheduled_launch);
+    assert_eq!(execution_spec.review_policy, HarnessTaskReviewPolicyV1::OperatorReview);
+
+    let start_intent = intent('d', HarnessOperatorActionV1::StartTask {
+        task_id: task_b.task_id.clone(),
+        expected_task_revision: task_b.revision,
+        expected_execution_spec_revision: execution_spec.revision,
+        expected_scheduled_launch_digest: execution_spec.scheduled_launch_digest.clone(),
+    });
+    let HarnessOperatorResponseV1::TaskStarted(started) =
+        tui.submit_intent(start_intent.clone()).unwrap()
+    else {
+        panic!("selected StartTask intent did not return TaskStarted");
+    };
+    assert!(!started.replayed);
+    assert_eq!(started.dispatch.task_id, task_b.task_id);
+    let dispatch = started.dispatch;
+    let run_id = dispatch.run_id.clone();
+    let HarnessOperatorResponseV1::TaskStarted(immediate_replay) =
+        tui.submit_intent(start_intent.clone()).unwrap()
+    else {
+        panic!("exact immediate StartTask replay did not return TaskStarted");
+    };
+    assert!(immediate_replay.replayed);
+    assert_eq!(immediate_replay.dispatch, dispatch);
 
     timeout(Duration::from_secs(15), async {
         loop {
@@ -464,18 +550,26 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
             sleep(Duration::from_millis(20)).await;
         }
     }).await.expect("Harness did not drive C2 and Node to the fixture start marker");
-    let run_id = timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(10), async {
         loop {
-            let task = tui.task_get(task_id.clone()).unwrap();
+            let task = tui.task_get(task_b.task_id.clone()).unwrap();
             if task.state == HarnessTaskStateV1::Running {
-                let run_id = task.run_ids.first().cloned().unwrap();
-                if tui.run_get(run_id.clone()).unwrap().lifecycle == HarnessRunLifecycleV1::Running {
-                    break run_id;
+                if task.run_ids == vec![run_id.clone()]
+                    && tui.run_get(run_id.clone()).unwrap().lifecycle
+                        == HarnessRunLifecycleV1::Running
+                {
+                    break;
                 }
             }
             sleep(Duration::from_millis(20)).await;
         }
-    }).await.expect("Harness workflow did not become Running through C2 and Node");
+    }).await.expect("selected Harness workflow did not become Running through C2 and Node");
+    let unselected_task = tui.task_get(task_a.task_id.clone()).unwrap();
+    assert_eq!(unselected_task.state, HarnessTaskStateV1::Ready);
+    assert!(unselected_task.run_ids.is_empty());
+    let selected_task = tui.task_get(task_b.task_id.clone()).unwrap();
+    assert_eq!(selected_task.state, HarnessTaskStateV1::Running);
+    assert_eq!(selected_task.run_ids, vec![run_id.clone()]);
     let runtime_inventory = wait_runtime_inventory(&tui, &node_id, &workspace_id).await;
     assert_eq!(runtime_inventory.node_id, node_id.as_str());
     assert_eq!(runtime_inventory.inventory.workspace_count, 1);
@@ -486,7 +580,7 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
         .active_binding.clone().expect("Running record has no exact runtime identity");
     let correlation = tui.run_correlation_get(run_id.clone()).unwrap();
     assert_eq!(correlation.run_id, run_id);
-    assert_eq!(correlation.task_id, task_id);
+    assert_eq!(correlation.task_id, task_b.task_id);
     assert_eq!(correlation.node_id.as_str(), node_id.as_str());
     assert_eq!(correlation.node_incarnation_id.as_str(), runtime_inventory.incarnation_id);
     assert_eq!(correlation.workspace_id.as_str(), workspace_id.as_str());
@@ -511,7 +605,18 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
     assert!(c2_client.ready().await.unwrap().ready, "dropping TUI client stopped C2");
 
     let reconnected_tui = tui_harness_client(harness_endpoint, operator_credential);
-    let reconnected_task = reconnected_tui.task_get(task_id.clone()).unwrap();
+    let HarnessOperatorResponseV1::TaskStarted(reconnected_replay) =
+        reconnected_tui.submit_intent(start_intent).unwrap()
+    else {
+        panic!("reconnected exact StartTask replay did not return TaskStarted");
+    };
+    assert!(reconnected_replay.replayed);
+    assert_eq!(reconnected_replay.dispatch, dispatch);
+    sleep(Duration::from_millis(50)).await;
+    let reconnected_unselected_task = reconnected_tui.task_get(task_a.task_id.clone()).unwrap();
+    assert_eq!(reconnected_unselected_task.state, HarnessTaskStateV1::Ready);
+    assert!(reconnected_unselected_task.run_ids.is_empty());
+    let reconnected_task = reconnected_tui.task_get(task_b.task_id.clone()).unwrap();
     assert_eq!(reconnected_task.state, HarnessTaskStateV1::Running);
     assert_eq!(reconnected_task.run_ids, vec![run_id.clone()]);
     assert_eq!(
@@ -528,17 +633,24 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
         .find(|node| node.node_id == node_id.as_str())
         .expect("reconnected TUI skin lost the Harness-owned Node inventory");
     assert_eq!(reconnected_node.incarnation_id, runtime_inventory.incarnation_id);
+    assert_eq!(reconnected_node.inventory.session_count, 1);
+    assert_eq!(reconnected_node.inventory.managed_session_count, 1);
     assert_eq!(reconnected_node.inventory.managed_sessions.len(), 1);
     assert_eq!(
         reconnected_node.inventory.managed_sessions[0].record_id,
         runtime_record_id,
+    );
+    assert_eq!(
+        reconnected_node.inventory.managed_sessions[0].active_binding.as_ref(),
+        Some(&runtime_binding),
+        "replaying StartTask after reconnect changed the atomic runtime binding",
     );
 
     OpenOptions::new().write(true).create_new(true).open(&fixture.release).unwrap()
         .write_all(b"release\n").unwrap();
     timeout(Duration::from_secs(15), async {
         loop {
-            let task = reconnected_tui.task_get(task_id.clone()).unwrap();
+            let task = reconnected_tui.task_get(task_b.task_id.clone()).unwrap();
             if task.state == HarnessTaskStateV1::Review {
                 break;
             }

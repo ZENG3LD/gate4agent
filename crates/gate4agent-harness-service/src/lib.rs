@@ -18,13 +18,18 @@ use gate4agent_harness_protocol::{
     HarnessContinuationOutcomeUnknownReasonV1,
     HarnessContinuationRef, HarnessContinuationStateV1, HarnessContinuationV1,
     HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1, HarnessDispatchIntentV1,
-    HarnessExecutionModeV1, HarnessIdempotencyRef, HarnessMoveTaskRequestV1,
+    HarnessExecutionModeV1, HarnessExecutionSpecId,
+    HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef,
+    HarnessLaunchAuthorityRefV1, HarnessMoveTaskRequestV1,
     HarnessOperationId, HarnessOperationKindV1, HarnessOperationStateV1, HarnessOperationV1,
-    HarnessOperatorAuthorityV1, HarnessReplaceTaskRequestV1, HarnessRequestDigest,
+    HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
+    HarnessReplaceTaskRequestV1, HarnessRequestDigest,
     HarnessRetryTaskRequestV1, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
     HarnessResolvedContextPackReceiptV1, HarnessRunV1, HarnessScheduleOutcomeV1,
-    HarnessScheduleRequestV1, HarnessSelectorV1, HarnessSessionIdentityV1,
-    HarnessTaskId, HarnessTaskStateV1, HarnessTaskV1, HarnessValidationError, SessionGrantId,
+    HarnessScheduledLaunchRefV2, HarnessScheduleRequestV1, HarnessSelectorV1,
+    HarnessSessionIdentityV1, HarnessStartTaskRequestV1, HarnessTaskExecutionSpecV1,
+    HarnessTaskId, HarnessTaskStartOutcomeV1, HarnessTaskStateV1, HarnessTaskV1,
+    HarnessValidationError, SessionGrantId,
 };
 use gate4agent_harness_delivery::{CompiledDeliveryBundleV2, DeliveryCatalogV2};
 use gate4agent_node_protocol::{
@@ -48,6 +53,8 @@ pub use store::{HarnessStoreError, HARNESS_OPERATION_TAIL_MAX, HARNESS_STORE_SCH
 
 pub const HARNESS_SERVICE_CHECKPOINT_VERSION_V1: u16 = 1;
 pub const HARNESS_DISPATCH_BASELINE_MAX: usize = 4_096;
+const HARNESS_EXECUTION_SPEC_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-execution-spec-id-v1\0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -288,7 +295,13 @@ impl HarnessService {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HarnessServiceError> {
         let store = HarnessStore::open(path)?;
-        let (engine, dispatch_contexts, harness_mcp_reservations, operator_requests, scheduled_launches) = match store.load_checkpoint()? {
+        let (
+            engine,
+            dispatch_contexts,
+            harness_mcp_reservations,
+            operator_requests,
+            scheduled_launches,
+        ) = match store.load_checkpoint()? {
             Some(encoded) => {
                 let mut checkpoint: HarnessServiceCheckpointV1 = serde_json::from_slice(&encoded)?;
                 if checkpoint.version != HARNESS_SERVICE_CHECKPOINT_VERSION_V1 {
@@ -339,6 +352,13 @@ impl HarnessService {
                 } else {
                     engine
                 };
+                for spec in engine.execution_specs() {
+                    validate_service_execution_spec(spec).map_err(|_| {
+                        HarnessServiceError::Corrupt(
+                            "invalid task execution specification",
+                        )
+                    })?;
+                }
                 let mut contexts = BTreeMap::new();
                 for context in checkpoint.dispatch_contexts {
                     context.validate()?;
@@ -401,9 +421,21 @@ impl HarnessService {
                         ));
                     }
                 }
-                (engine, contexts, reservations, operator_requests, checkpoint.scheduled_launches)
+                (
+                    engine,
+                    contexts,
+                    reservations,
+                    operator_requests,
+                    checkpoint.scheduled_launches,
+                )
             }
-            None => (HarnessEngine::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+            None => (
+                HarnessEngine::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
         };
         Ok(Self {
             store: Some(store),
@@ -606,6 +638,230 @@ impl HarnessService {
             HarnessTaskStateV1::Ready,
             command_digest,
         )
+    }
+
+    pub fn task_execution_spec(
+        &self,
+        task_id: &HarnessTaskId,
+    ) -> Option<&HarnessTaskExecutionSpecV1> {
+        self.engine.execution_spec(task_id)
+    }
+
+    pub fn operator_replace_task_execution_spec(
+        &mut self,
+        catalog: &HarnessLaunchCatalog,
+        request: HarnessReplaceTaskExecutionSpecRequestV1,
+    ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
+        self.ensure_healthy()?;
+        request.validate()?;
+        let command_digest = operator_command_digest("replace-task-execution-spec", &request)?;
+        if let Some(outcome) = self.replay_operator_request(
+            &request.authority.operation_id,
+            &command_digest,
+            HarnessOperationKindV1::MutateExecutionSpec,
+        )? {
+            return Ok(outcome);
+        }
+        let plan = catalog.resolve_ordinary_scheduled(&request.spec.scheduled_launch)?;
+        let scheduled_launch_digest = scheduled_launch_digest(
+            &request.spec.scheduled_launch,
+        )?;
+        let current = self.engine.execution_spec(&request.task_id);
+        let (revision, created_at_unix_ms) = match (
+            request.expected_execution_spec_revision,
+            current,
+        ) {
+            (HarnessExpectedExecutionSpecRevisionV1::Absent, None) => (
+                HarnessRevision::new(1)?,
+                request.authority.now_unix_ms,
+            ),
+            (HarnessExpectedExecutionSpecRevisionV1::Exact(expected), Some(current)) => (
+                next_harness_revision(expected, "execution spec")?,
+                current.created_at_unix_ms,
+            ),
+            (HarnessExpectedExecutionSpecRevisionV1::Absent, Some(current)) => {
+                return Err(HarnessServiceError::ExecutionSpecRevisionMismatch {
+                    expected: None,
+                    actual: Some(current.revision),
+                });
+            }
+            (HarnessExpectedExecutionSpecRevisionV1::Exact(expected), current) => {
+                return Err(HarnessServiceError::ExecutionSpecRevisionMismatch {
+                    expected: Some(expected),
+                    actual: current.map(|spec| spec.revision),
+                });
+            }
+        };
+        if plan.ordinary_scheduled_ref()? != request.spec.scheduled_launch {
+            return Err(HarnessServiceError::ExecutionSpecLaunchMismatch);
+        }
+        let spec = HarnessTaskExecutionSpecV1 {
+            execution_spec_id: deterministic_execution_spec_id(&request.task_id)?,
+            revision,
+            task_id: request.task_id.clone(),
+            scheduled_launch: request.spec.scheduled_launch,
+            scheduled_launch_digest,
+            review_policy: request.spec.review_policy,
+            created_at_unix_ms,
+            updated_at_unix_ms: request.authority.now_unix_ms,
+        };
+        validate_service_execution_spec(&spec)?;
+        let operation = operator_task_operation(
+            &request.authority,
+            operator_actor(&request.authority),
+            HarnessOperationKindV1::MutateExecutionSpec,
+            request.task_id,
+            Some(request.expected_task_revision),
+        )?;
+        self.commit_operator_mutation(
+            HarnessMutationV1::PutExecutionSpec {
+                operation,
+                expected_task_revision: request.expected_task_revision,
+                expected_spec_revision: request.expected_execution_spec_revision,
+                spec,
+            },
+            command_digest,
+        )
+    }
+
+    pub(crate) fn start_task(
+        &mut self,
+        catalog: &HarnessLaunchCatalog,
+        request: HarnessStartTaskRequestV1,
+    ) -> Result<HarnessTaskStartOutcomeV1, HarnessServiceError> {
+        self.ensure_healthy()?;
+        request.validate()?;
+        let command_digest = operator_command_digest("start-task", &request)?;
+        if self.replay_operator_request(
+            &request.authority.operation_id,
+            &command_digest,
+            HarnessOperationKindV1::CreateRun,
+        )?.is_some() {
+            return Ok(HarnessTaskStartOutcomeV1 {
+                dispatch: self.replayed_dispatch_intent_for_operation(
+                    &request.authority.operation_id,
+                )?,
+                replayed: true,
+            });
+        }
+        let spec = self.engine.execution_spec(&request.task_id)
+            .ok_or(HarnessServiceError::ExecutionSpecMissing)?
+            .clone();
+        validate_service_execution_spec(&spec)?;
+        if spec.revision != request.expected_execution_spec_revision {
+            return Err(HarnessServiceError::ExecutionSpecRevisionMismatch {
+                expected: Some(request.expected_execution_spec_revision),
+                actual: Some(spec.revision),
+            });
+        }
+        if spec.scheduled_launch_digest != request.expected_scheduled_launch_digest {
+            return Err(HarnessServiceError::ExecutionSpecLaunchMismatch);
+        }
+        let plan = catalog.resolve_ordinary_scheduled(&spec.scheduled_launch)?;
+        if self.scheduler_pending_dispatch()?.is_some() {
+            return Err(HarnessServiceError::SchedulerBusy);
+        }
+        let task = self.engine.scheduler_ready_task_by_id(&request.task_id)
+            .map_err(map_scheduler_error)?
+            .ok_or(HarnessServiceError::TaskNotReady)?
+            .clone();
+        if task.revision != request.expected_task_revision {
+            return Err(HarnessServiceError::Engine(
+                HarnessEngineError::ExpectedRevisionMismatch {
+                    entity: "task",
+                    expected: request.expected_task_revision.get(),
+                    actual: Some(task.revision.get()),
+                },
+            ));
+        }
+        let (schedule_request, scheduled) = derive_schedule_request(
+            plan,
+            &task,
+            &request.authority,
+        )?;
+        let dispatch = self.schedule_exact_task_with_launch(
+            schedule_request,
+            request.task_id,
+            scheduled,
+            command_digest,
+        )?;
+        Ok(HarnessTaskStartOutcomeV1 { dispatch, replayed: false })
+    }
+
+    fn schedule_exact_task_with_launch(
+        &mut self,
+        request: HarnessScheduleRequestV1,
+        task_id: HarnessTaskId,
+        scheduled: HarnessScheduledLaunchRefV1,
+        command_digest: HarnessRequestDigest,
+    ) -> Result<HarnessDispatchIntentV1, HarnessServiceError> {
+        request.validate()?;
+        scheduled.validate().map_err(|_| HarnessServiceError::Corrupt(
+            "invalid exact scheduled launch reference",
+        ))?;
+        let current_task = self.engine.scheduler_ready_task_by_id(&task_id)
+            .map_err(map_scheduler_error)?
+            .ok_or(HarnessServiceError::TaskNotReady)?
+            .clone();
+        let mut task = current_task.clone();
+        task.revision = next_harness_revision(task.revision, "task")?;
+        task.state = HarnessTaskStateV1::Running;
+        task.updated_at_unix_ms = request.now_unix_ms;
+        task.run_ids.push(request.run_id.clone());
+        task.run_ids.sort();
+        let mut operation = HarnessOperationV1 {
+            operation_id: request.operation_id.clone(),
+            revision: HarnessRevision::new(1)?,
+            actor: request.actor.clone(),
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Prepared,
+            task_id: Some(task.task_id.clone()),
+            run_id: Some(request.run_id.clone()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(current_task.revision),
+            request_digest: HarnessRequestDigest::new("0".repeat(64))?,
+            idempotency_ref: request.idempotency_ref.clone(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: request.now_unix_ms,
+            updated_at_unix_ms: request.now_unix_ms,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: None,
+        };
+        let run = HarnessRunV1 {
+            run_id: request.run_id,
+            revision: HarnessRevision::new(1)?,
+            parent_run_id: request.parent_run_id,
+            task_id: task.task_id.clone(),
+            operation_id: operation.operation_id.clone(),
+            intent: request.intent,
+            delivery_receipt: None,
+            continuation_receipt: None,
+            binding: None,
+            lifecycle: HarnessRunLifecycleV1::Requested,
+            result_disposition: None,
+            failure: None,
+            created_at_unix_ms: request.now_unix_ms,
+            updated_at_unix_ms: request.now_unix_ms,
+        };
+        let mut mutation = HarnessMutationV1::CreateRun {
+            operation: operation.clone(),
+            expected_task_revision: current_task.revision,
+            task,
+            run,
+        };
+        operation.request_digest = mutation_request_digest(&mutation)?;
+        *mutation.operation_mut() = operation;
+        let prepared = self.engine.prepare(mutation)?;
+        let intent = dispatch_intent_from_prepared(&prepared)?;
+        self.commit_operator_prepared_with_launch(
+            prepared,
+            command_digest,
+            Some(scheduled),
+        )?;
+        Ok(intent)
     }
 
     pub(crate) fn schedule_ready_task(
@@ -3485,6 +3741,50 @@ fn operator_command_digest<T: Serialize>(
     Ok(HarnessRequestDigest::new(hex)?)
 }
 
+fn scheduled_launch_digest(
+    scheduled: &HarnessScheduledLaunchRefV2,
+) -> Result<HarnessRequestDigest, HarnessServiceError> {
+    const DOMAIN: &[u8] = b"gate4agent-harness-scheduled-launch-ref-v2\0";
+    scheduled.validate()?;
+    let encoded = serde_json::to_vec(scheduled)?;
+    let digest = gate4agent_node_wire::local_hmac_sha256(DOMAIN, &encoded)
+        .map_err(HarnessServiceError::MutationDigest)?;
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(HarnessRequestDigest::new(hex)?)
+}
+
+fn deterministic_execution_spec_id(
+    task_id: &HarnessTaskId,
+) -> Result<HarnessExecutionSpecId, HarnessServiceError> {
+    task_id.validate()?;
+    let digest = gate4agent_node_wire::local_hmac_sha256(
+        HARNESS_EXECUTION_SPEC_ID_DOMAIN,
+        task_id.as_str().as_bytes(),
+    ).map_err(HarnessServiceError::MutationDigest)?;
+    let mut nonce = String::with_capacity(24);
+    for byte in &digest[..12] {
+        use std::fmt::Write as _;
+        write!(&mut nonce, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(HarnessExecutionSpecId::new(format!("hespec_{nonce}"))?)
+}
+
+fn validate_service_execution_spec(
+    spec: &HarnessTaskExecutionSpecV1,
+) -> Result<(), HarnessServiceError> {
+    spec.validate()?;
+    if spec.execution_spec_id != deterministic_execution_spec_id(&spec.task_id)?
+        || spec.scheduled_launch_digest != scheduled_launch_digest(&spec.scheduled_launch)?
+    {
+        return Err(HarnessServiceError::ExecutionSpecLaunchMismatch);
+    }
+    Ok(())
+}
+
 fn operator_actor(authority: &HarnessOperatorAuthorityV1) -> HarnessActorV1 {
     HarnessActorV1::User {
         actor_id: authority.actor_id.clone(),
@@ -4592,6 +4892,19 @@ pub enum HarnessServiceError {
     },
     #[error("task mutation requires every linked run to be terminal")]
     TaskHasActiveRun,
+    #[error("task execution specification is missing")]
+    ExecutionSpecMissing,
+    #[error("task execution specification revision mismatch: expected {expected:?}, actual {actual:?}")]
+    ExecutionSpecRevisionMismatch {
+        expected: Option<HarnessRevision>,
+        actual: Option<HarnessRevision>,
+    },
+    #[error("task execution specification launch identity does not match")]
+    ExecutionSpecLaunchMismatch,
+    #[error("selected task is not ready with completed dependencies")]
+    TaskNotReady,
+    #[error("another durable scheduled dispatch is pending")]
+    SchedulerBusy,
     #[error("harness scheduler scan exceeded its fixed resource bound")]
     SchedulerResourceExhausted,
     #[error("harness scheduler durable graph is invalid: {0}")]
@@ -5001,6 +5314,45 @@ mod tests {
         }
     }
 
+    fn ordinary_launch_plan(plan_id: &str) -> dispatch::HarnessLaunchPlanV1 {
+        let mut plan = exact_launch_plan(false, false, false);
+        plan.plan_id = HarnessSelectorV1::new(plan_id).unwrap();
+        plan.grant = dispatch::HarnessGrantPolicyV1::Operator;
+        plan
+    }
+
+    fn create_task_request_for(
+        marker: char,
+        task_id: HarnessTaskId,
+    ) -> HarnessCreateTaskRequestV1 {
+        HarnessCreateTaskRequestV1 {
+            authority: operator_authority(marker, 10),
+            task_id,
+            title: format!("Task {marker}"),
+            body: format!("Run selected task {marker}"),
+            parent_task_id: None,
+            dependencies: Vec::new(),
+            initial_state: HarnessTaskStateV1::Ready,
+        }
+    }
+
+    fn replace_execution_spec_request(
+        marker: char,
+        task_id: HarnessTaskId,
+        scheduled_launch: HarnessScheduledLaunchRefV2,
+    ) -> HarnessReplaceTaskExecutionSpecRequestV1 {
+        HarnessReplaceTaskExecutionSpecRequestV1 {
+            authority: operator_authority(marker, 20),
+            task_id,
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            spec: gate4agent_harness_protocol::HarnessTaskExecutionSpecInputV1 {
+                scheduled_launch,
+                review_policy: gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        }
+    }
+
     fn dispatch_context(
         operation: &HarnessOperationV1,
         fingerprint: HarnessRequestDigest,
@@ -5133,6 +5485,7 @@ mod tests {
             runs: vec![run],
             grants: vec![grant],
             operations: vec![operation],
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap()
@@ -5315,6 +5668,7 @@ mod tests {
             runs: vec![target_run, source_run],
             grants: vec![grant],
             operations: vec![target_operation, source_operation],
+            execution_specs: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
         }).unwrap();
@@ -5457,6 +5811,230 @@ mod tests {
         assert!(matches!(
             service.schedule_ready_task(changed),
             Err(HarnessServiceError::OperatorRequestConflict { .. }),
+        ));
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn task_start_selects_exact_task_b_and_replays_after_reopen() {
+        let path = database_path("task-start-selected-b");
+        let task_a = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let task_b = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
+        let plan = ordinary_launch_plan("ordinary-b");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request_for('1', task_a.clone())).unwrap();
+        service.operator_create_task(create_task_request_for('2', task_b.clone())).unwrap();
+        let replace = replace_execution_spec_request(
+            '3',
+            task_b.clone(),
+            plan.ordinary_scheduled_ref().unwrap(),
+        );
+        assert_eq!(
+            service.operator_replace_task_execution_spec(&catalog, replace).unwrap(),
+            HarnessApplyOutcome::Applied,
+        );
+        let spec = service.task_execution_spec(&task_b).unwrap().clone();
+        assert_ne!(spec.scheduled_launch.plan.digest, spec.scheduled_launch_digest);
+        let start = HarnessStartTaskRequestV1 {
+            authority: operator_authority('4', 30),
+            task_id: task_b.clone(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: spec.revision,
+            expected_scheduled_launch_digest: spec.scheduled_launch_digest.clone(),
+        };
+        let first = service.start_task(&catalog, start.clone()).unwrap();
+        assert!(!first.replayed);
+        assert_eq!(first.dispatch.task_id, task_b);
+        assert_eq!(
+            service.engine().task(&task_a).unwrap().state,
+            HarnessTaskStateV1::Ready,
+        );
+        service.close().unwrap();
+
+        let mut reopened = HarnessService::open(&path).unwrap();
+        assert_eq!(reopened.task_execution_spec(&first.dispatch.task_id), Some(&spec));
+        let replay = reopened.start_task(&catalog, start.clone()).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.dispatch, first.dispatch);
+        let mut changed_authority = start;
+        changed_authority.authority.actor_id = HarnessSelectorV1::new("other-operator").unwrap();
+        assert!(matches!(
+            reopened.start_task(&catalog, changed_authority),
+            Err(HarnessServiceError::OperatorRequestConflict { .. }),
+        ));
+        reopened.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn execution_spec_and_start_reject_stale_revision_digest_and_authority() {
+        let path = database_path("task-start-cas");
+        let task = task_id();
+        let plan = ordinary_launch_plan("ordinary-cas");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        let replace = replace_execution_spec_request(
+            '2',
+            task.clone(),
+            plan.ordinary_scheduled_ref().unwrap(),
+        );
+        service.operator_replace_task_execution_spec(&catalog, replace.clone()).unwrap();
+        assert!(matches!(
+            service.operator_replace_task_execution_spec(
+                &catalog,
+                HarnessReplaceTaskExecutionSpecRequestV1 {
+                    authority: operator_authority('3', 21),
+                    ..replace.clone()
+                },
+            ),
+            Err(HarnessServiceError::ExecutionSpecRevisionMismatch { .. }),
+        ));
+        let mut changed_replay = replace;
+        changed_replay.spec.scheduled_launch.plan.digest =
+            HarnessRequestDigest::new("f".repeat(64)).unwrap();
+        assert!(matches!(
+            service.operator_replace_task_execution_spec(&catalog, changed_replay),
+            Err(HarnessServiceError::OperatorRequestConflict { .. }),
+        ));
+        let spec = service.task_execution_spec(&task).unwrap().clone();
+        let mut stale_start = HarnessStartTaskRequestV1 {
+            authority: operator_authority('4', 30),
+            task_id: task.clone(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: HarnessRevision::new(2).unwrap(),
+            expected_scheduled_launch_digest: spec.scheduled_launch_digest.clone(),
+        };
+        assert!(matches!(
+            service.start_task(&catalog, stale_start.clone()),
+            Err(HarnessServiceError::ExecutionSpecRevisionMismatch { .. }),
+        ));
+        stale_start.expected_execution_spec_revision = spec.revision;
+        stale_start.expected_task_revision = HarnessRevision::new(2).unwrap();
+        assert!(matches!(
+            service.start_task(&catalog, stale_start.clone()),
+            Err(HarnessServiceError::Engine(
+                HarnessEngineError::ExpectedRevisionMismatch { entity: "task", .. },
+            )),
+        ));
+        stale_start.expected_task_revision = HarnessRevision::new(1).unwrap();
+        stale_start.expected_scheduled_launch_digest =
+            HarnessRequestDigest::new("e".repeat(64)).unwrap();
+        assert!(matches!(
+            service.start_task(&catalog, stale_start),
+            Err(HarnessServiceError::ExecutionSpecLaunchMismatch),
+        ));
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn execution_spec_rejects_delivery_continuation_mcp_and_exact_grant_plans() {
+        let path = database_path("execution-spec-privileged");
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        for (index, plan) in [
+            exact_launch_plan(true, false, false),
+            exact_launch_plan(false, true, false),
+            exact_launch_plan(false, false, true),
+            exact_launch_plan(false, false, false),
+        ].into_iter().enumerate() {
+            let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+            let request = replace_execution_spec_request(
+                char::from_digit((index + 2) as u32, 10).unwrap(),
+                task_id(),
+                HarnessScheduledLaunchRefV2 {
+                    plan: plan.plan_ref().unwrap(),
+                    authority: HarnessLaunchAuthorityRefV1::OrdinaryOperator,
+                },
+            );
+            assert!(matches!(
+                service.operator_replace_task_execution_spec(&catalog, request),
+                Err(HarnessServiceError::DispatchPolicy(
+                    dispatch::HarnessDispatchError::OperatorPrivilegedFlow,
+                )),
+            ));
+        }
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn execution_spec_reopen_rejects_tampered_scheduled_launch_digest() {
+        let path = database_path("execution-spec-tampered-checkpoint");
+        let plan = ordinary_launch_plan("ordinary-tamper");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        service.operator_replace_task_execution_spec(
+            &catalog,
+            replace_execution_spec_request(
+                '2',
+                task_id(),
+                plan.ordinary_scheduled_ref().unwrap(),
+            ),
+        ).unwrap();
+        service.close().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let encoded: Vec<u8> = connection.query_row(
+            "SELECT payload FROM harness_checkpoint WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        let mut checkpoint: HarnessServiceCheckpointV1 =
+            serde_json::from_slice(&encoded).unwrap();
+        checkpoint.engine.execution_specs[0].scheduled_launch_digest =
+            HarnessRequestDigest::new("d".repeat(64)).unwrap();
+        connection.execute(
+            "UPDATE harness_checkpoint SET payload = ?1 WHERE singleton = 1",
+            [serde_json::to_vec(&checkpoint).unwrap()],
+        ).unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            HarnessService::open(&path),
+            Err(HarnessServiceError::Corrupt(
+                "invalid task execution specification",
+            )),
+        ));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn task_start_is_busy_on_foreign_pending_dispatch() {
+        let path = database_path("task-start-foreign-pending");
+        let task_a = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let task_b = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
+        let plan = ordinary_launch_plan("ordinary-busy");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request_for('1', task_a)).unwrap();
+        service.operator_create_task(create_task_request_for('2', task_b.clone())).unwrap();
+        service.operator_replace_task_execution_spec(
+            &catalog,
+            replace_execution_spec_request(
+                '3',
+                task_b.clone(),
+                plan.ordinary_scheduled_ref().unwrap(),
+            ),
+        ).unwrap();
+        service.schedule_ready_task(schedule_request('4', '4')).unwrap();
+        let spec = service.task_execution_spec(&task_b).unwrap().clone();
+        assert!(matches!(
+            service.start_task(
+                &catalog,
+                HarnessStartTaskRequestV1 {
+                    authority: operator_authority('5', 30),
+                    task_id: task_b,
+                    expected_task_revision: HarnessRevision::new(1).unwrap(),
+                    expected_execution_spec_revision: spec.revision,
+                    expected_scheduled_launch_digest: spec.scheduled_launch_digest.clone(),
+                },
+            ),
+            Err(HarnessServiceError::SchedulerBusy),
         ));
         service.close().unwrap();
         remove_database(&path);

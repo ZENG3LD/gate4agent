@@ -1554,15 +1554,13 @@ fn prepare_run_context_source_observation(
     let route_support = support.get(
         &prepared.route().node_id,
         prepared.route().expected_incarnation_id,
-    );
-    if !support.is_authoritative(
-        &prepared.route().node_id,
-        prepared.route().expected_incarnation_id,
-    ) {
-        return Err(HarnessOperatorHostErrorV1::Unavailable);
-    }
+    ).ok_or(HarnessOperatorHostErrorV1::Unavailable)?;
+    // A same-incarnation topology notification temporarily marks the route
+    // unhealthy while recovery runs, but the exact runtime cache remains the
+    // restart authority for this sealed request. Completion still requires a
+    // new durable HistorySnapshot after recovery makes the route authoritative.
     if !record.provider_identity_present
-        || !route_support.flatten().is_some_and(|support| {
+        || !route_support.is_some_and(|support| {
             support.events && support.managed_target
         })
     {
@@ -6805,7 +6803,7 @@ mod tests {
     }
 
     #[test]
-    fn run_context_source_observed_waits_for_exact_durable_history_and_reopens() {
+    fn run_context_source_restart_recovery_waits_for_exact_durable_history_and_reopens() {
         let (harness, _task_id, run_id, route) = running_harness_fixture();
         let snapshot = bound_snapshot(
             &route.node_id,
@@ -6857,6 +6855,20 @@ mod tests {
             events: Vec::new(),
         }).unwrap();
         let run = harness.engine().run(&run_id).unwrap();
+        assert!(matches!(
+            prepare_run_context_source_observation(
+                run,
+                &observation,
+                &ObservationSupportRegistry::default(),
+                &runtime_inventory,
+            ),
+            Err(HarnessOperatorHostErrorV1::Unavailable),
+        ));
+        support.mark_unhealthy(&route.node_id, route.expected_incarnation_id);
+        assert!(!support.is_authoritative(
+            &route.node_id,
+            route.expected_incarnation_id,
+        ));
         let prepared = prepare_run_context_source_observation(
             run,
             &observation,
@@ -6884,6 +6896,16 @@ mod tests {
                 &pending,
             ).unwrap(),
             None,
+        );
+
+        support.replace(
+            route.node_id.clone(),
+            route.expected_incarnation_id,
+            Some(C2ObservationSupport {
+                events: true,
+                managed_target: true,
+                workflow_detail: false,
+            }),
         );
 
         apply_routed_observation_event(

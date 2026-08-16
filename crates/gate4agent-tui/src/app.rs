@@ -50,7 +50,7 @@ use gate4agent_harness_client::{
     HarnessReviewedTaskLaunchSelectionV1, HarnessReviewedWorktreeSelectionV1,
     HarnessRevision,
     HarnessNodeIncarnationV1, HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
-    HarnessRunTransferSummaryV1,
+    HarnessRunTransferSummaryV1, HarnessRuntimeSessionAddressV1,
     HarnessTaskLaunchIssuanceRefV1, HarnessTaskLaunchOptionsV1, HarnessTaskId,
     HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
     HarnessTaskStateV1, RedactedBindingStateV1, RedactedRunV1, RedactedTaskV1,
@@ -2277,6 +2277,10 @@ pub enum AppAction {
     },
     HarnessOpenMonitor {
         run: HarnessRunRef,
+    },
+    HarnessOpenTerminal {
+        session: HarnessRuntimeSessionAddressV1,
+        after_sequence: Option<u64>,
     },
     HarnessLoadTaskCorrelations {
         task: HarnessTaskRef,

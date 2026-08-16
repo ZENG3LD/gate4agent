@@ -214,6 +214,26 @@ impl HarnessOperatorClient {
         }
     }
 
+    pub fn terminal_read(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        after_sequence: Option<u64>,
+        limit: u16,
+    ) -> Result<HarnessRuntimeTerminalPageV1, HarnessOperatorClientError> {
+        let expected_session = session.clone();
+        match self.send(HarnessOperatorRequestV1::TerminalRead {
+            session,
+            after_sequence,
+            limit,
+        })? {
+            HarnessOperatorResponseV1::TerminalRead(value) => {
+                value.validate_for(&expected_session)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn tasks_list(
         &self,
         after_task_id: Option<HarnessTaskId>,

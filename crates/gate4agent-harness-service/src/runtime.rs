@@ -26,6 +26,7 @@ use crate::dispatch::{
     exact_bound_control_lifecycle,
     HarnessLaunchCatalog, HarnessLifecycleEventKindV1, HarnessLifecycleProjectionV1,
 };
+use crate::terminal::{terminal_frame_to_wire, TerminalBufferRegistry};
 use gate4agent_harness_delivery::DeliveryCatalogV2;
 use gate4agent_c2_protocol::{
     C2ManagedSessionRecord, C2NodeEvent, C2ObservationSupport, C2SessionStatus,
@@ -55,8 +56,9 @@ use gate4agent_harness_api::{
     HarnessRuntimeInventoryPageV1, HarnessRuntimeInventoryV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
-    HarnessRuntimeSessionBindingV1, HarnessRuntimeSessionStatusV1,
-    HarnessRuntimeSessionV1, HarnessRuntimeTerminalSizeV1,
+    HarnessRuntimeSessionAddressV1, HarnessRuntimeSessionBindingV1,
+    HarnessRuntimeSessionStatusV1,
+    HarnessRuntimeSessionV1, HarnessRuntimeTerminalPageV1, HarnessRuntimeTerminalSizeV1,
     HarnessRuntimeTransportV1, HarnessRuntimeWorkspaceV1,
     HarnessTaskLaunchOptionsV1,
     HarnessReverseAttributionBindingV1, HarnessReverseAttributionLinkV1,
@@ -2225,6 +2227,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
     );
     let mut support = ObservationSupportRegistry::default();
     let mut runtime_inventory = HarnessRuntimeInventoryCache::default();
+    let mut terminal_buffers = TerminalBufferRegistry::default();
     let mut topology = adapter.topology_receiver();
     recover_all_routes(
         &adapter,
@@ -2498,6 +2501,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 &catalogs.launch,
                                 &catalogs.delivery,
                                 &runtime_inventory,
+                                &terminal_buffers,
                                 request,
                             );
                             let scheduled_dispatch = response.as_ref().ok()
@@ -3332,6 +3336,27 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                 event = events.recv(), if events_open => {
                     match event {
                         Some(event) => {
+                            match &event.event {
+                                C2NodeEvent::TerminalFrame { address, frame } => {
+                                    terminal_buffers.ingest(
+                                        RuntimeSessionKey {
+                                            node_id: event.node_id.clone(),
+                                            incarnation_id: event.cursor.incarnation_id,
+                                            workspace_id: address.workspace_id.clone(),
+                                            instance_id: address.session.instance_id,
+                                            generation: address.session.generation,
+                                        },
+                                        frame.clone(),
+                                    );
+                                }
+                                C2NodeEvent::ResyncRequired { .. } => {
+                                    terminal_buffers.invalidate(&NodeRoute {
+                                        node_id: event.node_id.clone(),
+                                        expected_incarnation_id: event.cursor.incarnation_id,
+                                    });
+                                }
+                                _ => {}
+                            }
                             let result = if matches!(
                                 event.event,
                                 C2NodeEvent::HarnessMcpReadCall { .. }
@@ -3384,6 +3409,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 .collect::<Vec<_>>();
                             observation_recovery.reconcile_topology(&routes);
                             runtime_inventory.reconcile_topology(&routes);
+                            terminal_buffers.reconcile_topology(&routes);
                             for route in &routes {
                                 support.mark_unhealthy(
                                     &route.node_id,
@@ -4698,6 +4724,7 @@ fn execute_operator_request(
     launch_catalog: &HarnessLaunchCatalog,
     delivery_catalog: &DeliveryCatalogV2,
     runtime_inventory: &HarnessRuntimeInventoryCache,
+    terminal_buffers: &TerminalBufferRegistry,
     request: HarnessOperatorRequestV1,
 ) -> Result<HarnessOperatorResponseV1, HarnessOperatorHostErrorV1> {
     request.validate().map_err(|_| HarnessOperatorHostErrorV1::InvalidRequest)?;
@@ -4840,6 +4867,18 @@ fn execute_operator_request(
                 runtime_inventory.page(after_node_id.as_deref(), limit),
             )
         }
+        HarnessOperatorRequestV1::TerminalRead { session, after_sequence, limit } => {
+            let key = terminal_session_key(&session)?;
+            let page = terminal_buffers.page(&key, after_sequence, limit)
+                .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
+            HarnessOperatorResponseV1::TerminalRead(HarnessRuntimeTerminalPageV1 {
+                session,
+                frames: page.frames.into_iter().map(terminal_frame_to_wire).collect(),
+                dropped: page.dropped,
+                transport_incomplete: page.transport_incomplete,
+                next_cursor: page.next_cursor,
+            })
+        }
         HarnessOperatorRequestV1::CatalogNativeSessions { .. }
         | HarnessOperatorRequestV1::PageNativeSessions { .. }
         | HarnessOperatorRequestV1::PreviewNativeSession { .. }
@@ -4930,6 +4969,21 @@ fn execute_operator_request(
     };
     response.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
     Ok(response)
+}
+
+fn terminal_session_key(
+    session: &HarnessRuntimeSessionAddressV1,
+) -> Result<RuntimeSessionKey, HarnessOperatorHostErrorV1> {
+    Ok(RuntimeSessionKey {
+        node_id: NodeId::new(session.node_id.as_str())
+            .map_err(|_| HarnessOperatorHostErrorV1::InvalidRequest)?,
+        incarnation_id: session.incarnation_id.as_str().parse()
+            .map_err(|_| HarnessOperatorHostErrorV1::InvalidRequest)?,
+        workspace_id: gate4agent_node_protocol::WorkspaceId::new(session.workspace_id.as_str())
+            .map_err(|_| HarnessOperatorHostErrorV1::InvalidRequest)?,
+        instance_id: gate4agent_types::AgentInstanceId(session.instance_id),
+        generation: gate4agent_types::SessionGeneration(session.generation),
+    })
 }
 
 fn project_reverse_attribution(
@@ -7328,6 +7382,7 @@ mod tests {
             &HarnessLaunchCatalog::default(),
             &DeliveryCatalogV2::default(),
             &cache,
+            &TerminalBufferRegistry::default(),
             HarnessOperatorRequestV1::RunCorrelationGet {
                 run_id: run_id.clone(),
             },
@@ -7440,6 +7495,7 @@ mod tests {
             &HarnessLaunchCatalog::default(),
             &DeliveryCatalogV2::default(),
             &HarnessRuntimeInventoryCache::default(),
+            &TerminalBufferRegistry::default(),
             HarnessOperatorRequestV1::RunTransferGet {
                 run_id: run_id.clone(),
             },
@@ -7460,6 +7516,7 @@ mod tests {
             &HarnessLaunchCatalog::default(),
             &DeliveryCatalogV2::default(),
             &HarnessRuntimeInventoryCache::default(),
+            &TerminalBufferRegistry::default(),
             HarnessOperatorRequestV1::RunTransferGet {
                 run_id: HarnessRunId::new(format!("hrun_{}", "f".repeat(24))).unwrap(),
             },
@@ -8180,6 +8237,7 @@ mod tests {
         let support = ObservationSupportRegistry::default();
         let launch_catalog = HarnessLaunchCatalog::default();
         let runtime_inventory = HarnessRuntimeInventoryCache::default();
+        let terminal_buffers = TerminalBufferRegistry::default();
         let request = operator_create_request();
         let first = execute_operator_request(
             &mut harness,
@@ -8188,6 +8246,7 @@ mod tests {
             &launch_catalog,
             &DeliveryCatalogV2::default(),
             &runtime_inventory,
+            &terminal_buffers,
             HarnessOperatorRequestV1::CreateTask { request: request.clone() },
         ).unwrap();
         let replay = execute_operator_request(
@@ -8197,6 +8256,7 @@ mod tests {
             &launch_catalog,
             &DeliveryCatalogV2::default(),
             &runtime_inventory,
+            &terminal_buffers,
             HarnessOperatorRequestV1::CreateTask { request: request.clone() },
         ).unwrap();
         assert_eq!(
@@ -8217,6 +8277,7 @@ mod tests {
                 &launch_catalog,
                 &DeliveryCatalogV2::default(),
                 &runtime_inventory,
+                &terminal_buffers,
                 HarnessOperatorRequestV1::CreateTask { request: changed },
             ),
             Err(HarnessOperatorHostErrorV1::Conflict),
@@ -8242,6 +8303,7 @@ mod tests {
         let support = ObservationSupportRegistry::default();
         let launch_catalog = HarnessLaunchCatalog::default();
         let runtime_inventory = HarnessRuntimeInventoryCache::default();
+        let terminal_buffers = TerminalBufferRegistry::default();
         let intent = operator_create_intent("Stable typed intent", 10);
 
         let first_credential = HarnessOperatorCredential::parse(format!(
@@ -8277,6 +8339,7 @@ mod tests {
                 &launch_catalog,
                 &DeliveryCatalogV2::default(),
                 &runtime_inventory,
+                &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: intent.clone() },
             ).unwrap(),
             HarnessOperatorResponseV1::Mutation(HarnessOperatorMutationOutcomeV1::Applied),
@@ -8293,6 +8356,7 @@ mod tests {
                 &launch_catalog,
                 &DeliveryCatalogV2::default(),
                 &runtime_inventory,
+                &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: intent.clone() },
             ).unwrap(),
             HarnessOperatorResponseV1::Mutation(HarnessOperatorMutationOutcomeV1::Replayed),
@@ -8313,6 +8377,7 @@ mod tests {
                 &launch_catalog,
                 &DeliveryCatalogV2::default(),
                 &runtime_inventory,
+                &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: changed_payload },
             ),
             Err(HarnessOperatorHostErrorV1::Conflict),
@@ -8327,6 +8392,7 @@ mod tests {
                 &launch_catalog,
                 &DeliveryCatalogV2::default(),
                 &runtime_inventory,
+                &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: changed_time },
             ),
             Err(HarnessOperatorHostErrorV1::Conflict),

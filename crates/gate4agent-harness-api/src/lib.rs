@@ -85,6 +85,14 @@ pub const HARNESS_GIT_IDENTITY_MAX_BYTES: usize = 512;
 pub const HARNESS_GIT_TIMESTAMP_MAX_BYTES: usize = 128;
 pub const HARNESS_GIT_SIGNER_MAX_BYTES: usize = 1_024;
 pub const HARNESS_REVERSE_ATTRIBUTION_LINKS_MAX: usize = 64;
+pub const HARNESS_TERMINAL_PAGE_LIMIT_MAX: u16 = 64;
+pub const HARNESS_TERMINAL_SCROLLBACK_LINES_MAX: usize = 512;
+// Ceiling for one wire terminal frame. Must stay above the node's real maximum
+// live frame: PTY_TERMINAL_SCROLLBACK_ROWS_MAX (256) styled rows plus the screen,
+// which on a wide, heavily styled terminal can exceed 512 KiB. 2 MiB gives
+// headroom so validate() never rejects a legitimate frame while still bounding a
+// malformed one.
+pub const HARNESS_TERMINAL_FRAME_MAX_BYTES: usize = 2 * 1_024 * 1_024;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -1556,6 +1564,11 @@ pub enum HarnessOperatorRequestV1 {
         after_node_id: Option<String>,
         limit: u16,
     },
+    TerminalRead {
+        session: HarnessRuntimeSessionAddressV1,
+        after_sequence: Option<u64>,
+        limit: u16,
+    },
     CatalogNativeSessions {
         route: HarnessNativeSessionRouteV1,
         limit: u16,
@@ -1666,6 +1679,12 @@ impl HarnessOperatorRequestV1 {
                     return Err(HarnessOperatorApiError::InvalidCursor);
                 }
                 Ok(())
+            }
+            Self::TerminalRead { session, limit, .. } => {
+                // after_sequence is unconstrained: node terminal sequences are
+                // 0-based, so Some(0) legitimately means "after frame 0".
+                session.validate()?;
+                validate_operator_terminal_limit(*limit)
             }
             Self::CatalogNativeSessions { route, limit } => {
                 route.validate()?;
@@ -1830,6 +1849,7 @@ pub enum HarnessOperatorResponseV1 {
     TaskExecutionSpec(Option<HarnessTaskExecutionSpecV1>),
     TaskLaunchOptions(HarnessTaskLaunchOptionsV1),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
+    TerminalRead(HarnessRuntimeTerminalPageV1),
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
     NativeSessionPreviewed(HarnessNativeSessionPreviewedV1),
@@ -1865,6 +1885,7 @@ impl HarnessOperatorResponseV1 {
             }
             Self::TaskLaunchOptions(value) => value.validate(),
             Self::RuntimeInventory(value) => value.validate(),
+            Self::TerminalRead(value) => value.validate(),
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
             Self::NativeSessionPreviewed(value) => value.validate(),
@@ -2468,6 +2489,110 @@ impl HarnessRuntimeSessionV1 {
             || self.terminal_size.is_some_and(|size| size.rows == 0 || size.columns == 0)
         {
             return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessRuntimeMouseProtocolEncodingV1 { Default, Utf8, Sgr }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRuntimeTerminalFrameV1 {
+    pub sequence: u64,
+    pub size: HarnessRuntimeTerminalSizeV1,
+    pub cursor_row: u16,
+    pub cursor_column: u16,
+    pub formatted: Vec<u8>,
+    pub scrollback_formatted: Vec<Vec<u8>>,
+    pub alternate_screen: bool,
+    pub mouse_protocol_enabled: bool,
+    pub mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1,
+}
+// NOTE: gate4agent_types::TerminalFrame::contents (plain-text render) is
+// deliberately dropped on the wire -- gate4agent-tui's apply_terminal_frame
+// never reads it. No dead field on the wire.
+
+impl HarnessRuntimeTerminalFrameV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if self.size.rows == 0 || self.size.columns == 0 {
+            return Err(HarnessOperatorApiError::InvalidTerminalPage);
+        }
+        if self.scrollback_formatted.len() > HARNESS_TERMINAL_SCROLLBACK_LINES_MAX {
+            return Err(HarnessOperatorApiError::InvalidTerminalPage);
+        }
+        let scrollback_bytes = self.scrollback_formatted.iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        if self.formatted.len().saturating_add(scrollback_bytes) > HARNESS_TERMINAL_FRAME_MAX_BYTES {
+            return Err(HarnessOperatorApiError::InvalidTerminalPage);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRuntimeSessionAddressV1 {
+    pub node_id: String,
+    pub incarnation_id: String,
+    pub workspace_id: String,
+    pub instance_id: u64,
+    pub generation: u64,
+}
+
+impl HarnessRuntimeSessionAddressV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if !valid_runtime_id(&self.node_id, 128)
+            || self.incarnation_id.len() != 32
+            || !self.incarnation_id.bytes().all(is_lower_hex)
+            || !valid_runtime_id(&self.workspace_id, 128)
+            || self.instance_id == 0
+            || self.generation == 0
+        {
+            return Err(HarnessOperatorApiError::InvalidTerminalPage);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRuntimeTerminalPageV1 {
+    pub session: HarnessRuntimeSessionAddressV1,
+    pub frames: Vec<HarnessRuntimeTerminalFrameV1>,
+    pub dropped: u64,
+    pub transport_incomplete: bool,
+    pub next_cursor: Option<u64>,
+}
+
+impl HarnessRuntimeTerminalPageV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.session.validate()?;
+        if self.frames.len() > usize::from(HARNESS_TERMINAL_PAGE_LIMIT_MAX)
+            || self.frames.windows(2).any(|pair| pair[0].sequence >= pair[1].sequence)
+            || self.next_cursor == Some(0)
+        {
+            return Err(HarnessOperatorApiError::InvalidTerminalPage);
+        }
+        if self.next_cursor.is_some()
+            && self.next_cursor != self.frames.last().map(|frame| frame.sequence)
+        {
+            return Err(HarnessOperatorApiError::InvalidTerminalPage);
+        }
+        for frame in &self.frames { frame.validate()?; }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        session: &HarnessRuntimeSessionAddressV1,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        if &self.session != session {
+            return Err(HarnessOperatorApiError::InvalidTerminalPage);
         }
         Ok(())
     }
@@ -3737,6 +3862,8 @@ pub enum HarnessOperatorApiError {
     InvalidTaskLaunchSelection,
     #[error("harness native history value is invalid")]
     InvalidNativeHistory,
+    #[error("harness terminal page is invalid")]
+    InvalidTerminalPage,
     #[error("harness operator response is invalid")]
     Read(#[source] HarnessReadApiError),
     #[error("harness protocol value is invalid: {0}")]
@@ -3897,6 +4024,13 @@ fn validate_operator_limit(limit: u16) -> Result<(), HarnessOperatorApiError> {
 
 fn validate_operator_timeline_limit(limit: u16) -> Result<(), HarnessOperatorApiError> {
     if !(1..=HARNESS_TIMELINE_PAGE_LIMIT_MAX).contains(&limit) {
+        return Err(HarnessOperatorApiError::InvalidLimit);
+    }
+    Ok(())
+}
+
+fn validate_operator_terminal_limit(limit: u16) -> Result<(), HarnessOperatorApiError> {
+    if !(1..=HARNESS_TERMINAL_PAGE_LIMIT_MAX).contains(&limit) {
         return Err(HarnessOperatorApiError::InvalidLimit);
     }
     Ok(())

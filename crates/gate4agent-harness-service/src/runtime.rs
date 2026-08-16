@@ -122,7 +122,7 @@ const HARNESS_MCP_GENERAL_NETWORK_WORKERS_MAX: usize =
 const NATIVE_HISTORY_WORKERS_MAX: usize = 8;
 const RUN_READ_WORKERS_MAX: usize = 8;
 const RUN_CONTEXT_SOURCE_WORKERS_MAX: usize = 8;
-const RUN_CONTEXT_SOURCE_PERSISTENCE_WAIT: Duration = Duration::from_millis(1_500);
+const RUN_CONTEXT_SOURCE_TOTAL_BUDGET: Duration = Duration::from_secs(11);
 const RUN_CONTEXT_SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const OPERATOR_CREDENTIAL_DIGEST_DOMAIN: &[u8] = b"gate4agent-harness-operator-credential-digest-v1";
 const OPERATOR_INTENT_OPERATION_ID_DOMAIN: &[u8] =
@@ -1721,6 +1721,22 @@ fn poll_pending_run_context_sources(
     *pending = waiting;
 }
 
+fn ensure_run_context_source_recovery_if_pending(
+    pending: &[PendingRunContextSourceReply],
+    recovery: &mut ObservationRecoveryRegistry,
+    run_id: &gate4agent_harness_protocol::HarnessRunId,
+    route: &NodeRoute,
+    observed_after_sequence: u64,
+) {
+    if pending.iter().any(|pending| {
+        pending.prepared.run_id() == run_id
+            && pending.prepared.route() == route
+            && pending.prepared.observed_after_sequence() == observed_after_sequence
+    }) {
+        recovery.ensure_route(route.clone());
+    }
+}
+
 fn start_delivery_stage_finish(
     adapter: HarnessC2Adapter,
     commands: mpsc::Sender<HostCommand>,
@@ -3219,11 +3235,17 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     });
                                 }
                                 (Ok(_), Ok(projection)) => {
+                                    let recovery_route = prepared.route().clone();
+                                    let recovery_run_id = prepared.run_id().clone();
+                                    let recovery_after = prepared.observed_after_sequence();
+                                    let deadline = Instant::from_std(
+                                        prepared.started_at()
+                                            + RUN_CONTEXT_SOURCE_TOTAL_BUDGET,
+                                    );
                                     pending_run_context_sources.push(PendingRunContextSourceReply {
                                         prepared,
                                         projection,
-                                        deadline: Instant::now()
-                                            + RUN_CONTEXT_SOURCE_PERSISTENCE_WAIT,
+                                        deadline,
                                         reply,
                                     });
                                     poll_pending_run_context_sources(
@@ -3232,6 +3254,13 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         &support,
                                         &runtime_inventory,
                                         &mut pending_run_context_sources,
+                                    );
+                                    ensure_run_context_source_recovery_if_pending(
+                                        &pending_run_context_sources,
+                                        &mut observation_recovery,
+                                        &recovery_run_id,
+                                        &recovery_route,
+                                        recovery_after,
                                     );
                                 }
                             }
@@ -6803,7 +6832,7 @@ mod tests {
     }
 
     #[test]
-    fn run_context_source_restart_recovery_waits_for_exact_durable_history_and_reopens() {
+    fn run_context_source_restart_churn_triggers_recovery_and_reopens_exact_history() {
         let (harness, _task_id, run_id, route) = running_harness_fixture();
         let snapshot = bound_snapshot(
             &route.node_id,
@@ -6869,6 +6898,22 @@ mod tests {
             &route.node_id,
             route.expected_incarnation_id,
         ));
+        let restart_prepared = prepare_run_context_source_observation(
+            run,
+            &observation,
+            &support,
+            &runtime_inventory,
+        ).unwrap().unwrap();
+        assert_eq!(restart_prepared.observed_after_sequence(), 5);
+        support.replace(
+            route.node_id.clone(),
+            route.expected_incarnation_id,
+            Some(C2ObservationSupport {
+                events: true,
+                managed_target: true,
+                workflow_detail: false,
+            }),
+        );
         let prepared = prepare_run_context_source_observation(
             run,
             &observation,
@@ -6876,6 +6921,11 @@ mod tests {
             &runtime_inventory,
         ).unwrap().unwrap();
         assert_eq!(prepared.observed_after_sequence(), 5);
+        let deadline = Instant::from_std(
+            prepared.started_at() + RUN_CONTEXT_SOURCE_TOTAL_BUDGET,
+        );
+        assert!(deadline > Instant::now() + Duration::from_secs(9));
+        support.mark_unhealthy(&route.node_id, route.expected_incarnation_id);
         let (reply, _receive) = oneshot::channel();
         let pending = PendingRunContextSourceReply {
             prepared,
@@ -6884,9 +6934,18 @@ mod tests {
                 completed_turn_count: Some(3),
                 total_tokens: Some(700),
             },
-            deadline: Instant::now() + RUN_CONTEXT_SOURCE_PERSISTENCE_WAIT,
+            deadline,
             reply,
         };
+        let mut recovery = ObservationRecoveryRegistry::default();
+        ensure_run_context_source_recovery_if_pending(
+            std::slice::from_ref(&pending),
+            &mut recovery,
+            &run_id,
+            &route,
+            5,
+        );
+        assert!(recovery.contains(&route));
         assert_eq!(
             evaluate_pending_run_context_source(
                 &harness,
@@ -6896,16 +6955,6 @@ mod tests {
                 &pending,
             ).unwrap(),
             None,
-        );
-
-        support.replace(
-            route.node_id.clone(),
-            route.expected_incarnation_id,
-            Some(C2ObservationSupport {
-                events: true,
-                managed_target: true,
-                workflow_detail: false,
-            }),
         );
 
         apply_routed_observation_event(
@@ -6934,6 +6983,25 @@ mod tests {
             },
             1_234,
         ).unwrap();
+        assert_eq!(
+            evaluate_pending_run_context_source(
+                &harness,
+                &mut observation,
+                &support,
+                &runtime_inventory,
+                &pending,
+            ).unwrap(),
+            None,
+        );
+        support.replace(
+            route.node_id.clone(),
+            route.expected_incarnation_id,
+            Some(C2ObservationSupport {
+                events: true,
+                managed_target: true,
+                workflow_detail: false,
+            }),
+        );
         let observed = evaluate_pending_run_context_source(
             &harness,
             &mut observation,

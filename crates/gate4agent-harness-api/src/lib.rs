@@ -17,14 +17,19 @@ pub use gate4agent_harness_protocol::{
     HarnessExpectedExecutionSpecRevisionV1, HarnessExecutionSpecId,
     HarnessContinuationOutcomeUnknownReasonV1, HarnessContinuationRef,
     HarnessContinuationStateV1, HarnessDeliveryBundleDigestV1,
-    HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1,
+    HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1, HarnessDeliveryBundleV1,
+    HarnessDeliveryBundleSelectionV1, HarnessDeliveryComponentCountV1,
+    HarnessDeliveryComponentKindV1, HarnessContextSourceSelectionV1,
     HarnessDeliveryManifestDigestV2, HarnessDeliveryRef, HarnessDeliveryStateV1,
     HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1, HarnessMoveTaskRequestV1,
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
     HarnessReplaceTaskRequestV1, HarnessRequestDigest, HarnessRetryTaskRequestV1,
     HarnessScheduledLaunchRefV2, HarnessScheduleNextRequestV1, HarnessScheduleOutcomeV1,
     HarnessStartTaskRequestV1, HarnessTaskExecutionSpecInputV1,
-    HarnessTaskExecutionSpecV1, HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
+    HarnessTaskExecutionSpecV1, HarnessTaskExecutionSpecV2,
+    HarnessTaskLaunchIssuanceId, HarnessTaskLaunchIssuanceRefV1,
+    HarnessTaskReviewPolicyV1,
+    HarnessTaskStartOutcomeV1,
     HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResultDispositionV1,
     HarnessInlineRef, HarnessReceiptRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
     HarnessRunLifecycleV1,
@@ -55,6 +60,7 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V2: u16 = 2;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V3: u16 = 3;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V4: u16 = 4;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V5: u16 = 5;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V6: u16 = 6;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -63,6 +69,7 @@ pub const HARNESS_NATIVE_SESSION_CATALOG_LIMIT_MAX: u16 = 64;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX: u16 = 24;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_TEXT_MAX_BYTES: usize = 4_096;
 pub const HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX: u16 = 64;
+pub const HARNESS_TASK_LAUNCH_OPTIONS_MAX: usize = 64;
 pub const HARNESS_REPOSITORY_PATH_MAX_BYTES: usize = 1_024;
 pub const HARNESS_WORKSPACE_FILE_MAX_BYTES: usize = 256 * 1_024;
 pub const HARNESS_WORKSPACE_TREE_ENTRIES_MAX: usize = 512;
@@ -173,6 +180,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V3
                 | HARNESS_OPERATOR_WIRE_VERSION_V4
                 | HARNESS_OPERATOR_WIRE_VERSION_V5
+                | HARNESS_OPERATOR_WIRE_VERSION_V6
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -292,6 +300,18 @@ pub enum HarnessOperatorActionV1 {
         expected_execution_spec_revision: HarnessRevision,
         expected_scheduled_launch_digest: HarnessRequestDigest,
     },
+    ReplaceTaskExecutionSpecV2 {
+        task_id: HarnessTaskId,
+        expected_task_revision: HarnessRevision,
+        expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1,
+        selection: HarnessReviewedTaskLaunchSelectionV1,
+    },
+    StartTaskV2 {
+        task_id: HarnessTaskId,
+        expected_task_revision: HarnessRevision,
+        expected_execution_spec_revision: HarnessRevision,
+        expected_launch_issuance: HarnessTaskLaunchIssuanceRefV1,
+    },
 }
 
 impl HarnessOperatorActionV1 {
@@ -395,6 +415,34 @@ impl HarnessOperatorActionV1 {
                     expected_scheduled_launch_digest,
                 },
             },
+            Self::ReplaceTaskExecutionSpecV2 {
+                task_id,
+                expected_task_revision,
+                expected_execution_spec_revision,
+                selection,
+            } => HarnessOperatorRequestV1::ReplaceTaskExecutionSpecV2 {
+                request: HarnessReplaceTaskExecutionSpecRequestV2 {
+                    authority,
+                    task_id,
+                    expected_task_revision,
+                    expected_execution_spec_revision,
+                    selection,
+                },
+            },
+            Self::StartTaskV2 {
+                task_id,
+                expected_task_revision,
+                expected_execution_spec_revision,
+                expected_launch_issuance,
+            } => HarnessOperatorRequestV1::StartTaskV2 {
+                request: HarnessStartTaskRequestV2 {
+                    authority,
+                    task_id,
+                    expected_task_revision,
+                    expected_execution_spec_revision,
+                    expected_launch_issuance,
+                },
+            },
         }
     }
 
@@ -402,6 +450,13 @@ impl HarnessOperatorActionV1 {
         matches!(
             self,
             Self::ReplaceTaskExecutionSpec { .. } | Self::StartTask { .. }
+        )
+    }
+
+    pub fn requires_v6(&self) -> bool {
+        matches!(
+            self,
+            Self::ReplaceTaskExecutionSpecV2 { .. } | Self::StartTaskV2 { .. }
         )
     }
 }
@@ -455,6 +510,258 @@ impl HarnessLaunchPlanPageV1 {
             {
                 return Err(HarnessOperatorApiError::InvalidLaunchPlans);
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessOrdinaryLaunchPlanOptionV1 {
+    pub plan: HarnessLaunchPlanRefV1,
+    pub node_id: HarnessSelectorV1,
+    pub source_workspace_id: HarnessSelectorV1,
+    pub provider_profile: HarnessSelectorV1,
+    pub provider_id: HarnessSelectorV1,
+    pub mode: HarnessExecutionModeV1,
+}
+
+impl HarnessOrdinaryLaunchPlanOptionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.plan.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.source_workspace_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.provider_profile.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.provider_id.validate().map_err(HarnessOperatorApiError::Protocol)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessManagedWorktreeRetentionV1 {
+    RemoveWhenReleased,
+    Retain,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessManagedWorktreeProfileOptionV1 {
+    pub node_id: HarnessSelectorV1,
+    pub node_incarnation: HarnessSelectorV1,
+    pub source_workspace_id: HarnessSelectorV1,
+    pub profile_id: HarnessSelectorV1,
+    pub profile_revision: HarnessSelectorV1,
+    pub retention: HarnessManagedWorktreeRetentionV1,
+    pub observed_at_unix_ms: u64,
+}
+
+impl HarnessManagedWorktreeProfileOptionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.node_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.node_incarnation.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.source_workspace_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.profile_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.profile_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if self.observed_at_unix_ms == 0 {
+            return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessReviewedWorktreeSelectionV1 {
+    Existing,
+    Managed { profile: HarnessManagedWorktreeProfileOptionV1 },
+}
+
+impl HarnessReviewedWorktreeSelectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::Existing => Ok(()),
+            Self::Managed { profile } => profile.validate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessReviewedTaskLaunchSelectionV1 {
+    pub plan: HarnessOrdinaryLaunchPlanOptionV1,
+    pub worktree: HarnessReviewedWorktreeSelectionV1,
+    pub context_source: Option<HarnessContextSourceSelectionV1>,
+    pub delivery: Option<HarnessDeliveryBundleSelectionV1>,
+    pub review_policy: HarnessTaskReviewPolicyV1,
+}
+
+impl HarnessReviewedTaskLaunchSelectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.plan.validate()?;
+        self.worktree.validate()?;
+        if let HarnessReviewedWorktreeSelectionV1::Managed { profile } = &self.worktree {
+            if profile.node_id != self.plan.node_id
+                || profile.source_workspace_id != self.plan.source_workspace_id
+            {
+                return Err(HarnessOperatorApiError::InvalidTaskLaunchSelection);
+            }
+        }
+        if let Some(context_source) = &self.context_source {
+            context_source.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        }
+        if let Some(delivery) = &self.delivery {
+            delivery.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessIssuedExecutionSpecSummaryV1 {
+    pub task_id: HarnessTaskId,
+    pub execution_spec_id: HarnessExecutionSpecId,
+    pub revision: HarnessRevision,
+    pub launch_issuance: HarnessTaskLaunchIssuanceRefV1,
+    pub review_policy: HarnessTaskReviewPolicyV1,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+impl HarnessIssuedExecutionSpecSummaryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if self.launch_issuance.revision != self.revision {
+            return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+        }
+        HarnessTaskExecutionSpecV2 {
+            execution_spec_id: self.execution_spec_id.clone(),
+            revision: self.revision,
+            task_id: self.task_id.clone(),
+            launch_issuance: self.launch_issuance.clone(),
+            review_policy: self.review_policy,
+            created_at_unix_ms: self.created_at_unix_ms,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+        }.validate().map_err(HarnessOperatorApiError::Protocol)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessTaskLaunchOptionsV1 {
+    pub task_id: HarnessTaskId,
+    pub task_revision: HarnessRevision,
+    pub policy_digest: HarnessRequestDigest,
+    pub plans: Vec<HarnessOrdinaryLaunchPlanOptionV1>,
+    pub managed_worktree_profiles: Vec<HarnessManagedWorktreeProfileOptionV1>,
+    pub context_sources: Vec<HarnessContextSourceSelectionV1>,
+    pub delivery_bundles: Vec<HarnessDeliveryBundleSelectionV1>,
+    pub current_issued_spec: Option<HarnessIssuedExecutionSpecSummaryV1>,
+    pub truncated: bool,
+}
+
+impl HarnessTaskLaunchOptionsV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.task_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.policy_digest.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if self.plans.len() > HARNESS_TASK_LAUNCH_OPTIONS_MAX
+            || self.managed_worktree_profiles.len() > HARNESS_TASK_LAUNCH_OPTIONS_MAX
+            || self.context_sources.len() > HARNESS_TASK_LAUNCH_OPTIONS_MAX
+            || self.delivery_bundles.len() > HARNESS_TASK_LAUNCH_OPTIONS_MAX
+        {
+            return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+        }
+        for plan in &self.plans { plan.validate()?; }
+        for profile in &self.managed_worktree_profiles { profile.validate()?; }
+        for source in &self.context_sources {
+            source.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        }
+        for delivery in &self.delivery_bundles {
+            delivery.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        }
+        if self.plans.windows(2).any(|items| {
+            (&items[0].plan.plan_id, items[0].plan.revision)
+                >= (&items[1].plan.plan_id, items[1].plan.revision)
+        }) || self.managed_worktree_profiles.windows(2).any(|items| {
+            (
+                &items[0].node_id,
+                &items[0].source_workspace_id,
+                &items[0].profile_id,
+                &items[0].profile_revision,
+            ) >= (
+                &items[1].node_id,
+                &items[1].source_workspace_id,
+                &items[1].profile_id,
+                &items[1].profile_revision,
+            )
+        }) || self.context_sources.windows(2).any(|items| {
+            (&items[0].source_run_id, items[0].source_run_revision)
+                >= (&items[1].source_run_id, items[1].source_run_revision)
+        }) || self.delivery_bundles.windows(2).any(|items| {
+            (&items[0].bundle.bundle_id, &items[0].bundle.revision)
+                >= (&items[1].bundle.bundle_id, &items[1].bundle.revision)
+        }) {
+            return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+        }
+        if let Some(current) = &self.current_issued_spec {
+            current.validate()?;
+            if current.task_id != self.task_id {
+                return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, task_id: &HarnessTaskId) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        if &self.task_id != task_id {
+            return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessReplaceTaskExecutionSpecRequestV2 {
+    pub authority: HarnessOperatorAuthorityV1,
+    pub task_id: HarnessTaskId,
+    pub expected_task_revision: HarnessRevision,
+    pub expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1,
+    pub selection: HarnessReviewedTaskLaunchSelectionV1,
+}
+
+impl HarnessReplaceTaskExecutionSpecRequestV2 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.authority.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.expected_task_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.expected_execution_spec_revision.validate()
+            .map_err(HarnessOperatorApiError::Protocol)?;
+        self.selection.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessStartTaskRequestV2 {
+    pub authority: HarnessOperatorAuthorityV1,
+    pub task_id: HarnessTaskId,
+    pub expected_task_revision: HarnessRevision,
+    pub expected_execution_spec_revision: HarnessRevision,
+    pub expected_launch_issuance: HarnessTaskLaunchIssuanceRefV1,
+}
+
+impl HarnessStartTaskRequestV2 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.authority.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.expected_task_revision.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.expected_execution_spec_revision.validate()
+            .map_err(HarnessOperatorApiError::Protocol)?;
+        self.expected_launch_issuance.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if self.expected_launch_issuance.revision != self.expected_execution_spec_revision {
+            return Err(HarnessOperatorApiError::InvalidTaskLaunchSelection);
         }
         Ok(())
     }
@@ -970,6 +1277,7 @@ pub enum HarnessOperatorRequestV1 {
         limit: u16,
     },
     TaskExecutionSpecGet { task_id: HarnessTaskId },
+    TaskLaunchOptionsGet { task_id: HarnessTaskId },
     RuntimeInventoryList {
         after_node_id: Option<String>,
         limit: u16,
@@ -998,6 +1306,8 @@ pub enum HarnessOperatorRequestV1 {
     ScheduleNext { request: HarnessScheduleNextRequestV1 },
     ReplaceTaskExecutionSpec { request: HarnessReplaceTaskExecutionSpecRequestV1 },
     StartTask { request: HarnessStartTaskRequestV1 },
+    ReplaceTaskExecutionSpecV2 { request: HarnessReplaceTaskExecutionSpecRequestV2 },
+    StartTaskV2 { request: HarnessStartTaskRequestV2 },
     SubmitIntent { intent: HarnessOperatorIntentV1 },
 }
 
@@ -1066,7 +1376,8 @@ impl HarnessOperatorRequestV1 {
                 }
                 Ok(())
             }
-            Self::TaskExecutionSpecGet { task_id } => {
+            Self::TaskExecutionSpecGet { task_id }
+            | Self::TaskLaunchOptionsGet { task_id } => {
                 task_id.validate().map_err(HarnessOperatorApiError::Protocol)
             }
             Self::RuntimeInventoryList { after_node_id, limit } => {
@@ -1134,6 +1445,8 @@ impl HarnessOperatorRequestV1 {
             Self::StartTask { request } => {
                 request.validate().map_err(HarnessOperatorApiError::Protocol)
             }
+            Self::ReplaceTaskExecutionSpecV2 { request } => request.validate(),
+            Self::StartTaskV2 { request } => request.validate(),
             Self::SubmitIntent { intent } => intent.validate(),
         }
     }
@@ -1168,8 +1481,19 @@ impl HarnessOperatorRequestV1 {
         matches!(self, Self::RunTransferGet { .. })
     }
 
+    pub fn requires_v6(&self) -> bool {
+        matches!(
+            self,
+            Self::TaskLaunchOptionsGet { .. }
+                | Self::ReplaceTaskExecutionSpecV2 { .. }
+                | Self::StartTaskV2 { .. }
+        ) || matches!(self, Self::SubmitIntent { intent } if intent.action.requires_v6())
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v5() {
+        if self.requires_v6() {
+            HARNESS_OPERATOR_WIRE_VERSION_V6
+        } else if self.requires_v5() {
             HARNESS_OPERATOR_WIRE_VERSION_V5
         } else if self.requires_v4() {
             HARNESS_OPERATOR_WIRE_VERSION_V4
@@ -1214,6 +1538,7 @@ pub enum HarnessOperatorResponseV1 {
     RunGitDiffRead(HarnessRunGitDiffV1),
     LaunchPlans(HarnessLaunchPlanPageV1),
     TaskExecutionSpec(Option<HarnessTaskExecutionSpecV1>),
+    TaskLaunchOptions(HarnessTaskLaunchOptionsV1),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
@@ -1246,6 +1571,7 @@ impl HarnessOperatorResponseV1 {
                 }
                 Ok(())
             }
+            Self::TaskLaunchOptions(value) => value.validate(),
             Self::RuntimeInventory(value) => value.validate(),
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
@@ -3067,6 +3393,10 @@ pub enum HarnessOperatorApiError {
     InvalidGitDiff,
     #[error("harness launch plan catalog is invalid")]
     InvalidLaunchPlans,
+    #[error("harness task launch options are invalid")]
+    InvalidTaskLaunchOptions,
+    #[error("harness reviewed task launch selection is invalid")]
+    InvalidTaskLaunchSelection,
     #[error("harness native history value is invalid")]
     InvalidNativeHistory,
     #[error("harness operator response is invalid")]
@@ -3774,6 +4104,262 @@ mod tests {
             provider_id: HarnessSelectorV1::new("codex").unwrap(),
             mode: HarnessExecutionModeV1::Pty,
         }
+    }
+
+    fn task_launch_options() -> HarnessTaskLaunchOptionsV1 {
+        let task_id = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
+        let legacy_plan = ordinary_launch_plan("plan-a", 'a');
+        let plan = HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: legacy_plan.scheduled_launch.plan,
+            node_id: legacy_plan.node_id,
+            source_workspace_id: legacy_plan.workspace_id,
+            provider_profile: legacy_plan.provider_profile,
+            provider_id: legacy_plan.provider_id,
+            mode: legacy_plan.mode,
+        };
+        let context = HarnessContextSourceSelectionV1 {
+            source_run_id: HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap(),
+            source_run_revision: HarnessRevision::new(7).unwrap(),
+            observed_at_unix_ms: 90,
+            metadata_digest: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("source-workspace").unwrap(),
+            session_record_id: HarnessSelectorV1::new("record-a").unwrap(),
+            active_session: HarnessRuntimeIdentityV1 { instance_id: 41, generation: 3 },
+            message_count: 12,
+            message_count_exact: true,
+            completed_turn_count: Some(5),
+            total_tokens: Some(4096),
+        };
+        let delivery = HarnessDeliveryBundleSelectionV1 {
+            bundle: HarnessDeliveryBundleV1 {
+                selector: HarnessSelectorV1::new("review-kit").unwrap(),
+                bundle_id: HarnessDeliveryBundleIdV1::new("bundle.review-kit").unwrap(),
+                revision: HarnessDeliveryBundleRevisionV1::new("revision-7").unwrap(),
+                digest: HarnessDeliveryBundleDigestV1::new(format!(
+                    "sha256:{}",
+                    "e".repeat(64),
+                )).unwrap(),
+                manifest_digest: HarnessDeliveryManifestDigestV2::new(format!(
+                    "sha256:{}",
+                    "f".repeat(64),
+                )).unwrap(),
+            },
+            component_counts: vec![HarnessDeliveryComponentCountV1 {
+                kind: HarnessDeliveryComponentKindV1::Skill,
+                workspace_count: 2,
+                session_count: 1,
+            }],
+        };
+        let issuance = HarnessTaskLaunchIssuanceRefV1 {
+            issuance_id: HarnessTaskLaunchIssuanceId::new(format!(
+                "hissue_{}",
+                "1".repeat(24),
+            )).unwrap(),
+            revision: HarnessRevision::new(2).unwrap(),
+            digest: HarnessRequestDigest::new("2".repeat(64)).unwrap(),
+        };
+        HarnessTaskLaunchOptionsV1 {
+            task_id: task_id.clone(),
+            task_revision: HarnessRevision::new(5).unwrap(),
+            policy_digest: HarnessRequestDigest::new("3".repeat(64)).unwrap(),
+            plans: vec![plan],
+            managed_worktree_profiles: vec![HarnessManagedWorktreeProfileOptionV1 {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+                source_workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                profile_id: HarnessSelectorV1::new("review").unwrap(),
+                profile_revision: HarnessSelectorV1::new("review.r7").unwrap(),
+                retention: HarnessManagedWorktreeRetentionV1::RemoveWhenReleased,
+                observed_at_unix_ms: 90,
+            }],
+            context_sources: vec![context],
+            delivery_bundles: vec![delivery],
+            current_issued_spec: Some(HarnessIssuedExecutionSpecSummaryV1 {
+                task_id,
+                execution_spec_id: HarnessExecutionSpecId::new(format!(
+                    "hespec_{}",
+                    "4".repeat(24),
+                )).unwrap(),
+                revision: HarnessRevision::new(2).unwrap(),
+                launch_issuance: issuance,
+                review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+                created_at_unix_ms: 80,
+                updated_at_unix_ms: 90,
+            }),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn operator_v6_task_launch_contract_is_exact_private_and_fails_closed_on_v5() {
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        let options = task_launch_options();
+        options.validate().unwrap();
+        let task_id = options.task_id.clone();
+        let authority = HarnessOperatorAuthorityV1 {
+            operation_id: HarnessOperationId::new(format!("hop_{}", "5".repeat(24))).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                "6".repeat(24),
+            )).unwrap(),
+            actor_id: HarnessSelectorV1::new("operator").unwrap(),
+            now_unix_ms: 100,
+        };
+        let selection = HarnessReviewedTaskLaunchSelectionV1 {
+            plan: options.plans[0].clone(),
+            worktree: HarnessReviewedWorktreeSelectionV1::Managed {
+                profile: options.managed_worktree_profiles[0].clone(),
+            },
+            context_source: Some(options.context_sources[0].clone()),
+            delivery: Some(options.delivery_bundles[0].clone()),
+            review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+        };
+        let replace = HarnessOperatorRequestV1::ReplaceTaskExecutionSpecV2 {
+            request: HarnessReplaceTaskExecutionSpecRequestV2 {
+                authority: authority.clone(),
+                task_id: task_id.clone(),
+                expected_task_revision: options.task_revision,
+                expected_execution_spec_revision:
+                    HarnessExpectedExecutionSpecRevisionV1::Exact(HarnessRevision::new(2).unwrap()),
+                selection: selection.clone(),
+            },
+        };
+        let issuance = options.current_issued_spec.as_ref().unwrap().launch_issuance.clone();
+        let start = HarnessOperatorRequestV1::StartTaskV2 {
+            request: HarnessStartTaskRequestV2 {
+                authority: authority.clone(),
+                task_id: task_id.clone(),
+                expected_task_revision: options.task_revision,
+                expected_execution_spec_revision: HarnessRevision::new(2).unwrap(),
+                expected_launch_issuance: issuance,
+            },
+        };
+        for request in [
+            HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id: task_id.clone() },
+            replace.clone(),
+            start.clone(),
+        ] {
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V6);
+            request.validate().unwrap();
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V5,
+                    credential: credential.clone(),
+                    request,
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+        }
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V6,
+            credential,
+            request: replace.clone(),
+        }.validate().unwrap();
+
+        let replace_json = serde_json::to_string(&replace).unwrap();
+        for forbidden in [
+            "issuance_id",
+            "policy_digest",
+            "provider_home",
+            "credential",
+            "canonical_root",
+            "display_root",
+            "prompt",
+        ] {
+            assert!(!replace_json.contains(forbidden), "leaked {forbidden}");
+        }
+        let mut unknown = serde_json::to_value(start).unwrap();
+        unknown["request"]["caller_issuance_digest"] = serde_json::json!("untrusted");
+        assert!(serde_json::from_value::<HarnessOperatorRequestV1>(unknown).is_err());
+
+        let intent = HarnessOperatorIntentV1 {
+            request_ref: HarnessOperatorRequestRefV1::new(format!(
+                "hireq_{}",
+                "7".repeat(24),
+            )).unwrap(),
+            submitted_at_unix_ms: 100,
+            action: HarnessOperatorActionV1::ReplaceTaskExecutionSpecV2 {
+                task_id,
+                expected_task_revision: options.task_revision,
+                expected_execution_spec_revision:
+                    HarnessExpectedExecutionSpecRevisionV1::Exact(HarnessRevision::new(2).unwrap()),
+                selection,
+            },
+        };
+        let intent_json = serde_json::to_string(&intent).unwrap();
+        assert!(!intent_json.contains("authority"));
+        assert_eq!(
+            HarnessOperatorRequestV1::SubmitIntent { intent }.minimum_wire_version(),
+            HARNESS_OPERATOR_WIRE_VERSION_V6,
+        );
+        let start_intent = HarnessOperatorIntentV1 {
+            request_ref: HarnessOperatorRequestRefV1::new(format!(
+                "hireq_{}",
+                "8".repeat(24),
+            )).unwrap(),
+            submitted_at_unix_ms: 101,
+            action: HarnessOperatorActionV1::StartTaskV2 {
+                task_id: options.task_id.clone(),
+                expected_task_revision: options.task_revision,
+                expected_execution_spec_revision: HarnessRevision::new(2).unwrap(),
+                expected_launch_issuance: options.current_issued_spec.as_ref().unwrap()
+                    .launch_issuance.clone(),
+            },
+        };
+        let start_intent_json = serde_json::to_string(&start_intent).unwrap();
+        assert!(!start_intent_json.contains("authority"));
+        assert_eq!(
+            HarnessOperatorRequestV1::SubmitIntent { intent: start_intent }
+                .minimum_wire_version(),
+            HARNESS_OPERATOR_WIRE_VERSION_V6,
+        );
+    }
+
+    #[test]
+    fn task_launch_options_are_bounded_canonical_correlated_and_redacted() {
+        let options = task_launch_options();
+        options.validate_for(&options.task_id).unwrap();
+        let encoded = serde_json::to_string(&HarnessOperatorResponseV1::TaskLaunchOptions(
+            options.clone(),
+        )).unwrap();
+        for forbidden in [
+            "canonical_root",
+            "display_root",
+            "provider_session_id",
+            "provider_home",
+            "credential",
+            "auth_token",
+            "source_path",
+            "payload",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+
+        let mut duplicate = options.clone();
+        duplicate.plans.push(duplicate.plans[0].clone());
+        assert!(matches!(
+            duplicate.validate(),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ));
+        let mut oversized = options.clone();
+        oversized.context_sources = vec![
+            options.context_sources[0].clone();
+            HARNESS_TASK_LAUNCH_OPTIONS_MAX + 1
+        ];
+        assert!(matches!(
+            oversized.validate(),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ));
+        let other_task = HarnessTaskId::new(format!("htask_{}", "8".repeat(24))).unwrap();
+        assert!(matches!(
+            options.validate_for(&other_task),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ));
     }
 
     #[test]

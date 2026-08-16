@@ -573,6 +573,7 @@ async fn schedule_next_observation_and_outcome_unknown_inventory_are_exact() {
         spawn_spec_fingerprint: spawn_spec_fingerprint(&spec).unwrap(),
         dispatched_at_unix_ms,
         idempotency_ref: dispatching_operation.idempotency_ref.clone(),
+        managed_worktree_binding: None,
     };
     authority_service
         .begin_run_dispatch(

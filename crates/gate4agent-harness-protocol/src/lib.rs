@@ -1834,9 +1834,16 @@ impl HarnessRunV1 {
         if let Some(receipt) = &self.continuation_receipt { receipt.validate()?; }
         if let Some(binding) = &self.binding {
             binding.validate()?;
-            if binding.node_id != self.intent.node_id
-                || binding.workspace_id != self.intent.workspace_id
-            {
+            let workspace_matches = match &self.intent.worktree {
+                HarnessWorktreeIntentV1::ManagedProfile { .. } => {
+                    binding.workspace_id != self.intent.workspace_id
+                }
+                HarnessWorktreeIntentV1::Existing
+                | HarnessWorktreeIntentV1::Managed { .. } => {
+                    binding.workspace_id == self.intent.workspace_id
+                }
+            };
+            if binding.node_id != self.intent.node_id || !workspace_matches {
                 return Err(HarnessValidationError::BindingIntentMismatch);
             }
         }
@@ -2665,6 +2672,24 @@ mod tests {
 
         run.binding.as_mut().unwrap().node_id = selector("node-a");
         run.validate().unwrap();
+
+        run.intent.worktree = HarnessWorktreeIntentV1::ManagedProfile {
+            profile_id: selector("review-tree"),
+            expected_profile_revision: selector("review-tree-r1"),
+        };
+        assert_eq!(
+            run.validate(),
+            Err(HarnessValidationError::BindingIntentMismatch),
+        );
+
+        run.binding.as_mut().unwrap().workspace_id = selector("workspace-allocated");
+        run.validate().unwrap();
+
+        run.intent.worktree = HarnessWorktreeIntentV1::Existing;
+        assert_eq!(
+            run.validate(),
+            Err(HarnessValidationError::BindingIntentMismatch),
+        );
     }
 
     #[test]

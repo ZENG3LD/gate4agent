@@ -32,7 +32,9 @@ use gate4agent_node_protocol::{
     DeliveryBlobChunkHexV1, DeliveryBlobDigestV1, DeliveryBundleManifestV2,
     DeliveryCommitReceiptV1, DeliveryStageId, HarnessMcpActivationDigest,
     HarnessMcpCallId, HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1,
-    HarnessMcpReservationId, NodeFailureCode, NodeId, NodeRequest,
+    HarnessMcpReservationId, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
+    ManagedWorktreeLeaseState,
+    ManagedWorktreeSpawnRequestV2, NodeFailureCode, NodeId, NodeRequest,
     ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedHarnessMcpProxyReceiptV1,
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
     GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage, GitObjectId,
@@ -42,13 +44,14 @@ use gate4agent_node_protocol::{
     SessionRecordId, SpawnFieldProvenance, SpawnOverride, SpawnProfileRevision,
     SpawnProfileId,
     SpawnPromptMetadata, SpawnResolutionProvenance, SpawnSpec, WorkspaceId,
+    WorktreeProfileId, WorktreeProfileRevision,
     NativeSessionCatalogRoute, NativeSessionSelection,
     MAX_DELIVERY_CHUNK_RAW_BYTES,
 };
 use gate4agent_harness_protocol::{
     HarnessContinuationRef, HarnessContinuationStateV1, HarnessIdempotencyRef,
     HarnessOperationId, HarnessRequestDigest, HarnessRunId, HarnessRunV1,
-    HarnessSelectorV1, HarnessSessionBindingV1,
+    HarnessSelectorV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
 };
 use gate4agent_node_wire::local_hmac_sha256;
 use gate4agent_types::AgentId;
@@ -57,6 +60,8 @@ use std::{sync::Arc, time::{Duration, Instant}};
 
 const NATIVE_HISTORY_TIMEOUT_FLOOR: Duration = Duration::from_secs(34);
 const RUN_READ_TIMEOUT_FLOOR: Duration = Duration::from_secs(4);
+const RUN_CONTEXT_SOURCE_C2_DEADLINE: Duration = Duration::from_secs(10);
+const RUN_CONTEXT_SOURCE_MESSAGE_LIMIT: u16 = 1;
 
 #[derive(Clone)]
 pub struct HarnessC2Adapter {
@@ -208,6 +213,60 @@ impl HarnessC2Adapter {
                     mcp.activation_digest,
                     mcp.proxy_receipt,
                 )),
+            },
+            pending: Some(pending),
+        })
+    }
+
+    pub(crate) fn start_prepared_managed_worktree_spawn(
+        &self,
+        prepared: PreparedManagedWorktreeSpawnDispatch,
+        profile: SpawnProfileRevisionProof,
+    ) -> Result<PendingManagedWorktreeSpawnDispatch, HarnessC2Error> {
+        validate_prepared_spawn_profile(&prepared.inner, &profile)?;
+        validate_prepared_managed_worktree_spawn(&prepared)?;
+        self.ensure_current_incarnation(&prepared.inner.route)?;
+        let PreparedManagedWorktreeSpawnDispatch {
+            inner: PreparedSpawnDispatch {
+                route,
+                operation_id,
+                idempotency_ref,
+                spec,
+                fingerprint,
+                expected_bundle,
+                expected_context,
+                harness_mcp: _,
+            },
+            worktree_profile_id,
+            expected_worktree_profile_revision,
+        } = prepared;
+        let mut cleared_spec = spec.clone();
+        cleared_spec.overrides.bundle_id = SpawnOverride::Clear;
+        cleared_spec.overrides.context_id = SpawnOverride::Clear;
+        let request = NodeRequest::SpawnManagedWorktreeV2 {
+            request: ManagedWorktreeSpawnRequestV2 {
+                spawn_spec: spec,
+                worktree_profile_id: worktree_profile_id.clone(),
+                expected_profile_revision: expected_worktree_profile_revision.clone(),
+            },
+        };
+        let pending = self.control.start_request(route.clone(), request)
+            .map_err(HarnessC2Error::SpawnEnqueue)?;
+        Ok(PendingManagedWorktreeSpawnDispatch {
+            correlation: ManagedWorktreeSpawnResponseCorrelation {
+                spawn: SpawnResponseCorrelation {
+                    route,
+                    operation_id,
+                    idempotency_ref,
+                    cleared_spec,
+                    profile_revision: profile.profile_revision,
+                    fingerprint,
+                    expected_bundle,
+                    expected_context,
+                    expected_proxy: None,
+                },
+                worktree_profile_id,
+                expected_worktree_profile_revision,
             },
             pending: Some(pending),
         })
@@ -370,6 +429,24 @@ impl HarnessC2Adapter {
         Ok(PendingRunRead {
             prepared,
             started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+
+    /// Enqueues the sole Node request allowed for a run context-source
+    /// observation. Route and record authority come only from the sealed
+    /// durable run binding retained in `prepared`.
+    pub(crate) fn start_prepared_run_context_source_observation(
+        &self,
+        prepared: PreparedRunContextSourceObservation,
+    ) -> Result<PendingRunContextSourceObservation, HarnessC2Error> {
+        self.ensure_current_incarnation(&prepared.route)?;
+        let pending = self.control.start_request(
+            prepared.route.clone(),
+            prepared.wire_request(),
+        ).map_err(HarnessC2Error::RunContextSourceEnqueue)?;
+        Ok(PendingRunContextSourceObservation {
+            prepared,
             pending: Some(pending),
         })
     }
@@ -698,7 +775,37 @@ impl HarnessC2Adapter {
             bundle: receipt.bundle.clone(),
             context: receipt.context.clone(),
             harness_mcp_proxy: accepted.harness_mcp_proxy.clone(),
+            managed_worktree: None,
         })
+    }
+
+    /// Resolves a managed-worktree record only from the sealed V2 response
+    /// whose allocated workspace and exact profile revision were correlated
+    /// before this proof is constructed.
+    pub(crate) async fn resolve_managed_accepted_receipt(
+        &self,
+        route: &NodeRoute,
+        accepted: &AuthoritativeManagedWorktreeSpawnReceipt,
+    ) -> Result<AcceptedSpawnBindingProof, HarnessC2Error> {
+        let mut proof = self.resolve_accepted_receipt(route, accepted.spawn()).await?;
+        let lease = accepted.lease();
+        if proof.workspace_id != lease.workspace_id
+            || proof.session.workspace_id != lease.workspace_id
+            || lease.source_workspace_id == lease.workspace_id
+            || lease.state != ManagedWorktreeLeaseState::InUse
+            || lease.cleanup_failure.is_some()
+            || lease.active_session_count != 1
+        {
+            return Err(HarnessC2Error::AcceptedReceiptRouteMismatch);
+        }
+        proof.managed_worktree = Some(ManagedAcceptedWorktreeBinding {
+            lease_id: lease.lease_id.clone(),
+            source_workspace_id: lease.source_workspace_id.clone(),
+            allocated_workspace_id: lease.workspace_id.clone(),
+            profile_id: lease.profile_id.clone(),
+            profile_revision: lease.profile_revision.clone(),
+        });
+        Ok(proof)
     }
 
     pub(crate) async fn activate_harness_mcp_reservation(
@@ -1315,6 +1422,17 @@ pub enum SpawnDispatchOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedWorktreeSpawnDispatchOutcome {
+    Accepted(AuthoritativeManagedWorktreeSpawnReceipt),
+    Rejected {
+        code: gate4agent_node_protocol::NodeFailureCode,
+    },
+    OutcomeUnknown {
+        reason: SpawnOutcomeUnknownReason,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedSpawnDispatch {
     route: NodeRoute,
@@ -1325,6 +1443,29 @@ pub(crate) struct PreparedSpawnDispatch {
     expected_bundle: Option<ResolvedBundleReceipt>,
     expected_context: Option<ResolvedContextPackReceipt>,
     harness_mcp: Option<PreparedSpawnHarnessMcp>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedManagedWorktreeSpawnDispatch {
+    inner: PreparedSpawnDispatch,
+    worktree_profile_id: WorktreeProfileId,
+    expected_worktree_profile_revision: WorktreeProfileRevision,
+}
+
+impl PreparedManagedWorktreeSpawnDispatch {
+    pub(crate) fn new(
+        inner: PreparedSpawnDispatch,
+        worktree_profile_id: WorktreeProfileId,
+        expected_worktree_profile_revision: WorktreeProfileRevision,
+    ) -> Result<Self, HarnessC2Error> {
+        let prepared = Self {
+            inner,
+            worktree_profile_id,
+            expected_worktree_profile_revision,
+        };
+        validate_prepared_managed_worktree_spawn(&prepared)?;
+        Ok(prepared)
+    }
 }
 
 impl PreparedSpawnDispatch {
@@ -1393,6 +1534,155 @@ impl PreparedSpawnDispatch {
 pub(crate) struct PendingSpawnDispatch {
     correlation: SpawnResponseCorrelation,
     pending: Option<C2PendingRequest>,
+}
+
+pub(crate) struct PendingManagedWorktreeSpawnDispatch {
+    correlation: ManagedWorktreeSpawnResponseCorrelation,
+    pending: Option<C2PendingRequest>,
+}
+
+/// Sealed authority for observing one exact managed session record selected
+/// only through a durable run binding. It deliberately carries no provider
+/// session identity, path, model, title, or message content.
+pub(crate) struct PreparedRunContextSourceObservation {
+    run_id: HarnessRunId,
+    binding: HarnessSessionBindingV1,
+    route: NodeRoute,
+    record_id: SessionRecordId,
+    observed_after_sequence: u64,
+}
+
+impl PreparedRunContextSourceObservation {
+    pub(crate) fn from_run(run: &HarnessRunV1) -> Result<Self, HarnessC2Error> {
+        let binding = run.binding.clone()
+            .ok_or(HarnessC2Error::RunContextSourceUnbound)?;
+        binding.validate()
+            .map_err(|_| HarnessC2Error::InvalidRunContextSourceBinding)?;
+        let HarnessSessionIdentityV1::Managed { record_id, .. } = &binding.session else {
+            return Err(HarnessC2Error::RunContextSourceUnsupportedBinding);
+        };
+        let route = NodeRoute {
+            node_id: NodeId::new(binding.node_id.as_str())
+                .map_err(|_| HarnessC2Error::InvalidRunContextSourceBinding)?,
+            expected_incarnation_id: binding.node_incarnation.as_str().parse()
+                .map_err(|_| HarnessC2Error::InvalidRunContextSourceBinding)?,
+        };
+        let record_id = SessionRecordId::new(record_id.as_str())
+            .map_err(|_| HarnessC2Error::InvalidRunContextSourceBinding)?;
+        Ok(Self {
+            run_id: run.run_id.clone(),
+            binding,
+            route,
+            record_id,
+            observed_after_sequence: 0,
+        })
+    }
+
+    pub(crate) fn set_observed_after_sequence(&mut self, sequence: u64) {
+        self.observed_after_sequence = sequence;
+    }
+
+    pub(crate) fn run_id(&self) -> &HarnessRunId { &self.run_id }
+
+    pub(crate) fn binding(&self) -> &HarnessSessionBindingV1 { &self.binding }
+
+    pub(crate) fn route(&self) -> &NodeRoute { &self.route }
+
+    pub(crate) fn record_id(&self) -> &SessionRecordId { &self.record_id }
+
+    pub(crate) fn observed_after_sequence(&self) -> u64 {
+        self.observed_after_sequence
+    }
+
+    fn wire_request(&self) -> NodeRequest {
+        NodeRequest::PreviewSessionRecord {
+            record_id: self.record_id.clone(),
+            message_limit: RUN_CONTEXT_SOURCE_MESSAGE_LIMIT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RunContextSourceProjection {
+    SupportedNotObserved,
+    Aggregate {
+        message_count: u64,
+        completed_turn_count: Option<u64>,
+        total_tokens: Option<u64>,
+    },
+}
+
+pub(crate) struct PendingRunContextSourceObservation {
+    prepared: PreparedRunContextSourceObservation,
+    pending: Option<C2PendingRequest>,
+}
+
+pub(crate) struct RunContextSourceObservationCompletion {
+    prepared: PreparedRunContextSourceObservation,
+    result: Result<RunContextSourceProjection, HarnessC2Error>,
+}
+
+impl RunContextSourceObservationCompletion {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PreparedRunContextSourceObservation,
+        Result<RunContextSourceProjection, HarnessC2Error>,
+    ) {
+        (self.prepared, self.result)
+    }
+}
+
+impl PendingRunContextSourceObservation {
+    pub(crate) async fn finish(mut self) -> RunContextSourceObservationCompletion {
+        let pending = self.pending.take()
+            .expect("pending context-source observation owns exactly one C2 waiter");
+        let result = match tokio::time::timeout(
+            RUN_CONTEXT_SOURCE_C2_DEADLINE,
+            pending.finish(),
+        ).await {
+            Err(_) => Err(HarnessC2Error::RunContextSourceDeadline),
+            Ok(Err(error)) => Err(HarnessC2Error::RunContextSourceTransport(error)),
+            Ok(Ok(routed)) if routed.node_id != self.prepared.route.node_id
+                || routed.incarnation_id != self.prepared.route.expected_incarnation_id =>
+            {
+                Err(HarnessC2Error::RunContextSourceRouteMismatch)
+            }
+            Ok(Ok(routed)) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::RunContextSourceRejected {
+                    code: failure.code,
+                }),
+                Ok(response) => correlate_run_context_source_response(
+                    &self.prepared,
+                    response,
+                ),
+            },
+        };
+        RunContextSourceObservationCompletion { prepared: self.prepared, result }
+    }
+}
+
+fn correlate_run_context_source_response(
+    prepared: &PreparedRunContextSourceObservation,
+    response: C2NodeResponse,
+) -> Result<RunContextSourceProjection, HarnessC2Error> {
+    let C2NodeResponse::SessionRecordPreviewed { record_id, preview } = response else {
+        return Err(HarnessC2Error::RunContextSourceCorrelationMismatch);
+    };
+    if record_id != prepared.record_id || preview.validate().is_err() {
+        return Err(HarnessC2Error::RunContextSourceCorrelationMismatch);
+    }
+    if preview.message_count == 0 || !preview.message_count_exact {
+        return Ok(RunContextSourceProjection::SupportedNotObserved);
+    }
+    if preview.completed_turn_count.is_some_and(|count| count > preview.message_count) {
+        return Err(HarnessC2Error::RunContextSourceProjection);
+    }
+    Ok(RunContextSourceProjection::Aggregate {
+        message_count: preview.message_count,
+        completed_turn_count: preview.completed_turn_count,
+        total_tokens: preview.total_tokens,
+    })
 }
 
 /// Sealed authority for one read rooted exclusively in a stored run binding.
@@ -2159,10 +2449,29 @@ struct SpawnResponseCorrelation {
     )>,
 }
 
+struct ManagedWorktreeSpawnResponseCorrelation {
+    spawn: SpawnResponseCorrelation,
+    worktree_profile_id: WorktreeProfileId,
+    expected_worktree_profile_revision: WorktreeProfileRevision,
+}
+
 impl PendingSpawnDispatch {
     pub(crate) async fn finish(mut self) -> Result<SpawnDispatchOutcome, HarnessC2Error> {
         let pending = self.pending.take().expect("pending spawn owns exactly one C2 waiter");
         correlate_spawn_response(self.correlation, pending.finish().await)
+    }
+}
+
+impl PendingManagedWorktreeSpawnDispatch {
+    pub(crate) async fn finish(
+        mut self,
+    ) -> Result<ManagedWorktreeSpawnDispatchOutcome, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending managed worktree spawn owns exactly one C2 waiter");
+        correlate_managed_worktree_spawn_response(
+            self.correlation,
+            pending.finish().await,
+        )
     }
 }
 
@@ -2232,6 +2541,83 @@ fn correlate_spawn_response(
             harness_mcp_proxy: receipt.harness_mcp_proxy.clone(),
             receipt,
         }))
+}
+
+fn correlate_managed_worktree_spawn_response(
+    correlation: ManagedWorktreeSpawnResponseCorrelation,
+    routed: Result<gate4agent_c2_protocol::RoutedNodeResponse, C2ControlError>,
+) -> Result<ManagedWorktreeSpawnDispatchOutcome, HarnessC2Error> {
+    let routed = match routed {
+        Ok(response) => response,
+        Err(error) => return Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown {
+            reason: unknown_reason(&error),
+        }),
+    };
+    if routed.node_id != correlation.spawn.route.node_id
+        || routed.incarnation_id != correlation.spawn.route.expected_incarnation_id
+    {
+        return Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown {
+            reason: SpawnOutcomeUnknownReason::RoutedIdentityMismatch,
+        });
+    }
+    let receipt = match routed.response {
+        Ok(C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt }) => receipt,
+        Err(failure) => return Ok(ManagedWorktreeSpawnDispatchOutcome::Rejected {
+            code: failure.code,
+        }),
+        _ => return Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown {
+            reason: SpawnOutcomeUnknownReason::UnexpectedResponse,
+        }),
+    };
+    if receipt.lease.source_workspace_id != correlation.spawn.cleared_spec.target.workspace_id
+        || receipt.lease.profile_id != correlation.worktree_profile_id
+        || receipt.lease.profile_revision != correlation.expected_worktree_profile_revision
+        || receipt.lease.state != ManagedWorktreeLeaseState::InUse
+        || receipt.lease.cleanup_failure.is_some()
+        || receipt.lease.active_session_count != 1
+        || receipt.spawn.target.worktree_id.as_ref() != Some(&receipt.lease.workspace_id)
+        || receipt.spawn.session.workspace_id != receipt.lease.workspace_id
+    {
+        return Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown {
+            reason: SpawnOutcomeUnknownReason::ReceiptMismatch,
+        });
+    }
+    let mut expected = explicit_spawn_resolution(
+        &correlation.spawn.cleared_spec,
+        correlation.spawn.profile_revision.clone(),
+    )?;
+    expected.target.worktree_id = Some(receipt.lease.workspace_id.clone());
+    if let Some(bundle) = &correlation.spawn.expected_bundle {
+        expected.bundle_id = Some(bundle.id.clone());
+        expected.provenance.bundle_id = SpawnFieldProvenance::Override;
+    }
+    if let Some(context) = &correlation.spawn.expected_context {
+        expected.context_id = Some(context.id.clone());
+        expected.provenance.context_id = SpawnFieldProvenance::Override;
+    }
+    if !validate_spawn_receipt(
+        &correlation.spawn.route,
+        &expected,
+        correlation.spawn.expected_bundle.as_ref(),
+        correlation.spawn.expected_context.as_ref(),
+        &receipt.spawn,
+    ) {
+        return Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown {
+            reason: SpawnOutcomeUnknownReason::ReceiptMismatch,
+        });
+    }
+    Ok(ManagedWorktreeSpawnDispatchOutcome::Accepted(
+        AuthoritativeManagedWorktreeSpawnReceipt {
+            spawn: AuthoritativeSpawnReceipt {
+                operation_id: correlation.spawn.operation_id,
+                spawn_spec_fingerprint: correlation.spawn.fingerprint,
+                idempotency_ref: correlation.spawn.idempotency_ref,
+                receipt: receipt.spawn,
+                harness_mcp_proxy: None,
+            },
+            lease: receipt.lease,
+        },
+    ))
 }
 
 /// Non-cloneable evidence of one exact typed C2 ContextPack export reply.
@@ -2514,6 +2900,17 @@ pub struct AuthoritativeSpawnReceipt {
     harness_mcp_proxy: Option<ResolvedHarnessMcpProxyReceiptV1>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthoritativeManagedWorktreeSpawnReceipt {
+    spawn: AuthoritativeSpawnReceipt,
+    lease: ManagedWorktreeLeaseSnapshot,
+}
+
+impl AuthoritativeManagedWorktreeSpawnReceipt {
+    pub(crate) fn spawn(&self) -> &AuthoritativeSpawnReceipt { &self.spawn }
+    pub(crate) fn lease(&self) -> &ManagedWorktreeLeaseSnapshot { &self.lease }
+}
+
 impl AuthoritativeSpawnReceipt {
     pub fn session(&self) -> &SessionAddress {
         &self.receipt.session
@@ -2556,6 +2953,38 @@ pub struct AcceptedSpawnBindingProof {
     bundle: Option<ResolvedBundleReceipt>,
     context: Option<ResolvedContextPackReceipt>,
     harness_mcp_proxy: Option<ResolvedHarnessMcpProxyReceiptV1>,
+    managed_worktree: Option<ManagedAcceptedWorktreeBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedAcceptedWorktreeBinding {
+    lease_id: ManagedWorktreeLeaseId,
+    source_workspace_id: WorkspaceId,
+    allocated_workspace_id: WorkspaceId,
+    profile_id: WorktreeProfileId,
+    profile_revision: WorktreeProfileRevision,
+}
+
+impl ManagedAcceptedWorktreeBinding {
+    pub(crate) fn lease_id(&self) -> &ManagedWorktreeLeaseId {
+        &self.lease_id
+    }
+
+    pub(crate) fn source_workspace_id(&self) -> &WorkspaceId {
+        &self.source_workspace_id
+    }
+
+    pub(crate) fn allocated_workspace_id(&self) -> &WorkspaceId {
+        &self.allocated_workspace_id
+    }
+
+    pub(crate) fn profile_id(&self) -> &WorktreeProfileId {
+        &self.profile_id
+    }
+
+    pub(crate) fn profile_revision(&self) -> &WorktreeProfileRevision {
+        &self.profile_revision
+    }
 }
 
 impl AcceptedSpawnBindingProof {
@@ -2611,6 +3040,10 @@ impl AcceptedSpawnBindingProof {
         self.harness_mcp_proxy.as_ref()
     }
 
+    pub(crate) fn managed_worktree(&self) -> Option<&ManagedAcceptedWorktreeBinding> {
+        self.managed_worktree.as_ref()
+    }
+
     pub(crate) fn runtime_identity(&self) -> (u64, u64) {
         (
             self.session.session.instance_id.0,
@@ -2648,7 +3081,26 @@ pub(crate) fn accepted_spawn_binding_proof_for_test(
         bundle,
         context,
         harness_mcp_proxy: None,
+        managed_worktree: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn accepted_managed_spawn_binding_proof_for_test(
+    mut proof: AcceptedSpawnBindingProof,
+    lease_id: ManagedWorktreeLeaseId,
+    source_workspace_id: WorkspaceId,
+    profile_id: WorktreeProfileId,
+    profile_revision: WorktreeProfileRevision,
+) -> AcceptedSpawnBindingProof {
+    proof.managed_worktree = Some(ManagedAcceptedWorktreeBinding {
+        lease_id,
+        source_workspace_id,
+        allocated_workspace_id: proof.workspace_id.clone(),
+        profile_id,
+        profile_revision,
+    });
+    proof
 }
 
 #[cfg(test)]
@@ -2689,6 +3141,7 @@ pub(crate) fn accepted_harness_mcp_spawn_binding_proof_for_test(
         bundle,
         context,
         harness_mcp_proxy: Some(harness_mcp_proxy),
+        managed_worktree: None,
     }
 }
 
@@ -2767,6 +3220,19 @@ fn validate_prepared_spawn(prepared: &PreparedSpawnDispatch) -> Result<(), Harne
         _ => return Err(HarnessC2Error::NonAuthoritativeContextOverride),
     }
     validate_authoritative_overrides(&cleared)
+}
+
+fn validate_prepared_managed_worktree_spawn(
+    prepared: &PreparedManagedWorktreeSpawnDispatch,
+) -> Result<(), HarnessC2Error> {
+    validate_prepared_spawn(&prepared.inner)?;
+    if prepared.inner.spec.target.worktree_id.is_some() {
+        return Err(HarnessC2Error::ManagedWorktreeTargetAlreadySelected);
+    }
+    if prepared.inner.harness_mcp.is_some() {
+        return Err(HarnessC2Error::ManagedWorktreeHarnessMcpUnsupported);
+    }
+    Ok(())
 }
 
 fn validate_authoritative_overrides(spec: &SpawnSpec) -> Result<(), HarnessC2Error> {
@@ -3036,6 +3502,10 @@ pub enum HarnessC2Error {
     SpawnTargetMismatch,
     #[error("SpawnSpec was not enqueued on the bounded C2 control queue: {0}")]
     SpawnEnqueue(C2ControlError),
+    #[error("managed worktree spawn requires an unallocated source-workspace target")]
+    ManagedWorktreeTargetAlreadySelected,
+    #[error("harness MCP is unsupported for managed worktree V2 dispatch")]
+    ManagedWorktreeHarnessMcpUnsupported,
     #[error("SpawnSpec provider override is not an explicit authoritative value")]
     NonAuthoritativeProviderOverride,
     #[error("SpawnSpec mode override is not an explicit authoritative value")]
@@ -3114,6 +3584,26 @@ pub enum HarnessC2Error {
     NativeHistoryCorrelationMismatch,
     #[error("Node rejected native history request with {code:?}")]
     NativeHistoryRejected { code: NodeFailureCode },
+    #[error("authoritative run has no context-source binding")]
+    RunContextSourceUnbound,
+    #[error("authoritative run context-source binding is malformed")]
+    InvalidRunContextSourceBinding,
+    #[error("authoritative run is not bound to a managed session record")]
+    RunContextSourceUnsupportedBinding,
+    #[error("run context-source observation was not enqueued: {0}")]
+    RunContextSourceEnqueue(C2ControlError),
+    #[error("run context-source observation transport failed: {0}")]
+    RunContextSourceTransport(C2ControlError),
+    #[error("run context-source observation deadline elapsed")]
+    RunContextSourceDeadline,
+    #[error("run context-source response route or incarnation does not match")]
+    RunContextSourceRouteMismatch,
+    #[error("run context-source response does not correlate with the exact record")]
+    RunContextSourceCorrelationMismatch,
+    #[error("run context-source response cannot be projected privately")]
+    RunContextSourceProjection,
+    #[error("Node rejected run context-source observation with {code:?}")]
+    RunContextSourceRejected { code: NodeFailureCode },
     #[error("run workspace read request is invalid")]
     InvalidRunReadRequest,
     #[error("authoritative run has no workspace binding")]
@@ -3166,12 +3656,14 @@ mod tests {
     use gate4agent_node_protocol::{
         CapabilityId, ContextPackLineageReceipt, NodeIncarnationId,
         ResolvedBundleReceipt, ResolvedContextPackReceipt,
-        ManagedSessionState, OpaqueHostPath, ResolvedEnvironmentProfileReceipt,
+        ManagedSessionState, ManagedWorktreeLeaseId, ManagedWorktreeRetention,
+        OpaqueHostPath, ResolvedEnvironmentProfileReceipt,
         SessionKey, SpawnBundleDigest,
         SpawnBundleId, SpawnBundleRevision, SpawnContextDigest, SpawnContextId,
         SpawnDeadlineMs, SpawnEnvironmentProfileId, SpawnEnvironmentProfileRevision,
         SpawnIdempotencyKey, SpawnOverrides, SpawnProfileId, SpawnProfileRevision,
         SpawnPromptMetadata, SpawnRequiredCapabilities, SpawnTarget,
+        WorktreeProfileId, WorktreeProfileRevision,
     };
     use gate4agent_harness_protocol::{
         HarnessExecutionModeV1, HarnessInlineRef, HarnessResultDispositionV1,
@@ -3429,6 +3921,148 @@ mod tests {
                 reason: SpawnOutcomeUnknownReason::UnexpectedResponse,
             },
         );
+    }
+
+    fn prepared_managed_worktree_case(
+    ) -> (
+        PreparedManagedWorktreeSpawnDispatch,
+        ManagedWorktreeSpawnResponseCorrelation,
+        gate4agent_c2_protocol::RoutedNodeResponse,
+    ) {
+        let mut spec = explicit_spec();
+        spec.target.worktree_id = None;
+        let route = NodeRoute {
+            node_id: spec.target.node_id.clone(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+        };
+        let fingerprint = spawn_spec_fingerprint(&spec).unwrap();
+        let operation_id = HarnessOperationId::new(format!("hop_{}", "7".repeat(24))).unwrap();
+        let idempotency_ref = HarnessIdempotencyRef::new(format!(
+            "hidem_{}",
+            "8".repeat(24),
+        )).unwrap();
+        let worktree_profile_id = WorktreeProfileId::new("managed-default").unwrap();
+        let worktree_profile_revision = WorktreeProfileRevision::new("r17").unwrap();
+        let inner = PreparedSpawnDispatch::new(
+            route.clone(),
+            operation_id.clone(),
+            idempotency_ref.clone(),
+            spec.clone(),
+            fingerprint.clone(),
+        ).unwrap();
+        let prepared = PreparedManagedWorktreeSpawnDispatch::new(
+            inner,
+            worktree_profile_id.clone(),
+            worktree_profile_revision.clone(),
+        ).unwrap();
+        let correlation = ManagedWorktreeSpawnResponseCorrelation {
+            spawn: SpawnResponseCorrelation {
+                route: route.clone(),
+                operation_id,
+                idempotency_ref,
+                cleared_spec: spec.clone(),
+                profile_revision: SpawnProfileRevision::new("r1").unwrap(),
+                fingerprint,
+                expected_bundle: None,
+                expected_context: None,
+                expected_proxy: None,
+            },
+            worktree_profile_id: worktree_profile_id.clone(),
+            expected_worktree_profile_revision: worktree_profile_revision.clone(),
+        };
+        let worktree_id = WorkspaceId::new("managed-worktree-17").unwrap();
+        let lease = ManagedWorktreeLeaseSnapshot {
+            lease_id: ManagedWorktreeLeaseId::new("lease-17").unwrap(),
+            source_workspace_id: spec.target.workspace_id.clone(),
+            workspace_id: worktree_id.clone(),
+            profile_id: worktree_profile_id,
+            profile_revision: worktree_profile_revision,
+            retention: ManagedWorktreeRetention::Retain,
+            state: ManagedWorktreeLeaseState::InUse,
+            active_session_count: 1,
+            managed_record_count: 1,
+            cleanup_failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 11,
+        };
+        let mut resolved = explicit_spawn_resolution(
+            &spec,
+            SpawnProfileRevision::new("r1").unwrap(),
+        ).unwrap();
+        resolved.target.worktree_id = Some(worktree_id.clone());
+        let spawn = resolved.receipt(
+            route.expected_incarnation_id,
+            SessionAddress {
+                workspace_id: worktree_id,
+                session: SessionKey {
+                    instance_id: AgentInstanceId(17),
+                    generation: SessionGeneration(1),
+                },
+            },
+        );
+        let routed = gate4agent_c2_protocol::RoutedNodeResponse {
+            node_id: route.node_id,
+            incarnation_id: route.expected_incarnation_id,
+            response: Ok(C2NodeResponse::ManagedWorktreeSpawnAccepted {
+                receipt: gate4agent_node_protocol::ManagedWorktreeSpawnReceipt {
+                    spawn,
+                    lease,
+                },
+            }),
+        };
+        (prepared, correlation, routed)
+    }
+
+    #[test]
+    fn managed_worktree_dispatch_is_sealed_to_unallocated_v2_without_harness_mcp() {
+        let (prepared, _, _) = prepared_managed_worktree_case();
+        assert!(validate_prepared_managed_worktree_spawn(&prepared).is_ok());
+
+        let mut allocated = explicit_spec();
+        allocated.target.worktree_id = Some(WorkspaceId::new("caller-selected").unwrap());
+        let route = NodeRoute {
+            node_id: allocated.target.node_id.clone(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+        };
+        let inner = PreparedSpawnDispatch::new(
+            route,
+            HarnessOperationId::new(format!("hop_{}", "9".repeat(24))).unwrap(),
+            HarnessIdempotencyRef::new(format!("hidem_{}", "a".repeat(24))).unwrap(),
+            allocated.clone(),
+            spawn_spec_fingerprint(&allocated).unwrap(),
+        ).unwrap();
+        assert!(matches!(
+            PreparedManagedWorktreeSpawnDispatch::new(
+                inner,
+                WorktreeProfileId::new("managed-default").unwrap(),
+                WorktreeProfileRevision::new("r17").unwrap(),
+            ),
+            Err(HarnessC2Error::ManagedWorktreeTargetAlreadySelected),
+        ));
+    }
+
+    #[test]
+    fn managed_worktree_receipt_requires_exact_profile_revision_and_lease_correlation() {
+        let (_, correlation, routed) = prepared_managed_worktree_case();
+        let accepted = correlate_managed_worktree_spawn_response(correlation, Ok(routed)).unwrap();
+        let ManagedWorktreeSpawnDispatchOutcome::Accepted(receipt) = accepted else {
+            panic!("exact managed V2 receipt was not accepted");
+        };
+        assert_eq!(receipt.lease().profile_revision.as_str(), "r17");
+        assert_eq!(receipt.spawn().session().workspace_id.as_str(), "managed-worktree-17");
+
+        let (_, correlation, mut routed) = prepared_managed_worktree_case();
+        let Ok(C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt }) = &mut routed.response
+        else {
+            unreachable!();
+        };
+        receipt.lease.profile_revision = WorktreeProfileRevision::new("r18").unwrap();
+        assert!(matches!(
+            correlate_managed_worktree_spawn_response(correlation, Ok(routed)).unwrap(),
+            ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown {
+                reason: SpawnOutcomeUnknownReason::ReceiptMismatch,
+            },
+        ));
     }
 
     #[test]
@@ -4205,6 +4839,84 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 3,
         }
+    }
+
+    #[test]
+    fn run_context_source_sealed_request_is_exact_private_and_rejects_mismatch() {
+        let run = run_read_fixture(HarnessSessionIdentityV1::Managed {
+            record_id: HarnessSelectorV1::new("record-a").unwrap(),
+            active_session: None,
+        });
+        let mut prepared = PreparedRunContextSourceObservation::from_run(&run).unwrap();
+        prepared.set_observed_after_sequence(41);
+        assert_eq!(prepared.observed_after_sequence(), 41);
+        assert_eq!(prepared.route().node_id.as_str(), "node-a");
+        assert!(matches!(
+            prepared.wire_request(),
+            NodeRequest::PreviewSessionRecord { record_id, message_limit: 1 }
+                if record_id.as_str() == "record-a"
+        ));
+
+        let private_title = "private title must be dropped";
+        let private_model = "private-model";
+        let private_message = "private message must be dropped";
+        let response = C2NodeResponse::SessionRecordPreviewed {
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            preview: gate4agent_types::SessionRecordPreview {
+                title: Some(private_title.to_owned()),
+                modified_at_unix_ms: Some(99),
+                model: Some(private_model.to_owned()),
+                message_count: 7,
+                message_count_exact: true,
+                completed_turn_count: Some(3),
+                total_tokens: Some(700),
+                truncated: false,
+                messages: vec![gate4agent_types::NativeSessionPreviewMessage {
+                    role: gate4agent_types::HistoryMessageRole::User,
+                    text: private_message.to_owned(),
+                }],
+            },
+        };
+        let projection = correlate_run_context_source_response(&prepared, response).unwrap();
+        assert_eq!(
+            projection,
+            RunContextSourceProjection::Aggregate {
+                message_count: 7,
+                completed_turn_count: Some(3),
+                total_tokens: Some(700),
+            },
+        );
+        let projected = format!("{projection:?}");
+        for private in [private_title, private_model, private_message, "modified_at"] {
+            assert!(!projected.contains(private), "leaked {private}");
+        }
+
+        let mismatch = C2NodeResponse::SessionRecordPreviewed {
+            record_id: SessionRecordId::new("record-b").unwrap(),
+            preview: gate4agent_types::SessionRecordPreview {
+                title: None,
+                modified_at_unix_ms: None,
+                model: None,
+                message_count: 1,
+                message_count_exact: true,
+                completed_turn_count: None,
+                total_tokens: None,
+                truncated: false,
+                messages: Vec::new(),
+            },
+        };
+        assert!(matches!(
+            correlate_run_context_source_response(&prepared, mismatch),
+            Err(HarnessC2Error::RunContextSourceCorrelationMismatch),
+        ));
+
+        let inline = run_read_fixture(HarnessSessionIdentityV1::Inline {
+            inline_ref: HarnessInlineRef::new(format!("hinline_{}", "d".repeat(24))).unwrap(),
+        });
+        assert!(matches!(
+            PreparedRunContextSourceObservation::from_run(&inline),
+            Err(HarnessC2Error::RunContextSourceUnsupportedBinding),
+        ));
     }
 
     #[test]

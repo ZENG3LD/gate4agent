@@ -6,7 +6,8 @@ pub use gate4agent_node_protocol::{
     ManagedWorktreeCleanupFailure, ManagedWorktreeGitScope, ManagedWorktreeLeaseId,
     ManagedWorktreeLeaseSnapshot,
     ManagedWorktreeLeaseState, ManagedWorktreeRetention, ManagedWorktreeSpawnReceipt,
-    ManagedWorktreeSpawnRequest, ManagedWorktreeProfileSummary, WorktreeProfileInventory,
+    ManagedWorktreeSpawnRequest, ManagedWorktreeSpawnRequestV2, ManagedWorktreeProfileSummary,
+    WorktreeProfileInventory,
     WorktreeServiceMode,
     provider_id_is_legacy, NodeCursor, NodeEvent, NodeFailure, NodeId, NodeIncarnationId, NodeRequest,
     NodeResponse, OpaqueHostPath, OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
@@ -26,6 +27,7 @@ pub use gate4agent_node_protocol::{
     SpawnTarget,
     WorktreeProfileId, WorktreeProfileRevision,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+    NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
@@ -102,6 +104,8 @@ pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS
 pub const C2_WORKTREE_SELECTION_CAPABILITY: &str = NODE_WORKTREE_SELECTION_CAPABILITY;
 pub const C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY;
+pub const C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY: &str =
+    NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY;
 pub const C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
     NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY;
 pub const C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
@@ -255,6 +259,9 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::ManagedWorktreeBusy => "managed worktree busy",
             NodeFailureCode::ManagedWorktreeOwnershipConflict => {
                 "managed worktree ownership conflict"
+            }
+            NodeFailureCode::ManagedWorktreeProfileRevisionMismatch => {
+                "managed worktree profile revision mismatch"
             }
             NodeFailureCode::ManagedWorktreeRecoveryRequired => {
                 "managed worktree recovery required"
@@ -3855,6 +3862,18 @@ mod tests {
         assert_eq!(
             C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             "managed-worktree-lifecycle-v1",
+        );
+        assert_eq!(
+            C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
+            "managed-worktree-spawn-v2",
+        );
+        assert_eq!(
+            C2NodeFailure::from(&NodeFailure {
+                code: NodeFailureCode::ManagedWorktreeProfileRevisionMismatch,
+                message: "private node detail".to_owned(),
+            })
+            .message,
+            "managed worktree profile revision mismatch",
         );
         let capability =
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap();

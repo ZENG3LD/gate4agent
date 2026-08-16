@@ -37,7 +37,9 @@ use crate::worktree_service::{
     ManagedWorktreeProfile, ManagedWorktreeRegistry, ManagedWorktreeSessionHolder,
 };
 use crate::session_registry::{
-    self, validate_display_name, LoadedNodeState, MAX_MANAGED_SESSION_RECORDS,
+    self, validate_display_name, LoadedNodeState, ManagedWorktreeSpawnReplayRecordV10,
+    ManagedWorktreeSpawnReplayStateV10, MAX_MANAGED_SESSION_RECORDS,
+    MAX_MANAGED_WORKTREE_SPAWN_REPLAYS,
 };
 #[cfg(unix)]
 use crate::workspace_file_unix::{
@@ -94,7 +96,8 @@ use crate::protocol::{
     ManagedSessionRecord,
     ManagedSessionState, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
     ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
-    ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest, SessionRecordId,
+    ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest,
+    ManagedWorktreeSpawnRequestV2, SessionRecordId,
     NativeSessionCatalogRoute, NativeSessionSelection, SessionTaskBindingV1,
     SessionTaskTargetV1, TaskId,
     ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
@@ -127,6 +130,7 @@ use crate::protocol::{
     NODE_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY,
     NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+    NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
     NODE_SPAWN_PROFILE_REVISION_CAPABILITY, NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_GIT_READ_CAPABILITY, NODE_WORKSPACE_FILE_READ_CAPABILITY,
@@ -137,11 +141,13 @@ use crate::protocol::{
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES,
     MAX_REPOSITORY_PATH_BYTES,
     MAX_GIT_DIFF_BYTES, MAX_GIT_HISTORY_COMMITS, MAX_WORKSPACE_FILE_BYTES,
-    MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V9,
+    MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V10,
     SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
     SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
     SPAWN_RUNTIME_STRUCTURED_PROMPT,
 };
+#[cfg(test)]
+use crate::protocol::WorktreeProfileRevision;
 use ring::digest::{digest, SHA256};
 use gate4agent_catalog::{builtin_registry, AgentRegistry};
 use gate4agent_handle::{EventSubscription, Gate4AgentHandle, PortDispatchError};
@@ -1934,6 +1940,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         let managed_worktree_tombstones =
             std::mem::take(&mut loaded.managed_worktree_tombstones);
         let materializations = std::mem::take(&mut loaded.materializations);
+        let managed_spawn_replays = std::mem::take(&mut loaded.managed_spawn_replays);
         let (workspaces, records, persistence_warning) =
             merge_durable_state(&config.workspaces, loaded)?;
         let mut shared = NodeShared::new_with_incarnation(
@@ -1962,6 +1969,12 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         shared.harness_mcp_registry = harness_mcp_registry.clone();
         shared.bundle_catalog = RwLock::new(delivered_catalog);
         shared.delivery_store = Mutex::new(delivery_store);
+        shared.managed_spawn_replays = Mutex::new(
+            managed_spawn_replays
+                .into_iter()
+                .map(|record| (record.idempotency_key.clone(), record))
+                .collect(),
+        );
         let shared = Arc::new(shared);
         if let Some(registry) = harness_mcp_registry {
             let weak = Arc::downgrade(&shared);
@@ -2505,6 +2518,8 @@ struct NodeShared {
     session_environment_materializer: Option<SessionEnvironmentMaterializer>,
     materializations: Mutex<BTreeMap<MaterializationId, MaterializationOwnershipRecord>>,
     spawn_idempotency: Mutex<SpawnIdempotencyCache>,
+    managed_spawn_replays:
+        Mutex<BTreeMap<SpawnIdempotencyKey, ManagedWorktreeSpawnReplayRecordV10>>,
     controller: Mutex<Option<ControllerLease>>,
     history: Mutex<NodeEventHistory>,
     event_tx: broadcast::Sender<NodeEventEnvelope>,
@@ -2670,6 +2685,12 @@ enum SpawnIdempotencyValue {
     HarnessMcp,
 }
 
+enum DurableManagedSpawnReplayDecision {
+    Reserved,
+    PendingLinked,
+    Committed(ManagedWorktreeSpawnReceipt),
+}
+
 impl SpawnIdempotencyValue {
     fn references_context(&self, context_id: &SpawnContextId) -> bool {
         match self {
@@ -2811,6 +2832,7 @@ impl NodeShared {
             spawn_idempotency: Mutex::new(SpawnIdempotencyCache {
                 entries: BTreeMap::new(),
             }),
+            managed_spawn_replays: Mutex::new(BTreeMap::new()),
             controller: Mutex::new(None),
             history: Mutex::new(NodeEventHistory::new(record_providers)),
             event_tx,
@@ -4355,6 +4377,239 @@ impl NodeShared {
             );
     }
 
+    fn remember_managed_spawn_attempt(
+        &self,
+        durable_v2_key: Option<&SpawnIdempotencyKey>,
+        request: ManagedWorktreeSpawnRequest,
+        result: Result<ManagedWorktreeSpawnReceipt, NodeFailure>,
+        accepted_at: Instant,
+    ) {
+        if durable_v2_key.is_none() {
+            self.remember_managed_spawn(request, result, accepted_at);
+        }
+    }
+
+    fn acquire_durable_managed_spawn_v2(
+        &self,
+        request: &ManagedWorktreeSpawnRequestV2,
+        request_digest: String,
+    ) -> Result<DurableManagedSpawnReplayDecision, NodeFailure> {
+        if self.state_path.is_none() {
+            return Err(failure(
+                NodeFailureCode::BackendOperationFailed,
+                "managed worktree V2 requires durable node state",
+            ));
+        }
+        let _transaction = self.state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = request.spawn_spec.idempotency_key.clone();
+        let mut previous = None;
+        {
+            let mut replays = self.managed_spawn_replays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(record) = replays.get_mut(&key) {
+                if record.request_digest != request_digest {
+                    return Err(failure(
+                        NodeFailureCode::SpawnIdempotencyConflict,
+                        "managed worktree V2 idempotency key was reused with a different request",
+                    ));
+                }
+                match &record.state {
+                    ManagedWorktreeSpawnReplayStateV10::Pending {
+                        owner_incarnation_id,
+                        lease_id: None,
+                    } if owner_incarnation_id != &self.incarnation_id => {
+                        previous = Some(record.clone());
+                        record.state = ManagedWorktreeSpawnReplayStateV10::Pending {
+                            owner_incarnation_id: self.incarnation_id,
+                            lease_id: None,
+                        };
+                        record.updated_at_unix_ms = unix_time_ms();
+                    }
+                    ManagedWorktreeSpawnReplayStateV10::Pending {
+                        lease_id: None,
+                        ..
+                    } => {
+                        return Err(failure(
+                            NodeFailureCode::BackendBusy,
+                            "managed worktree V2 reservation is already active",
+                        ));
+                    }
+                    ManagedWorktreeSpawnReplayStateV10::Pending {
+                        lease_id: Some(_),
+                        ..
+                    } => {
+                        return Ok(DurableManagedSpawnReplayDecision::PendingLinked);
+                    }
+                    ManagedWorktreeSpawnReplayStateV10::Committed { receipt } => {
+                        return Ok(DurableManagedSpawnReplayDecision::Committed(
+                            receipt.clone(),
+                        ));
+                    }
+                }
+            } else if replays.len() >= MAX_MANAGED_WORKTREE_SPAWN_REPLAYS {
+                return Err(failure(
+                    NodeFailureCode::SpawnIdempotencyCapacity,
+                    "durable managed worktree replay ledger reached its bounded capacity",
+                ));
+            } else {
+                let now = unix_time_ms();
+                replays.insert(key.clone(), ManagedWorktreeSpawnReplayRecordV10 {
+                    idempotency_key: key.clone(),
+                    request_digest,
+                    source_workspace_id: request.spawn_spec.target.workspace_id.clone(),
+                    profile_id: request.worktree_profile_id.clone(),
+                    expected_profile_revision: request.expected_profile_revision.clone(),
+                    state: ManagedWorktreeSpawnReplayStateV10::Pending {
+                        owner_incarnation_id: self.incarnation_id,
+                        lease_id: None,
+                    },
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                });
+            }
+        }
+        if let Err(error) = self.persist_state_locked() {
+            let mut replays = self.managed_spawn_replays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match previous {
+                Some(previous) => {
+                    replays.insert(key, previous);
+                }
+                None => {
+                    replays.remove(&key);
+                }
+            }
+            return Err(persistence_failure(error));
+        }
+        Ok(DurableManagedSpawnReplayDecision::Reserved)
+    }
+
+    fn link_durable_managed_spawn_v2_lease_locked(
+        &self,
+        key: &SpawnIdempotencyKey,
+        lease_id: &ManagedWorktreeLeaseId,
+    ) -> Result<ManagedWorktreeSpawnReplayRecordV10, NodeFailure> {
+        let mut replays = self.managed_spawn_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = replays.get_mut(key).ok_or_else(|| {
+            failure(
+                NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                "managed worktree V2 reservation disappeared before allocation",
+            )
+        })?;
+        let previous = record.clone();
+        match &mut record.state {
+            ManagedWorktreeSpawnReplayStateV10::Pending {
+                lease_id: current,
+                ..
+            }
+                if current.is_none() =>
+            {
+                *current = Some(lease_id.clone());
+                record.updated_at_unix_ms = unix_time_ms();
+                Ok(previous)
+            }
+            _ => Err(failure(
+                NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                "managed worktree V2 reservation is not allocation-ready",
+            )),
+        }
+    }
+
+    fn restore_durable_managed_spawn_v2_locked(
+        &self,
+        key: &SpawnIdempotencyKey,
+        previous: ManagedWorktreeSpawnReplayRecordV10,
+    ) {
+        self.managed_spawn_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.clone(), previous);
+    }
+
+    fn commit_durable_managed_spawn_v2(
+        &self,
+        request: &ManagedWorktreeSpawnRequestV2,
+        receipt: ManagedWorktreeSpawnReceipt,
+    ) -> Result<(), NodeFailure> {
+        let _transaction = self.state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = &request.spawn_spec.idempotency_key;
+        let previous = {
+            let mut replays = self.managed_spawn_replays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let record = replays.get_mut(key).ok_or_else(|| {
+                failure(
+                    NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                    "managed worktree V2 reservation disappeared before commit",
+                )
+            })?;
+            let previous = record.clone();
+            match &record.state {
+                ManagedWorktreeSpawnReplayStateV10::Pending {
+                    lease_id: Some(lease_id),
+                    ..
+                } if lease_id == &receipt.lease.lease_id => {}
+                _ => {
+                    return Err(failure(
+                        NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                        "managed worktree V2 reservation is not linked to the spawned lease",
+                    ));
+                }
+            }
+            record.state = ManagedWorktreeSpawnReplayStateV10::Committed { receipt };
+            record.updated_at_unix_ms = unix_time_ms();
+            previous
+        };
+        if let Err(error) = self.persist_state_locked() {
+            self.restore_durable_managed_spawn_v2_locked(key, previous);
+            return Err(persistence_failure(error));
+        }
+        Ok(())
+    }
+
+    fn remove_unallocated_durable_managed_spawn_v2(
+        &self,
+        request: &ManagedWorktreeSpawnRequestV2,
+    ) -> Result<(), NodeFailure> {
+        let _transaction = self.state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = &request.spawn_spec.idempotency_key;
+        let removed = {
+            let mut replays = self.managed_spawn_replays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match replays.get(key).map(|record| &record.state) {
+                Some(ManagedWorktreeSpawnReplayStateV10::Pending {
+                    lease_id: None,
+                    ..
+                }) => {
+                    replays.remove(key)
+                }
+                _ => None,
+            }
+        };
+        let Some(removed) = removed else {
+            return Ok(());
+        };
+        if let Err(error) = self.persist_state_locked() {
+            self.managed_spawn_replays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key.clone(), removed);
+            return Err(persistence_failure(error));
+        }
+        Ok(())
+    }
+
     fn resolve_spawn_spec(&self, spec: &SpawnSpec) -> Result<ResolvedSpawnSpec, NodeFailure> {
         if spec.target.node_id != self.node_id {
             return Err(failure(
@@ -4588,9 +4843,19 @@ impl NodeShared {
         &self,
         request: ManagedWorktreeSpawnRequest,
     ) -> Result<ManagedWorktreeSpawnReceipt, NodeFailure> {
+        self.spawn_managed_worktree_inner(request, None).await
+    }
+
+    async fn spawn_managed_worktree_inner(
+        &self,
+        request: ManagedWorktreeSpawnRequest,
+        durable_v2_key: Option<&SpawnIdempotencyKey>,
+    ) -> Result<ManagedWorktreeSpawnReceipt, NodeFailure> {
         let accepted_at = Instant::now();
-        if let Some(replayed) = self.replay_managed_spawn(&request, accepted_at)? {
-            return replayed;
+        if durable_v2_key.is_none() {
+            if let Some(replayed) = self.replay_managed_spawn(&request, accepted_at)? {
+                return replayed;
+            }
         }
         let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
         if request.spawn_spec.target.worktree_id.is_some() {
@@ -4598,7 +4863,12 @@ impl NodeShared {
                 NodeFailureCode::InvalidRequest,
                 "managed worktree spawn must not select a caller-provided worktree",
             ));
-            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            self.remember_managed_spawn_attempt(
+                durable_v2_key,
+                request,
+                result.clone(),
+                accepted_at,
+            );
             return result;
         }
         let environment_profile = self.resolve_environment_profile(&resolved)?;
@@ -4657,9 +4927,25 @@ impl NodeShared {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .allocate(source_workspace_id.clone(), &profile, base_commit.clone(), unix_time_ms())
                 .map_err(|message| failure(NodeFailureCode::BackendBusy, &message))?;
+            let previous_replay = match durable_v2_key
+                .map(|key| self.link_durable_managed_spawn_v2_lease_locked(key, &lease.lease_id))
+                .transpose()
+            {
+                Ok(previous) => previous,
+                Err(error) => {
+                    *self.managed_worktrees.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
+                    return Err(error);
+                }
+            };
             if let Err(error) = self.persist_state_locked() {
                 *self.managed_worktrees.lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
+                if let (Some(key), Some(previous_replay)) =
+                    (durable_v2_key, previous_replay)
+                {
+                    self.restore_durable_managed_spawn_v2_locked(key, previous_replay);
+                }
                 return Err(persistence_failure(error));
             }
             lease
@@ -4673,7 +4959,12 @@ impl NodeShared {
                 self.set_persistence_error(Some(DURABLE_STATE_COMMIT_FAILED_ERROR.to_owned()));
             }
             let result = Err(failure(NodeFailureCode::ManagedWorktreeOwnershipConflict, &message));
-            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            self.remember_managed_spawn_attempt(
+                durable_v2_key,
+                request,
+                result.clone(),
+                accepted_at,
+            );
             return result;
         }
         let mutation_timeout_ms = match spawn_deadline_remaining(deadline) {
@@ -4681,7 +4972,12 @@ impl NodeShared {
             Err(error) => {
                 self.reconcile_failed_allocation(&lease, &source_root).await;
                 let result = Err(error);
-                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                self.remember_managed_spawn_attempt(
+                    durable_v2_key,
+                    request,
+                    result.clone(),
+                    accepted_at,
+                );
                 return result;
             }
         };
@@ -4706,7 +5002,12 @@ impl NodeShared {
                 } else {
                     managed_git_worktree_failure(error)
                 });
-                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                self.remember_managed_spawn_attempt(
+                    durable_v2_key,
+                    request,
+                    result.clone(),
+                    accepted_at,
+                );
                 return result;
             }
         };
@@ -4716,7 +5017,12 @@ impl NodeShared {
                 NodeFailureCode::ManagedWorktreeRecoveryRequired,
                 "created worktree identity did not match its durable lease",
             ));
-            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            self.remember_managed_spawn_attempt(
+                durable_v2_key,
+                request,
+                result.clone(),
+                accepted_at,
+            );
             return result;
         }
         {
@@ -4734,7 +5040,12 @@ impl NodeShared {
                 ManagedWorktreeCleanupFailure::Backend,
             );
             let result = Err(persistence_failure(error));
-            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            self.remember_managed_spawn_attempt(
+                durable_v2_key,
+                request,
+                result.clone(),
+                accepted_at,
+            );
             return result;
         }
         let ready = self.managed_worktrees.lock()
@@ -4746,7 +5057,12 @@ impl NodeShared {
         if let Err(error) = self.register_workspace(lease.workspace_id.clone(), created.path.clone()).await {
             let _ = self.cleanup_managed_worktree(&lease.lease_id, true).await;
             let result = Err(error);
-            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            self.remember_managed_spawn_attempt(
+                durable_v2_key,
+                request,
+                result.clone(),
+                accepted_at,
+            );
             return result;
         }
         let spawn = self.spawn_session_with_deadline(
@@ -4779,7 +5095,12 @@ impl NodeShared {
                     );
                 }
                 let result = Err(error);
-                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                self.remember_managed_spawn_attempt(
+                    durable_v2_key,
+                    request,
+                    result.clone(),
+                    accepted_at,
+                );
                 return result;
             }
         };
@@ -4826,7 +5147,12 @@ impl NodeShared {
                     ManagedWorktreeCleanupFailure::Backend,
                 );
                 let result = Err(error);
-                self.remember_managed_spawn(request, result.clone(), accepted_at);
+                self.remember_managed_spawn_attempt(
+                    durable_v2_key,
+                    request,
+                    result.clone(),
+                    accepted_at,
+                );
                 return result;
             }
         };
@@ -4852,7 +5178,12 @@ impl NodeShared {
                 );
             }
             let result = Err(persistence_failure(error));
-            self.remember_managed_spawn(request, result.clone(), accepted_at);
+            self.remember_managed_spawn_attempt(
+                durable_v2_key,
+                request,
+                result.clone(),
+                accepted_at,
+            );
             return result;
         }
         self.publish(NodeEvent::ManagedWorktreeUpserted { lease: snapshot.clone() });
@@ -4866,8 +5197,84 @@ impl NodeShared {
             context,
         );
         let result = Ok(receipt);
-        self.remember_managed_spawn(request, result.clone(), accepted_at);
+        self.remember_managed_spawn_attempt(
+            durable_v2_key,
+            request,
+            result.clone(),
+            accepted_at,
+        );
         result
+    }
+
+    async fn spawn_managed_worktree_v2(
+        &self,
+        request: ManagedWorktreeSpawnRequestV2,
+    ) -> Result<ManagedWorktreeSpawnReceipt, NodeFailure> {
+        if request.spawn_spec.target.node_id != self.node_id {
+            return Err(failure(
+                NodeFailureCode::SpawnTargetMismatch,
+                "spawn target does not match this node",
+            ));
+        }
+        if request.spawn_spec.target.worktree_id.is_some() {
+            return Err(failure(
+                NodeFailureCode::InvalidRequest,
+                "managed worktree spawn must not select a caller-provided worktree",
+            ));
+        }
+        let request_digest = managed_spawn_request_digest_v2(&request)?;
+        let replay = self.acquire_durable_managed_spawn_v2(&request, request_digest)?;
+        match replay {
+            DurableManagedSpawnReplayDecision::Committed(receipt) => return Ok(receipt),
+            DurableManagedSpawnReplayDecision::PendingLinked => {
+                return Err(failure(
+                    NodeFailureCode::ManagedWorktreeRecoveryRequired,
+                    "managed worktree V2 reservation has an incomplete durable allocation",
+                ));
+            }
+            DurableManagedSpawnReplayDecision::Reserved => {}
+        }
+        let validated = (|| {
+            let resolved = self.resolve_spawn_spec(&request.spawn_spec)?;
+            let profile = self.managed_profile(
+                &resolved.target.workspace_id,
+                &request.worktree_profile_id,
+            )?;
+            if profile.revision() != &request.expected_profile_revision {
+                return Err(failure(
+                    NodeFailureCode::ManagedWorktreeProfileRevisionMismatch,
+                    "managed worktree profile revision does not match the loaded profile",
+                ));
+            }
+            Ok(())
+        })();
+        match validated {
+            Ok(()) => {}
+            Err(error) => {
+                self.remove_unallocated_durable_managed_spawn_v2(&request)?;
+                return Err(error);
+            }
+        }
+        let legacy = ManagedWorktreeSpawnRequest {
+            spawn_spec: request.spawn_spec.clone(),
+            worktree_profile_id: request.worktree_profile_id.clone(),
+        };
+        match self
+            .spawn_managed_worktree_inner(
+                legacy,
+                Some(&request.spawn_spec.idempotency_key),
+            )
+            .await
+        {
+            Ok(receipt) => {
+                self.commit_durable_managed_spawn_v2(&request, receipt.clone())?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.remove_unallocated_durable_managed_spawn_v2(&request)?;
+                Err(error)
+            }
+        }
     }
 
     fn managed_profile(
@@ -5119,7 +5526,13 @@ impl NodeShared {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let result = session_registry::save_v9(
+        let managed_spawn_replays = self.managed_spawn_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = session_registry::save_v10(
             self.state_path.as_deref(),
             &self.node_id,
             &workspaces,
@@ -5127,6 +5540,7 @@ impl NodeShared {
             &managed.records(),
             &managed.tombstones(),
             &materializations,
+            &managed_spawn_replays,
         );
         match &result {
             Ok(warning) => self.set_persistence_error(warning.clone()),
@@ -10435,7 +10849,7 @@ fn node_compatibility_support_for_manifest(
         path_semantics: platform::path_semantics(),
         local_transport: platform::local_transport(),
         state_schema: StateSchemaSupport {
-            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V9)
+            versions: ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V10)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
         },
         provider_contracts: provider_contracts.to_vec(),
@@ -10461,6 +10875,7 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
         NODE_WORKTREE_SELECTION_CAPABILITY,
         NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+        NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
         NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
         NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
         NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
@@ -10758,6 +11173,7 @@ fn request_requires_open_provider_ids(shared: &NodeShared, request: &NodeRequest
         | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
         | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
+        NodeRequest::SpawnManagedWorktreeV2 { request } => Some(&request.spawn_spec),
         _ => None,
     } {
         return shared
@@ -10780,6 +11196,7 @@ fn request_requires_child_environment_profile(
         | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
         | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
+        NodeRequest::SpawnManagedWorktreeV2 { request } => Some(&request.spawn_spec),
         _ => None,
     } {
         return shared
@@ -10845,6 +11262,7 @@ fn request_requires_child_environment_profile(
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::IndexProviderSession { .. }
         | NodeRequest::IndexNativeSession { .. }
@@ -10863,6 +11281,7 @@ fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -
         | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
         | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
+        NodeRequest::SpawnManagedWorktreeV2 { request } => Some(&request.spawn_spec),
         _ => None,
     } {
         return shared
@@ -10928,6 +11347,7 @@ fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::IndexProviderSession { .. }
         | NodeRequest::IndexNativeSession { .. }
@@ -10949,6 +11369,7 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
         | NodeRequest::SpawnSpecWithHarnessMcp { spec, .. }
         | NodeRequest::ArmHarnessMcpReservation { spawn_spec: spec, .. } => Some(spec),
         NodeRequest::SpawnManagedWorktree { request } => Some(&request.spawn_spec),
+        NodeRequest::SpawnManagedWorktreeV2 { request } => Some(&request.spawn_spec),
         _ => None,
     } {
         return shared
@@ -11011,6 +11432,7 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
         | NodeRequest::CreateWorktree { .. }
         | NodeRequest::RemoveWorktree { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::IndexProviderSession { .. }
         | NodeRequest::IndexNativeSession { .. }
@@ -11044,7 +11466,8 @@ fn request_requires_open_provider_ids_with(
         }
         NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnSpecWithHarnessMcp { .. } => false,
-        NodeRequest::SpawnManagedWorktree { .. } => false,
+        NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. } => false,
         NodeRequest::Resume { session, .. }
         | NodeRequest::Prompt { session, .. }
         | NodeRequest::Paste { session, .. }
@@ -12646,6 +13069,11 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             let receipt = shared.spawn_managed_worktree(request).await?;
             Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt })
         }
+        NodeRequest::SpawnManagedWorktreeV2 { request } => {
+            shared.require_controller(connection_id, role)?;
+            let receipt = shared.spawn_managed_worktree_v2(request).await?;
+            Ok(NodeResponse::ManagedWorktreeSpawnAccepted { receipt })
+        }
         NodeRequest::CleanupManagedWorktree { lease_id } => {
             shared.require_controller(connection_id, role)?;
             let lease = shared.cleanup_managed_worktree(&lease_id, true).await?;
@@ -13239,6 +13667,24 @@ fn workspace_file_revision(bytes: &[u8]) -> WorkspaceFileRevision {
     WorkspaceFileRevision::new(value).expect("SHA-256 produces a valid workspace revision")
 }
 
+fn managed_spawn_request_digest_v2(
+    request: &ManagedWorktreeSpawnRequestV2,
+) -> Result<String, NodeFailure> {
+    let encoded = serde_json::to_vec(request).map_err(|_| {
+        failure(
+            NodeFailureCode::InvalidRequest,
+            "managed worktree V2 request could not be canonicalized",
+        )
+    })?;
+    let mut value = String::with_capacity(71);
+    value.push_str("sha256:");
+    for byte in digest(&SHA256, &encoded).as_ref() {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(value)
+}
+
 fn native_session_preview_failure(error: NativeSessionPreviewError) -> NodeFailure {
     let code = match error {
         NativeSessionPreviewError::InvalidLimit => NodeFailureCode::InvalidRequest,
@@ -13471,6 +13917,9 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::UnknownManagedWorktreeLease => "unknown-managed-worktree-lease",
         NodeFailureCode::ManagedWorktreeBusy => "managed-worktree-busy",
         NodeFailureCode::ManagedWorktreeOwnershipConflict => "managed-worktree-ownership-conflict",
+        NodeFailureCode::ManagedWorktreeProfileRevisionMismatch => {
+            "managed-worktree-profile-revision-mismatch"
+        }
         NodeFailureCode::ManagedWorktreeRecoveryRequired => "managed-worktree-recovery-required",
         NodeFailureCode::StandaloneWorkspaceRecoveryRequired => {
             "standalone-workspace-recovery-required"
@@ -15749,7 +16198,7 @@ mod tests {
             capability.as_str() == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
         }));
         let support = node_compatibility_support_for_manifest(&[], &[]).unwrap();
-        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V9);
+        assert_eq!(support.state_schema.versions.maximum(), NODE_STATE_SCHEMA_V10);
         let mut spec = spawn_spec_fixture();
         spec.expected_profile_revision =
             crate::protocol::SpawnProfileRevision::new("test-r1").unwrap();
@@ -16915,6 +17364,51 @@ mod tests {
         lease
     }
 
+    fn managed_v2_test_shared(
+        allocation_root: &Path,
+        state_path: Option<PathBuf>,
+        profile_revision: &str,
+    ) -> NodeShared {
+        let profile = ManagedWorktreeProfile::new(
+            WorktreeProfileId::new("default").unwrap(),
+            WorktreeProfileRevision::new(profile_revision).unwrap(),
+            allocation_root,
+            "gate4agent",
+            "HEAD",
+            ManagedWorktreeRetention::RemoveWhenReleased,
+        )
+        .unwrap();
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap()
+        .with_worktree_service_mode(WorktreeServiceMode::Managed)
+        .with_managed_worktree_profile(profile)
+        .unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-terminal-test").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+        shared.state_path = state_path;
+        shared
+    }
+
+    fn managed_v2_request(idempotency_key: &str) -> ManagedWorktreeSpawnRequestV2 {
+        let mut spawn_spec = spawn_spec_fixture();
+        spawn_spec.idempotency_key = SpawnIdempotencyKey::new(idempotency_key).unwrap();
+        ManagedWorktreeSpawnRequestV2 {
+            spawn_spec,
+            worktree_profile_id: WorktreeProfileId::new("default").unwrap(),
+            expected_profile_revision: WorktreeProfileRevision::new("v1").unwrap(),
+        }
+    }
+
     #[test]
     fn managed_spawn_receipt_rebinds_allocated_worktree_and_roundtrips_wire() {
         let shared = terminal_test_shared();
@@ -16952,6 +17446,389 @@ mod tests {
         let encoded = serde_json::to_vec(&receipt).unwrap();
         let decoded: ManagedWorktreeSpawnReceipt = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, receipt);
+    }
+
+    #[tokio::test]
+    async fn managed_spawn_v2_rejects_profile_revision_before_allocation() {
+        let root = temporary_workspace_root("managed-v2-revision");
+        let allocation = root.join("allocation");
+        std::fs::create_dir_all(&allocation).unwrap();
+        let shared = managed_v2_test_shared(
+            &allocation,
+            Some(root.join("node-state.json")),
+            "v1",
+        );
+        let mut request = managed_v2_request("managed-v2-revision");
+        request.expected_profile_revision = WorktreeProfileRevision::new("v2").unwrap();
+
+        let failure = shared.spawn_managed_worktree_v2(request).await.unwrap_err();
+
+        assert_eq!(
+            failure.code,
+            NodeFailureCode::ManagedWorktreeProfileRevisionMismatch,
+        );
+        assert!(shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records()
+            .is_empty());
+        assert!(shared
+            .managed_spawn_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_spawn_v2_concurrent_same_key_has_one_durable_reservation() {
+        let root = temporary_workspace_root("managed-v2-concurrent");
+        let allocation = root.join("allocation");
+        std::fs::create_dir_all(&allocation).unwrap();
+        let shared = Arc::new(managed_v2_test_shared(
+            &allocation,
+            Some(root.join("node-state.json")),
+            "v1",
+        ));
+        let request = managed_v2_request("managed-v2-concurrent");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let shared = Arc::clone(&shared);
+            let request = request.clone();
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                let digest = managed_spawn_request_digest_v2(&request).unwrap();
+                barrier.wait();
+                shared.acquire_durable_managed_spawn_v2(&request, digest)
+            }));
+        }
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(result, Ok(DurableManagedSpawnReplayDecision::Reserved))
+                })
+                .count(),
+            1,
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(result, Err(error) if error.code == NodeFailureCode::BackendBusy)
+                })
+                .count(),
+            1,
+        );
+        assert_eq!(
+            shared
+                .managed_spawn_replays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+        );
+        assert!(shared
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records()
+            .is_empty());
+        drop(shared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_spawn_v2_linked_pending_reopen_fails_closed_without_reallocation() {
+        let root = temporary_workspace_root("managed-v2-linked-pending");
+        let allocation = root.join("allocation");
+        std::fs::create_dir_all(&allocation).unwrap();
+        let state_path = root.join("node-state.json");
+        let shared = managed_v2_test_shared(&allocation, Some(state_path.clone()), "v1");
+        let lease = install_managed_lease(&shared);
+        let request = managed_v2_request("managed-v2-linked-pending");
+        assert!(matches!(
+            shared
+                .acquire_durable_managed_spawn_v2(
+                    &request,
+                    managed_spawn_request_digest_v2(&request).unwrap(),
+                )
+                .unwrap(),
+            DurableManagedSpawnReplayDecision::Reserved,
+        ));
+        {
+            let _transaction = shared
+                .state_transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared
+                .link_durable_managed_spawn_v2_lease_locked(
+                    &request.spawn_spec.idempotency_key,
+                    &lease.lease_id,
+                )
+                .unwrap();
+            shared.persist_state_locked().unwrap();
+        }
+        drop(shared);
+
+        let mut loaded = session_registry::load(
+            Some(&state_path),
+            &NodeId::new("node-terminal-test").unwrap(),
+        )
+        .unwrap();
+        let reopened = managed_v2_test_shared(&allocation, Some(state_path), "v2");
+        *reopened
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ManagedWorktreeRegistry::from_records(
+                std::mem::take(&mut loaded.managed_worktrees),
+                std::mem::take(&mut loaded.managed_worktree_tombstones),
+            )
+            .unwrap();
+        *reopened
+            .managed_spawn_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = loaded
+            .managed_spawn_replays
+            .into_iter()
+            .map(|record| (record.idempotency_key.clone(), record))
+            .collect();
+        let lease_count = reopened
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records()
+            .len();
+
+        let failure = reopened
+            .spawn_managed_worktree_v2(request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            failure.code,
+            NodeFailureCode::ManagedWorktreeRecoveryRequired,
+        );
+        assert_eq!(
+            reopened
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records()
+                .len(),
+            lease_count,
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_spawn_v2_replays_exact_receipt_after_durable_reopen_and_conflicts() {
+        let root = temporary_workspace_root("managed-v2-reopen");
+        let allocation = root.join("allocation");
+        std::fs::create_dir_all(&allocation).unwrap();
+        let state_path = root.join("node-state.json");
+        let shared = managed_v2_test_shared(&allocation, Some(state_path.clone()), "v1");
+        let lease = install_managed_lease(&shared);
+        let request = managed_v2_request("managed-v2-reopen");
+        let session = SessionAddress {
+            workspace_id: lease.workspace_id.clone(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(91),
+                generation: SessionGeneration(1),
+            },
+        };
+        let snapshot = {
+            let mut registry = shared
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = registry.get_mut(&lease.lease_id).unwrap();
+            current.state = ManagedWorktreeLeaseState::InUse;
+            current.session_holders.push(ManagedWorktreeSessionHolder {
+                incarnation_id: shared.incarnation_id,
+                instance_id: session.session.instance_id,
+                generation: session.session.generation,
+            });
+            current.snapshot()
+        };
+        let resolved = shared.resolve_spawn_spec(&request.spawn_spec).unwrap();
+        let receipt = managed_spawn_receipt(
+            &resolved,
+            shared.incarnation_id,
+            session,
+            snapshot,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            shared
+                .acquire_durable_managed_spawn_v2(
+                    &request,
+                    managed_spawn_request_digest_v2(&request).unwrap(),
+                )
+                .unwrap(),
+            DurableManagedSpawnReplayDecision::Reserved,
+        ));
+        {
+            let _transaction = shared
+                .state_transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared
+                .link_durable_managed_spawn_v2_lease_locked(
+                    &request.spawn_spec.idempotency_key,
+                    &lease.lease_id,
+                )
+                .unwrap();
+            shared.persist_state_locked().unwrap();
+        }
+        shared
+            .commit_durable_managed_spawn_v2(&request, receipt.clone())
+            .unwrap();
+        let legacy_same_key = ManagedWorktreeSpawnRequest {
+            spawn_spec: request.spawn_spec.clone(),
+            worktree_profile_id: request.worktree_profile_id.clone(),
+        };
+        shared.remember_managed_spawn_attempt(
+            Some(&request.spawn_spec.idempotency_key),
+            legacy_same_key.clone(),
+            Ok(receipt.clone()),
+            Instant::now(),
+        );
+        assert!(shared
+            .replay_managed_spawn(&legacy_same_key, Instant::now())
+            .unwrap()
+            .is_none());
+        drop(shared);
+
+        let mut loaded = session_registry::load(
+            Some(&state_path),
+            &NodeId::new("node-terminal-test").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.managed_spawn_replays.len(), 1);
+        let reopened = managed_v2_test_shared(&allocation, Some(state_path), "v2");
+        *reopened
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ManagedWorktreeRegistry::from_records(
+                std::mem::take(&mut loaded.managed_worktrees),
+                std::mem::take(&mut loaded.managed_worktree_tombstones),
+            )
+            .unwrap();
+        *reopened
+            .managed_spawn_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = loaded
+            .managed_spawn_replays
+            .into_iter()
+            .map(|record| (record.idempotency_key.clone(), record))
+            .collect();
+        let lease_count_before = reopened
+            .managed_worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records()
+            .len();
+
+        assert_eq!(
+            reopened
+                .spawn_managed_worktree_v2(request.clone())
+                .await
+                .unwrap(),
+            receipt,
+        );
+        assert_eq!(
+            reopened
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records()
+                .len(),
+            lease_count_before,
+        );
+        let mut changed = request;
+        changed.spawn_spec.deadline_ms = crate::protocol::SpawnDeadlineMs::new(29_000).unwrap();
+        let failure = reopened
+            .spawn_managed_worktree_v2(changed)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, NodeFailureCode::SpawnIdempotencyConflict);
+        assert_eq!(
+            reopened
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records()
+                .len(),
+            lease_count_before,
+        );
+        let mut new_key = managed_v2_request("managed-v2-new-after-profile-change");
+        new_key.expected_profile_revision = WorktreeProfileRevision::new("v1").unwrap();
+        let failure = reopened
+            .spawn_managed_worktree_v2(new_key)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.code,
+            NodeFailureCode::ManagedWorktreeProfileRevisionMismatch,
+        );
+        assert_eq!(
+            reopened
+                .managed_worktrees
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records()
+                .len(),
+            lease_count_before,
+        );
+        assert_eq!(
+            reopened
+                .managed_spawn_replays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_managed_spawn_idempotency_remains_transient_and_exact() {
+        let shared = terminal_test_shared();
+        let request = ManagedWorktreeSpawnRequest {
+            spawn_spec: spawn_spec_fixture(),
+            worktree_profile_id: WorktreeProfileId::new("default").unwrap(),
+        };
+        let expected = failure(NodeFailureCode::BackendBusy, "legacy fixture failure");
+        shared.remember_managed_spawn(
+            request.clone(),
+            Err(expected.clone()),
+            Instant::now(),
+        );
+
+        assert_eq!(
+            shared
+                .replay_managed_spawn(&request, Instant::now())
+                .unwrap()
+                .unwrap(),
+            Err(expected),
+        );
+        assert!(shared
+            .managed_spawn_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[tokio::test]
@@ -17790,7 +18667,7 @@ mod tests {
         );
 
         let persisted = std::fs::read(&state_path).unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&persisted).unwrap()["version"], NODE_STATE_SCHEMA_V9);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&persisted).unwrap()["version"], NODE_STATE_SCHEMA_V10);
         let loaded = session_registry::load(Some(&state_path), &node_id).unwrap();
         assert_eq!(loaded.records[0].task_binding, cleared.task_binding);
         std::fs::remove_dir_all(root).unwrap();

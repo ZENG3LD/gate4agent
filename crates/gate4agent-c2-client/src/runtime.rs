@@ -24,6 +24,7 @@ use gate4agent_c2_protocol::{
     C2_HARNESS_MCP_READ_PROXY_CAPABILITY,
     C2_PROVIDER_ID_OPEN_CAPABILITY,
     C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+    C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_PROVIDER_RUNTIME_STATUS_CAPABILITY,
     C2_SPAWN_PROFILE_REVISION_CAPABILITY,
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
@@ -83,6 +84,8 @@ const WORKTREE_SELECTION_NOT_NEGOTIATED: &str =
     "worktree selection requires negotiated C2 capability";
 const MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED: &str =
     "managed worktree lifecycle requires negotiated C2 capability";
+const MANAGED_WORKTREE_SPAWN_V2_NOT_NEGOTIATED: &str =
+    "managed worktree V2 spawn requires negotiated C2 capability";
 const CHILD_ENVIRONMENT_PROFILE_NOT_NEGOTIATED: &str =
     "child environment profiles require negotiated C2 capability";
 const SESSION_BUNDLE_MATERIALIZATION_NOT_NEGOTIATED: &str =
@@ -116,6 +119,7 @@ struct NegotiatedPathCapabilities {
     spawn_profile_revision: bool,
     worktree_selection: bool,
     managed_worktree_lifecycle: bool,
+    managed_worktree_spawn_v2: bool,
     child_environment_profile: bool,
     session_bundle_materialization: bool,
     history_context_pack: bool,
@@ -268,6 +272,9 @@ fn control_request_deadline(request: &NodeRequest) -> Duration {
         NodeRequest::SpawnSpec { spec } =>
             Duration::from_millis(spec.deadline_ms.get()) + RELAY_REPLY_HEADROOM,
         NodeRequest::SpawnManagedWorktree { request } =>
+            Duration::from_millis(request.spawn_spec.deadline_ms.get())
+                + RELAY_REPLY_HEADROOM,
+        NodeRequest::SpawnManagedWorktreeV2 { request } =>
             Duration::from_millis(request.spawn_spec.deadline_ms.get())
                 + RELAY_REPLY_HEADROOM,
         NodeRequest::ResumeSessionRecord { .. } => Duration::from_secs(35),
@@ -511,6 +518,8 @@ fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlErr
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY)
@@ -622,6 +631,8 @@ fn negotiated_path_capabilities(
         worktree_selection: selected_has(C2_WORKTREE_SELECTION_CAPABILITY),
         managed_worktree_lifecycle:
             selected_has(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY),
+        managed_worktree_spawn_v2:
+            selected_has(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY),
         child_environment_profile:
             selected_has(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY),
         session_bundle_materialization:
@@ -711,6 +722,9 @@ fn reject_unnegotiated_outbound_path(
         Some(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY) => {
             capabilities.managed_worktree_lifecycle
         }
+        Some(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY) => {
+            capabilities.managed_worktree_spawn_v2
+        }
         Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => capabilities.history_context_pack,
         Some(C2_NATIVE_SESSION_CATALOG_CAPABILITY) => capabilities.native_session_catalog,
         Some(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY) => {
@@ -742,6 +756,9 @@ fn reject_unnegotiated_outbound_path(
                 }
                 Some(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY) => {
                     MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED.to_owned()
+                }
+                Some(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY) => {
+                    MANAGED_WORKTREE_SPAWN_V2_NOT_NEGOTIATED.to_owned()
                 }
                 Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => {
                     HISTORY_CONTEXT_PACK_NOT_NEGOTIATED.to_owned()
@@ -834,6 +851,7 @@ fn c2_request_requires_child_environment_profile_capability(request: &NodeReques
     let spec = match request {
         NodeRequest::SpawnSpec { spec } => spec,
         NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
+        NodeRequest::SpawnManagedWorktreeV2 { request } => &request.spawn_spec,
         _ => return false,
     };
     !matches!(
@@ -846,6 +864,7 @@ fn spawn_spec_requires_open_provider_capability(request: &NodeRequest) -> bool {
     let spec = match request {
         NodeRequest::SpawnSpec { spec } => spec,
         NodeRequest::SpawnManagedWorktree { request } => &request.spawn_spec,
+        NodeRequest::SpawnManagedWorktreeV2 { request } => &request.spawn_spec,
         _ => return false,
     };
     match &spec.overrides.provider {
@@ -892,6 +911,7 @@ fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
@@ -960,6 +980,7 @@ fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
@@ -1295,6 +1316,36 @@ fn validate_session_task_response(
         ) if c2_session_task_record_matches(record, record_id, *expected_revision, target) => Ok(()),
         (NodeRequest::SetSessionTask { .. }, Ok(_)) => {
             Err("C2 session task response does not match the routed request")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_managed_worktree_spawn_v2_response(
+    expected: &NodeRequest,
+    response: &Result<RoutedNodeResponse, C2RelayFailure>,
+) -> Result<(), &'static str> {
+    let Ok(routed) = response else {
+        return Ok(());
+    };
+    match (expected, &routed.response) {
+        (
+            NodeRequest::SpawnManagedWorktreeV2 { request },
+            Ok(C2NodeResponse::ManagedWorktreeSpawnAccepted { receipt }),
+        ) if receipt.spawn.incarnation_id == routed.incarnation_id
+            && receipt.spawn.target.node_id == request.spawn_spec.target.node_id
+            && receipt.spawn.target.workspace_id == request.spawn_spec.target.workspace_id
+            && receipt.spawn.target.worktree_id.as_ref() == Some(&receipt.lease.workspace_id)
+            && receipt.spawn.session.workspace_id == receipt.lease.workspace_id
+            && receipt.spawn.profile_id == request.spawn_spec.profile_id
+            && receipt.spawn.profile_revision == request.spawn_spec.expected_profile_revision
+            && receipt.spawn.idempotency_key == request.spawn_spec.idempotency_key
+            && receipt.lease.source_workspace_id == request.spawn_spec.target.workspace_id
+            && receipt.lease.profile_id == request.worktree_profile_id
+            && receipt.lease.profile_revision == request.expected_profile_revision => Ok(()),
+        (NodeRequest::SpawnManagedWorktreeV2 { .. }, Err(_)) => Ok(()),
+        (NodeRequest::SpawnManagedWorktreeV2 { .. }, Ok(_)) => {
+            Err("C2 managed worktree V2 response does not match the routed request")
         }
         _ => Ok(()),
     }
@@ -2116,6 +2167,15 @@ async fn control_owner<E>(
                             )));
                             break;
                         }
+                        if let Err(message) = validate_managed_worktree_spawn_v2_response(
+                            &expected_request,
+                            &reply.result,
+                        ) {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                message.to_owned(),
+                            )));
+                            break;
+                        }
                         if let Err(message) = validate_harness_mcp_response(
                             &expected_request,
                             &reply.result,
@@ -2881,6 +2941,7 @@ mod tests {
             spawn_spec_defaults_overrides: false,
             worktree_selection: false,
             managed_worktree_lifecycle: false,
+            managed_worktree_spawn_v2: false,
             child_environment_profile: false,
             session_bundle_materialization: false,
             history_context_pack: false,
@@ -2906,6 +2967,7 @@ mod tests {
             spawn_profile_revision: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
+            managed_worktree_spawn_v2: true,
             child_environment_profile: true,
             session_bundle_materialization: true,
             history_context_pack: true,
@@ -3277,6 +3339,7 @@ mod tests {
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
@@ -3292,6 +3355,8 @@ mod tests {
                 CapabilityId::new(C2_OBSERVATION_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_OBSERVATION_MANAGED_TARGET_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_HARNESS_MCP_READ_PROXY_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);
@@ -5257,6 +5322,84 @@ mod tests {
             ..legacy
         };
         assert!(c2_workspace_has_managed_worktree_metadata(&profile_only));
+    }
+
+    #[test]
+    fn managed_worktree_v2_is_capability_gated_and_receipt_correlated() {
+        let offer = client_compatibility_offer().unwrap();
+        assert!(offer.capabilities.iter().any(|capability| {
+            capability.as_str() == C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY
+        }));
+        let request = NodeRequest::SpawnManagedWorktreeV2 {
+            request: gate4agent_c2_protocol::ManagedWorktreeSpawnRequestV2 {
+                spawn_spec: spawn_spec("node-a"),
+                worktree_profile_id:
+                    gate4agent_c2_protocol::WorktreeProfileId::new("review").unwrap(),
+                expected_profile_revision:
+                    gate4agent_c2_protocol::WorktreeProfileRevision::new("wr1").unwrap(),
+            },
+        };
+        let mut capabilities = all_path_capabilities();
+        capabilities.managed_worktree_spawn_v2 = false;
+        assert!(matches!(
+            reject_unnegotiated_outbound_path(&request, capabilities),
+            Err(C2ControlError::Protocol(ref message))
+                if message == MANAGED_WORKTREE_SPAWN_V2_NOT_NEGOTIATED
+        ));
+
+        let managed_workspace_id = WorkspaceId::new("managed-v2").unwrap();
+        let mut spawn = spawn_receipt();
+        spawn.profile_revision = SpawnProfileRevision::new("default.r1").unwrap();
+        spawn.target.worktree_id = Some(managed_workspace_id.clone());
+        spawn.session.workspace_id = managed_workspace_id.clone();
+        let receipt = gate4agent_c2_protocol::ManagedWorktreeSpawnReceipt {
+            spawn,
+            lease: gate4agent_c2_protocol::ManagedWorktreeLeaseSnapshot {
+                lease_id:
+                    gate4agent_c2_protocol::ManagedWorktreeLeaseId::new("lease-v2").unwrap(),
+                source_workspace_id: WorkspaceId::new("primary").unwrap(),
+                workspace_id: managed_workspace_id,
+                profile_id:
+                    gate4agent_c2_protocol::WorktreeProfileId::new("review").unwrap(),
+                profile_revision:
+                    gate4agent_c2_protocol::WorktreeProfileRevision::new("wr1").unwrap(),
+                retention: gate4agent_c2_protocol::ManagedWorktreeRetention::RemoveWhenReleased,
+                state: gate4agent_c2_protocol::ManagedWorktreeLeaseState::InUse,
+                active_session_count: 1,
+                managed_record_count: 1,
+                cleanup_failure: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 2,
+            },
+        };
+        let routed = RoutedNodeResponse {
+            node_id: NodeId::new("node-a").unwrap(),
+            incarnation_id: receipt.spawn.incarnation_id,
+            response: Ok(C2NodeResponse::ManagedWorktreeSpawnAccepted {
+                receipt: receipt.clone(),
+            }),
+        };
+        assert!(validate_managed_worktree_spawn_v2_response(
+            &request,
+            &Ok(routed),
+        )
+        .is_ok());
+
+        let mut mismatched = receipt;
+        mismatched.lease.profile_revision =
+            gate4agent_c2_protocol::WorktreeProfileRevision::new("wr2").unwrap();
+        let routed = RoutedNodeResponse {
+            node_id: NodeId::new("node-a").unwrap(),
+            incarnation_id: mismatched.spawn.incarnation_id,
+            response: Ok(C2NodeResponse::ManagedWorktreeSpawnAccepted {
+                receipt: mismatched,
+            }),
+        };
+        assert!(validate_managed_worktree_spawn_v2_response(
+            &request,
+            &Ok(routed),
+        )
+        .is_err());
     }
 
     #[test]

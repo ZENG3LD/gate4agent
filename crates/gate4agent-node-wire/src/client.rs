@@ -1847,6 +1847,12 @@ fn ensure_node_request_provider_capability(
                 spawn_spec: spec,
                 ..
             },
+        }
+        | NodeRequest::SpawnManagedWorktreeV2 {
+            request: gate4agent_node_protocol::ManagedWorktreeSpawnRequestV2 {
+                spawn_spec: spec,
+                ..
+            },
         } => {
             if let gate4agent_node_protocol::SpawnOverride::Set { value: provider } =
                 &spec.overrides.provider
@@ -2010,6 +2016,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }
@@ -2218,6 +2225,7 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::Spawn { .. }
         | NodeRequest::SpawnSpec { .. }
         | NodeRequest::SpawnManagedWorktree { .. }
+        | NodeRequest::SpawnManagedWorktreeV2 { .. }
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Resume { .. }
         | NodeRequest::RenameSessionRecord { .. }

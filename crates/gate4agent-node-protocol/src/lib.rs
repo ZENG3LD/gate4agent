@@ -42,6 +42,7 @@ pub const NODE_STATE_SCHEMA_V6: u16 = 6;
 pub const NODE_STATE_SCHEMA_V7: u16 = 7;
 pub const NODE_STATE_SCHEMA_V8: u16 = 8;
 pub const NODE_STATE_SCHEMA_V9: u16 = 9;
+pub const NODE_STATE_SCHEMA_V10: u16 = 10;
 pub const NODE_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const NODE_OPAQUE_UNIX_PATH_CAPABILITY: &str = "path.opaque-unix-bytes-v1";
 pub const NODE_REPOSITORY_PATH_CAPABILITY: &str = "repository-path-v1";
@@ -60,6 +61,8 @@ pub const NODE_SPAWN_PROFILE_REVISION_CAPABILITY: &str =
 pub const NODE_WORKTREE_SELECTION_CAPABILITY: &str = "worktree-selection-v1";
 pub const NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     "managed-worktree-lifecycle-v1";
+pub const NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY: &str =
+    "managed-worktree-spawn-v2";
 pub const NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY: &str =
     "child-environment-profile-v1";
 pub const NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY: &str =
@@ -1028,6 +1031,14 @@ pub enum ManagedWorktreeCleanupFailure {
 pub struct ManagedWorktreeSpawnRequest {
     pub spawn_spec: SpawnSpec,
     pub worktree_profile_id: WorktreeProfileId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeSpawnRequestV2 {
+    pub spawn_spec: SpawnSpec,
+    pub worktree_profile_id: WorktreeProfileId,
+    pub expected_profile_revision: WorktreeProfileRevision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3456,6 +3467,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
             NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
+            NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
             NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
@@ -3471,7 +3483,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
         state_schema: Some(StateSchemaSupport {
             versions: ProtocolRange {
                 minimum: NODE_STATE_SCHEMA_V1,
-                maximum: NODE_STATE_SCHEMA_V9,
+                maximum: NODE_STATE_SCHEMA_V10,
             },
         }),
     }
@@ -5512,6 +5524,9 @@ pub enum NodeRequest {
     SpawnManagedWorktree {
         request: ManagedWorktreeSpawnRequest,
     },
+    SpawnManagedWorktreeV2 {
+        request: ManagedWorktreeSpawnRequestV2,
+    },
     CleanupManagedWorktree {
         lease_id: ManagedWorktreeLeaseId,
     },
@@ -5735,6 +5750,7 @@ impl NodeRequest {
             | Self::Spawn { .. }
             | Self::SpawnSpec { .. }
             | Self::SpawnManagedWorktree { .. }
+            | Self::SpawnManagedWorktreeV2 { .. }
             | Self::CleanupManagedWorktree { .. }
             | Self::Resume { .. }
             | Self::RenameSessionRecord { .. }
@@ -5806,6 +5822,9 @@ impl NodeRequest {
             | Self::CleanupManagedWorktree { .. } => {
                 Some(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
             }
+            Self::SpawnManagedWorktreeV2 { .. } => {
+                Some(NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY)
+            }
             Self::DiscoverHistory { .. }
             | Self::LoadHistory { .. }
             | Self::ExportContextPack { .. }
@@ -5848,6 +5867,7 @@ impl NodeRequest {
             || matches!(
                 self,
                 Self::SpawnManagedWorktree { .. } | Self::CleanupManagedWorktree { .. }
+                    | Self::SpawnManagedWorktreeV2 { .. }
             )
     }
 
@@ -5856,6 +5876,7 @@ impl NodeRequest {
             self,
             Self::SpawnSpec { .. }
                 | Self::SpawnManagedWorktree { .. }
+                | Self::SpawnManagedWorktreeV2 { .. }
                 | Self::ArmHarnessMcpReservation { .. }
                 | Self::SpawnSpecWithHarnessMcp { .. }
         )
@@ -5866,6 +5887,7 @@ impl NodeRequest {
             self,
             Self::SpawnSpec { .. }
                 | Self::SpawnManagedWorktree { .. }
+                | Self::SpawnManagedWorktreeV2 { .. }
                 | Self::ArmHarnessMcpReservation { .. }
                 | Self::SpawnSpecWithHarnessMcp { .. }
         )
@@ -5877,6 +5899,7 @@ impl NodeRequest {
             Self::ArmHarnessMcpReservation { spawn_spec: spec, .. }
             | Self::SpawnSpecWithHarnessMcp { spec, .. } => spec,
             Self::SpawnManagedWorktree { request } => &request.spawn_spec,
+            Self::SpawnManagedWorktreeV2 { request } => &request.spawn_spec,
             _ => return false,
         };
         matches!(
@@ -5892,6 +5915,7 @@ impl NodeRequest {
             Self::ArmHarnessMcpReservation { spawn_spec: spec, .. }
             | Self::SpawnSpecWithHarnessMcp { spec, .. } => spec,
             Self::SpawnManagedWorktree { request } => &request.spawn_spec,
+            Self::SpawnManagedWorktreeV2 { request } => &request.spawn_spec,
             _ => return false,
         };
         !matches!(spec.overrides.bundle_id, SpawnOverride::Clear)
@@ -5911,6 +5935,9 @@ impl NodeRequest {
                 !matches!(spec.overrides.context_id, SpawnOverride::Clear)
             }
             Self::SpawnManagedWorktree { request } => {
+                !matches!(request.spawn_spec.overrides.context_id, SpawnOverride::Clear)
+            }
+            Self::SpawnManagedWorktreeV2 { request } => {
                 !matches!(request.spawn_spec.overrides.context_id, SpawnOverride::Clear)
             }
             _ => false,
@@ -6476,6 +6503,7 @@ pub enum NodeFailureCode {
     UnknownManagedWorktreeLease,
     ManagedWorktreeBusy,
     ManagedWorktreeOwnershipConflict,
+    ManagedWorktreeProfileRevisionMismatch,
     ManagedWorktreeRecoveryRequired,
     StandaloneWorkspaceRecoveryRequired,
     UnknownSpawnProfile,
@@ -8636,6 +8664,7 @@ mod tests {
         assert_eq!(NODE_STATE_SCHEMA_V4, 4);
         assert_eq!(NODE_STATE_SCHEMA_V5, 5);
         assert_eq!(NODE_STATE_SCHEMA_V6, 6);
+        assert_eq!(NODE_STATE_SCHEMA_V10, 10);
         assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES)).is_ok());
         assert!(WorktreeProfileId::new("p".repeat(MAX_WORKTREE_PROFILE_ID_BYTES + 1)).is_err());
         assert!(WorktreeProfileRevision::new(
@@ -8674,6 +8703,26 @@ mod tests {
         for forbidden in ["canonical", "target_root", "gitdir", "branch", "base_commit", "diagnostic"] {
             assert!(!json.contains(forbidden), "managed request leaked {forbidden}");
         }
+
+        let legacy = match request {
+            NodeRequest::SpawnManagedWorktree { request } => request,
+            _ => unreachable!(),
+        };
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert!(serde_json::from_str::<ManagedWorktreeSpawnRequest>(&legacy_json).is_ok());
+        assert!(serde_json::from_str::<ManagedWorktreeSpawnRequestV2>(&legacy_json).is_err());
+        let v2 = NodeRequest::SpawnManagedWorktreeV2 {
+            request: ManagedWorktreeSpawnRequestV2 {
+                spawn_spec: legacy.spawn_spec,
+                worktree_profile_id: legacy.worktree_profile_id,
+                expected_profile_revision: WorktreeProfileRevision::new("review.r1").unwrap(),
+            },
+        };
+        assert_eq!(
+            v2.required_capability(),
+            Some(NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY),
+        );
+        assert!(v2.requires_worktree_selection_capability());
     }
 
     #[test]

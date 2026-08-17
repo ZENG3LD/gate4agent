@@ -20,7 +20,8 @@ use gate4agent_harness_client::{
     HarnessReplaceTaskExecutionSpecRequestV2, HarnessReviewedTaskLaunchSelectionV1,
     HarnessReviewedWorktreeSelectionV1, HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1,
     HarnessStartTaskRequestV2, HarnessTaskId, HarnessTaskLaunchOptionsV1, HarnessTaskReviewPolicyV1,
-    HarnessTaskStateV1, HARNESS_ENTITY_PAGE_LIMIT_MAX, HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX,
+    HarnessTaskStateV1, RedactedRunV1, RedactedTaskV1, HARNESS_ENTITY_PAGE_LIMIT_MAX,
+    HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX,
 };
 
 const HARNESS_OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
@@ -34,6 +35,7 @@ fn usage() -> &'static str {
      \x20 runs list [--task TASK_ID] [--lifecycle LIFECYCLE] [--after RUN_ID] [--limit N]\n\
      \x20 task get TASK_ID\n\
      \x20 run get RUN_ID\n\
+     \x20 results TASK_ID\n\
      \x20 task create --title TITLE --body BODY [--parent TASK_ID]\n\
      \x20 task move TASK_ID --to STATE\n\
      \x20 launch-options TASK_ID\n\
@@ -69,6 +71,7 @@ enum Command {
     },
     TaskGet { task_id: HarnessTaskId },
     RunGet { run_id: HarnessRunId },
+    Results { task_id: HarnessTaskId },
     TaskCreate { title: String, body: String, parent: Option<HarnessTaskId> },
     TaskMove { task_id: HarnessTaskId, to: HarnessTaskStateV1 },
     LaunchOptions { task_id: HarnessTaskId },
@@ -91,6 +94,7 @@ enum Verb {
     RunsList,
     TaskGet,
     RunGet,
+    Results,
     TaskCreate,
     TaskMove,
     LaunchOptions,
@@ -114,6 +118,7 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
             _ => Err(usage().to_owned()),
         },
         Some("run") if args.get(2).map(String::as_str) == Some("get") => Ok((Verb::RunGet, 2)),
+        Some("results") => Ok((Verb::Results, 1)),
         Some("spec") if args.get(2).map(String::as_str) == Some("save") => Ok((Verb::SpecSave, 2)),
         Some("launch-options") => Ok((Verb::LaunchOptions, 1)),
         Some("observe-context") => Ok((Verb::ObserveContext, 1)),
@@ -253,6 +258,10 @@ fn build_command(
         Verb::RunGet => {
             let run_id = expect_single_positional(positionals, "run-id").and_then(parse_run_id)?;
             Ok(Command::RunGet { run_id })
+        }
+        Verb::Results => {
+            let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
+            Ok(Command::Results { task_id })
         }
         Verb::TaskCreate => {
             expect_no_positionals(positionals, "task create")?;
@@ -431,6 +440,15 @@ struct TaskCreated {
     outcome: HarnessOperatorMutationOutcomeV1,
 }
 
+/// `results TASK_ID` aggregate — zero new server RPC, a client-side loop
+/// over the two already-existing `task_get`/`run_get` methods (same
+/// "zero new server surface" discipline as every other subcommand here).
+#[derive(serde::Serialize)]
+struct TaskResults {
+    task: RedactedTaskV1,
+    runs: Vec<RedactedRunV1>,
+}
+
 fn render<T: serde::Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|error| error.to_string())
 }
@@ -456,6 +474,16 @@ fn execute(invocation: Invocation) -> Result<String, String> {
         Command::RunGet { run_id } => {
             let run = client.run_get(run_id).map_err(|error| error.to_string())?;
             render(&run)
+        }
+        Command::Results { task_id } => {
+            let task = client.task_get(task_id).map_err(|error| error.to_string())?;
+            let mut runs = task
+                .run_ids
+                .iter()
+                .map(|run_id| client.run_get(run_id.clone()).map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            runs.sort_by_key(|run| run.created_at_unix_ms);
+            render(&TaskResults { task, runs })
         }
         Command::TaskCreate { title, body, parent } => {
             let task_id = fresh_task_id()?;

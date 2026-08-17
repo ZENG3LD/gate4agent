@@ -31,9 +31,10 @@ pub use gate4agent_harness_protocol::{
     HarnessTaskLaunchIssuanceId, HarnessTaskLaunchIssuanceRefV1,
     HarnessTaskReviewPolicyV1,
     HarnessTaskStartOutcomeV1,
-    HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResultDispositionV1,
+    HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResolvedContextPackReceiptV1,
+    HarnessResultDispositionV1,
     HarnessInlineRef, HarnessReceiptRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
-    HarnessRunLifecycleV1,
+    HarnessRunGitFactsV1, HarnessRunLifecycleV1,
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     HarnessValidationError, HarnessWorktreeIntentV1, SessionGrantId,
     HARNESS_ARTIFACTS_MAX, HARNESS_BODY_MAX_BYTES,
@@ -3694,6 +3695,8 @@ pub struct RedactedRunV1 {
     pub binding: RedactedBindingStateV1,
     pub result_disposition: Option<HarnessResultDispositionV1>,
     pub failure_category: Option<HarnessFailureCategoryV1>,
+    pub context_pack: Option<HarnessResolvedContextPackReceiptV1>,
+    pub git_facts: Option<HarnessRunGitFactsV1>,
     pub references_redacted: bool,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -3719,6 +3722,12 @@ impl RedactedRunV1 {
         }
         if matches!(self.lifecycle, HarnessRunLifecycleV1::Failed) != self.failure_category.is_some() {
             return Err(HarnessReadApiError::InvalidRunState);
+        }
+        if let Some(pack) = &self.context_pack {
+            pack.validate().map_err(HarnessReadApiError::Protocol)?;
+        }
+        if let Some(facts) = &self.git_facts {
+            facts.validate().map_err(HarnessReadApiError::Protocol)?;
         }
         validate_timestamps(self.created_at_unix_ms, self.updated_at_unix_ms)
     }

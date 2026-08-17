@@ -3,6 +3,7 @@ use uzor_tui::{
     TerminalBuffer, Text, Widget,
 };
 use gate4agent_c2_protocol::C2RelayRoute;
+use gate4agent_harness_protocol::HarnessRunGitFactsOutcomeV1;
 use gate4agent_node_protocol::{
     GitSnapshot, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseSnapshot,
     ManagedWorktreeLeaseState, ManagedWorktreeRetention, ResolvedSpawnReceipt, SessionMode,
@@ -4708,6 +4709,105 @@ fn render_harness_task_detail(
                     || line.starts_with("Continuation:")
                 {
                     theme.text
+                } else {
+                    theme.dim
+                };
+                Paragraph::new(truncate_cells(&line, body.width as usize))
+                    .style(Style::default().fg(color).bg(theme.surface))
+                    .render(Rect::new(body.x, y, body.width, 1), buf);
+            }
+        }
+        HarnessTaskDetailSection::Results => {
+            // No new fetch machinery: every field rendered here
+            // (`result_disposition`, `failure_category`, `context_pack`,
+            // `git_facts`) already lives on the `RedactedRunV1` returned by
+            // `app.harness_task_runs`, unlike Transfers' own
+            // `HarnessRunTransferState` fetch above.
+            let runs = app.harness_task_runs(&task.task_id);
+            if body.height == 0 {
+                return;
+            }
+            let selected = detail.selected_run.as_ref()
+                .and_then(|run_id| runs.iter().find(|run| &run.run_id == run_id).copied());
+            let selected_index = selected.and_then(|run| {
+                runs.iter().position(|candidate| candidate.run_id == run.run_id)
+            });
+            let toolbar = Rect::new(body.x, body.y, body.width, 1);
+            let can_previous = selected_index.is_some_and(|index| index > 0);
+            let x = render_toolbar_segment(
+                "[Up]",
+                toolbar.x,
+                toolbar,
+                Style::default().fg(if can_previous { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_previous.then_some(HitTarget::HarnessResultPreviousRun),
+                buf,
+                layout,
+            ).saturating_add(1);
+            let can_next = selected_index.is_some_and(|index| index + 1 < runs.len());
+            let _ = render_toolbar_segment(
+                "[Down]",
+                x,
+                toolbar,
+                Style::default().fg(if can_next { theme.teal } else { theme.muted }).bg(theme.surface),
+                can_next.then_some(HitTarget::HarnessResultNextRun),
+                buf,
+                layout,
+            );
+            let Some(run) = selected else {
+                if body.height > 1 {
+                    Paragraph::new("Results: None | task has no selected run")
+                        .style(Style::default().fg(theme.muted).bg(theme.surface))
+                        .render(Rect::new(body.x, body.y + 1, body.width, 1), buf);
+                }
+                return;
+            };
+            let mut lines = vec![format!(
+                "Run {} r{} | lifecycle {:?}",
+                short_opaque_marker(run.run_id.as_str()),
+                run.revision.get(),
+                run.lifecycle,
+            )];
+            lines.push(match (run.result_disposition, run.failure_category) {
+                (None, _) => "Result: None yet".to_owned(),
+                (Some(disposition), Some(category)) => {
+                    format!("Result: {disposition:?} | category {category:?}")
+                }
+                (Some(disposition), None) => format!("Result: {disposition:?}"),
+            });
+            lines.push(match &run.context_pack {
+                None => "Context pack: none".to_owned(),
+                Some(pack) => format!(
+                    "Context pack: digest {} | {} messages retained | {}",
+                    compact_digest(&pack.digest),
+                    pack.retained_message_count,
+                    if pack.truncated { "truncated" } else { "complete" },
+                ),
+            });
+            lines.push(match &run.git_facts {
+                None => "Git: not yet captured".to_owned(),
+                Some(facts) => match &facts.outcome {
+                    HarnessRunGitFactsOutcomeV1::Unavailable => "Git: unavailable".to_owned(),
+                    HarnessRunGitFactsOutcomeV1::Captured(summary) if !summary.is_repository => {
+                        "Git: not repository".to_owned()
+                    }
+                    HarnessRunGitFactsOutcomeV1::Captured(summary) => format!(
+                        "Git: stored | branch {} | {} changed | {} commits | {}",
+                        summary.branch.as_deref().unwrap_or("detached"),
+                        summary.status.len(),
+                        summary.recent_commits.len(),
+                        if summary.truncated { "truncated" } else { "complete" },
+                    ),
+                },
+            });
+            for (index, line) in lines.into_iter().enumerate() {
+                let y = body.y.saturating_add(1 + index as u16);
+                if y >= body.bottom() {
+                    break;
+                }
+                let color = if index == 0 {
+                    theme.text
+                } else if line.starts_with("Result: Failed") {
+                    theme.yellow
                 } else {
                     theme.dim
                 };
@@ -9959,6 +10059,8 @@ mod tests {
                 binding: RedactedBindingStateV1::ManagedActive,
                 result_disposition: None,
                 failure_category: None,
+                context_pack: None,
+                git_facts: None,
                 references_redacted: false,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -10021,6 +10123,8 @@ mod tests {
             binding: RedactedBindingStateV1::ManagedActive,
             result_disposition: None,
             failure_category: None,
+            context_pack: None,
+            git_facts: None,
             references_redacted: false,
             created_at_unix_ms: 2,
             updated_at_unix_ms: 2,
@@ -10263,6 +10367,8 @@ mod tests {
             binding: RedactedBindingStateV1::ManagedActive,
             result_disposition: None,
             failure_category: None,
+            context_pack: None,
+            git_facts: None,
             references_redacted: false,
             created_at_unix_ms: 2,
             updated_at_unix_ms: 2,
@@ -10349,6 +10455,8 @@ mod tests {
             binding: RedactedBindingStateV1::ManagedActive,
             result_disposition: None,
             failure_category: None,
+            context_pack: None,
+            git_facts: None,
             references_redacted: false,
             created_at_unix_ms: 2,
             updated_at_unix_ms: 2,
@@ -10422,6 +10530,8 @@ mod tests {
             binding: RedactedBindingStateV1::ManagedActive,
             result_disposition: None,
             failure_category: None,
+            context_pack: None,
+            git_facts: None,
             references_redacted: false,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
@@ -10549,6 +10659,8 @@ mod tests {
             binding: RedactedBindingStateV1::ManagedActive,
             result_disposition: None,
             failure_category: None,
+            context_pack: None,
+            git_facts: None,
             references_redacted: false,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -10639,6 +10751,8 @@ mod tests {
             binding: RedactedBindingStateV1::ManagedActive,
             result_disposition: None,
             failure_category: None,
+            context_pack: None,
+            git_facts: None,
             references_redacted: false,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

@@ -16,6 +16,11 @@ pub const HARNESS_LINKS_MAX: usize = 128;
 pub const HARNESS_DEPENDENCIES_MAX: usize = 64;
 pub const HARNESS_RESULTS_MAX: usize = 64;
 pub const HARNESS_ARTIFACTS_MAX: usize = 128;
+pub const HARNESS_RUN_GIT_STATUS_ENTRIES_MAX: usize = 128;
+pub const HARNESS_RUN_GIT_RECENT_COMMITS_MAX: usize = 12;
+pub const HARNESS_RUN_GIT_BRANCH_MAX_BYTES: usize = 1_024;
+pub const HARNESS_RUN_GIT_PATH_MAX_BYTES: usize = 1_024;
+pub const HARNESS_RUN_GIT_SUMMARY_MAX_BYTES: usize = 1_024;
 pub const HARNESS_ALLOWED_TARGETS_MAX: usize = 128;
 pub const HARNESS_CHILD_COUNT_MAX: u16 = 256;
 pub const HARNESS_CHILD_DEPTH_MAX: u16 = 32;
@@ -91,6 +96,35 @@ opaque_id!(HarnessDeliveryRef, "hdelivery_", "delivery reference");
 opaque_id!(HarnessContinuationRef, "hcontinuation_", "continuation reference");
 opaque_id!(HarnessExecutionSpecId, "hespec_", "execution specification id");
 opaque_id!(HarnessTaskLaunchIssuanceId, "hissue_", "task launch issuance id");
+
+impl HarnessResultRef {
+    /// Derives the result reference for `run_id` by reprefixing its hex
+    /// body. `HarnessRunId` and `HarnessResultRef` share the identical
+    /// 24-hex-body scheme (`opaque_id!`), so this is a mechanical,
+    /// reversible relabeling, never a lookup — see `run_id()` for the
+    /// inverse. The `expect` below is sound by construction: every
+    /// `HarnessRunId` in existence was produced by `HarnessRunId::new`
+    /// (directly or via `Deserialize`), which validates the `hrun_` prefix
+    /// before the value can exist at all.
+    pub fn for_run(run_id: &HarnessRunId) -> Self {
+        let hex = run_id
+            .as_str()
+            .strip_prefix(HarnessRunId::PREFIX)
+            .expect("HarnessRunId always carries its own prefix");
+        Self(format!("{}{hex}", Self::PREFIX))
+    }
+
+    /// Inverts `for_run`: recovers the `HarnessRunId` a result reference
+    /// was derived from. Fails only if `self` was not produced by
+    /// `for_run` from a valid run id (wrong prefix or malformed hex body).
+    pub fn run_id(&self) -> Result<HarnessRunId, HarnessValidationError> {
+        let hex = self
+            .0
+            .strip_prefix(Self::PREFIX)
+            .ok_or(HarnessValidationError::InvalidOpaqueId { field: "result reference" })?;
+        HarnessRunId::new(format!("{}{hex}", HarnessRunId::PREFIX))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -1820,6 +1854,141 @@ impl HarnessFailureV1 {
     }
 }
 
+/// Mirror of harness-api's `HarnessGitStatusCodeV1` (field-for-field), kept
+/// as a narrow, intentional duplication forced by crate layering:
+/// `gate4agent-harness-protocol` has no dependency on `gate4agent-harness-api`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessRunGitStatusCodeV1 {
+    Unmodified,
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Unmerged,
+    Untracked,
+    Ignored,
+    TypeChanged,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunGitStatusEntryV1 {
+    pub index_status: HarnessRunGitStatusCodeV1,
+    pub worktree_status: HarnessRunGitStatusCodeV1,
+    pub path: String,
+    pub previous_path: Option<String>,
+}
+
+impl HarnessRunGitStatusEntryV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        validate_run_git_text(&self.path, HARNESS_RUN_GIT_PATH_MAX_BYTES, true)?;
+        if let Some(previous_path) = &self.previous_path {
+            validate_run_git_text(previous_path, HARNESS_RUN_GIT_PATH_MAX_BYTES, true)?;
+            if previous_path == &self.path {
+                return Err(HarnessValidationError::InvalidGitSummary);
+            }
+        }
+        let renamed_or_copied = matches!(
+            self.index_status,
+            HarnessRunGitStatusCodeV1::Renamed | HarnessRunGitStatusCodeV1::Copied
+        ) || matches!(
+            self.worktree_status,
+            HarnessRunGitStatusCodeV1::Renamed | HarnessRunGitStatusCodeV1::Copied
+        );
+        if self.previous_path.is_some() != renamed_or_copied {
+            return Err(HarnessValidationError::InvalidGitSummary);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunGitCommitSummaryV1 {
+    /// 40 or 64 lowercase hex characters — validated inline, no new newtype
+    /// (unlike harness-api's `HarnessGitObjectIdV1`; see crate-layering note).
+    pub id: String,
+    pub summary: String,
+}
+
+impl HarnessRunGitCommitSummaryV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        validate_git_commit_id(&self.id)?;
+        validate_run_git_text(&self.summary, HARNESS_RUN_GIT_SUMMARY_MAX_BYTES, false)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunGitSummaryV1 {
+    pub is_repository: bool,
+    pub branch: Option<String>,
+    pub status: Vec<HarnessRunGitStatusEntryV1>,
+    pub recent_commits: Vec<HarnessRunGitCommitSummaryV1>,
+    pub truncated: bool,
+}
+
+impl HarnessRunGitSummaryV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        if self.status.len() > HARNESS_RUN_GIT_STATUS_ENTRIES_MAX
+            || self.recent_commits.len() > HARNESS_RUN_GIT_RECENT_COMMITS_MAX
+            || !self.is_repository
+                && (self.branch.is_some()
+                    || !self.status.is_empty()
+                    || !self.recent_commits.is_empty())
+        {
+            return Err(HarnessValidationError::InvalidGitSummary);
+        }
+        if let Some(branch) = &self.branch {
+            validate_run_git_text(branch, HARNESS_RUN_GIT_BRANCH_MAX_BYTES, true)?;
+        }
+        for status in &self.status {
+            status.validate()?;
+        }
+        if self.status.windows(2).any(|pair| pair[0].path >= pair[1].path) {
+            return Err(HarnessValidationError::InvalidGitSummary);
+        }
+        for commit in &self.recent_commits {
+            commit.validate()?;
+        }
+        if self.recent_commits.iter().enumerate().any(|(index, commit)| {
+            self.recent_commits[..index].iter().any(|existing| existing.id == commit.id)
+        }) {
+            return Err(HarnessValidationError::InvalidGitSummary);
+        }
+        Ok(())
+    }
+}
+
+/// Terminal outcome of one background git-facts capture attempt against a
+/// run's workspace. `Unavailable` folds every non-success cause (Node
+/// unreachable, route mismatch, deadline, rejection) into one permanent,
+/// non-retried terminal state — see the A3 design (§5.2/§9 risk 2).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessRunGitFactsOutcomeV1 {
+    Captured(HarnessRunGitSummaryV1),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunGitFactsV1 {
+    pub captured_at_unix_ms: u64,
+    pub outcome: HarnessRunGitFactsOutcomeV1,
+}
+
+impl HarnessRunGitFactsV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        if let HarnessRunGitFactsOutcomeV1::Captured(summary) = &self.outcome {
+            summary.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessRunV1 {
@@ -1833,6 +2002,8 @@ pub struct HarnessRunV1 {
     pub continuation_receipt: Option<HarnessReceiptRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_pack: Option<HarnessResolvedContextPackReceiptV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_facts: Option<HarnessRunGitFactsV1>,
     pub binding: Option<HarnessSessionBindingV1>,
     pub lifecycle: HarnessRunLifecycleV1,
     pub result_disposition: Option<HarnessResultDispositionV1>,
@@ -1880,6 +2051,12 @@ impl HarnessRunV1 {
                 || pack.lineage.source_provider != self.intent.provider_profile
             {
                 return Err(HarnessValidationError::InvalidContextPackReceipt);
+            }
+        }
+        if let Some(facts) = &self.git_facts {
+            facts.validate()?;
+            if self.binding.is_none() {
+                return Err(HarnessValidationError::MissingFieldForState { field: "git_facts" });
             }
         }
         if let Some(failure) = &self.failure { failure.validate()?; }
@@ -2110,6 +2287,8 @@ pub enum HarnessOperationKindV1 {
     RevokeGrant,
     Reconcile,
     RecordRunContextPack,
+    RecordRunGitFacts,
+    RecordTaskResultRef,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2235,7 +2414,8 @@ impl HarnessOperationV1 {
             HarnessOperationKindV1::CreateTask => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
             HarnessOperationKindV1::MutateTask | HarnessOperationKindV1::MutateExecutionSpec => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::CreateRun => self.task_id.is_some() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
-            HarnessOperationKindV1::BindRun | HarnessOperationKindV1::MutateRun | HarnessOperationKindV1::RecordRunContextPack => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
+            HarnessOperationKindV1::BindRun | HarnessOperationKindV1::MutateRun | HarnessOperationKindV1::RecordRunContextPack | HarnessOperationKindV1::RecordRunGitFacts => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
+            HarnessOperationKindV1::RecordTaskResultRef => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::CreateGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
             HarnessOperationKindV1::MutateGrant | HarnessOperationKindV1::RevokeGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::Reconcile => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_some() && self.expected_revision.is_some(),
@@ -2255,6 +2435,20 @@ fn validate_prefixed_hex_id(label: &'static str, value: &str, prefix: &str, hex_
 fn validate_lower_hex(label: &'static str, value: &str, expected_len: usize) -> Result<(), HarnessValidationError> {
     if value.len() != expected_len || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
         return Err(HarnessValidationError::InvalidOpaqueId { field: label });
+    }
+    Ok(())
+}
+
+fn validate_git_commit_id(value: &str) -> Result<(), HarnessValidationError> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err(HarnessValidationError::InvalidGitSummary);
+    }
+    Ok(())
+}
+
+fn validate_run_git_text(value: &str, maximum: usize, required: bool) -> Result<(), HarnessValidationError> {
+    if value.len() > maximum || required && value.is_empty() || value.chars().any(char::is_control) {
+        return Err(HarnessValidationError::InvalidGitSummary);
     }
     Ok(())
 }
@@ -2408,6 +2602,8 @@ pub enum HarnessValidationError {
     InvalidContextSourceCounts,
     #[error("continuation authority has invalid state fields or exact links")]
     InvalidContinuationLink,
+    #[error("harness run git summary is empty, unbounded, unsorted, or contains a control character")]
+    InvalidGitSummary,
 }
 
 #[cfg(test)]
@@ -2505,6 +2701,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -2815,6 +3012,259 @@ mod tests {
         let decoded: HarnessRunV1 = serde_json::from_value(legacy_wire).unwrap();
         assert_eq!(decoded.context_pack, None);
         assert_eq!(decoded, run);
+    }
+
+    #[test]
+    fn harness_run_git_facts_is_additive_and_absent_on_pre_a3_wire() {
+        let run = valid_run();
+        let mut legacy_wire = serde_json::to_value(&run).unwrap();
+        assert!(legacy_wire.as_object().unwrap().get("git_facts").is_none());
+        legacy_wire.as_object_mut().unwrap().remove("git_facts");
+        let decoded: HarnessRunV1 = serde_json::from_value(legacy_wire).unwrap();
+        assert_eq!(decoded.git_facts, None);
+        assert_eq!(decoded, run);
+    }
+
+    #[test]
+    fn harness_run_git_facts_requires_binding_but_not_managed_session() {
+        let managed_binding = HarnessSessionBindingV1 {
+            node_id: selector("node-a"),
+            node_incarnation: selector("incarnation-a"),
+            workspace_id: selector("workspace-a"),
+            session: HarnessSessionIdentityV1::Managed {
+                record_id: selector("record-a"),
+                active_session: None,
+            },
+        };
+        let facts = HarnessRunGitFactsV1 {
+            captured_at_unix_ms: 5,
+            outcome: HarnessRunGitFactsOutcomeV1::Captured(HarnessRunGitSummaryV1 {
+                is_repository: true,
+                branch: Some("main".to_owned()),
+                status: vec![],
+                recent_commits: vec![],
+                truncated: false,
+            }),
+        };
+
+        let mut run = valid_run();
+        run.lifecycle = HarnessRunLifecycleV1::Completed;
+        run.result_disposition = Some(HarnessResultDispositionV1::Succeeded);
+        run.binding = Some(managed_binding.clone());
+        run.git_facts = Some(facts);
+        run.validate().unwrap();
+
+        let mut missing_binding = run.clone();
+        missing_binding.binding = None;
+        assert_eq!(
+            missing_binding.validate(),
+            Err(HarnessValidationError::MissingFieldForState { field: "git_facts" }),
+        );
+
+        // Unlike context_pack, git_facts carries no lineage to cross-check,
+        // so any present binding — not just a Managed one — satisfies it.
+        let mut inline_bound = run.clone();
+        inline_bound.binding = Some(HarnessSessionBindingV1 {
+            session: HarnessSessionIdentityV1::Inline {
+                inline_ref: HarnessInlineRef::new(format!("hinline_{}", "a".repeat(24))).unwrap(),
+            },
+            ..managed_binding
+        });
+        inline_bound.validate().unwrap();
+    }
+
+    #[test]
+    fn harness_run_git_summary_validate_enforces_bounds_and_invariants() {
+        let empty = HarnessRunGitSummaryV1 {
+            is_repository: false,
+            branch: None,
+            status: vec![],
+            recent_commits: vec![],
+            truncated: false,
+        };
+        empty.validate().unwrap();
+
+        let mut not_repository_with_branch = empty.clone();
+        not_repository_with_branch.branch = Some("main".to_owned());
+        assert_eq!(
+            not_repository_with_branch.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let clean_entry = HarnessRunGitStatusEntryV1 {
+            index_status: HarnessRunGitStatusCodeV1::Unmodified,
+            worktree_status: HarnessRunGitStatusCodeV1::Modified,
+            path: "src/lib.rs".to_owned(),
+            previous_path: None,
+        };
+        let commit = HarnessRunGitCommitSummaryV1 {
+            id: "a".repeat(40),
+            summary: "initial commit".to_owned(),
+        };
+        let summary = HarnessRunGitSummaryV1 {
+            is_repository: true,
+            branch: Some("main".to_owned()),
+            status: vec![clean_entry.clone()],
+            recent_commits: vec![commit.clone()],
+            truncated: false,
+        };
+        summary.validate().unwrap();
+
+        let mut too_many_status = summary.clone();
+        too_many_status.status = (0..=HARNESS_RUN_GIT_STATUS_ENTRIES_MAX)
+            .map(|index| HarnessRunGitStatusEntryV1 {
+                index_status: HarnessRunGitStatusCodeV1::Unmodified,
+                worktree_status: HarnessRunGitStatusCodeV1::Modified,
+                path: format!("src/file-{index:05}.rs"),
+                previous_path: None,
+            })
+            .collect();
+        assert_eq!(
+            too_many_status.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let mut too_many_commits = summary.clone();
+        too_many_commits.recent_commits = (0..=HARNESS_RUN_GIT_RECENT_COMMITS_MAX)
+            .map(|index| HarnessRunGitCommitSummaryV1 {
+                id: format!("{index:040x}"),
+                summary: "commit".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            too_many_commits.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let mut unsorted = summary.clone();
+        unsorted.status = vec![
+            HarnessRunGitStatusEntryV1 { path: "b.rs".to_owned(), ..clean_entry.clone() },
+            HarnessRunGitStatusEntryV1 { path: "a.rs".to_owned(), ..clean_entry.clone() },
+        ];
+        assert_eq!(unsorted.validate(), Err(HarnessValidationError::InvalidGitSummary));
+
+        let mut duplicate_commit_ids = summary.clone();
+        duplicate_commit_ids.recent_commits = vec![commit.clone(), commit.clone()];
+        assert_eq!(
+            duplicate_commit_ids.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let mut bad_commit_id = summary.clone();
+        bad_commit_id.recent_commits = vec![HarnessRunGitCommitSummaryV1 {
+            id: "not-hex".to_owned(),
+            summary: "bad".to_owned(),
+        }];
+        assert_eq!(
+            bad_commit_id.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let mut rename_without_previous_path = summary.clone();
+        rename_without_previous_path.status = vec![HarnessRunGitStatusEntryV1 {
+            index_status: HarnessRunGitStatusCodeV1::Renamed,
+            worktree_status: HarnessRunGitStatusCodeV1::Unmodified,
+            path: "new.rs".to_owned(),
+            previous_path: None,
+        }];
+        assert_eq!(
+            rename_without_previous_path.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let mut previous_path_without_rename = summary.clone();
+        previous_path_without_rename.status = vec![HarnessRunGitStatusEntryV1 {
+            index_status: HarnessRunGitStatusCodeV1::Modified,
+            worktree_status: HarnessRunGitStatusCodeV1::Unmodified,
+            path: "new.rs".to_owned(),
+            previous_path: Some("old.rs".to_owned()),
+        }];
+        assert_eq!(
+            previous_path_without_rename.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let mut control_char_branch = summary.clone();
+        control_char_branch.branch = Some("main\u{0007}".to_owned());
+        assert_eq!(
+            control_char_branch.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let facts = HarnessRunGitFactsV1 {
+            captured_at_unix_ms: 10,
+            outcome: HarnessRunGitFactsOutcomeV1::Captured(summary.clone()),
+        };
+        facts.validate().unwrap();
+
+        let mut invalid_facts = facts.clone();
+        invalid_facts.outcome = HarnessRunGitFactsOutcomeV1::Captured(bad_commit_id);
+        assert_eq!(
+            invalid_facts.validate(),
+            Err(HarnessValidationError::InvalidGitSummary),
+        );
+
+        let unavailable = HarnessRunGitFactsV1 {
+            captured_at_unix_ms: 10,
+            outcome: HarnessRunGitFactsOutcomeV1::Unavailable,
+        };
+        unavailable.validate().unwrap();
+    }
+
+    #[test]
+    fn harness_result_ref_for_run_round_trips_and_rejects_malformed() {
+        let run = run_id('7');
+        let result_ref = HarnessResultRef::for_run(&run);
+        assert_eq!(result_ref.as_str(), format!("hresult_{}", "7".repeat(24)));
+        assert_eq!(result_ref.run_id(), Ok(run.clone()));
+
+        // A result reference must carry its own "hresult_" prefix — the
+        // run's own "hrun_" wire string is not interchangeable with its
+        // derived reference, even though the hex body is byte-identical.
+        assert!(HarnessResultRef::new(run.as_str().to_owned()).is_err());
+        // Malformed hex bodies are rejected the same way any opaque id is.
+        assert!(HarnessResultRef::new(format!("hresult_{}", "g".repeat(24))).is_err());
+        assert!(HarnessResultRef::new(format!("hresult_{}", "7".repeat(23))).is_err());
+    }
+
+    #[test]
+    fn harness_operation_kind_targets_accept_record_run_git_facts_and_record_task_result_ref() {
+        let git_facts_operation = HarnessOperationV1 {
+            operation_id: operation_id('8'),
+            revision: HarnessRevision::new(1).unwrap(),
+            actor: HarnessActorV1::ParentRun { run_id: run_id('7') },
+            kind: HarnessOperationKindV1::RecordRunGitFacts,
+            state: HarnessOperationStateV1::Prepared,
+            task_id: None,
+            run_id: Some(run_id('7')),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(HarnessRevision::new(1).unwrap()),
+            request_digest: HarnessRequestDigest::new("a".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!("hidem_{}", "b".repeat(24))).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 1_000,
+            updated_at_unix_ms: 1_000,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: None,
+        };
+        git_facts_operation.validate().unwrap();
+
+        let mut misdirected = git_facts_operation.clone();
+        misdirected.task_id = Some(task_id('1'));
+        assert_eq!(misdirected.validate(), Err(HarnessValidationError::InvalidOperationTarget));
+
+        let mut result_ref_operation = git_facts_operation.clone();
+        result_ref_operation.kind = HarnessOperationKindV1::RecordTaskResultRef;
+        result_ref_operation.task_id = Some(task_id('1'));
+        result_ref_operation.run_id = None;
+        result_ref_operation.validate().unwrap();
+
+        let mut missing_task = result_ref_operation.clone();
+        missing_task.task_id = None;
+        assert_eq!(missing_task.validate(), Err(HarnessValidationError::InvalidOperationTarget));
     }
 
     #[test]

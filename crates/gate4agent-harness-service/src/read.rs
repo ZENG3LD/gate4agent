@@ -588,6 +588,8 @@ fn redact_run(
         binding,
         result_disposition: run.result_disposition,
         failure_category: run.failure.as_ref().map(|failure| failure.category),
+        context_pack: run.context_pack.clone(),
+        git_facts: run.git_facts.clone(),
         references_redacted,
         created_at_unix_ms: run.created_at_unix_ms,
         updated_at_unix_ms: run.updated_at_unix_ms,

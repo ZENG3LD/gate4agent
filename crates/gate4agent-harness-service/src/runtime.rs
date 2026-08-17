@@ -6,7 +6,7 @@ use crate::{
         HarnessC2Error, HarnessC2EventReceiver,
         HarnessObservationResync, PendingNativeHistoryRequest, PendingRunRead,
         PendingRunContextSourceObservation, PreparedRunContextSourceObservation,
-        PreparedRunRead, RunContextSourceObservationCompletion,
+        PreparedRunRead, PreparedRunReadKind, RunContextSourceObservationCompletion,
         RunContextSourceProjection, RunReadCompletion,
         ManagedWorktreeSpawnDispatchOutcome, PendingManagedWorktreeSpawnDispatch,
         SpawnDispatchOutcome, SpawnProfileRevisionProof,
@@ -77,7 +77,9 @@ use gate4agent_harness_protocol::{
     HarnessIdempotencyRef,
     HarnessFailureV1, HarnessOperationId, HarnessOperationKindV1,
     HarnessOperationStateV1, HarnessOperationV1,
-    HarnessOutcomeUnknownReasonV1, HarnessResultDispositionV1, HarnessRevision,
+    HarnessOutcomeUnknownReasonV1, HarnessResultDispositionV1, HarnessResultRef, HarnessRevision,
+    HarnessRunGitFactsOutcomeV1, HarnessRunGitFactsV1, HarnessRunGitCommitSummaryV1,
+    HarnessRunGitStatusCodeV1, HarnessRunGitStatusEntryV1, HarnessRunGitSummaryV1,
     HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskStateV1,
     HarnessRuntimeIdentityV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
     HarnessContextSourceSelectionV1, HarnessContextSourceAvailabilityV1, HarnessRequestDigest,
@@ -126,6 +128,15 @@ const HARNESS_MCP_GENERAL_NETWORK_WORKERS_MAX: usize =
 const NATIVE_HISTORY_WORKERS_MAX: usize = 8;
 const RUN_READ_WORKERS_MAX: usize = 8;
 const RUN_CONTEXT_SOURCE_WORKERS_MAX: usize = 8;
+// Deliberately separate from `RUN_READ_WORKERS_MAX`, not shared: background
+// git-facts capture must never be able to starve a live operator's own
+// `InspectRunWorkspace` click by soaking up the shared pool during a burst
+// of run completions (A3 design §3.3).
+const RUN_GIT_FACTS_WORKERS_MAX: usize = 2;
+// Bounded latency on a background fact, not a correctness requirement — see
+// the A3 design §3.4/§9 risk 1 for why this is periodic rather than
+// reactive.
+const RUN_GIT_FACTS_SWEEP_PERIOD: Duration = Duration::from_secs(5);
 const RUN_CONTEXT_SOURCE_TOTAL_BUDGET: Duration = Duration::from_secs(11);
 const RUN_CONTEXT_SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const OPERATOR_CREDENTIAL_DIGEST_DOMAIN: &[u8] = b"gate4agent-harness-operator-credential-digest-v1";
@@ -300,6 +311,10 @@ enum HostCommand {
         completion: RunReadCompletion,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
     },
+    RunGitFactsCaptureFinished {
+        run_id: gate4agent_harness_protocol::HarnessRunId,
+        completion: RunReadCompletion,
+    },
     RunContextSourceFinished {
         completion: RunContextSourceObservationCompletion,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
@@ -465,6 +480,11 @@ struct RunReadWorkerRegistry {
 }
 
 #[derive(Default)]
+struct RunGitFactsWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
 struct RunContextSourceWorkerRegistry {
     in_flight: usize,
 }
@@ -491,6 +511,22 @@ impl NativeHistoryWorkerRegistry {
 impl RunReadWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= RUN_READ_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl RunGitFactsWorkerRegistry {
+    fn has_capacity(&self) -> bool {
+        self.in_flight < RUN_GIT_FACTS_WORKERS_MAX
+    }
+
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= RUN_GIT_FACTS_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -740,6 +776,44 @@ fn specialized_spawn_spec(
     Ok(spec)
 }
 
+/// Reactive, cheap, in-memory-only reconciliation of every task's
+/// `result_refs` index against its own already-durable runs — a run's
+/// `result_disposition` is committed by the caller before this runs, so a
+/// redundant scan costs nothing correctness-relevant
+/// (`record_task_result_ref`'s own (task_id, ref) idempotency makes a
+/// repeat insertion attempt a free `Replayed` no-op, same posture as
+/// `apply_context_pack_receipt_for_record`). Safe to call unconditionally
+/// after any commit that could have newly set a run's `result_disposition`
+/// — wired at the three sites the A3 design §5.1 names. Also the whole
+/// reason restart-survival is free (§5.3): this is a pure function of
+/// already-durable state (`run.result_disposition`, reloaded from
+/// `harness_runs.payload`), so a call after any future commit re-derives
+/// the same fixed point regardless of what the in-memory host state looked
+/// like before the restart.
+fn reconcile_task_result_refs(
+    harness: &mut HarnessService,
+    now_unix_ms: u64,
+) -> Result<(), HarnessRuntimeError> {
+    let mut matches = Vec::new();
+    for task in harness.engine().tasks() {
+        for run_id in &task.run_ids {
+            let Some(run) = harness.engine().run(run_id) else { continue; };
+            if run.result_disposition.is_none() {
+                continue;
+            }
+            let result_ref = HarnessResultRef::for_run(&run.run_id);
+            if task.result_refs.binary_search(&result_ref).is_err() {
+                matches.push((task.task_id.clone(), run.run_id.clone()));
+            }
+        }
+    }
+    for (task_id, run_id) in matches {
+        harness.record_task_result_ref(&task_id, &run_id, now_unix_ms)
+            .map_err(HarnessRuntimeError::Harness)?;
+    }
+    Ok(())
+}
+
 fn apply_spawn_result(
     harness: &mut HarnessService,
     launch_catalog: &HarnessLaunchCatalog,
@@ -967,14 +1041,16 @@ fn apply_spawn_result(
             next_task.revision = next_runtime_revision(task.revision)?;
             next_task.state = HarnessTaskStateV1::Failed;
             next_task.updated_at_unix_ms = now_unix_ms;
-            harness.commit_scheduled_pre_dispatch_outcome(
+            let reservation = harness.commit_scheduled_pre_dispatch_outcome(
                 run.revision,
                 next_run,
                 operation.revision,
                 next_operation,
                 task.revision,
                 next_task,
-            ).map_err(HarnessRuntimeError::Harness)
+            ).map_err(HarnessRuntimeError::Harness)?;
+            reconcile_task_result_refs(harness, now_unix_ms)?;
+            Ok(reservation)
         }
         CoordinatorSpawnResult::OutcomeUnknown => {
             next_run.lifecycle = HarnessRunLifecycleV1::OutcomeUnknown;
@@ -1053,14 +1129,16 @@ fn apply_pre_dispatch_result(
             next_task.state = HarnessTaskStateV1::Waiting;
         }
     }
-    harness.commit_scheduled_pre_dispatch_outcome(
+    let reservation = harness.commit_scheduled_pre_dispatch_outcome(
         run.revision,
         next_run,
         operation.revision,
         next_operation,
         task.revision,
         next_task,
-    ).map_err(HarnessRuntimeError::Harness)
+    ).map_err(HarnessRuntimeError::Harness)?;
+    reconcile_task_result_refs(harness, now_unix_ms)?;
+    Ok(reservation)
 }
 
 fn delivery_pre_dispatch_result(error: &HarnessC2Error) -> CoordinatorPreDispatchResult {
@@ -1243,7 +1321,8 @@ fn apply_exact_control_lifecycle(
         kind,
         projection,
         now_unix_ms,
-    )
+    )?;
+    reconcile_task_result_refs(harness, now_unix_ms)
 }
 
 fn freeze_bound_route_waiting(
@@ -1319,6 +1398,23 @@ fn start_run_read_worker(
     tokio::spawn(async move {
         let completion = pending.finish().await;
         let _ = commands.send(HostCommand::RunReadFinished { completion, reply }).await;
+    });
+}
+
+/// Background twin of `start_run_read_worker`: no live client is waiting,
+/// so there is no `reply` sender — the completion travels back into the
+/// host loop as a plain `HostCommand` for `finish_run_git_facts_capture` to
+/// resolve.
+fn start_run_git_facts_capture_worker(
+    pending: PendingRunRead,
+    run_id: gate4agent_harness_protocol::HarnessRunId,
+    commands: mpsc::Sender<HostCommand>,
+) {
+    tokio::spawn(async move {
+        let completion = pending.finish().await;
+        let _ = commands.send(
+            HostCommand::RunGitFactsCaptureFinished { run_id, completion },
+        ).await;
     });
 }
 
@@ -2266,6 +2362,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut harness_mcp_workers = HarnessMcpWorkerRegistry::default();
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
+        let mut run_git_facts_workers = RunGitFactsWorkerRegistry::default();
         let mut run_context_source_workers = RunContextSourceWorkerRegistry::default();
         let mut pending_run_context_sources = Vec::new();
         let (harness_mcp_rejects, harness_mcp_reject_rx) = mpsc::channel(
@@ -2317,6 +2414,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
             OBSERVATION_RECOVERY_RETRY,
         );
         recovery_retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut run_git_facts_sweep = interval_at(
+            Instant::now() + RUN_GIT_FACTS_SWEEP_PERIOD,
+            RUN_GIT_FACTS_SWEEP_PERIOD,
+        );
+        run_git_facts_sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut run_context_source_poll = interval_at(
             Instant::now() + RUN_CONTEXT_SOURCE_POLL_INTERVAL,
             RUN_CONTEXT_SOURCE_POLL_INTERVAL,
@@ -3258,6 +3360,15 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             };
                             let _ = reply.send(reply_value);
                         }
+                        Some(HostCommand::RunGitFactsCaptureFinished { run_id, completion }) => {
+                            run_git_facts_workers.finish();
+                            finish_run_git_facts_capture(
+                                &mut harness,
+                                run_id,
+                                completion,
+                                unix_time_ms(),
+                            );
+                        }
                         Some(HostCommand::RunContextSourceFinished { completion, reply }) => {
                             run_context_source_workers.finish();
                             let (prepared, result) = completion.into_parts();
@@ -3492,6 +3603,14 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             )?;
                         }
                     }
+                }
+                _ = run_git_facts_sweep.tick(), if run_git_facts_workers.has_capacity() => {
+                    reconcile_run_git_facts_capture(
+                        &harness,
+                        &adapter,
+                        &mut run_git_facts_workers,
+                        &commands,
+                    );
                 }
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(|_| HarnessRuntimeError::AcceptFailed)?;
@@ -5245,6 +5364,8 @@ fn redact_operator_run(
         binding,
         result_disposition: run.result_disposition,
         failure_category: run.failure.as_ref().map(|failure| failure.category),
+        context_pack: run.context_pack.clone(),
+        git_facts: run.git_facts.clone(),
         references_redacted: false,
         created_at_unix_ms: run.created_at_unix_ms,
         updated_at_unix_ms: run.updated_at_unix_ms,
@@ -6201,6 +6322,171 @@ fn apply_live_context_pack_receipt(
     apply_context_pack_receipt_for_record(harness, route, record, received_at_ms)
 }
 
+/// Background, best-effort capture of one run's bounded git workspace
+/// summary, reusing the exact `InspectRunWorkspace` C2 round trip the live
+/// operator Git tab already uses (`PreparedRunRead::for_run`,
+/// `HarnessC2Adapter::start_prepared_run_read`) — no second inspection
+/// mechanism. Driven by `run_git_facts_sweep`'s periodic tick
+/// (`RUN_GIT_FACTS_SWEEP_PERIOD`), not a reactive hook on any lifecycle
+/// commit — see the A3 design §3.4 for why. Single-attempt by construction:
+/// `git_facts` can only transition `None -> Some(_)` once
+/// (`prepare_run_git_facts_record`'s validator, harness-engine), so a run
+/// this sweep already attempted (successfully or not) is filtered out here
+/// by `run.git_facts.is_some()` and never re-enqueued — no retry storm
+/// against a permanently-unavailable workspace (A3 design §11 risk 2).
+fn reconcile_run_git_facts_capture(
+    harness: &HarnessService,
+    adapter: &HarnessC2Adapter,
+    workers: &mut RunGitFactsWorkerRegistry,
+    commands: &mpsc::Sender<HostCommand>,
+) {
+    for run in harness.engine().runs() {
+        if run.git_facts.is_some() || run.binding.is_none()
+            || !matches!(run.lifecycle, HarnessRunLifecycleV1::Completed
+                | HarnessRunLifecycleV1::Failed | HarnessRunLifecycleV1::Cancelled)
+        {
+            continue;
+        }
+        if !workers.try_start() {
+            return;
+        }
+        let Ok(prepared) = PreparedRunRead::for_run(run, PreparedRunReadKind::InspectWorkspace)
+        else {
+            workers.finish();
+            continue;
+        };
+        match adapter.start_prepared_run_read(prepared) {
+            Ok(pending) => start_run_git_facts_capture_worker(
+                pending,
+                run.run_id.clone(),
+                commands.clone(),
+            ),
+            Err(_) => workers.finish(), // route/queue-full — try again next tick
+        }
+    }
+}
+
+/// Resolves one finished background git-facts capture attempt
+/// (`HostCommand::RunGitFactsCaptureFinished`). Bails silently — no error
+/// surfaces anywhere, this is purely a background fact — if the run is
+/// gone, its binding no longer matches the frozen `PreparedRunRead` origin
+/// (`validate_run_read_completion_origin`, reused as-is), or `git_facts`
+/// already landed from a concurrent pass (harmless, matches
+/// `apply_context_pack_receipt_for_record`'s own idempotency posture).
+/// Otherwise records `Captured` on a well-formed workspace inspection or
+/// `Unavailable` on any transport/route/deadline/rejection failure or
+/// unexpected response shape, and swallows any engine-level rejection from
+/// `record_run_git_facts` itself — a stale-revision race is a legitimate,
+/// harmless outcome for a background, single-attempt fact (A3 design §11
+/// risk 2: this attempt is never retried, by design).
+fn finish_run_git_facts_capture(
+    harness: &mut HarnessService,
+    run_id: gate4agent_harness_protocol::HarnessRunId,
+    completion: RunReadCompletion,
+    now_unix_ms: u64,
+) {
+    let (prepared, result) = completion.into_parts();
+    if validate_run_read_completion_origin(harness.engine().run(&run_id), &prepared).is_err() {
+        return;
+    }
+    let Some(current) = harness.engine().run(&run_id) else { return; };
+    if current.git_facts.is_some() {
+        return;
+    }
+    let Some(binding) = current.binding.as_ref() else { return; };
+    let Ok(node_id) = NodeId::new(binding.node_id.as_str()) else { return; };
+    let Ok(incarnation_id) = binding.node_incarnation.as_str().parse::<NodeIncarnationId>()
+    else {
+        return;
+    };
+    let outcome = match result {
+        Ok(HarnessOperatorResponseV1::RunWorkspaceInspected(inspection)) => {
+            HarnessRunGitFactsOutcomeV1::Captured(
+                run_git_summary_from_inspection(&inspection.git),
+            )
+        }
+        Ok(_) | Err(_) => HarnessRunGitFactsOutcomeV1::Unavailable,
+    };
+    let facts = HarnessRunGitFactsV1 { captured_at_unix_ms: now_unix_ms, outcome };
+    let _ = harness.record_run_git_facts(&run_id, facts, now_unix_ms, &node_id, incarnation_id);
+}
+
+/// Purely-mechanical, infallible field-for-field projection from the
+/// operator-facing (`gate4agent-harness-api`) git-summary hierarchy to its
+/// structurally-identical `gate4agent-harness-protocol` mirror (A3 design
+/// §1.1/§3.2). Infallible because both hierarchies share numerically
+/// identical bounds (status entries/recent commits/path/branch/summary byte
+/// caps) and `inspection.git` already passed
+/// `HarnessOperatorResponseV1::validate()` (`correlate_run_read_response`)
+/// before reaching here — a straight copy can never violate the
+/// protocol-side `HarnessRunGitSummaryV1::validate()`.
+fn run_git_summary_from_inspection(
+    git: &gate4agent_harness_api::HarnessGitSummaryV1,
+) -> HarnessRunGitSummaryV1 {
+    HarnessRunGitSummaryV1 {
+        is_repository: git.is_repository,
+        branch: git.branch.clone(),
+        status: git.status.iter().map(run_git_status_entry_from_api).collect(),
+        recent_commits: git.recent_commits.iter()
+            .map(run_git_commit_summary_from_api)
+            .collect(),
+        truncated: git.truncated,
+    }
+}
+
+fn run_git_status_entry_from_api(
+    entry: &gate4agent_harness_api::HarnessGitStatusEntryV1,
+) -> HarnessRunGitStatusEntryV1 {
+    HarnessRunGitStatusEntryV1 {
+        index_status: run_git_status_code_from_api(entry.index_status),
+        worktree_status: run_git_status_code_from_api(entry.worktree_status),
+        path: entry.path.as_str().to_owned(),
+        previous_path: entry.previous_path.as_ref().map(|path| path.as_str().to_owned()),
+    }
+}
+
+fn run_git_status_code_from_api(
+    code: gate4agent_harness_api::HarnessGitStatusCodeV1,
+) -> HarnessRunGitStatusCodeV1 {
+    match code {
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Unmodified => {
+            HarnessRunGitStatusCodeV1::Unmodified
+        }
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Added => HarnessRunGitStatusCodeV1::Added,
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Modified => {
+            HarnessRunGitStatusCodeV1::Modified
+        }
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Deleted => {
+            HarnessRunGitStatusCodeV1::Deleted
+        }
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Renamed => {
+            HarnessRunGitStatusCodeV1::Renamed
+        }
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Copied => HarnessRunGitStatusCodeV1::Copied,
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Unmerged => {
+            HarnessRunGitStatusCodeV1::Unmerged
+        }
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Untracked => {
+            HarnessRunGitStatusCodeV1::Untracked
+        }
+        gate4agent_harness_api::HarnessGitStatusCodeV1::Ignored => {
+            HarnessRunGitStatusCodeV1::Ignored
+        }
+        gate4agent_harness_api::HarnessGitStatusCodeV1::TypeChanged => {
+            HarnessRunGitStatusCodeV1::TypeChanged
+        }
+    }
+}
+
+fn run_git_commit_summary_from_api(
+    commit: &gate4agent_harness_api::HarnessGitCommitSummaryV1,
+) -> HarnessRunGitCommitSummaryV1 {
+    HarnessRunGitCommitSummaryV1 {
+        id: commit.id.as_str().to_owned(),
+        summary: commit.summary.clone(),
+    }
+}
+
 fn apply_snapshot_lifecycle(
     harness: &mut HarnessService,
     route: &NodeRoute,
@@ -6234,7 +6520,7 @@ fn apply_snapshot_lifecycle(
             received_at_ms,
         )?;
     }
-    Ok(())
+    reconcile_task_result_refs(harness, received_at_ms)
 }
 
 fn replay_contains_exact_lifecycle(
@@ -7028,6 +7314,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: Some(HarnessSessionBindingV1 {
                 node_id: selector("node-a"),
                 node_incarnation: selector(&incarnation.to_string()),
@@ -8282,6 +8569,41 @@ mod tests {
                 HarnessTaskStateV1::Waiting,
             );
         }
+    }
+
+    #[test]
+    fn snapshot_recovery_terminal_failure_reconciles_task_result_refs() {
+        // The 4th `reconcile_task_result_refs` insertion (A3 design §5.1):
+        // `apply_snapshot_lifecycle` is the resync/recovery-catchup path and
+        // can newly set `result_disposition` on a run that skips straight to
+        // `Failed` via a reconnect snapshot, without ever passing through
+        // `apply_exact_control_lifecycle`'s own reactive reconcile call.
+        let (mut harness, task_id, run_id, route) = running_harness_fixture();
+        freeze_bound_route_waiting(&mut harness, &route, 9, 10).unwrap();
+        assert_eq!(
+            harness.engine().run(&run_id).unwrap().lifecycle,
+            HarnessRunLifecycleV1::Waiting,
+        );
+        assert!(harness.engine().task(&task_id).unwrap().result_refs.is_empty());
+        let snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::Live,
+            Some(bound_session_address()),
+            C2SessionStatus::Failed,
+        );
+        apply_snapshot_lifecycle(&mut harness, &route, 9, &snapshot, &[], 11).unwrap();
+        assert_eq!(
+            harness.engine().run(&run_id).unwrap().lifecycle,
+            HarnessRunLifecycleV1::Failed,
+        );
+        assert_eq!(
+            harness.engine().run(&run_id).unwrap().result_disposition,
+            Some(HarnessResultDispositionV1::Failed),
+        );
+        assert_eq!(
+            harness.engine().task(&task_id).unwrap().result_refs,
+            vec![HarnessResultRef::for_run(&run_id)],
+        );
     }
 
     #[test]

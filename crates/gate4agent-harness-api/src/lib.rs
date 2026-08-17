@@ -3125,6 +3125,16 @@ pub struct SessionContextV1 {
     pub grant_id: SessionGrantId,
     pub grant_revision: HarnessRevision,
     pub actor_run: CallerRunV1,
+    /// The calling run's own task, redacted the same way as `TaskGet` --
+    /// present only when the grant's task scope makes it visible (mirrors
+    /// `actor_run.task_id`).
+    pub task: Option<RedactedTaskV1>,
+    /// Every OTHER run recorded against `task` ("what previous sessions did
+    /// on it"), redacted the same way as `RunGet`. Gated solely by `task`
+    /// being visible -- independent of the grant's `runs` read scope, which
+    /// governs the general run-browsing tools instead. Always empty when
+    /// `task` is `None`; never includes runs of another task.
+    pub sibling_runs: Vec<RedactedRunV1>,
     pub read_permissions: HarnessReadPermissionsV1,
     pub monitoring_visibility: HarnessMonitoringVisibilityV1,
     pub maximum_child_count: u16,
@@ -3140,6 +3150,30 @@ impl SessionContextV1 {
         self.grant_id.validate().map_err(HarnessReadApiError::Protocol)?;
         self.grant_revision.validate().map_err(HarnessReadApiError::Protocol)?;
         self.actor_run.validate()?;
+        match &self.task {
+            Some(task) => {
+                task.validate()?;
+                if self.actor_run.task_id.as_ref() != Some(&task.task_id) {
+                    return Err(HarnessReadApiError::InvalidContextTask);
+                }
+            }
+            None if !self.sibling_runs.is_empty() => {
+                return Err(HarnessReadApiError::InvalidContextTask);
+            }
+            None => {}
+        }
+        if self.sibling_runs.len() > HARNESS_LINKS_MAX
+            || self.sibling_runs.windows(2).any(|pair| pair[0].run_id >= pair[1].run_id)
+            || self.sibling_runs.iter().any(|run| {
+                run.run_id == self.actor_run.run_id
+                    || run.task_id.as_ref() != self.actor_run.task_id.as_ref()
+            })
+        {
+            return Err(HarnessReadApiError::InvalidContextTask);
+        }
+        for run in &self.sibling_runs {
+            run.validate()?;
+        }
         self.read_permissions.validate().map_err(HarnessReadApiError::Protocol)?;
         if self.maximum_child_count > HARNESS_CHILD_COUNT_MAX
             || self.maximum_child_depth > HARNESS_CHILD_DEPTH_MAX
@@ -3816,6 +3850,8 @@ pub enum HarnessReadApiError {
     InvalidRunState,
     #[error("harness redacted operation state is invalid")]
     InvalidOperationState,
+    #[error("harness context task or sibling runs are inconsistent with the actor run")]
+    InvalidContextTask,
     #[error("harness read text field is invalid: {0}")]
     InvalidText(&'static str),
     #[error("harness protocol value is invalid: {0}")]

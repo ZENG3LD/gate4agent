@@ -636,8 +636,10 @@ pub enum HarnessMcpStartupError {
 mod tests {
     use super::*;
     use gate4agent_harness_client::{
-        CallerRunV1, HarnessMonitoringVisibilityV1, HarnessReadPermissionsV1,
-        HarnessRevision, HarnessEntityReadScopeV1,
+        CallerRunV1, HarnessExecutionModeV1, HarnessMonitoringVisibilityV1,
+        HarnessReadPermissionsV1, HarnessResultDispositionV1, HarnessRevision,
+        HarnessEntityReadScopeV1, RedactedBindingStateV1, RedactedRunIntentV1,
+        RedactedRunV1, RedactedTaskV1, RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
     };
     use std::cell::{Cell, RefCell};
 
@@ -646,10 +648,60 @@ mod tests {
         calls: Cell<u32>,
         call_error: Cell<Option<HarnessMcpBackendError>>,
         tasks_enabled: Cell<bool>,
+        own_task_present: Cell<bool>,
+    }
+
+    /// The calling run's own task, returned only when `own_task_present` is set.
+    fn sample_redacted_task() -> RedactedTaskV1 {
+        RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_000000000000000000000001").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "fixture task".to_owned(),
+            body: "fixture body".to_owned(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        }
+    }
+
+    /// A prior run of `sample_redacted_task`, exercising the `sibling_runs`
+    /// pass-through end to end over the MCP wire.
+    fn sample_sibling_run() -> RedactedRunV1 {
+        RedactedRunV1 {
+            run_id: HarnessRunId::new("hrun_000000000000000000000002").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: Some(HarnessTaskId::new("htask_000000000000000000000001").unwrap()),
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: HarnessRunLifecycleV1::Completed,
+            binding: RedactedBindingStateV1::ManagedDormant,
+            result_disposition: Some(HarnessResultDispositionV1::Succeeded),
+            failure_category: None,
+            context_pack: None,
+            git_facts: None,
+            references_redacted: false,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        }
     }
 
     impl FixtureBackend {
         fn context(&self) -> SessionContextV1 {
+            let task = self.own_task_present.get().then(sample_redacted_task);
+            let sibling_runs = if task.is_some() { vec![sample_sibling_run()] } else { Vec::new() };
             SessionContextV1 {
                 grant_id: gate4agent_harness_client::SessionGrantId::new(
                     "hgrant_000000000000000000000001",
@@ -658,11 +710,13 @@ mod tests {
                 grant_revision: HarnessRevision::new(1).unwrap(),
                 actor_run: CallerRunV1 {
                     run_id: HarnessRunId::new("hrun_000000000000000000000001").unwrap(),
-                    task_id: None,
+                    task_id: task.as_ref().map(|task| task.task_id.clone()),
                     parent_run_id: None,
                     lifecycle: HarnessRunLifecycleV1::Running,
                     references_redacted: true,
                 },
+                task,
+                sibling_runs,
                 read_permissions: HarnessReadPermissionsV1 {
                     tasks: if self.tasks_enabled.get() {
                         HarnessEntityReadScopeV1::SelfOnly
@@ -708,6 +762,7 @@ mod tests {
             calls: Cell::new(0),
             call_error: Cell::new(None),
             tasks_enabled: Cell::new(true),
+            own_task_present: Cell::new(false),
         }
     }
 
@@ -908,5 +963,42 @@ mod tests {
         assert_eq!(rejected["error"]["code"], -32602);
         assert_eq!(server.backend.calls.get(), 1);
         assert!(server.state == McpState::Ready);
+    }
+
+    #[test]
+    fn context_get_result_carries_own_task_and_sibling_runs_over_the_wire() {
+        let mut server = HarnessMcpServer::new(fixture());
+        initialize(&mut server);
+        server.backend.own_task_present.set(true);
+
+        let called = request(&mut server, json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"g4a_context_get","arguments":{}}
+        }));
+        assert_eq!(called["result"]["isError"], false);
+        let text = called["result"]["content"][0]["text"].as_str().unwrap();
+        let response: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["kind"], "context");
+        let context = &response["value"];
+        assert_eq!(context["actor_run"]["task_id"], "htask_000000000000000000000001");
+        assert_eq!(context["task"]["task_id"], "htask_000000000000000000000001");
+        assert_eq!(context["task"]["title"], "fixture task");
+        assert_eq!(context["task"]["body"], "fixture body");
+        let siblings = context["sibling_runs"].as_array().unwrap();
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0]["run_id"], "hrun_000000000000000000000002");
+        assert_eq!(siblings[0]["lifecycle"], "completed");
+        assert_eq!(siblings[0]["result_disposition"], "succeeded");
+
+        // Without an own task, both fields stay empty -- no leakage by default.
+        server.backend.own_task_present.set(false);
+        let called = request(&mut server, json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"g4a_context_get","arguments":{}}
+        }));
+        let text = called["result"]["content"][0]["text"].as_str().unwrap();
+        let response: Value = serde_json::from_str(text).unwrap();
+        assert!(response["value"]["task"].is_null());
+        assert_eq!(response["value"]["sibling_runs"], json!([]));
     }
 }

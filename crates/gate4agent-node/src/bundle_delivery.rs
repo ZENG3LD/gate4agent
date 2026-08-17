@@ -1181,7 +1181,8 @@ mod tests {
     use super::*;
     use crate::bundle_catalog::{BundleCatalog, BundleCatalogError};
     use crate::bundle_provider::{
-        bundle_launch_arguments, validate_bundle_binding, BundleProviderLayout,
+        bundle_launch_arguments, validate_bundle_binding, BundleProviderError,
+        BundleProviderLayout,
     };
     use crate::protocol::{
         DeliveryBlobReceiptV1, DeliveryComponentKindV2, DeliveryComponentV2,
@@ -1194,6 +1195,7 @@ mod tests {
         NodeSessionPathBinding, NodeSessionPathClass, SessionEnvironmentMaterializer,
     };
     use gate4agent_types::{AgentId, AgentInstanceId, SessionGeneration, TransportKind};
+    use std::ffi::OsString;
     use std::sync::Arc;
     use ring::digest::{Context, SHA256};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1841,6 +1843,109 @@ mod tests {
             .unwrap();
         codex.mark_cleanup_required(22).unwrap();
         materializer.cleanup(&codex).unwrap();
+    }
+
+    #[test]
+    fn delivery_mcp_declaration_materializes_at_claude_plugin_root_and_fails_closed_elsewhere() {
+        let root = TestRoot::new("mcp-declaration");
+        let mcp_bytes =
+            br#"{"mcpServers":{"review":{"command":"review-mcp-server"}}}"#.to_vec();
+        let (manifest, blobs) = manifest_with(
+            "review-tools-mcp",
+            "r1",
+            vec![
+                (
+                    DeliveryComponentKindV2::PluginManifest,
+                    DeliveryScopeV2::Session,
+                    ".claude-plugin/plugin.json",
+                    br#"{"name":"review-tools","description":"review tools","version":"1.0.0"}"#
+                        .to_vec(),
+                ),
+                (
+                    DeliveryComponentKindV2::PluginManifest,
+                    DeliveryScopeV2::Session,
+                    "plugin.json",
+                    br#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"review-tools"}"#
+                        .to_vec(),
+                ),
+                (
+                    DeliveryComponentKindV2::Skill,
+                    DeliveryScopeV2::Session,
+                    "skills/review/SKILL.md",
+                    b"---\nname: review\ndescription: review changes\n---\nReview.\n".to_vec(),
+                ),
+                (
+                    DeliveryComponentKindV2::McpDeclaration,
+                    DeliveryScopeV2::Session,
+                    ".mcp.json",
+                    mcp_bytes.clone(),
+                ),
+            ],
+        );
+        let bundle = NodeBundle::from_delivery(manifest, &blobs).unwrap();
+
+        // Kimi's --skills-dir and Codex's isolated CODEX_HOME profile expose
+        // no grounded MCP-consumption contract reachable through Gate4Agent's
+        // existing bundle wiring: fail closed at binding time rather than
+        // silently staging the declaration as an inert file.
+        assert_eq!(
+            validate_bundle_binding(&AgentId::new("kimi").unwrap(), SessionMode::Pty, &bundle),
+            Err(BundleProviderError::McpDeclarationUnsupported),
+        );
+        assert_eq!(
+            validate_bundle_binding(&AgentId::new("codex").unwrap(), SessionMode::Pty, &bundle),
+            Err(BundleProviderError::McpDeclarationUnsupported),
+        );
+
+        // Claude is grounded: the plugin root's .mcp.json materializes at the
+        // exact directory the already-wired --plugin-dir argument points at.
+        let layout = validate_bundle_binding(
+            &AgentId::new("claude").unwrap(),
+            SessionMode::Pty,
+            &bundle,
+        )
+        .unwrap();
+        assert_eq!(layout, BundleProviderLayout::Claude);
+
+        let materializer = SessionEnvironmentMaterializer::new(
+            root.0.clone(),
+            Arc::new(NoSecrets),
+        )
+        .unwrap();
+        let profile = NodeSessionMaterializationProfile::from_bundle(&bundle, layout).unwrap();
+        let mut ownership = materializer
+            .begin(
+                MaterializationId::new("delivery-claude-mcp").unwrap(),
+                None,
+                Some(bundle.receipt()),
+                None,
+                materialization_owner(81),
+                None,
+                &profile,
+                10,
+            )
+            .unwrap();
+        materializer.materialize(&mut ownership, &profile, 11).unwrap();
+
+        let arguments =
+            bundle_launch_arguments(layout, ownership.bundle_root(), ownership.provider_home())
+                .unwrap();
+        assert_eq!(
+            arguments,
+            vec![
+                OsString::from("--plugin-dir"),
+                ownership.bundle_root().as_os_str().to_owned(),
+            ],
+        );
+
+        let materialized_mcp_path = ownership.bundle_root().join(".mcp.json");
+        assert!(materialized_mcp_path.is_file());
+        assert_eq!(fs::read(&materialized_mcp_path).unwrap(), mcp_bytes);
+        assert!(ownership.bundle_root().join("skills/review/SKILL.md").is_file());
+
+        materializer.revalidate_bundle(&ownership, &bundle, layout).unwrap();
+        ownership.mark_cleanup_required(12).unwrap();
+        materializer.cleanup(&ownership).unwrap();
     }
 
     #[test]

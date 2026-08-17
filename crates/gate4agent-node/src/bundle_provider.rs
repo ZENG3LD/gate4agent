@@ -1,11 +1,22 @@
 use crate::bundle_catalog::NodeBundle;
-use crate::protocol::{DeliveryComponentKindV2, DeliveryScopeV2, SessionMode};
+use crate::protocol::{
+    DeliveryComponentKindV2, DeliveryComponentV2, DeliveryScopeV2, SessionMode,
+};
 use gate4agent_types::AgentId;
 use std::ffi::OsString;
 use std::path::Path;
 use thiserror::Error;
 
 const CLAUDE_PLUGIN_MANIFEST: &str = ".claude-plugin/plugin.json";
+
+/// Claude Code's own installed CLI documents this as the plugin-root MCP
+/// declaration file ("MCP configs go in `.mcp.json` at plugin root"), loaded
+/// automatically from whatever directory `--plugin-dir` points at — the same
+/// directory Gate4Agent already materializes skills and the plugin manifest
+/// into. No other provider wired today (Kimi's `--skills-dir`, Codex's
+/// isolated `CODEX_HOME` profile) exposes an equivalent session-scoped root
+/// for a bundle-shipped MCP declaration to land in.
+const CLAUDE_MCP_DECLARATION_PATH: &str = ".mcp.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BundleProviderLayout {
@@ -20,6 +31,8 @@ pub(crate) enum BundleProviderError {
     UnsupportedBinding,
     #[error("the Claude bundle manifest is missing")]
     MissingClaudeManifest,
+    #[error("MCP declarations are only supported at the Claude plugin root's .mcp.json")]
+    McpDeclarationUnsupported,
     #[error("the materialized bundle root is not absolute")]
     BundleRootNotAbsolute,
     #[error("the materialized provider home is not absolute")]
@@ -40,32 +53,54 @@ pub(crate) fn validate_bundle_binding(
             .any(|file| file.path() == CLAUDE_PLUGIN_MANIFEST),
     )?;
     if let Some(manifest) = bundle.delivery_manifest() {
-        if manifest.components.iter().any(|component| {
-            component.scope != DeliveryScopeV2::Session
-                || match component.kind {
-                    DeliveryComponentKindV2::Skill => {
-                        !component.relative_path.as_str().starts_with("skills/")
-                    }
-                    DeliveryComponentKindV2::PluginManifest => !matches!(
-                        component.relative_path.as_str(),
-                        "plugin.json" | CLAUDE_PLUGIN_MANIFEST
-                    ),
-                    DeliveryComponentKindV2::Prompt
-                    | DeliveryComponentKindV2::Instructions
-                    | DeliveryComponentKindV2::AgentDefinition
-                    | DeliveryComponentKindV2::Command
-                    | DeliveryComponentKindV2::File
-                    | DeliveryComponentKindV2::Template
-                    | DeliveryComponentKindV2::McpDeclaration => true,
-                }
-        }) {
-            return Err(BundleProviderError::UnsupportedBinding);
+        for component in &manifest.components {
+            validate_delivery_component(layout, component)?;
         }
         bundle
             .validate_skill_bundle_contract()
             .map_err(|_| BundleProviderError::UnsupportedBinding)?;
     }
     Ok(layout)
+}
+
+fn validate_delivery_component(
+    layout: BundleProviderLayout,
+    component: &DeliveryComponentV2,
+) -> Result<(), BundleProviderError> {
+    if component.scope != DeliveryScopeV2::Session {
+        return Err(BundleProviderError::UnsupportedBinding);
+    }
+    match component.kind {
+        DeliveryComponentKindV2::Skill => {
+            if !component.relative_path.as_str().starts_with("skills/") {
+                return Err(BundleProviderError::UnsupportedBinding);
+            }
+        }
+        DeliveryComponentKindV2::PluginManifest => {
+            if !matches!(
+                component.relative_path.as_str(),
+                "plugin.json" | CLAUDE_PLUGIN_MANIFEST
+            ) {
+                return Err(BundleProviderError::UnsupportedBinding);
+            }
+        }
+        DeliveryComponentKindV2::McpDeclaration => {
+            if layout != BundleProviderLayout::Claude
+                || component.relative_path.as_str() != CLAUDE_MCP_DECLARATION_PATH
+            {
+                return Err(BundleProviderError::McpDeclarationUnsupported);
+            }
+        }
+        DeliveryComponentKindV2::Prompt
+        | DeliveryComponentKindV2::Instructions
+        | DeliveryComponentKindV2::AgentDefinition
+        | DeliveryComponentKindV2::Command
+        | DeliveryComponentKindV2::File
+        | DeliveryComponentKindV2::Template => {
+            return Err(BundleProviderError::UnsupportedBinding);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn bundle_launch_arguments(
@@ -120,6 +155,9 @@ fn launch_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        DeliveryBlobDigestV1, DeliveryBlobReceiptV1, DeliveryRelativePathV2,
+    };
     use std::path::PathBuf;
 
     fn agent(value: &str) -> AgentId {
@@ -203,6 +241,59 @@ mod tests {
                 &absolute_provider_home(),
             ),
             Err(BundleProviderError::BundleRootNotAbsolute),
+        );
+    }
+
+    fn mcp_component(scope: DeliveryScopeV2, path: &str) -> DeliveryComponentV2 {
+        DeliveryComponentV2 {
+            kind: DeliveryComponentKindV2::McpDeclaration,
+            scope,
+            relative_path: DeliveryRelativePathV2::new(path).unwrap(),
+            blob: DeliveryBlobReceiptV1::new(
+                DeliveryBlobDigestV1::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+                0,
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn mcp_declaration_lands_only_at_the_grounded_claude_plugin_root_path() {
+        let mcp = mcp_component(DeliveryScopeV2::Session, ".mcp.json");
+        assert!(validate_delivery_component(BundleProviderLayout::Claude, &mcp).is_ok());
+    }
+
+    #[test]
+    fn mcp_declaration_fails_closed_for_ungrounded_kimi_and_codex_layouts() {
+        let mcp = mcp_component(DeliveryScopeV2::Session, ".mcp.json");
+        for layout in [BundleProviderLayout::Kimi, BundleProviderLayout::Codex] {
+            assert_eq!(
+                validate_delivery_component(layout, &mcp),
+                Err(BundleProviderError::McpDeclarationUnsupported),
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_declaration_fails_closed_off_the_exact_claude_path() {
+        let wrong_path = mcp_component(DeliveryScopeV2::Session, "mcp.json");
+        assert_eq!(
+            validate_delivery_component(BundleProviderLayout::Claude, &wrong_path),
+            Err(BundleProviderError::McpDeclarationUnsupported),
+        );
+        let nested = mcp_component(DeliveryScopeV2::Session, "config/.mcp.json");
+        assert_eq!(
+            validate_delivery_component(BundleProviderLayout::Claude, &nested),
+            Err(BundleProviderError::McpDeclarationUnsupported),
+        );
+    }
+
+    #[test]
+    fn mcp_declaration_still_honors_the_session_scope_floor() {
+        let workspace_scoped = mcp_component(DeliveryScopeV2::Workspace, ".mcp.json");
+        assert_eq!(
+            validate_delivery_component(BundleProviderLayout::Claude, &workspace_scoped),
+            Err(BundleProviderError::UnsupportedBinding),
         );
     }
 }

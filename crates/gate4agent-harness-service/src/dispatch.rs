@@ -2,10 +2,10 @@ use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessContinuationRef, HarnessDeliveryRef, HarnessDispatchIntentV1,
     HarnessExecutionModeV1, HarnessIdempotencyRef, HarnessLaunchAuthorityRefV1,
     HarnessLaunchPlanRefV1, HarnessOperationId, HarnessOperatorAuthorityV1, HarnessReceiptRef,
-    HarnessRequestDigest, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
+    HarnessRequestDigest, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
     HarnessScheduledLaunchRefV2, HarnessScheduleRequestV1, HarnessSelectorV1,
-    HarnessSessionIdentityV1, HarnessTaskStateV1, HarnessTaskV1, HarnessWorktreeIntentV1,
-    SessionGrantId,
+    HarnessSessionIdentityV1, HarnessTaskId, HarnessTaskStateV1, HarnessTaskV1,
+    HarnessWorktreeIntentV1, SessionGrantId,
 };
 use gate4agent_c2_protocol::{C2ControlEventKind, C2NodeEvent, RoutedNodeEvent};
 use gate4agent_node_protocol::{
@@ -52,6 +52,18 @@ const HARNESS_CONTEXT_PACK_RECORD_IDEMPOTENCY_REF_DOMAIN: &[u8] =
     b"gate4agent-harness-context-pack-record-idempotency-ref-v1\0";
 const HARNESS_CONTEXT_PACK_RECORD_REQUEST_DIGEST_DOMAIN: &[u8] =
     b"gate4agent-harness-context-pack-record-request-digest-v1\0";
+const HARNESS_GIT_FACTS_RECORD_OPERATION_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-git-facts-record-operation-id-v1\0";
+const HARNESS_GIT_FACTS_RECORD_IDEMPOTENCY_REF_DOMAIN: &[u8] =
+    b"gate4agent-harness-git-facts-record-idempotency-ref-v1\0";
+const HARNESS_GIT_FACTS_RECORD_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"gate4agent-harness-git-facts-record-request-digest-v1\0";
+const HARNESS_RESULT_REF_RECORD_OPERATION_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-result-ref-record-operation-id-v1\0";
+const HARNESS_RESULT_REF_RECORD_IDEMPOTENCY_REF_DOMAIN: &[u8] =
+    b"gate4agent-harness-result-ref-record-idempotency-ref-v1\0";
+const HARNESS_RESULT_REF_RECORD_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"gate4agent-harness-result-ref-record-request-digest-v1\0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -860,6 +872,103 @@ pub fn deterministic_context_pack_record_ids(
         request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
     )?;
     Ok(HarnessContextPackRecordAuthorityIdsV1 {
+        operation_id,
+        idempotency_ref,
+        request_digest,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessGitFactsRecordAuthorityIdsV1 {
+    pub operation_id: HarnessOperationId,
+    pub idempotency_ref: HarnessIdempotencyRef,
+    pub request_digest: HarnessRequestDigest,
+}
+
+/// Keyed by `(run_id, node_id, incarnation_id)`, deliberately without the
+/// captured outcome: unlike `RecordRunContextPack`, a git-facts capture is
+/// single-attempt by design (A3 design §2/§9 risk 2), so there is no
+/// legitimate "second, different capture" this identity needs to
+/// distinguish. Two attempts against the same binding either observe the
+/// same real workspace state — a harmless value-based replay the engine
+/// recognizes before ever consulting the operation ledger — or diverge, in
+/// which case the engine rejects the second one as a hard conflict
+/// regardless of what operation id either attempt carried.
+pub fn deterministic_run_git_facts_record_ids(
+    run_id: &HarnessRunId,
+    node_id: &NodeId,
+    incarnation_id: &NodeIncarnationId,
+) -> Result<HarnessGitFactsRecordAuthorityIdsV1, HarnessDispatchError> {
+    run_id.validate()?;
+    let incarnation = incarnation_id.to_string();
+    let material = serde_json::to_vec(&(
+        run_id.as_str(),
+        node_id.as_str(),
+        incarnation.as_str(),
+    ))?;
+    let operation_id = derived_id_from_material(
+        HarnessOperationId::PREFIX,
+        HARNESS_GIT_FACTS_RECORD_OPERATION_ID_DOMAIN,
+        &material,
+        HarnessOperationId::new,
+    )?;
+    let idempotency_ref = derived_id_from_material(
+        HarnessIdempotencyRef::PREFIX,
+        HARNESS_GIT_FACTS_RECORD_IDEMPOTENCY_REF_DOMAIN,
+        &material,
+        HarnessIdempotencyRef::new,
+    )?;
+    let request_digest = local_hmac_sha256(
+        HARNESS_GIT_FACTS_RECORD_REQUEST_DIGEST_DOMAIN,
+        &material,
+    ).map_err(HarnessDispatchError::Digest)?;
+    let request_digest = HarnessRequestDigest::new(
+        request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    )?;
+    Ok(HarnessGitFactsRecordAuthorityIdsV1 {
+        operation_id,
+        idempotency_ref,
+        request_digest,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessResultRefRecordAuthorityIdsV1 {
+    pub operation_id: HarnessOperationId,
+    pub idempotency_ref: HarnessIdempotencyRef,
+    pub request_digest: HarnessRequestDigest,
+}
+
+/// Keyed by `(task_id, result_ref)`: `RecordTaskResultRef` fires once per
+/// distinct run whose result lands on this task, so the ref itself — not an
+/// event sequence — is what must derive a stable, replay-safe identity.
+pub fn deterministic_task_result_ref_record_ids(
+    task_id: &HarnessTaskId,
+    result_ref: &HarnessResultRef,
+) -> Result<HarnessResultRefRecordAuthorityIdsV1, HarnessDispatchError> {
+    task_id.validate()?;
+    result_ref.validate()?;
+    let material = serde_json::to_vec(&(task_id.as_str(), result_ref.as_str()))?;
+    let operation_id = derived_id_from_material(
+        HarnessOperationId::PREFIX,
+        HARNESS_RESULT_REF_RECORD_OPERATION_ID_DOMAIN,
+        &material,
+        HarnessOperationId::new,
+    )?;
+    let idempotency_ref = derived_id_from_material(
+        HarnessIdempotencyRef::PREFIX,
+        HARNESS_RESULT_REF_RECORD_IDEMPOTENCY_REF_DOMAIN,
+        &material,
+        HarnessIdempotencyRef::new,
+    )?;
+    let request_digest = local_hmac_sha256(
+        HARNESS_RESULT_REF_RECORD_REQUEST_DIGEST_DOMAIN,
+        &material,
+    ).map_err(HarnessDispatchError::Digest)?;
+    let request_digest = HarnessRequestDigest::new(
+        request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    )?;
+    Ok(HarnessResultRefRecordAuthorityIdsV1 {
         operation_id,
         idempotency_ref,
         request_digest,

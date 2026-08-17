@@ -31,7 +31,8 @@ use gate4agent_harness_protocol::{
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
     HarnessReplaceTaskRequestV1, HarnessRequestDigest,
     HarnessRetryTaskRequestV1, HarnessRevision, HarnessRunId, HarnessRunLifecycleV1,
-    HarnessResolvedContextPackReceiptV1, HarnessRunV1, HarnessScheduleOutcomeV1,
+    HarnessResolvedContextPackReceiptV1, HarnessResultRef, HarnessRunGitFactsV1, HarnessRunV1,
+    HarnessScheduleOutcomeV1,
     HarnessScheduledLaunchRefV2, HarnessScheduleRequestV1, HarnessSelectorV1,
     HarnessLaunchTargetSelectionV1, HarnessLaunchWorktreeSelectionV1,
     HarnessSessionIdentityV1, HarnessStartTaskRequestV1, HarnessTaskExecutionSpecV1,
@@ -40,7 +41,7 @@ use gate4agent_harness_protocol::{
     HarnessTaskLaunchIssuanceRefV1,
     HarnessTaskStartOutcomeV1, HarnessTaskStateV1, HarnessTaskV1,
     HarnessTransferAuthorityRefV1, HarnessValidationError, HarnessWorktreeIntentV1,
-    SessionGrantId,
+    SessionGrantId, HARNESS_RESULTS_MAX,
 };
 use gate4agent_harness_delivery::{CompiledDeliveryBundleV2, DeliveryCatalogV2};
 use gate4agent_node_protocol::{
@@ -1014,6 +1015,7 @@ impl HarnessService {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -1347,6 +1349,7 @@ impl HarnessService {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -1545,6 +1548,7 @@ impl HarnessService {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -3143,6 +3147,139 @@ impl HarnessService {
             operation,
             current_run.revision,
             next_run,
+        )?;
+        let outcome = prepared.outcome();
+        if outcome == HarnessApplyOutcome::Applied {
+            self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
+        }
+        Ok(outcome)
+    }
+
+    /// Idempotently records a single, terminal, best-effort git-facts
+    /// capture on `run_id`, reusing the run's own already-observed
+    /// revision — same idiom as `record_run_context_pack`. Structural twin
+    /// of that wrapper; the one behavioral difference is that this mutation
+    /// is legal exactly once per run — `prepare_run_git_facts_record`
+    /// rejects a second, different capture rather than ever silently
+    /// overwriting it.
+    pub(crate) fn record_run_git_facts(
+        &mut self,
+        run_id: &HarnessRunId,
+        facts: HarnessRunGitFactsV1,
+        recorded_at_unix_ms: u64,
+        node_id: &NodeId,
+        incarnation_id: NodeIncarnationId,
+    ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
+        self.ensure_healthy()?;
+        facts.validate()?;
+        let current_run = self.engine.run(run_id)
+            .ok_or_else(|| HarnessServiceError::Engine(HarnessEngineError::NotFound(
+                run_id.to_string(),
+            )))?
+            .clone();
+        if current_run.git_facts.as_ref() == Some(&facts) {
+            return Ok(HarnessApplyOutcome::Replayed);
+        }
+        let ids = dispatch::deterministic_run_git_facts_record_ids(
+            run_id,
+            node_id,
+            &incarnation_id,
+        )?;
+        let recorded_at = recorded_at_unix_ms.max(current_run.updated_at_unix_ms);
+        let mut next_run = current_run.clone();
+        next_run.git_facts = Some(facts);
+        next_run.revision = next_revision(current_run.revision)?;
+        next_run.updated_at_unix_ms = recorded_at;
+        let operation = HarnessOperationV1 {
+            operation_id: ids.operation_id,
+            revision: HarnessRevision::new(1)?,
+            actor: HarnessActorV1::ParentRun { run_id: run_id.clone() },
+            kind: HarnessOperationKindV1::RecordRunGitFacts,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: None,
+            run_id: Some(run_id.clone()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(current_run.revision),
+            request_digest: ids.request_digest,
+            idempotency_ref: ids.idempotency_ref,
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: recorded_at,
+            updated_at_unix_ms: recorded_at,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: Some(recorded_at),
+        };
+        let prepared = self.engine.prepare_run_git_facts_record(
+            operation,
+            current_run.revision,
+            next_run,
+        )?;
+        let outcome = prepared.outcome();
+        if outcome == HarnessApplyOutcome::Applied {
+            self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
+        }
+        Ok(outcome)
+    }
+
+    /// Idempotently grows `task_id`'s `result_refs` index by the reference
+    /// derived from `run_id`, reusing the task's own already-observed
+    /// revision. No-ops to `Replayed` when the ref is already present or the
+    /// task is already at `HARNESS_RESULTS_MAX` capacity — both are legal,
+    /// cost-free no-ops, never a conflict, matching
+    /// `prepare_task_result_ref_record`'s own idempotency posture.
+    pub(crate) fn record_task_result_ref(
+        &mut self,
+        task_id: &HarnessTaskId,
+        run_id: &HarnessRunId,
+        recorded_at_unix_ms: u64,
+    ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
+        self.ensure_healthy()?;
+        let candidate = HarnessResultRef::for_run(run_id);
+        let current_task = self.engine.task(task_id)
+            .ok_or_else(|| HarnessServiceError::Engine(HarnessEngineError::NotFound(
+                task_id.to_string(),
+            )))?
+            .clone();
+        let insert_at = match current_task.result_refs.binary_search(&candidate) {
+            Ok(_) => return Ok(HarnessApplyOutcome::Replayed),
+            Err(_) if current_task.result_refs.len() >= HARNESS_RESULTS_MAX => {
+                return Ok(HarnessApplyOutcome::Replayed);
+            }
+            Err(index) => index,
+        };
+        let ids = dispatch::deterministic_task_result_ref_record_ids(task_id, &candidate)?;
+        let recorded_at = recorded_at_unix_ms.max(current_task.updated_at_unix_ms);
+        let mut next_task = current_task.clone();
+        next_task.result_refs.insert(insert_at, candidate);
+        next_task.revision = next_revision(current_task.revision)?;
+        next_task.updated_at_unix_ms = recorded_at;
+        let operation = HarnessOperationV1 {
+            operation_id: ids.operation_id,
+            revision: HarnessRevision::new(1)?,
+            actor: HarnessActorV1::ParentRun { run_id: run_id.clone() },
+            kind: HarnessOperationKindV1::RecordTaskResultRef,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: Some(task_id.clone()),
+            run_id: None,
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(current_task.revision),
+            request_digest: ids.request_digest,
+            idempotency_ref: ids.idempotency_ref,
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: recorded_at,
+            updated_at_unix_ms: recorded_at,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: Some(recorded_at),
+        };
+        let prepared = self.engine.prepare_task_result_ref_record(
+            operation,
+            current_task.revision,
+            next_task,
         )?;
         let outcome = prepared.outcome();
         if outcome == HarnessApplyOutcome::Applied {
@@ -6365,7 +6502,8 @@ mod tests {
         HarnessIdempotencyRef, HarnessMonitoringVisibilityV1, HarnessOperationKindV1,
         HarnessOperationTimeoutsV1, HarnessReadPermissionsV1,
         HarnessOperationStateV1, HarnessRunId, HarnessRunIntentV1,
-        HarnessResultDispositionV1, HarnessRunLifecycleV1, HarnessRunV1,
+        HarnessResultDispositionV1, HarnessRunGitFactsOutcomeV1, HarnessRunLifecycleV1,
+        HarnessRunV1,
         HarnessRuntimeIdentityV1,
         HarnessReceiptRef, HarnessSessionBindingV1, HarnessSessionIdentityV1, HarnessTaskId,
         HarnessTaskPermissionsV1, HarnessTaskStateV1, HarnessTaskV1,
@@ -6808,6 +6946,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -6828,6 +6967,176 @@ mod tests {
             service.engine().run(&run_id()).unwrap().clone(),
             service.engine().operation(&run_operation_id()).unwrap().clone(),
         )
+    }
+
+    /// One task (`Review`) with one already-`Completed`, already-bound run —
+    /// the exact precondition `record_run_git_facts`/`record_task_result_ref`
+    /// require (binding present for git-facts; a run the task can index).
+    fn terminal_bound_run_fixture() -> HarnessService {
+        let mut current_task = task();
+        current_task.state = HarnessTaskStateV1::Review;
+        current_task.run_ids = vec![run_id()];
+        let run = HarnessRunV1 {
+            run_id: run_id(),
+            revision: HarnessRevision::new(3).unwrap(),
+            parent_run_id: None,
+            task_id: task_id(),
+            operation_id: run_operation_id(),
+            intent: HarnessRunIntentV1 {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: HarnessSelectorV1::new("claude-default").unwrap(),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: None,
+            git_facts: None,
+            binding: Some(HarnessSessionBindingV1 {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+                workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                session: HarnessSessionIdentityV1::Managed {
+                    record_id: HarnessSelectorV1::new("record-a").unwrap(),
+                    active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 1, generation: 1 }),
+                },
+            }),
+            lifecycle: HarnessRunLifecycleV1::Completed,
+            result_disposition: Some(HarnessResultDispositionV1::Succeeded),
+            failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 13,
+        };
+        let operation = HarnessOperationV1 {
+            operation_id: run_operation_id(),
+            revision: HarnessRevision::new(1).unwrap(),
+            actor: HarnessActorV1::User {
+                actor_id: HarnessSelectorV1::new("operator").unwrap(),
+            },
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: Some(task_id()),
+            run_id: Some(run_id()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(HarnessRevision::new(1).unwrap()),
+            request_digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                "b".repeat(24),
+            )).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 13,
+            dispatched_at_unix_ms: Some(12),
+            finished_at_unix_ms: Some(13),
+        };
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: gate4agent_harness_engine::HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![current_task],
+            runs: vec![run],
+            grants: Vec::new(),
+            operations: vec![operation],
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap();
+        HarnessService::from_engine_for_test(engine)
+    }
+
+    #[test]
+    fn record_run_git_facts_applies_replays_and_conflicts() {
+        let mut service = terminal_bound_run_fixture();
+        let node_id = NodeId::new("node-a").unwrap();
+        let incarnation = NodeIncarnationId::from_bytes([7; 16]);
+        let facts = HarnessRunGitFactsV1 {
+            captured_at_unix_ms: 20,
+            outcome: HarnessRunGitFactsOutcomeV1::Unavailable,
+        };
+
+        let applied = service.record_run_git_facts(
+            &run_id(),
+            facts.clone(),
+            20,
+            &node_id,
+            incarnation,
+        ).unwrap();
+        assert_eq!(applied, HarnessApplyOutcome::Applied);
+        assert_eq!(service.engine().run(&run_id()).unwrap().git_facts, Some(facts.clone()));
+
+        // A redundant call with the exact same value is a free no-op.
+        let replayed = service.record_run_git_facts(
+            &run_id(),
+            facts.clone(),
+            21,
+            &node_id,
+            incarnation,
+        ).unwrap();
+        assert_eq!(replayed, HarnessApplyOutcome::Replayed);
+        assert_eq!(service.engine().run(&run_id()).unwrap().git_facts, Some(facts));
+
+        // A different value is a hard conflict, never a silent overwrite.
+        let different = HarnessRunGitFactsV1 {
+            captured_at_unix_ms: 22,
+            outcome: HarnessRunGitFactsOutcomeV1::Unavailable,
+        };
+        assert!(matches!(
+            service.record_run_git_facts(&run_id(), different, 22, &node_id, incarnation),
+            Err(HarnessServiceError::Engine(HarnessEngineError::TerminalRunMutation)),
+        ));
+    }
+
+    #[test]
+    fn record_task_result_ref_applies_and_replays() {
+        let mut service = terminal_bound_run_fixture();
+        let candidate = HarnessResultRef::for_run(&run_id());
+
+        let applied = service.record_task_result_ref(&task_id(), &run_id(), 20).unwrap();
+        assert_eq!(applied, HarnessApplyOutcome::Applied);
+        assert_eq!(
+            service.engine().task(&task_id()).unwrap().result_refs,
+            vec![candidate.clone()],
+        );
+
+        // A redundant call for the same run's ref is a free no-op.
+        let replayed = service.record_task_result_ref(&task_id(), &run_id(), 21).unwrap();
+        assert_eq!(replayed, HarnessApplyOutcome::Replayed);
+        assert_eq!(service.engine().task(&task_id()).unwrap().result_refs, vec![candidate]);
+    }
+
+    #[test]
+    fn record_task_result_ref_no_ops_at_capacity() {
+        let mut full_task = task();
+        full_task.state = HarnessTaskStateV1::Review;
+        full_task.result_refs = (0..HARNESS_RESULTS_MAX)
+            .map(|index| HarnessRunId::new(format!("hrun_{index:024x}")).unwrap())
+            .map(|id| HarnessResultRef::for_run(&id))
+            .collect();
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: gate4agent_harness_engine::HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![full_task.clone()],
+            runs: Vec::new(),
+            grants: Vec::new(),
+            operations: Vec::new(),
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap();
+        let mut service = HarnessService::from_engine_for_test(engine);
+        let overflow_run = HarnessRunId::new(format!("hrun_{HARNESS_RESULTS_MAX:024x}")).unwrap();
+
+        let outcome = service.record_task_result_ref(&task_id(), &overflow_run, 30).unwrap();
+        assert_eq!(outcome, HarnessApplyOutcome::Replayed);
+        assert_eq!(service.engine().task(&task_id()).unwrap().result_refs, full_task.result_refs);
     }
 
     fn spawn_spec(prompt: &str) -> SpawnSpec {
@@ -7030,6 +7339,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -7157,6 +7467,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: Some(source_binding.clone()),
             lifecycle: HarnessRunLifecycleV1::Running,
             result_disposition: None,
@@ -7206,6 +7517,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,

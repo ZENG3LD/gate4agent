@@ -1736,7 +1736,7 @@ pub(crate) struct PreparedRunRead {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PreparedRunReadKind {
+pub(crate) enum PreparedRunReadKind {
     InspectWorkspace,
     ReadWorkspaceFile { path: RepositoryPath },
     ReadGitHistory {
@@ -1790,6 +1790,20 @@ impl PreparedRunRead {
         if request_run_id != run.run_id {
             return Err(HarnessC2Error::InvalidRunReadRequest);
         }
+        Self::for_run(run, kind)
+    }
+
+    /// Internal constructor for a coordinator-originated read: the caller
+    /// holds an authoritative `&HarnessRunV1` directly (no live operator
+    /// request behind it). Shares every binding/route/workspace_id
+    /// derivation and validation rule with `from_operator_request`, which is
+    /// now a thin wrapper over this — behavior-preserving, zero change to
+    /// any existing `from_operator_request` test. Used by the background
+    /// git-facts capture sweep (`reconcile_run_git_facts_capture`).
+    pub(crate) fn for_run(
+        run: &HarnessRunV1,
+        kind: PreparedRunReadKind,
+    ) -> Result<Self, HarnessC2Error> {
         let binding = run.binding.clone().ok_or(HarnessC2Error::RunReadUnbound)?;
         binding.validate().map_err(|_| HarnessC2Error::InvalidRunReadBinding)?;
         let route = NodeRoute {
@@ -5350,6 +5364,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding: Some(HarnessSessionBindingV1 {
                 node_id: HarnessSelectorV1::new("node-a").unwrap(),
                 node_incarnation: HarnessSelectorV1::new(incarnation.to_string()).unwrap(),

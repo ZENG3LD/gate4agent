@@ -652,17 +652,19 @@ pub enum HarnessTaskDetailSection {
     Runs,
     Agents,
     Transfers,
+    Results,
     Files,
     Git,
     Launch,
 }
 
 impl HarnessTaskDetailSection {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Overview,
         Self::Runs,
         Self::Agents,
         Self::Transfers,
+        Self::Results,
         Self::Files,
         Self::Git,
         Self::Launch,
@@ -674,6 +676,7 @@ impl HarnessTaskDetailSection {
             Self::Runs => "Runs",
             Self::Agents => "Agents",
             Self::Transfers => "Transfers",
+            Self::Results => "Results",
             Self::Files => "Files",
             Self::Git => "Git",
             Self::Launch => "Launch",
@@ -2432,6 +2435,8 @@ pub enum HitTarget {
     HarnessTransferRefresh,
     HarnessTransferPreviousRun,
     HarnessTransferNextRun,
+    HarnessResultPreviousRun,
+    HarnessResultNextRun,
     HarnessRunMonitorBack,
     HarnessRunMonitorSection(HarnessRunMonitorSection),
     HarnessRunMonitorScrollUp,
@@ -6156,6 +6161,35 @@ impl App {
         self.open_harness_run_transfers(runs[next].clone(), false)
     }
 
+    /// Results tab run selection — unlike `move_harness_transfer_selection`,
+    /// this never triggers a fetch: every field the Results tab renders
+    /// already lives on the `RedactedRunV1` returned by `harness_task_runs`.
+    fn move_harness_result_selection(&mut self, previous: bool) -> AppAction {
+        let Some(detail) = self.harness_kanban.detail.as_ref() else {
+            return AppAction::None;
+        };
+        let runs = self.harness_task_runs(&detail.task_id)
+            .into_iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        if runs.is_empty() {
+            return AppAction::None;
+        }
+        let current = detail.selected_run.as_ref()
+            .and_then(|selected| runs.iter().position(|run_id| run_id == selected))
+            .unwrap_or(0);
+        let next = if previous {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(runs.len() - 1)
+        };
+        if let Some(detail) = self.harness_kanban.detail.as_mut() {
+            detail.selected_run = Some(runs[next].clone());
+            detail.scroll = 0;
+        }
+        AppAction::None
+    }
+
     pub fn harness_run_ref(&self, run_id: &HarnessRunId) -> Option<HarnessRunRef> {
         let run = self.harness_kanban.runs.get(run_id)?;
         Some(HarnessRunRef {
@@ -6664,6 +6698,12 @@ impl App {
             {
                 self.harness_kanban.detail = Some(detail);
                 return self.move_harness_transfer_selection(key == UiKey::Up);
+            }
+            UiKey::Up | UiKey::Down
+                if detail.section == HarnessTaskDetailSection::Results =>
+            {
+                self.harness_kanban.detail = Some(detail);
+                return self.move_harness_result_selection(key == UiKey::Up);
             }
             UiKey::Char('r') | UiKey::Char('R')
                 if detail.section == HarnessTaskDetailSection::Transfers =>
@@ -9096,6 +9136,12 @@ impl App {
             Some(HitTarget::HarnessTransferNextRun) => {
                 return self.move_harness_transfer_selection(false);
             }
+            Some(HitTarget::HarnessResultPreviousRun) => {
+                return self.move_harness_result_selection(true);
+            }
+            Some(HitTarget::HarnessResultNextRun) => {
+                return self.move_harness_result_selection(false);
+            }
             Some(HitTarget::HarnessTaskDetailRunFiles(run_id)) => {
                 return self.open_harness_workspace_section(
                     run_id.clone(),
@@ -9859,6 +9905,8 @@ impl App {
                 | HitTarget::HarnessTransferRefresh
                 | HitTarget::HarnessTransferPreviousRun
                 | HitTarget::HarnessTransferNextRun
+                | HitTarget::HarnessResultPreviousRun
+                | HitTarget::HarnessResultNextRun
                 | HitTarget::HarnessTaskDetailRunFiles(_)
                 | HitTarget::HarnessTaskDetailRunGit(_)
                 | HitTarget::HarnessWorkspaceFile(_, _)
@@ -18904,6 +18952,8 @@ mod tests {
             binding,
             result_disposition: None,
             failure_category: None,
+            context_pack: None,
+            git_facts: None,
             references_redacted: false,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

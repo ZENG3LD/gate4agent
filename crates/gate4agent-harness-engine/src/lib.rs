@@ -5,13 +5,13 @@ use gate4agent_harness_protocol::{
     HarnessContinuationV1, HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1,
     HarnessEntityReadScopeV1, HarnessExpectedExecutionSpecRevisionV1,
     HarnessOperationId, HarnessOperationKindV1,
-    HarnessOperationStateV1, HarnessOperationV1, HarnessRevision, HarnessRunId,
-    HarnessRunLifecycleV1, HarnessRunV1, HarnessTaskExecutionSpecV1,
+    HarnessOperationStateV1, HarnessOperationV1, HarnessResultRef, HarnessRevision,
+    HarnessRunId, HarnessRunLifecycleV1, HarnessRunV1, HarnessTaskExecutionSpecV1,
     HarnessTaskExecutionSpecV2, HarnessTaskId, HarnessTaskLaunchIssuanceV1,
     HarnessTaskStateV1, HarnessTaskV1, HarnessTransferAuthorityRefV1,
     HarnessValidationError, SessionGrantId, SessionGrantStateV1, SessionGrantV1,
     HARNESS_CHILD_DEPTH_MAX, HARNESS_CONTINUATIONS_MAX, HARNESS_DELIVERIES_MAX,
-    HARNESS_SCHEDULER_SCAN_MAX,
+    HARNESS_RESULTS_MAX, HARNESS_SCHEDULER_SCAN_MAX,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1885,6 +1885,135 @@ impl HarnessEngine {
         next.finish(operation, HarnessApplyOutcome::Applied)
     }
 
+    /// Narrow, single-entity, terminal-lifecycle-exempt mutation that records
+    /// a durable, one-shot git-facts capture of a run's workspace. Structural
+    /// twin of `prepare_run_context_pack_record`; the only behavioral
+    /// difference is that this fact is legal to write exactly once —
+    /// `validate_git_facts_recording` treats any change to an already-`Some`
+    /// `git_facts` as a hard conflict regardless of cause (the A3 design has
+    /// no legitimate "second capture" scenario the way a context pack has a
+    /// legitimate re-export).
+    pub fn prepare_run_git_facts_record(
+        &self,
+        operation: HarnessOperationV1,
+        expected_run_revision: HarnessRevision,
+        run: HarnessRunV1,
+    ) -> Result<PreparedHarnessMutation, HarnessEngineError> {
+        operation.validate()?;
+        run.validate()?;
+        let current_run = self.runs.get(&run.run_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(run.run_id.to_string()))?;
+        validate_git_facts_recording(current_run, &run)?;
+        if current_run.git_facts.is_some() {
+            // Idempotent replay: an earlier (possibly racing) capture attempt
+            // already recorded this exact value — never re-derives a
+            // revision or touches `self.operations`.
+            return Ok(PreparedHarnessMutation {
+                next: self.clone(),
+                outcome: HarnessApplyOutcome::Replayed,
+                operation,
+            });
+        }
+        if self.operations.contains_key(&operation.operation_id) {
+            return Err(HarnessEngineError::OperationIdConflict {
+                operation_id: operation.operation_id,
+            });
+        }
+        require_first_revision(operation.revision, "operation")?;
+        require_kind(operation.kind, HarnessOperationKindV1::RecordRunGitFacts)?;
+        require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
+        require_operation_expected(&operation, expected_run_revision)?;
+        require_same_id(operation.run_id.as_ref(), &run.run_id, "run")?;
+        if operation.actor != (HarnessActorV1::ParentRun { run_id: run.run_id.clone() })
+            || operation.task_id.is_some()
+            || operation.grant_id.is_some()
+            || operation.reconciles_operation_id.is_some()
+            || operation.updated_at_unix_ms != run.updated_at_unix_ms
+            || operation.finished_at_unix_ms != Some(run.updated_at_unix_ms)
+        {
+            return Err(HarnessEngineError::InvalidGitFactsRecordAuthority);
+        }
+        validate_replacement(
+            "run",
+            current_run.revision,
+            expected_run_revision,
+            run.revision,
+            current_run.created_at_unix_ms,
+            run.created_at_unix_ms,
+        )?;
+        let mut next = self.clone();
+        next.runs.insert(run.run_id.clone(), run);
+        next.operations.insert(operation.operation_id.clone(), operation.clone());
+        next.finish(operation, HarnessApplyOutcome::Applied)
+    }
+
+    /// Genuinely new mutation (no A2 analog): grows one task's `result_refs`
+    /// index by exactly one entry, attributing the growth to the exact run
+    /// whose already-committed result caused it. Never touches `task.state`
+    /// — the index is a passive fact about a task's runs, not a task-state
+    /// transition, the same doctrine A2 held for run state. Idempotent on an
+    /// already-present ref, or on a task already at `HARNESS_RESULTS_MAX`
+    /// capacity: both replay cleanly rather than conflicting.
+    pub fn prepare_task_result_ref_record(
+        &self,
+        operation: HarnessOperationV1,
+        expected_task_revision: HarnessRevision,
+        task: HarnessTaskV1,
+    ) -> Result<PreparedHarnessMutation, HarnessEngineError> {
+        operation.validate()?;
+        task.validate()?;
+        let current_task = self.tasks.get(&task.task_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(task.task_id.to_string()))?;
+        validate_task_result_ref_recording(current_task, &task)?;
+        if current_task.result_refs == task.result_refs {
+            // Idempotent replay: the exact ref this attempt wanted to add
+            // (or the exact no-op at capacity) is already reflected — never
+            // re-derives a revision or touches `self.operations`.
+            return Ok(PreparedHarnessMutation {
+                next: self.clone(),
+                outcome: HarnessApplyOutcome::Replayed,
+                operation,
+            });
+        }
+        let inserted = task.result_refs.iter()
+            .find(|candidate| current_task.result_refs.binary_search(candidate).is_err())
+            .ok_or(HarnessEngineError::InvalidResultRefRecordProjection)?;
+        if self.operations.contains_key(&operation.operation_id) {
+            return Err(HarnessEngineError::OperationIdConflict {
+                operation_id: operation.operation_id,
+            });
+        }
+        require_first_revision(operation.revision, "operation")?;
+        require_kind(operation.kind, HarnessOperationKindV1::RecordTaskResultRef)?;
+        require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
+        require_operation_expected(&operation, expected_task_revision)?;
+        require_same_id(operation.task_id.as_ref(), &task.task_id, "task")?;
+        let expected_actor = inserted.run_id()
+            .map(|run_id| HarnessActorV1::ParentRun { run_id })
+            .map_err(|_| HarnessEngineError::InvalidResultRefRecordAuthority)?;
+        if operation.actor != expected_actor
+            || operation.run_id.is_some()
+            || operation.grant_id.is_some()
+            || operation.reconciles_operation_id.is_some()
+            || operation.updated_at_unix_ms != task.updated_at_unix_ms
+            || operation.finished_at_unix_ms != Some(task.updated_at_unix_ms)
+        {
+            return Err(HarnessEngineError::InvalidResultRefRecordAuthority);
+        }
+        validate_replacement(
+            "task",
+            current_task.revision,
+            expected_task_revision,
+            task.revision,
+            current_task.created_at_unix_ms,
+            task.created_at_unix_ms,
+        )?;
+        let mut next = self.clone();
+        next.tasks.insert(task.task_id.clone(), task);
+        next.operations.insert(operation.operation_id.clone(), operation.clone());
+        next.finish(operation, HarnessApplyOutcome::Applied)
+    }
+
     /// Atomically records the categorical result of one leased CreateRun
     /// dispatch. Accepted outcomes use the authoritative spawn-proof seams.
     pub fn prepare_dispatch_outcome_commit(
@@ -3344,6 +3473,7 @@ fn validate_context_pack_recording(
         || current.intent != next.intent
         || current.delivery_receipt != next.delivery_receipt
         || current.continuation_receipt != next.continuation_receipt
+        || current.git_facts != next.git_facts
         || current.binding != next.binding
         || current.lifecycle != next.lifecycle
         || current.result_disposition != next.result_disposition
@@ -3360,6 +3490,114 @@ fn validate_context_pack_recording(
         Some(existing) if existing == candidate => Ok(()),
         Some(_) => Err(HarnessEngineError::TerminalRunMutation),
     }
+}
+
+/// Guards `prepare_run_git_facts_record`: only `git_facts`, `revision`, and
+/// `updated_at_unix_ms` may differ between `current` and `next` (the
+/// structural twin of `validate_context_pack_recording`, symmetrically
+/// freezing `context_pack` alongside every other run field). A run already
+/// frozen by H4 (`OutcomeUnknown`) stays frozen; `git_facts` transitions
+/// `None -> Some(_)` exactly once — a replay of the exact same value is
+/// accepted, any other change (including `Some(x)` to a different `Some(y)`)
+/// is a hard conflict, never a silent overwrite.
+fn validate_git_facts_recording(
+    current: &HarnessRunV1,
+    next: &HarnessRunV1,
+) -> Result<(), HarnessEngineError> {
+    if current.lifecycle == HarnessRunLifecycleV1::OutcomeUnknown {
+        return Err(HarnessEngineError::OutcomeUnknownRunFrozen);
+    }
+    if current.run_id != next.run_id
+        || current.parent_run_id != next.parent_run_id
+        || current.task_id != next.task_id
+        || current.operation_id != next.operation_id
+        || current.intent != next.intent
+        || current.delivery_receipt != next.delivery_receipt
+        || current.continuation_receipt != next.continuation_receipt
+        || current.context_pack != next.context_pack
+        || current.binding != next.binding
+        || current.lifecycle != next.lifecycle
+        || current.result_disposition != next.result_disposition
+        || current.failure != next.failure
+        || current.created_at_unix_ms != next.created_at_unix_ms
+    {
+        return Err(HarnessEngineError::InvalidGitFactsRecordProjection);
+    }
+    let Some(candidate) = &next.git_facts else {
+        return Err(HarnessEngineError::InvalidGitFactsRecordProjection);
+    };
+    match &current.git_facts {
+        None => Ok(()),
+        Some(existing) if existing == candidate => Ok(()),
+        Some(_) => Err(HarnessEngineError::TerminalRunMutation),
+    }
+}
+
+/// Guards `prepare_task_result_ref_record`: every task field except
+/// `result_refs`, `revision`, and `updated_at_unix_ms` must stay
+/// byte-identical — `task.state` in particular never changes here. Below
+/// `HARNESS_RESULTS_MAX` capacity, `next.result_refs` must equal
+/// `current.result_refs` with either no change (a legal replay of an
+/// already-present ref) or exactly one new ref inserted at its sorted
+/// position; at capacity, only the unchanged no-op is legal — an attempt to
+/// grow past the bound is rejected, never silently truncated.
+fn validate_task_result_ref_recording(
+    current: &HarnessTaskV1,
+    next: &HarnessTaskV1,
+) -> Result<(), HarnessEngineError> {
+    if current.task_id != next.task_id
+        || current.title != next.title
+        || current.body != next.body
+        || current.creator != next.creator
+        || current.parent_task_id != next.parent_task_id
+        || current.dependencies != next.dependencies
+        || current.run_ids != next.run_ids
+        || current.state != next.state
+        || current.artifact_refs != next.artifact_refs
+        || current.created_at_unix_ms != next.created_at_unix_ms
+    {
+        return Err(HarnessEngineError::InvalidResultRefRecordProjection);
+    }
+    if current.result_refs.len() >= HARNESS_RESULTS_MAX {
+        return (next.result_refs == current.result_refs)
+            .then_some(())
+            .ok_or(HarnessEngineError::InvalidResultRefRecordProjection);
+    }
+    validate_single_sorted_insertion(&current.result_refs, &next.result_refs)
+        .map_err(|()| HarnessEngineError::InvalidResultRefRecordProjection)
+}
+
+/// Verifies `next` equals `current` with either no change (a legal replay
+/// of an already-present entry) or exactly one additional element inserted
+/// at its correct sorted position. Both slices are required to already be
+/// individually sorted-ascending (enforced by `HarnessTaskV1::validate()`
+/// before this runs), so a merge-style scan is sufficient to reject every
+/// other delta: removal, reorder, substitution, or more than one insertion.
+fn validate_single_sorted_insertion(
+    current: &[HarnessResultRef],
+    next: &[HarnessResultRef],
+) -> Result<(), ()> {
+    if current == next {
+        return Ok(());
+    }
+    if next.len() != current.len() + 1 {
+        return Err(());
+    }
+    let mut current_iter = current.iter().peekable();
+    let mut inserted = false;
+    for item in next {
+        if current_iter.peek() == Some(&item) {
+            current_iter.next();
+        } else if inserted {
+            return Err(());
+        } else {
+            inserted = true;
+        }
+    }
+    if current_iter.next().is_some() {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn validate_coupled_run_operation(
@@ -3564,6 +3802,14 @@ pub enum HarnessEngineError {
     InvalidContextPackRecordAuthority,
     #[error("ContextPack record must not change any run field besides context_pack, revision, or updated_at_unix_ms")]
     InvalidContextPackRecordProjection,
+    #[error("git-facts record operation does not have exact single-run, task-free authority")]
+    InvalidGitFactsRecordAuthority,
+    #[error("git-facts record must not change any run field besides git_facts, revision, or updated_at_unix_ms")]
+    InvalidGitFactsRecordProjection,
+    #[error("result-ref record operation does not have exact single-task, run-free authority")]
+    InvalidResultRefRecordAuthority,
+    #[error("result-ref record must not change any task field besides result_refs, revision, or updated_at_unix_ms")]
+    InvalidResultRefRecordProjection,
     #[error("CreateRun dispatch outcome does not have the exact atomic run/operation/task projection")]
     InvalidDispatchOutcomeProjection,
     #[error("coupled CreateRun operation state does not match run lifecycle")]
@@ -3670,6 +3916,8 @@ mod tests {
         HarnessOperationKindV1, HarnessOperationStateV1, HarnessOperationTimeoutsV1,
         HarnessReceiptRef, HarnessRequestDigest, HarnessResolvedContextPackReceiptV1,
         HarnessResultDispositionV1,
+        HarnessRunGitCommitSummaryV1, HarnessRunGitFactsOutcomeV1, HarnessRunGitFactsV1,
+        HarnessRunGitStatusCodeV1, HarnessRunGitStatusEntryV1, HarnessRunGitSummaryV1,
         HarnessRunIntentV1, HarnessRunLifecycleV1, HarnessRuntimeIdentityV1,
         HarnessScheduledLaunchRefV2, HarnessTaskReviewPolicyV1,
         HarnessSelectorV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
@@ -3939,6 +4187,7 @@ mod tests {
             delivery_receipt: None,
             continuation_receipt: None,
             context_pack: None,
+            git_facts: None,
             binding,
             lifecycle,
             result_disposition: match lifecycle {
@@ -5250,6 +5499,623 @@ mod tests {
         let mut committed = engine.clone();
         committed.accept(prepared);
         assert_eq!(committed.task(&task_id('a')).unwrap(), &original_task);
+    }
+
+    #[test]
+    fn context_pack_record_freezes_git_facts_too() {
+        // A3 fix: `validate_context_pack_recording` must reject a `next`
+        // that smuggles a git_facts change alongside a legitimate
+        // context_pack write — symmetric with `validate_git_facts_recording`
+        // freezing `context_pack` (see the "freezes every field" tests for
+        // both twins).
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let operation = context_pack_record_operation('8', current_run.revision, 30);
+        let mut tampered = current_run.clone();
+        tampered.context_pack = Some(context_pack_receipt('a'));
+        tampered.git_facts = Some(git_facts('a', 30));
+        tampered.revision = revision(current_run.revision.get() + 1);
+        tampered.updated_at_unix_ms = 30;
+        let before = engine.checkpoint();
+        assert!(matches!(
+            engine.prepare_run_context_pack_record(operation, current_run.revision, tampered),
+            Err(HarnessEngineError::InvalidContextPackRecordProjection),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+    }
+
+    fn git_facts_summary(marker: char) -> HarnessRunGitSummaryV1 {
+        HarnessRunGitSummaryV1 {
+            is_repository: true,
+            branch: Some(format!("branch-{marker}")),
+            status: vec![HarnessRunGitStatusEntryV1 {
+                index_status: HarnessRunGitStatusCodeV1::Unmodified,
+                worktree_status: HarnessRunGitStatusCodeV1::Modified,
+                path: "src/lib.rs".to_owned(),
+                previous_path: None,
+            }],
+            recent_commits: vec![HarnessRunGitCommitSummaryV1 {
+                id: marker.to_string().repeat(40),
+                summary: "commit summary".to_owned(),
+            }],
+            truncated: false,
+        }
+    }
+
+    fn git_facts(marker: char, at_unix_ms: u64) -> HarnessRunGitFactsV1 {
+        HarnessRunGitFactsV1 {
+            captured_at_unix_ms: at_unix_ms,
+            outcome: HarnessRunGitFactsOutcomeV1::Captured(git_facts_summary(marker)),
+        }
+    }
+
+    fn git_facts_record_operation(
+        marker: char,
+        expected_revision: HarnessRevision,
+        at_unix_ms: u64,
+    ) -> HarnessOperationV1 {
+        HarnessOperationV1 {
+            operation_id: operation_id(marker),
+            revision: revision(1),
+            actor: HarnessActorV1::ParentRun { run_id: run_id() },
+            kind: HarnessOperationKindV1::RecordRunGitFacts,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: None,
+            run_id: Some(run_id()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(expected_revision),
+            request_digest: HarnessRequestDigest::new(marker.to_string().repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                marker.to_string().repeat(24),
+            )).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: at_unix_ms,
+            updated_at_unix_ms: at_unix_ms,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: Some(at_unix_ms),
+        }
+    }
+
+    #[test]
+    fn git_facts_record_freezes_every_field_except_facts_revision_and_updated_at() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let operation = git_facts_record_operation('1', current_run.revision, 30);
+
+        let mut tampered = current_run.clone();
+        tampered.git_facts = Some(git_facts('a', 30));
+        tampered.revision = revision(current_run.revision.get() + 1);
+        tampered.updated_at_unix_ms = 30;
+        tampered.parent_run_id = Some(numbered_run_id(999));
+        let before = engine.checkpoint();
+        assert!(matches!(
+            engine.prepare_run_git_facts_record(operation.clone(), current_run.revision, tampered),
+            Err(HarnessEngineError::InvalidGitFactsRecordProjection),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+
+        let mut clean = current_run.clone();
+        clean.git_facts = Some(git_facts('a', 30));
+        clean.revision = revision(current_run.revision.get() + 1);
+        clean.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_git_facts_record(
+            operation,
+            current_run.revision,
+            clean.clone(),
+        ).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let recorded = committed.run(&run_id()).unwrap().clone();
+        let mut expected = current_run;
+        expected.git_facts = clean.git_facts;
+        expected.revision = clean.revision;
+        expected.updated_at_unix_ms = clean.updated_at_unix_ms;
+        assert_eq!(recorded, expected);
+    }
+
+    #[test]
+    fn git_facts_record_rejects_a_second_different_value_as_conflict() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let first_operation = git_facts_record_operation('2', current_run.revision, 30);
+        let mut first_next = current_run.clone();
+        first_next.git_facts = Some(git_facts('a', 30));
+        first_next.revision = revision(current_run.revision.get() + 1);
+        first_next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_git_facts_record(
+            first_operation,
+            current_run.revision,
+            first_next,
+        ).unwrap();
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let before = committed.checkpoint();
+
+        let recorded_run = committed.run(&run_id()).unwrap().clone();
+        let second_operation = git_facts_record_operation('3', recorded_run.revision, 40);
+        let mut second_next = recorded_run.clone();
+        second_next.git_facts = Some(git_facts('b', 40));
+        second_next.revision = revision(recorded_run.revision.get() + 1);
+        second_next.updated_at_unix_ms = 40;
+        assert!(matches!(
+            committed.prepare_run_git_facts_record(
+                second_operation,
+                recorded_run.revision,
+                second_next,
+            ),
+            Err(HarnessEngineError::TerminalRunMutation),
+        ));
+        assert_eq!(committed.checkpoint(), before);
+    }
+
+    #[test]
+    fn git_facts_record_is_idempotent_on_the_same_value() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let operation = git_facts_record_operation('4', current_run.revision, 30);
+        let mut next = current_run.clone();
+        next.git_facts = Some(git_facts('a', 30));
+        next.revision = revision(current_run.revision.get() + 1);
+        next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_git_facts_record(
+            operation,
+            current_run.revision,
+            next,
+        ).unwrap();
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let committed_snapshot = committed.checkpoint();
+
+        // A second reconcile pass rediscovers the exact same value against a
+        // stale (pre-commit) revision snapshot — this must no-op, not
+        // conflict, per the design's single-attempt race mitigation (§9 risk
+        // #2).
+        let replay_operation = git_facts_record_operation('5', current_run.revision, 31);
+        let mut replay_next = current_run.clone();
+        replay_next.git_facts = Some(git_facts('a', 30));
+        replay_next.revision = revision(current_run.revision.get() + 1);
+        replay_next.updated_at_unix_ms = 31;
+        let replayed = committed.prepare_run_git_facts_record(
+            replay_operation,
+            current_run.revision,
+            replay_next,
+        ).unwrap();
+        assert_eq!(replayed.outcome(), HarnessApplyOutcome::Replayed);
+        assert_eq!(replayed.checkpoint(), committed_snapshot);
+    }
+
+    #[test]
+    fn git_facts_record_keeps_outcome_unknown_run_frozen() {
+        let mut current_task = task(task_id('a'), 2, "frozen task");
+        current_task.state = HarnessTaskStateV1::Waiting;
+        current_task.run_ids = vec![run_id()];
+        let mut current_run = run(HarnessRunLifecycleV1::Requested, 3);
+        current_run.lifecycle = HarnessRunLifecycleV1::OutcomeUnknown;
+        let mut create_run = original_run_operation(HarnessOperationStateV1::OutcomeUnknown);
+        create_run.outcome_unknown_reason = Some(HarnessOutcomeUnknownReasonV1::Timeout);
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![current_task],
+            runs: vec![current_run.clone()],
+            grants: Vec::new(),
+            operations: vec![create_run],
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap();
+        let operation = git_facts_record_operation('6', current_run.revision, 30);
+        let before = engine.checkpoint();
+        assert!(matches!(
+            engine.prepare_run_git_facts_record(operation, current_run.revision, current_run),
+            Err(HarnessEngineError::OutcomeUnknownRunFrozen),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+    }
+
+    #[test]
+    fn git_facts_record_never_touches_task_state() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let original_task = engine.task(&task_id('a')).unwrap().clone();
+        let operation = git_facts_record_operation('7', current_run.revision, 30);
+        let mut next = current_run.clone();
+        next.git_facts = Some(git_facts('a', 30));
+        next.revision = revision(current_run.revision.get() + 1);
+        next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_git_facts_record(
+            operation,
+            current_run.revision,
+            next,
+        ).unwrap();
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        assert_eq!(committed.task(&task_id('a')).unwrap(), &original_task);
+    }
+
+    fn result_ref_fixture() -> HarnessEngine {
+        let mut current_task = task(task_id('a'), 2, "result ref task");
+        current_task.state = HarnessTaskStateV1::Review;
+        current_task.run_ids = vec![numbered_run_id(1), numbered_run_id(2)];
+
+        let mut run_one = run(HarnessRunLifecycleV1::Completed, 3);
+        run_one.run_id = numbered_run_id(1);
+        run_one.operation_id = operation_id('e');
+        let mut create_run_one = original_run_operation(HarnessOperationStateV1::Succeeded);
+        create_run_one.operation_id = operation_id('e');
+        create_run_one.run_id = Some(numbered_run_id(1));
+        create_run_one.request_digest = HarnessRequestDigest::new("e".repeat(64)).unwrap();
+        create_run_one.idempotency_ref = HarnessIdempotencyRef::new(format!(
+            "hidem_{}",
+            "e".repeat(24),
+        )).unwrap();
+        create_run_one.updated_at_unix_ms = run_one.updated_at_unix_ms;
+        create_run_one.finished_at_unix_ms = Some(run_one.updated_at_unix_ms);
+
+        let mut run_two = run(HarnessRunLifecycleV1::Completed, 3);
+        run_two.run_id = numbered_run_id(2);
+        run_two.operation_id = operation_id('f');
+        let mut create_run_two = original_run_operation(HarnessOperationStateV1::Succeeded);
+        create_run_two.operation_id = operation_id('f');
+        create_run_two.run_id = Some(numbered_run_id(2));
+        create_run_two.request_digest = HarnessRequestDigest::new("f".repeat(64)).unwrap();
+        create_run_two.idempotency_ref = HarnessIdempotencyRef::new(format!(
+            "hidem_{}",
+            "f".repeat(24),
+        )).unwrap();
+        create_run_two.updated_at_unix_ms = run_two.updated_at_unix_ms;
+        create_run_two.finished_at_unix_ms = Some(run_two.updated_at_unix_ms);
+
+        HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![current_task],
+            runs: vec![run_one, run_two],
+            grants: Vec::new(),
+            operations: vec![create_run_one, create_run_two],
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap()
+    }
+
+    fn result_ref_record_operation(
+        marker: char,
+        for_run_id: HarnessRunId,
+        expected_task_revision: HarnessRevision,
+        at_unix_ms: u64,
+    ) -> HarnessOperationV1 {
+        HarnessOperationV1 {
+            operation_id: operation_id(marker),
+            revision: revision(1),
+            actor: HarnessActorV1::ParentRun { run_id: for_run_id },
+            kind: HarnessOperationKindV1::RecordTaskResultRef,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: Some(task_id('a')),
+            run_id: None,
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(expected_task_revision),
+            request_digest: HarnessRequestDigest::new(marker.to_string().repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                marker.to_string().repeat(24),
+            )).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: at_unix_ms,
+            updated_at_unix_ms: at_unix_ms,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: Some(at_unix_ms),
+        }
+    }
+
+    #[test]
+    fn result_ref_record_freezes_every_field_except_refs_revision_and_updated_at() {
+        let engine = result_ref_fixture();
+        let current_task = engine.task(&task_id('a')).unwrap().clone();
+        let candidate = HarnessResultRef::for_run(&numbered_run_id(1));
+        let operation = result_ref_record_operation(
+            '1',
+            numbered_run_id(1),
+            current_task.revision,
+            30,
+        );
+
+        // task.state must never change here — not even alongside an
+        // otherwise-legal insertion.
+        let mut tampered = current_task.clone();
+        tampered.result_refs = vec![candidate.clone()];
+        tampered.revision = revision(current_task.revision.get() + 1);
+        tampered.updated_at_unix_ms = 30;
+        tampered.state = HarnessTaskStateV1::Done;
+        let before = engine.checkpoint();
+        assert!(matches!(
+            engine.prepare_task_result_ref_record(operation.clone(), current_task.revision, tampered),
+            Err(HarnessEngineError::InvalidResultRefRecordProjection),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+
+        let mut clean = current_task.clone();
+        clean.result_refs = vec![candidate.clone()];
+        clean.revision = revision(current_task.revision.get() + 1);
+        clean.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_task_result_ref_record(
+            operation,
+            current_task.revision,
+            clean.clone(),
+        ).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let recorded = committed.task(&task_id('a')).unwrap().clone();
+        let mut expected = current_task;
+        expected.result_refs = clean.result_refs;
+        expected.revision = clean.revision;
+        expected.updated_at_unix_ms = clean.updated_at_unix_ms;
+        assert_eq!(recorded, expected);
+    }
+
+    #[test]
+    fn result_ref_record_inserts_at_sorted_position() {
+        let engine = result_ref_fixture();
+        let current_task = engine.task(&task_id('a')).unwrap().clone();
+        let ref_one = HarnessResultRef::for_run(&numbered_run_id(1));
+        let ref_two = HarnessResultRef::for_run(&numbered_run_id(2));
+        assert!(ref_one < ref_two, "fixture run ids must sort ref_one before ref_two");
+
+        // Insert the higher-sorting ref first.
+        let first_operation = result_ref_record_operation(
+            '1',
+            numbered_run_id(2),
+            current_task.revision,
+            30,
+        );
+        let mut first_next = current_task.clone();
+        first_next.result_refs = vec![ref_two.clone()];
+        first_next.revision = revision(current_task.revision.get() + 1);
+        first_next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_task_result_ref_record(
+            first_operation,
+            current_task.revision,
+            first_next,
+        ).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+
+        // Insert the lower-sorting ref second — it must land BEFORE ref_two,
+        // not appended after it, proving insertion at the correct sorted
+        // position rather than a plain append.
+        let after_first = committed.task(&task_id('a')).unwrap().clone();
+        let second_operation = result_ref_record_operation(
+            '2',
+            numbered_run_id(1),
+            after_first.revision,
+            40,
+        );
+        let mut second_next = after_first.clone();
+        second_next.result_refs = vec![ref_one.clone(), ref_two.clone()];
+        second_next.revision = revision(after_first.revision.get() + 1);
+        second_next.updated_at_unix_ms = 40;
+        let prepared = committed.prepare_task_result_ref_record(
+            second_operation,
+            after_first.revision,
+            second_next,
+        ).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        committed.accept(prepared);
+        assert_eq!(
+            committed.task(&task_id('a')).unwrap().result_refs,
+            vec![ref_one, ref_two],
+        );
+    }
+
+    #[test]
+    fn result_ref_record_is_idempotent_on_replay() {
+        let engine = result_ref_fixture();
+        let current_task = engine.task(&task_id('a')).unwrap().clone();
+        let candidate = HarnessResultRef::for_run(&numbered_run_id(1));
+        let operation = result_ref_record_operation(
+            '1',
+            numbered_run_id(1),
+            current_task.revision,
+            30,
+        );
+        let mut next = current_task.clone();
+        next.result_refs = vec![candidate.clone()];
+        next.revision = revision(current_task.revision.get() + 1);
+        next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_task_result_ref_record(
+            operation,
+            current_task.revision,
+            next,
+        ).unwrap();
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let committed_snapshot = committed.checkpoint();
+
+        // A second reconcile pass rediscovers the exact same ref against a
+        // stale (pre-commit) revision snapshot — this must no-op, not
+        // conflict, mirroring the context-pack/git-facts twins' race
+        // mitigation.
+        let replay_operation = result_ref_record_operation(
+            '2',
+            numbered_run_id(1),
+            current_task.revision,
+            31,
+        );
+        let mut replay_next = current_task.clone();
+        replay_next.result_refs = vec![candidate];
+        replay_next.revision = revision(current_task.revision.get() + 1);
+        replay_next.updated_at_unix_ms = 31;
+        let replayed = committed.prepare_task_result_ref_record(
+            replay_operation,
+            current_task.revision,
+            replay_next,
+        ).unwrap();
+        assert_eq!(replayed.outcome(), HarnessApplyOutcome::Replayed);
+        assert_eq!(replayed.checkpoint(), committed_snapshot);
+    }
+
+    #[test]
+    fn result_ref_record_is_a_no_op_at_capacity() {
+        let mut current_task = task(task_id('a'), 2, "full task");
+        current_task.state = HarnessTaskStateV1::Review;
+        current_task.result_refs = (0..HARNESS_RESULTS_MAX)
+            .map(numbered_run_id)
+            .map(|run_id| HarnessResultRef::for_run(&run_id))
+            .collect();
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![current_task.clone()],
+            runs: Vec::new(),
+            grants: Vec::new(),
+            operations: Vec::new(),
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap();
+
+        // Same-value replay at capacity is a legal no-op: the delta is
+        // empty, so this must never reach — let alone be rejected by — the
+        // authority checks that a real insertion would require.
+        let replay_operation = result_ref_record_operation(
+            '1',
+            numbered_run_id(0),
+            current_task.revision,
+            30,
+        );
+        let mut replay_next = current_task.clone();
+        replay_next.revision = revision(current_task.revision.get() + 1);
+        replay_next.updated_at_unix_ms = 30;
+        let replayed = engine.prepare_task_result_ref_record(
+            replay_operation,
+            current_task.revision,
+            replay_next,
+        ).unwrap();
+        assert_eq!(replayed.outcome(), HarnessApplyOutcome::Replayed);
+        assert_eq!(replayed.checkpoint(), engine.checkpoint());
+
+        // An attempted substitution while at capacity (same length, but a
+        // different set of refs) is rejected — capacity only ever permits
+        // the unchanged no-op, never a swap.
+        let substitute_operation = result_ref_record_operation(
+            '2',
+            numbered_run_id(HARNESS_RESULTS_MAX),
+            current_task.revision,
+            30,
+        );
+        let mut substitute_next = current_task.clone();
+        substitute_next.result_refs.pop();
+        substitute_next.result_refs.push(
+            HarnessResultRef::for_run(&numbered_run_id(HARNESS_RESULTS_MAX)),
+        );
+        substitute_next.result_refs.sort();
+        substitute_next.revision = revision(current_task.revision.get() + 1);
+        substitute_next.updated_at_unix_ms = 30;
+        let before = engine.checkpoint();
+        assert!(matches!(
+            engine.prepare_task_result_ref_record(
+                substitute_operation,
+                current_task.revision,
+                substitute_next,
+            ),
+            Err(HarnessEngineError::InvalidResultRefRecordProjection),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+    }
+
+    #[test]
+    fn result_ref_record_rejects_removal_or_reorder() {
+        let mut current_task = task(task_id('a'), 2, "seeded task");
+        current_task.state = HarnessTaskStateV1::Review;
+        let ref_one = HarnessResultRef::for_run(&numbered_run_id(1));
+        let ref_two = HarnessResultRef::for_run(&numbered_run_id(2));
+        let ref_three = HarnessResultRef::for_run(&numbered_run_id(3));
+        current_task.result_refs = vec![ref_one.clone(), ref_two.clone()];
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![current_task.clone()],
+            runs: Vec::new(),
+            grants: Vec::new(),
+            operations: Vec::new(),
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap();
+        let before = engine.checkpoint();
+
+        // Removal: drop ref_two entirely.
+        let removal_operation = result_ref_record_operation(
+            '1',
+            numbered_run_id(1),
+            current_task.revision,
+            30,
+        );
+        let mut removed = current_task.clone();
+        removed.result_refs = vec![ref_one.clone()];
+        removed.revision = revision(current_task.revision.get() + 1);
+        removed.updated_at_unix_ms = 30;
+        assert!(matches!(
+            engine.prepare_task_result_ref_record(removal_operation, current_task.revision, removed),
+            Err(HarnessEngineError::InvalidResultRefRecordProjection),
+        ));
+
+        // Reorder: same two entries, swapped positions — rejected by the
+        // task's own struct validation (result_refs must stay sorted
+        // ascending) before this mutation's own projection check ever runs.
+        let reorder_operation = result_ref_record_operation(
+            '2',
+            numbered_run_id(1),
+            current_task.revision,
+            30,
+        );
+        let mut reordered = current_task.clone();
+        reordered.result_refs = vec![ref_two.clone(), ref_one.clone()];
+        reordered.revision = revision(current_task.revision.get() + 1);
+        reordered.updated_at_unix_ms = 30;
+        assert!(matches!(
+            engine.prepare_task_result_ref_record(reorder_operation, current_task.revision, reordered),
+            Err(HarnessEngineError::Validation(HarnessValidationError::CollectionNotCanonical {
+                field: "result_refs",
+            })),
+        ));
+
+        // Unrelated substitution: same length, but ref_two replaced by an
+        // unrelated third ref — not an insertion, not a replay, rejected.
+        let substitution_operation = result_ref_record_operation(
+            '3',
+            numbered_run_id(1),
+            current_task.revision,
+            30,
+        );
+        let mut substituted = current_task.clone();
+        substituted.result_refs = vec![ref_one, ref_three];
+        substituted.revision = revision(current_task.revision.get() + 1);
+        substituted.updated_at_unix_ms = 30;
+        assert!(matches!(
+            engine.prepare_task_result_ref_record(
+                substitution_operation,
+                current_task.revision,
+                substituted,
+            ),
+            Err(HarnessEngineError::InvalidResultRefRecordProjection),
+        ));
+
+        assert_eq!(engine.checkpoint(), before);
     }
 
     #[test]

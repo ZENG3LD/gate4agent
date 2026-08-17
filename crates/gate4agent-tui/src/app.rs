@@ -3766,6 +3766,17 @@ impl App {
                 None,
             ),
         };
+        // A node we have never registered at all (no snapshot has arrived yet)
+        // is a different failure than a known node whose incarnation moved on:
+        // there is no established topology baseline to resync against, so
+        // requesting one would just signal a gap that bootstrap already covers.
+        if !self.nodes.iter().any(|node| node.node_id == target.node_id()) {
+            return self.reject_observation_ingress(
+                target.node_id(),
+                "Session Monitor rejected observation for a non-current session; node is not registered yet".to_owned(),
+                None,
+            );
+        }
         if !self.is_current_node_incarnation(target.node_id(), target.incarnation()) {
             let after = self.nodes.iter()
                 .find(|node| node.node_id == target.node_id())
@@ -16506,6 +16517,14 @@ impl App {
                 return AppAction::None;
             };
             if !matches_route {
+                if let Some(view) = self.preview_tabs.get_mut(&origin) {
+                    view.phase = PreviewTabPhase::Hydrated;
+                    view.reconnect_error = Some(
+                        "Reconnect failed: resumed session no longer matches this history entry."
+                            .to_owned(),
+                    );
+                }
+                self.preview_resume = None;
                 return AppAction::None;
             }
             let record_id = record.record_id.clone();
@@ -16516,6 +16535,24 @@ impl App {
             };
             self.upsert_managed_session(record.clone());
             if let Some(mut view) = self.preview_tabs.remove(&origin) {
+                // The resolved record can already have its own preview tab open
+                // elsewhere (e.g. resumed independently while this index was in
+                // flight). `replace_tab` writes unconditionally, so rekeying onto
+                // an already-open identity would silently duplicate it and
+                // clobber that tab's state; refuse and leave both tabs in place.
+                if self
+                    .surface
+                    .tab_location(&SurfaceTab::Preview(replacement_key.clone()))
+                    .is_some()
+                {
+                    view.phase = PreviewTabPhase::Hydrated;
+                    view.reconnect_error = Some(
+                        "Reconnect failed: this session is already open in another tab.".to_owned(),
+                    );
+                    self.preview_tabs.insert(origin, view);
+                    self.preview_resume = None;
+                    return AppAction::None;
+                }
                 view.phase = PreviewTabPhase::Resuming;
                 view.record_id = Some(record_id.clone());
                 if self.surface.replace_tab(
@@ -21140,6 +21177,15 @@ mod tests {
             } if workspace_id == "workspace-a" && group_provider == &provider("codex")
         )).unwrap();
         app.existing_session.as_mut().unwrap().tree_cursor = codex_provider;
+        // Provider branches start collapsed on first open of the native/live tree
+        // (see `initial_native_provider_branches_are_collapsed_and_keep_grok_header_visible`),
+        // so the first Enter here expands codex before a second Enter re-collapses it.
+        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(!app.collapsed_native_providers.contains(&(
+            "node-a".to_owned(),
+            NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+            provider("codex"),
+        )));
         assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
         assert!(app.collapsed_native_providers.contains(&(
             "node-a".to_owned(),
@@ -22707,18 +22753,21 @@ mod tests {
         app.history = Some(loaded_history(&app, Some(context_receipt())));
         app.focus = Focus::Agents;
         app.reduce(UiKey::Ctrl('n'));
+        // `SpawnField` only focuses a field; `SpawnFieldNext` is the click
+        // target that also advances its value, so exercising the mouse-driven
+        // route/target/context toggles below needs the latter.
         app.layout.hits = vec![
             HitRegion {
                 rect: Rect::new(1, 1, 10, 1),
-                target: HitTarget::SpawnField(LaunchField::Workspace),
+                target: HitTarget::SpawnFieldNext(LaunchField::Workspace),
             },
             HitRegion {
                 rect: Rect::new(1, 2, 10, 1),
-                target: HitTarget::SpawnField(LaunchField::GitLocation),
+                target: HitTarget::SpawnFieldNext(LaunchField::GitLocation),
             },
             HitRegion {
                 rect: Rect::new(1, 3, 10, 1),
-                target: HitTarget::SpawnField(LaunchField::ContinueFrom),
+                target: HitTarget::SpawnFieldNext(LaunchField::ContinueFrom),
             },
             HitRegion {
                 rect: Rect::new(1, 4, 10, 1),
@@ -23288,6 +23337,10 @@ mod tests {
         assert_eq!(app.spawn.as_ref().unwrap().workspace_id, "workspace-b");
         assert_eq!(app.spawn.as_ref().unwrap().provider, provider("kimi"));
 
+        // The dialog opens focused on the Node field (there is only one node,
+        // so Up/Down there is a no-op); move to the Workspace field before
+        // exercising its route change.
+        app.spawn.as_mut().unwrap().field = LaunchField::Workspace;
         app.reduce(UiKey::Up);
         assert_eq!(app.spawn.as_ref().unwrap().workspace_id, "workspace-a");
         app.reduce(UiKey::Down);
@@ -23795,9 +23848,18 @@ mod tests {
         assert_eq!(app.selected_workspace_route(), Some(("node-b".to_owned(), "workspace-b".to_owned())));
         assert_eq!(app.selected_agent_session().unwrap().address, surviving_address);
         assert_eq!(app.surface.leaf_ids().len(), 1);
-        assert_eq!(app.focus, Focus::Tabs);
+        // The removed pane is empty and gets merged away by
+        // `remove_pane_if_empty`, which hands focus straight to the surviving
+        // pane — so Viewport focus is retained instead of dropping to Tabs, and
+        // Enter is already live terminal input rather than a Tabs-to-Viewport
+        // navigation step.
+        assert_eq!(app.focus, Focus::Viewport);
 
-        assert_eq!(app.reduce(UiKey::Enter), AppAction::None);
+        assert!(matches!(
+            app.reduce(UiKey::Enter),
+            AppAction::TerminalControl { address, control: TerminalControl::Enter }
+                if address == surviving_address
+        ));
         assert!(matches!(
             app.reduce(UiKey::Char('x')),
             AppAction::Input { address, text } if address == surviving_address && text == "x"
@@ -23863,7 +23925,9 @@ mod tests {
         assert_eq!(app.menu_placement, MenuPlacement::Modal);
         assert!(matches!(app.reduce(UiKey::Right), AppAction::InspectWorkspace { .. }));
         assert_eq!(app.control_section, ControlSection::Git);
-        assert_eq!(app.reduce(UiKey::Right), AppAction::None);
+        // Entering the Agents section for the first time opens the unified
+        // native/live tree, which kicks off its own native session catalog fetch.
+        assert!(matches!(app.reduce(UiKey::Right), AppAction::CatalogNativeSessions { .. }));
         assert_eq!(app.control_section, ControlSection::Agents);
         assert_eq!(app.reduce(UiKey::Right), AppAction::None);
         assert_eq!(app.control_section, ControlSection::Workspaces);
@@ -23921,9 +23985,12 @@ mod tests {
             rect: Rect::new(30, 11, 40, 1),
             target: HitTarget::ControlSection(ControlSection::Agents),
         });
-        assert_eq!(app.click(40, 11), AppAction::None);
+        // Selecting the Agents control section now also switches to the Agents
+        // roster and opens the unified native/live tree (first-visit catalog
+        // fetch), so both the action and the roster mode follow it.
+        assert!(matches!(app.click(40, 11), AppAction::CatalogNativeSessions { .. }));
         assert_eq!(app.control_section, ControlSection::Agents);
-        assert_eq!(app.roster_mode, RosterMode::Workspaces);
+        assert_eq!(app.roster_mode, RosterMode::Agents);
     }
 
     #[test]
@@ -24381,7 +24448,12 @@ mod tests {
         let address = active_pty_address(&app);
         app.nodes[0].workspaces[0].sessions[0].terminal_scrollback =
             (0..10).map(|line| format!("history-{line}").into_bytes()).collect();
-        app.layout.viewport = Rect::new(26, 1, 74, 20);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id: PaneId(0),
+            frame: Rect::new(26, 0, 74, 21),
+            header: Rect::new(26, 0, 74, 1),
+            viewport: Rect::new(26, 1, 74, 20),
+        }];
 
         assert_eq!(app.scroll(30, 5, true), AppAction::None);
         assert_eq!(app.terminal_scroll_offset(&address), WHEEL_SCROLL_LINES);
@@ -24396,7 +24468,12 @@ mod tests {
         session.terminal_alternate_screen = true;
         session.terminal_mouse_protocol_enabled = true;
         session.terminal_mouse_protocol_encoding = TerminalMouseProtocolEncoding::Sgr;
-        app.layout.viewport = Rect::new(26, 1, 74, 20);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id: PaneId(0),
+            frame: Rect::new(26, 0, 74, 21),
+            header: Rect::new(26, 0, 74, 1),
+            viewport: Rect::new(26, 1, 74, 20),
+        }];
 
         assert!(matches!(
             app.scroll(30, 5, true),
@@ -24415,7 +24492,12 @@ mod tests {
         session.terminal_scrollback = vec![b"history".to_vec()];
         session.terminal_mouse_protocol_enabled = true;
         session.terminal_mouse_protocol_encoding = TerminalMouseProtocolEncoding::Sgr;
-        app.layout.viewport = Rect::new(26, 1, 74, 20);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id: PaneId(0),
+            frame: Rect::new(26, 0, 74, 21),
+            header: Rect::new(26, 0, 74, 1),
+            viewport: Rect::new(26, 1, 74, 20),
+        }];
 
         assert!(matches!(
             app.scroll(30, 5, true),
@@ -24433,7 +24515,12 @@ mod tests {
         session.terminal_scrollback = vec![b"history".to_vec()];
         session.terminal_mouse_protocol_enabled = true;
         session.terminal_mouse_protocol_encoding = TerminalMouseProtocolEncoding::Sgr;
-        app.layout.viewport = Rect::new(26, 1, 74, 20);
+        app.layout.surface_panes = vec![SurfacePaneLayout {
+            pane_id: PaneId(0),
+            frame: Rect::new(26, 0, 74, 21),
+            header: Rect::new(26, 0, 74, 1),
+            viewport: Rect::new(26, 1, 74, 20),
+        }];
 
         assert_eq!(app.scroll(30, 5, true), AppAction::None);
         assert_eq!(app.terminal_scroll_offset(&address), 1);
@@ -26017,7 +26104,19 @@ mod tests {
 
         assert_eq!(app.selected_agent, reordered_index);
         assert_eq!(app.selected_managed_session().unwrap().record_id, "record-dormant");
-        assert_eq!(app.surface.all_tabs().len(), 1);
+        // Dropping back at the click origin (no intervening pointer movement) is
+        // a plain click, and clicking a dormant-but-resumable record now opens
+        // its preview tab (`open_selected_agent`'s Dormant branch) rather than
+        // doing nothing — so the surface gains a second tab, and it must be the
+        // tracked record's, not whatever now sits at the original index.
+        assert_eq!(app.surface.all_tabs().len(), 2);
+        assert_eq!(
+            app.surface.active_tab(),
+            Some(&SurfaceTab::Preview(PreviewTabKey::ManagedRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-dormant".to_owned(),
+            })),
+        );
     }
 
     #[test]

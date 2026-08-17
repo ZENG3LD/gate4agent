@@ -822,10 +822,22 @@ impl C2ApplyState {
                     .insert(current.incarnation_id);
             }
         }
-        let event_incarnation = self.event_watermarks
-            .get(node_id)
-            .map(|current| current.incarnation_id);
-        if let Some(previous) = event_incarnation.filter(|previous| *previous != cursor.incarnation_id) {
+        let event_current = self.event_watermarks.get(node_id).copied();
+        if let Some(current) = event_current {
+            // A later per-event update can already have advanced past this
+            // snapshot's watermark (events and snapshots are applied
+            // independently); a snapshot stale relative to that must not
+            // regress state the event already established.
+            if current.incarnation_id == cursor.incarnation_id
+                && cursor.sequence < current.sequence
+            {
+                return false;
+            }
+        }
+        if let Some(previous) = event_current
+            .map(|current| current.incarnation_id)
+            .filter(|previous| *previous != cursor.incarnation_id)
+        {
             self.retired_incarnations
                 .entry(node_id.to_owned())
                 .or_default()
@@ -863,6 +875,22 @@ impl C2ApplyState {
         });
         self.event_watermarks.insert(node_id.to_owned(), cursor);
         C2EventAdmission::Accepted { gap_after }
+    }
+
+    /// A session-record/terminal-frame event that is at or below the most
+    /// recently accepted snapshot's own watermark is a duplicate (or older)
+    /// relative to that snapshot and must not regress the state it
+    /// established. Deliberately not folded into `accept_event`: observations
+    /// share that function as a fallback and are allowed to trail a snapshot's
+    /// `event_sequence` (they are a separate, independently queued stream).
+    fn event_is_stale_relative_to_snapshot(
+        &self,
+        node_id: &str,
+        cursor: gate4agent_c2_protocol::NodeCursor,
+    ) -> bool {
+        self.snapshot_watermarks.get(node_id).is_some_and(|current| {
+            current.incarnation_id == cursor.incarnation_id && cursor.sequence <= current.sequence
+        })
     }
 
     fn accept_observation(
@@ -6445,6 +6473,9 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
             }
         }
         WorkerUpdate::C2Event { node_id, cursor, event } => {
+            if c2.event_is_stale_relative_to_snapshot(&node_id, cursor) {
+                return AppAction::None;
+            }
             let C2EventAdmission::Accepted { gap_after } = c2.accept_event(&node_id, cursor)
             else { return AppAction::None; };
             if let Some(after_sequence) = gap_after {
@@ -9012,7 +9043,8 @@ mod tests {
             workspace_id: "workspace-a".to_owned(),
             provider: provider("codex"),
             target: LaunchTarget::ExistingWorkspace,
-            profile_id: "default".to_owned(),
+            // Must match `test_launch_inventory()`'s only advertised profile id.
+            profile_id: "review-default".to_owned(),
             worktree_profile_id: "default".to_owned(),
             bundle_id: String::new(),
             context_mode: LaunchContextMode::None,
@@ -9209,6 +9241,14 @@ mod tests {
             1,
         )
         .await;
+        // A non-observation `NodeEvent` publishes its cursor advance and its
+        // payload as two separate messages; drain both so nothing is left in
+        // the channel to leak into the next section's `recv` below.
+        apply_update(
+            &mut app,
+            &mut C2ApplyState::default(),
+            receiver.recv().await.unwrap(),
+        );
         apply_update(
             &mut app,
             &mut C2ApplyState::default(),
@@ -9252,6 +9292,13 @@ mod tests {
             1,
         )
         .await;
+        // Same two-message shape as above: the cursor advance, then the
+        // removal payload itself.
+        apply_update(
+            &mut app,
+            &mut C2ApplyState::default(),
+            receiver.recv().await.unwrap(),
+        );
         apply_update(
             &mut app,
             &mut C2ApplyState::default(),
@@ -11389,6 +11436,15 @@ mod tests {
         assert_eq!(dialog.rows.len(), 1);
         assert_eq!(dialog.rows[0].title.as_deref(), Some("Persisted native review"));
         assert_eq!(dialog.rows[0].route, route);
+        // The provider branch carrying this catalog result starts collapsed on
+        // first open of the native/live tree (see
+        // `initial_native_provider_branches_are_collapsed_and_keep_grok_header_visible`);
+        // expand it so its projected Session item is reachable.
+        app.collapsed_native_providers.remove(&(
+            "node-a".to_owned(),
+            crate::app::NativeSessionGroupKey::Workspace(route.workspace_id.clone().unwrap()),
+            route.provider.clone(),
+        ));
         assert!(app.native_session_tree_items().iter().any(|item| {
             matches!(item, crate::app::NativeSessionTreeItem::Session { .. })
         }));

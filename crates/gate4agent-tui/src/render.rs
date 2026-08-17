@@ -1102,7 +1102,6 @@ fn render_agent_list(
         let rendered_height = card_height.min(area.bottom().saturating_sub(y));
         let selected = index == app.selected_agent;
         let background = if selected { theme.active } else { theme.panel };
-        let compact_actions_only = area.width < 55;
         let more_label = if area.width < 30 { "[act]" } else { "[actions]" };
         let more_width = (cell_width(more_label) as u16).min(area.width);
         let run_label = if area.width < 40 {
@@ -1127,33 +1126,37 @@ fn render_agent_list(
         } else {
             0
         };
-        if compact_actions_only {
-            run_width = 0;
-            progress_width = 0;
-            order_width = 0;
-        }
-        let reserved_controls = more_width
+        // Shed controls in order of how replaceable they are: the run-lens and
+        // progress toggles both fall back to the "[actions]" menu, but the order
+        // handle is the only way to reorder a pinned managed agent, so it is kept
+        // as long as the title still has room for a few characters. `MIN_TITLE`
+        // mirrors the reservation `title_width` makes below (marker + 3 gaps).
+        const MIN_TITLE: u16 = 5;
+        let fixed_overhead = 6_u16.saturating_add(MIN_TITLE);
+        let order_reserved = order_width.saturating_add(u16::from(order_width > 0));
+        if fixed_overhead
+            .saturating_add(more_width)
             .saturating_add(run_width)
             .saturating_add(progress_width)
-            .saturating_add(order_width)
-            .saturating_add(5);
-        if reserved_controls > area.width {
-            order_width = 0;
-        }
-        if more_width
-            .saturating_add(run_width)
-            .saturating_add(progress_width)
-            .saturating_add(4)
+            .saturating_add(order_reserved)
             > area.width
         {
             progress_width = 0;
         }
-        if more_width
+        if fixed_overhead
+            .saturating_add(more_width)
             .saturating_add(run_width)
-            .saturating_add(3)
+            .saturating_add(order_reserved)
             > area.width
         {
             run_width = 0;
+        }
+        if fixed_overhead
+            .saturating_add(more_width)
+            .saturating_add(order_reserved)
+            > area.width
+        {
+            order_width = 0;
         }
         let title_width = area
             .width
@@ -1230,6 +1233,7 @@ fn render_agent_list(
                 )
             }
         };
+        let order_offset = order_width.saturating_add(u16::from(order_width > 0));
         Paragraph::new(Text::from_lines(vec![Line::from_spans(vec![
             Span::styled(format!(" {marker} "), Style::default().fg(color)),
             Span::styled(
@@ -1238,7 +1242,15 @@ fn render_agent_list(
             ),
         ])]))
         .style(Style::default().bg(background))
-        .render(Rect::new(area.x, y, area.width, 1), buf);
+        .render(
+            Rect::new(
+                area.x.saturating_add(order_offset),
+                y,
+                area.width.saturating_sub(order_offset),
+                1,
+            ),
+            buf,
+        );
         Paragraph::new(format!(
             "   {}",
             compact_middle_cells(&secondary, area.width.saturating_sub(3) as usize)
@@ -1499,7 +1511,11 @@ fn render_native_session_list(
         NativeSessionTreeItem::Agent { agent_index, .. } => app.agent_rows()
             .get(*agent_index)
             .map(|key| {
-                if area.width >= 55 && app.agent_progress_expanded(key) {
+                // 25 matches the roster's default sidebar content width (see
+                // `compact_agent_actions` below): below it there is no room for
+                // the run/progress controls, so the expanded detail lines never
+                // render and the row only needs its single label line.
+                if area.width >= 25 && app.agent_progress_expanded(key) {
                     4
                 } else {
                     1
@@ -1701,7 +1717,9 @@ fn render_native_session_list(
             NativeSessionTreeItem::Agent { agent_index, .. } => Some(*agent_index),
             _ => None,
         };
-        let compact_agent_actions = agent_run_key.is_some() && area.width < 55;
+        // 25 is the default sidebar content width; narrower than that there is no
+        // room left for the run-lens/progress toggles alongside the row label.
+        let compact_agent_actions = agent_run_key.is_some() && area.width < 25;
         let agent_expanded = agent_run_key.as_ref()
             .is_some_and(|key| app.agent_progress_expanded(key));
         let progress_label = if agent_expanded { "[details -]" } else { "[details +]" };
@@ -12239,6 +12257,25 @@ mod tests {
         let mut unified = fixture(PtyColorMode::Inherited);
         unified.focus = Focus::Agents;
         let _ = unified.reduce(crate::app::UiKey::Char('a'));
+        // The unified tree starts with every provider branch collapsed on first
+        // open (see `begin_existing_session`'s one-time
+        // `native_provider_branches_initialized` seeding); expand kimi's branch
+        // before its row's stable AgentRun key becomes reachable.
+        let opening = render(&unified, &mut buf);
+        let provider_branch = opening
+            .hits
+            .iter()
+            .find(|hit| {
+                hit.target
+                    == HitTarget::NativeProviderGroup(
+                        NativeSessionGroupKey::Workspace("workspace-a".to_owned()),
+                        provider("kimi"),
+                    )
+            })
+            .cloned()
+            .expect("native tree exposes the kimi provider branch");
+        unified.layout = opening;
+        unified.click(provider_branch.rect.x, provider_branch.rect.y);
         let tree = render(&unified, &mut buf);
         assert!(tree.hits.iter().any(|hit| {
             hit.target == HitTarget::AgentRun(AgentRowKey::Legacy(active_pty_address(&unified)))
@@ -13116,7 +13153,7 @@ mod tests {
         }
         app.selected_space = 7;
         app.roster_mode = RosterMode::Workspaces;
-        let mut buf = TerminalBuffer::new(60, 12);
+        let mut buf = TerminalBuffer::new(60, 14);
 
         let top_layout = render(&app, &mut buf);
         assert!(top_layout.hits.iter().any(|hit| hit.target == HitTarget::Space(0)));
@@ -13139,9 +13176,10 @@ mod tests {
         let mut buf = TerminalBuffer::new(100, 24);
 
         let layout = render(&app, &mut buf);
+        let pane_viewport = layout.surface_panes[0].viewport;
 
-        assert_eq!(buf.get(layout.viewport.x, layout.viewport.y).symbol, "H");
-        assert_eq!(buf.get(layout.viewport.x, layout.viewport.y + 1).symbol, "C");
+        assert_eq!(buf.get(pane_viewport.x, pane_viewport.y).symbol, "H");
+        assert_eq!(buf.get(pane_viewport.x, pane_viewport.y + 1).symbol, "C");
     }
 
     #[test]
@@ -13149,7 +13187,8 @@ mod tests {
         let app = fixture(PtyColorMode::Inherited);
         let mut buf = TerminalBuffer::new(100, 24);
         let layout = render(&app, &mut buf);
-        let cell = buf.get(layout.viewport.x, layout.viewport.y);
+        let pane_viewport = layout.surface_panes[0].viewport;
+        let cell = buf.get(pane_viewport.x, pane_viewport.y);
         assert_eq!(cell.symbol, "K");
         assert_eq!(cell.style.fg, Color::Rgb(80, 160, 255));
         assert_eq!(cell.style.bg, Color::Rgb(0, 51, 102));
@@ -13160,7 +13199,8 @@ mod tests {
         let app = fixture(PtyColorMode::GateOverride);
         let mut buf = TerminalBuffer::new(100, 24);
         let layout = render(&app, &mut buf);
-        let cell = buf.get(layout.viewport.x, layout.viewport.y);
+        let pane_viewport = layout.surface_panes[0].viewport;
+        let cell = buf.get(pane_viewport.x, pane_viewport.y);
         assert_eq!(cell.symbol, "K");
         assert_ne!(cell.style.fg, Color::Rgb(80, 160, 255));
         assert_eq!(cell.style.bg, TERM_BG);
@@ -15739,13 +15779,20 @@ mod tests {
                 },
             ),
         );
+        // `Error.detail` is a bounded lowercase category slug
+        // (`validate_error_category` in gate4agent-observation-api), so it can
+        // never carry raw sentinel-shaped text — ingestion fail-closes on
+        // anything else. Exercise it with a representative valid category and
+        // keep the sentinel on the two fields that do carry free text below.
         apply_render_monitor_observation(
             &mut app,
             2,
             render_monitor_observation(
                 2,
                 gate4agent_node_protocol::ObservationEvidenceV1::StructuredProvider,
-                gate4agent_node_protocol::ObservationKindV1::Error { detail: sentinel.to_owned() },
+                gate4agent_node_protocol::ObservationKindV1::Error {
+                    detail: "provider-tool-error".to_owned(),
+                },
             ),
         );
         apply_render_monitor_observation(

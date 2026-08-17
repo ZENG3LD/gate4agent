@@ -65,6 +65,7 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V5: u16 = 5;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V6: u16 = 6;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V7: u16 = 7;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V8: u16 = 8;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V9: u16 = 9;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -74,6 +75,8 @@ pub const HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX: u16 = 24;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_TEXT_MAX_BYTES: usize = 4_096;
 pub const HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX: u16 = 64;
 pub const HARNESS_TASK_LAUNCH_OPTIONS_MAX: usize = 64;
+pub const HARNESS_RUNTIME_SPAWN_PROFILES_MAX: usize = 64;
+pub const HARNESS_RUNTIME_LAUNCH_BUNDLES_MAX: usize = 128;
 pub const HARNESS_REPOSITORY_PATH_MAX_BYTES: usize = 1_024;
 pub const HARNESS_WORKSPACE_FILE_MAX_BYTES: usize = 256 * 1_024;
 pub const HARNESS_WORKSPACE_TREE_ENTRIES_MAX: usize = 512;
@@ -196,6 +199,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V6
                 | HARNESS_OPERATOR_WIRE_VERSION_V7
                 | HARNESS_OPERATOR_WIRE_VERSION_V8
+                | HARNESS_OPERATOR_WIRE_VERSION_V9
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -890,6 +894,42 @@ impl HarnessRunWorkspaceOriginV1 {
     }
 }
 
+/// Node-scoped sibling of `HarnessRunWorkspaceOriginV1`: identifies a
+/// workspace read routed straight from a node/workspace pair, with no run
+/// binding to descend from.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessNodeWorkspaceOriginV1 {
+    pub node_id: String,
+    pub node_incarnation_id: String,
+    pub workspace_id: String,
+}
+
+impl HarnessNodeWorkspaceOriginV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if !valid_runtime_id(&self.node_id, 128)
+            || self.node_incarnation_id.len() != 32
+            || !self.node_incarnation_id.bytes().all(is_lower_hex)
+            || !valid_runtime_id(&self.workspace_id, 128)
+        {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceOrigin);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        if self.node_id != node_id || self.workspace_id != workspace_id {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceOrigin);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessWorkspaceEntryKindV1 {
@@ -1029,6 +1069,39 @@ impl HarnessRunWorkspaceInspectionV1 {
     }
 }
 
+/// Node-scoped sibling of `HarnessRunWorkspaceInspectionV1`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessNodeWorkspaceInspectionV1 {
+    pub origin: HarnessNodeWorkspaceOriginV1,
+    pub entries: Vec<HarnessWorkspaceTreeEntryV1>,
+    pub tree_truncated: bool,
+    pub git: HarnessGitSummaryV1,
+}
+
+impl HarnessNodeWorkspaceInspectionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        if self.entries.len() > HARNESS_WORKSPACE_TREE_ENTRIES_MAX {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceTree);
+        }
+        for entry in &self.entries { entry.validate()?; }
+        if self.entries.windows(2).any(|entries| entries[0].relative_path >= entries[1].relative_path) {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceTree);
+        }
+        self.git.validate()
+    }
+
+    pub fn validate_for(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(node_id, workspace_id)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessWorkspaceFileContentV1 {
@@ -1089,6 +1162,43 @@ impl HarnessRunWorkspaceFileV1 {
     ) -> Result<(), HarnessOperatorApiError> {
         self.validate()?;
         self.origin.validate_for(run_id)?;
+        if &self.path != path {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+        }
+        Ok(())
+    }
+}
+
+/// Node-scoped sibling of `HarnessRunWorkspaceFileV1`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessNodeWorkspaceFileV1 {
+    pub origin: HarnessNodeWorkspaceOriginV1,
+    pub path: HarnessRepositoryPathV1,
+    pub content: HarnessWorkspaceFileContentV1,
+    pub revision: Option<HarnessWorkspaceFileRevisionV1>,
+}
+
+impl HarnessNodeWorkspaceFileV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        self.path.validate()?;
+        self.content.validate()?;
+        if let Some(revision) = &self.revision { revision.validate()?; }
+        if !matches!(&self.content, HarnessWorkspaceFileContentV1::Utf8 { .. }) && self.revision.is_some() {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+        path: &HarnessRepositoryPathV1,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(node_id, workspace_id)?;
         if &self.path != path {
             return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
         }
@@ -1193,6 +1303,55 @@ impl HarnessRunGitHistoryPageV1 {
     }
 }
 
+/// Node-scoped sibling of `HarnessRunGitHistoryPageV1`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessNodeGitHistoryPageV1 {
+    pub origin: HarnessNodeWorkspaceOriginV1,
+    pub path: Option<HarnessRepositoryPathV1>,
+    pub commits: Vec<HarnessGitCommitV1>,
+    pub next_before: Option<HarnessGitObjectIdV1>,
+    pub truncated: bool,
+}
+
+impl HarnessNodeGitHistoryPageV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        if let Some(path) = &self.path { path.validate()?; }
+        if self.commits.len() > usize::from(HARNESS_GIT_HISTORY_LIMIT_MAX) {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        for commit in &self.commits { commit.validate()?; }
+        if self.commits.iter().enumerate().any(|(index, commit)| {
+            self.commits[..index].iter().any(|existing| existing.id == commit.id)
+        }) {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        if let Some(next_before) = &self.next_before {
+            next_before.validate()?;
+            if self.commits.last().map(|commit| &commit.id) != Some(next_before) {
+                return Err(HarnessOperatorApiError::InvalidGitHistory);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+        path: Option<&HarnessRepositoryPathV1>,
+        limit: u16,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(node_id, workspace_id)?;
+        if self.path.as_ref() != path || self.commits.len() > usize::from(limit) {
+            return Err(HarnessOperatorApiError::InvalidGitHistory);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessGitDiffModeV1 {
@@ -1240,6 +1399,44 @@ impl HarnessRunGitDiffV1 {
     ) -> Result<(), HarnessOperatorApiError> {
         self.validate()?;
         self.origin.validate_for(run_id)?;
+        if &self.mode != mode || self.path.as_ref() != path {
+            return Err(HarnessOperatorApiError::InvalidGitDiff);
+        }
+        Ok(())
+    }
+}
+
+/// Node-scoped sibling of `HarnessRunGitDiffV1`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessNodeGitDiffV1 {
+    pub origin: HarnessNodeWorkspaceOriginV1,
+    pub mode: HarnessGitDiffModeV1,
+    pub path: Option<HarnessRepositoryPathV1>,
+    pub text: String,
+    pub truncated: bool,
+}
+
+impl HarnessNodeGitDiffV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        self.mode.validate()?;
+        if let Some(path) = &self.path { path.validate()?; }
+        if self.text.len() > HARNESS_GIT_DIFF_MAX_BYTES {
+            return Err(HarnessOperatorApiError::InvalidGitDiff);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+        mode: &HarnessGitDiffModeV1,
+        path: Option<&HarnessRepositoryPathV1>,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(node_id, workspace_id)?;
         if &self.mode != mode || self.path.as_ref() != path {
             return Err(HarnessOperatorApiError::InvalidGitDiff);
         }
@@ -1556,6 +1753,29 @@ pub enum HarnessOperatorRequestV1 {
         mode: HarnessGitDiffModeV1,
         path: Option<HarnessRepositoryPathV1>,
     },
+    // Node-scoped siblings of the `*RunWorkspace*`/`*RunGit*` family above:
+    // routed straight from a node/workspace pair with no run binding, for
+    // sidebar Files/Git reads that have no run in flight (harness-mode
+    // parity with the direct-C2 TUI's `InspectWorkspace`).
+    InspectNodeWorkspace { node_id: String, workspace_id: String },
+    ReadNodeWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+    },
+    ReadNodeGitHistory {
+        node_id: String,
+        workspace_id: String,
+        path: Option<HarnessRepositoryPathV1>,
+        before: Option<HarnessGitObjectIdV1>,
+        limit: u16,
+    },
+    ReadNodeGitDiff {
+        node_id: String,
+        workspace_id: String,
+        mode: HarnessGitDiffModeV1,
+        path: Option<HarnessRepositoryPathV1>,
+    },
     LaunchPlansList {
         after_plan_id: Option<HarnessSelectorV1>,
         limit: u16,
@@ -1654,6 +1874,28 @@ impl HarnessOperatorRequestV1 {
             }
             Self::ReadRunGitDiff { run_id, mode, path } => {
                 run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                mode.validate()?;
+                if let Some(path) = path { path.validate()?; }
+                Ok(())
+            }
+            Self::InspectNodeWorkspace { node_id, workspace_id } => {
+                validate_node_workspace_route(node_id, workspace_id)
+            }
+            Self::ReadNodeWorkspaceFile { node_id, workspace_id, path } => {
+                validate_node_workspace_route(node_id, workspace_id)?;
+                path.validate()
+            }
+            Self::ReadNodeGitHistory { node_id, workspace_id, path, before, limit } => {
+                validate_node_workspace_route(node_id, workspace_id)?;
+                if let Some(path) = path { path.validate()?; }
+                if let Some(before) = before { before.validate()?; }
+                if !(1..=HARNESS_GIT_HISTORY_LIMIT_MAX).contains(limit) {
+                    return Err(HarnessOperatorApiError::InvalidLimit);
+                }
+                Ok(())
+            }
+            Self::ReadNodeGitDiff { node_id, workspace_id, mode, path } => {
+                validate_node_workspace_route(node_id, workspace_id)?;
                 mode.validate()?;
                 if let Some(path) = path { path.validate()?; }
                 Ok(())
@@ -1795,8 +2037,20 @@ impl HarnessOperatorRequestV1 {
         matches!(self, Self::ObserveRunContextSource { .. })
     }
 
+    pub fn requires_v9(&self) -> bool {
+        matches!(
+            self,
+            Self::InspectNodeWorkspace { .. }
+                | Self::ReadNodeWorkspaceFile { .. }
+                | Self::ReadNodeGitHistory { .. }
+                | Self::ReadNodeGitDiff { .. }
+        )
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v8() {
+        if self.requires_v9() {
+            HARNESS_OPERATOR_WIRE_VERSION_V9
+        } else if self.requires_v8() {
             HARNESS_OPERATOR_WIRE_VERSION_V8
         } else if self.requires_v7() {
             HARNESS_OPERATOR_WIRE_VERSION_V7
@@ -1847,6 +2101,10 @@ pub enum HarnessOperatorResponseV1 {
     RunWorkspaceFileRead(HarnessRunWorkspaceFileV1),
     RunGitHistoryRead(HarnessRunGitHistoryPageV1),
     RunGitDiffRead(HarnessRunGitDiffV1),
+    NodeWorkspaceInspected(HarnessNodeWorkspaceInspectionV1),
+    NodeWorkspaceFileRead(HarnessNodeWorkspaceFileV1),
+    NodeGitHistoryRead(HarnessNodeGitHistoryPageV1),
+    NodeGitDiffRead(HarnessNodeGitDiffV1),
     LaunchPlans(HarnessLaunchPlanPageV1),
     TaskExecutionSpec(Option<HarnessTaskExecutionSpecV1>),
     TaskLaunchOptions(HarnessTaskLaunchOptionsV1),
@@ -1878,6 +2136,10 @@ impl HarnessOperatorResponseV1 {
             Self::RunWorkspaceFileRead(value) => value.validate(),
             Self::RunGitHistoryRead(value) => value.validate(),
             Self::RunGitDiffRead(value) => value.validate(),
+            Self::NodeWorkspaceInspected(value) => value.validate(),
+            Self::NodeWorkspaceFileRead(value) => value.validate(),
+            Self::NodeGitHistoryRead(value) => value.validate(),
+            Self::NodeGitDiffRead(value) => value.validate(),
             Self::LaunchPlans(value) => value.validate(),
             Self::TaskExecutionSpec(value) => {
                 if let Some(value) = value {
@@ -2390,6 +2652,15 @@ pub struct HarnessRuntimeInventoryV1 {
     pub managed_sessions: Vec<HarnessRuntimeManagedSessionV1>,
     pub managed_session_count: usize,
     pub managed_sessions_truncated: bool,
+    // Operator-visible surface: no redaction beyond what the direct-C2 TUI
+    // already shows for the same node (`NodeView::launch_inventory`). Mirrors
+    // `gate4agent_node_protocol::LaunchInventory` field-for-field rather than
+    // reusing it: `gate4agent-node-protocol` already depends on this crate
+    // (for the shared Harness MCP wire types), so the reverse edge would be
+    // a cyclic package dependency. The TUI reconstructs the real node-protocol
+    // type from this mirror on receipt (`client.rs::project_harness_inventory_node`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_inventory: Option<HarnessRuntimeLaunchInventoryV1>,
 }
 
 impl HarnessRuntimeInventoryV1 {
@@ -2419,6 +2690,103 @@ impl HarnessRuntimeInventoryV1 {
             workspace.validate()?;
         }
         for record in &self.managed_sessions { record.validate()?; }
+        if let Some(launch_inventory) = &self.launch_inventory { launch_inventory.validate()?; }
+        Ok(())
+    }
+}
+
+/// Mirror of `gate4agent_node_protocol::ResolvedEnvironmentProfileReceipt`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRuntimeEnvironmentProfileReceiptV1 {
+    pub profile_id: String,
+    pub profile_revision: String,
+}
+
+impl HarnessRuntimeEnvironmentProfileReceiptV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if !valid_runtime_id(&self.profile_id, 128) || !valid_runtime_id(&self.profile_revision, 128) {
+            return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+        }
+        Ok(())
+    }
+}
+
+/// Mirror of `gate4agent_node_protocol::SpawnProfileSummary`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRuntimeSpawnProfileSummaryV1 {
+    pub id: String,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_profile: Option<HarnessRuntimeEnvironmentProfileReceiptV1>,
+}
+
+impl HarnessRuntimeSpawnProfileSummaryV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if !valid_runtime_id(&self.id, 128) || !valid_runtime_id(&self.revision, 128) {
+            return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+        }
+        if let Some(environment_profile) = &self.environment_profile {
+            environment_profile.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Mirror of `gate4agent_node_protocol::ResolvedBundleReceipt`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRuntimeBundleReceiptV1 {
+    pub id: String,
+    pub revision: String,
+    pub digest: String,
+}
+
+impl HarnessRuntimeBundleReceiptV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if !valid_runtime_id(&self.id, 128)
+            || !valid_runtime_id(&self.revision, 128)
+            || !valid_sha256_digest(&self.digest)
+        {
+            return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+        }
+        Ok(())
+    }
+}
+
+/// Mirror of `gate4agent_node_protocol::LaunchInventory`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRuntimeLaunchInventoryV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_profiles: Option<Vec<HarnessRuntimeSpawnProfileSummaryV1>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundles: Option<Vec<HarnessRuntimeBundleReceiptV1>>,
+}
+
+impl HarnessRuntimeLaunchInventoryV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if self.spawn_profiles.is_none() && self.bundles.is_none() {
+            return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+        }
+        if let Some(profiles) = &self.spawn_profiles {
+            if profiles.len() > HARNESS_RUNTIME_SPAWN_PROFILES_MAX {
+                return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+            }
+            for profile in profiles { profile.validate()?; }
+            if profiles.iter().enumerate().any(|(index, profile)| {
+                profiles[..index].iter().any(|existing| existing.id == profile.id)
+            }) {
+                return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+            }
+        }
+        if let Some(bundles) = &self.bundles {
+            if bundles.len() > HARNESS_RUNTIME_LAUNCH_BUNDLES_MAX {
+                return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+            }
+            for bundle in bundles { bundle.validate()?; }
+        }
         Ok(())
     }
 }
@@ -3976,6 +4344,21 @@ fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
 }
 
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:")
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(is_lower_hex))
+}
+
+fn validate_node_workspace_route(
+    node_id: &str,
+    workspace_id: &str,
+) -> Result<(), HarnessOperatorApiError> {
+    if !valid_runtime_id(node_id, 128) || !valid_runtime_id(workspace_id, 128) {
+        return Err(HarnessOperatorApiError::InvalidWorkspaceOrigin);
+    }
+    Ok(())
+}
+
 fn validate_repository_path(value: &str) -> Result<(), HarnessOperatorApiError> {
     if value.is_empty()
         || value.len() > HARNESS_REPOSITORY_PATH_MAX_BYTES
@@ -4341,6 +4724,14 @@ mod tests {
             node_id: HarnessSelectorV1::new("node-a").unwrap(),
             node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
             workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        }
+    }
+
+    fn node_workspace_origin() -> HarnessNodeWorkspaceOriginV1 {
+        HarnessNodeWorkspaceOriginV1 {
+            node_id: "node-a".to_owned(),
+            node_incarnation_id: "07".repeat(16),
+            workspace_id: "workspace-a".to_owned(),
         }
     }
 
@@ -5155,6 +5546,69 @@ mod tests {
             credential,
             request,
         }.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_inventory_launch_inventory_round_trips_and_fails_closed() {
+        let node = HarnessRuntimeNodeInventoryV1 {
+            node_id: "node-a".to_owned(),
+            incarnation_id: "07".repeat(16),
+            observed_at_unix_ms: 1_000,
+            event_sequence: 4,
+            inventory: HarnessRuntimeInventoryV1 {
+                enabled_providers: vec!["claude".to_owned()],
+                workspaces: BTreeMap::new(),
+                workspace_count: 0,
+                workspaces_truncated: false,
+                session_count: 0,
+                sessions_truncated: false,
+                managed_sessions: Vec::new(),
+                managed_session_count: 0,
+                managed_sessions_truncated: false,
+                launch_inventory: Some(HarnessRuntimeLaunchInventoryV1 {
+                    spawn_profiles: Some(vec![HarnessRuntimeSpawnProfileSummaryV1 {
+                        id: "default".to_owned(),
+                        revision: "rev-1".to_owned(),
+                        environment_profile: Some(HarnessRuntimeEnvironmentProfileReceiptV1 {
+                            profile_id: "env-a".to_owned(),
+                            profile_revision: "env-rev-1".to_owned(),
+                        }),
+                    }]),
+                    bundles: Some(vec![HarnessRuntimeBundleReceiptV1 {
+                        id: "bundle-a".to_owned(),
+                        revision: "bundle-rev-1".to_owned(),
+                        digest: format!("sha256:{}", "a".repeat(64)),
+                    }]),
+                }),
+            },
+        };
+        node.validate().expect("valid launch inventory");
+        let encoded = serde_json::to_string(&node).unwrap();
+        let decoded: HarnessRuntimeNodeInventoryV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, node);
+
+        let mut missing_component = node.clone();
+        missing_component.inventory.launch_inventory = Some(HarnessRuntimeLaunchInventoryV1 {
+            spawn_profiles: None,
+            bundles: None,
+        });
+        assert!(missing_component.validate().is_err());
+
+        let mut duplicate_profile = node.clone();
+        let profile = duplicate_profile.inventory.launch_inventory.as_ref().unwrap()
+            .spawn_profiles.as_ref().unwrap()[0].clone();
+        duplicate_profile.inventory.launch_inventory.as_mut().unwrap()
+            .spawn_profiles.as_mut().unwrap().push(profile);
+        assert!(duplicate_profile.validate().is_err());
+
+        let mut bad_digest = node.clone();
+        bad_digest.inventory.launch_inventory.as_mut().unwrap()
+            .bundles.as_mut().unwrap()[0].digest = "not-a-digest".to_owned();
+        assert!(bad_digest.validate().is_err());
+
+        let mut no_launch_inventory = node;
+        no_launch_inventory.inventory.launch_inventory = None;
+        no_launch_inventory.validate().expect("absent launch inventory stays valid");
     }
 
     #[test]
@@ -5979,6 +6433,155 @@ mod tests {
             active_generation: None,
         };
         assert!(invalid_active_pair.validate().is_err());
+    }
+
+    #[test]
+    fn operator_v9_node_workspace_requests_are_exact_round_trips_and_fail_closed_on_v8() {
+        let node_id = node_workspace_origin().node_id;
+        let workspace_id = node_workspace_origin().workspace_id;
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let object_id = HarnessGitObjectIdV1::new("a".repeat(40)).unwrap();
+        let requests = vec![
+            HarnessOperatorRequestV1::InspectNodeWorkspace {
+                node_id: node_id.clone(),
+                workspace_id: workspace_id.clone(),
+            },
+            HarnessOperatorRequestV1::ReadNodeWorkspaceFile {
+                node_id: node_id.clone(),
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+            },
+            HarnessOperatorRequestV1::ReadNodeGitHistory {
+                node_id: node_id.clone(),
+                workspace_id: workspace_id.clone(),
+                path: Some(path.clone()),
+                before: Some(object_id.clone()),
+                limit: HARNESS_GIT_HISTORY_LIMIT_MAX,
+            },
+            HarnessOperatorRequestV1::ReadNodeGitDiff {
+                node_id: node_id.clone(),
+                workspace_id: workspace_id.clone(),
+                mode: HarnessGitDiffModeV1::Commit { revision: object_id },
+                path: Some(path),
+            },
+        ];
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        for request in requests {
+            request.validate().expect("valid V9 node-workspace request");
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V9);
+            let encoded = serde_json::to_string(&request).unwrap();
+            for forbidden in ["run_id", "endpoint", "root", "worktree", "environment"] {
+                assert!(!encoded.contains(forbidden), "request exposed {forbidden}");
+            }
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V8,
+                    credential: credential.clone(),
+                    request: request.clone(),
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V9,
+                credential: credential.clone(),
+                request,
+            }.validate().unwrap();
+        }
+
+        assert!(HarnessOperatorRequestV1::InspectNodeWorkspace {
+            node_id: String::new(),
+            workspace_id,
+        }.validate().is_err());
+        assert!(HarnessOperatorRequestV1::InspectNodeWorkspace {
+            node_id,
+            workspace_id: String::new(),
+        }.validate().is_err());
+    }
+
+    #[test]
+    fn operator_v9_node_workspace_replies_round_trip_without_run_or_diagnostic_fields() {
+        let origin = node_workspace_origin();
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let commit = git_commit('a');
+        let responses = vec![
+            HarnessOperatorResponseV1::NodeWorkspaceInspected(
+                HarnessNodeWorkspaceInspectionV1 {
+                    origin: origin.clone(),
+                    entries: vec![HarnessWorkspaceTreeEntryV1 {
+                        relative_path: path.clone(),
+                        kind: HarnessWorkspaceEntryKindV1::File,
+                    }],
+                    tree_truncated: false,
+                    git: HarnessGitSummaryV1 {
+                        is_repository: true,
+                        branch: Some("main".to_owned()),
+                        status: vec![HarnessGitStatusEntryV1 {
+                            index_status: HarnessGitStatusCodeV1::Unmodified,
+                            worktree_status: HarnessGitStatusCodeV1::Modified,
+                            path: path.clone(),
+                            previous_path: None,
+                        }],
+                        recent_commits: vec![HarnessGitCommitSummaryV1 {
+                            id: commit.id.clone(),
+                            summary: commit.subject.clone(),
+                        }],
+                        truncated: false,
+                    },
+                },
+            ),
+            HarnessOperatorResponseV1::NodeWorkspaceFileRead(HarnessNodeWorkspaceFileV1 {
+                origin: origin.clone(),
+                path: path.clone(),
+                content: HarnessWorkspaceFileContentV1::Utf8 {
+                    text: "fn main() {}\n".to_owned(),
+                    byte_len: 13,
+                },
+                revision: Some(HarnessWorkspaceFileRevisionV1::new("b".repeat(64)).unwrap()),
+            }),
+            HarnessOperatorResponseV1::NodeGitHistoryRead(HarnessNodeGitHistoryPageV1 {
+                origin: origin.clone(),
+                path: Some(path.clone()),
+                commits: vec![commit],
+                next_before: None,
+                truncated: false,
+            }),
+            HarnessOperatorResponseV1::NodeGitDiffRead(HarnessNodeGitDiffV1 {
+                origin,
+                mode: HarnessGitDiffModeV1::Working,
+                path: Some(path),
+                text: "diff --git a/src/lib.rs b/src/lib.rs\n".to_owned(),
+                truncated: false,
+            }),
+        ];
+        for response in responses {
+            response.validate().expect("valid V9 node-workspace response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert_json_has_no_forbidden_keys(&encoded, &[
+                "run_id",
+                "run_revision",
+                "root",
+                "worktree",
+                "endpoint",
+                "diagnostic",
+                "author_email",
+                "committer_email",
+                "environment",
+            ]);
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+
+        let mismatched_workspace = HarnessNodeWorkspaceOriginV1 {
+            workspace_id: "other-workspace".to_owned(),
+            ..node_workspace_origin()
+        };
+        assert!(mismatched_workspace.validate_for("node-a", "workspace-a").is_err());
+        mismatched_workspace.validate_for("node-a", "other-workspace").unwrap();
     }
 
     #[test]

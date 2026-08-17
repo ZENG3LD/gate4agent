@@ -4,10 +4,11 @@ use crate::{
         ArmedHarnessMcpReservationProof,
         ContextPackExportStart, ExportContextPackOutcome, HarnessC2Adapter,
         HarnessC2Error, HarnessC2EventReceiver,
-        HarnessObservationResync, PendingNativeHistoryRequest, PendingRunRead,
+        HarnessObservationResync, PendingNativeHistoryRequest, PendingNodeWorkspaceRead,
+        PendingRunRead,
         PendingRunContextSourceObservation, PreparedRunContextSourceObservation,
-        PreparedRunRead, PreparedRunReadKind, RunContextSourceObservationCompletion,
-        RunContextSourceProjection, RunReadCompletion,
+        PreparedNodeWorkspaceRead, PreparedRunRead, RunContextSourceObservationCompletion,
+        RunContextSourceProjection, RunReadCompletion, WorkspaceReadKind,
         ManagedWorktreeSpawnDispatchOutcome, PendingManagedWorktreeSpawnDispatch,
         SpawnDispatchOutcome, SpawnProfileRevisionProof,
         StagedDeliveryProof,
@@ -60,6 +61,8 @@ use gate4agent_harness_api::{
     HarnessRuntimeSessionStatusV1,
     HarnessRuntimeSessionV1, HarnessRuntimeTerminalPageV1, HarnessRuntimeTerminalSizeV1,
     HarnessRuntimeTransportV1, HarnessRuntimeWorkspaceV1,
+    HarnessRuntimeBundleReceiptV1, HarnessRuntimeEnvironmentProfileReceiptV1,
+    HarnessRuntimeLaunchInventoryV1, HarnessRuntimeSpawnProfileSummaryV1,
     HarnessTaskLaunchOptionsV1,
     HarnessReverseAttributionBindingV1, HarnessReverseAttributionLinkV1,
     HarnessReverseAttributionOutcomeV1, HarnessReverseAttributionRelationV1,
@@ -127,6 +130,11 @@ const HARNESS_MCP_GENERAL_NETWORK_WORKERS_MAX: usize =
     HARNESS_MCP_NETWORK_WORKERS_MAX - 1;
 const NATIVE_HISTORY_WORKERS_MAX: usize = 8;
 const RUN_READ_WORKERS_MAX: usize = 8;
+// Deliberately a separate pool from `RUN_READ_WORKERS_MAX`, not shared: a
+// burst of harness-mode sidebar Files/Git reads (no run in flight) must
+// never be able to starve a live operator's run-scoped
+// `InspectRunWorkspace` by soaking up the shared pool.
+const NODE_WORKSPACE_READ_WORKERS_MAX: usize = 8;
 const RUN_CONTEXT_SOURCE_WORKERS_MAX: usize = 8;
 // Deliberately separate from `RUN_READ_WORKERS_MAX`, not shared: background
 // git-facts capture must never be able to starve a live operator's own
@@ -311,6 +319,10 @@ enum HostCommand {
         completion: RunReadCompletion,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
     },
+    NodeWorkspaceReadFinished {
+        result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    },
     RunGitFactsCaptureFinished {
         run_id: gate4agent_harness_protocol::HarnessRunId,
         completion: RunReadCompletion,
@@ -480,6 +492,11 @@ struct RunReadWorkerRegistry {
 }
 
 #[derive(Default)]
+struct NodeWorkspaceReadWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
 struct RunGitFactsWorkerRegistry {
     in_flight: usize,
 }
@@ -511,6 +528,18 @@ impl NativeHistoryWorkerRegistry {
 impl RunReadWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= RUN_READ_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl NodeWorkspaceReadWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= NODE_WORKSPACE_READ_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -1401,6 +1430,21 @@ fn start_run_read_worker(
     });
 }
 
+/// Node-scoped sibling of `start_run_read_worker`. No completion origin
+/// re-check is needed on the way back: unlike a run's binding, a node route
+/// cannot drift out from under an in-flight read — `PendingNodeWorkspaceRead::
+/// finish` already rejects a response whose route or incarnation changed.
+fn start_node_workspace_read_worker(
+    pending: PendingNodeWorkspaceRead,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+) {
+    tokio::spawn(async move {
+        let result = pending.finish().await;
+        let _ = commands.send(HostCommand::NodeWorkspaceReadFinished { result, reply }).await;
+    });
+}
+
 /// Background twin of `start_run_read_worker`: no live client is waiting,
 /// so there is no `reply` sender — the completion travels back into the
 /// host loop as a plain `HostCommand` for `finish_run_git_facts_capture` to
@@ -1530,6 +1574,68 @@ fn map_run_read_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     }
 }
 
+/// Node-scoped sibling of `map_run_read_error`. The `NodeFailureCode` branch
+/// is intentionally kept in lockstep with `map_run_read_error`'s: both read
+/// families relay the exact same `NodeRequest::InspectWorkspace`/
+/// `ReadWorkspaceFile`/`ReadGitHistory`/`ReadGitDiff` verbs, so the Node
+/// fails them the same way regardless of which harness read family asked.
+fn map_node_workspace_read_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidNodeWorkspaceReadRequest => {
+            HarnessOperatorHostErrorV1::InvalidRequest
+        }
+        HarnessC2Error::NodeWorkspaceReadEnqueue(gate4agent_c2_client::C2ControlError::QueueFull) => {
+            HarnessOperatorHostErrorV1::Busy
+        }
+        HarnessC2Error::NodeWorkspaceReadEnqueue(_)
+        | HarnessC2Error::NodeWorkspaceReadTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::NodeWorkspaceReadRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
+        HarnessC2Error::NodeWorkspaceReadDeadline => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::NodeWorkspaceReadTooLarge => HarnessOperatorHostErrorV1::TooLarge,
+        HarnessC2Error::NodeWorkspaceReadRejected { code } => match code {
+            NodeFailureCode::InvalidRequest
+            | NodeFailureCode::InvalidRepositoryPath => {
+                HarnessOperatorHostErrorV1::InvalidRequest
+            }
+            NodeFailureCode::UnknownWorkspace
+            | NodeFailureCode::RepositoryFileNotFound
+            | NodeFailureCode::RepositoryParentNotFound => {
+                HarnessOperatorHostErrorV1::NotFound
+            }
+            NodeFailureCode::BindingMismatch
+            | NodeFailureCode::RepositoryFileRevisionConflict
+            | NodeFailureCode::RepositoryFileNotRegular
+            | NodeFailureCode::RepositoryPathUnsafe
+            | NodeFailureCode::NotGitRepository
+            | NodeFailureCode::StaleGeneration => HarnessOperatorHostErrorV1::Conflict,
+            NodeFailureCode::ControllerBusy
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::RepositoryFileReadTimedOut
+            | NodeFailureCode::GitReadTimedOut
+            | NodeFailureCode::HostDirectoryReadTimedOut
+            | NodeFailureCode::SpawnDeadlineExceeded => {
+                HarnessOperatorHostErrorV1::Deadline
+            }
+            NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::RepositoryFileReadFailed
+            | NodeFailureCode::GitReadFailed
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        HarnessC2Error::NodeWorkspaceReadCorrelationMismatch
+        | HarnessC2Error::NodeWorkspaceReadProjection => HarnessOperatorHostErrorV1::Internal,
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
 fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidNativeHistoryRequest => {
@@ -1588,6 +1694,18 @@ fn is_run_read_request(request: &HarnessOperatorRequestV1) -> bool {
     )
 }
 
+/// Node-scoped sibling of `is_run_read_request`: sidebar Files/Git reads
+/// that have no run in flight, routed directly from a node/workspace pair.
+fn is_node_workspace_read_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(
+        request,
+        HarnessOperatorRequestV1::InspectNodeWorkspace { .. }
+            | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { .. }
+            | HarnessOperatorRequestV1::ReadNodeGitHistory { .. }
+            | HarnessOperatorRequestV1::ReadNodeGitDiff { .. }
+    )
+}
+
 fn is_run_context_source_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(request, HarnessOperatorRequestV1::ObserveRunContextSource { .. })
 }
@@ -1597,7 +1715,7 @@ fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
         HOST_NATIVE_HISTORY_RESPONSE_DEADLINE
     } else if is_run_context_source_request(request) {
         HOST_RUN_CONTEXT_SOURCE_RESPONSE_DEADLINE
-    } else if is_run_read_request(request) {
+    } else if is_run_read_request(request) || is_node_workspace_read_request(request) {
         HOST_RUN_READ_RESPONSE_DEADLINE
     } else {
         HOST_DEADLINE
@@ -2362,6 +2480,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut harness_mcp_workers = HarnessMcpWorkerRegistry::default();
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
+        let mut node_workspace_read_workers = NodeWorkspaceReadWorkerRegistry::default();
         let mut run_git_facts_workers = RunGitFactsWorkerRegistry::default();
         let mut run_context_source_workers = RunContextSourceWorkerRegistry::default();
         let mut pending_run_context_sources = Vec::new();
@@ -2570,6 +2689,39 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         run_read_workers.finish();
                                         let _ = reply.send(HarnessOperatorReplyV1::Error {
                                             error: map_run_read_error(error),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            if is_node_workspace_read_request(&request) {
+                                let prepared = PreparedNodeWorkspaceRead::from_operator_request(
+                                    &adapter,
+                                    request,
+                                ).map_err(map_node_workspace_read_error);
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(error) => {
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error { error });
+                                        continue;
+                                    }
+                                };
+                                if !node_workspace_read_workers.try_start() {
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_node_workspace_read(prepared) {
+                                    Ok(pending) => start_node_workspace_read_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                    ),
+                                    Err(error) => {
+                                        node_workspace_read_workers.finish();
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_node_workspace_read_error(error),
                                         });
                                     }
                                 }
@@ -3356,6 +3508,16 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     Err(error) => HarnessOperatorReplyV1::Error {
                                         error: map_run_read_error(error),
                                     },
+                                },
+                            };
+                            let _ = reply.send(reply_value);
+                        }
+                        Some(HostCommand::NodeWorkspaceReadFinished { result, reply }) => {
+                            node_workspace_read_workers.finish();
+                            let reply_value = match result {
+                                Ok(response) => HarnessOperatorReplyV1::Ok { response },
+                                Err(error) => HarnessOperatorReplyV1::Error {
+                                    error: map_node_workspace_read_error(error),
                                 },
                             };
                             let _ = reply.send(reply_value);
@@ -4607,6 +4769,33 @@ fn redact_runtime_inventory(
         managed_sessions,
         managed_session_count: inventory.managed_session_count,
         managed_sessions_truncated: inventory.managed_sessions_truncated,
+        launch_inventory: inventory.launch_inventory.map(redact_launch_inventory),
+    }
+}
+
+fn redact_launch_inventory(
+    inventory: gate4agent_node_protocol::LaunchInventory,
+) -> HarnessRuntimeLaunchInventoryV1 {
+    HarnessRuntimeLaunchInventoryV1 {
+        spawn_profiles: inventory.spawn_profiles.map(|profiles| {
+            profiles.into_iter().map(|profile| HarnessRuntimeSpawnProfileSummaryV1 {
+                id: profile.id.as_str().to_owned(),
+                revision: profile.revision.as_str().to_owned(),
+                environment_profile: profile.environment_profile.map(|receipt| {
+                    HarnessRuntimeEnvironmentProfileReceiptV1 {
+                        profile_id: receipt.profile_id.as_str().to_owned(),
+                        profile_revision: receipt.profile_revision.as_str().to_owned(),
+                    }
+                }),
+            }).collect()
+        }),
+        bundles: inventory.bundles.map(|bundles| {
+            bundles.into_iter().map(|bundle| HarnessRuntimeBundleReceiptV1 {
+                id: bundle.id.as_str().to_owned(),
+                revision: bundle.revision.as_str().to_owned(),
+                digest: bundle.digest.as_str().to_owned(),
+            }).collect()
+        }),
     }
 }
 
@@ -5061,7 +5250,11 @@ fn execute_operator_request(
         | HarnessOperatorRequestV1::InspectRunWorkspace { .. }
         | HarnessOperatorRequestV1::ReadRunWorkspaceFile { .. }
         | HarnessOperatorRequestV1::ReadRunGitHistory { .. }
-        | HarnessOperatorRequestV1::ReadRunGitDiff { .. } => {
+        | HarnessOperatorRequestV1::ReadRunGitDiff { .. }
+        | HarnessOperatorRequestV1::InspectNodeWorkspace { .. }
+        | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { .. }
+        | HarnessOperatorRequestV1::ReadNodeGitHistory { .. }
+        | HarnessOperatorRequestV1::ReadNodeGitDiff { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
         HarnessOperatorRequestV1::CreateTask { request } => {
@@ -6350,7 +6543,7 @@ fn reconcile_run_git_facts_capture(
         if !workers.try_start() {
             return;
         }
-        let Ok(prepared) = PreparedRunRead::for_run(run, PreparedRunReadKind::InspectWorkspace)
+        let Ok(prepared) = PreparedRunRead::for_run(run, WorkspaceReadKind::InspectWorkspace)
         else {
             workers.finish();
             continue;
@@ -9429,6 +9622,59 @@ mod tests {
         );
         assert_eq!(
             map_run_read_error(HarnessC2Error::RunReadRejected {
+                code: NodeFailureCode::ResponseTooLarge,
+            }),
+            HarnessOperatorHostErrorV1::TooLarge,
+        );
+    }
+
+    /// Node-scoped sibling of `run_read_worker_cap_deadline_and_failure_mapping_are_typed`:
+    /// the same worker-cap/deadline/failure-mapping contract, for the read
+    /// family that routes from a node/workspace pair with no run in flight.
+    #[test]
+    fn node_workspace_read_worker_cap_deadline_and_failure_mapping_are_typed() {
+        let mut workers = NodeWorkspaceReadWorkerRegistry::default();
+        for _ in 0..NODE_WORKSPACE_READ_WORKERS_MAX { assert!(workers.try_start()); }
+        assert!(!workers.try_start());
+        workers.finish();
+        assert!(workers.try_start());
+
+        let request = HarnessOperatorRequestV1::InspectNodeWorkspace {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+        };
+        assert_eq!(
+            operator_response_deadline(&request),
+            HOST_RUN_READ_RESPONSE_DEADLINE,
+        );
+        assert_eq!(
+            map_node_workspace_read_error(HarnessC2Error::NodeWorkspaceReadEnqueue(
+                gate4agent_c2_client::C2ControlError::QueueFull,
+            )),
+            HarnessOperatorHostErrorV1::Busy,
+        );
+        assert_eq!(
+            map_node_workspace_read_error(HarnessC2Error::NodeWorkspaceReadDeadline),
+            HarnessOperatorHostErrorV1::Deadline,
+        );
+        assert_eq!(
+            map_node_workspace_read_error(HarnessC2Error::NodeWorkspaceReadRouteMismatch),
+            HarnessOperatorHostErrorV1::Conflict,
+        );
+        assert_eq!(
+            map_node_workspace_read_error(HarnessC2Error::NodeOffline(
+                gate4agent_node_protocol::NodeId::new("node-a").unwrap(),
+            )),
+            HarnessOperatorHostErrorV1::Unavailable,
+        );
+        assert_eq!(
+            map_node_workspace_read_error(HarnessC2Error::NodeWorkspaceReadRejected {
+                code: NodeFailureCode::RepositoryFileNotFound,
+            }),
+            HarnessOperatorHostErrorV1::NotFound,
+        );
+        assert_eq!(
+            map_node_workspace_read_error(HarnessC2Error::NodeWorkspaceReadRejected {
                 code: NodeFailureCode::ResponseTooLarge,
             }),
             HarnessOperatorHostErrorV1::TooLarge,

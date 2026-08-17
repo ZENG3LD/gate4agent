@@ -415,6 +415,113 @@ impl HarnessOperatorClient {
         }
     }
 
+    /// Node-scoped sibling of `inspect_run_workspace`: needs no run in
+    /// flight, only a node/workspace pair.
+    pub fn inspect_node_workspace(
+        &self,
+        node_id: String,
+        workspace_id: String,
+    ) -> Result<HarnessNodeWorkspaceInspectionV1, HarnessOperatorClientError> {
+        let expected_node_id = node_id.clone();
+        let expected_workspace_id = workspace_id.clone();
+        match self.send(HarnessOperatorRequestV1::InspectNodeWorkspace {
+            node_id,
+            workspace_id,
+        })? {
+            HarnessOperatorResponseV1::NodeWorkspaceInspected(value) => {
+                value.validate_for(&expected_node_id, &expected_workspace_id)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Node-scoped sibling of `read_run_workspace_file`.
+    pub fn read_node_workspace_file(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+    ) -> Result<HarnessNodeWorkspaceFileV1, HarnessOperatorClientError> {
+        let expected_node_id = node_id.clone();
+        let expected_workspace_id = workspace_id.clone();
+        let expected_path = path.clone();
+        match self.send(HarnessOperatorRequestV1::ReadNodeWorkspaceFile {
+            node_id,
+            workspace_id,
+            path,
+        })? {
+            HarnessOperatorResponseV1::NodeWorkspaceFileRead(value) => {
+                value.validate_for(&expected_node_id, &expected_workspace_id, &expected_path)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Node-scoped sibling of `read_run_git_history`.
+    pub fn read_node_git_history(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        path: Option<HarnessRepositoryPathV1>,
+        before: Option<HarnessGitObjectIdV1>,
+        limit: u16,
+    ) -> Result<HarnessNodeGitHistoryPageV1, HarnessOperatorClientError> {
+        let expected_node_id = node_id.clone();
+        let expected_workspace_id = workspace_id.clone();
+        let expected_path = path.clone();
+        match self.send(HarnessOperatorRequestV1::ReadNodeGitHistory {
+            node_id,
+            workspace_id,
+            path,
+            before,
+            limit,
+        })? {
+            HarnessOperatorResponseV1::NodeGitHistoryRead(value) => {
+                value.validate_for(
+                    &expected_node_id,
+                    &expected_workspace_id,
+                    expected_path.as_ref(),
+                    limit,
+                )?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Node-scoped sibling of `read_run_git_diff`.
+    pub fn read_node_git_diff(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        mode: HarnessGitDiffModeV1,
+        path: Option<HarnessRepositoryPathV1>,
+    ) -> Result<HarnessNodeGitDiffV1, HarnessOperatorClientError> {
+        let expected_node_id = node_id.clone();
+        let expected_workspace_id = workspace_id.clone();
+        let expected_mode = mode.clone();
+        let expected_path = path.clone();
+        match self.send(HarnessOperatorRequestV1::ReadNodeGitDiff {
+            node_id,
+            workspace_id,
+            mode,
+            path,
+        })? {
+            HarnessOperatorResponseV1::NodeGitDiffRead(value) => {
+                value.validate_for(
+                    &expected_node_id,
+                    &expected_workspace_id,
+                    &expected_mode,
+                    expected_path.as_ref(),
+                )?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn launch_plans_list(
         &self,
         after_plan_id: Option<HarnessSelectorV1>,
@@ -651,6 +758,10 @@ impl HarnessOperatorClient {
                 | HarnessOperatorRequestV1::ReadRunWorkspaceFile { .. }
                 | HarnessOperatorRequestV1::ReadRunGitHistory { .. }
                 | HarnessOperatorRequestV1::ReadRunGitDiff { .. }
+                | HarnessOperatorRequestV1::InspectNodeWorkspace { .. }
+                | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { .. }
+                | HarnessOperatorRequestV1::ReadNodeGitHistory { .. }
+                | HarnessOperatorRequestV1::ReadNodeGitDiff { .. }
         ) {
             HARNESS_RUN_WORKSPACE_READ_DEADLINE
         } else {
@@ -1766,6 +1877,138 @@ mod tests {
         assert_eq!(
             client.read_run_git_diff(
                 run_id,
+                HarnessGitDiffModeV1::Working,
+                Some(path),
+            ).unwrap(),
+            expected_diff,
+        );
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_round_trips_v9_node_workspace_reads_over_one_shot_sockets() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let origin = HarnessNodeWorkspaceOriginV1 {
+            node_id: "node-a".to_owned(),
+            node_incarnation_id: "07".repeat(16),
+            workspace_id: "workspace-a".to_owned(),
+        };
+        let inspection = HarnessNodeWorkspaceInspectionV1 {
+            origin: origin.clone(),
+            entries: vec![HarnessWorkspaceTreeEntryV1 {
+                relative_path: path.clone(),
+                kind: HarnessWorkspaceEntryKindV1::File,
+            }],
+            tree_truncated: false,
+            git: HarnessGitSummaryV1 {
+                is_repository: false,
+                branch: None,
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                truncated: false,
+            },
+        };
+        let file = HarnessNodeWorkspaceFileV1 {
+            origin: origin.clone(),
+            path: path.clone(),
+            content: HarnessWorkspaceFileContentV1::Utf8 {
+                text: "fn main() {}\n".to_owned(),
+                byte_len: 13,
+            },
+            revision: Some(HarnessWorkspaceFileRevisionV1::new("b".repeat(64)).unwrap()),
+        };
+        let history = HarnessNodeGitHistoryPageV1 {
+            origin: origin.clone(),
+            path: Some(path.clone()),
+            commits: Vec::new(),
+            next_before: None,
+            truncated: false,
+        };
+        let diff = HarnessNodeGitDiffV1 {
+            origin,
+            mode: HarnessGitDiffModeV1::Working,
+            path: Some(path.clone()),
+            text: "diff --git a/src/lib.rs b/src/lib.rs\n".to_owned(),
+            truncated: false,
+        };
+        let expected_inspection = inspection.clone();
+        let expected_file = file.clone();
+        let expected_history = history.clone();
+        let expected_diff = diff.clone();
+        let expected_path = path.clone();
+        let host = thread::spawn(move || {
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = String::new();
+                stream.read_to_string(&mut request).expect("request");
+                for forbidden in ["run_id", "endpoint", "root", "worktree", "environment"] {
+                    assert!(!request.contains(forbidden), "request exposed {forbidden}");
+                }
+                let envelope: HarnessOperatorEnvelopeV1 =
+                    serde_json::from_str(request.trim_end()).expect("operator envelope");
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V9);
+                let response = match (index, envelope.request) {
+                    (0, HarnessOperatorRequestV1::InspectNodeWorkspace { .. }) => {
+                        HarnessOperatorResponseV1::NodeWorkspaceInspected(inspection.clone())
+                    }
+                    (1, HarnessOperatorRequestV1::ReadNodeWorkspaceFile { path, .. })
+                        if path == expected_path =>
+                    {
+                        HarnessOperatorResponseV1::NodeWorkspaceFileRead(file.clone())
+                    }
+                    (2, HarnessOperatorRequestV1::ReadNodeGitHistory {
+                        path: Some(path),
+                        before: None,
+                        limit: 16,
+                        ..
+                    }) if path == expected_path => {
+                        HarnessOperatorResponseV1::NodeGitHistoryRead(history.clone())
+                    }
+                    (3, HarnessOperatorRequestV1::ReadNodeGitDiff {
+                        mode: HarnessGitDiffModeV1::Working,
+                        path: Some(path),
+                        ..
+                    }) if path == expected_path => {
+                        HarnessOperatorResponseV1::NodeGitDiffRead(diff.clone())
+                    }
+                    _ => panic!("unexpected V9 node workspace request"),
+                };
+                let reply = HarnessOperatorReplyV1::Ok { response };
+                let mut encoded = serde_json::to_vec(&reply).expect("reply");
+                encoded.push(b'\n');
+                stream.write_all(&encoded).expect("write reply");
+            }
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert_eq!(
+            client.inspect_node_workspace("node-a".to_owned(), "workspace-a".to_owned()).unwrap(),
+            expected_inspection,
+        );
+        assert_eq!(
+            client.read_node_workspace_file(
+                "node-a".to_owned(),
+                "workspace-a".to_owned(),
+                path.clone(),
+            ).unwrap(),
+            expected_file,
+        );
+        assert_eq!(
+            client.read_node_git_history(
+                "node-a".to_owned(),
+                "workspace-a".to_owned(),
+                Some(path.clone()),
+                None,
+                16,
+            ).unwrap(),
+            expected_history,
+        );
+        assert_eq!(
+            client.read_node_git_diff(
+                "node-a".to_owned(),
+                "workspace-a".to_owned(),
                 HarnessGitDiffModeV1::Working,
                 Some(path),
             ).unwrap(),

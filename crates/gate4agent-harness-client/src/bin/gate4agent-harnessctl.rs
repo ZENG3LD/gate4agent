@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate4agent_harness_client::{
     HarnessCreateTaskRequestV1, HarnessDeliveryBundleIdV1, HarnessDeliveryBundleSelectionV1,
-    HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef, HarnessOperationId,
-    HarnessOperatorAuthorityV1, HarnessOperatorClient, HarnessOperatorCredential,
+    HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef, HarnessMoveTaskRequestV1,
+    HarnessOperationId, HarnessOperatorAuthorityV1, HarnessOperatorClient, HarnessOperatorCredential,
     HarnessOperatorMutationOutcomeV1, HarnessOrdinaryLaunchPlanOptionV1,
     HarnessReplaceTaskExecutionSpecRequestV2, HarnessReviewedTaskLaunchSelectionV1,
     HarnessReviewedWorktreeSelectionV1, HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1,
@@ -35,6 +35,7 @@ fn usage() -> &'static str {
      \x20 task get TASK_ID\n\
      \x20 run get RUN_ID\n\
      \x20 task create --title TITLE --body BODY [--parent TASK_ID]\n\
+     \x20 task move TASK_ID --to STATE\n\
      \x20 launch-options TASK_ID\n\
      \x20 spec save TASK_ID --plan PLAN_ID [--context-source-run RUN_ID] [--delivery BUNDLE_ID] [--review POLICY]\n\
      \x20 task start TASK_ID\n\
@@ -69,6 +70,7 @@ enum Command {
     TaskGet { task_id: HarnessTaskId },
     RunGet { run_id: HarnessRunId },
     TaskCreate { title: String, body: String, parent: Option<HarnessTaskId> },
+    TaskMove { task_id: HarnessTaskId, to: HarnessTaskStateV1 },
     LaunchOptions { task_id: HarnessTaskId },
     SpecSave {
         task_id: HarnessTaskId,
@@ -90,6 +92,7 @@ enum Verb {
     TaskGet,
     RunGet,
     TaskCreate,
+    TaskMove,
     LaunchOptions,
     SpecSave,
     TaskStart,
@@ -106,6 +109,7 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
         Some("task") => match args.get(2).map(String::as_str) {
             Some("get") => Ok((Verb::TaskGet, 2)),
             Some("create") => Ok((Verb::TaskCreate, 2)),
+            Some("move") => Ok((Verb::TaskMove, 2)),
             Some("start") => Ok((Verb::TaskStart, 2)),
             _ => Err(usage().to_owned()),
         },
@@ -256,6 +260,11 @@ fn build_command(
             let body = require_flag(flags, "body")?;
             let parent = take_flag(flags, "parent").map(parse_task_id).transpose()?;
             Ok(Command::TaskCreate { title, body, parent })
+        }
+        Verb::TaskMove => {
+            let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
+            let to = parse_kebab::<HarnessTaskStateV1>(&require_flag(flags, "to")?, "--to")?;
+            Ok(Command::TaskMove { task_id, to })
         }
         Verb::LaunchOptions => {
             let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
@@ -463,6 +472,19 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                 })
                 .map_err(|error| error.to_string())?;
             render(&TaskCreated { task_id, outcome })
+        }
+        Command::TaskMove { task_id, to } => {
+            let task = client.task_get(task_id.clone()).map_err(|error| error.to_string())?;
+            let authority = fresh_authority()?;
+            let outcome = client
+                .move_task(HarnessMoveTaskRequestV1 {
+                    authority,
+                    task_id,
+                    expected_revision: task.revision,
+                    state: to,
+                })
+                .map_err(|error| error.to_string())?;
+            render(&outcome)
         }
         Command::LaunchOptions { task_id } => {
             let options = client.task_launch_options_get(task_id).map_err(|error| error.to_string())?;
@@ -740,6 +762,54 @@ mod tests {
             invocation.command,
             Command::TaskGet { task_id: actual } if actual.as_str() == task_id
         ));
+    }
+
+    #[test]
+    fn task_move_requires_to_and_parses_kebab_target_state() {
+        let task_id = format!("htask_{}", "1".repeat(24));
+        let error = parse(
+            &["gate4agent-harnessctl", "task", "move", &task_id, "--harness-operator", "127.0.0.1:18080"],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap_err();
+        assert_eq!(error, "--to is required");
+
+        let outcome = parse(
+            &[
+                "gate4agent-harnessctl",
+                "task",
+                "move",
+                &task_id,
+                "--to",
+                "ready",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        assert!(matches!(
+            invocation.command,
+            Command::TaskMove { task_id: actual, to: HarnessTaskStateV1::Ready }
+                if actual.as_str() == task_id
+        ));
+
+        let error = parse(
+            &[
+                "gate4agent-harnessctl",
+                "task",
+                "move",
+                &task_id,
+                "--to",
+                "bogus-state",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap_err();
+        assert_eq!(error, "--to has an invalid value: bogus-state");
     }
 
     #[test]

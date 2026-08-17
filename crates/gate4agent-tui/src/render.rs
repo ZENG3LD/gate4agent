@@ -4202,7 +4202,7 @@ fn render_harness_task_detail(
     theme: Theme,
 ) {
     use crate::app::HarnessTaskDetailSection;
-    use gate4agent_harness_client::HarnessRunSessionViewV1;
+    use gate4agent_harness_client::{HarnessRunCorrelationAvailabilityV1, HarnessRunSessionViewV1};
 
     let Some(detail) = app.harness_kanban.detail.as_ref() else {
         return;
@@ -4556,8 +4556,11 @@ fn render_harness_task_detail(
                 } else {
                     format!("Run {} | exact correlation unavailable", run.run_id)
                 };
+                let row_selected = detail.selected_run.as_ref() == Some(&run.run_id);
                 Paragraph::new(truncate_cells(&heading, body.width as usize))
-                    .style(Style::default().fg(theme.text).bg(theme.panel).add_modifier(Modifier::BOLD))
+                    .style(Style::default().fg(theme.text)
+                        .bg(if row_selected { theme.active } else { theme.panel })
+                        .add_modifier(Modifier::BOLD))
                     .render(Rect::new(body.x, y, body.width, 1), buf);
                 y = y.saturating_add(1);
                 if let Some(correlation) = correlation {
@@ -4588,12 +4591,30 @@ fn render_harness_task_detail(
                     y = y.saturating_add(1);
                 }
                 if y < body.bottom() {
-                    Paragraph::new(truncate_cells(
-                        "PTY: unavailable (Harness-mediated terminal contract pending)",
-                        body.width as usize,
-                    ))
-                        .style(Style::default().fg(theme.muted).bg(theme.surface))
-                        .render(Rect::new(body.x, y, body.width, 1), buf);
+                    if app.harness_run_terminal_address(&run.run_id).is_some() {
+                        let actions = Rect::new(body.x, y, body.width, 1);
+                        let _ = render_toolbar_segment(
+                            "[Open terminal]",
+                            actions.x,
+                            actions,
+                            Style::default().fg(theme.teal).bg(theme.surface),
+                            Some(HitTarget::HarnessTaskDetailRunTerminal(run.run_id.clone())),
+                            buf,
+                            layout,
+                        );
+                    } else {
+                        let dormant = correlation.is_some_and(|correlation| {
+                            correlation.availability == HarnessRunCorrelationAvailabilityV1::Dormant
+                        });
+                        let label = if dormant {
+                            "PTY: dormant | managed record has no active runtime session"
+                        } else {
+                            "PTY: none | run has no live managed binding"
+                        };
+                        Paragraph::new(truncate_cells(label, body.width as usize))
+                            .style(Style::default().fg(theme.muted).bg(theme.surface))
+                            .render(Rect::new(body.x, y, body.width, 1), buf);
+                    }
                     y = y.saturating_add(1);
                 }
                 if y < body.bottom() {
@@ -10262,7 +10283,8 @@ mod tests {
         render(&app, &mut agents_buf);
         let agents_text = buffer_text(&agents_buf);
         assert!(agents_text.contains("exact correlation unavailable"), "{agents_text}");
-        assert!(agents_text.contains("PTY: unavailable"), "{agents_text}");
+        assert!(agents_text.contains("PTY: none | run has no live managed binding"), "{agents_text}");
+        assert!(!agents_text.contains("[Open terminal]"), "{agents_text}");
         assert!(
             agents_text.contains("Workspace/Git: open Files or Git to load"),
             "{agents_text}"

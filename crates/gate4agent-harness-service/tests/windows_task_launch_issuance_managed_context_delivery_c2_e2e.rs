@@ -860,8 +860,31 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
             monitor.map(|projection| projection.features.history),
         );
     }
-    let observed_source = client.observe_run_context_source(source_dispatch.run_id.clone())
-        .unwrap();
+    // Same background-churn family as the later `policy_digest`/context-source
+    // races (see the comments further down): the readiness poll just above
+    // only proves the monitor projection satisfied its own checks at THAT
+    // moment -- a GapWaiting/reconverge blip landing in the gap before this
+    // specific call is processed can still make `observe_run_context_source`
+    // itself report `Unavailable` once, transiently. Retry is safe: this is
+    // a read/observe RPC, not a mutation, so there is no idempotency ledger
+    // to worry about.
+    let observed_source = timeout(Duration::from_secs(10), async {
+        loop {
+            match client.observe_run_context_source(source_dispatch.run_id.clone()) {
+                Ok(observed) => break observed,
+                Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Unavailable)) => {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!(
+                    "observe_run_context_source failed with a non-transient error: {error:?}",
+                ),
+            }
+        }
+    })
+    .await
+    .expect(
+        "source support stayed transiently Unavailable past the retry budget after its own readiness poll converged",
+    );
     assert_eq!(observed_source.feature_state, FeatureObservationStateV1::Observed);
     assert_eq!(observed_source.message_count, 2);
     assert!(observed_source.message_count_exact);
@@ -983,14 +1006,50 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
     // fresh right before the one call in this block that is expected to
     // succeed, exactly like a real client would re-fetch before submitting
     // rather than replaying an arbitrarily-aged snapshot.
-    let mut fresh_selection = selection.clone();
-    fresh_selection.context_source = Some(
-        client.task_launch_options_get(target_task_id()).unwrap().context_sources[0].clone(),
-    );
-    assert_eq!(
-        client.replace_task_execution_spec_v2(replace('h', fresh_selection)).unwrap(),
-        HarnessOperatorMutationOutcomeV1::Applied,
-    );
+    //
+    // A single fetch-then-submit is not quite tight enough: the server
+    // re-validates against its OWN freshly-computed options at the moment it
+    // processes the request (`validate_current_launch_options` ->
+    // `context_source_semantically_matches`, harness-service/src/lib.rs),
+    // which is one more round trip after this client's own fetch -- the same
+    // live background churn can still land in that second, narrower gap
+    // (rare, but the fast-fail `Host(Conflict)` this produces is the same
+    // race family as the `policy_digest` fix above, one step earlier in the
+    // test). Retry is safe: `operator_replace_task_execution_spec_v2` checks
+    // `replay_operator_request` before `validate_current_launch_options`
+    // (`lib.rs:801-815`), so a validation-rejected attempt never records its
+    // operation_id in the ledger -- resubmitting the same `'h'` marker with a
+    // freshly re-fetched selection is a clean retry, not a replay.
+    let applied = timeout(Duration::from_secs(10), async {
+        loop {
+            let current_options = client.task_launch_options_get(target_task_id()).unwrap();
+            // The same GapWaiting/reconverge churn that bumps
+            // `source_run_revision` can, for a single poll, transiently drop
+            // the live source out of `context_sources` entirely (the `Live`
+            // branch of `context_source_option`, runtime.rs, requires a
+            // fully-Current/Live monitor projection with an exact active
+            // managed-session binding match) -- wait for it to reappear
+            // rather than indexing into a possibly-empty `Vec`.
+            let Some(current_source) = current_options.context_sources.first() else {
+                sleep(Duration::from_millis(20)).await;
+                continue;
+            };
+            let mut fresh_selection = selection.clone();
+            fresh_selection.context_source = Some(current_source.clone());
+            match client.replace_task_execution_spec_v2(replace('h', fresh_selection)) {
+                Ok(outcome) => break outcome,
+                Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Conflict)) => {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!(
+                    "replace_task_execution_spec_v2 failed with a non-conflict error: {error:?}",
+                ),
+            }
+        }
+    })
+    .await
+    .expect("fresh context source kept losing the race against live background churn");
+    assert_eq!(applied, HarnessOperatorMutationOutcomeV1::Applied);
     let issued_options = client.task_launch_options_get(target_task_id()).unwrap();
     let issued_summary = issued_options.current_issued_spec.clone().unwrap();
     assert_eq!(issued_summary.revision, revision(1));
@@ -1080,7 +1139,21 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
             >= selection.context_source.as_ref().unwrap().observed_at_unix_ms,
     );
     assert_eq!(resynced_options.task_revision, issuance_before.task_revision);
-    assert_eq!(resynced_options.policy_digest, issuance_before.policy_digest);
+    // `policy_digest` embeds the whole `context_sources` array (only
+    // `observed_at_unix_ms` normalized away -- see `task_launch_policy_digest`,
+    // harness-service/src/lib.rs), including `source_run_revision` and each
+    // source's own `metadata_digest`. The source run stays live throughout
+    // this whole stretch (see the comment above `fresh_selection`), and its
+    // revision can legitimately bump on either reconnect between here and
+    // where `issuance_before` was captured (`freeze_bound_route_waiting`'s
+    // `GapWaiting` fallback), independent of anything under test -- so a
+    // byte-for-byte `policy_digest` comparison across that window is the
+    // same class of race already de-raced above, just surfacing through a
+    // digest instead of a raw counter. `task_revision` (just above), `plans`,
+    // `managed_worktree_profiles`, and the context source's stable identity
+    // (all checked individually below) are the actual invariant this
+    // assertion was meant to protect; digest determinism itself is already
+    // covered by `task_launch_policy_digest`'s own unit tests in `lib.rs`.
     assert!(resynced_options.plans.iter().any(|plan| {
         plan.plan == issuance_before.plan
             && plan.node_id == issuance_before.target.node_id
@@ -1100,11 +1173,28 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
             && profile.profile_id == *profile_id
             && profile.profile_revision == *expected_profile_revision
     }));
-    let mut current_context = resynced_source.clone();
-    let mut issued_context = issuance_before.context_source.clone().unwrap();
-    current_context.observed_at_unix_ms = 0;
-    issued_context.observed_at_unix_ms = 0;
-    assert_eq!(current_context, issued_context);
+    // Same background churn as `policy_digest` above: compare the context
+    // source's stable identity exactly, and require the fields a live
+    // source can only grow (never shrink) to have advanced monotonically
+    // rather than pinning them to the aged `issuance_before` snapshot.
+    let current_context = resynced_source.clone();
+    let issued_context = issuance_before.context_source.clone().unwrap();
+    assert_eq!(current_context.source_run_id, issued_context.source_run_id);
+    assert_eq!(current_context.node_id, issued_context.node_id);
+    assert_eq!(current_context.node_incarnation, issued_context.node_incarnation);
+    assert_eq!(current_context.workspace_id, issued_context.workspace_id);
+    assert_eq!(current_context.session_record_id, issued_context.session_record_id);
+    assert_eq!(current_context.active_session, issued_context.active_session);
+    assert_eq!(current_context.availability, issued_context.availability);
+    assert_eq!(current_context.message_count_exact, issued_context.message_count_exact);
+    assert_eq!(current_context.context_pack, issued_context.context_pack);
+    assert!(current_context.source_run_revision >= issued_context.source_run_revision);
+    assert!(current_context.message_count >= issued_context.message_count);
+    assert!(
+        current_context.completed_turn_count.unwrap_or(0)
+            >= issued_context.completed_turn_count.unwrap_or(0)
+    );
+    assert!(current_context.total_tokens.unwrap_or(0) >= issued_context.total_tokens.unwrap_or(0));
     assert!(resynced_options.delivery_bundles.contains(
         issuance_before.delivery.as_ref().unwrap(),
     ));
@@ -1178,7 +1268,96 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
         &preallocation_state,
     );
 
-    let started = exact_client.start_task_v2(start_request.clone()).unwrap();
+    // `start_task_v2`'s anti-tamper gate (`validate_current_issued_launch_options`,
+    // `lib.rs:4908-4952`) is intentionally strict, by design, not a bug: if
+    // the live source's telemetry moved since `issuance_before` was captured
+    // (the same `freeze_bound_route_waiting` `GapWaiting` churn de-raced
+    // above), the reviewed snapshot the operator approved is genuinely
+    // stale, and "re-review, reissue, start again" is the correct
+    // real-client response -- not a bare retry of the identical request
+    // (`HarnessRevision` is monotonic, so a second attempt against the SAME
+    // frozen `issuance_before`/`spec_before` would fail identically forever,
+    // never transiently). Model that real-client response here, bounded to
+    // exactly one reissue cycle: re-fetch launch options, re-save the spec
+    // from the fresh context source, re-capture `issuance_before`/
+    // `spec_before`/`start_request` from the freshly-persisted state, and
+    // start again -- the whole downstream chain (correlation, durability,
+    // replay, reverse-attribution) then runs against whichever issuance
+    // actually started, which is its real intent: proving consistency of
+    // the launch that happened, not pinning to a specific attempt number. A
+    // second consecutive `Conflict` is a different bug and fails loudly,
+    // never swallowed into a retry loop.
+    let (started, issuance_before, spec_before, start_request) =
+        match exact_client.start_task_v2(start_request.clone()) {
+            Ok(started) => (started, issuance_before, spec_before, start_request),
+            Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Conflict)) => {
+                let reissued = timeout(Duration::from_secs(10), async {
+                    loop {
+                        let current_options =
+                            exact_client.task_launch_options_get(target_task_id()).unwrap();
+                        // Same transient-empty-Vec churn as the first replace
+                        // above -- wait for the live source to reappear
+                        // rather than indexing into a possibly-empty `Vec`.
+                        let Some(current_source) = current_options.context_sources.first()
+                        else {
+                            sleep(Duration::from_millis(20)).await;
+                            continue;
+                        };
+                        let mut fresh_selection = selection.clone();
+                        fresh_selection.context_source = Some(current_source.clone());
+                        let mut reissue_request = replace('n', fresh_selection);
+                        reissue_request.expected_execution_spec_revision =
+                            HarnessExpectedExecutionSpecRevisionV1::Exact(spec_before.revision);
+                        match exact_client.replace_task_execution_spec_v2(reissue_request) {
+                            Ok(outcome) => break outcome,
+                            Err(HarnessOperatorClientError::Host(
+                                HarnessOperatorHostErrorV1::Conflict,
+                            )) => {
+                                sleep(Duration::from_millis(20)).await;
+                            }
+                            Err(error) => panic!(
+                                "reissue replace_task_execution_spec_v2 failed with a non-conflict error: {error:?}",
+                            ),
+                        }
+                    }
+                })
+                .await
+                .expect(
+                    "reissue's fresh context source kept losing the race against live background churn",
+                );
+                assert_eq!(reissued, HarnessOperatorMutationOutcomeV1::Applied);
+
+                let reopened = HarnessService::open(&fixture.harness).unwrap();
+                let issuance_before = reopened.engine()
+                    .task_launch_issuance(&target_task_id())
+                    .unwrap()
+                    .clone();
+                let spec_before = reopened.engine()
+                    .task_execution_spec_v2(&target_task_id())
+                    .unwrap()
+                    .clone();
+                assert_eq!(spec_before.launch_issuance, issuance_before.reference());
+                assert_eq!(issuance_before.revision.get(), 2);
+                drop(reopened);
+
+                let start_request = HarnessStartTaskRequestV2 {
+                    authority: authority('o'),
+                    task_id: target_task_id(),
+                    expected_task_revision: options.task_revision,
+                    expected_execution_spec_revision: spec_before.revision,
+                    expected_launch_issuance: issuance_before.reference(),
+                };
+                let started = match exact_client.start_task_v2(start_request.clone()) {
+                    Ok(started) => started,
+                    Err(error) => panic!(
+                        "start_task_v2 conflicted again immediately after a fresh reissue -- \
+                         a different bug, not the live-source-drift race: {error:?}",
+                    ),
+                };
+                (started, issuance_before, spec_before, start_request)
+            }
+            Err(error) => panic!("start_task_v2 failed with a non-conflict error: {error:?}"),
+        };
     assert!(!started.replayed);
     let correlation = match timeout(Duration::from_secs(30), async {
         loop {

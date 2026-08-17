@@ -5153,6 +5153,7 @@ async fn publish_c2_response_for_request(
         | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
         | C2NodeResponse::DeliveryCommitted { .. }
         | C2NodeResponse::DeliveryStageAborted { .. }
+        | C2NodeResponse::DurableContextPackResolved { .. }
         | C2NodeResponse::Accepted => {}
         C2NodeResponse::ShuttingDown => {
             send_update(

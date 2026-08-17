@@ -20,6 +20,7 @@ pub use gate4agent_harness_protocol::{
     HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1, HarnessDeliveryBundleV1,
     HarnessDeliveryBundleSelectionV1, HarnessDeliveryComponentCountV1,
     HarnessDeliveryComponentKindV1, HarnessContextSourceSelectionV1,
+    HarnessContextSourceAvailabilityV1,
     HarnessDeliveryManifestDigestV2, HarnessDeliveryRef, HarnessDeliveryStateV1,
     HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1, HarnessMoveTaskRequestV1,
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
@@ -4619,11 +4620,13 @@ mod tests {
             node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
             workspace_id: HarnessSelectorV1::new("source-workspace").unwrap(),
             session_record_id: HarnessSelectorV1::new("record-a").unwrap(),
-            active_session: HarnessRuntimeIdentityV1 { instance_id: 41, generation: 3 },
+            active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 41, generation: 3 }),
             message_count: 12,
             message_count_exact: true,
             completed_turn_count: Some(5),
             total_tokens: Some(4096),
+            availability: HarnessContextSourceAvailabilityV1::Live,
+            context_pack: None,
         };
         let delivery = HarnessDeliveryBundleSelectionV1 {
             bundle: HarnessDeliveryBundleV1 {

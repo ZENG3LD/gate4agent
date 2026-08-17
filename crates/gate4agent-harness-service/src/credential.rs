@@ -263,6 +263,7 @@ pub(crate) mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: Some(HarnessSessionBindingV1 {
                 node_id: selector("node-a"),
                 node_incarnation: incarnation_selector(),

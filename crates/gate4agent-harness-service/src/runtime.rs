@@ -80,7 +80,7 @@ use gate4agent_harness_protocol::{
     HarnessOutcomeUnknownReasonV1, HarnessResultDispositionV1, HarnessRevision,
     HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskStateV1,
     HarnessRuntimeIdentityV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
-    HarnessContextSourceSelectionV1, HarnessRequestDigest,
+    HarnessContextSourceSelectionV1, HarnessContextSourceAvailabilityV1, HarnessRequestDigest,
     HarnessWorktreeIntentV1, HarnessContinuationV1, HarnessDeliveryV1,
     HarnessTransferAuthorityRefV1,
 };
@@ -1812,6 +1812,7 @@ fn start_continuation_export_finish(
     tokio::spawn(async move {
         let result = match start {
             ContextPackExportStart::Enqueued(pending) => pending.finish().await,
+            ContextPackExportStart::EnqueuedDurable(pending) => pending.finish().await,
             ContextPackExportStart::NotEnqueued(outcome) => Ok(outcome),
         };
         let _ = commands.send(HostCommand::ContinuationExportFinished {
@@ -4663,6 +4664,59 @@ fn context_source_option(
     runtime_inventory: &HarnessRuntimeInventoryCache,
     run: &gate4agent_harness_protocol::HarnessRunV1,
 ) -> Result<Option<HarnessContextSourceSelectionV1>, HarnessOperatorHostErrorV1> {
+    if let Some(pack) = &run.context_pack {
+        let Some(binding) = &run.binding else { return Ok(None); };
+        let HarnessSessionIdentityV1::Managed { record_id, .. } = &binding.session else {
+            return Ok(None);
+        };
+        // The durable pack outlives the Node incarnation it was produced
+        // under (surviving exactly that restart is the entire point of a
+        // Durable source), but `binding.node_incarnation` is `run`'s own
+        // original spawn-accept binding and never updates. Re-resolve the
+        // Node's CURRENT incarnation by node_id alone here (unlike the Live
+        // branch below, which legitimately needs an exact incarnation match
+        // since a live session cannot survive a restart either way) — this
+        // is what both the later C2 route (`start_context_pack_export`,
+        // c2.rs) and the eventual target binding
+        // (`HarnessContinuationV1.target_binding`, which
+        // `HarnessContinuationV1::validate()`'s `exact_route` invariant also
+        // requires to share this same incarnation) actually need to match.
+        // `HarnessService::start_task_v2` synthesizes `continuation.source_binding`
+        // with this same current incarnation rather than copying `run`'s own
+        // stale one verbatim, for the identical reason.
+        // If the Node isn't currently known at all, there is no route to
+        // resolve the pack through right now — the source is correctly
+        // unavailable, not merely stale, until the Node reconnects.
+        let Some(current_node_incarnation) = runtime_inventory.nodes.values()
+            .find(|node| node.node_id == binding.node_id.as_str())
+            .map(|node| node.incarnation_id.clone())
+        else {
+            return Ok(None);
+        };
+        let mut source = HarnessContextSourceSelectionV1 {
+            source_run_id: run.run_id.clone(),
+            source_run_revision: run.revision,
+            observed_at_unix_ms: run.updated_at_unix_ms,
+            metadata_digest: HarnessRequestDigest::new("0".repeat(64))
+                .map_err(|_| HarnessOperatorHostErrorV1::Internal)?,
+            node_id: binding.node_id.clone(),
+            node_incarnation: HarnessSelectorV1::new(current_node_incarnation)
+                .map_err(|_| HarnessOperatorHostErrorV1::Internal)?,
+            workspace_id: binding.workspace_id.clone(),
+            session_record_id: record_id.clone(),
+            active_session: None,
+            message_count: pack.source_message_count,
+            message_count_exact: true,
+            completed_turn_count: None,
+            total_tokens: None,
+            availability: HarnessContextSourceAvailabilityV1::Durable,
+            context_pack: Some(pack.clone()),
+        };
+        source.metadata_digest = crate::context_source_metadata_digest(&source)
+            .map_err(map_operator_service_error)?;
+        source.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+        return Ok(Some(source));
+    }
     if run.lifecycle != HarnessRunLifecycleV1::Running { return Ok(None); }
     let Some(binding) = &run.binding else { return Ok(None); };
     let HarnessSessionIdentityV1::Managed {
@@ -4705,11 +4759,13 @@ fn context_source_option(
         node_incarnation: binding.node_incarnation.clone(),
         workspace_id: binding.workspace_id.clone(),
         session_record_id: record_id.clone(),
-        active_session: active_session.clone(),
+        active_session: Some(active_session.clone()),
         message_count: history.message_count,
         message_count_exact: history.message_count_exact,
         completed_turn_count: history.completed_turn_count,
         total_tokens: history.total_tokens,
+        availability: HarnessContextSourceAvailabilityV1::Live,
+        context_pack: None,
     };
     source.metadata_digest = crate::context_source_metadata_digest(&source)
         .map_err(map_operator_service_error)?;
@@ -4959,7 +5015,8 @@ fn execute_operator_request(
                 &request.task_id,
             )?;
             HarnessOperatorResponseV1::TaskStarted(
-                harness.start_task_v2(launch_catalog, &options, request)
+                harness
+                    .start_task_v2(launch_catalog, &options, request)
                     .map_err(map_operator_service_error)?,
             )
         }
@@ -5201,10 +5258,34 @@ async fn handle_connection(
 ) -> Result<(), HarnessRuntimeError> {
     let mut operator_frame = false;
     let outcome = timeout(HOST_CONNECTION_DEADLINE, async {
-        let frame = timeout(
+        let frame = match timeout(
             HOST_DEADLINE,
             read_single_frame_detecting_operator(&mut stream, &mut operator_frame),
-        ).await.map_err(|_| HarnessRuntimeError::Deadline)??;
+        ).await {
+            Ok(result) => result?,
+            Err(_) => {
+                // The first-frame read deadline (not the outer connection
+                // deadline) elapsed. `operator_frame` may already have been
+                // flipped by a partial read that contained "g4aho_" before
+                // the timeout fired, so it still picks the correct reply
+                // shape — matching the other Deadline branches below, which
+                // all write a reply before returning.
+                if operator_frame {
+                    write_operator_reply(
+                        &mut stream,
+                        HarnessOperatorReplyV1::Error {
+                            error: HarnessOperatorHostErrorV1::Deadline,
+                        },
+                    ).await?;
+                } else {
+                    write_reply(
+                        &mut stream,
+                        HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Deadline },
+                    ).await?;
+                }
+                return Err(HarnessRuntimeError::Deadline);
+            }
+        };
         operator_frame = frame_is_operator(&frame);
         if operator_frame {
             let envelope: HarnessOperatorEnvelopeV1 = match serde_json::from_slice(&frame) {
@@ -5612,6 +5693,7 @@ fn apply_or_buffer_host_live_event(
     }
     let received_at = unix_time_ms();
     apply_exact_control_lifecycle(harness, &routed, received_at)?;
+    apply_live_context_pack_receipt(harness, &route, &routed, received_at)?;
     if durable_cursor_for(observation, &route).is_some_and(|sequence| {
         sequence >= routed.cursor.sequence
     }) {
@@ -5754,6 +5836,7 @@ fn finish_observation_recovery(
             break;
         }
         apply_exact_control_lifecycle(harness, &routed, received_at)?;
+        apply_live_context_pack_receipt(harness, &route, &routed, received_at)?;
         observation.apply_ingress(routed_event_to_ingress(routed, received_at)?)?;
     }
     if follow_up {
@@ -6011,7 +6094,111 @@ fn apply_resync_lifecycle(
         resync.snapshot(),
         resync.lifecycle_control_events(),
         received_at_ms,
+    )?;
+    apply_snapshot_context_pack_receipts(
+        harness,
+        resync.route(),
+        resync.snapshot(),
+        received_at_ms,
     )
+}
+
+/// Reconciles one more durable fact from a managed session record: its most
+/// recent clean-exit ContextPack export (`exported_context`) is copied onto
+/// every harness run currently bound to that exact record, on the exact
+/// route it was observed on, exactly once. Deliberately matches on every
+/// lifecycle, not just `Waiting` — a Completed run is exactly the case A2
+/// cares about — and the `run.context_pack.is_some()` guard already makes a
+/// repeat pass a no-op; the remaining (run_id, digest) idempotency lives in
+/// `record_run_context_pack` itself, so this — and both callers below — can
+/// be invoked redundantly at no cost. Independent of and never
+/// blocks/delays any lifecycle transition committed elsewhere: if the pack
+/// has not landed yet, it simply shows up on a later call (design risk #1
+/// — no race to win). Shared by both context-pack receipt appliers: the
+/// resync/recovery snapshot scan (`apply_snapshot_context_pack_receipts`,
+/// one record at a time from a full snapshot) and the steady-state live
+/// reaction (`apply_live_context_pack_receipt`, the one record a
+/// `SessionRecordUpserted` event just carried).
+fn apply_context_pack_receipt_for_record(
+    harness: &mut HarnessService,
+    route: &NodeRoute,
+    record: &C2ManagedSessionRecord,
+    received_at_ms: u64,
+) -> Result<(), HarnessRuntimeError> {
+    let Some(exported_context) = record.exported_context.as_ref() else {
+        return Ok(());
+    };
+    let matches = harness.engine().runs().filter_map(|run| {
+        if run.context_pack.is_some() {
+            return None;
+        }
+        let binding = run.binding.as_ref()?;
+        let HarnessSessionIdentityV1::Managed { record_id, .. } = &binding.session else {
+            return None;
+        };
+        if binding.node_id.as_str() != route.node_id.as_str()
+            || binding.node_incarnation.as_str() != route.expected_incarnation_id.to_string()
+            || record_id.as_str() != record.record_id.as_str()
+            || binding.workspace_id.as_str() != record.workspace_id.as_str()
+        {
+            return None;
+        }
+        Some(run.run_id.clone())
+    }).collect::<Vec<_>>();
+    for run_id in matches {
+        let receipt = crate::context_receipt_from_node(exported_context)?;
+        harness.record_run_context_pack(
+            &run_id,
+            receipt,
+            received_at_ms,
+            &route.node_id,
+            route.expected_incarnation_id,
+        )?;
+    }
+    Ok(())
+}
+
+/// Resync/recovery path: scans a full snapshot's session records for any
+/// carrying an `exported_context`, delegating each one to
+/// `apply_context_pack_receipt_for_record`. See that function's doc comment
+/// for the shared idempotency and the steady-state counterpart below.
+fn apply_snapshot_context_pack_receipts(
+    harness: &mut HarnessService,
+    route: &NodeRoute,
+    snapshot: &gate4agent_c2_protocol::C2NodeSnapshot,
+    received_at_ms: u64,
+) -> Result<(), HarnessRuntimeError> {
+    if snapshot.node_id != route.node_id {
+        return Ok(());
+    }
+    for record in &snapshot.session_records {
+        apply_context_pack_receipt_for_record(harness, route, record, received_at_ms)?;
+    }
+    Ok(())
+}
+
+/// Steady-state path: reacts to the live `SessionRecordUpserted` event a
+/// Node publishes the moment `set_exported_context` commits a record's
+/// `exported_context` (`gate4agent-node/src/server.rs`'s
+/// `set_exported_context` -> `publish_record`), so a run's own
+/// `context_pack` lands within the very same live event that carried the
+/// export while the route stays healthy — no reconnect or resync required.
+/// Called from `apply_or_buffer_host_live_event` right alongside (and after)
+/// `apply_exact_control_lifecycle`, never gated behind the observation
+/// cursor dedup check further down: `record_run_context_pack`'s own
+/// (run_id, digest) idempotency already makes a redundant call free, exactly
+/// as it does for `apply_snapshot_context_pack_receipts`, whose per-record
+/// logic this shares via `apply_context_pack_receipt_for_record`.
+fn apply_live_context_pack_receipt(
+    harness: &mut HarnessService,
+    route: &NodeRoute,
+    routed: &RoutedNodeEvent,
+    received_at_ms: u64,
+) -> Result<(), HarnessRuntimeError> {
+    let C2NodeEvent::SessionRecordUpserted { record } = &routed.event else {
+        return Ok(());
+    };
+    apply_context_pack_receipt_for_record(harness, route, record, received_at_ms)
 }
 
 fn apply_snapshot_lifecycle(
@@ -6431,8 +6618,9 @@ mod tests {
         C2SessionSnapshot, C2SessionStatus, C2WorkspaceSnapshot,
     };
     use gate4agent_node_protocol::{
-        ManagedSessionState, NodeCursor, OpaqueHostPath, ProviderRuntimeStatuses,
-        SessionMode, SessionRecordId,
+        ContextPackLineageReceipt, ManagedSessionState, NodeCursor, OpaqueHostPath,
+        ProviderRuntimeStatuses, ResolvedContextPackReceipt, SessionMode, SessionRecordId,
+        SpawnContextDigest,
     };
     use gate4agent_observation_protocol::{
         ObservationEvidenceV1, ObservationKindV1, ObservationV1,
@@ -6839,6 +7027,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: Some(HarnessSessionBindingV1 {
                 node_id: selector("node-a"),
                 node_incarnation: selector(&incarnation.to_string()),
@@ -6899,6 +7088,90 @@ mod tests {
             expected_incarnation_id: incarnation,
         };
         (harness, task_id, run_id, route)
+    }
+
+    fn exported_context_pack_receipt(route: &NodeRoute) -> ResolvedContextPackReceipt {
+        ResolvedContextPackReceipt {
+            id: SpawnContextId::new("context-a").unwrap(),
+            digest: SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            lineage: ContextPackLineageReceipt {
+                source_node_id: route.node_id.clone(),
+                source_session: bound_session_address(),
+                // Matches `running_harness_fixture()`'s own
+                // `intent.provider_profile` -- `HarnessRunV1::validate()`
+                // requires a run's `context_pack.lineage.source_provider` to
+                // equal its own `intent.provider_profile`.
+                source_provider: AgentId::new("profile-a").unwrap(),
+            },
+            source_message_count: 2,
+            retained_message_count: 2,
+            byte_len: 64,
+            truncated: false,
+        }
+    }
+
+    fn session_record_upserted(
+        route: &NodeRoute,
+        sequence: u64,
+        record: C2ManagedSessionRecord,
+    ) -> RoutedNodeEvent {
+        RoutedNodeEvent {
+            node_id: route.node_id.clone(),
+            cursor: NodeCursor { incarnation_id: route.expected_incarnation_id, sequence },
+            event: C2NodeEvent::SessionRecordUpserted { record },
+        }
+    }
+
+    #[test]
+    fn apply_live_context_pack_receipt_lands_within_one_live_event() {
+        // Steady-state proof for `apply_live_context_pack_receipt`: exercises
+        // the exact call `apply_or_buffer_host_live_event` makes right
+        // alongside `apply_exact_control_lifecycle` on a healthy route,
+        // reacting to a single live `SessionRecordUpserted` event -- no
+        // snapshot, no resync, no reconnect anywhere in this test.
+        let (mut harness, _task_id, run_id, route) = running_harness_fixture();
+        assert!(harness.engine().run(&run_id).unwrap().context_pack.is_none());
+
+        let receipt = exported_context_pack_receipt(&route);
+        let record = C2ManagedSessionRecord {
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            display_name: "Live export fixture".to_owned(),
+            provider: AgentId::new("profile-a").unwrap(),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Dormant,
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("workspace-a").unwrap(),
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            exported_context: Some(receipt.clone()),
+            task_binding: None,
+            provider_identity_present: true,
+            created_at_unix_ms: 5,
+            updated_at_unix_ms: 6,
+        };
+        let routed = session_record_upserted(&route, 6, record.clone());
+
+        apply_live_context_pack_receipt(&mut harness, &route, &routed, 10).unwrap();
+        let context_pack = harness.engine().run(&run_id).unwrap().context_pack.clone()
+            .expect("run's context_pack did not land from the live SessionRecordUpserted event");
+        assert_eq!(context_pack.digest, receipt.digest.as_str());
+        assert_eq!(context_pack.lineage.source_provider.as_str(), "profile-a");
+        let revision_after_first = harness.engine().run(&run_id).unwrap().revision;
+
+        // Same (run_id, digest) idempotency the resync path relies on via
+        // `record_run_context_pack`: a redundant live upsert of the same
+        // already-exported record must not re-mutate the run.
+        apply_live_context_pack_receipt(&mut harness, &route, &routed, 11).unwrap();
+        assert_eq!(harness.engine().run(&run_id).unwrap().revision, revision_after_first);
+
+        // A live event for an unrelated record must never touch this run.
+        let mut other_record = record;
+        other_record.record_id = SessionRecordId::new("record-b").unwrap();
+        let other_routed = session_record_upserted(&route, 7, other_record);
+        apply_live_context_pack_receipt(&mut harness, &route, &other_routed, 12).unwrap();
+        assert_eq!(harness.engine().run(&run_id).unwrap().revision, revision_after_first);
     }
 
     #[test]
@@ -7096,6 +7369,7 @@ mod tests {
                     bundle: None,
                     context_id: None,
                     context: None,
+                    exported_context: None,
                     task_binding: None,
                     provider_identity_present: true,
                     created_at_unix_ms: 1,

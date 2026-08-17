@@ -3733,6 +3733,8 @@ pub struct ManagedSessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ResolvedContextPackReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_context: Option<ResolvedContextPackReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_binding: Option<SessionTaskBindingV1>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -3742,6 +3744,12 @@ pub struct ManagedSessionRecord {
 impl ManagedSessionRecord {
     pub fn context_binding_is_valid(&self) -> bool {
         context_receipt_binding_is_valid(self.context_id.as_ref(), self.context.as_ref())
+    }
+
+    pub fn exported_context_is_valid(&self) -> bool {
+        self.exported_context.as_ref().map_or(true, |pack| {
+            pack.is_valid() && pack.lineage.source_provider == self.provider
+        })
     }
 
     pub fn task_binding_is_valid(&self) -> bool {
@@ -3781,6 +3789,8 @@ impl<'de> Deserialize<'de> for ManagedSessionRecord {
             #[serde(default)]
             context: Option<ResolvedContextPackReceipt>,
             #[serde(default)]
+            exported_context: Option<ResolvedContextPackReceipt>,
+            #[serde(default)]
             task_binding: Option<SessionTaskBindingV1>,
             created_at_unix_ms: u64,
             updated_at_unix_ms: u64,
@@ -3802,6 +3812,7 @@ impl<'de> Deserialize<'de> for ManagedSessionRecord {
             bundle: wire.bundle,
             context_id: wire.context_id,
             context: wire.context,
+            exported_context: wire.exported_context,
             task_binding: wire.task_binding,
             created_at_unix_ms: wire.created_at_unix_ms,
             updated_at_unix_ms: wire.updated_at_unix_ms,
@@ -3810,6 +3821,11 @@ impl<'de> Deserialize<'de> for ManagedSessionRecord {
         if !record.context_binding_is_valid() {
             return Err(serde::de::Error::custom(
                 "managed session context id and materialization receipt are not correlated",
+            ));
+        }
+        if !record.exported_context_is_valid() {
+            return Err(serde::de::Error::custom(
+                "managed session exported context receipt is invalid or from a different provider",
             ));
         }
         if !record.task_binding_is_valid() {
@@ -5619,6 +5635,9 @@ pub enum NodeRequest {
     ForgetContextPack {
         context_id: SpawnContextId,
     },
+    ResolveDurableContextPack {
+        context_id: SpawnContextId,
+    },
     Prompt { session: SessionAddress, text: String },
     Paste { session: SessionAddress, text: String },
     Input { session: SessionAddress, text: String },
@@ -5782,6 +5801,7 @@ impl NodeRequest {
             | Self::ExportContextPackForSessionRecord { .. }
             | Self::ExportContextPack { .. }
             | Self::ForgetContextPack { .. }
+            | Self::ResolveDurableContextPack { .. }
             | Self::Prompt { .. }
             | Self::Paste { .. }
             | Self::Input { .. }
@@ -5848,7 +5868,8 @@ impl NodeRequest {
             Self::DiscoverHistory { .. }
             | Self::LoadHistory { .. }
             | Self::ExportContextPack { .. }
-            | Self::ForgetContextPack { .. } => {
+            | Self::ForgetContextPack { .. }
+            | Self::ResolveDurableContextPack { .. } => {
                 Some(NODE_HISTORY_CONTEXT_PACK_CAPABILITY)
             }
             Self::Snapshot
@@ -6148,6 +6169,9 @@ pub enum NodeResponse {
     ContextPackForgotten {
         context_id: SpawnContextId,
     },
+    DurableContextPackResolved {
+        context: ResolvedContextPackReceipt,
+    },
     WorkspaceRegistered {
         workspace: WorkspaceSnapshot,
     },
@@ -6332,6 +6356,7 @@ impl NodeResponse {
             | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
+            | Self::DurableContextPackResolved { .. }
             | Self::WorkspaceRegistered { .. }
             | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
@@ -6362,6 +6387,7 @@ impl NodeResponse {
             | Self::ProviderSessionIndexed { record }
             | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
+            Self::DurableContextPackResolved { .. } => false,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -6432,7 +6458,8 @@ impl NodeResponse {
             | Self::HistoryLoaded { .. }
             | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
-            | Self::ContextPackForgotten { .. } => true,
+            | Self::ContextPackForgotten { .. }
+            | Self::DurableContextPackResolved { .. } => true,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -8368,6 +8395,7 @@ mod tests {
             bundle: None,
             context_id: Some(context.id.clone()),
             context: Some(context.clone()),
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
@@ -8411,6 +8439,19 @@ mod tests {
         let mut empty = json;
         empty["context"]["retained_message_count"] = serde_json::Value::from(0);
         assert!(serde_json::from_value::<ManagedSessionRecord>(empty).is_err());
+
+        let mut with_exported_context = record.clone();
+        with_exported_context.exported_context = Some(context.clone());
+        assert!(with_exported_context.exported_context_is_valid());
+        let exported_json = serde_json::to_value(&with_exported_context).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ManagedSessionRecord>(exported_json.clone()).unwrap(),
+            with_exported_context,
+        );
+        let mut mismatched_provider = exported_json;
+        mismatched_provider["exported_context"]["lineage"]["source_provider"] =
+            serde_json::Value::String("codex".to_owned());
+        assert!(serde_json::from_value::<ManagedSessionRecord>(mismatched_provider).is_err());
 
         let receipt = ResolvedSpawnReceipt {
             incarnation_id: NodeIncarnationId::from_bytes([9; NODE_INCARNATION_ID_BYTES]),
@@ -9706,6 +9747,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 1_723_000_000_000,
             updated_at_unix_ms: 1_723_000_000_123,

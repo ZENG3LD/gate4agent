@@ -46,6 +46,12 @@ const HARNESS_LIFECYCLE_IDEMPOTENCY_REF_DOMAIN: &[u8] =
     b"gate4agent-harness-lifecycle-idempotency-ref-v1\0";
 const HARNESS_LIFECYCLE_REQUEST_DIGEST_DOMAIN: &[u8] =
     b"gate4agent-harness-lifecycle-request-digest-v1\0";
+const HARNESS_CONTEXT_PACK_RECORD_OPERATION_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-context-pack-record-operation-id-v1\0";
+const HARNESS_CONTEXT_PACK_RECORD_IDEMPOTENCY_REF_DOMAIN: &[u8] =
+    b"gate4agent-harness-context-pack-record-idempotency-ref-v1\0";
+const HARNESS_CONTEXT_PACK_RECORD_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"gate4agent-harness-context-pack-record-request-digest-v1\0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -802,6 +808,58 @@ pub fn deterministic_lifecycle_authority_ids(
         request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
     )?;
     Ok(HarnessLifecycleAuthorityIdsV1 {
+        operation_id,
+        idempotency_ref,
+        request_digest,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessContextPackRecordAuthorityIdsV1 {
+    pub operation_id: HarnessOperationId,
+    pub idempotency_ref: HarnessIdempotencyRef,
+    pub request_digest: HarnessRequestDigest,
+}
+
+/// Keyed by `(run_id, node_id, incarnation_id, receipt digest)` rather than
+/// an event sequence number: `RecordRunContextPack` fires off an idempotent
+/// snapshot poll (§3.5), not a discrete lifecycle event, so the exact same
+/// receipt observed on a later resync must derive the identical operation
+/// identity and replay cleanly instead of conflicting.
+pub fn deterministic_context_pack_record_ids(
+    run_id: &HarnessRunId,
+    node_id: &NodeId,
+    incarnation_id: &NodeIncarnationId,
+    receipt_digest: &str,
+) -> Result<HarnessContextPackRecordAuthorityIdsV1, HarnessDispatchError> {
+    run_id.validate()?;
+    let incarnation = incarnation_id.to_string();
+    let material = serde_json::to_vec(&(
+        run_id.as_str(),
+        node_id.as_str(),
+        incarnation.as_str(),
+        receipt_digest,
+    ))?;
+    let operation_id = derived_id_from_material(
+        HarnessOperationId::PREFIX,
+        HARNESS_CONTEXT_PACK_RECORD_OPERATION_ID_DOMAIN,
+        &material,
+        HarnessOperationId::new,
+    )?;
+    let idempotency_ref = derived_id_from_material(
+        HarnessIdempotencyRef::PREFIX,
+        HARNESS_CONTEXT_PACK_RECORD_IDEMPOTENCY_REF_DOMAIN,
+        &material,
+        HarnessIdempotencyRef::new,
+    )?;
+    let request_digest = local_hmac_sha256(
+        HARNESS_CONTEXT_PACK_RECORD_REQUEST_DIGEST_DOMAIN,
+        &material,
+    ).map_err(HarnessDispatchError::Digest)?;
+    let request_digest = HarnessRequestDigest::new(
+        request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    )?;
+    Ok(HarnessContextPackRecordAuthorityIdsV1 {
         operation_id,
         idempotency_ref,
         request_digest,

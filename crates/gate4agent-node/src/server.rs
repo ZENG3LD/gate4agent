@@ -16,6 +16,7 @@ use crate::environment_profiles::{
 };
 use crate::bundle_catalog::{BundleCatalog, NodeBundle};
 use self::bundle_delivery::{DeliveryStore, DeliveryStoreError};
+use self::context_pack_store::ContextPackStore;
 use crate::bundle_provider::{
     bundle_launch_arguments, validate_bundle_binding, BundleProviderLayout,
 };
@@ -195,6 +196,9 @@ mod http_api;
 
 #[path = "bundle_delivery.rs"]
 mod bundle_delivery;
+
+#[path = "context_pack_store.rs"]
+mod context_pack_store;
 
 #[cfg(windows)]
 pub use crate::platform::DEFAULT_NODE_ENDPOINT;
@@ -1262,6 +1266,13 @@ fn delivery_store_root_for_state_path(state_path: &Path) -> Option<PathBuf> {
     Some(parent.join(name))
 }
 
+fn context_pack_store_root_for_state_path(state_path: &Path) -> Option<PathBuf> {
+    let parent = state_path.parent()?;
+    let mut name = state_path.file_name()?.to_os_string();
+    name.push(".context-pack-store");
+    Some(parent.join(name))
+}
+
 pub struct NodeServer {
     config: NodeServerConfig,
     runtime: NativeRuntime,
@@ -1344,6 +1355,70 @@ impl NodeServer {
             .map_err(|error| NodeServerError::Registry(error.to_string()))?;
         spec.display_name = "Controlled Claude clean-exit fixture".to_owned();
         Self::new_fixture_with_spec(config, spec)
+    }
+
+    /// A `claude` source whose session establishes a verified provider
+    /// identity via an early `SessionStart` Hook post (so it is eligible for
+    /// auto-export-at-exit and its native history is independently
+    /// loadable), waits for `release_signal`, then exits cleanly — paired
+    /// on the same Node with a plain `codex` target that never validates
+    /// anything about what it receives. Built for A2 durable ContextPack
+    /// E2E coverage: the test itself inspects materialized files and
+    /// managed-session-record fields directly, rather than having the
+    /// target script self-validate.
+    #[cfg(all(feature = "fixture", windows))]
+    pub fn new_durable_context_pack_clean_exit_fixture(
+        config: NodeServerConfig,
+        fixture_root: PathBuf,
+        started_marker: PathBuf,
+        release_signal: PathBuf,
+        session_id: &str,
+    ) -> Result<Self, NodeServerError> {
+        let mut source_spec = gate4agent_testkit::identified_clean_exit_agent_spec(
+            &fixture_root,
+            &started_marker,
+            &release_signal,
+            session_id,
+        )
+        .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let source_id = AgentId::new("claude")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let source_provider = builtin_registry().get(&source_id).ok_or_else(|| {
+            NodeServerError::Registry(
+                "durable context pack clean-exit fixture source adapter is unavailable"
+                    .to_owned(),
+            )
+        })?;
+        source_spec.capabilities.adapters.history =
+            source_provider.capabilities.adapters.history.clone();
+        source_spec.id = source_id;
+        source_spec.display_name =
+            "Controlled Claude durable context-pack clean-exit fixture".to_owned();
+        // Both specs launch via `powershell.exe`; the registry's ambiguity
+        // check keys on `detection.command` (+ aliases), not `launch.program`
+        // -- give each a distinct detection identity, same precedent as
+        // `context_pack_fixture_catalog`'s per-provider
+        // `gate4agent-{provider}-context-fixture.cmd` commands.
+        source_spec.detection.command =
+            "gate4agent-claude-durable-context-pack-fixture.cmd".to_owned();
+        source_spec.detection.aliases.clear();
+
+        let mut target_spec = gate4agent_testkit::interactive_agent_spec();
+        target_spec.id = AgentId::new("codex")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        target_spec.display_name =
+            "Controlled Codex durable context-pack target fixture".to_owned();
+        target_spec.detection.command =
+            "gate4agent-codex-durable-context-pack-fixture.cmd".to_owned();
+        target_spec.detection.aliases.clear();
+
+        let catalog = AgentRegistry::new([source_spec, target_spec])
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let mut server = Self::new_with_registry(config, catalog)?;
+        Arc::get_mut(&mut server.shared)
+            .expect("fixture Node shared state must remain uniquely owned before run")
+            .fixture_semantic_hook_policy = true;
+        Ok(server)
     }
 
     #[cfg(feature = "fixture")]
@@ -2036,6 +2111,22 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         };
         let delivered_catalog = BundleCatalog::new(delivered_bundles)
             .map_err(|_| NodeServerError::DeliveryStore)?;
+        let (context_pack_store, durable_context_packs) = match config.state_path.as_ref() {
+            Some(state_path) => {
+                let context_pack_root = context_pack_store_root_for_state_path(state_path)
+                    .ok_or(NodeServerError::ContextPackStore)?;
+                let (store, packs) = ContextPackStore::open(context_pack_root)
+                    .map_err(|_| NodeServerError::ContextPackStore)?;
+                (Some(store), packs)
+            }
+            None => (None, Vec::new()),
+        };
+        let mut durable_context_catalog = ContextPackCatalog::default();
+        for pack in durable_context_packs {
+            durable_context_catalog
+                .insert(pack)
+                .map_err(|_| NodeServerError::ContextPackStore)?;
+        }
         let session_environment_materializer = config
             .session_environment
             .as_ref()
@@ -2097,6 +2188,8 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         shared.harness_mcp_registry = harness_mcp_registry.clone();
         shared.bundle_catalog = RwLock::new(delivered_catalog);
         shared.delivery_store = Mutex::new(delivery_store);
+        shared.context_catalog = RwLock::new(durable_context_catalog);
+        shared.context_pack_store = Mutex::new(context_pack_store);
         shared.managed_spawn_replays = Mutex::new(
             managed_spawn_replays
                 .into_iter()
@@ -2246,6 +2339,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         } = self;
         shared.reconcile_materializations();
         shared.reconcile_managed_worktrees().await;
+        shared.reconcile_context_pack_exports().await;
         runtime
             .start_hook_ingress(HookIngressConfig::default())
             .await
@@ -2327,6 +2421,35 @@ async fn drive_runtime_until_shutdown(
     loop {
         runtime.tick().await;
         while let Ok(event) = events.try_recv() {
+            let clean_exit = matches!(
+                event.event,
+                ControlEventKind::Exited { exit_code: Some(0), forced: false },
+            );
+            let instance_id = event.instance_id;
+            let generation = event.generation;
+            // Resolve and spawn before publish_control: publish_control's own
+            // managed-record bookkeeping (reconcile_managed_record) downgrades
+            // this exact record from Live to Dormant and clears
+            // active_session for every Exited event, inside the same
+            // synchronous call. Capturing (record_id, session) here — before
+            // that runs — is the only way to observe them still Live and
+            // still populated; the export itself must still run on its own
+            // detached task (never awaited inline on this loop) because it
+            // needs NativeRuntime::tick() to keep running to ever settle, and
+            // tick() is only ever driven by this same loop. See
+            // reconcile_context_pack_export_for_record's doc comment.
+            if clean_exit {
+                if let Some((record_id, session)) =
+                    shared.managed_record_export_target_for_instance(instance_id, generation)
+                {
+                    let export_shared = Arc::clone(&shared);
+                    tokio::spawn(async move {
+                        export_shared
+                            .reconcile_context_pack_export_for_record(&record_id, session)
+                            .await;
+                    });
+                }
+            }
             shared.publish_control(event);
         }
         shared.publish_terminal_frames();
@@ -2648,6 +2771,7 @@ struct NodeShared {
         RwLock<BTreeMap<SpawnEnvironmentProfileId, NodeSessionMaterializationProfile>>,
     bundle_catalog: RwLock<BundleCatalog>,
     delivery_store: Mutex<Option<DeliveryStore>>,
+    context_pack_store: Mutex<Option<ContextPackStore>>,
     context_catalog: RwLock<ContextPackCatalog>,
     native_launch_profile_control: Option<NativeLaunchProfileControl>,
     harness_mcp_registry: Option<HarnessMcpProxyRegistry>,
@@ -2957,6 +3081,7 @@ impl NodeShared {
             environment_materialization_profiles: RwLock::new(BTreeMap::new()),
             bundle_catalog: RwLock::new(BundleCatalog::default()),
             delivery_store: Mutex::new(None),
+            context_pack_store: Mutex::new(None),
             context_catalog: RwLock::new(ContextPackCatalog::default()),
             native_launch_profile_control,
             harness_mcp_registry: None,
@@ -5602,6 +5727,169 @@ impl NodeShared {
         }
     }
 
+    /// Crash-recovery startup sweep: durably capture the pack for every
+    /// `Live` managed record whose most recent session has not yet produced
+    /// one (recovers a session whose `Exited{0}` event was observed but the
+    /// Node crashed before the export finished). The reactive fast path for
+    /// a single just-exited record does not go through this — see
+    /// `drive_runtime_until_shutdown`, which resolves and spawns directly so
+    /// it can capture the exact `SessionAddress` before `publish_control`
+    /// clears it, rather than re-deriving it from (by then likely already
+    /// `Dormant`) record state the way a rescan naturally would.
+    ///
+    /// Returns as soon as every eligible record's export has been *spawned*,
+    /// not completed — each one runs on its own detached task (see
+    /// `reconcile_context_pack_export_for_record`'s own doc comment for why:
+    /// `NativeRuntime::tick()` has not even started its own loop yet at the
+    /// point this is called from `NodeServer::run()`, so nothing could ever
+    /// drain the history round trip if this awaited it inline here either).
+    /// Best-effort throughout: never panics, no unwrap/expect; every failure
+    /// is a silent skip for THIS record — an unusable source or a racing
+    /// record is not surfaced to any caller.
+    async fn reconcile_context_pack_exports(self: &Arc<Self>) {
+        let candidates: Vec<(SessionRecordId, SessionAddress)> = self
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .values()
+            .filter(|record| {
+                record.state == ManagedSessionState::Live
+                    && record.exported_context.is_none()
+                    && record.provider_session.is_some()
+            })
+            .filter_map(|record| {
+                record
+                    .active_session
+                    .clone()
+                    .map(|session| (record.record_id.clone(), session))
+            })
+            .collect();
+        for (record_id, session) in candidates {
+            let shared = Arc::clone(self);
+            tokio::spawn(async move {
+                shared
+                    .reconcile_context_pack_export_for_record(&record_id, session)
+                    .await;
+            });
+        }
+    }
+
+    /// Runs on its own detached task (`tokio::spawn`, see both call sites),
+    /// never inline on `drive_runtime_until_shutdown`'s own task: the history
+    /// round trip this performs (`discover_history`/`load_history`, via
+    /// `export_context_pack_for_session_record`) can only ever settle once
+    /// `NativeRuntime::tick()` runs again to drain the authority worker's
+    /// completion — and `tick()` is exclusively owned by, and only ever
+    /// called from, that same drive-loop task. Awaiting this inline there
+    /// would starve `tick()` and this call could never observe its own
+    /// command complete.
+    ///
+    /// Because this now genuinely races the drive loop's own
+    /// `publish_control` (which downgrades this exact record from `Live` to
+    /// `Dormant`, clearing `active_session`, for the very `Exited` event that
+    /// triggered this reconcile), the record legitimately may already be
+    /// `Dormant` by the time this reads it, or may transition mid-flight —
+    /// `allow_clean_detachment: true` on the downstream export call is what
+    /// tolerates exactly that transition (and only that transition; see
+    /// `session_record_export_target_matches`).
+    async fn reconcile_context_pack_export_for_record(
+        &self,
+        record_id: &SessionRecordId,
+        session: SessionAddress,
+    ) {
+        let Ok(record) = self.record(record_id) else {
+            return;
+        };
+        if !matches!(
+            record.state,
+            ManagedSessionState::Live | ManagedSessionState::Dormant
+        ) || record.exported_context.is_some()
+            || record.provider_session.is_none()
+        {
+            return;
+        }
+        // Pack bytes are already durably committed inside this call, via
+        // commit_context_pack_for_session_record's own durable
+        // write-through (context_pack_store) — no separate step here.
+        // Unclean exits (non-zero/forced/no loadable history) are already
+        // rejected by context_pack_source_status_is_usable inside
+        // materialize_context_pack: this simply returns Err and is skipped.
+        let Ok(receipt) = self
+            .export_context_pack_for_session_record(&record.record_id, &session, true)
+            .await
+        else {
+            return;
+        };
+        self.set_exported_context(&record.record_id, receipt);
+    }
+
+    /// Records the record's most recent clean-exit pack. No-op (not an
+    /// error) if the record disappeared, or if it already carries an
+    /// `exported_context` — first-write-wins, matching the harness-side
+    /// idempotent reconciliation that consumes this field.
+    fn set_exported_context(&self, record_id: &SessionRecordId, receipt: ResolvedContextPackReceipt) {
+        let transaction = self
+            .state_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (previous, updated) = {
+            let mut records = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = records.records.get_mut(record_id) else {
+                return;
+            };
+            if record.exported_context.is_some() {
+                return;
+            }
+            let previous = record.clone();
+            record.exported_context = Some(receipt);
+            record.updated_at_unix_ms = unix_time_ms().max(record.updated_at_unix_ms);
+            (previous, record.clone())
+        };
+        if self.persist_state_locked().is_err() {
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .insert(record_id.clone(), previous);
+            return;
+        }
+        drop(transaction);
+        self.publish_record(updated);
+    }
+
+    /// Resolves the managed record and its exact `SessionAddress` currently
+    /// bound to `instance_id` at exactly `generation`, used by the reactive
+    /// `Exited{0}` hook in `drive_runtime_until_shutdown` to target a single
+    /// record without a full rescan. Mirrors the lookup already inlined in
+    /// `publish_control`. Captured synchronously, before `publish_control`
+    /// for the same event clears the record's own `active_session` — the
+    /// caller passes the resolved address through to a detached
+    /// reconciliation task rather than re-deriving it from the record later,
+    /// after that race has necessarily already happened.
+    fn managed_record_export_target_for_instance(
+        &self,
+        instance_id: AgentInstanceId,
+        generation: SessionGeneration,
+    ) -> Option<(SessionRecordId, SessionAddress)> {
+        let bindings = self
+            .session_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let binding = bindings.get(&instance_id).filter(|binding| binding.generation == generation)?;
+        let record_id = binding.record_id.clone()?;
+        Some((
+            record_id,
+            SessionAddress {
+                workspace_id: binding.workspace_id.clone(),
+                session: SessionKey { instance_id, generation },
+            },
+        ))
+    }
+
     fn mark_managed_recovery_required(
         &self,
         lease_id: &ManagedWorktreeLeaseId,
@@ -6089,6 +6377,7 @@ impl NodeShared {
             bundle,
             context_id: context.as_ref().map(|receipt| receipt.id.clone()),
             context,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
@@ -6182,6 +6471,7 @@ impl NodeShared {
         expected: &ManagedSessionRecord,
         identity: &ProviderSessionIdentity,
         session: &SessionAddress,
+        allow_clean_detachment: bool,
     ) -> Result<(), NodeFailure> {
         let current = self.record(&expected.record_id)?;
         let current_root = self.workspace_root(&current.workspace_id)?;
@@ -6206,7 +6496,12 @@ impl NodeShared {
             &binding,
             &snapshot.agent_id,
             &current_root,
-        ) || !session_record_context_export_source_is_usable(&current, &snapshot.status) {
+            allow_clean_detachment,
+        ) || !session_record_context_export_source_is_usable(
+            &current,
+            &snapshot.status,
+            allow_clean_detachment,
+        ) {
             return Err(failure(
                 NodeFailureCode::SessionRecordConflict,
                 "managed session binding changed during context export",
@@ -6519,6 +6814,7 @@ impl NodeShared {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
@@ -8721,6 +9017,12 @@ impl NodeShared {
                             bundle: current_snapshot.bundle,
                             context_id: current_snapshot.context_id,
                             context: current_snapshot.context,
+                            // This is a fresh record_id representing the session under its
+                            // newly-observed identity; it has not yet produced any clean
+                            // exit of its own, so it starts with no exported pack (the old
+                            // record, still addressable under its own record_id, keeps
+                            // whatever exported_context it already had).
+                            exported_context: None,
                             task_binding: current_snapshot.task_binding,
                             created_at_unix_ms: now,
                             updated_at_unix_ms: now,
@@ -9535,10 +9837,17 @@ impl NodeShared {
         })
     }
 
+    /// `allow_clean_detachment`: `false` for the on-demand
+    /// `NodeRequest::ExportContextPackForSessionRecord` API path (the
+    /// managed record must stay untouched, still live, for the whole call);
+    /// `true` only for the reactive auto-export-at-exit path (`§2.1`), which
+    /// reacts to the very clean-exit event that detaches the record out from
+    /// under this same call — see `session_record_export_target_matches`.
     async fn export_context_pack_for_session_record(
         &self,
         record_id: &SessionRecordId,
         session: &SessionAddress,
+        allow_clean_detachment: bool,
     ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
         let record = self.record(record_id)?;
         let identity = record.provider_session.clone().ok_or_else(|| {
@@ -9553,7 +9862,12 @@ impl NodeShared {
                 "managed session provider identity cannot bind history exactly",
             ));
         }
-        self.revalidate_session_record_context_export(&record, &identity, session)?;
+        self.revalidate_session_record_context_export(
+            &record,
+            &identity,
+            session,
+            allow_clean_detachment,
+        )?;
         let candidates = self
             .discover_history(session, HISTORY_DISCOVERY_LIMIT_MAX)
             .await?;
@@ -9568,7 +9882,12 @@ impl NodeShared {
                 "loaded history identity does not match the managed session record",
             ));
         }
-        self.revalidate_session_record_context_export(&record, &identity, session)?;
+        self.revalidate_session_record_context_export(
+            &record,
+            &identity,
+            session,
+            allow_clean_detachment,
+        )?;
         self.revalidate_loaded_history(session, &candidate_id, &loaded)?;
         let pack = self.materialize_context_pack(session).await?;
         self.commit_context_pack_for_session_record(
@@ -9578,6 +9897,7 @@ impl NodeShared {
             &candidate_id,
             &loaded,
             pack,
+            allow_clean_detachment,
         )
     }
 
@@ -9648,10 +9968,32 @@ impl NodeShared {
         })
     }
 
+    /// Write-through to the durable [`ContextPackStore`], if one is
+    /// configured (`state_path` is `Some`). A node with no durable state
+    /// path — fixtures, tests, ephemeral runs — has no `ContextPackStore`
+    /// open at all and this is a no-op, matching `persist_state`'s own
+    /// "durability optional, degrade gracefully when unconfigured" idiom.
+    fn commit_context_pack_durably(&self, pack: &NodeContextPack) -> Result<(), NodeFailure> {
+        let mut store = self
+            .context_pack_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(store) = store.as_mut() else {
+            return Ok(());
+        };
+        store.commit(pack).map_err(|_| {
+            failure(
+                NodeFailureCode::ContextPackMaterializationFailed,
+                "durable context pack commit failed",
+            )
+        })
+    }
+
     fn commit_context_pack(
         &self,
         pack: NodeContextPack,
     ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
+        self.commit_context_pack_durably(&pack)?;
         self.context_catalog
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -9672,6 +10014,7 @@ impl NodeShared {
         candidate_id: &str,
         loaded: &HistorySessionRecord,
         pack: NodeContextPack,
+        allow_clean_detachment: bool,
     ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
         let current_root = self.workspace_root(&expected.workspace_id)?;
         let _transaction = self
@@ -9688,7 +10031,7 @@ impl NodeShared {
                 "managed session record disappeared during context export",
             )
         })?;
-        if current != expected || current.state != ManagedSessionState::Live {
+        if !session_record_export_target_matches(expected, current, session, allow_clean_detachment) {
             return Err(failure(
                 NodeFailureCode::SessionRecordConflict,
                 "managed session record changed during context export",
@@ -9729,8 +10072,12 @@ impl NodeShared {
             binding,
             &runtime.agent_id,
             &current_root,
-        ) || !session_record_context_export_source_is_usable(current, &runtime.status)
-            || runtime.history.pending.is_some()
+            allow_clean_detachment,
+        ) || !session_record_context_export_source_is_usable(
+            current,
+            &runtime.status,
+            allow_clean_detachment,
+        ) || runtime.history.pending.is_some()
             || runtime.history.loaded_candidate_id.as_deref() != Some(candidate_id)
             || runtime.history.loaded.as_ref() != Some(loaded)
             || receipt.lineage.source_node_id != self.node_id
@@ -9743,6 +10090,7 @@ impl NodeShared {
                 "managed session source changed before context catalog commit",
             ));
         }
+        self.commit_context_pack_durably(&pack)?;
         self.context_catalog
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -11647,6 +11995,7 @@ fn request_requires_child_environment_profile(
         | NodeRequest::PreviewNativeSession { .. }
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -11733,6 +12082,7 @@ fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -
         | NodeRequest::PreviewNativeSession { .. }
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -11822,6 +12172,7 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
         | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -11897,6 +12248,10 @@ fn request_requires_open_provider_ids_with(
         | NodeRequest::CleanupManagedWorktree { .. }
         | NodeRequest::Shutdown => false,
         NodeRequest::ForgetContextPack { .. } => true,
+        // No session/record to cheaply resolve a provider from here either;
+        // the resolved receipt can carry an open-id provider, so require the
+        // same capability as ForgetContextPack unconditionally.
+        NodeRequest::ResolveDurableContextPack { .. } => true,
     }
 }
 
@@ -12015,6 +12370,7 @@ fn project_response_without_child_environment_profile(reply: &mut ResponseEnvelo
         | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
+        | NodeResponse::DurableContextPackResolved { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
         | NodeResponse::StandaloneWorkspaceCreated { .. }
@@ -12105,6 +12461,7 @@ fn project_response_without_session_bundle(reply: &mut ResponseEnvelope) {
         | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
+        | NodeResponse::DurableContextPackResolved { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
         | NodeResponse::StandaloneWorkspaceCreated { .. }
@@ -12188,6 +12545,7 @@ fn clear_snapshot_context_packs(snapshot: &mut NodeSnapshot) {
     for record in &mut snapshot.session_records {
         record.context_id = None;
         record.context = None;
+        record.exported_context = None;
     }
 }
 
@@ -12197,6 +12555,7 @@ fn project_event_without_context_pack(
     if let NodeEvent::SessionRecordUpserted { record } = &mut envelope.event {
         record.context_id = None;
         record.context = None;
+        record.exported_context = None;
     }
     envelope
 }
@@ -12211,7 +12570,8 @@ fn project_response_without_context_pack(reply: &mut ResponseEnvelope) {
         | Ok(NodeResponse::HistoryLoaded { .. })
         | Ok(NodeResponse::ContextPackForSessionRecordExported { .. })
         | Ok(NodeResponse::ContextPackExported { .. })
-        | Ok(NodeResponse::ContextPackForgotten { .. }) => true,
+        | Ok(NodeResponse::ContextPackForgotten { .. })
+        | Ok(NodeResponse::DurableContextPackResolved { .. }) => true,
         _ => false,
     };
     if contains_context {
@@ -12234,6 +12594,7 @@ fn project_response_without_context_pack(reply: &mut ResponseEnvelope) {
                 if let NodeEvent::SessionRecordUpserted { record } = &mut event.event {
                     record.context_id = None;
                     record.context = None;
+                    record.exported_context = None;
                 }
             }
         }
@@ -12243,6 +12604,7 @@ fn project_response_without_context_pack(reply: &mut ResponseEnvelope) {
         | NodeResponse::SessionRecordResumed { record, .. } => {
             record.context_id = None;
             record.context = None;
+            record.exported_context = None;
         }
         _ => {}
     }
@@ -12334,6 +12696,7 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
         | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
+        | NodeResponse::DurableContextPackResolved { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::ProviderSessionIndexed { .. }
         | NodeResponse::NativeSessionIndexed { .. }
@@ -12423,6 +12786,7 @@ fn clear_response_provider_runtime_status(reply: &mut ResponseEnvelope) {
         | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
+        | NodeResponse::DurableContextPackResolved { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::ProviderSessionIndexed { .. }
         | NodeResponse::NativeSessionIndexed { .. }
@@ -13498,7 +13862,7 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
         NodeRequest::ExportContextPackForSessionRecord { record_id, session } => {
             shared.require_controller(connection_id, role)?;
             let context = shared
-                .export_context_pack_for_session_record(&record_id, &session)
+                .export_context_pack_for_session_record(&record_id, &session, false)
                 .await?;
             Ok(NodeResponse::ContextPackForSessionRecordExported {
                 record_id,
@@ -13515,6 +13879,24 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             shared.require_controller(connection_id, role)?;
             shared.forget_context_pack(&context_id)?;
             Ok(NodeResponse::ContextPackForgotten { context_id })
+        }
+        NodeRequest::ResolveDurableContextPack { context_id } => {
+            // Read-only, idempotent, no controller lease required: this lets
+            // a caller preflight "is this durably exported pack still here"
+            // without holding the Node's mutation controller.
+            let context = shared
+                .context_catalog
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&context_id)
+                .map(|pack| pack.receipt().clone())
+                .ok_or_else(|| {
+                    failure(
+                        NodeFailureCode::UnknownContextPack,
+                        "context pack is not present",
+                    )
+                })?;
+            Ok(NodeResponse::DurableContextPackResolved { context })
         }
         NodeRequest::Resume { session, terminal_size, initial_prompt } => {
             let provider = controlled_session(shared, connection_id, role, &session)?;
@@ -13757,6 +14139,53 @@ fn resolved_spawn_profile_summary(
     })
 }
 
+/// True if `current` is an acceptable version of `expected` at export
+/// revalidation/commit time.
+///
+/// When `allow_clean_detachment` is `false` (the on-demand,
+/// `NodeRequest::ExportContextPackForSessionRecord` API path), `current` must
+/// be byte-identical to `expected` and still actively bound to `session` —
+/// the original, unchanged invariant.
+///
+/// When `true` (the reactive auto-export-at-exit path, `§2.1`), `current` may
+/// ALSO be the exact Live -> Dormant transition that the same clean exit this
+/// export reacts to produces on its own: `state` Live -> Dormant,
+/// `active_session` `Some(session)` -> `None`, `updated_at_unix_ms`
+/// advancing. Every other field — including `provider_session`, `context`,
+/// `bundle`, `task_binding` — must still match exactly. A record that changed
+/// in any other way (rebind, a different active session, an identity
+/// conflict, capacity eviction) is rejected either way; this widens nothing
+/// about which sessions are eligible, only how the record's own expected
+/// detachment is tolerated mid-export.
+fn session_record_export_target_matches(
+    expected: &ManagedSessionRecord,
+    current: &ManagedSessionRecord,
+    session: &SessionAddress,
+    allow_clean_detachment: bool,
+) -> bool {
+    if current == expected && current.active_session.as_ref() == Some(session) {
+        return current.state == ManagedSessionState::Live;
+    }
+    allow_clean_detachment
+        && current.state == ManagedSessionState::Dormant
+        && current.active_session.is_none()
+        && current.record_id == expected.record_id
+        && current.display_name == expected.display_name
+        && current.provider == expected.provider
+        && current.mode == expected.mode
+        && current.workspace_id == expected.workspace_id
+        && current.canonical_root == expected.canonical_root
+        && current.provider_session == expected.provider_session
+        && current.environment_profile == expected.environment_profile
+        && current.bundle == expected.bundle
+        && current.context_id == expected.context_id
+        && current.context == expected.context
+        && current.exported_context == expected.exported_context
+        && current.task_binding == expected.task_binding
+        && current.created_at_unix_ms == expected.created_at_unix_ms
+        && current.last_error == expected.last_error
+}
+
 fn session_record_context_export_binding_is_exact(
     expected: &ManagedSessionRecord,
     current: &ManagedSessionRecord,
@@ -13765,10 +14194,10 @@ fn session_record_context_export_binding_is_exact(
     binding: &SessionBinding,
     provider: &AgentId,
     current_root: &str,
+    allow_clean_detachment: bool,
 ) -> bool {
-    current == expected
+    session_record_export_target_matches(expected, current, session, allow_clean_detachment)
         && current.provider_session.as_ref() == Some(identity)
-        && current.active_session.as_ref() == Some(session)
         && current.workspace_id == session.workspace_id
         && provider == &current.provider
         && binding.workspace_id == session.workspace_id
@@ -13783,8 +14212,10 @@ fn session_record_context_export_binding_is_exact(
 fn session_record_context_export_source_is_usable(
     record: &ManagedSessionRecord,
     status: &SessionStatus,
+    allow_clean_detachment: bool,
 ) -> bool {
-    record.state == ManagedSessionState::Live
+    (record.state == ManagedSessionState::Live
+        || (allow_clean_detachment && record.state == ManagedSessionState::Dormant))
         && context_pack_source_status_is_usable(status)
 }
 
@@ -14568,6 +14999,8 @@ pub enum NodeServerError {
     BundleCatalog(String),
     #[error("node delivery store failed to initialize")]
     DeliveryStore,
+    #[error("node context pack store failed to initialize")]
+    ContextPackStore,
     #[error("active agent registry failed: {0}")]
     Registry(String),
     #[error("node provider contract manifest is invalid: {0}")]
@@ -15639,6 +16072,7 @@ mod observation_projection_tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -15660,6 +16094,7 @@ mod observation_projection_tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
@@ -17572,6 +18007,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -18806,9 +19242,42 @@ mod tests {
         ));
         let profile_revision_capability =
             CapabilityId::new(NODE_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap();
+        assert!(request_uses_unnegotiated_capability(
+            &request,
+            &[
+                spawn_spec_capability.clone(),
+                worktree_capability.clone(),
+                profile_revision_capability.clone(),
+            ],
+        ));
+        // Default `SpawnOverrides` leaves `bundle_id`/`context_id` at
+        // `Inherit`, not `Clear` — the profile's own defaults might still
+        // materialize a bundle or a context pack, so both capabilities stay
+        // conservatively required until negotiated (see
+        // `requires_session_bundle_materialization_capability` /
+        // `requires_history_context_pack_capability`).
+        let bundle_materialization_capability =
+            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        assert!(request_uses_unnegotiated_capability(
+            &request,
+            &[
+                spawn_spec_capability.clone(),
+                worktree_capability.clone(),
+                profile_revision_capability.clone(),
+                bundle_materialization_capability.clone(),
+            ],
+        ));
+        let history_context_pack_capability =
+            CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
         assert!(!request_uses_unnegotiated_capability(
             &request,
-            &[spawn_spec_capability, worktree_capability, profile_revision_capability],
+            &[
+                spawn_spec_capability,
+                worktree_capability,
+                profile_revision_capability,
+                bundle_materialization_capability,
+                history_context_pack_capability,
+            ],
         ));
     }
 
@@ -19229,6 +19698,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -19314,6 +19784,7 @@ mod tests {
             &binding,
             &expected.provider,
             &current_root,
+            false,
         ));
         let mut changed = expected.clone();
         changed.updated_at_unix_ms += 1;
@@ -19325,6 +19796,45 @@ mod tests {
             &binding,
             &expected.provider,
             &current_root,
+            false,
+        ));
+        // A same-instant timestamp bump alone (state and active_session
+        // otherwise unchanged) is not the clean-detachment transition
+        // either, even with the reactive flag on: only the exact Live ->
+        // Dormant + active_session cleared shape qualifies.
+        assert!(!session_record_context_export_binding_is_exact(
+            &expected,
+            &changed,
+            &identity,
+            &session,
+            &binding,
+            &expected.provider,
+            &current_root,
+            true,
+        ));
+        let mut detached = expected.clone();
+        detached.state = ManagedSessionState::Dormant;
+        detached.active_session = None;
+        detached.updated_at_unix_ms += 1;
+        assert!(!session_record_context_export_binding_is_exact(
+            &expected,
+            &detached,
+            &identity,
+            &session,
+            &binding,
+            &expected.provider,
+            &current_root,
+            false,
+        ));
+        assert!(session_record_context_export_binding_is_exact(
+            &expected,
+            &detached,
+            &identity,
+            &session,
+            &binding,
+            &expected.provider,
+            &current_root,
+            true,
         ));
     }
 
@@ -19335,21 +19845,38 @@ mod tests {
         assert!(session_record_context_export_source_is_usable(
             &source,
             &SessionStatus::Running,
+            false,
         ));
         assert!(session_record_context_export_source_is_usable(
             &source,
             &SessionStatus::Exited { exit_code: Some(0) },
+            false,
         ));
 
         source.state = ManagedSessionState::Dormant;
         assert!(!session_record_context_export_source_is_usable(
             &source,
             &SessionStatus::Running,
+            false,
+        ));
+        // The reactive auto-export-at-exit path (allow_clean_detachment) is
+        // the only caller that may treat a Dormant, cleanly-exited record as
+        // still usable — the on-demand path above never does.
+        assert!(session_record_context_export_source_is_usable(
+            &source,
+            &SessionStatus::Exited { exit_code: Some(0) },
+            true,
+        ));
+        assert!(!session_record_context_export_source_is_usable(
+            &source,
+            &SessionStatus::Exited { exit_code: Some(0) },
+            false,
         ));
         source.state = ManagedSessionState::Live;
         assert!(!session_record_context_export_source_is_usable(
             &source,
             &SessionStatus::Starting,
+            false,
         ));
     }
 
@@ -19414,6 +19941,7 @@ mod tests {
                 "candidate-exact",
                 &history,
                 pack,
+                false,
             )
             .unwrap_err();
 
@@ -21117,10 +21645,15 @@ mod tests {
                 session: address.clone(),
                 text: "paste".to_owned(),
             },
+            // `initial_prompt: Some(_)` selects `ResumeWithPrompt`, which needs
+            // the same semantic capabilities as `Prompt`/`Paste`. A bare
+            // (promptless) resume is a raw PTY relaunch and IS admitted under
+            // `raw_pty()` — see `raw_pty_admits_provider_native_resume_without_prompt_only`
+            // in `provider_runtime.rs`; it is deliberately not exercised here.
             NodeRequest::Resume {
                 session: address.clone(),
                 terminal_size,
-                initial_prompt: None,
+                initial_prompt: Some("resume".to_owned()),
             },
         ] {
             let error = process_request_inner(
@@ -21651,6 +22184,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -21696,6 +22230,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -21758,6 +22293,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -21844,6 +22380,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -21873,6 +22410,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
@@ -21986,6 +22524,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -22015,6 +22554,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 2,
                 updated_at_unix_ms: 2,
@@ -22183,6 +22723,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,

@@ -944,6 +944,7 @@ fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -1014,6 +1015,7 @@ fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -1462,6 +1464,7 @@ fn c2_node_response_has_terminal_frame_event(response: &C2NodeResponse) -> bool 
         | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::DurableContextPackResolved { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
         | C2NodeResponse::StandaloneWorkspaceCreated { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -1556,6 +1559,7 @@ fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::DurableContextPackResolved { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::Accepted
         | C2NodeResponse::ShuttingDown => false,
@@ -1591,6 +1595,7 @@ fn c2_node_response_has_unix_repository_path(response: &C2NodeResponse) -> bool 
             .path
             .as_ref()
             .is_some_and(|path| path.as_unix_bytes().is_some()),
+        C2NodeResponse::DurableContextPackResolved { .. } => false,
         C2NodeResponse::Snapshot { .. }
         | C2NodeResponse::Resync { .. }
         | C2NodeResponse::Armed { .. }
@@ -2013,7 +2018,8 @@ fn c2_node_response_has_open_provider_id(response: &C2NodeResponse) -> bool {
                     .is_some_and(context_receipt_has_open_provider_id)
         }
         C2NodeResponse::ContextPackExported { context }
-        | C2NodeResponse::ContextPackForSessionRecordExported { context, .. } => {
+        | C2NodeResponse::ContextPackForSessionRecordExported { context, .. }
+        | C2NodeResponse::DurableContextPackResolved { context } => {
             context_receipt_has_open_provider_id(context)
         }
         C2NodeResponse::NativeSessionsCataloged { route, .. }
@@ -3238,6 +3244,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             provider_identity_present: true,
             created_at_unix_ms: 1,

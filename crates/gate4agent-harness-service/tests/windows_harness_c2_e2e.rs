@@ -289,6 +289,7 @@ fn create_frozen_run(
         },
         delivery_receipt: None,
         continuation_receipt: None,
+        context_pack: None,
         binding: None,
         lifecycle: HarnessRunLifecycleV1::Requested,
         result_disposition: None,

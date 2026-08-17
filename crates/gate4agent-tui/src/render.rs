@@ -11,7 +11,8 @@ use gate4agent_node_protocol::{
 use gate4agent_observation_api::{ProjectionAvailability, ProjectionFreshness};
 use gate4agent_observation_engine::{ContextOccupancyProvenance, ContextOccupancySnapshot, CorrelationProjection, CorrelationState, SessionProjection};
 use gate4agent_harness_client::{
-    FeatureObservationStateV1, HarnessReverseAttributionBindingV1,
+    FeatureObservationStateV1, HarnessContextSourceAvailabilityV1,
+    HarnessReverseAttributionBindingV1,
     HarnessReverseAttributionOutcomeV1, HarnessReverseAttributionRelationV1,
     HarnessReverseAttributionSubjectV1, SessionMonitorV1 as HarnessSessionMonitorV1,
 };
@@ -5119,10 +5120,14 @@ fn render_harness_task_detail(
                 };
                 let row = Rect::new(context_inner.x, context_inner.y + visible as u16, context_inner.width, 1);
                 let line = source.map(|source| format!(
-                        "{} run {} r{} | messages {}{} | turns {} | tokens {} | digest {}",
+                        "{} run {} r{} | {} | messages {}{} | turns {} | tokens {} | digest {}",
                         if selected { ">" } else { " " },
                         short_opaque_marker(source.source_run_id.as_str()),
                         source.source_run_revision.get(),
+                        match source.availability {
+                            HarnessContextSourceAvailabilityV1::Live => "live",
+                            HarnessContextSourceAvailabilityV1::Durable => "stored",
+                        },
                         source.message_count,
                         if source.message_count_exact { " exact" } else { "+" },
                         source.completed_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned()),
@@ -9633,7 +9638,7 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 mod tests {
     use super::*;
     use gate4agent_harness_client::{
-        HarnessContextSourceSelectionV1,
+        HarnessContextSourceSelectionV1, HarnessContextSourceAvailabilityV1,
         HarnessContinuationRef, HarnessContinuationStateV1, HarnessDeliveryBundleDigestV1,
         HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1, HarnessDeliveryBundleV1,
         HarnessDeliveryBundleSelectionV1,
@@ -10740,14 +10745,16 @@ mod tests {
                 node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
                 workspace_id: HarnessSelectorV1::new("source-workspace").unwrap(),
                 session_record_id: HarnessSelectorV1::new("record-private").unwrap(),
-                active_session: gate4agent_harness_client::HarnessRuntimeIdentityV1 {
+                active_session: Some(gate4agent_harness_client::HarnessRuntimeIdentityV1 {
                     instance_id: 41,
                     generation: 3,
-                },
+                }),
                 message_count: 12,
                 message_count_exact: true,
                 completed_turn_count: Some(5),
                 total_tokens: Some(4096),
+                availability: HarnessContextSourceAvailabilityV1::Live,
+                context_pack: None,
             }],
             delivery_bundles: vec![HarnessDeliveryBundleSelectionV1 {
                 bundle: HarnessDeliveryBundleV1 {

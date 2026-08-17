@@ -45,7 +45,7 @@ use gate4agent_harness_protocol::{
 use gate4agent_harness_delivery::{CompiledDeliveryBundleV2, DeliveryCatalogV2};
 use gate4agent_node_protocol::{
     HarnessMcpActivationDigest, HarnessMcpReservationId, ResolvedHarnessMcpProxyReceiptV1,
-    ManagedWorktreeLeaseId,
+    ManagedWorktreeLeaseId, NodeId, NodeIncarnationId,
     SessionAddress, SessionMode, SessionRecordId, SpawnOverride, SpawnSpec,
     MAX_HARNESS_MCP_RESERVATION_TTL_MS,
     WorktreeProfileId, WorktreeProfileRevision,
@@ -338,11 +338,20 @@ pub struct HarnessService {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PreparedContinuationExport {
     continuation: HarnessContinuationV1,
+    /// The source run's own durable receipt, when present — lets
+    /// `start_context_pack_export` (c2.rs) resolve the pack via the durable
+    /// `ResolveDurableContextPack` C2 verb instead of a live session export,
+    /// with no second engine lookup.
+    source_context_pack: Option<HarnessResolvedContextPackReceiptV1>,
 }
 
 impl PreparedContinuationExport {
     pub(crate) fn continuation(&self) -> &HarnessContinuationV1 {
         &self.continuation
+    }
+
+    pub(crate) fn source_context_pack(&self) -> Option<&HarnessResolvedContextPackReceiptV1> {
+        self.source_context_pack.as_ref()
     }
 }
 
@@ -902,7 +911,9 @@ impl HarnessService {
         request: HarnessStartTaskRequestV2,
     ) -> Result<HarnessTaskStartOutcomeV1, HarnessServiceError> {
         self.ensure_healthy()?;
-        request.validate().map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
+        if request.validate().is_err() {
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        }
         let command_digest = operator_command_digest("start-task-v2", &request)?;
         if self.replay_operator_request(
             &request.authority.operation_id,
@@ -1002,6 +1013,7 @@ impl HarnessService {
             intent,
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -1043,6 +1055,30 @@ impl HarnessService {
                     .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
                 let source_context = self.dispatch_contexts.get(&source_run.operation_id)
                     .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                // For a Durable source, `source_binding.node_incarnation`
+                // (the source run's own original spawn-accept binding) is
+                // necessarily stale once the Node has restarted.
+                // `HarnessContinuationV1::validate()`'s `exact_route`
+                // invariant requires `source_binding.node_incarnation` to
+                // equal the continuation's own `node_incarnation` set below
+                // (the Node's CURRENT incarnation, from
+                // `source.node_incarnation` — see `context_source_option`),
+                // and the eventual `target_binding` will carry that same
+                // current incarnation once run B actually spawns. Record the
+                // current incarnation here instead of copying the stale one
+                // verbatim; every other field of the binding — node_id,
+                // workspace_id, and the managed session identity that
+                // actually identifies the source — is unchanged.
+                let source_binding = if source.availability
+                    == gate4agent_harness_protocol::HarnessContextSourceAvailabilityV1::Durable
+                {
+                    gate4agent_harness_protocol::HarnessSessionBindingV1 {
+                        node_incarnation: source.node_incarnation.clone(),
+                        ..source_binding.clone()
+                    }
+                } else {
+                    source_binding.clone()
+                };
                 Some(HarnessContinuationV1 {
                     continuation_ref,
                     receipt_ref,
@@ -1056,7 +1092,7 @@ impl HarnessService {
                     node_incarnation: source.node_incarnation.clone(),
                     workspace_id: source.workspace_id.clone(),
                     source_provider: source_context.expected_provider.clone(),
-                    source_binding: source_binding.clone(),
+                    source_binding,
                     context: None,
                     target_binding: None,
                     prepared_at_unix_ms: request.authority.now_unix_ms,
@@ -1310,6 +1346,7 @@ impl HarnessService {
             intent: request.intent,
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -1507,6 +1544,7 @@ impl HarnessService {
             intent: request.intent,
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -1871,15 +1909,50 @@ impl HarnessService {
                 "continuation target run is missing at export lease issuance",
             ),
         )?;
-        let source_has_active_managed_binding = source_run.binding.as_ref()
-            == Some(&current.source_binding)
+        let source_is_live_managed = matches!(
+            &current.source_binding.session,
+            HarnessSessionIdentityV1::Managed {
+                active_session: Some(_),
+                ..
+            }
+        );
+        let source_is_durable = source_run.context_pack.is_some()
             && matches!(
                 &current.source_binding.session,
-                HarnessSessionIdentityV1::Managed {
-                    active_session: Some(_),
-                    ..
-                }
+                HarnessSessionIdentityV1::Managed { .. }
             );
+        // For a durable source, `current.source_binding` deliberately does
+        // not equal `source_run.binding` byte-for-byte: it was synthesized
+        // at continuation-creation time (`start_task_v2`) with the Node's
+        // then-current incarnation in its `node_incarnation` field, while
+        // `source_run.binding` stays fixed at run A's own original
+        // spawn-accept binding forever. What must still hold is that
+        // `source_run` remains bound to the SAME managed record — node_id,
+        // workspace_id, and record_id — the continuation was built against;
+        // `active_session`/`node_incarnation` are not signals the durable
+        // path can or needs to compare (see
+        // `source_binding_matches_context_selection`'s doc comment for the
+        // identical reasoning). The Live path is unchanged: it still
+        // requires the binding to be byte-for-byte current.
+        let source_binding_is_current = match source_run.binding.as_ref() {
+            Some(live_binding) if source_is_durable => {
+                live_binding.node_id == current.source_binding.node_id
+                    && live_binding.workspace_id == current.source_binding.workspace_id
+                    && matches!(
+                        (&live_binding.session, &current.source_binding.session),
+                        (
+                            HarnessSessionIdentityV1::Managed { record_id: left, .. },
+                            HarnessSessionIdentityV1::Managed { record_id: right, .. },
+                        ) if left == right
+                    )
+            }
+            live_binding => live_binding == Some(&current.source_binding),
+        };
+        let source_has_usable_managed_binding =
+            source_binding_is_current && (source_is_live_managed || source_is_durable);
+        // Captured now (an owned value, no `self.engine` borrow) so it
+        // survives past the `&mut self` commit below.
+        let source_context_pack = source_run.context_pack.clone();
         let transfer_authorized = match &current.authority {
             HarnessTransferAuthorityRefV1::ParentGrant { grant_id, revision } => {
                 self.engine.grant(grant_id).is_some_and(|grant| {
@@ -1923,7 +1996,7 @@ impl HarnessService {
                     | HarnessRunLifecycleV1::Waiting
                     | HarnessRunLifecycleV1::Completed
             )
-            || !source_has_active_managed_binding
+            || !source_has_usable_managed_binding
         {
             return Err(HarnessServiceError::InvalidContinuationProof(
                 "continuation export lease is not authorized by the current exact grant and source binding",
@@ -1947,7 +2020,10 @@ impl HarnessService {
             exporting.clone(),
         )?;
         self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
-        Ok(PreparedContinuationExport { continuation: exporting })
+        Ok(PreparedContinuationExport {
+            continuation: exporting,
+            source_context_pack,
+        })
     }
 
     pub(crate) fn complete_continuation_export(
@@ -3005,6 +3081,74 @@ impl HarnessService {
             self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
         }
         Ok(())
+    }
+
+    /// Idempotently records a durable ContextPack receipt on `run_id`,
+    /// reusing the run's own already-observed revision rather than requiring
+    /// a caller-supplied CAS token. Never touches task state and stays legal
+    /// on an already-terminal (Completed/Failed/Cancelled) run — the exact
+    /// narrow exception to the generic terminal-run-mutation freeze that
+    /// `prepare_run_context_pack_record` (harness-engine) enforces.
+    pub(crate) fn record_run_context_pack(
+        &mut self,
+        run_id: &HarnessRunId,
+        receipt: HarnessResolvedContextPackReceiptV1,
+        recorded_at_unix_ms: u64,
+        node_id: &NodeId,
+        incarnation_id: NodeIncarnationId,
+    ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
+        self.ensure_healthy()?;
+        receipt.validate()?;
+        let current_run = self.engine.run(run_id)
+            .ok_or_else(|| HarnessServiceError::Engine(HarnessEngineError::NotFound(
+                run_id.to_string(),
+            )))?
+            .clone();
+        if current_run.context_pack.as_ref() == Some(&receipt) {
+            return Ok(HarnessApplyOutcome::Replayed);
+        }
+        let ids = dispatch::deterministic_context_pack_record_ids(
+            run_id,
+            node_id,
+            &incarnation_id,
+            &receipt.digest,
+        )?;
+        let recorded_at = recorded_at_unix_ms.max(current_run.updated_at_unix_ms);
+        let mut next_run = current_run.clone();
+        next_run.context_pack = Some(receipt);
+        next_run.revision = next_revision(current_run.revision)?;
+        next_run.updated_at_unix_ms = recorded_at;
+        let operation = HarnessOperationV1 {
+            operation_id: ids.operation_id,
+            revision: HarnessRevision::new(1)?,
+            actor: HarnessActorV1::ParentRun { run_id: run_id.clone() },
+            kind: HarnessOperationKindV1::RecordRunContextPack,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: None,
+            run_id: Some(run_id.clone()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(current_run.revision),
+            request_digest: ids.request_digest,
+            idempotency_ref: ids.idempotency_ref,
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: recorded_at,
+            updated_at_unix_ms: recorded_at,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: Some(recorded_at),
+        };
+        let prepared = self.engine.prepare_run_context_pack_record(
+            operation,
+            current_run.revision,
+            next_run,
+        )?;
+        let outcome = prepared.outcome();
+        if outcome == HarnessApplyOutcome::Applied {
+            self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
+        }
+        Ok(outcome)
     }
 
     pub fn transition_run_with_accepted_spawn_and_continuation(
@@ -4693,20 +4837,38 @@ fn context_source_semantically_matches(
     left == right
 }
 
+/// A `Durable` source (`context_source_option`'s durable branch,
+/// `runtime.rs`) carries the Node's CURRENT incarnation and
+/// `active_session: None` — the receipt, not a live session, is
+/// authoritative, and `HarnessRunV1.binding.session`'s own
+/// `node_incarnation`/`active_session` are set once at spawn-accept and
+/// never update back in production (empirically confirmed by the A2
+/// durable-context-pack E2E: a run that finished cleanly, and whose Node
+/// later restarted, still carries its ORIGINAL incarnation and
+/// `active_session` in its durable binding). Requiring exact equality on
+/// either field for a durable source would therefore reject every durable
+/// source once the Node has actually restarted — neither is a signal the
+/// durable path can or needs to check; `record_id` (plus node_id and
+/// workspace) is what identifies the source. The `Live` path is unchanged:
+/// it still requires exact equality on both, since there the live session
+/// genuinely is what was observed, on the Node incarnation it is still
+/// running under.
 fn source_binding_matches_context_selection(
     binding: &gate4agent_harness_protocol::HarnessSessionBindingV1,
     source: &HarnessContextSourceSelectionV1,
 ) -> bool {
+    let is_durable = source.availability
+        == gate4agent_harness_protocol::HarnessContextSourceAvailabilityV1::Durable;
     binding.node_id == source.node_id
-        && binding.node_incarnation == source.node_incarnation
+        && (is_durable || binding.node_incarnation == source.node_incarnation)
         && binding.workspace_id == source.workspace_id
         && matches!(
             &binding.session,
             HarnessSessionIdentityV1::Managed {
                 record_id,
-                active_session: Some(active),
+                active_session,
             } if record_id == &source.session_record_id
-                && active == &source.active_session
+                && (is_durable || active_session.as_ref() == source.active_session.as_ref())
         )
 }
 
@@ -6193,6 +6355,7 @@ mod tests {
     };
     use gate4agent_harness_protocol::{
         HarnessActorV1, HarnessContextPermissionsV1, HarnessDeliveryBundleDigestV1,
+        HarnessContextSourceAvailabilityV1,
         HarnessContinuationCleanupStateV1, HarnessContinuationRef,
         HarnessContinuationStateV1, HarnessContinuationV1,
         HarnessDeliveryBundleIdV1, HarnessDeliveryBundleRevisionV1,
@@ -6249,14 +6412,16 @@ mod tests {
                 .unwrap(),
             workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
             session_record_id: HarnessSelectorV1::new("record-a").unwrap(),
-            active_session: HarnessRuntimeIdentityV1 {
+            active_session: Some(HarnessRuntimeIdentityV1 {
                 instance_id: 9,
                 generation: 3,
-            },
+            }),
             message_count: 11,
             message_count_exact: true,
             completed_turn_count: Some(5),
             total_tokens: Some(1_024),
+            availability: HarnessContextSourceAvailabilityV1::Live,
+            context_pack: None,
         };
         source.metadata_digest = context_source_metadata_digest(&source).unwrap();
         source
@@ -6330,15 +6495,73 @@ mod tests {
         ));
     }
 
+    // The `icacls`-subprocess form of this helper was unreliable under this
+    // workspace's sandboxed test hosts: `/grant:r <username>:(F)` names a
+    // specific account, and a sandboxed job/AppContainer layer can make the
+    // resulting DACL diverge from a strict single-ACE, owner-only shape
+    // (`gate4agent_harness_delivery::validate_source_permissions`'s exact
+    // requirement) even though `icacls` itself reports success. Setting the
+    // DACL directly via `SetNamedSecurityInfoW` with the well-known "Owner
+    // Rights" SID (SDDL `OW`) sidesteps account-name/SID resolution
+    // entirely — the identical, already-proven approach
+    // `gate4agent-harness-delivery`'s own tests use for the same check.
     #[cfg(windows)]
     fn protect_delivery_test_path(path: &Path) {
-        let principal = format!("{}:(F)", std::env::var("USERNAME").unwrap());
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r", principal.as_str()])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+
+        let sddl = OsStr::new("D:P(A;;FA;;;OW)")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = std::ptr::null_mut();
+        assert!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } != 0,
+            "owner-only test SDDL failed to convert",
+        );
+        let mut present = 0_i32;
+        let mut defaulted = 0_i32;
+        let mut dacl = std::ptr::null_mut();
+        let has_dacl = unsafe {
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+        };
+        assert!(
+            has_dacl != 0 && present != 0 && !dacl.is_null(),
+            "owner-only test DACL is missing from the converted descriptor",
+        );
+        let mut wide = path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe { LocalFree(descriptor); }
+        assert_eq!(status, 0, "SetNamedSecurityInfoW failed to protect the test path");
     }
 
     #[cfg(unix)]
@@ -6584,6 +6807,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -6805,6 +7029,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -6931,6 +7156,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: Some(source_binding.clone()),
             lifecycle: HarnessRunLifecycleV1::Running,
             result_disposition: None,
@@ -6979,6 +7205,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,

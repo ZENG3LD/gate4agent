@@ -794,6 +794,7 @@ fn decode_v1_state(state: PersistedNodeStateV1) -> io::Result<DecodedNodeState> 
                     bundle: None,
                     context_id: None,
                     context: None,
+                    exported_context: None,
                     task_binding: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
@@ -840,6 +841,7 @@ fn decode_v2_state(state: PersistedNodeStateV2) -> io::Result<DecodedNodeState> 
                     bundle: None,
                     context_id: None,
                     context: None,
+                    exported_context: None,
                     task_binding: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
@@ -886,6 +888,7 @@ fn decode_v3_state(state: PersistedNodeStateV3) -> io::Result<DecodedNodeState> 
                     bundle: None,
                     context_id: None,
                     context: None,
+                    exported_context: None,
                     task_binding: None,
                     created_at_unix_ms: record.created_at_unix_ms,
                     updated_at_unix_ms: record.updated_at_unix_ms,
@@ -2419,6 +2422,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 11,
@@ -3352,7 +3356,7 @@ mod tests {
         load_one(&backup, &node_id).unwrap();
 
         let future = persisted_v1_state(
-            NODE_STATE_SCHEMA_V3 + 1,
+            NODE_STATE_SCHEMA_V10 + 1,
             node_id.clone(),
             &workspaces,
             vec![record.clone()],
@@ -3390,7 +3394,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         let future = persisted_v1_state(
-            NODE_STATE_SCHEMA_V3 + 1,
+            NODE_STATE_SCHEMA_V10 + 1,
             node_id.clone(),
             &workspaces,
             vec![record],

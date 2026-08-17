@@ -32,3 +32,10 @@ gate4agent-c2 = { path = "../gate4agent-c2" }
 gate4agent-harness-client = { path = "../gate4agent-harness-client" }
 gate4agent-node = { path = "../gate4agent-node", features = ["fixture"] }
 ring = "=0.17.14"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }

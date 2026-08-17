@@ -906,6 +906,7 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
                     | C2NodeResponse::ContextPackForSessionRecordExported { .. }
                     | C2NodeResponse::ContextPackExported { .. }
                     | C2NodeResponse::ContextPackForgotten { .. }
+                    | C2NodeResponse::DurableContextPackResolved { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
                     | C2NodeResponse::StandaloneWorkspaceCreated { .. }
                     | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -1242,6 +1243,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -1344,6 +1346,7 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                         .path
                         .as_ref()
                         .is_some_and(|path| path.as_unix_bytes().is_some()),
+                    C2NodeResponse::DurableContextPackResolved { .. } => false,
                     C2NodeResponse::Snapshot { .. }
                     | C2NodeResponse::Resync { .. }
                     | C2NodeResponse::Armed { .. }
@@ -1711,7 +1714,8 @@ fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bo
         | C2NodeResponse::HistoryLoaded { .. }
         | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
-        | C2NodeResponse::ContextPackForgotten { .. } => false,
+        | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::DurableContextPackResolved { .. } => false,
         C2NodeResponse::Armed { .. }
         | C2NodeResponse::Activated { .. }
         | C2NodeResponse::Aborted { .. }
@@ -1897,6 +1901,7 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::DurableContextPackResolved { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::Accepted
         | C2NodeResponse::ShuttingDown => false,
@@ -2276,6 +2281,7 @@ fn request_targets_unavailable_provider(
             !status_record_is_legacy(status, node_id, record_id)
         }
         NodeRequest::ForgetContextPack { .. } => true,
+        NodeRequest::ResolveDurableContextPack { .. } => true,
         NodeRequest::IndexProviderSession { provider, .. } => !provider_id_is_legacy(provider),
         NodeRequest::CatalogNativeSessions { route, .. }
         | NodeRequest::PageNativeSessions { route, .. } => {
@@ -2508,7 +2514,8 @@ fn project_legacy_response(
             project_legacy_spawn_provider(&mut receipt.spawn)
         }
         C2NodeResponse::ContextPackExported { context }
-        | C2NodeResponse::ContextPackForSessionRecordExported { context, .. } => {
+        | C2NodeResponse::ContextPackForSessionRecordExported { context, .. }
+        | C2NodeResponse::DurableContextPackResolved { context } => {
             context_receipt_provider_is_legacy(context)
         }
         C2NodeResponse::NativeSessionsCataloged { route, .. }
@@ -2700,6 +2707,7 @@ fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
         | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::DurableContextPackResolved { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
         | C2NodeResponse::StandaloneWorkspaceCreated { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }

@@ -221,6 +221,7 @@ fn seed_parent_grant_and_child(
         },
         delivery_receipt: None,
         continuation_receipt: None,
+        context_pack: None,
         binding: None,
         lifecycle: HarnessRunLifecycleV1::Requested,
         result_disposition: None,

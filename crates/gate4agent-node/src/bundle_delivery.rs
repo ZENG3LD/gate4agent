@@ -1044,7 +1044,10 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-fn publish_temporary_create_new(source: &Path, target: &Path) -> io::Result<()> {
+// pub(crate): also reused verbatim by `context_pack_store::ContextPackStore`
+// for its own create-new atomic publish (same Windows MoveFileExW +
+// MOVEFILE_WRITE_THROUGH semantics, same create-new-only Unix rename path).
+pub(crate) fn publish_temporary_create_new(source: &Path, target: &Path) -> io::Result<()> {
     if source.parent() != target.parent() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

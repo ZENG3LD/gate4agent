@@ -1864,7 +1864,8 @@ fn ensure_node_request_provider_capability(
                 ensure_outbound_provider_id_capability(provider, open_provider_ids_enabled)?;
             }
         }
-        NodeRequest::ForgetContextPack { .. } => {
+        NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. } => {
             if !open_provider_ids_enabled {
                 return Err(NodeClientError::UnsupportedCapability(
                     NODE_PROVIDER_ID_OPEN_CAPABILITY.to_owned(),
@@ -2039,6 +2040,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -2093,7 +2095,8 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
             resolved_spawn_receipt_contains_open_provider_id(&receipt.spawn)
         }
         NodeResponse::ContextPackExported { context }
-        | NodeResponse::ContextPackForSessionRecordExported { context, .. } => {
+        | NodeResponse::ContextPackForSessionRecordExported { context, .. }
+        | NodeResponse::DurableContextPackResolved { context } => {
             context_pack_contains_open_provider_id(context)
         }
         NodeResponse::NativeSessionsCataloged { route, .. }
@@ -2250,6 +2253,7 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPackForSessionRecord { .. }
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
+        | NodeRequest::ResolveDurableContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -2338,6 +2342,7 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
         | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
+        | NodeResponse::DurableContextPackResolved { .. }
         | NodeResponse::WorkspaceRegistered { .. }
         | NodeResponse::StandaloneWorkspaceCreated { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
@@ -2416,6 +2421,7 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         | NodeResponse::ContextPackForSessionRecordExported { .. }
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
+        | NodeResponse::DurableContextPackResolved { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::Accepted
         | NodeResponse::ShuttingDown => false,
@@ -2808,6 +2814,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,

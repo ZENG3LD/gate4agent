@@ -51,7 +51,8 @@ use gate4agent_node_protocol::{
 };
 use gate4agent_harness_protocol::{
     HarnessContinuationRef, HarnessContinuationStateV1, HarnessIdempotencyRef,
-    HarnessOperationId, HarnessRequestDigest, HarnessRunId, HarnessRunV1,
+    HarnessOperationId, HarnessRequestDigest, HarnessResolvedContextPackReceiptV1,
+    HarnessRunId, HarnessRunV1,
     HarnessSelectorV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
 };
 use gate4agent_node_wire::local_hmac_sha256;
@@ -309,9 +310,52 @@ impl HarnessC2Adapter {
         if authority.state != HarnessContinuationStateV1::Exporting {
             return Err(HarnessC2Error::ContinuationAuthorityMismatch);
         }
+        let node_id = NodeId::new(authority.node_id.as_str())
+            .map_err(|_| HarnessC2Error::ContinuationAuthorityMismatch)?;
+        if let Some(pack) = prepared.source_context_pack().cloned() {
+            // Resolved fresh, NOT from `authority.node_incarnation`: the
+            // durable resolve is content-addressed by context_id and does
+            // not depend on matching the incarnation the source session
+            // originally ran under. That stored incarnation is necessarily
+            // stale once the Node has restarted — surviving exactly that
+            // restart is the entire point of a Durable source —
+            // and `HarnessContinuationV1::validate()`'s `exact_route`
+            // invariant fixes `authority.node_incarnation` to the source
+            // run's original binding regardless (see `context_source_option`
+            // in `runtime.rs`), so it can never be repointed there.
+            let route = match self.exact_route(&node_id) {
+                Ok(route) => route,
+                Err(error) => return Ok(ContextPackExportStart::NotEnqueued(
+                    ExportContextPackOutcome::ExpiredBeforeSend {
+                        prepared,
+                        reason: context_export_expiry_reason(&error),
+                    },
+                )),
+            };
+            let context_id = gate4agent_node_protocol::SpawnContextId::new(pack.id.as_str())
+                .map_err(|_| HarnessC2Error::ContinuationAuthorityMismatch)?;
+            let pending = match self.control.start_request(
+                route.clone(),
+                NodeRequest::ResolveDurableContextPack { context_id },
+            ) {
+                Ok(pending) => pending,
+                Err(_) => return Ok(ContextPackExportStart::NotEnqueued(
+                    ExportContextPackOutcome::ExpiredBeforeSend {
+                        prepared,
+                        reason: ContextExportExpiryReason::QueueUnavailable,
+                    },
+                )),
+            };
+            return Ok(ContextPackExportStart::EnqueuedDurable(PendingDurableContextPackResolve {
+                prepared,
+                authority,
+                route,
+                pack,
+                pending: Some(pending),
+            }));
+        }
         let route = NodeRoute {
-            node_id: NodeId::new(authority.node_id.as_str())
-                .map_err(|_| HarnessC2Error::ContinuationAuthorityMismatch)?,
+            node_id,
             expected_incarnation_id: authority.node_incarnation.as_str().parse()
                 .map_err(|_| HarnessC2Error::ContinuationAuthorityMismatch)?,
         };
@@ -358,6 +402,7 @@ impl HarnessC2Adapter {
     ) -> Result<ExportContextPackOutcome, HarnessC2Error> {
         match self.start_context_pack_export(prepared)? {
             ContextPackExportStart::Enqueued(pending) => pending.finish().await,
+            ContextPackExportStart::EnqueuedDurable(pending) => pending.finish().await,
             ContextPackExportStart::NotEnqueued(outcome) => Ok(outcome),
         }
     }
@@ -2709,6 +2754,7 @@ impl PendingContinuationSpawnDispatch {
 
 pub(crate) enum ContextPackExportStart {
     Enqueued(PendingContextPackExport),
+    EnqueuedDurable(PendingDurableContextPackResolve),
     NotEnqueued(ExportContextPackOutcome),
 }
 
@@ -2767,6 +2813,80 @@ impl PendingContextPackExport {
                     },
                 }),
             Ok(C2NodeResponse::ContextPackForSessionRecordExported { .. }) => {
+                Ok(ExportContextPackOutcome::OutcomeUnknown {
+                    prepared: self.prepared,
+                    reason: ContextExportOutcomeUnknownReason::ReceiptMismatch,
+                })
+            }
+            Err(failure) => Ok(ExportContextPackOutcome::Rejected {
+                prepared: self.prepared,
+                code: failure.code,
+            }),
+            Ok(_) => Ok(ExportContextPackOutcome::OutcomeUnknown {
+                prepared: self.prepared,
+                reason: ContextExportOutcomeUnknownReason::UnexpectedResponse,
+            }),
+        }
+    }
+}
+
+/// Durable counterpart of `PendingContextPackExport`: resolves an already
+/// exported receipt from the Node's durable `ContextPackStore` instead of
+/// re-exporting a live session. Produces the identical `ExportContextPackOutcome`
+/// shape, so `complete_continuation_export` and everything downstream stay
+/// completely unchanged.
+pub(crate) struct PendingDurableContextPackResolve {
+    prepared: crate::PreparedContinuationExport,
+    authority: gate4agent_harness_protocol::HarnessContinuationV1,
+    route: NodeRoute,
+    pack: HarnessResolvedContextPackReceiptV1,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingDurableContextPackResolve {
+    pub(crate) async fn finish(
+        mut self,
+    ) -> Result<ExportContextPackOutcome, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending durable ContextPack resolve owns exactly one C2 waiter");
+        let routed = match pending.finish().await {
+            Ok(routed) => routed,
+            Err(_) => return Ok(ExportContextPackOutcome::OutcomeUnknown {
+                prepared: self.prepared,
+                reason: ContextExportOutcomeUnknownReason::Transport,
+            }),
+        };
+        if routed.node_id != self.route.node_id
+            || routed.incarnation_id != self.route.expected_incarnation_id
+        {
+            return Ok(ExportContextPackOutcome::OutcomeUnknown {
+                prepared: self.prepared,
+                reason: ContextExportOutcomeUnknownReason::RouteMismatch,
+            });
+        }
+        let expected = match harness_context_to_node(&self.pack) {
+            Ok(expected) => expected,
+            Err(_) => return Ok(ExportContextPackOutcome::OutcomeUnknown {
+                prepared: self.prepared,
+                reason: ContextExportOutcomeUnknownReason::ReceiptMismatch,
+            }),
+        };
+        match routed.response {
+            Ok(C2NodeResponse::DurableContextPackResolved { context })
+                if context == expected && expected.lineage.source_node_id == self.route.node_id =>
+            {
+                Ok(ExportContextPackOutcome::Exported {
+                    prepared: self.prepared,
+                    proof: ExportedContextPackProof {
+                        continuation_ref: self.authority.continuation_ref,
+                        route: self.route,
+                        source_session: expected.lineage.source_session,
+                        source_provider: expected.lineage.source_provider,
+                        context,
+                    },
+                })
+            }
+            Ok(C2NodeResponse::DurableContextPackResolved { .. }) => {
                 Ok(ExportContextPackOutcome::OutcomeUnknown {
                     prepared: self.prepared,
                     reason: ContextExportOutcomeUnknownReason::ReceiptMismatch,
@@ -4771,6 +4891,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 provider_identity_present: true,
                 created_at_unix_ms: 1,
@@ -4831,6 +4952,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 provider_identity_present: true,
                 created_at_unix_ms: 1,
@@ -5227,6 +5349,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: Some(HarnessSessionBindingV1 {
                 node_id: HarnessSelectorV1::new("node-a").unwrap(),
                 node_incarnation: HarnessSelectorV1::new(incarnation.to_string()).unwrap(),

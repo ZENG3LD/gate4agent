@@ -612,12 +612,19 @@ pub struct HarnessContextSourceSelectionV1 {
     pub node_incarnation: HarnessSelectorV1,
     pub workspace_id: HarnessSelectorV1,
     pub session_record_id: HarnessSelectorV1,
-    pub active_session: HarnessRuntimeIdentityV1,
+    pub active_session: Option<HarnessRuntimeIdentityV1>,
     pub message_count: u64,
     pub message_count_exact: bool,
     pub completed_turn_count: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub availability: HarnessContextSourceAvailabilityV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pack: Option<HarnessResolvedContextPackReceiptV1>,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessContextSourceAvailabilityV1 { Live, Durable }
 
 impl HarnessContextSourceSelectionV1 {
     pub fn validate(&self) -> Result<(), HarnessValidationError> {
@@ -631,7 +638,20 @@ impl HarnessContextSourceSelectionV1 {
         self.node_incarnation.validate()?;
         self.workspace_id.validate()?;
         self.session_record_id.validate()?;
-        self.active_session.validate()?;
+        if let Some(session) = &self.active_session { session.validate()?; }
+        match self.availability {
+            HarnessContextSourceAvailabilityV1::Live => {
+                if self.active_session.is_none() || self.context_pack.is_some() {
+                    return Err(HarnessValidationError::InvalidContextSourceCounts);
+                }
+            }
+            HarnessContextSourceAvailabilityV1::Durable => {
+                let Some(pack) = &self.context_pack else {
+                    return Err(HarnessValidationError::InvalidContextSourceCounts);
+                };
+                pack.validate()?;
+            }
+        }
         if self.message_count == 0
             || self.completed_turn_count.is_some_and(|count| count > self.message_count)
         {
@@ -1811,6 +1831,8 @@ pub struct HarnessRunV1 {
     pub intent: HarnessRunIntentV1,
     pub delivery_receipt: Option<HarnessReceiptRef>,
     pub continuation_receipt: Option<HarnessReceiptRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pack: Option<HarnessResolvedContextPackReceiptV1>,
     pub binding: Option<HarnessSessionBindingV1>,
     pub lifecycle: HarnessRunLifecycleV1,
     pub result_disposition: Option<HarnessResultDispositionV1>,
@@ -1844,6 +1866,20 @@ impl HarnessRunV1 {
             };
             if binding.node_id != self.intent.node_id || !workspace_matches {
                 return Err(HarnessValidationError::BindingIntentMismatch);
+            }
+        }
+        if let Some(pack) = &self.context_pack {
+            pack.validate()?;
+            let Some(binding) = &self.binding else {
+                return Err(HarnessValidationError::MissingFieldForState { field: "context_pack" });
+            };
+            let managed = matches!(&binding.session, HarnessSessionIdentityV1::Managed { .. });
+            if !managed
+                || pack.lineage.source_node_id != binding.node_id
+                || pack.lineage.source_workspace_id != binding.workspace_id
+                || pack.lineage.source_provider != self.intent.provider_profile
+            {
+                return Err(HarnessValidationError::InvalidContextPackReceipt);
             }
         }
         if let Some(failure) = &self.failure { failure.validate()?; }
@@ -2073,6 +2109,7 @@ pub enum HarnessOperationKindV1 {
     MutateGrant,
     RevokeGrant,
     Reconcile,
+    RecordRunContextPack,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2198,7 +2235,7 @@ impl HarnessOperationV1 {
             HarnessOperationKindV1::CreateTask => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
             HarnessOperationKindV1::MutateTask | HarnessOperationKindV1::MutateExecutionSpec => self.task_id.is_some() && self.run_id.is_none() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::CreateRun => self.task_id.is_some() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
-            HarnessOperationKindV1::BindRun | HarnessOperationKindV1::MutateRun => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
+            HarnessOperationKindV1::BindRun | HarnessOperationKindV1::MutateRun | HarnessOperationKindV1::RecordRunContextPack => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::CreateGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
             HarnessOperationKindV1::MutateGrant | HarnessOperationKindV1::RevokeGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::Reconcile => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_some() && self.expected_revision.is_some(),
@@ -2467,6 +2504,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding: None,
             lifecycle: HarnessRunLifecycleV1::Requested,
             result_disposition: None,
@@ -2689,6 +2727,94 @@ mod tests {
             run.validate(),
             Err(HarnessValidationError::BindingIntentMismatch),
         );
+    }
+
+    #[test]
+    fn harness_run_context_pack_requires_managed_binding_and_matching_lineage() {
+        let managed_binding = HarnessSessionBindingV1 {
+            node_id: selector("node-a"),
+            node_incarnation: selector("incarnation-a"),
+            workspace_id: selector("workspace-a"),
+            session: HarnessSessionIdentityV1::Managed {
+                record_id: selector("record-a"),
+                active_session: None,
+            },
+        };
+        let pack = HarnessResolvedContextPackReceiptV1 {
+            id: selector("context-a"),
+            digest: format!("sha256:{}", "c".repeat(64)),
+            lineage: HarnessContextPackLineageV1 {
+                source_node_id: selector("node-a"),
+                source_workspace_id: selector("workspace-a"),
+                source_instance_id: 1,
+                source_generation: 1,
+                source_provider: selector("claude"),
+            },
+            source_message_count: 2,
+            retained_message_count: 2,
+            byte_len: 64,
+            truncated: false,
+        };
+
+        let mut run = valid_run();
+        run.lifecycle = HarnessRunLifecycleV1::Completed;
+        run.result_disposition = Some(HarnessResultDispositionV1::Succeeded);
+        run.binding = Some(managed_binding.clone());
+        run.context_pack = Some(pack.clone());
+        run.validate().unwrap();
+
+        let mut missing_binding = run.clone();
+        missing_binding.binding = None;
+        assert_eq!(
+            missing_binding.validate(),
+            Err(HarnessValidationError::MissingFieldForState { field: "context_pack" }),
+        );
+
+        let mut inline_bound = run.clone();
+        inline_bound.binding = Some(HarnessSessionBindingV1 {
+            session: HarnessSessionIdentityV1::Inline {
+                inline_ref: HarnessInlineRef::new(format!("hinline_{}", "a".repeat(24))).unwrap(),
+            },
+            ..managed_binding.clone()
+        });
+        assert_eq!(
+            inline_bound.validate(),
+            Err(HarnessValidationError::InvalidContextPackReceipt),
+        );
+
+        let mut node_mismatch = run.clone();
+        node_mismatch.context_pack.as_mut().unwrap().lineage.source_node_id = selector("node-b");
+        assert_eq!(
+            node_mismatch.validate(),
+            Err(HarnessValidationError::InvalidContextPackReceipt),
+        );
+
+        let mut workspace_mismatch = run.clone();
+        workspace_mismatch.context_pack.as_mut().unwrap().lineage.source_workspace_id =
+            selector("workspace-b");
+        assert_eq!(
+            workspace_mismatch.validate(),
+            Err(HarnessValidationError::InvalidContextPackReceipt),
+        );
+
+        let mut provider_mismatch = run.clone();
+        provider_mismatch.context_pack.as_mut().unwrap().lineage.source_provider =
+            selector("codex");
+        assert_eq!(
+            provider_mismatch.validate(),
+            Err(HarnessValidationError::InvalidContextPackReceipt),
+        );
+    }
+
+    #[test]
+    fn harness_run_context_pack_is_additive_and_absent_on_pre_a2_wire() {
+        let run = valid_run();
+        let mut legacy_wire = serde_json::to_value(&run).unwrap();
+        assert!(legacy_wire.as_object().unwrap().get("context_pack").is_none());
+        legacy_wire.as_object_mut().unwrap().remove("context_pack");
+        let decoded: HarnessRunV1 = serde_json::from_value(legacy_wire).unwrap();
+        assert_eq!(decoded.context_pack, None);
+        assert_eq!(decoded, run);
     }
 
     #[test]
@@ -3091,14 +3217,16 @@ mod tests {
             node_incarnation: selector("incarnation-a"),
             workspace_id: selector("workspace-a"),
             session_record_id: selector("record-a"),
-            active_session: HarnessRuntimeIdentityV1 {
+            active_session: Some(HarnessRuntimeIdentityV1 {
                 instance_id: 7,
                 generation: 3,
-            },
+            }),
             message_count: 12,
             message_count_exact: true,
             completed_turn_count: Some(5),
             total_tokens: Some(900),
+            availability: HarnessContextSourceAvailabilityV1::Live,
+            context_pack: None,
         };
         context_source.validate().unwrap();
         let issuance = HarnessTaskLaunchIssuanceV1 {
@@ -3170,6 +3298,73 @@ mod tests {
         empty_context.total_tokens = Some(0);
         assert_eq!(
             empty_context.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+    }
+
+    #[test]
+    fn context_source_availability_invariants_require_matching_active_session_or_pack() {
+        let pack = HarnessResolvedContextPackReceiptV1 {
+            id: selector("context-b"),
+            digest: format!("sha256:{}", "d".repeat(64)),
+            lineage: HarnessContextPackLineageV1 {
+                source_node_id: selector("node-a"),
+                source_workspace_id: selector("workspace-a"),
+                source_instance_id: 7,
+                source_generation: 3,
+                source_provider: selector("claude"),
+            },
+            source_message_count: 12,
+            retained_message_count: 12,
+            byte_len: 128,
+            truncated: false,
+        };
+        let base = HarnessContextSourceSelectionV1 {
+            source_run_id: run_id('2'),
+            source_run_revision: HarnessRevision::new(4).unwrap(),
+            observed_at_unix_ms: 30,
+            metadata_digest: HarnessRequestDigest::new("4".repeat(64)).unwrap(),
+            node_id: selector("node-a"),
+            node_incarnation: selector("incarnation-a"),
+            workspace_id: selector("workspace-a"),
+            session_record_id: selector("record-a"),
+            active_session: Some(HarnessRuntimeIdentityV1 {
+                instance_id: 7,
+                generation: 3,
+            }),
+            message_count: 12,
+            message_count_exact: true,
+            completed_turn_count: Some(5),
+            total_tokens: Some(900),
+            availability: HarnessContextSourceAvailabilityV1::Live,
+            context_pack: None,
+        };
+        base.validate().unwrap();
+
+        let mut live_missing_session = base.clone();
+        live_missing_session.active_session = None;
+        assert_eq!(
+            live_missing_session.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+
+        let mut live_with_pack = base.clone();
+        live_with_pack.context_pack = Some(pack.clone());
+        assert_eq!(
+            live_with_pack.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+
+        let mut durable = base.clone();
+        durable.availability = HarnessContextSourceAvailabilityV1::Durable;
+        durable.active_session = None;
+        durable.context_pack = Some(pack.clone());
+        durable.validate().unwrap();
+
+        let mut durable_missing_pack = durable.clone();
+        durable_missing_pack.context_pack = None;
+        assert_eq!(
+            durable_missing_pack.validate(),
             Err(HarnessValidationError::InvalidContextSourceCounts),
         );
     }

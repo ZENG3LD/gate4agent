@@ -1231,6 +1231,7 @@ impl HarnessEngine {
         }
         let operation = self.continuation_operation(&continuation)?.clone();
         let mut next = self.clone();
+        next.validate_continuation_authority(&continuation)?;
         next.continuations.insert(continuation.continuation_ref.clone(), continuation);
         next.finish(operation, HarnessApplyOutcome::Applied)
     }
@@ -1824,6 +1825,66 @@ impl HarnessEngine {
         next.finish(operation, HarnessApplyOutcome::Applied)
     }
 
+    /// Narrow, single-entity, terminal-lifecycle-exempt mutation that records
+    /// a durable ContextPack receipt a run's own session cleanly exported.
+    /// Deliberately does not call `validate_run_lifecycle_transition` (that
+    /// function rejects any mutation on a terminal run) and never touches
+    /// task state. Idempotent on the exact same receipt (a lost reconcile
+    /// race just replays); a second, different receipt is a hard conflict.
+    pub fn prepare_run_context_pack_record(
+        &self,
+        operation: HarnessOperationV1,
+        expected_run_revision: HarnessRevision,
+        run: HarnessRunV1,
+    ) -> Result<PreparedHarnessMutation, HarnessEngineError> {
+        operation.validate()?;
+        run.validate()?;
+        let current_run = self.runs.get(&run.run_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(run.run_id.to_string()))?;
+        validate_context_pack_recording(current_run, &run)?;
+        if current_run.context_pack.is_some() {
+            // Idempotent replay: an earlier (possibly racing) reconcile pass
+            // already recorded this exact receipt — never re-derives a
+            // revision or touches `self.operations`.
+            return Ok(PreparedHarnessMutation {
+                next: self.clone(),
+                outcome: HarnessApplyOutcome::Replayed,
+                operation,
+            });
+        }
+        if self.operations.contains_key(&operation.operation_id) {
+            return Err(HarnessEngineError::OperationIdConflict {
+                operation_id: operation.operation_id,
+            });
+        }
+        require_first_revision(operation.revision, "operation")?;
+        require_kind(operation.kind, HarnessOperationKindV1::RecordRunContextPack)?;
+        require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
+        require_operation_expected(&operation, expected_run_revision)?;
+        require_same_id(operation.run_id.as_ref(), &run.run_id, "run")?;
+        if operation.actor != (HarnessActorV1::ParentRun { run_id: run.run_id.clone() })
+            || operation.task_id.is_some()
+            || operation.grant_id.is_some()
+            || operation.reconciles_operation_id.is_some()
+            || operation.updated_at_unix_ms != run.updated_at_unix_ms
+            || operation.finished_at_unix_ms != Some(run.updated_at_unix_ms)
+        {
+            return Err(HarnessEngineError::InvalidContextPackRecordAuthority);
+        }
+        validate_replacement(
+            "run",
+            current_run.revision,
+            expected_run_revision,
+            run.revision,
+            current_run.created_at_unix_ms,
+            run.created_at_unix_ms,
+        )?;
+        let mut next = self.clone();
+        next.runs.insert(run.run_id.clone(), run);
+        next.operations.insert(operation.operation_id.clone(), operation.clone());
+        next.finish(operation, HarnessApplyOutcome::Applied)
+    }
+
     /// Atomically records the categorical result of one leased CreateRun
     /// dispatch. Accepted outcomes use the authoritative spawn-proof seams.
     pub fn prepare_dispatch_outcome_commit(
@@ -2091,13 +2152,24 @@ impl HarnessEngine {
                 let Some(context_source) = &current.context_source else {
                     return Err(HarnessEngineError::IssuedExecutionTransferMismatch);
                 };
+                // A `Durable` context source always carries `active_session:
+                // None` (the receipt, not a live session, is authoritative),
+                // while `source_binding.session`'s own `active_session` is
+                // set once at spawn-accept and never clears back to `None`
+                // in production. Requiring exact equality for a durable
+                // source would reject every durable source unconditionally;
+                // `record_id` (plus node/incarnation/workspace, checked
+                // below) is what identifies it instead. The `Live` path is
+                // unchanged.
                 let source_session_matches = matches!(
                     &continuation.source_binding.session,
                     gate4agent_harness_protocol::HarnessSessionIdentityV1::Managed {
                         record_id,
-                        active_session: Some(active_session),
+                        active_session,
                     } if record_id == &context_source.session_record_id
-                        && active_session == &context_source.active_session
+                        && (context_source.availability
+                            == gate4agent_harness_protocol::HarnessContextSourceAvailabilityV1::Durable
+                            || active_session.as_ref() == context_source.active_session.as_ref())
                 );
                 if context_source.source_run_id != continuation.source_run_id
                     || context_source.node_id != continuation.node_id
@@ -2111,20 +2183,61 @@ impl HarnessEngine {
                 }
             }
         }
+        let source_is_live_managed = matches!(
+            &continuation.source_binding.session,
+            gate4agent_harness_protocol::HarnessSessionIdentityV1::Managed {
+                active_session: Some(_),
+                ..
+            }
+        );
+        let source_is_durable_managed = source.context_pack.is_some()
+            && matches!(
+                &continuation.source_binding.session,
+                gate4agent_harness_protocol::HarnessSessionIdentityV1::Managed { .. }
+            );
+        // For a durable source, `continuation.source_binding` deliberately
+        // does not equal `source.binding` byte-for-byte: the service layer
+        // synthesizes it with the Node's then-current incarnation in its
+        // `node_incarnation` field at continuation-creation time
+        // (`HarnessService::start_task_v2`), while `source.binding` (this
+        // run's own live, durable binding) stays fixed at its original
+        // spawn-accept shape forever. What must still hold is that `source`
+        // remains bound to the SAME managed record — node_id, workspace_id,
+        // and record_id — the continuation was built against;
+        // `node_incarnation`/`active_session` are not signals the durable
+        // path can or needs to compare here (mirrors
+        // `HarnessService`'s own `source_binding_is_current` in
+        // `begin_continuation_export`, `lib.rs`). The live path is
+        // unchanged: it still requires the binding to be byte-for-byte
+        // identical.
+        let source_binding_matches = match source.binding.as_ref() {
+            Some(binding) if source_is_durable_managed => {
+                binding.node_id == continuation.source_binding.node_id
+                    && binding.workspace_id == continuation.source_binding.workspace_id
+                    && matches!(
+                        (&binding.session, &continuation.source_binding.session),
+                        (
+                            gate4agent_harness_protocol::HarnessSessionIdentityV1::Managed {
+                                record_id: left,
+                                ..
+                            },
+                            gate4agent_harness_protocol::HarnessSessionIdentityV1::Managed {
+                                record_id: right,
+                                ..
+                            },
+                        ) if left == right
+                    )
+            }
+            binding => binding == Some(&continuation.source_binding),
+        };
         if !matches!(
             source.lifecycle,
             HarnessRunLifecycleV1::Running
                 | HarnessRunLifecycleV1::Waiting
                 | HarnessRunLifecycleV1::Completed
         )
-            || source.binding.as_ref() != Some(&continuation.source_binding)
-            || !matches!(
-                &continuation.source_binding.session,
-                gate4agent_harness_protocol::HarnessSessionIdentityV1::Managed {
-                    active_session: Some(_),
-                    ..
-                }
-            )
+            || !source_binding_matches
+            || !(source_is_live_managed || source_is_durable_managed)
         {
             return Err(HarnessEngineError::InvalidContinuationLink);
         }
@@ -3211,6 +3324,44 @@ fn validate_generic_run_operation(
     Ok(())
 }
 
+/// Guards `prepare_run_context_pack_record`: only `context_pack`, `revision`,
+/// and `updated_at_unix_ms` may differ between `current` and `next`. A run
+/// already frozen by H4 (`OutcomeUnknown`) stays frozen; a second, different
+/// receipt is a hard conflict, never a silent overwrite; and a replay of the
+/// exact same receipt is accepted (checked structurally here, resolved to an
+/// `Applied`/`Replayed` outcome by the caller).
+fn validate_context_pack_recording(
+    current: &HarnessRunV1,
+    next: &HarnessRunV1,
+) -> Result<(), HarnessEngineError> {
+    if current.lifecycle == HarnessRunLifecycleV1::OutcomeUnknown {
+        return Err(HarnessEngineError::OutcomeUnknownRunFrozen);
+    }
+    if current.run_id != next.run_id
+        || current.parent_run_id != next.parent_run_id
+        || current.task_id != next.task_id
+        || current.operation_id != next.operation_id
+        || current.intent != next.intent
+        || current.delivery_receipt != next.delivery_receipt
+        || current.continuation_receipt != next.continuation_receipt
+        || current.binding != next.binding
+        || current.lifecycle != next.lifecycle
+        || current.result_disposition != next.result_disposition
+        || current.failure != next.failure
+        || current.created_at_unix_ms != next.created_at_unix_ms
+    {
+        return Err(HarnessEngineError::InvalidContextPackRecordProjection);
+    }
+    let Some(candidate) = &next.context_pack else {
+        return Err(HarnessEngineError::InvalidContextPackRecordProjection);
+    };
+    match &current.context_pack {
+        None => Ok(()),
+        Some(existing) if existing == candidate => Ok(()),
+        Some(_) => Err(HarnessEngineError::TerminalRunMutation),
+    }
+}
+
 fn validate_coupled_run_operation(
     current: &HarnessRunV1,
     next: &HarnessRunV1,
@@ -3409,6 +3560,10 @@ pub enum HarnessEngineError {
     InvalidRunEventAuthority,
     #[error("run lifecycle event does not have the exact atomic task projection")]
     InvalidRunEventTaskProjection,
+    #[error("ContextPack record operation does not have exact single-run, task-free authority")]
+    InvalidContextPackRecordAuthority,
+    #[error("ContextPack record must not change any run field besides context_pack, revision, or updated_at_unix_ms")]
+    InvalidContextPackRecordProjection,
     #[error("CreateRun dispatch outcome does not have the exact atomic run/operation/task projection")]
     InvalidDispatchOutcomeProjection,
     #[error("coupled CreateRun operation state does not match run lifecycle")]
@@ -3497,6 +3652,7 @@ mod tests {
     use super::*;
     use gate4agent_harness_protocol::{
         HarnessActorV1, HarnessContextPermissionsV1, HarnessContextSourceSelectionV1,
+        HarnessContextSourceAvailabilityV1,
         HarnessEntityReadScopeV1,
         HarnessContextPackLineageV1, HarnessContinuationCleanupStateV1,
         HarnessDeliveryBundleDigestV1, HarnessDeliveryBundleIdV1,
@@ -3782,6 +3938,7 @@ mod tests {
             },
             delivery_receipt: None,
             continuation_receipt: None,
+            context_pack: None,
             binding,
             lifecycle,
             result_disposition: match lifecycle {
@@ -4423,11 +4580,13 @@ mod tests {
             node_incarnation: source_binding.node_incarnation.clone(),
             workspace_id: source_binding.workspace_id.clone(),
             session_record_id: record_id,
-            active_session,
+            active_session: Some(active_session),
             message_count: 3,
             message_count_exact: true,
             completed_turn_count: Some(1),
             total_tokens: Some(100),
+            availability: HarnessContextSourceAvailabilityV1::Live,
+            context_pack: None,
         });
         let spec = issued_execution_spec(&issuance, 1);
         engine.issuances.insert(task_id.clone(), issuance.clone());
@@ -4862,6 +5021,235 @@ mod tests {
             ).is_err());
             assert_eq!(engine.checkpoint(), before);
         }
+    }
+
+    fn context_pack_fixture() -> HarnessEngine {
+        let mut current_task = task(task_id('a'), 2, "context pack task");
+        current_task.state = HarnessTaskStateV1::Review;
+        current_task.run_ids = vec![run_id()];
+        let current_run = run(HarnessRunLifecycleV1::Completed, 3);
+        let mut create_run = original_run_operation(HarnessOperationStateV1::Succeeded);
+        create_run.updated_at_unix_ms = current_run.updated_at_unix_ms;
+        create_run.finished_at_unix_ms = Some(current_run.updated_at_unix_ms);
+        HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![current_task],
+            runs: vec![current_run],
+            grants: Vec::new(),
+            operations: vec![create_run],
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap()
+    }
+
+    fn context_pack_receipt(digest_hex: char) -> HarnessResolvedContextPackReceiptV1 {
+        HarnessResolvedContextPackReceiptV1 {
+            id: HarnessSelectorV1::new("context-a").unwrap(),
+            digest: format!("sha256:{}", digest_hex.to_string().repeat(64)),
+            lineage: HarnessContextPackLineageV1 {
+                source_node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                source_workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                source_instance_id: 1,
+                source_generation: 1,
+                source_provider: HarnessSelectorV1::new("claude").unwrap(),
+            },
+            source_message_count: 4,
+            retained_message_count: 4,
+            byte_len: 64,
+            truncated: false,
+        }
+    }
+
+    fn context_pack_record_operation(
+        marker: char,
+        expected_revision: HarnessRevision,
+        at_unix_ms: u64,
+    ) -> HarnessOperationV1 {
+        HarnessOperationV1 {
+            operation_id: operation_id(marker),
+            revision: revision(1),
+            actor: HarnessActorV1::ParentRun { run_id: run_id() },
+            kind: HarnessOperationKindV1::RecordRunContextPack,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: None,
+            run_id: Some(run_id()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(expected_revision),
+            request_digest: HarnessRequestDigest::new(marker.to_string().repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                marker.to_string().repeat(24),
+            )).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: at_unix_ms,
+            updated_at_unix_ms: at_unix_ms,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: Some(at_unix_ms),
+        }
+    }
+
+    #[test]
+    fn context_pack_record_freezes_every_field_except_pack_revision_and_updated_at() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let operation = context_pack_record_operation('1', current_run.revision, 30);
+
+        let mut tampered = current_run.clone();
+        tampered.context_pack = Some(context_pack_receipt('a'));
+        tampered.revision = revision(current_run.revision.get() + 1);
+        tampered.updated_at_unix_ms = 30;
+        tampered.parent_run_id = Some(numbered_run_id(999));
+        let before = engine.checkpoint();
+        assert!(matches!(
+            engine.prepare_run_context_pack_record(operation.clone(), current_run.revision, tampered),
+            Err(HarnessEngineError::InvalidContextPackRecordProjection),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+
+        let mut clean = current_run.clone();
+        clean.context_pack = Some(context_pack_receipt('a'));
+        clean.revision = revision(current_run.revision.get() + 1);
+        clean.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_context_pack_record(
+            operation,
+            current_run.revision,
+            clean.clone(),
+        ).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let recorded = committed.run(&run_id()).unwrap().clone();
+        let mut expected = current_run;
+        expected.context_pack = clean.context_pack;
+        expected.revision = clean.revision;
+        expected.updated_at_unix_ms = clean.updated_at_unix_ms;
+        assert_eq!(recorded, expected);
+    }
+
+    #[test]
+    fn context_pack_record_rejects_a_second_different_receipt_as_conflict() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let first_operation = context_pack_record_operation('2', current_run.revision, 30);
+        let mut first_next = current_run.clone();
+        first_next.context_pack = Some(context_pack_receipt('a'));
+        first_next.revision = revision(current_run.revision.get() + 1);
+        first_next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_context_pack_record(
+            first_operation,
+            current_run.revision,
+            first_next,
+        ).unwrap();
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let before = committed.checkpoint();
+
+        let recorded_run = committed.run(&run_id()).unwrap().clone();
+        let second_operation = context_pack_record_operation('3', recorded_run.revision, 40);
+        let mut second_next = recorded_run.clone();
+        second_next.context_pack = Some(context_pack_receipt('b'));
+        second_next.revision = revision(recorded_run.revision.get() + 1);
+        second_next.updated_at_unix_ms = 40;
+        assert!(matches!(
+            committed.prepare_run_context_pack_record(
+                second_operation,
+                recorded_run.revision,
+                second_next,
+            ),
+            Err(HarnessEngineError::TerminalRunMutation),
+        ));
+        assert_eq!(committed.checkpoint(), before);
+    }
+
+    #[test]
+    fn context_pack_record_is_idempotent_on_the_same_digest() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let operation = context_pack_record_operation('4', current_run.revision, 30);
+        let mut next = current_run.clone();
+        next.context_pack = Some(context_pack_receipt('a'));
+        next.revision = revision(current_run.revision.get() + 1);
+        next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_context_pack_record(
+            operation,
+            current_run.revision,
+            next,
+        ).unwrap();
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        let committed_snapshot = committed.checkpoint();
+
+        // A second reconcile pass rediscovers the exact same receipt against
+        // a stale (pre-commit) revision snapshot — this must no-op, not
+        // conflict, per the design's race mitigation (§10 risk #1).
+        let replay_operation = context_pack_record_operation('5', current_run.revision, 31);
+        let mut replay_next = current_run.clone();
+        replay_next.context_pack = Some(context_pack_receipt('a'));
+        replay_next.revision = revision(current_run.revision.get() + 1);
+        replay_next.updated_at_unix_ms = 31;
+        let replayed = committed.prepare_run_context_pack_record(
+            replay_operation,
+            current_run.revision,
+            replay_next,
+        ).unwrap();
+        assert_eq!(replayed.outcome(), HarnessApplyOutcome::Replayed);
+        assert_eq!(replayed.checkpoint(), committed_snapshot);
+    }
+
+    #[test]
+    fn context_pack_record_keeps_outcome_unknown_run_frozen() {
+        let mut current_task = task(task_id('a'), 2, "frozen task");
+        current_task.state = HarnessTaskStateV1::Waiting;
+        current_task.run_ids = vec![run_id()];
+        let mut current_run = run(HarnessRunLifecycleV1::Requested, 3);
+        current_run.lifecycle = HarnessRunLifecycleV1::OutcomeUnknown;
+        let mut create_run = original_run_operation(HarnessOperationStateV1::OutcomeUnknown);
+        create_run.outcome_unknown_reason = Some(HarnessOutcomeUnknownReasonV1::Timeout);
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![current_task],
+            runs: vec![current_run.clone()],
+            grants: Vec::new(),
+            operations: vec![create_run],
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+        }).unwrap();
+        let operation = context_pack_record_operation('6', current_run.revision, 30);
+        let before = engine.checkpoint();
+        assert!(matches!(
+            engine.prepare_run_context_pack_record(operation, current_run.revision, current_run),
+            Err(HarnessEngineError::OutcomeUnknownRunFrozen),
+        ));
+        assert_eq!(engine.checkpoint(), before);
+    }
+
+    #[test]
+    fn context_pack_record_never_touches_task_state() {
+        let engine = context_pack_fixture();
+        let current_run = engine.run(&run_id()).unwrap().clone();
+        let original_task = engine.task(&task_id('a')).unwrap().clone();
+        let operation = context_pack_record_operation('7', current_run.revision, 30);
+        let mut next = current_run.clone();
+        next.context_pack = Some(context_pack_receipt('a'));
+        next.revision = revision(current_run.revision.get() + 1);
+        next.updated_at_unix_ms = 30;
+        let prepared = engine.prepare_run_context_pack_record(
+            operation,
+            current_run.revision,
+            next,
+        ).unwrap();
+        let mut committed = engine.clone();
+        committed.accept(prepared);
+        assert_eq!(committed.task(&task_id('a')).unwrap(), &original_task);
     }
 
     #[test]

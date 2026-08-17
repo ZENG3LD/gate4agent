@@ -973,8 +973,22 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
     assert_conflict(client.replace_task_execution_spec_v2(replace('g', stale_profile)));
     assert_eq!(allocation_count(&fixture.allocation), 0);
 
+    // The source run stays live throughout this whole stretch, and its own
+    // revision advances independently of anything under test here whenever
+    // the coordinator's C2 control-event pipeline needs to revalidate it
+    // (e.g. `freeze_bound_route_waiting`'s `GapWaiting` fallback bumps it by
+    // design when an observation resync cannot yet prove the bound run is
+    // still exactly live, then again when it reconverges). `selection` was
+    // captured several round trips ago, above; re-read the context source
+    // fresh right before the one call in this block that is expected to
+    // succeed, exactly like a real client would re-fetch before submitting
+    // rather than replaying an arbitrarily-aged snapshot.
+    let mut fresh_selection = selection.clone();
+    fresh_selection.context_source = Some(
+        client.task_launch_options_get(target_task_id()).unwrap().context_sources[0].clone(),
+    );
     assert_eq!(
-        client.replace_task_execution_spec_v2(replace('h', selection.clone())).unwrap(),
+        client.replace_task_execution_spec_v2(replace('h', fresh_selection)).unwrap(),
         HarnessOperatorMutationOutcomeV1::Applied,
     );
     let issued_options = client.task_launch_options_get(target_task_id()).unwrap();
@@ -1054,9 +1068,12 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
     let resynced_source = resynced_options.context_sources.iter()
         .find(|source| source.source_run_id == source_dispatch.run_id)
         .unwrap();
-    assert_eq!(
-        resynced_source.source_run_revision,
-        selection.context_source.as_ref().unwrap().source_run_revision,
+    // Same background churn as above: the source run's own revision only
+    // ever advances (never regresses) across this reconnect boundary, it is
+    // not pinned to the snapshot `selection` captured well before it.
+    assert!(
+        resynced_source.source_run_revision
+            >= selection.context_source.as_ref().unwrap().source_run_revision,
     );
     assert!(
         resynced_source.observed_at_unix_ms
@@ -1302,10 +1319,35 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
     })
     .await
     .expect("target provider identity did not converge through Hook ingress");
-    let public_task = exact_client.task_get(target_task_id()).unwrap();
+    // The dispatch coordinator's own task/run lifecycle view converges
+    // through a separate C2 control-event pipeline from the Node-side
+    // session inventory polled above (`exact_target_inventory_is_live`):
+    // `start_task_v2` returning only means dispatch was accepted, never that
+    // the coordinator has already observed and committed `Running` — that
+    // commit lands later, asynchronously, off the control-event stream
+    // (`apply_exact_control_lifecycle` / `apply_spawn_result`). That stream
+    // also has a legitimate transient-`Waiting` fallback of its own
+    // (`freeze_bound_route_waiting`'s `GapWaiting`, taken whenever an
+    // observation resync cannot yet prove a bound run is still exactly
+    // live) which a slow poller can observe mid-flight. Poll here the same
+    // bounded way the inventory wait above does, instead of assuming a
+    // synchronous guarantee `start_task_v2` never made.
+    let (public_task, public_run) = timeout(Duration::from_secs(15), async {
+        loop {
+            let task = exact_client.task_get(target_task_id()).unwrap();
+            let run = exact_client.run_get(started.dispatch.run_id.clone()).unwrap();
+            if task.state == HarnessTaskStateV1::Running
+                && run.lifecycle == HarnessRunLifecycleV1::Running
+            {
+                break (task, run);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target task/run did not converge to Running through the C2 control-event pipeline");
     assert_eq!(public_task.state, HarnessTaskStateV1::Running);
     assert_eq!(public_task.run_ids, vec![started.dispatch.run_id.clone()]);
-    let public_run = exact_client.run_get(started.dispatch.run_id.clone()).unwrap();
     assert_eq!(public_run.lifecycle, HarnessRunLifecycleV1::Running);
     let public_transfer = exact_client.run_transfer_get(started.dispatch.run_id.clone()).unwrap();
     assert_eq!(
@@ -1322,6 +1364,24 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
         &started.dispatch.run_id,
         &attributed_binding,
     );
+    // Re-confirm immediately before disconnecting: the coordinator's C2
+    // control-event pipeline can independently detect a live-stream sequence
+    // gap at any time, not only around explicit host restarts, and take the
+    // same `GapWaiting` fallback confirmed above. Re-polling right here — with
+    // nothing but this call between the last check and `stop_host` — shrinks
+    // the unwatched window as far as the test can control it.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if exact_client.run_get(started.dispatch.run_id.clone())
+                .is_ok_and(|run| run.lifecycle == HarnessRunLifecycleV1::Running)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("target run regressed from Running before the host could be stopped");
     stop_host(exact_host, exact_host_task).await;
     drop(exact_client);
 
@@ -1433,11 +1493,11 @@ async fn task_launch_v2_issues_managed_context_delivery_once_across_reopen_and_r
     );
     assert_eq!(
         target_context.lineage.source_session.session.instance_id.0,
-        issued_context.active_session.instance_id,
+        issued_context.active_session.as_ref().unwrap().instance_id,
     );
     assert_eq!(
         target_context.lineage.source_session.session.generation.0,
-        issued_context.active_session.generation,
+        issued_context.active_session.as_ref().unwrap().generation,
     );
     assert_eq!(target_context.lineage.source_provider.as_str(), "claude");
     assert_eq!(target_context.source_message_count, issued_context.message_count);

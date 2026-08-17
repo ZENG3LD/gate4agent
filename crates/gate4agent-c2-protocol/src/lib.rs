@@ -371,6 +371,8 @@ pub struct C2ManagedSessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ResolvedContextPackReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_context: Option<ResolvedContextPackReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_binding: Option<SessionTaskBindingV1>,
     pub provider_identity_present: bool,
     pub created_at_unix_ms: u64,
@@ -390,6 +392,12 @@ impl C2ManagedSessionRecord {
 
     pub fn requires_history_context_pack_capability(&self) -> bool {
         self.context_id.is_some() || self.context.is_some()
+    }
+
+    pub fn exported_context_is_valid(&self) -> bool {
+        self.exported_context.as_ref().map_or(true, |pack| {
+            pack.is_valid() && pack.lineage.source_provider == self.provider
+        })
     }
 
     pub fn requires_session_task_correlation_capability(&self) -> bool {
@@ -428,6 +436,8 @@ impl<'de> Deserialize<'de> for C2ManagedSessionRecord {
             #[serde(default)]
             context: Option<ResolvedContextPackReceipt>,
             #[serde(default)]
+            exported_context: Option<ResolvedContextPackReceipt>,
+            #[serde(default)]
             task_binding: Option<SessionTaskBindingV1>,
             provider_identity_present: bool,
             created_at_unix_ms: u64,
@@ -447,6 +457,7 @@ impl<'de> Deserialize<'de> for C2ManagedSessionRecord {
             bundle: wire.bundle,
             context_id: wire.context_id,
             context: wire.context,
+            exported_context: wire.exported_context,
             task_binding: wire.task_binding,
             provider_identity_present: wire.provider_identity_present,
             created_at_unix_ms: wire.created_at_unix_ms,
@@ -455,6 +466,11 @@ impl<'de> Deserialize<'de> for C2ManagedSessionRecord {
         if !record.context_binding_is_valid() {
             return Err(serde::de::Error::custom(
                 "C2 managed session context id and materialization receipt are not correlated",
+            ));
+        }
+        if !record.exported_context_is_valid() {
+            return Err(serde::de::Error::custom(
+                "C2 managed session exported context receipt is invalid or from a different provider",
             ));
         }
         if !record.task_binding_is_valid() {
@@ -480,6 +496,7 @@ impl From<&ManagedSessionRecord> for C2ManagedSessionRecord {
             bundle: record.bundle.clone(),
             context_id: record.context_id.clone(),
             context: record.context.clone(),
+            exported_context: record.exported_context.clone(),
             task_binding: record.task_binding.clone().filter(|binding| {
                 binding.revision > 0
                     && binding.changed_at_unix_ms >= record.created_at_unix_ms
@@ -1435,6 +1452,7 @@ pub enum C2NodeResponse {
         context: ResolvedContextPackReceipt,
     },
     ContextPackForgotten { context_id: SpawnContextId },
+    DurableContextPackResolved { context: ResolvedContextPackReceipt },
     WorkspaceRegistered {
         workspace: C2WorkspaceSnapshot,
     },
@@ -1680,6 +1698,11 @@ impl From<&NodeResponse> for C2NodeResponse {
             NodeResponse::ContextPackForgotten { context_id } => Self::ContextPackForgotten {
                 context_id: context_id.clone(),
             },
+            NodeResponse::DurableContextPackResolved { context } => {
+                Self::DurableContextPackResolved {
+                    context: context.clone(),
+                }
+            }
             NodeResponse::WorkspaceRegistered { workspace } => Self::WorkspaceRegistered {
                 workspace: C2WorkspaceSnapshot::from(workspace),
             },
@@ -1842,6 +1865,7 @@ impl C2NodeResponse {
             | Self::SessionRecordResumed { record, .. } => {
                 record.environment_profile.is_some()
             }
+            Self::DurableContextPackResolved { .. } => false,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -1902,6 +1926,7 @@ impl C2NodeResponse {
             | Self::ProviderSessionIndexed { record }
             | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
+            Self::DurableContextPackResolved { .. } => false,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -1972,7 +1997,8 @@ impl C2NodeResponse {
             | Self::HistoryLoaded { .. }
             | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
-            | Self::ContextPackForgotten { .. } => true,
+            | Self::ContextPackForgotten { .. }
+            | Self::DurableContextPackResolved { .. } => true,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -3242,6 +3268,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
@@ -4258,6 +4285,29 @@ mod tests {
         assert!(!json.contains("messages"));
         assert!(!json.contains("path"));
         assert_eq!(serde_json::from_str::<C2NodeResponse>(&json).unwrap(), exported);
+    }
+
+    #[test]
+    fn c2_exported_context_projects_through_records_and_is_provider_correlated() {
+        let exported = context_pack_receipt();
+        let mut source = private_session_record();
+        source.exported_context = Some(exported.clone());
+        let projected = C2ManagedSessionRecord::from(&source);
+        assert!(projected.exported_context_is_valid());
+        assert_eq!(projected.exported_context.as_ref(), Some(&exported));
+
+        let record_json = serde_json::to_string(&projected).unwrap();
+        assert_private_record_fields_absent(&record_json);
+        assert_eq!(
+            serde_json::from_str::<C2ManagedSessionRecord>(&record_json).unwrap(),
+            projected,
+        );
+
+        let mut mismatched_provider =
+            serde_json::from_str::<serde_json::Value>(&record_json).unwrap();
+        mismatched_provider["exported_context"]["lineage"]["source_provider"] =
+            serde_json::json!("claude");
+        assert!(serde_json::from_value::<C2ManagedSessionRecord>(mismatched_provider).is_err());
     }
 
     #[test]
@@ -5769,6 +5819,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 20,
@@ -5839,6 +5890,7 @@ mod tests {
                 bundle: None,
                 context_id: None,
                 context: None,
+                exported_context: None,
                 task_binding: None,
                 created_at_unix_ms: index as u64,
                 updated_at_unix_ms: index as u64,

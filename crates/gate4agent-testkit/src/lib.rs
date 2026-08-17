@@ -18,6 +18,7 @@ pub const PTY_PROVIDER_FIXTURE_ID: &str = "pty-provider-fixture";
 pub const HOOK_POSTING_FIXTURE_ID: &str = "hook-posting-fixture";
 pub const MONITORING_HOOK_FIXTURE_ID: &str = "monitoring-hook-fixture";
 pub const CLEAN_EXIT_FIXTURE_ID: &str = "clean-exit-fixture";
+pub const IDENTIFIED_CLEAN_EXIT_FIXTURE_ID: &str = "identified-clean-exit-fixture";
 pub const MONITORING_PROMPT_CANARY: &str = "g4a-private-prompt-canary";
 pub const MONITORING_TOOL_INPUT_CANARY: &str = "g4a-private-tool-input-canary";
 pub const MONITORING_TOOL_OUTPUT_CANARY: &str = "g4a-private-tool-output-canary";
@@ -36,6 +37,7 @@ pub enum ControlledExitFixtureError {
     InvalidTarget(&'static str),
     TargetExists(&'static str),
     DuplicateTargets,
+    InvalidSessionId,
 }
 
 impl fmt::Display for ControlledExitFixtureError {
@@ -54,6 +56,9 @@ impl fmt::Display for ControlledExitFixtureError {
             ),
             Self::DuplicateTargets => formatter.write_str(
                 "controlled-exit fixture marker and release paths must differ",
+            ),
+            Self::InvalidSessionId => formatter.write_str(
+                "controlled-exit fixture session id must be a bounded, non-empty ASCII alphanumeric-or-hyphen string",
             ),
         }
     }
@@ -202,6 +207,125 @@ while True:
             acp: None,
         },
     ))
+}
+
+/// Combines [`controlled_clean_exit_agent_spec`]'s deterministic
+/// marker/release/exit-0 handshake with an early `SessionStart` Hook post
+/// carrying `session_id`, so the session establishes a verified
+/// `ProviderSessionIdentity` (`provider_session: Some(_)`) before it waits
+/// for release and exits cleanly. Bind this to a Hook-capable agent id (e.g.
+/// `"claude"`) that also declares History adapter capability so a session
+/// produced by this fixture is both auto-export-at-exit eligible
+/// (`provider_session.is_some()`) and its exported pack's native history is
+/// independently loadable.
+pub fn identified_clean_exit_agent_spec(
+    fixture_root: &Path,
+    started_marker: &Path,
+    release_signal: &Path,
+    session_id: &str,
+) -> Result<AgentSpec, ControlledExitFixtureError> {
+    validate_fixture_root(fixture_root)?;
+    let started_marker = validate_fixture_target(
+        fixture_root,
+        started_marker,
+        "started marker",
+    )?;
+    let release_signal = validate_fixture_target(
+        fixture_root,
+        release_signal,
+        "release signal",
+    )?;
+    if started_marker == release_signal {
+        return Err(ControlledExitFixtureError::DuplicateTargets);
+    }
+    if session_id.is_empty()
+        || session_id.len() > FIXTURE_PATH_MAX_BYTES
+        || !session_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(ControlledExitFixtureError::InvalidSessionId);
+    }
+
+    #[cfg(windows)]
+    let launch = LaunchSpec {
+        program: "powershell.exe".to_owned(),
+        fixed_args: vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-ExecutionPolicy".to_owned(),
+            "Bypass".to_owned(),
+            "-Command".to_owned(),
+            r#"& { param([string]$startedMarker, [string]$releaseSignal, [string]$sessionId)
+$ErrorActionPreference = 'Stop'
+$headers = @{'X-Gate4Agent-Hook-Token' = $env:GATE4AGENT_HOOK_TOKEN; 'X-Gate4Agent-Hook-Route' = $env:GATE4AGENT_HOOK_ROUTE}
+$body = @{
+    hook_event_name = 'SessionStart'
+    event_id = 'identified-clean-exit-session-start'
+    payload = @{ hook_event_name = 'SessionStart'; session_id = $sessionId; model = 'fixture-model' }
+} | ConvertTo-Json -Compress -Depth 12
+Invoke-WebRequest -UseBasicParsing -Method Post -Uri $env:GATE4AGENT_HOOK_URL -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
+$bytes = [Text.Encoding]::UTF8.GetBytes("started`n")
+$marker = [IO.File]::Open($startedMarker, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+try { $marker.Write($bytes, 0, $bytes.Length) } finally { $marker.Dispose() }
+while (-not (Test-Path -LiteralPath $releaseSignal -PathType Leaf)) {
+    Start-Sleep -Milliseconds 25
+}
+$release = Get-Item -LiteralPath $releaseSignal -Force
+if (($release -isnot [IO.FileInfo]) -or (($release.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { exit 81 }
+exit 0
+}"#.to_owned(),
+            started_marker,
+            release_signal,
+            session_id.to_owned(),
+        ],
+    };
+
+    #[cfg(not(windows))]
+    let launch = LaunchSpec {
+        program: "python3".to_owned(),
+        fixed_args: vec![
+            "-u".to_owned(),
+            "-c".to_owned(),
+            r#"import json,os,stat,sys,time,urllib.request
+marker=sys.argv[1]
+release=sys.argv[2]
+session_id=sys.argv[3]
+body=json.dumps({"hook_event_name":"SessionStart","event_id":"identified-clean-exit-session-start","payload":{"hook_event_name":"SessionStart","session_id":session_id,"model":"fixture-model"}}).encode()
+request=urllib.request.Request(os.environ["GATE4AGENT_HOOK_URL"],data=body,headers={"Content-Type":"application/json","X-Gate4Agent-Hook-Token":os.environ["GATE4AGENT_HOOK_TOKEN"],"X-Gate4Agent-Hook-Route":os.environ["GATE4AGENT_HOOK_ROUTE"]},method="POST")
+urllib.request.urlopen(request,timeout=5).read()
+fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+try:
+ os.write(fd,b'started\n')
+finally:
+ os.close(fd)
+while True:
+ try:
+  mode=os.lstat(release).st_mode
+ except FileNotFoundError:
+  time.sleep(0.025)
+  continue
+ if not stat.S_ISREG(mode):
+  sys.exit(81)
+ sys.exit(0)"#.to_owned(),
+            started_marker,
+            release_signal,
+            session_id.to_owned(),
+        ],
+    };
+
+    let mut spec = provider_spec(
+        IDENTIFIED_CLEAN_EXIT_FIXTURE_ID,
+        "Controlled identified clean-exit fixture",
+        launch,
+        AgentTransportCapabilities {
+            pty: true,
+            pty_adapter: None,
+            pipe: None,
+            acp: None,
+        },
+    );
+    spec.capabilities.adapters.hook = Some(adapter(AdapterFamily::Hook, "claude-code"));
+    Ok(spec)
 }
 
 pub fn pipe_agent_spec() -> AgentSpec {

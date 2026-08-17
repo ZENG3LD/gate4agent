@@ -35,6 +35,7 @@ use gate4agent_node_protocol::{
     NativeSessionCatalogSummary, NativeSessionCatalogWindow, NativeSessionSelection,
     SessionAgentProgress, SessionRecordPreview, NodeEvent, NodeFailureCode, NodeId,
     NodeRequest, NodeResponse, NodeSnapshot, ObservationV1, ResolvedContextPackReceipt, ResolvedSpawnReceipt,
+    LaunchInventory, ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, SpawnProfileSummary,
     ManagedSessionState, OpaqueHostPath, SessionAddress as WireSessionAddress, SessionKey,
     SessionMode, SessionRecordId, SpawnBundleId,
     SpawnContextId, SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides,
@@ -70,6 +71,9 @@ use gate4agent_harness_client::{
     HarnessRuntimeMouseProtocolEncodingV1, HarnessRuntimeSessionAddressV1,
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTerminalFrameV1,
     HarnessRuntimeTerminalPageV1, HarnessRuntimeTransportV1,
+    HarnessRuntimeLaunchInventoryV1,
+    HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1,
+    HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
     RedactedTaskV1, RunPageV1, TaskPageV1,
     SessionMonitorV1 as HarnessSessionMonitorV1, TimelineEntryV1,
     HARNESS_TERMINAL_PAGE_LIMIT_MAX,
@@ -747,6 +751,52 @@ enum WorkerUpdate {
         token: u64,
         failure: HarnessReadFailure,
     },
+    // Node-scoped siblings of the four `Harness*Workspace*`/`HarnessGit*`
+    // variants above: the sidebar's harness-mode reads, which land in the
+    // same direct-mode state (`workspace_inspections`, `file_tabs`,
+    // `git_tabs`) the direct-C2 replies fill.
+    // No token: mirrors `AppAction::HarnessInspectNodeWorkspace`, tokenless
+    // like direct-mode `InspectWorkspace`.
+    HarnessNodeWorkspaceInspected {
+        node_id: String,
+        workspace_id: String,
+        inspection: HarnessNodeWorkspaceInspectionV1,
+    },
+    HarnessNodeWorkspaceInspectionFailed {
+        node_id: String,
+        workspace_id: String,
+        message: String,
+    },
+    HarnessNodeWorkspaceFileRead {
+        node_id: String,
+        token: u64,
+        file: HarnessNodeWorkspaceFileV1,
+    },
+    HarnessNodeWorkspaceFileFailed {
+        key: WorkspaceFileTabKey,
+        token: u64,
+        message: String,
+    },
+    HarnessNodeGitHistoryRead {
+        destination: WorkspaceGitRequestDestination,
+        token: u64,
+        page: HarnessNodeGitHistoryPageV1,
+    },
+    HarnessNodeGitHistoryFailed {
+        destination: WorkspaceGitRequestDestination,
+        token: u64,
+        message: String,
+    },
+    HarnessNodeGitDiffRead {
+        destination: WorkspaceGitRequestDestination,
+        token: u64,
+        diff: HarnessNodeGitDiffV1,
+    },
+    HarnessNodeGitDiffFailed {
+        destination: WorkspaceGitRequestDestination,
+        token: u64,
+        message: String,
+    },
     HarnessReverseAttributionLoaded {
         subject: HarnessReverseAttributionSubjectV1,
         token: u64,
@@ -1277,7 +1327,11 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             next_auto_inspection = Instant::now();
         }
         let now = Instant::now();
-        if selected_backend.c2_worker
+        // The harness-only backend serves workspace reads through the V9
+        // node-scoped operator family — the periodic auto-inspection must
+        // fire there too, or the Files/Git sidebar never leaves
+        // "loading workspace...".
+        if (selected_backend.c2_worker || selected_backend.harness_worker)
             && selected_route.is_some()
             && app.workspace_inspection_visible()
             && !app.workspace_inspection_pending()
@@ -1530,26 +1584,61 @@ fn send_action(
     send_operator_action(app, commands, action);
 }
 
+/// Rewrites a direct-shaped workspace-read action into its harness-routed,
+/// node-scoped sibling when the session has no direct node connection
+/// (harness-operator mode: `harness_only`). The App methods that build
+/// `InspectWorkspace`/`ReadWorkspaceFile`/`ReadGitHistory`/`ReadGitDiff` stay
+/// mode-agnostic and keep populating the same direct-mode state
+/// (`inspection_pending`, `file_tabs`, `git_tabs`) either way — only the
+/// wire-level action this dispatch boundary sends onward changes. Applied
+/// once, here, rather than at each of the several call sites that build
+/// these four actions (sidebar open, pagination, diff selection).
+fn harness_route_workspace_read(harness_only: bool, action: AppAction) -> AppAction {
+    if !harness_only {
+        return action;
+    }
+    match action {
+        AppAction::InspectWorkspace { node_id, workspace_id } => {
+            AppAction::HarnessInspectNodeWorkspace { node_id, workspace_id }
+        }
+        AppAction::ReadWorkspaceFile { node_id, workspace_id, path, token } => {
+            AppAction::HarnessReadNodeWorkspaceFile { node_id, workspace_id, path, token }
+        }
+        AppAction::ReadGitHistory { node_id, workspace_id, path, before, limit, token, destination } => {
+            AppAction::HarnessReadNodeGitHistory {
+                node_id, workspace_id, path, before, limit, token, destination,
+            }
+        }
+        AppAction::ReadGitDiff { node_id, workspace_id, target, token, destination } => {
+            AppAction::HarnessReadNodeGitDiff { node_id, workspace_id, target, token, destination }
+        }
+        other => other,
+    }
+}
+
 fn send_operator_action(
     app: &mut App,
     commands: &BTreeMap<String, mpsc::Sender<AppAction>>,
     action: AppAction,
 ) {
-    let Some(node_id) = action_node_id(&action).map(str::to_owned) else {
-        return;
-    };
     let harness_only = commands.contains_key(HARNESS_COMMAND_ROUTE)
         && commands.contains_key(HARNESS_HISTORY_COMMAND_ROUTE)
         && commands.contains_key(HARNESS_DETAIL_COMMAND_ROUTE)
         && !commands.contains_key(C2_COMMAND_ROUTE)
         && commands.len() == 3;
+    let action = harness_route_workspace_read(harness_only, action);
+    let Some(node_id) = action_node_id(&action).map(str::to_owned) else {
+        return;
+    };
     let harness_native_history_read = harness_only && harness_native_history_read_action(&action);
     let harness_detail_read = harness_only && harness_detail_read_action(&action);
     if harness_only && node_id != HARNESS_COMMAND_ROUTE
         && !harness_native_history_read
         && !harness_detail_read
     {
-        if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable") {
+        if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable")
+            && !reject_workspace_write_action(app, &action, "Harness-owned session action unavailable")
+        {
             app.notice = Some(
                 "Harness-owned session action unavailable: no typed Harness intent exists"
                     .to_owned(),
@@ -1637,6 +1726,35 @@ fn reject_harness_queue_action(
         }
         AppAction::HarnessReadGitDiff { destination, token, .. } => {
             app.fail_harness_git_diff(destination, *token, detail_failure());
+            return true;
+        }
+        AppAction::HarnessInspectNodeWorkspace { node_id, workspace_id, .. } => {
+            app.fail_workspace_inspection(
+                node_id.clone(),
+                workspace_id.clone(),
+                detail_failure().display(),
+            );
+            return true;
+        }
+        AppAction::HarnessReadNodeWorkspaceFile { node_id, workspace_id, path, token } => {
+            app.fail_workspace_file(
+                &WorkspaceFileTabKey {
+                    node_id: node_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    path: path.clone(),
+                },
+                *token,
+                detail_failure().display(),
+                false,
+            );
+            return true;
+        }
+        AppAction::HarnessReadNodeGitHistory { destination, token, .. } => {
+            app.fail_git_history(destination, *token, detail_failure().display());
+            return true;
+        }
+        AppAction::HarnessReadNodeGitDiff { destination, token, .. } => {
+            app.fail_git_diff(destination, *token, detail_failure().display());
             return true;
         }
         AppAction::HarnessLoadRunTransfer { run, token } => {
@@ -1777,6 +1895,10 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
             | AppAction::HarnessReadGitHistory { .. }
             | AppAction::HarnessReadGitDiff { .. }
             | AppAction::HarnessLoadReverseAttribution { .. }
+            | AppAction::HarnessInspectNodeWorkspace { .. }
+            | AppAction::HarnessReadNodeWorkspaceFile { .. }
+            | AppAction::HarnessReadNodeGitHistory { .. }
+            | AppAction::HarnessReadNodeGitDiff { .. }
     )
 }
 
@@ -1796,6 +1918,50 @@ fn reject_history_refresh_action(app: &mut App, action: &AppAction, reason: &str
         reason.to_owned(),
     );
     true
+}
+
+/// Honest-notice sibling of `reject_history_refresh_action` for the
+/// sidebar's write affordances (save, create file/directory), which stay
+/// direct-mode-only — harness mode has no typed Harness intent for them.
+/// Without this, the optimistic "saving"/"creating" state the direct-mode
+/// key handler already set (`TextEditor::mark_saving`,
+/// `CreateWorkspaceEntryDialog::pending`) would never clear in harness mode:
+/// a silent hang rather than the honest notice the generic rejection below
+/// already gives every other untranslatable action.
+fn reject_workspace_write_action(app: &mut App, action: &AppAction, reason: &str) -> bool {
+    match action {
+        AppAction::WriteWorkspaceFile { node_id, workspace_id, path, token, .. } => {
+            app.fail_workspace_file(
+                &WorkspaceFileTabKey {
+                    node_id: node_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    path: path.clone(),
+                },
+                *token,
+                reason.to_owned(),
+                true,
+            );
+            true
+        }
+        AppAction::CreateWorkspaceFile { node_id, workspace_id, path, token }
+        | AppAction::CreateWorkspaceDirectory { node_id, workspace_id, path, token } => {
+            let kind = if matches!(action, AppAction::CreateWorkspaceFile { .. }) {
+                WorkspaceEntryKind::File
+            } else {
+                WorkspaceEntryKind::Directory
+            };
+            app.fail_workspace_entry_create(
+                node_id.clone(),
+                workspace_id.clone(),
+                path.clone(),
+                kind,
+                *token,
+                reason.to_owned(),
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 fn action_node_id(action: &AppAction) -> Option<&str> {
@@ -1858,7 +2024,11 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
         | AppAction::HarnessReadGitDiff { .. }
-        | AppAction::HarnessLoadReverseAttribution { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
+        | AppAction::HarnessLoadReverseAttribution { .. }
+        | AppAction::HarnessInspectNodeWorkspace { .. }
+        | AppAction::HarnessReadNodeWorkspaceFile { .. }
+        | AppAction::HarnessReadNodeGitHistory { .. }
+        | AppAction::HarnessReadNodeGitDiff { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
         AppAction::None | AppAction::Quit => None,
     }
 }
@@ -2937,6 +3107,107 @@ fn harness_detail_worker(
                     return;
                 }
             }
+            AppAction::HarnessInspectNodeWorkspace { node_id, workspace_id } => {
+                let update = match client.inspect_node_workspace(
+                    node_id.clone(),
+                    workspace_id.clone(),
+                ) {
+                    Ok(inspection) => WorkerUpdate::HarnessNodeWorkspaceInspected {
+                        node_id,
+                        workspace_id,
+                        inspection,
+                    },
+                    Err(error) => WorkerUpdate::HarnessNodeWorkspaceInspectionFailed {
+                        node_id,
+                        workspace_id,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessReadNodeWorkspaceFile { node_id, workspace_id, path, token } => {
+                let result = project_harness_repository_path(&path)
+                    .and_then(|path| {
+                        client.read_node_workspace_file(node_id.clone(), workspace_id.clone(), path)
+                    });
+                let update = match result {
+                    Ok(file) => WorkerUpdate::HarnessNodeWorkspaceFileRead { node_id, token, file },
+                    Err(error) => WorkerUpdate::HarnessNodeWorkspaceFileFailed {
+                        key: WorkspaceFileTabKey { node_id, workspace_id, path },
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessReadNodeGitHistory {
+                node_id,
+                workspace_id,
+                path,
+                before,
+                limit,
+                token,
+                destination,
+            } => {
+                let result = (|| {
+                    let path = path.as_ref().map(project_harness_repository_path).transpose()?;
+                    let before = before.map(HarnessGitObjectIdV1::new).transpose()
+                        .map_err(HarnessOperatorClientError::Api)?;
+                    client.read_node_git_history(
+                        node_id.clone(),
+                        workspace_id.clone(),
+                        path,
+                        before,
+                        limit,
+                    )
+                })();
+                let update = match result {
+                    Ok(page) => WorkerUpdate::HarnessNodeGitHistoryRead {
+                        destination,
+                        token,
+                        page,
+                    },
+                    Err(error) => WorkerUpdate::HarnessNodeGitHistoryFailed {
+                        destination,
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessReadNodeGitDiff {
+                node_id,
+                workspace_id,
+                target,
+                token,
+                destination,
+            } => {
+                let result = (|| {
+                    let (mode, path) = project_harness_git_diff_target(&target)?;
+                    client.read_node_git_diff(node_id.clone(), workspace_id.clone(), mode, path)
+                })();
+                let update = match result {
+                    Ok(diff) => WorkerUpdate::HarnessNodeGitDiffRead {
+                        destination,
+                        token,
+                        diff,
+                    },
+                    Err(error) => WorkerUpdate::HarnessNodeGitDiffFailed {
+                        destination,
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
             AppAction::HarnessLoadReverseAttribution { subject, token } => {
                 let update = match client.reverse_attribution_get(subject.clone()) {
                     Ok(value) => WorkerUpdate::HarnessReverseAttributionLoaded {
@@ -3131,6 +3402,95 @@ fn project_harness_git_diff_target_from_response(
             revision: revision.as_str().to_owned(),
             path,
         },
+    }
+}
+
+/// Node-scoped sibling of `project_harness_workspace_inspection`: the
+/// response lands in the same direct-mode state (`workspace_inspections`)
+/// the direct-C2 `InspectWorkspace` reply fills, so it projects straight to
+/// `gate4agent_node_protocol::WorkspaceInspection` rather than to a
+/// Harness-prefixed presentation type.
+fn project_harness_node_workspace_inspection(
+    inspection: HarnessNodeWorkspaceInspectionV1,
+) -> Result<(String, gate4agent_node_protocol::WorkspaceInspection), String> {
+    let node_id = inspection.origin.node_id;
+    let workspace_id = WorkspaceId::new(inspection.origin.workspace_id)
+        .map_err(|error| format!("invalid Harness runtime workspace ID: {error}"))?;
+    let entries = inspection.entries.into_iter().map(|entry| WorkspaceEntry {
+        relative_path: project_harness_path(entry.relative_path),
+        kind: match entry.kind {
+            HarnessWorkspaceEntryKindV1::File => WorkspaceEntryKind::File,
+            HarnessWorkspaceEntryKindV1::Directory => WorkspaceEntryKind::Directory,
+        },
+    }).collect();
+    let git = GitSnapshot {
+        is_repository: inspection.git.is_repository,
+        branch: inspection.git.branch,
+        status: inspection.git.status.into_iter().map(|entry| GitStatusEntry {
+            index_status: project_harness_git_status_code(entry.index_status),
+            worktree_status: project_harness_git_status_code(entry.worktree_status),
+            path: project_harness_path(entry.path),
+            previous_path: entry.previous_path.map(project_harness_path),
+        }).collect(),
+        recent_commits: inspection.git.recent_commits.into_iter().map(|commit| GitCommitSummary {
+            id: commit.id.as_str().to_owned(),
+            summary: commit.summary,
+        }).collect(),
+        worktrees: Vec::new(),
+        managed_worktree: None,
+        truncated: inspection.git.truncated,
+        diagnostic: None,
+    };
+    Ok((node_id, gate4agent_node_protocol::WorkspaceInspection {
+        workspace_id,
+        entries,
+        tree_truncated: inspection.tree_truncated,
+        git,
+    }))
+}
+
+/// Node-scoped sibling projecting straight to `WorkspaceFileRead` for
+/// `apply_workspace_file_read`, the same direct-mode apply function the
+/// direct-C2 `ReadWorkspaceFile` reply uses.
+fn project_harness_node_workspace_file(
+    file: HarnessNodeWorkspaceFileV1,
+) -> Result<(String, gate4agent_node_protocol::WorkspaceFileRead), String> {
+    let node_id = file.origin.node_id;
+    let workspace_id = WorkspaceId::new(file.origin.workspace_id)
+        .map_err(|error| format!("invalid Harness runtime workspace ID: {error}"))?;
+    let revision = file.revision.map(|revision| {
+        WorkspaceFileRevision::new(revision.as_str().to_owned())
+            .map_err(|error| format!("invalid Harness runtime file revision: {error}"))
+    }).transpose()?;
+    Ok((node_id, gate4agent_node_protocol::WorkspaceFileRead {
+        workspace_id,
+        path: project_harness_path(file.path),
+        content: project_harness_file_content(file.content),
+        revision,
+    }))
+}
+
+/// Node-scoped sibling projecting straight to the `(commits, next_before,
+/// has_more)` triple `apply_git_history` expects.
+fn project_harness_node_git_history(
+    page: HarnessNodeGitHistoryPageV1,
+) -> (Vec<GitCommitView>, Option<String>, bool) {
+    let has_more = page.next_before.is_some();
+    let next_before = page.next_before.map(|id| id.as_str().to_owned());
+    let commits = page.commits.into_iter().map(project_harness_git_commit).collect();
+    (commits, next_before, has_more)
+}
+
+/// Node-scoped sibling projecting straight to `WorkspaceGitDiffView` for
+/// `apply_git_diff`.
+fn project_harness_node_git_diff(diff: HarnessNodeGitDiffV1) -> WorkspaceGitDiffView {
+    let target = project_harness_git_diff_target_from_response(diff.mode, diff.path);
+    let byte_len = diff.text.len().min(u32::MAX as usize) as u32;
+    WorkspaceGitDiffView {
+        target,
+        text: diff.text,
+        byte_len,
+        truncated: diff.truncated,
     }
 }
 
@@ -5891,7 +6251,11 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessReadWorkspaceFile { .. }
         | AppAction::HarnessReadGitHistory { .. }
         | AppAction::HarnessReadGitDiff { .. }
-        | AppAction::HarnessLoadReverseAttribution { .. } => None,
+        | AppAction::HarnessLoadReverseAttribution { .. }
+        | AppAction::HarnessInspectNodeWorkspace { .. }
+        | AppAction::HarnessReadNodeWorkspaceFile { .. }
+        | AppAction::HarnessReadNodeGitHistory { .. }
+        | AppAction::HarnessReadNodeGitDiff { .. } => None,
     }
 }
 
@@ -7171,6 +7535,59 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         WorkerUpdate::HarnessGitDiffFailed { destination, token, failure } => {
             app.fail_harness_git_diff(&destination, token, failure);
         }
+        WorkerUpdate::HarnessNodeWorkspaceInspected { node_id: expected_node_id, workspace_id: expected_workspace_id, inspection } => {
+            match project_harness_node_workspace_inspection(inspection) {
+                Ok((node_id, inspection)) if node_id == expected_node_id
+                    && inspection.workspace_id.as_str() == expected_workspace_id =>
+                {
+                    app.apply_workspace_inspection(node_id, inspection);
+                }
+                Ok((node_id, inspection)) => {
+                    app.fail_workspace_inspection(
+                        expected_node_id,
+                        expected_workspace_id,
+                        format!(
+                            "Harness replied for {node_id}/{} instead of the requested workspace",
+                            inspection.workspace_id,
+                        ),
+                    );
+                }
+                Err(message) => {
+                    app.fail_workspace_inspection(expected_node_id, expected_workspace_id, message);
+                }
+            }
+        }
+        WorkerUpdate::HarnessNodeWorkspaceInspectionFailed { node_id, workspace_id, message } => {
+            app.fail_workspace_inspection(node_id, workspace_id, message);
+        }
+        WorkerUpdate::HarnessNodeWorkspaceFileRead { node_id: expected_node_id, token, file } => {
+            match project_harness_node_workspace_file(file) {
+                Ok((node_id, file)) => app.apply_workspace_file_read(node_id, token, file),
+                Err(message) => app.notice = Some(format!("{expected_node_id}: {message}")),
+            }
+        }
+        WorkerUpdate::HarnessNodeWorkspaceFileFailed { key, token, message } => {
+            app.fail_workspace_file(&key, token, message, false);
+        }
+        WorkerUpdate::HarnessNodeGitHistoryRead { destination, token, page } => {
+            let (commits, next_before, has_more) = project_harness_node_git_history(page);
+            follow_up = app.apply_git_history(
+                &destination,
+                token,
+                commits,
+                next_before,
+                has_more,
+            ).unwrap_or(AppAction::None);
+        }
+        WorkerUpdate::HarnessNodeGitHistoryFailed { destination, token, message } => {
+            app.fail_git_history(&destination, token, message);
+        }
+        WorkerUpdate::HarnessNodeGitDiffRead { destination, token, diff } => {
+            app.apply_git_diff(&destination, token, project_harness_node_git_diff(diff));
+        }
+        WorkerUpdate::HarnessNodeGitDiffFailed { destination, token, message } => {
+            app.fail_git_diff(&destination, token, message);
+        }
         WorkerUpdate::HarnessReverseAttributionLoaded { subject, token, value } => {
             app.apply_harness_reverse_attribution(subject, token, value);
         }
@@ -7568,6 +7985,55 @@ fn remove_workspace(app: &mut App, node_id: &str, workspace_id: &str) {
     }
 }
 
+/// Reconstructs the real node-protocol `LaunchInventory` from the harness
+/// runtime inventory's redacted mirror (`HarnessRuntimeLaunchInventoryV1`
+/// cannot itself be that type: `gate4agent-node-protocol` already depends on
+/// `gate4agent-harness-api` for the shared Harness MCP wire types, so the
+/// reverse edge would be a cyclic package dependency; see
+/// `HarnessRuntimeInventoryV1::launch_inventory`'s doc comment).
+fn project_harness_launch_inventory(
+    inventory: HarnessRuntimeLaunchInventoryV1,
+) -> Result<LaunchInventory, String> {
+    let spawn_profiles = inventory.spawn_profiles.map(|profiles| {
+        profiles.into_iter().map(|profile| {
+            let environment_profile = profile.environment_profile.map(|receipt| -> Result<ResolvedEnvironmentProfileReceipt, String> {
+                Ok(ResolvedEnvironmentProfileReceipt {
+                    profile_id: receipt.profile_id.parse().map_err(|error| {
+                        format!("invalid Harness runtime environment profile ID: {error}")
+                    })?,
+                    profile_revision: receipt.profile_revision.parse().map_err(|error| {
+                        format!("invalid Harness runtime environment profile revision: {error}")
+                    })?,
+                })
+            }).transpose()?;
+            Ok(SpawnProfileSummary {
+                id: profile.id.parse()
+                    .map_err(|error| format!("invalid Harness runtime spawn profile ID: {error}"))?,
+                revision: profile.revision.parse().map_err(|error| {
+                    format!("invalid Harness runtime spawn profile revision: {error}")
+                })?,
+                environment_profile,
+            })
+        }).collect::<Result<Vec<_>, String>>()
+    }).transpose()?;
+    let bundles = inventory.bundles.map(|bundles| {
+        bundles.into_iter().map(|bundle| {
+            Ok(ResolvedBundleReceipt {
+                id: bundle.id.parse()
+                    .map_err(|error| format!("invalid Harness runtime bundle ID: {error}"))?,
+                revision: bundle.revision.parse()
+                    .map_err(|error| format!("invalid Harness runtime bundle revision: {error}"))?,
+                digest: bundle.digest.parse()
+                    .map_err(|error| format!("invalid Harness runtime bundle digest: {error}"))?,
+            })
+        }).collect::<Result<Vec<_>, String>>()
+    }).transpose()?;
+    if spawn_profiles.is_none() && bundles.is_none() {
+        return Err("Harness runtime launch inventory carries no negotiated component".to_owned());
+    }
+    Ok(LaunchInventory { spawn_profiles, bundles })
+}
+
 fn project_harness_inventory_node(entry: HarnessRuntimeNodeInventoryV1) -> Result<NodeView, String> {
     let HarnessRuntimeNodeInventoryV1 {
         node_id,
@@ -7584,6 +8050,9 @@ fn project_harness_inventory_node(entry: HarnessRuntimeNodeInventoryV1) -> Resul
             enabled: true,
         }).map_err(|error| format!("invalid Harness runtime provider: {error}"))
     }).collect::<Result<Vec<_>, _>>()?;
+    let launch_inventory = inventory.launch_inventory
+        .map(project_harness_launch_inventory)
+        .transpose()?;
     let workspaces = inventory.workspaces.into_values().map(|workspace| {
         let workspace_id = workspace.workspace_id;
         let canonical_root = OpaqueHostPath::utf8(workspace.display_root)
@@ -7612,7 +8081,7 @@ fn project_harness_inventory_node(entry: HarnessRuntimeNodeInventoryV1) -> Resul
         connection: ConnectionState::Connected,
         controller_owned: false,
         event_sequence,
-        launch_inventory: None,
+        launch_inventory,
         providers,
         workspaces,
         session_records,
@@ -8518,6 +8987,7 @@ mod tests {
         HarnessTaskReviewPolicyV1,
         HarnessTaskId, HarnessTaskStateV1, RedactedRunIntentV1,
         RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
+        HarnessGitSummaryV1, HarnessNodeWorkspaceOriginV1, HarnessWorkspaceTreeEntryV1,
     };
     use gate4agent_node_protocol::{
         AgentProgressCurrentV1, AgentProgressUsageV1, LaunchInventory,
@@ -8740,6 +9210,7 @@ mod tests {
                 ],
                 managed_session_count: 2,
                 managed_sessions_truncated: false,
+                launch_inventory: None,
             },
         }
     }
@@ -10924,11 +11395,18 @@ mod tests {
             (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
 
+        // `UnregisterWorkspace` has neither a Harness route nor a specific
+        // reject handler (unlike `WriteWorkspaceFile`/`CreateWorkspace*`,
+        // covered by `harness_only_backend_clears_optimistic_write_state_instead_of_hanging`
+        // below): the generic fallback notice is the only feedback.
+        // `InspectWorkspace` and siblings are covered by
+        // `harness_only_backend_routes_sidebar_workspace_reads_to_the_detail_lane`,
+        // now that the dispatch layer rewrites them.
         send_action(
             &mut app,
             &commands,
             &BTreeMap::new(),
-            AppAction::InspectWorkspace {
+            AppAction::UnregisterWorkspace {
                 node_id: "node-a".to_owned(),
                 workspace_id: "workspace-a".to_owned(),
             },
@@ -10950,6 +11428,270 @@ mod tests {
             app.notice.as_deref(),
             Some("Harness-owned session action unavailable: no typed Harness intent exists"),
         );
+    }
+
+    #[test]
+    fn harness_only_backend_clears_optimistic_write_state_instead_of_hanging() {
+        let mut app = App::default();
+        let (harness_tx, _harness_rx) = mpsc::channel(1);
+        let (history_tx, _history_rx) = mpsc::channel(1);
+        let (detail_tx, _detail_rx) = mpsc::channel(1);
+        let commands = BTreeMap::from([
+            (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
+            (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
+        ]);
+
+        // Writes stay direct-mode-only (no Harness intent exists for them).
+        // The optimistic "saving" state `Ctrl+s` already set on the editor
+        // must clear to an honest error, not hang forever — see
+        // `reject_workspace_write_action`.
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let file_key = WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: path.clone(),
+        };
+        let mut editor = crate::text_editor::TextEditor::new(
+            "fn main() {}\n".to_owned(),
+            Some("b".repeat(64)),
+        ).unwrap();
+        editor.mark_saving();
+        app.file_tabs.insert(file_key.clone(), crate::app::WorkspaceFileTabView {
+            editor,
+            state: crate::app::WorkspaceFileState::Ready,
+            edit_mode: false,
+            request_token: 1,
+            inline_history: None,
+        });
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::WriteWorkspaceFile {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                path,
+                expected_revision: "b".repeat(64),
+                text: "fn main() {}\n".to_owned(),
+                token: 1,
+            },
+        );
+        // No generic notice: `reject_workspace_write_action` already routed
+        // the honest failure into the file tab's own error state (rendered
+        // inline where the user tried to save), the same division of labor
+        // `reject_history_refresh_action` uses for history refresh.
+        assert_eq!(app.notice, None);
+        assert!(matches!(
+            app.file_tabs.get(&file_key).unwrap().editor.sync_state(),
+            crate::text_editor::SyncState::Error(_),
+        ), "write rejection must clear the optimistic saving state, not hang");
+
+        // The "creating without overwrite..." modal spinner must clear too.
+        app.create_workspace_entry = Some(crate::app::CreateWorkspaceEntryDialog {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: "new/hello.txt".to_owned(),
+            kind: WorkspaceEntryKind::File,
+            pending: true,
+            error: None,
+            token: 2,
+        });
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::CreateWorkspaceFile {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                path: RepositoryPath::utf8("new/hello.txt".to_owned()).unwrap(),
+                token: 2,
+            },
+        );
+        // Unlike `fail_workspace_file`, `fail_workspace_entry_create` also
+        // surfaces a notice (the create dialog is a modal, not a background
+        // save) — both channels carry the same honest, non-generic message.
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Harness-owned session action unavailable"),
+        );
+        let dialog = app.create_workspace_entry.as_ref().unwrap();
+        assert!(!dialog.pending, "create rejection must clear the pending spinner, not hang");
+        assert!(dialog.error.is_some());
+    }
+
+    #[test]
+    fn harness_only_backend_routes_sidebar_workspace_reads_to_the_detail_lane() {
+        let mut app = App::default();
+        let (harness_tx, mut harness_rx) = mpsc::channel(4);
+        let (history_tx, mut history_rx) = mpsc::channel(4);
+        let (detail_tx, mut detail_rx) = mpsc::channel(4);
+        let commands = BTreeMap::from([
+            (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
+            (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
+        ]);
+
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::InspectWorkspace {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+            },
+        );
+        assert!(matches!(
+            detail_rx.try_recv(),
+            Ok(AppAction::HarnessInspectNodeWorkspace { node_id, workspace_id })
+                if node_id == "node-a" && workspace_id == "workspace-a"
+        ));
+
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::ReadWorkspaceFile {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                path: path.clone(),
+                token: 7,
+            },
+        );
+        assert!(matches!(
+            detail_rx.try_recv(),
+            Ok(AppAction::HarnessReadNodeWorkspaceFile { node_id, workspace_id, token: 7, .. })
+                if node_id == "node-a" && workspace_id == "workspace-a"
+        ));
+
+        let destination = WorkspaceGitRequestDestination::Surface(WorkspaceGitTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            history_path: None,
+        });
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::ReadGitHistory {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                path: None,
+                before: None,
+                limit: 20,
+                token: 9,
+                destination: destination.clone(),
+            },
+        );
+        assert!(matches!(
+            detail_rx.try_recv(),
+            Ok(AppAction::HarnessReadNodeGitHistory { node_id, workspace_id, token: 9, .. })
+                if node_id == "node-a" && workspace_id == "workspace-a"
+        ));
+
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::ReadGitDiff {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                target: WorkspaceGitDiffTarget::Working { path: Some(path) },
+                token: 11,
+                destination,
+            },
+        );
+        assert!(matches!(
+            detail_rx.try_recv(),
+            Ok(AppAction::HarnessReadNodeGitDiff { node_id, workspace_id, token: 11, .. })
+                if node_id == "node-a" && workspace_id == "workspace-a"
+        ));
+
+        assert!(matches!(
+            harness_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+        ));
+        assert!(matches!(
+            history_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+        ));
+        assert_eq!(app.notice, None);
+    }
+
+    #[test]
+    fn harness_node_workspace_inspected_response_populates_the_direct_state() {
+        let mut app = App::default();
+        let mut c2 = C2ApplyState::default();
+        let inspection = HarnessNodeWorkspaceInspectionV1 {
+            origin: HarnessNodeWorkspaceOriginV1 {
+                node_id: "node-a".to_owned(),
+                node_incarnation_id: "07".repeat(16),
+                workspace_id: "workspace-a".to_owned(),
+            },
+            entries: vec![HarnessWorkspaceTreeEntryV1 {
+                relative_path: HarnessRepositoryPathV1::new("src/lib.rs").unwrap(),
+                kind: HarnessWorkspaceEntryKindV1::File,
+            }],
+            tree_truncated: false,
+            git: HarnessGitSummaryV1 {
+                is_repository: true,
+                branch: Some("main".to_owned()),
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                truncated: false,
+            },
+        };
+        let follow_up = apply_update(
+            &mut app,
+            &mut c2,
+            WorkerUpdate::HarnessNodeWorkspaceInspected {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                inspection,
+            },
+        );
+        assert_eq!(follow_up, AppAction::None);
+        let stored = app.workspace_inspections
+            .get(&("node-a".to_owned(), "workspace-a".to_owned()))
+            .expect("harness-mode InspectWorkspace response lands in workspace_inspections");
+        assert_eq!(stored.workspace_id.as_str(), "workspace-a");
+        assert_eq!(stored.entries.len(), 1);
+        assert!(stored.git.is_repository);
+        assert_eq!(stored.git.branch.as_deref(), Some("main"));
+
+        // A mismatched-workspace reply is rejected rather than silently
+        // adopted into the requested slot.
+        let mismatched = HarnessNodeWorkspaceInspectionV1 {
+            origin: HarnessNodeWorkspaceOriginV1 {
+                node_id: "node-a".to_owned(),
+                node_incarnation_id: "07".repeat(16),
+                workspace_id: "workspace-b".to_owned(),
+            },
+            entries: Vec::new(),
+            tree_truncated: false,
+            git: HarnessGitSummaryV1 {
+                is_repository: false,
+                branch: None,
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                truncated: false,
+            },
+        };
+        apply_update(
+            &mut app,
+            &mut c2,
+            WorkerUpdate::HarnessNodeWorkspaceInspected {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                inspection: mismatched,
+            },
+        );
+        assert!(app.notice.as_deref().unwrap_or_default().contains("workspace-b"));
+        let still_valid = app.workspace_inspections
+            .get(&("node-a".to_owned(), "workspace-a".to_owned()))
+            .expect("the earlier valid inspection is not clobbered by a mismatched reply");
+        assert_eq!(still_valid.entries.len(), 1);
     }
 
     #[test]
@@ -13206,7 +13948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_non_observation_cursor_then_contiguous_observation_never_resyncs() {
+    async fn direct_observation_before_any_snapshot_requests_bootstrap_resync() {
         let (updates, mut received) = mpsc::channel(4);
         let mut controller_owned = true;
         let incarnation_id = incarnation(34);
@@ -13232,12 +13974,23 @@ mod tests {
 
         let mut app = App::default();
         let mut apply = C2ApplyState::default();
+        let mut actions = Vec::new();
         for _ in 0..3 {
-            let action = apply_update(&mut app, &mut apply, received.recv().await.unwrap());
-            assert_eq!(action, AppAction::None);
+            actions.push(apply_update(&mut app, &mut apply, received.recv().await.unwrap()));
         }
+        // An observation racing ahead of the first topology snapshot must
+        // request a resync — that request IS the bootstrap. Rejecting it
+        // locally (tried once) starved the session roster forever in both
+        // direct and light mode.
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                AppAction::Resync { node_id, after_sequence: 0 } if node_id == "node-a"
+            )),
+            "expected a bootstrap resync request, got {actions:?}",
+        );
         assert_eq!(apply.event_watermarks["node-a"].sequence, 21);
-        assert!(matches!(app.notice.as_deref(), Some(notice) if notice.contains("non-current session")));
+        assert!(matches!(app.notice.as_deref(), Some(notice) if notice.contains("resync requested")));
     }
 
     #[test]

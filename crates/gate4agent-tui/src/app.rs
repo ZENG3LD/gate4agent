@@ -2345,6 +2345,42 @@ pub enum AppAction {
         subject: HarnessReverseAttributionSubjectV1,
         token: u64,
     },
+    // Node-scoped siblings of `HarnessInspectWorkspace`/`HarnessReadWorkspaceFile`/
+    // `HarnessReadGitHistory`/`HarnessReadGitDiff`: the sidebar's harness-mode
+    // reads, routed straight from a node/workspace pair with no run in flight.
+    // The client dispatch layer rewrites the matching direct action
+    // (`InspectWorkspace`/`ReadWorkspaceFile`/`ReadGitHistory`/`ReadGitDiff`)
+    // into these when there is no direct node connection — see
+    // `client.rs::harness_route_workspace_read`.
+    // No token: mirrors direct-mode `InspectWorkspace`, which is also
+    // tokenless — `inspection_pending`/`workspace_inspections` correlate by
+    // `(node_id, workspace_id)` alone (see `apply_workspace_inspection`).
+    HarnessInspectNodeWorkspace {
+        node_id: String,
+        workspace_id: String,
+    },
+    HarnessReadNodeWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        token: u64,
+    },
+    HarnessReadNodeGitHistory {
+        node_id: String,
+        workspace_id: String,
+        path: Option<RepositoryPath>,
+        before: Option<String>,
+        limit: u16,
+        token: u64,
+        destination: WorkspaceGitRequestDestination,
+    },
+    HarnessReadNodeGitDiff {
+        node_id: String,
+        workspace_id: String,
+        target: WorkspaceGitDiffTarget,
+        token: u64,
+        destination: WorkspaceGitRequestDestination,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3766,17 +3802,11 @@ impl App {
                 None,
             ),
         };
-        // A node we have never registered at all (no snapshot has arrived yet)
-        // is a different failure than a known node whose incarnation moved on:
-        // there is no established topology baseline to resync against, so
-        // requesting one would just signal a gap that bootstrap already covers.
-        if !self.nodes.iter().any(|node| node.node_id == target.node_id()) {
-            return self.reject_observation_ingress(
-                target.node_id(),
-                "Session Monitor rejected observation for a non-current session; node is not registered yet".to_owned(),
-                None,
-            );
-        }
+        // A node with no snapshot yet still falls through to the resync
+        // request below: that request IS the bootstrap when observation
+        // ingress races ahead of the first topology snapshot. Rejecting
+        // locally here (tried once) starves the session roster forever in
+        // both direct and light mode.
         if !self.is_current_node_incarnation(target.node_id(), target.incarnation()) {
             let after = self.nodes.iter()
                 .find(|node| node.node_id == target.node_id())

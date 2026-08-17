@@ -49,7 +49,8 @@ use gate4agent_harness_client::{
     HarnessReverseAttributionV1, HarnessReverseAttributionWorkspaceV1,
     HarnessReviewedTaskLaunchSelectionV1, HarnessReviewedWorktreeSelectionV1,
     HarnessRevision,
-    HarnessNodeIncarnationV1, HarnessRunCorrelationV1, HarnessRunId, HarnessRunSessionViewV1,
+    HarnessNodeIncarnationV1, HarnessRunCorrelationAvailabilityV1, HarnessRunCorrelationV1,
+    HarnessRunId, HarnessRunSessionViewV1,
     HarnessRunTransferSummaryV1, HarnessRuntimeSessionAddressV1,
     HarnessTaskLaunchIssuanceRefV1, HarnessTaskLaunchOptionsV1, HarnessTaskId,
     HarnessTaskReviewPolicyV1, HarnessTaskStartOutcomeV1,
@@ -73,7 +74,7 @@ use gate4agent_harness_client::{
     HarnessIdempotencyRef, HarnessLaunchPlanRefV1,
     HarnessManagedRunSessionV1, HarnessOperationId,
     HarnessRunIntentV1,
-    HarnessRunCorrelationAvailabilityV1, HarnessRunLifecycleV1, HarnessRuntimeIdentityV1,
+    HarnessRunLifecycleV1, HarnessRuntimeIdentityV1,
     HarnessRunWorktreeViewV1, HarnessWorktreeIntentV1, RedactedRunIntentV1,
     RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
 };
@@ -2432,6 +2433,7 @@ pub enum HitTarget {
     HarnessTaskDetailRunMonitor(HarnessRunId),
     HarnessTaskDetailRunTransfers(HarnessRunId),
     HarnessTaskDetailRunObserveContext(HarnessRunId),
+    HarnessTaskDetailRunTerminal(HarnessRunId),
     HarnessTransferRefresh,
     HarnessTransferPreviousRun,
     HarnessTransferNextRun,
@@ -6053,6 +6055,33 @@ impl App {
         }
     }
 
+    /// Opens the A1 harness-mediated terminal for a Task Detail run row.
+    /// Reuses `open_address` exactly as the session-monitoring roster does
+    /// (`open_selected_agent`) -- no separate transport, no separate
+    /// surface: the resulting `SurfaceTab::Pty` is polled by the same
+    /// `AppAction::HarnessOpenTerminal` client-loop path. `open_address`
+    /// leaves `harness_kanban.detail` and `agent_board_mode` untouched, so
+    /// returning to the `AgentBoard` tab lands back on this Task Detail,
+    /// not the monitoring roster.
+    fn open_harness_run_terminal(&mut self, run_id: HarnessRunId) -> AppAction {
+        let Some(detail) = self.harness_kanban.detail.as_ref() else {
+            return AppAction::None;
+        };
+        let belongs_to_task = self.harness_kanban.runs.get(&run_id)
+            .is_some_and(|run| run.task_id.as_ref() == Some(&detail.task_id));
+        if !belongs_to_task {
+            return AppAction::None;
+        }
+        let Some(address) = self.harness_run_terminal_address(&run_id) else {
+            self.notice = Some(
+                "Harness terminal unavailable: run has no live managed session".to_owned(),
+            );
+            return AppAction::None;
+        };
+        self.open_address(address);
+        AppAction::None
+    }
+
     fn open_harness_run_transfers(
         &mut self,
         run_id: HarnessRunId,
@@ -6190,6 +6219,37 @@ impl App {
         AppAction::None
     }
 
+    /// Agents tab run selection -- like `move_harness_result_selection`,
+    /// this never triggers a fetch: correlations for every run in the task
+    /// are already requested the moment Task Detail opens
+    /// (`request_harness_task_correlations`), so moving the selection only
+    /// changes which row Enter opens the terminal for.
+    fn move_harness_agent_selection(&mut self, previous: bool) -> AppAction {
+        let Some(detail) = self.harness_kanban.detail.as_ref() else {
+            return AppAction::None;
+        };
+        let runs = self.harness_task_runs(&detail.task_id)
+            .into_iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        if runs.is_empty() {
+            return AppAction::None;
+        }
+        let current = detail.selected_run.as_ref()
+            .and_then(|selected| runs.iter().position(|run_id| run_id == selected))
+            .unwrap_or(0);
+        let next = if previous {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(runs.len() - 1)
+        };
+        if let Some(detail) = self.harness_kanban.detail.as_mut() {
+            detail.selected_run = Some(runs[next].clone());
+            detail.scroll = 0;
+        }
+        AppAction::None
+    }
+
     pub fn harness_run_ref(&self, run_id: &HarnessRunId) -> Option<HarnessRunRef> {
         let run = self.harness_kanban.runs.get(run_id)?;
         Some(HarnessRunRef {
@@ -6204,6 +6264,31 @@ impl App {
     ) -> Option<(&HarnessRunOrigin, &HarnessWorkspaceView)> {
         self.harness_kanban.workspaces.iter()
             .find(|(origin, _)| &origin.run == run)
+    }
+
+    /// Session address of a run's live managed terminal -- the same
+    /// `SessionAddress` shape `open_address` turns into `SurfaceTab::Pty`,
+    /// which the client loop then keeps fed via `AppAction::HarnessOpenTerminal`
+    /// once it is focused (`client.rs` `harness_terminal_session_address`).
+    /// `None` unless the run's exact correlation reports `Available` with a
+    /// Managed session's active runtime identity -- every other state
+    /// (dormant record, no correlation yet, stale incarnation, inline
+    /// session) has no live PTY to open.
+    pub fn harness_run_terminal_address(&self, run_id: &HarnessRunId) -> Option<SessionAddress> {
+        let correlation = self.harness_kanban.correlations.get(run_id)?;
+        if correlation.availability != HarnessRunCorrelationAvailabilityV1::Available {
+            return None;
+        }
+        let HarnessRunSessionViewV1::Managed(session) = &correlation.session else {
+            return None;
+        };
+        let active = session.active_session.as_ref()?;
+        Some(SessionAddress {
+            node_id: correlation.node_id.as_str().to_owned(),
+            workspace_id: correlation.workspace_id.as_str().to_owned(),
+            instance_id: active.instance_id,
+            generation: active.generation,
+        })
     }
 
     fn open_harness_workspace_section(
@@ -6704,6 +6789,19 @@ impl App {
             {
                 self.harness_kanban.detail = Some(detail);
                 return self.move_harness_result_selection(key == UiKey::Up);
+            }
+            UiKey::Up | UiKey::Down
+                if detail.section == HarnessTaskDetailSection::Agents =>
+            {
+                self.harness_kanban.detail = Some(detail);
+                return self.move_harness_agent_selection(key == UiKey::Up);
+            }
+            UiKey::Enter if detail.section == HarnessTaskDetailSection::Agents => {
+                let selected_run = detail.selected_run.clone();
+                self.harness_kanban.detail = Some(detail);
+                return selected_run.map_or(AppAction::None, |run_id| {
+                    self.open_harness_run_terminal(run_id)
+                });
             }
             UiKey::Char('r') | UiKey::Char('R')
                 if detail.section == HarnessTaskDetailSection::Transfers =>
@@ -9117,6 +9215,9 @@ impl App {
             Some(HitTarget::HarnessTaskDetailRunMonitor(run_id)) => {
                 return self.open_harness_run_monitor(run_id.clone());
             }
+            Some(HitTarget::HarnessTaskDetailRunTerminal(run_id)) => {
+                return self.open_harness_run_terminal(run_id.clone());
+            }
             Some(HitTarget::HarnessTaskDetailRunTransfers(run_id)) => {
                 return self.open_harness_run_transfers(run_id.clone(), false);
             }
@@ -9900,6 +10001,7 @@ impl App {
                 | HitTarget::HarnessTaskDetailSection(_)
                 | HitTarget::HarnessTaskDetailRun(_)
                 | HitTarget::HarnessTaskDetailRunMonitor(_)
+                | HitTarget::HarnessTaskDetailRunTerminal(_)
                 | HitTarget::HarnessTaskDetailRunTransfers(_)
                 | HitTarget::HarnessTaskDetailRunObserveContext(_)
                 | HitTarget::HarnessTransferRefresh
@@ -19576,6 +19678,108 @@ mod tests {
             },
         );
         assert_eq!(app.harness_kanban.monitor.as_ref().map(|view| &view.run.run_id), Some(&run.run_id));
+    }
+
+    #[test]
+    fn harness_task_detail_agents_terminal_click_and_keyboard_open_pty_for_live_binding_only() {
+        let mut app = fixture();
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = AgentBoardMode::HarnessKanban;
+        app.surface.open_in_focused(SurfaceTab::AgentBoard);
+        let mut task = harness_task('f', HarnessTaskStateV1::Running, 1);
+        let live = harness_run('a', task.task_id.clone(), RedactedBindingStateV1::ManagedActive);
+        let dormant = harness_run('b', task.task_id.clone(), RedactedBindingStateV1::ManagedDormant);
+        task.run_ids = vec![live.run_id.clone(), dormant.run_id.clone()];
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], vec![live.clone(), dormant.clone()]);
+        let _ = app.open_harness_task_detail(task.task_id.clone());
+        {
+            let detail = app.harness_kanban.detail.as_mut().unwrap();
+            detail.section = HarnessTaskDetailSection::Agents;
+            detail.selected_run = Some(live.run_id.clone());
+        }
+
+        // No correlation loaded yet for either run: nothing is a live binding.
+        assert!(app.harness_run_terminal_address(&live.run_id).is_none());
+        assert!(app.harness_run_terminal_address(&dormant.run_id).is_none());
+        assert_eq!(app.reduce_harness_kanban(UiKey::Enter), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+
+        let base_correlation = HarnessRunCorrelationV1 {
+            run_id: live.run_id.clone(),
+            run_revision: live.revision,
+            task_id: task.task_id.clone(),
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("07".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            provider_profile: HarnessSelectorV1::new("codex-default").unwrap(),
+            mode: HarnessExecutionModeV1::Pty,
+            worktree: HarnessRunWorktreeViewV1::Existing,
+            session: HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                record_id: HarnessSelectorV1::new("record-live").unwrap(),
+                active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 7, generation: 2 }),
+            }),
+            availability: HarnessRunCorrelationAvailabilityV1::Available,
+            observed_at_unix_ms: Some(10),
+        };
+        let dormant_correlation = HarnessRunCorrelationV1 {
+            run_id: dormant.run_id.clone(),
+            run_revision: dormant.revision,
+            session: HarnessRunSessionViewV1::Managed(HarnessManagedRunSessionV1 {
+                record_id: HarnessSelectorV1::new("record-dormant").unwrap(),
+                active_session: None,
+            }),
+            availability: HarnessRunCorrelationAvailabilityV1::Dormant,
+            ..base_correlation.clone()
+        };
+        app.apply_harness_task_correlations(
+            &task.task_id,
+            vec![base_correlation, dormant_correlation],
+            Vec::new(),
+        );
+
+        let expected_address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 7,
+            generation: 2,
+        };
+        assert_eq!(app.harness_run_terminal_address(&live.run_id), Some(expected_address.clone()));
+        assert!(app.harness_run_terminal_address(&dormant.run_id).is_none());
+
+        // Keyboard: Down moves off the live run onto the dormant one; Enter there is inert.
+        assert_eq!(app.reduce_harness_kanban(UiKey::Down), AppAction::None);
+        assert_eq!(
+            app.harness_kanban.detail.as_ref().and_then(|detail| detail.selected_run.clone()),
+            Some(dormant.run_id.clone()),
+        );
+        assert_eq!(app.reduce_harness_kanban(UiKey::Enter), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+
+        // Up moves back onto the live run; Enter there opens its terminal.
+        assert_eq!(app.reduce_harness_kanban(UiKey::Up), AppAction::None);
+        assert_eq!(
+            app.harness_kanban.detail.as_ref().and_then(|detail| detail.selected_run.clone()),
+            Some(live.run_id.clone()),
+        );
+        assert_eq!(app.reduce_harness_kanban(UiKey::Enter), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::Pty(expected_address.clone())));
+        // Task Detail must survive opening the terminal so back-navigation
+        // returns to it, not to the session-monitoring roster.
+        assert_eq!(
+            app.harness_kanban.detail.as_ref().map(|detail| &detail.task_id),
+            Some(&task.task_id),
+        );
+        assert_eq!(app.agent_board_mode, AgentBoardMode::HarnessKanban);
+
+        // Mouse: the hit target carries its own run id, independent of the
+        // keyboard selection cursor (left pointed at the dormant run above).
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 20, 1),
+            target: HitTarget::HarnessTaskDetailRunTerminal(live.run_id.clone()),
+        }];
+        assert_eq!(app.click(1, 0), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::Pty(expected_address)));
     }
 
     #[test]

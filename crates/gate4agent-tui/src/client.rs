@@ -799,22 +799,35 @@ enum C2EventAdmission {
     Accepted { gap_after: Option<u64> },
 }
 
+/// How much of a periodic snapshot may be applied. A snapshot lagging the
+/// per-event watermark still carries the only wire copy of inventory-shaped
+/// state (launch inventory, workspaces, capabilities) — starving those until
+/// a snapshot outruns a live event stream would starve them forever — but it
+/// must not regress state that events advance (session records, the displayed
+/// event sequence, terminal watermarks).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotAdmission {
+    Authoritative,
+    InventoryOnly,
+    Rejected,
+}
+
 impl C2ApplyState {
     fn accept_snapshot(
         &mut self,
         node_id: &str,
         cursor: gate4agent_c2_protocol::NodeCursor,
-    ) -> bool {
+    ) -> SnapshotAdmission {
         if let Some(current) = self.snapshot_watermarks.get(node_id).copied() {
             if current.incarnation_id == cursor.incarnation_id {
                 if cursor.sequence < current.sequence {
-                    return false;
+                    return SnapshotAdmission::Rejected;
                 }
             } else {
                 if self.retired_incarnations.get(node_id).is_some_and(|retired| {
                     retired.contains(&cursor.incarnation_id)
                 }) {
-                    return false;
+                    return SnapshotAdmission::Rejected;
                 }
                 self.retired_incarnations
                     .entry(node_id.to_owned())
@@ -823,17 +836,6 @@ impl C2ApplyState {
             }
         }
         let event_current = self.event_watermarks.get(node_id).copied();
-        if let Some(current) = event_current {
-            // A later per-event update can already have advanced past this
-            // snapshot's watermark (events and snapshots are applied
-            // independently); a snapshot stale relative to that must not
-            // regress state the event already established.
-            if current.incarnation_id == cursor.incarnation_id
-                && cursor.sequence < current.sequence
-            {
-                return false;
-            }
-        }
         if let Some(previous) = event_current
             .map(|current| current.incarnation_id)
             .filter(|previous| *previous != cursor.incarnation_id)
@@ -845,7 +847,17 @@ impl C2ApplyState {
             self.event_watermarks.remove(node_id);
         }
         self.snapshot_watermarks.insert(node_id.to_owned(), cursor);
-        true
+        // A later per-event update can already have advanced past this
+        // snapshot's watermark (events and snapshots ride independent
+        // pipelines, and a live terminal stream outruns every periodic
+        // snapshot); such a snapshot still delivers inventory but must not
+        // regress event-established state.
+        if event_current.is_some_and(|current| {
+            current.incarnation_id == cursor.incarnation_id && cursor.sequence < current.sequence
+        }) {
+            return SnapshotAdmission::InventoryOnly;
+        }
+        SnapshotAdmission::Authoritative
     }
 
     fn accept_event(
@@ -6411,8 +6423,9 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
                 incarnation_id,
                 sequence: event_sequence,
             };
-            if c2.accept_snapshot(&expected_node_id, cursor) {
-                let node = project_node(
+            let admission = c2.accept_snapshot(&expected_node_id, cursor);
+            if admission != SnapshotAdmission::Rejected {
+                let mut node = project_node(
                     expected_node_id,
                     endpoint,
                     incarnation_id,
@@ -6420,6 +6433,9 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
                     controller_owned,
                     event_sequence,
                 );
+                if admission == SnapshotAdmission::InventoryOnly {
+                    preserve_event_established_state(app, &mut node);
+                }
                 let node_id = node.node_id.clone();
                 app.upsert_node(node);
                 enqueue_managed_inventory(app, c2, &node_id, incarnation_id);
@@ -6445,10 +6461,13 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
                 incarnation_id,
                 sequence: event_sequence,
             };
-            if c2.accept_snapshot(&expected_node_id, cursor) {
+            let admission = c2.accept_snapshot(&expected_node_id, cursor);
+            if admission != SnapshotAdmission::Rejected {
                 let support = project_c2_observation_support(snapshot.observation_support.as_ref());
-                c2.rebuild_terminal_watermarks(&expected_node_id, &snapshot);
-                let node = project_c2_node(
+                if admission == SnapshotAdmission::Authoritative {
+                    c2.rebuild_terminal_watermarks(&expected_node_id, &snapshot);
+                }
+                let mut node = project_c2_node(
                     expected_node_id.clone(),
                     endpoint,
                     incarnation_id,
@@ -6459,6 +6478,9 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
                         .copied()
                         .unwrap_or(C2RelayRoute::Unknown),
                 );
+                if admission == SnapshotAdmission::InventoryOnly {
+                    preserve_event_established_state(app, &mut node);
+                }
                 app.upsert_node(node);
                 app.set_session_monitor_support(expected_node_id.clone(), incarnation_id, support);
                 enqueue_managed_inventory(app, c2, &expected_node_id, incarnation_id);
@@ -7782,6 +7804,19 @@ fn project_c2_node(
         workspaces,
         session_records,
         launch_inventory: snapshot.launch_inventory,
+    }
+}
+
+/// A snapshot admitted as `InventoryOnly` lags the per-event stream: keep the
+/// event-established session records and displayed event sequence from the
+/// node view the events already built, applying only the inventory-shaped
+/// remainder (launch inventory, workspaces, providers) the snapshot alone
+/// carries. A node the events never built has nothing to preserve — the
+/// projected snapshot then applies in full.
+fn preserve_event_established_state(app: &App, node: &mut NodeView) {
+    if let Some(existing) = app.nodes.iter().find(|existing| existing.node_id == node.node_id) {
+        node.session_records = existing.session_records.clone();
+        node.event_sequence = existing.event_sequence;
     }
 }
 
@@ -12069,6 +12104,49 @@ mod tests {
             "snapshot-authoritative"
         );
         assert_eq!(app.nodes[0].event_sequence, 6);
+    }
+
+    #[test]
+    fn c2_lagging_snapshot_still_delivers_inventory_without_regressing_event_state() {
+        let incarnation_id = gate4agent_c2_protocol::NodeIncarnationId::from_bytes([7; 16]);
+        let mut app = App::default();
+        let mut c2 = C2ApplyState::default();
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: c2_test_snapshot("baseline"),
+            event_sequence: 1,
+        });
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Event {
+            node_id: "node-a".to_owned(),
+            cursor: gate4agent_c2_protocol::NodeCursor {
+                incarnation_id,
+                sequence: 50,
+            },
+            event: C2EventUpdate::SessionRecordUpserted(project_c2_managed_session(
+                "node-a",
+                c2_test_record("event-live"),
+            )),
+        });
+        // A live terminal stream outruns every periodic snapshot: the next
+        // snapshot lags the event watermark yet is the ONLY carrier of
+        // inventory-shaped state. It must land that state (the pre-fix
+        // wholesale rejection starved launch inventory and workspaces
+        // forever) without regressing what events established.
+        let mut lagging = c2_test_snapshot("snapshot-lagging");
+        lagging.launch_inventory = Some(test_launch_inventory());
+        apply_update(&mut app, &mut c2, WorkerUpdate::C2Snapshot {
+            expected_node_id: "node-a".to_owned(),
+            endpoint: r"\\.\pipe\node-a".to_owned(),
+            incarnation_id,
+            snapshot: lagging,
+            event_sequence: 2,
+        });
+
+        assert!(app.nodes[0].launch_inventory.is_some(), "inventory starved");
+        assert_eq!(app.nodes[0].session_records[0].display_name, "event-live");
+        assert_eq!(app.nodes[0].event_sequence, 50);
     }
 
     #[test]
